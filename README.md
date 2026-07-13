@@ -23,7 +23,7 @@ venue; attribution is the point.
 
 | Path | Purpose |
 |---|---|
-| `CLAUDE_CODE_PROMPT.md` / `CODEX_HANDOFF.md` | Agent briefs (implementer / independent verifier) |
+| `CLAUDE_CODE_PROMPT.md` / `CODEX_PROMPT.md` | Agent briefs (implementer / independent verifier) |
 | `whiskeyjack-bot-v1-backlog.xlsx`, `docs/backlog/*.csv` | Issue-level acceptance criteria, verified facts, decisions, risks |
 | `config.example.yaml` | Configuration contract |
 | `prompts/forecaster.md` | Versioned, hashed forecaster prompt |

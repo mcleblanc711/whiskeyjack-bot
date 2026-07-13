@@ -29,14 +29,15 @@ Suite: **56 tests, all passing offline with sockets blocked** (autouse guard in
 1. **Rename applied in full.** Package/CLI/data paths are `whiskeyjack`-named; backlog
    acceptance text like `minibench-bot --help` was read as renamed. "minibench" survives
    only as the tournament id and in docs.
-2. **`CODEX_HANDOFF.md` is not the full spec.** The file now at `CODEX_HANDOFF.md` is
-   the Codex verification brief (it was `CODEX_PROMPT.md`; your uncommitted rename was
-   committed as-is). The "full spec" both briefs cite — ledger DDL, submission seam
+2. **The full spec (`CODEX_HANDOFF.md`) is missing from the repo.** The Codex
+   verification brief lives at `CODEX_PROMPT.md` (restored to its original name after a
+   transient rename). The "full spec" both briefs cite — ledger DDL, submission seam
    detail, § "Prohibited implementation claims" — **does not exist in the repo.** M0
    was fully specifiable without it; M1's ledger (M1-601) and M2's submission seam are
-   where it becomes load-bearing. **If you have that document, add it before M1
-   go-ahead;** otherwise I will propose the ledger design explicitly in the M1 plan for
-   your approval instead of implementing against an assumed spec.
+   where it becomes load-bearing. **If you have that document, add it as
+   `CODEX_HANDOFF.md` before M1 go-ahead;** otherwise I will propose the ledger design
+   explicitly in the M1 plan for your approval instead of implementing against an
+   assumed spec.
 3. **Python 3.11 provisioned via uv** (system has only 3.12): `.python-version` pins
    3.11; `uv.lock` is the lockfile M0-002's "lock resolves on 3.11" refers to.
 4. **Fixtures are synthetic.** The public Metaculus API now returns 403 without
