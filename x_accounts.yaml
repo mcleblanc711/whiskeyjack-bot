@@ -1,0 +1,239 @@
+# config/x_accounts.yaml — curated primary-source allowlist for the social retrieval adapter
+#
+# PURPOSE: constrains Grok X Search toward accounts that CONTROL resolution-relevant
+# facts (official_primary) or reliably break them (journalist). This is a primary-source
+# list, not a follow graph. Keep it under ~40 entries; every addition should answer
+# "which MiniBench question domain does this account resolve or lead?"
+#
+# OWNER ACTION BEFORE ENABLING (part of A-1106): verify every handle still exists and
+# still belongs to the stated institution. Handles get renamed, retired, and spoofed.
+# One wrong handle silently poisons the reliability tagging for its domain.
+#
+# reliability_tag values (must match schema): official_primary | verified_org | journalist | unverified_social
+# (unverified_social never appears in this file — it is the default for unmatched handles.)
+#
+# domains: freeform tags matched against the question's domain tag. Keep consistent with
+# the taxonomy below; add new domains deliberately, not per-question.
+#   econ_data, monetary_policy, fiscal_policy, markets, regulation, energy,
+#   elections, us_politics, intl_politics, geopolitics,
+#   space_launch, science, health, weather, climate,
+#   sports, ai_tech, canada, uk, eu
+
+accounts:
+  # ── Economic data & statistics (resolution sources for most econ questions) ──
+  - username: "BLS_gov"
+    display_name: "US Bureau of Labor Statistics"
+    reliability_tag: "official_primary"
+    domains: ["econ_data"]
+    notes: "CPI, jobs report, unemployment — resolves many econ questions directly."
+  - username: "BEA_News"
+    display_name: "US Bureau of Economic Analysis"
+    reliability_tag: "official_primary"
+    domains: ["econ_data"]
+    notes: "GDP, PCE releases."
+  - username: "stlouisfed"
+    display_name: "St. Louis Fed"
+    reliability_tag: "official_primary"
+    domains: ["econ_data", "monetary_policy"]
+    notes: "FRED operator; complements the structured-source router (M1-304)."
+  - username: "StatCan_eng"
+    display_name: "Statistics Canada"
+    reliability_tag: "official_primary"
+    domains: ["econ_data", "canada"]
+  - username: "ONS"
+    display_name: "UK Office for National Statistics"
+    reliability_tag: "official_primary"
+    domains: ["econ_data", "uk"]
+  - username: "EU_Eurostat"
+    display_name: "Eurostat"
+    reliability_tag: "official_primary"
+    domains: ["econ_data", "eu"]
+  - username: "IMFNews"
+    display_name: "International Monetary Fund"
+    reliability_tag: "official_primary"
+    domains: ["econ_data", "intl_politics"]
+
+  # ── Central banks & fiscal/regulatory authorities ──
+  - username: "federalreserve"
+    display_name: "US Federal Reserve"
+    reliability_tag: "official_primary"
+    domains: ["monetary_policy", "markets"]
+    notes: "FOMC decisions and statements."
+  - username: "ecb"
+    display_name: "European Central Bank"
+    reliability_tag: "official_primary"
+    domains: ["monetary_policy", "eu"]
+  - username: "bankofengland"
+    display_name: "Bank of England"
+    reliability_tag: "official_primary"
+    domains: ["monetary_policy", "uk"]
+  - username: "bankofcanada"
+    display_name: "Bank of Canada"
+    reliability_tag: "official_primary"
+    domains: ["monetary_policy", "canada"]
+  - username: "USTreasury"
+    display_name: "US Department of the Treasury"
+    reliability_tag: "official_primary"
+    domains: ["fiscal_policy", "markets"]
+  - username: "SECGov"
+    display_name: "US Securities and Exchange Commission"
+    reliability_tag: "official_primary"
+    domains: ["regulation", "markets"]
+  - username: "EIAgov"
+    display_name: "US Energy Information Administration"
+    reliability_tag: "official_primary"
+    domains: ["energy", "econ_data"]
+    notes: "Oil/gas inventories and energy stats."
+
+  # ── Elections & political process ──
+  - username: "AP"
+    display_name: "The Associated Press"
+    reliability_tag: "journalist"
+    domains: ["elections", "us_politics", "intl_politics", "geopolitics"]
+    notes: "AP race calls are the de facto resolution source for many election questions — journalist tag, but unusually load-bearing for elections."
+  - username: "DecisionDeskHQ"
+    display_name: "Decision Desk HQ"
+    reliability_tag: "journalist"
+    domains: ["elections", "us_politics"]
+    notes: "Fast race calls; corroborate with AP."
+  - username: "WhiteHouse"
+    display_name: "The White House"
+    reliability_tag: "official_primary"
+    domains: ["us_politics", "fiscal_policy", "geopolitics"]
+    notes: "Executive actions, signings, nominations."
+  - username: "StateDept"
+    display_name: "US Department of State"
+    reliability_tag: "official_primary"
+    domains: ["geopolitics", "intl_politics"]
+
+  # ── International bodies & geopolitics ──
+  - username: "UN"
+    display_name: "United Nations"
+    reliability_tag: "official_primary"
+    domains: ["intl_politics", "geopolitics"]
+  - username: "NATO"
+    display_name: "NATO"
+    reliability_tag: "official_primary"
+    domains: ["geopolitics"]
+  - username: "IAEAorg"
+    display_name: "International Atomic Energy Agency"
+    reliability_tag: "official_primary"
+    domains: ["geopolitics", "science", "energy"]
+
+  # ── Space & launch (frequent MiniBench domain; launches announce on X first) ──
+  - username: "NASA"
+    display_name: "NASA"
+    reliability_tag: "official_primary"
+    domains: ["space_launch", "science"]
+  - username: "SpaceX"
+    display_name: "SpaceX"
+    reliability_tag: "official_primary"
+    domains: ["space_launch"]
+    notes: "Announces launches/scrubs on X before anywhere else — the canonical lead-time case."
+  - username: "esa"
+    display_name: "European Space Agency"
+    reliability_tag: "official_primary"
+    domains: ["space_launch", "science", "eu"]
+  - username: "RocketLab"
+    display_name: "Rocket Lab"
+    reliability_tag: "official_primary"
+    domains: ["space_launch"]
+  - username: "ulalaunch"
+    display_name: "United Launch Alliance"
+    reliability_tag: "official_primary"
+    domains: ["space_launch"]
+
+  # ── Health & science ──
+  - username: "WHO"
+    display_name: "World Health Organization"
+    reliability_tag: "official_primary"
+    domains: ["health", "intl_politics"]
+  - username: "CDCgov"
+    display_name: "US CDC"
+    reliability_tag: "official_primary"
+    domains: ["health"]
+  - username: "US_FDA"
+    display_name: "US FDA"
+    reliability_tag: "official_primary"
+    domains: ["health", "regulation"]
+    notes: "Drug/device approval questions resolve here."
+  - username: "NIH"
+    display_name: "US National Institutes of Health"
+    reliability_tag: "official_primary"
+    domains: ["health", "science"]
+
+  # ── Weather & climate (numeric questions often resolve on these) ──
+  - username: "NWS"
+    display_name: "US National Weather Service"
+    reliability_tag: "official_primary"
+    domains: ["weather"]
+  - username: "NHC_Atlantic"
+    display_name: "NOAA National Hurricane Center (Atlantic)"
+    reliability_tag: "official_primary"
+    domains: ["weather"]
+    notes: "Named-storm questions resolve on NHC advisories."
+  - username: "NOAA"
+    display_name: "NOAA"
+    reliability_tag: "official_primary"
+    domains: ["weather", "climate", "science"]
+  - username: "CopernicusECMWF"
+    display_name: "Copernicus / ECMWF"
+    reliability_tag: "official_primary"
+    domains: ["climate"]
+    notes: "Monthly global temperature records — common numeric-question resolver."
+  - username: "USGS"
+    display_name: "US Geological Survey"
+    reliability_tag: "official_primary"
+    domains: ["science"]
+    notes: "Earthquake magnitude/count questions."
+
+  # ── Sports (league accounts are primary for their own results/decisions) ──
+  - username: "NBA"
+    display_name: "NBA"
+    reliability_tag: "official_primary"
+    domains: ["sports"]
+  - username: "NFL"
+    display_name: "NFL"
+    reliability_tag: "official_primary"
+    domains: ["sports"]
+  - username: "MLB"
+    display_name: "MLB"
+    reliability_tag: "official_primary"
+    domains: ["sports"]
+  - username: "FIFAcom"
+    display_name: "FIFA"
+    reliability_tag: "official_primary"
+    domains: ["sports"]
+  - username: "F1"
+    display_name: "Formula 1"
+    reliability_tag: "official_primary"
+    domains: ["sports"]
+
+  # ── AI / tech (labs are primary sources about their own releases) ──
+  - username: "OpenAI"
+    display_name: "OpenAI"
+    reliability_tag: "official_primary"
+    domains: ["ai_tech"]
+    notes: "Primary about its own releases; verified_org-grade for everything else — the tag applies only when the question is about the account's own facts (enforced by prompt guidance, not code)."
+  - username: "AnthropicAI"
+    display_name: "Anthropic"
+    reliability_tag: "official_primary"
+    domains: ["ai_tech"]
+  - username: "GoogleDeepMind"
+    display_name: "Google DeepMind"
+    reliability_tag: "official_primary"
+    domains: ["ai_tech"]
+
+  # ── Wire services (breaking-event lead time; secondary evidence) ──
+  - username: "Reuters"
+    display_name: "Reuters"
+    reliability_tag: "journalist"
+    domains: ["geopolitics", "intl_politics", "markets", "econ_data"]
+  - username: "BBCBreaking"
+    display_name: "BBC Breaking News"
+    reliability_tag: "journalist"
+    domains: ["geopolitics", "intl_politics", "uk"]
+  - username: "AFP"
+    display_name: "Agence France-Presse"
+    reliability_tag: "journalist"
+    domains: ["geopolitics", "intl_politics", "eu"]

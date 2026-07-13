@@ -1,0 +1,98 @@
+# whiskeyjack-bot example configuration
+# Secrets are read from environment variables; never place credentials here.
+
+environment: development
+
+metaculus:
+  base_url: "https://www.metaculus.com/api"
+  token_env: "METACULUS_TOKEN"
+  tournament:
+    # Current verified MiniBench SDK alias as checked 2026-07-09.
+    id: "minibench"
+    use_sdk_current_id: false
+  group_question_mode: "unpack_subquestions"
+  request_timeout_seconds: 30
+  request_spacing_seconds: 3.5
+  request_jitter_seconds: 1.0
+
+model:
+  # Use the LiteLLM-compatible name verified for the owner's provider account.
+  # Deliberately no silent default: replace before running.
+  provider: "openrouter"
+  name: "REPLACE_WITH_VERIFIED_LITELLM_MODEL_NAME"
+  api_key_env: "OPENROUTER_API_KEY"
+  temperature: 0.0
+  timeout_seconds: 120
+  max_output_tokens: 6000
+  allowed_tries: 2
+
+retrieval:
+  primary:
+    provider: "asknews"
+    api_key_env: "ASKNEWS_API_KEY"
+  fallback:
+    provider: "exa"
+    api_key_env: "EXA_API_KEY"
+  max_queries_per_question: 6
+  max_documents_per_query: 8
+  freshness_days_default: 30
+  retain_raw_responses: true
+  replay_saved_research: false
+  deduplicate_by:
+    - "canonical_url"
+    - "content_sha256"
+  structured_sources_enabled: true
+
+forecast:
+  supported_question_types:
+    - "binary"
+    - "multiple_choice"
+    - "numeric"
+  min_probability: 0.001
+  max_probability: 0.999
+  community_prediction_policy: "log_after_forecast_do_not_use_as_input"
+  replay_saved_model_output: false
+  fail_on_stale_research: false
+  flag_on_stale_research: true
+  prompt_path: "prompts/forecaster.md"
+  prompt_version: "1.0.0"
+
+numeric_calibration:
+  use_forecasting_tools_standardization: true
+  expected_cdf_points: 201
+  max_adjacent_pmf: 0.2
+  strict_validation: true
+  # No empirical recalibration is applied until resolved forecasts justify it.
+  calibration_profile: "identity"
+
+submission:
+  enabled: false
+  dry_run: true
+  no_submit: true
+  require_human_approval: true
+  approval_must_match_forecast_hash: true
+  verify_by_refetch: true
+  post_private_reasoning_comment: false
+  block_retry_on_uncertain_result: true
+
+storage:
+  sqlite_path: "data/minibench_bot.sqlite3"
+  artifact_root: "data/artifacts"
+  export_root: "data/exports"
+  sqlite_wal: true
+  retain_raw_model_output: true
+  retain_raw_research: true
+
+logging:
+  level: "INFO"
+  format: "json"
+  file: "data/logs/minibench_bot.jsonl"
+  redact_secrets: true
+  include_provider_costs: true
+
+run_limits:
+  max_questions: 1
+  max_cost_usd: 10.00
+  max_parallel_questions: 1
+
+
