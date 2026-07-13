@@ -1,0 +1,117 @@
+"""M0-103 acceptance: saved snapshots round-trip without network access and
+retain question, post, and tournament identity."""
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+from forecasting_tools.data_models.data_organizer import DataOrganizer
+from forecasting_tools.data_models.questions import (
+    BinaryQuestion,
+    MetaculusQuestion,
+    MultipleChoiceQuestion,
+    NumericQuestion,
+)
+
+from whiskeyjack_bot.metaculus.snapshots import (
+    SNAPSHOT_SCHEMA_VERSION,
+    SnapshotError,
+    load_snapshot,
+    save_snapshot,
+)
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+COMMITTED_SNAPSHOT = FIXTURES / "snapshots" / "minibench_sample_snapshot.json"
+
+
+def load_fixture_questions() -> list[MetaculusQuestion]:
+    posts = sorted((FIXTURES / "api_posts").glob("*_post.json"))
+    return [
+        DataOrganizer.get_question_from_post_json(json.loads(p.read_text(encoding="utf-8")))
+        for p in posts
+    ]
+
+
+def test_api_post_fixtures_parse_to_expected_types() -> None:
+    questions = load_fixture_questions()
+    types = {type(q) for q in questions}
+    assert types == {BinaryQuestion, MultipleChoiceQuestion, NumericQuestion}
+    for q in questions:
+        assert "minibench" in q.tournament_slugs
+        assert q.id_of_question is not None
+        assert q.id_of_post is not None
+
+
+def test_fixtures_contain_no_community_prediction() -> None:
+    for q in load_fixture_questions():
+        if isinstance(q, BinaryQuestion):
+            assert q.community_prediction_at_access_time is None
+
+
+def test_save_and_reload_round_trip(tmp_path: Path) -> None:
+    questions = load_fixture_questions()
+    path = tmp_path / "snap.json"
+    written_meta = save_snapshot(
+        path,
+        questions,
+        tournament_id="minibench",
+        group_question_mode="unpack_subquestions",
+        source="fixture",
+        fetched_at_utc=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    meta, reloaded = load_snapshot(path)
+    assert meta == written_meta
+    assert meta.tournament_id == "minibench"
+    assert [q.id_of_question for q in reloaded] == [q.id_of_question for q in questions]
+    assert [q.id_of_post for q in reloaded] == [q.id_of_post for q in questions]
+    assert [type(q) for q in reloaded] == [type(q) for q in questions]
+    # Full content identity, including the retained raw api_json payload.
+    assert [q.to_json() for q in reloaded] == [q.to_json() for q in questions]
+
+
+def test_committed_sample_snapshot_loads() -> None:
+    meta, questions = load_snapshot(COMMITTED_SNAPSHOT)
+    assert meta.tournament_id == "minibench"
+    assert meta.question_count == len(questions) == 3
+
+
+def test_unknown_schema_version_rejected(tmp_path: Path) -> None:
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    envelope["snapshot_schema_version"] = "999.0.0"
+    path = tmp_path / "bad_version.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(SnapshotError, match="schema version"):
+        load_snapshot(path)
+
+
+def test_unknown_question_class_rejected(tmp_path: Path) -> None:
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    envelope["questions"][0]["question_class"] = "TotallyMadeUpQuestion"
+    path = tmp_path / "bad_class.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(SnapshotError, match="TotallyMadeUpQuestion"):
+        load_snapshot(path)
+
+
+def test_count_mismatch_rejected(tmp_path: Path) -> None:
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    envelope["question_count"] = 7
+    path = tmp_path / "bad_count.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(SnapshotError, match="declares 7"):
+        load_snapshot(path)
+
+
+def test_missing_and_malformed_files_rejected(tmp_path: Path) -> None:
+    with pytest.raises(SnapshotError):
+        load_snapshot(tmp_path / "nope.json")
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json", encoding="utf-8")
+    with pytest.raises(SnapshotError):
+        load_snapshot(bad)
+
+
+def test_schema_version_constant_matches_committed_fixture() -> None:
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    assert envelope["snapshot_schema_version"] == SNAPSHOT_SCHEMA_VERSION

@@ -1,0 +1,32 @@
+{
+  "id": 90001,
+  "published_at": "2026-07-06T14:00:00Z",
+  "nr_forecasters": 12,
+  "forecasts_count": 34,
+  "projects": {
+    "tournament": [
+      {"slug": "minibench", "name": "MiniBench"}
+    ],
+    "default_project": {"id": 90900, "slug": "minibench", "name": "MiniBench"}
+  },
+  "question": {
+    "id": 91001,
+    "type": "binary",
+    "title": "[SYNTHETIC FIXTURE] Will the example agency publish its July data release before 2026-07-16?",
+    "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench binary question; never submitted anywhere.",
+    "resolution_criteria": "Resolves YES if the example agency publishes the July release on its website before 2026-07-16 23:59 UTC.",
+    "fine_print": "Publication time is taken from the agency's own release timestamp.",
+    "status": "open",
+    "open_time": "2026-07-06T14:00:00Z",
+    "scheduled_close_time": "2026-07-16T14:00:00Z",
+    "scheduled_resolve_time": "2026-07-17T14:00:00Z",
+    "cp_reveal_time": "2026-07-08T14:00:00Z",
+    "actual_resolve_time": null,
+    "resolution": null,
+    "include_bots_in_aggregates": true,
+    "question_weight": 1.0,
+    "label": null,
+    "unit": null,
+    "my_forecasts": {"history": null}
+  }
+}

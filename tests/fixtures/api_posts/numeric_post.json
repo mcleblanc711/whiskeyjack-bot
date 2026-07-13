@@ -1,0 +1,42 @@
+{
+  "id": 90002,
+  "published_at": "2026-07-06T14:00:00Z",
+  "nr_forecasters": 9,
+  "forecasts_count": 21,
+  "projects": {
+    "tournament": [
+      {"slug": "minibench", "name": "MiniBench"}
+    ],
+    "default_project": {"id": 90900, "slug": "minibench", "name": "MiniBench"}
+  },
+  "question": {
+    "id": 91002,
+    "type": "numeric",
+    "title": "[SYNTHETIC FIXTURE] What will the example index value be on 2026-07-15?",
+    "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench numeric question; never submitted anywhere.",
+    "resolution_criteria": "Resolves to the example index closing value on 2026-07-15 as published by the example source.",
+    "fine_print": "If no value is published that day, the question resolves to the next published value.",
+    "status": "open",
+    "open_time": "2026-07-06T14:00:00Z",
+    "scheduled_close_time": "2026-07-15T14:00:00Z",
+    "scheduled_resolve_time": "2026-07-16T14:00:00Z",
+    "cp_reveal_time": "2026-07-08T14:00:00Z",
+    "actual_resolve_time": null,
+    "resolution": null,
+    "include_bots_in_aggregates": true,
+    "question_weight": 1.0,
+    "label": null,
+    "unit": "points",
+    "open_upper_bound": true,
+    "open_lower_bound": false,
+    "scaling": {
+      "range_min": 0.0,
+      "range_max": 500.0,
+      "zero_point": null,
+      "inbound_outcome_count": 200,
+      "nominal_min": null,
+      "nominal_max": null
+    },
+    "my_forecasts": {"history": null}
+  }
+}
