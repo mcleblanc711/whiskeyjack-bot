@@ -1,0 +1,32 @@
+Decision ID,Decision,Status,Rationale,Alternatives Considered,Revisit Trigger
+D01,Build an attribution instrument that can also compete.,Locked,Primary value is learning where forecast edge comes from; tournament supplies external feedback.,Tournament-only bot,Never unless project objective changes.
+D02,Use MiniBench/current successor as initial venue.,Locked,Fast feedback and manageable question windows.,Seasonal-only; prediction markets,MiniBench unavailable or technically incompatible.
+D03,Use forecasting-tools wherever it supports the workflow.,Locked,Maintained API/question/CDF glue lowers integration risk.,Raw Metaculus API client,Package blocks attribution or safe submission.
+D04,Freeze attribution schema before first submission.,Locked,Prevents missing pre-resolution data and hindsight contamination.,Add schema after first run,Never for v1.
+D05,Use one strong forecaster model plus retrieval in v1.,Locked,Creates an interpretable baseline.,Model ensemble; Council,After reliable baseline and enough paired questions.
+D06,Do not build the nine-agent Council in v1.,Locked,Complexity would obscure attribution and delay first submission.,Full Council,Milestone 5 complete.
+D07,Reserve multi-agent forecasting for a later A/B test.,Locked,Paired identical questions can measure incremental value.,Immediate multi-agent pipeline,Reliable single-agent baseline exists.
+D08,Do not build continuous Market Pulse updates in v1.,Locked,Different operational problem and cadence.,Always-on updater,Separate post-baseline project.
+D09,Do not integrate PaperPolyMkt.,Locked,Unrelated to first venue and attribution milestone.,Shared trading layer,Explicit new project scope.
+D10,Do not architect around local inference.,Locked,"Local machine is for orchestration/storage, not competitive inference.",Local model default,Hardware/model economics materially change.
+D11,"Keep model, retrieval, tournament and calibration configurable.",Locked,All are moving external dependencies.,Hard-coded current choices,Never.
+D12,Keep human review before initial submissions.,Locked,Protects live venue and supports learning/debugging.,Autonomous submit,After audited safe batch history and explicit owner decision.
+D13,Prefer a small observable pipeline.,Locked,Fastest route to a trustworthy end-to-end record.,Agent framework/workflow platform,Measured scale requires it.
+D14,Public repository under mcleblanc711.,Locked,Project is intended as a reusable public learning artifact.,Private-only repo,Secrets/licensing issue makes public release unsafe.
+D15,ChatGPT Work researches/specifies; Claude Code may implement; Codex reviews; owner merges.,Locked,Clear division of labour and human merge authority.,Single-tool autonomous merge,Owner changes workflow.
+D16,Use SQLite as v1 source of truth.,Decided,"Transactions, uniqueness and local querying beat JSONL for lifecycle/version data without adding infrastructure.",JSONL primary; Parquet primary,SQLite becomes an operational bottleneck.
+D17,Use AskNews as primary retrieval.,Decided,"News-specialized, article timestamps/citations, package integration and FutureEval precedent.",Exa; Tavily; provider swarm,Pilot shows poor coverage/cost or credentials unavailable.
+D18,Use Exa as one fallback.,Decided,"Package familiarity, broad web/official-source retrieval and simple pricing.",Tavily; Perplexity,Fallback quality or availability fails pilot.
+D19,Bypass general retrieval for authoritative structured sources.,Decided,Direct data reduces transcription errors and improves reproducibility.,Route everything through AskNews/Exa,Source has no stable API/file access.
+D20,"Support binary, multiple-choice and numeric in v1.",Decided,Covers verified active types and foreseeable current venue formats.,Binary-only; every package type,Authenticated fetch proves a required unsupported type.
+D21,Defer date and conditional questions.,Decided,Not required by current Summer template and adds validation complexity.,Implement all package types,MiniBench/current successor requires them.
+D22,Log community prediction after forecasting; do not use it as v1 model input.,Decided,Preserves an independent baseline while enabling later comparison.,Give CP to model; omit CP entirely,Explicit experiment tests CP-assisted forecasting.
+D23,Make submission a separate approved command with idempotency.,Decided,Clear safety boundary and duplicate-post protection.,Auto-submit at end of run,Only after explicit safe-autonomy review.
+D24,"Store concise rationale summaries, not hidden chain-of-thought.",Decided,"Attribution needs auditable factors, not unrestricted internal traces.",Persist full model deliberation,Never without a specific compliant research need.
+D25,Append forecast versions and lifecycle events; never overwrite history.,Decided,Resolution analysis requires exact pre-resolution state.,Mutable current record,Never.
+D26,Pin forecasting-tools 0.2.92 for v1.,Decided,Verified current interface; beta package can change.,Unpinned latest,Reviewed upgrade passes contract tests.
+D27,Require explicit model name; provide no silent model default.,Decided,Provider availability and frontier rankings move faster than code.,Hard-code current leaderboard winner,Owner deliberately pins a stable default.
+D28,Use package post methods plus refetch verification first; spike exact response capture.,Decided,Uses maintained path while addressing receipt gap with a narrow seam.,Private method; raw API from day one,Refetch cannot establish submission outcome.
+D29,Treat JSONL/Parquet as derived exports.,Decided,Supports audit and polygraph analysis without multiple sources of truth.,Parallel primary stores,External consumer requires another canonical format.
+D30,Ingest platform numeric scores before implementing a local replica.,Decided,Avoids mislabelling a proxy metric as Metaculus continuous log score.,Custom numeric scoring immediately,Official formula/API is fully verified and tested.
+D31,Keep current tournament IDs in config and verify SDK aliases at runtime.,Decided,MiniBench slug rotates semantically even when string stays stable; seasonal numeric ID changes.,Hard-code constants in modules,Never.

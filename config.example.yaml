@@ -42,6 +42,19 @@ retrieval:
     - "canonical_url"
     - "content_sha256"
   structured_sources_enabled: true
+  social:
+    provider: "xai_x_search"
+    enabled: false               # off until XAI_API_KEY exists and pricing verified (A-1106)
+    api_key_env: "XAI_API_KEY"
+    # Verify current Grok model name at docs.x.ai; per D27, no silent default.
+    agent_model: "REPLACE_WITH_VERIFIED_GROK_MODEL_NAME"
+    temperature: 0.0
+    timeout_seconds: 60
+    account_allowlist_path: "config/x_accounts.yaml"
+    allow_open_search: true
+    max_agent_calls_per_question: 2
+    max_posts_per_call: 25
+    est_cost_per_tool_call_usd: 0.005   # x_search listed ~USD 5/1k calls; verify at docs.x.ai
 
 forecast:
   supported_question_types:
@@ -76,7 +89,7 @@ submission:
   block_retry_on_uncertain_result: true
 
 storage:
-  sqlite_path: "data/minibench_bot.sqlite3"
+  sqlite_path: "data/whiskeyjack_bot.sqlite3"
   artifact_root: "data/artifacts"
   export_root: "data/exports"
   sqlite_wal: true
@@ -86,7 +99,7 @@ storage:
 logging:
   level: "INFO"
   format: "json"
-  file: "data/logs/minibench_bot.jsonl"
+  file: "data/logs/whiskeyjack_bot.jsonl"
   redact_secrets: true
   include_provider_costs: true
 
