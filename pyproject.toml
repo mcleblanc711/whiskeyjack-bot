@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whiskeyjack-bot"
+version = "0.1.0"
+description = "Metaculus MiniBench forecasting pipeline built as an attribution instrument: an immutable, replayable record of every forecast, its evidence, and its outcome."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Chris LeBlanc" }]
+requires-python = ">=3.11,<4.0"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/mcleblanc711/whiskeyjack-bot"
+
+[project.scripts]
+whiskeyjack-bot = "whiskeyjack_bot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whiskeyjack_bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["whiskeyjack_bot"]
+mypy_path = "src"
