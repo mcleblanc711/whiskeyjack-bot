@@ -1,0 +1,18 @@
+Risk ID,Risk,Probability,Impact,Mitigation,Detection Signal,Owner,Status
+R-001,MiniBench-specific eligibility or payout rule is missed.,Medium,High,Owner verifies current rules before live batch and records deadlines.,Conflicting rule text; missing eligibility badge/payout step.,Chris,Open
+R-002,Active question count/type mix differs from public page assumptions.,High,Medium,Authenticated fetch drives runtime scope; unsupported types fail closed.,Fetched type not in supported set; eligible count differs from 59.,Claude Code,Open
+R-003,forecasting-tools beta update breaks interfaces or CDF behavior.,Medium,High,Pin 0.2.92 and run package contract tests before upgrades.,Dependency drift; CDF golden test failure.,Codex,Mitigated
+R-004,"Submission times out after server accepted it, causing duplicate retry risk.",Medium,Critical,"Idempotency key, block blind retry, refetch forecast history before retry.",Timeout/no receipt; refetch shows new forecast or remains ambiguous.,Claude Code,Open
+R-005,Public SDK cannot provide complete response receipt.,High,High,Submission seam; record payload/exception/refetch; spike narrow response-capturing adapter.,SDK returns None on successful post.,Codex,Open
+R-006,AskNews credentials/cost make primary retrieval unavailable.,Medium,Medium,Exa fallback; cost caps; raw replay cache.,verify-env failure; 401/402/429; cost limit reached.,Chris,Open
+R-007,Retrieval provides duplicated or stale evidence.,High,High,"Canonical URL/content hashes, publication timestamps and freshness flags.",Repeated content hashes; documents outside cutoff.,Claude Code,Open
+R-008,Model output passes JSON parsing but violates forecast semantics.,Medium,High,Strict Pydantic plus question-aware validators and one repair attempt.,Option mismatch; probability sum; unordered percentiles.,Claude Code,Open
+R-009,Community prediction anchors the independent baseline.,Medium,Medium,Exclude CP from prompt; snapshot only after forecast generation.,Research packet contains CP; model rationale cites community.,Codex,Mitigated
+R-010,Attribution record contains hidden chain-of-thought or sensitive data.,Medium,High,Persist concise structured rationale; redact secrets; public-data review.,Long unrestricted reasoning; token/key pattern scan hit.,Codex,Open
+R-011,SQLite/exports diverge.,Low,Medium,SQLite only source of truth; deterministic exports with counts/hashes.,Record count or hash mismatch.,Claude Code,Mitigated
+R-012,Numeric local score is incorrectly presented as Metaculus score.,Medium,High,Ingest platform score first; label any proxy explicitly.,Metric lacks source/implementation version.,Codex,Mitigated
+R-013,Provider model name is invalid or silently routes to a different model.,Medium,High,Require explicit LiteLLM name; record returned model identifier; smoke test.,Provider response model differs; 404/unsupported parameter.,Chris,Open
+R-014,Human approval applies to a stale forecast after content changes.,Medium,Critical,Approval binds exact forecast/payload hash and expires on version change.,Current hash differs from approval event.,Claude Code,Mitigated
+R-015,Public repository leaks tokens or raw private data.,Low,Critical,"Env-only secrets, ignore generated data, secret scanning and review gate.",Secret scanner alert; key-like string in git diff.,Chris + Codex,Open
+R-016,Limited Google Trends alpha access becomes a hidden dependency.,Low,Medium,Keep Trends optional and disabled by default.,Run fails without Trends credentials.,Claude Code,Mitigated
+R-017,Model/retrieval spend scales unexpectedly across 59 questions.,Medium,High,"Start limit=1, per-run USD cap, sequential processing and replay cache.",Cost manager approaches cap; concurrent calls exceed plan.,Chris,Open
