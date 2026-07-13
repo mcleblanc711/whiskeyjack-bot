@@ -1,0 +1,278 @@
+{
+  "fetched_at_utc": "2026-07-10T12:00:00+00:00",
+  "group_question_mode": "unpack_subquestions",
+  "question_count": 3,
+  "questions": [
+    {
+      "data": {
+        "actual_resolution_time": null,
+        "already_forecasted": false,
+        "api_json": {
+          "forecasts_count": 34,
+          "id": 90001,
+          "nr_forecasters": 12,
+          "projects": {
+            "default_project": {
+              "id": 90900,
+              "name": "MiniBench",
+              "slug": "minibench"
+            },
+            "tournament": [
+              {
+                "name": "MiniBench",
+                "slug": "minibench"
+              }
+            ]
+          },
+          "published_at": "2026-07-06T14:00:00Z",
+          "question": {
+            "actual_resolve_time": null,
+            "cp_reveal_time": "2026-07-08T14:00:00Z",
+            "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench binary question; never submitted anywhere.",
+            "fine_print": "Publication time is taken from the agency's own release timestamp.",
+            "id": 91001,
+            "include_bots_in_aggregates": true,
+            "label": null,
+            "my_forecasts": {
+              "history": null
+            },
+            "open_time": "2026-07-06T14:00:00Z",
+            "question_weight": 1.0,
+            "resolution": null,
+            "resolution_criteria": "Resolves YES if the example agency publishes the July release on its website before 2026-07-16 23:59 UTC.",
+            "scheduled_close_time": "2026-07-16T14:00:00Z",
+            "scheduled_resolve_time": "2026-07-17T14:00:00Z",
+            "status": "open",
+            "title": "[SYNTHETIC FIXTURE] Will the example agency publish its July data release before 2026-07-16?",
+            "type": "binary",
+            "unit": null
+          }
+        },
+        "background_info": "Synthetic fixture question for offline tests. Shaped like a MiniBench binary question; never submitted anywhere.",
+        "categories": [],
+        "close_time": "2026-07-16T14:00:00Z",
+        "community_prediction_at_access_time": null,
+        "conditional_type": null,
+        "cp_reveal_time": "2026-07-08T14:00:00Z",
+        "custom_metadata": {},
+        "date_accessed": "2026-07-13T12:56:40.290787-06:00",
+        "default_project_id": 90900,
+        "fine_print": "Publication time is taken from the agency's own release timestamp.",
+        "group_question_option": null,
+        "id_of_post": 90001,
+        "id_of_question": 91001,
+        "includes_bots_in_aggregates": true,
+        "num_forecasters": 12,
+        "num_predictions": 34,
+        "open_time": "2026-07-06T14:00:00Z",
+        "page_url": "https://www.metaculus.com/questions/90001",
+        "previous_forecasts": null,
+        "published_time": "2026-07-06T14:00:00Z",
+        "question_ids_of_group": null,
+        "question_text": "[SYNTHETIC FIXTURE] Will the example agency publish its July data release before 2026-07-16?",
+        "question_type": "binary",
+        "question_weight": 1.0,
+        "resolution_criteria": "Resolves YES if the example agency publishes the July release on its website before 2026-07-16 23:59 UTC.",
+        "resolution_string": null,
+        "scheduled_resolution_time": "2026-07-17T14:00:00Z",
+        "state": "open",
+        "tournament_slugs": [
+          "minibench"
+        ],
+        "unit_of_measure": null
+      },
+      "question_class": "BinaryQuestion"
+    },
+    {
+      "data": {
+        "actual_resolution_time": null,
+        "already_forecasted": false,
+        "api_json": {
+          "forecasts_count": 15,
+          "id": 90003,
+          "nr_forecasters": 7,
+          "projects": {
+            "default_project": {
+              "id": 90900,
+              "name": "MiniBench",
+              "slug": "minibench"
+            },
+            "tournament": [
+              {
+                "name": "MiniBench",
+                "slug": "minibench"
+              }
+            ]
+          },
+          "published_at": "2026-07-06T14:00:00Z",
+          "question": {
+            "actual_resolve_time": null,
+            "cp_reveal_time": "2026-07-08T14:00:00Z",
+            "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench multiple-choice question; never submitted anywhere.",
+            "fine_print": "If the statement is delayed past 2026-07-20, resolves Other.",
+            "group_variable": "option",
+            "id": 91003,
+            "include_bots_in_aggregates": true,
+            "label": null,
+            "my_forecasts": {
+              "history": null
+            },
+            "open_time": "2026-07-06T14:00:00Z",
+            "options": [
+              "Option Alpha",
+              "Option Beta",
+              "Other"
+            ],
+            "question_weight": 1.0,
+            "resolution": null,
+            "resolution_criteria": "Resolves to the option announced in the committee's official July statement.",
+            "scheduled_close_time": "2026-07-17T14:00:00Z",
+            "scheduled_resolve_time": "2026-07-20T14:00:00Z",
+            "status": "open",
+            "title": "[SYNTHETIC FIXTURE] Which example option will the example committee choose at its July meeting?",
+            "type": "multiple_choice",
+            "unit": null
+          }
+        },
+        "background_info": "Synthetic fixture question for offline tests. Shaped like a MiniBench multiple-choice question; never submitted anywhere.",
+        "categories": [],
+        "close_time": "2026-07-17T14:00:00Z",
+        "conditional_type": null,
+        "cp_reveal_time": "2026-07-08T14:00:00Z",
+        "custom_metadata": {},
+        "date_accessed": "2026-07-13T12:56:40.291206-06:00",
+        "default_project_id": 90900,
+        "fine_print": "If the statement is delayed past 2026-07-20, resolves Other.",
+        "group_question_option": null,
+        "id_of_post": 90003,
+        "id_of_question": 91003,
+        "includes_bots_in_aggregates": true,
+        "num_forecasters": 7,
+        "num_predictions": 15,
+        "open_time": "2026-07-06T14:00:00Z",
+        "option_is_instance_of": "option",
+        "options": [
+          "Option Alpha",
+          "Option Beta",
+          "Other"
+        ],
+        "page_url": "https://www.metaculus.com/questions/90003",
+        "previous_forecasts": null,
+        "published_time": "2026-07-06T14:00:00Z",
+        "question_ids_of_group": null,
+        "question_text": "[SYNTHETIC FIXTURE] Which example option will the example committee choose at its July meeting?",
+        "question_type": "multiple_choice",
+        "question_weight": 1.0,
+        "resolution_criteria": "Resolves to the option announced in the committee's official July statement.",
+        "resolution_string": null,
+        "scheduled_resolution_time": "2026-07-20T14:00:00Z",
+        "state": "open",
+        "tournament_slugs": [
+          "minibench"
+        ],
+        "unit_of_measure": null
+      },
+      "question_class": "MultipleChoiceQuestion"
+    },
+    {
+      "data": {
+        "actual_resolution_time": null,
+        "already_forecasted": false,
+        "api_json": {
+          "forecasts_count": 21,
+          "id": 90002,
+          "nr_forecasters": 9,
+          "projects": {
+            "default_project": {
+              "id": 90900,
+              "name": "MiniBench",
+              "slug": "minibench"
+            },
+            "tournament": [
+              {
+                "name": "MiniBench",
+                "slug": "minibench"
+              }
+            ]
+          },
+          "published_at": "2026-07-06T14:00:00Z",
+          "question": {
+            "actual_resolve_time": null,
+            "cp_reveal_time": "2026-07-08T14:00:00Z",
+            "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench numeric question; never submitted anywhere.",
+            "fine_print": "If no value is published that day, the question resolves to the next published value.",
+            "id": 91002,
+            "include_bots_in_aggregates": true,
+            "label": null,
+            "my_forecasts": {
+              "history": null
+            },
+            "open_lower_bound": false,
+            "open_time": "2026-07-06T14:00:00Z",
+            "open_upper_bound": true,
+            "question_weight": 1.0,
+            "resolution": null,
+            "resolution_criteria": "Resolves to the example index closing value on 2026-07-15 as published by the example source.",
+            "scaling": {
+              "inbound_outcome_count": 200,
+              "nominal_max": null,
+              "nominal_min": null,
+              "range_max": 500.0,
+              "range_min": 0.0,
+              "zero_point": null
+            },
+            "scheduled_close_time": "2026-07-15T14:00:00Z",
+            "scheduled_resolve_time": "2026-07-16T14:00:00Z",
+            "status": "open",
+            "title": "[SYNTHETIC FIXTURE] What will the example index value be on 2026-07-15?",
+            "type": "numeric",
+            "unit": "points"
+          }
+        },
+        "background_info": "Synthetic fixture question for offline tests. Shaped like a MiniBench numeric question; never submitted anywhere.",
+        "categories": [],
+        "cdf_size": 201,
+        "close_time": "2026-07-15T14:00:00Z",
+        "conditional_type": null,
+        "cp_reveal_time": "2026-07-08T14:00:00Z",
+        "custom_metadata": {},
+        "date_accessed": "2026-07-13T12:56:40.291614-06:00",
+        "default_project_id": 90900,
+        "fine_print": "If no value is published that day, the question resolves to the next published value.",
+        "group_question_option": null,
+        "id_of_post": 90002,
+        "id_of_question": 91002,
+        "includes_bots_in_aggregates": true,
+        "lower_bound": 0.0,
+        "nominal_lower_bound": null,
+        "nominal_upper_bound": null,
+        "num_forecasters": 9,
+        "num_predictions": 21,
+        "open_lower_bound": false,
+        "open_time": "2026-07-06T14:00:00Z",
+        "open_upper_bound": true,
+        "page_url": "https://www.metaculus.com/questions/90002",
+        "previous_forecasts": null,
+        "published_time": "2026-07-06T14:00:00Z",
+        "question_ids_of_group": null,
+        "question_text": "[SYNTHETIC FIXTURE] What will the example index value be on 2026-07-15?",
+        "question_type": "numeric",
+        "question_weight": 1.0,
+        "resolution_criteria": "Resolves to the example index closing value on 2026-07-15 as published by the example source.",
+        "resolution_string": null,
+        "scheduled_resolution_time": "2026-07-16T14:00:00Z",
+        "state": "open",
+        "tournament_slugs": [
+          "minibench"
+        ],
+        "unit_of_measure": "points",
+        "upper_bound": 500.0,
+        "zero_point": null
+      },
+      "question_class": "NumericQuestion"
+    }
+  ],
+  "snapshot_schema_version": "1.0.0",
+  "source": "fixture",
+  "tournament_id": "minibench"
+}

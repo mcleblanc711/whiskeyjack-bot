@@ -1,0 +1,34 @@
+{
+  "id": 90003,
+  "published_at": "2026-07-06T14:00:00Z",
+  "nr_forecasters": 7,
+  "forecasts_count": 15,
+  "projects": {
+    "tournament": [
+      {"slug": "minibench", "name": "MiniBench"}
+    ],
+    "default_project": {"id": 90900, "slug": "minibench", "name": "MiniBench"}
+  },
+  "question": {
+    "id": 91003,
+    "type": "multiple_choice",
+    "title": "[SYNTHETIC FIXTURE] Which example option will the example committee choose at its July meeting?",
+    "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench multiple-choice question; never submitted anywhere.",
+    "resolution_criteria": "Resolves to the option announced in the committee's official July statement.",
+    "fine_print": "If the statement is delayed past 2026-07-20, resolves Other.",
+    "status": "open",
+    "open_time": "2026-07-06T14:00:00Z",
+    "scheduled_close_time": "2026-07-17T14:00:00Z",
+    "scheduled_resolve_time": "2026-07-20T14:00:00Z",
+    "cp_reveal_time": "2026-07-08T14:00:00Z",
+    "actual_resolve_time": null,
+    "resolution": null,
+    "include_bots_in_aggregates": true,
+    "question_weight": 1.0,
+    "label": null,
+    "unit": null,
+    "options": ["Option Alpha", "Option Beta", "Other"],
+    "group_variable": "option",
+    "my_forecasts": {"history": null}
+  }
+}
