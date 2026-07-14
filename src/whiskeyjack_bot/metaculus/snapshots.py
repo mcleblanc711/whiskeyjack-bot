@@ -67,9 +67,7 @@ def save_snapshot(
         "fetched_at_utc": meta.fetched_at_utc.isoformat(),
         "source": meta.source,
         "question_count": meta.question_count,
-        "questions": [
-            {"question_class": type(q).__name__, "data": q.to_json()} for q in questions
-        ],
+        "questions": [{"question_class": type(q).__name__, "data": q.to_json()} for q in questions],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

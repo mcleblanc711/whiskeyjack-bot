@@ -103,9 +103,7 @@ def test_cli_questions_fetch_fixture_mode(capsys: pytest.CaptureFixture[str]) ->
     assert "placeholder" in captured.out
 
 
-def test_cli_fixture_mode_end_to_end(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_cli_fixture_mode_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
     data["model"]["name"] = "openrouter/test-model"
     data["logging"]["file"] = str(tmp_path / "logs" / "bot.jsonl")
@@ -186,9 +184,7 @@ def test_live_mode_plumbs_tournament_and_group_mode(
         seen["group_question_mode"] = group_question_mode
         return []
 
-    monkeypatch.setattr(
-        MetaculusClient, "get_all_open_questions_from_tournament", fake_get
-    )
+    monkeypatch.setattr(MetaculusClient, "get_all_open_questions_from_tournament", fake_get)
     config = make_config(tmp_path)
     resolved, questions = fetch_open_questions_live(config, override="bot-testing-area")
     assert questions == []

@@ -36,9 +36,7 @@ def test_missing_token_raises_named_error_without_network(
     assert excinfo.value.env_var_name == "METACULUS_TOKEN"
 
 
-def test_empty_token_counts_as_missing(
-    config: AppConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_empty_token_counts_as_missing(config: AppConfig, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("METACULUS_TOKEN", "")
     with pytest.raises(MissingCredentialError):
         build_client(config)
@@ -54,9 +52,7 @@ def test_client_config_plumb_through(config: AppConfig, monkeypatch: pytest.Monk
     assert client.token == FAKE_TOKEN
 
 
-def test_token_absent_from_repr_and_str(
-    config: AppConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_token_absent_from_repr_and_str(config: AppConfig, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("METACULUS_TOKEN", FAKE_TOKEN)
     client = build_client(config)
     assert FAKE_TOKEN not in repr(client)
@@ -95,9 +91,7 @@ def test_filter_redacts_token_value_in_message(monkeypatch: pytest.MonkeyPatch) 
 
 def test_filter_redacts_interpolated_args(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("METACULUS_TOKEN", FAKE_TOKEN)
-    record = logging.LogRecord(
-        "any", logging.INFO, __file__, 1, "token is %s", (FAKE_TOKEN,), None
-    )
+    record = logging.LogRecord("any", logging.INFO, __file__, 1, "token is %s", (FAKE_TOKEN,), None)
     SecretRedactionFilter(["METACULUS_TOKEN"]).filter(record)
     assert FAKE_TOKEN not in record.getMessage()
 

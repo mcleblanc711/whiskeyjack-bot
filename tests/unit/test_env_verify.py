@@ -79,9 +79,7 @@ def test_secret_values_never_appear_in_output(
         assert value not in captured.err
 
 
-def test_empty_string_counts_as_missing(
-    config_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_empty_string_counts_as_missing(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     set_all_env(monkeypatch)
     monkeypatch.setenv("METACULUS_TOKEN", "")
     report = verify_environment(config_file)
