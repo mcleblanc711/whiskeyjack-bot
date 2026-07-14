@@ -320,7 +320,10 @@ def validate_config_data(data: Any) -> AppConfig:
     try:
         return AppConfig.model_validate(data)
     except ValidationError as exc:
-        raise _sanitize_validation_error(exc) from exc
+        # from None: a chained __cause__ would re-expose the raw ValidationError
+        # (which echoes input values) whenever the ConfigError itself reaches a
+        # traceback renderer.
+        raise _sanitize_validation_error(exc) from None
 
 
 def load_config(path: Path | str) -> AppConfig:
@@ -332,8 +335,25 @@ def load_config(path: Path | str) -> AppConfig:
         raise ConfigError([f"cannot read config file {path}: {exc.strerror or exc}"]) from exc
     try:
         data: Any = yaml.safe_load(raw_text)
-    except yaml.YAMLError as exc:
-        raise ConfigError([f"config file {path} is not valid YAML: {exc}"]) from exc
+    except yaml.MarkedYAMLError as exc:
+        # PyYAML's message embeds a snippet of the offending source line, so a
+        # credential pasted into the file would be echoed back. Report the
+        # position only, and suppress the cause chain for the same reason.
+        mark = exc.problem_mark or exc.context_mark
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ConfigError(
+            [
+                f"config file {path} is not valid YAML{where} "
+                "(parser detail withheld: it can echo file contents)"
+            ]
+        ) from None
+    except yaml.YAMLError:
+        raise ConfigError(
+            [
+                f"config file {path} is not valid YAML "
+                "(parser detail withheld: it can echo file contents)"
+            ]
+        ) from None
     if not isinstance(data, dict):
         raise ConfigError([f"config file {path} must contain a YAML mapping at the top level"])
     return validate_config_data(data)

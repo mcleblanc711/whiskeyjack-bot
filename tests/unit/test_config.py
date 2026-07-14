@@ -3,6 +3,7 @@ replaced; invalid live-submit combinations and unknown keys are rejected; no
 input value ever leaks into a rendered configuration error."""
 
 import copy
+import traceback
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,25 @@ def test_pasted_secret_value_never_appears_in_error(valid_data: dict) -> None:
     message = str(excinfo.value)
     assert fake_secret not in message
     assert "environment variable" in message
+    # The full traceback rendering must also be clean: a chained __cause__
+    # would reprint pydantic's error, input values included.
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert fake_secret not in rendered
+
+
+def test_malformed_yaml_error_withholds_file_content(tmp_path: Path) -> None:
+    # Cross-review finding 2: PyYAML's message quotes the offending source
+    # line, so a pasted credential next to a syntax error would be echoed.
+    fake_secret = "sk-or-v1-0123456789abcdef-FAKE"
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(f'model:\n  api_key_env: "{fake_secret}\n', encoding="utf-8")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(bad)
+    message = str(excinfo.value)
+    assert "is not valid YAML" in message
+    assert "line" in message  # position survives so the file is still debuggable
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert fake_secret not in rendered
 
 
 def test_yaml_and_missing_file_errors_are_config_errors(tmp_path: Path) -> None:
