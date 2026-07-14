@@ -2,6 +2,7 @@
 retain question, post, and tournament identity."""
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -100,6 +101,47 @@ def test_count_mismatch_rejected(tmp_path: Path) -> None:
     path = tmp_path / "bad_count.json"
     path.write_text(json.dumps(envelope), encoding="utf-8")
     with pytest.raises(SnapshotError, match="declares 7"):
+        load_snapshot(path)
+
+
+@pytest.mark.parametrize(
+    ("description", "mutate", "match"),
+    [
+        ("questions not a list", lambda e: e.update(questions="not-a-list"), "in a list"),
+        ("entry not an object", lambda e: e.update(questions=["not-a-dict"]), "JSON object"),
+        (
+            "entry missing question_class",
+            lambda e: e["questions"][0].pop("question_class"),
+            "missing question_class",
+        ),
+        (
+            "entry missing data",
+            lambda e: e["questions"][0].pop("data"),
+            "missing its data payload",
+        ),
+        (
+            "entry data does not deserialize",
+            lambda e: e["questions"][0].update(data={"nonsense": True}),
+            "does not deserialize",
+        ),
+        ("missing metadata key", lambda e: e.pop("tournament_id"), "missing metadata"),
+        (
+            "bad timestamp",
+            lambda e: e.update(fetched_at_utc="not-a-timestamp"),
+            "invalid fetched_at_utc",
+        ),
+    ],
+)
+def test_malformed_snapshot_shapes_raise_snapshot_error(
+    tmp_path: Path, description: str, mutate: Callable[[dict], object], match: str
+) -> None:
+    # Cross-review finding 5: each of these shapes previously escaped as a raw
+    # AttributeError / KeyError / ValueError; the CLI only handles SnapshotError.
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    mutate(envelope)
+    path = tmp_path / "malformed.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(SnapshotError, match=match):
         load_snapshot(path)
 
 
