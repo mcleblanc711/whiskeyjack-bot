@@ -147,6 +147,24 @@ def test_probability_bounds_must_be_ordered(valid_data: dict) -> None:
     expect_rejection(valid_data, "min_probability")
 
 
+def test_probability_bounds_clamped_to_spec_range(valid_data: dict) -> None:
+    # Spec: 0.001 <= min < max <= 0.999. Cross-review finding 4: values like
+    # 0.0001/0.9999 validated under the looser 0 < p < 1 reading.
+    valid_data["forecast"]["min_probability"] = 0.0001
+    expect_rejection(valid_data, "min_probability")
+    valid_data["forecast"]["min_probability"] = 0.001
+    valid_data["forecast"]["max_probability"] = 0.9999
+    expect_rejection(valid_data, "max_probability")
+
+
+def test_probability_bounds_accept_exact_spec_boundaries(valid_data: dict) -> None:
+    valid_data["forecast"]["min_probability"] = 0.001
+    valid_data["forecast"]["max_probability"] = 0.999
+    config = validate_config_data(valid_data)
+    assert config.forecast.min_probability == 0.001
+    assert config.forecast.max_probability == 0.999
+
+
 def test_cdf_points_other_than_201_rejected(valid_data: dict) -> None:
     valid_data["numeric_calibration"]["expected_cdf_points"] = 200
     expect_rejection(valid_data, "numeric_calibration.expected_cdf_points")

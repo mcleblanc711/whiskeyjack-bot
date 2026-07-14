@@ -162,8 +162,9 @@ class RetrievalConfig(_StrictModel):
 
 class ForecastConfig(_StrictModel):
     supported_question_types: list[SupportedQuestionType] = Field(min_length=1)
-    min_probability: float = Field(0.001, gt=0, lt=1)
-    max_probability: float = Field(0.999, gt=0, lt=1)
+    # Spec (CODEX_HANDOFF.md § Configuration schema): 0.001 <= min < max <= 0.999.
+    min_probability: float = Field(0.001, ge=0.001, le=0.999)
+    max_probability: float = Field(0.999, ge=0.001, le=0.999)
     # D22: the only legal v1 policy. Community prediction is never a forecaster
     # input; changing this requires a code change, deliberately.
     community_prediction_policy: Literal["log_after_forecast_do_not_use_as_input"]
