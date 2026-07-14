@@ -3,6 +3,7 @@ questions; the tournament alias can be overridden without code changes; the
 SDK alias is checked but never silently adopted (D31)."""
 
 import copy
+import json
 import logging
 from pathlib import Path
 
@@ -120,6 +121,31 @@ def test_cli_fixture_mode_end_to_end(
     assert "[binary]" in captured.out
     assert "[numeric]" in captured.out
     assert "[multiple_choice]" in captured.out
+
+
+def test_cli_reports_malformed_snapshot_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Cross-review finding 5: a malformed snapshot must exit 2 through the
+    # SnapshotError path, not escape the CLI as a raw traceback.
+    data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    data["model"]["name"] = "openrouter/test-model"
+    data["logging"]["file"] = str(tmp_path / "logs" / "bot.jsonl")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    del snapshot["questions"][0]["data"]
+    bad_snapshot = tmp_path / "malformed_snapshot.json"
+    bad_snapshot.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    exit_code = main(
+        ["questions", "fetch", "--config", str(config_path), "--snapshot", str(bad_snapshot)]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "missing its data payload" in captured.out
+    assert "Traceback" not in captured.out
 
 
 def test_cli_fixture_mode_requires_snapshot_path(

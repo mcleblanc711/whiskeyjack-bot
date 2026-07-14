@@ -100,16 +100,31 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
             f"this build reads {SNAPSHOT_SCHEMA_VERSION!r}"
         )
 
+    entries = envelope.get("questions")
+    if not isinstance(entries, list):
+        raise SnapshotError(f"snapshot {path} must hold its questions in a list")
+
     registry = _question_class_registry()
     questions: list[MetaculusQuestion] = []
-    for i, entry in enumerate(envelope.get("questions", [])):
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise SnapshotError(f"snapshot {path} entry {i} must be a JSON object")
         class_name = entry.get("question_class")
+        if not isinstance(class_name, str):
+            raise SnapshotError(f"snapshot {path} entry {i} is missing question_class")
         question_cls = registry.get(class_name)
         if question_cls is None:
             raise SnapshotError(
                 f"snapshot {path} entry {i} has unknown question_class {class_name!r}"
             )
-        questions.append(question_cls.from_json(entry["data"]))
+        if "data" not in entry:
+            raise SnapshotError(f"snapshot {path} entry {i} is missing its data payload")
+        try:
+            questions.append(question_cls.from_json(entry["data"]))
+        except Exception as exc:  # noqa: BLE001 - pinned models raise several shapes
+            raise SnapshotError(
+                f"snapshot {path} entry {i} does not deserialize as {class_name}: {exc}"
+            ) from exc
 
     declared = envelope.get("question_count")
     if declared != len(questions):
@@ -117,10 +132,22 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
             f"snapshot {path} declares {declared} questions but contains {len(questions)}"
         )
 
+    missing = [
+        key
+        for key in ("tournament_id", "group_question_mode", "fetched_at_utc", "source")
+        if key not in envelope
+    ]
+    if missing:
+        raise SnapshotError(f"snapshot {path} is missing metadata: {', '.join(missing)}")
+    try:
+        fetched_at = datetime.fromisoformat(envelope["fetched_at_utc"])
+    except (TypeError, ValueError) as exc:
+        raise SnapshotError(f"snapshot {path} has an invalid fetched_at_utc timestamp") from exc
+
     meta = SnapshotMeta(
         tournament_id=envelope["tournament_id"],
         group_question_mode=envelope["group_question_mode"],
-        fetched_at_utc=datetime.fromisoformat(envelope["fetched_at_utc"]),
+        fetched_at_utc=fetched_at,
         source=envelope["source"],
         question_count=len(questions),
     )
