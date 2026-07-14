@@ -53,9 +53,7 @@ def test_example_config_is_rejected_while_placeholder_present(
     assert "placeholder" in str(excinfo.value)
 
 
-def test_example_config_loads_after_placeholder_replaced(
-    tmp_path: Path, valid_data: dict
-) -> None:
+def test_example_config_loads_after_placeholder_replaced(tmp_path: Path, valid_data: dict) -> None:
     config = load_config(write_config(tmp_path, valid_data))
     assert config.metaculus.tournament.id == "minibench"
     assert config.metaculus.group_question_mode == "unpack_subquestions"

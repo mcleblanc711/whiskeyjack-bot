@@ -85,9 +85,7 @@ def fetch_open_questions_live(
     questions = client.get_all_open_questions_from_tournament(
         resolved.id, group_question_mode=config.metaculus.group_question_mode
     )
-    logger.info(
-        "fetched %d open questions from tournament %r", len(questions), resolved.id
-    )
+    logger.info("fetched %d open questions from tournament %r", len(questions), resolved.id)
     return resolved, questions
 
 
