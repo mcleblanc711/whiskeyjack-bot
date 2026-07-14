@@ -88,8 +88,11 @@ There is no submission path in this codebase yet; `submission.enabled: false` an
 
 ## Status
 
-Milestone 0 (foundation + Metaculus integration) complete, pending owner review at the
-M0 stop point. No live submission path exists; nothing is posted to Metaculus.
+Milestone 0 (foundation + Metaculus integration): implementation complete and
+cross-review findings remediated, but the milestone gate is **not yet passed** —
+the CI quality gate with independent verification (M0-003, Codex-owned) and owner
+approval at the M0 stop point are both outstanding. No live submission path
+exists; nothing is posted to Metaculus.
 
 ## License
 
