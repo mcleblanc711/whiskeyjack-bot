@@ -119,6 +119,25 @@ def test_configured_logging_redacts_across_all_loggers(
     assert "<redacted:METACULUS_TOKEN>" in file_text
 
 
+def test_exception_text_is_redacted_in_formatted_output(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Cross-review finding 1: str(exc_info[1]) is rendered by the formatter,
+    # which the message-level filter cannot reach.
+    monkeypatch.setenv("METACULUS_TOKEN", FAKE_TOKEN)
+    configure_logging(config)
+    logger = logging.getLogger("whiskeyjack_bot.test_exception_redaction")
+    try:
+        raise RuntimeError(f"401 unauthorized for Token {FAKE_TOKEN}")
+    except RuntimeError:
+        logger.exception("request failed")
+    captured = capsys.readouterr()
+    file_text = config.logging.file.read_text(encoding="utf-8")
+    assert FAKE_TOKEN not in captured.err
+    assert FAKE_TOKEN not in file_text
+    assert "<redacted:METACULUS_TOKEN>" in file_text
+
+
 def test_configure_logging_is_idempotent(config: AppConfig) -> None:
     configure_logging(config)
     first = [h for h in logging.getLogger().handlers if getattr(h, "_whiskeyjack", False)]
