@@ -73,11 +73,15 @@ files, applied in M0-R7. Suite is 68 tests after the remediation below.**
 
 ## Open questions for M1
 
-1. **CODEX_HANDOFF full spec** — see deviation 2. Biggest open item.
-2. **Ledger DDL approval**: if the full spec stays unavailable, the M1 plan will
-   include the proposed append-only schema (forecast versions, lifecycle events,
-   research runs, documents, approvals, submissions, resolutions, scores) for sign-off
-   before implementation.
+1. ~~**CODEX_HANDOFF full spec** — see deviation 2. Biggest open item.~~
+   **Resolved (2026-07-15, re-review finding 3): the spec was recovered and
+   committed on 2026-07-14 — see the resolution note under deviation 2. No
+   longer an open question.**
+2. **Ledger DDL approval**: the M1 plan implements against the ledger DDL in the
+   committed `CODEX_HANDOFF.md` rather than proposing a schema from scratch;
+   the plan still goes to the owner for stop-point sign-off before
+   implementation. *(Rewritten 2026-07-15 — the original wording still hedged
+   on the spec being unavailable, contradicting its recovery.)*
 3. **Backlog xlsx vs CSV**: the exported CSVs under `docs/backlog/` are convenient for
    grepping; confirm the xlsx remains authoritative (the LibreOffice lock file
    suggests it's open/edited locally).
@@ -118,6 +122,44 @@ the Claude side; branches `fix/m0-r1-secret-leak-paths`, `fix/m0-r4-probability-
 
 Still outstanding for the M0 gate: M0-003 + independent verification (Codex),
 owner approval. Fixture regeneration remains blocked on A-1101.
+
+## Cross-review remediation, round 2 (2026-07-15)
+
+GPT-5.6 re-reviewed the round-1 remediation: no High findings remained, but
+approval was withheld over two Medium and two Low findings. All four were
+verified as real and fixed; branches `fix/m0-rr1-rr2-snapshot-provenance` and
+`fix/m0-rr3-rr4-records` (commits prefixed `M0-RR<n>`).
+
+1. **Medium — snapshot deserialization errors echoed snapshot values.** The
+   entry-level failure message interpolated the underlying validation
+   exception (pydantic prints input values) and chained it, so a planted
+   credential surfaced in `str(SnapshotError)` — which the CLI prints — and
+   through `__cause__` in tracebacks. `SnapshotError` now follows the
+   `ConfigError` rule: no snapshot-supplied value appears in any message
+   (schema version and unknown question_class echoes were closed as the same
+   leak class), and sanitizing raises use `from None`. Leak tests plant a fake
+   secret in four positions and grep `str(exc)`, the full formatted traceback,
+   and CLI stdout/stderr; all ran red pre-fix.
+2. **Medium — snapshot metadata checked for presence, not validity.**
+   `load_snapshot` accepted `source=[]`, `group_question_mode=false`,
+   `tournament_id=[]`, and a timezone-naive `fetched_at_utc`. Now enforced:
+   tournament_id int or non-empty str (bools rejected); group_question_mode
+   from the config `GroupQuestionMode` Literal; source `live`/`fixture`;
+   question_count a real int; fetched_at_utc timezone-aware, normalized to
+   UTC on load. Eleven shape tests including every reviewer probe; the ten
+   malformed shapes loaded unchallenged pre-fix.
+3. **Low — this document contradicted itself about the recovered spec.**
+   "Open questions for M1" still called `CODEX_HANDOFF.md` the biggest open
+   item and hedged on it staying unavailable; both entries corrected above.
+4. **Low — `git diff --check` failed on the remediation range.** Root cause:
+   the backlog CSVs are uniformly CRLF (RFC 4180 xlsx exports), which git's
+   default whitespace rules flag on any edited line. `.gitattributes` now
+   declares `-text whitespace=cr-at-eol` for `docs/backlog/*.csv`;
+   `git diff --check 0e872c3..HEAD` is clean.
+
+Suite is 84 tests after this round. The M0 gate items unchanged: M0-003 +
+independent verification (Codex), owner approval; A-1101 still blocks fixture
+regeneration.
 
 ## How to review
 
