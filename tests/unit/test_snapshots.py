@@ -2,8 +2,9 @@
 retain question, post, and tournament identity."""
 
 import json
+import traceback
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -91,7 +92,9 @@ def test_unknown_question_class_rejected(tmp_path: Path) -> None:
     envelope["questions"][0]["question_class"] = "TotallyMadeUpQuestion"
     path = tmp_path / "bad_class.json"
     path.write_text(json.dumps(envelope), encoding="utf-8")
-    with pytest.raises(SnapshotError, match="TotallyMadeUpQuestion"):
+    # Re-review finding 1 tightened the message: the class name comes from the
+    # snapshot file, so it is withheld like every other snapshot value.
+    with pytest.raises(SnapshotError, match="unrecognized question_class"):
         load_snapshot(path)
 
 
@@ -130,6 +133,38 @@ def test_count_mismatch_rejected(tmp_path: Path) -> None:
             lambda e: e.update(fetched_at_utc="not-a-timestamp"),
             "invalid fetched_at_utc",
         ),
+        # Re-review finding 2: metadata was only checked for presence; every
+        # shape below previously loaded into SnapshotMeta unchallenged.
+        ("tournament_id a list", lambda e: e.update(tournament_id=[]), "tournament_id"),
+        ("tournament_id a bool", lambda e: e.update(tournament_id=True), "tournament_id"),
+        ("tournament_id empty", lambda e: e.update(tournament_id=""), "tournament_id"),
+        (
+            "group_question_mode a bool",
+            lambda e: e.update(group_question_mode=False),
+            "group_question_mode",
+        ),
+        (
+            "group_question_mode unknown",
+            lambda e: e.update(group_question_mode="merge_everything"),
+            "group_question_mode",
+        ),
+        ("source a list", lambda e: e.update(source=[]), "source"),
+        ("source unknown", lambda e: e.update(source="archive"), "source"),
+        (
+            "timestamp timezone-naive",
+            lambda e: e.update(fetched_at_utc="2026-07-10T12:00:00"),
+            "timezone-aware",
+        ),
+        (
+            "question_count a string",
+            lambda e: e.update(question_count="3"),
+            "question_count",
+        ),
+        (
+            "question_count a bool",
+            lambda e: e.update(question_count=True),
+            "question_count",
+        ),
     ],
 )
 def test_malformed_snapshot_shapes_raise_snapshot_error(
@@ -143,6 +178,61 @@ def test_malformed_snapshot_shapes_raise_snapshot_error(
     path.write_text(json.dumps(envelope), encoding="utf-8")
     with pytest.raises(SnapshotError, match=match):
         load_snapshot(path)
+
+
+def test_aware_non_utc_timestamp_is_normalized_to_utc(tmp_path: Path) -> None:
+    # An aware non-UTC offset is a well-defined instant: accepted, but the
+    # loaded provenance is normalized so fetched_at_utc means what it says.
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    envelope["fetched_at_utc"] = "2026-07-10T14:00:00+02:00"
+    path = tmp_path / "offset.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    meta, _ = load_snapshot(path)
+    assert meta.fetched_at_utc == datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
+    assert meta.fetched_at_utc.utcoffset() == timedelta(0)
+
+
+PLANTED_SECRET = "privateFAKE123456"
+
+
+@pytest.mark.parametrize(
+    ("description", "mutate"),
+    [
+        (
+            "secret in a payload that fails model validation",
+            lambda e: e["questions"][0].update(data=json.dumps({"question_text": PLANTED_SECRET})),
+        ),
+        (
+            "secret as the schema version",
+            lambda e: e.update(snapshot_schema_version=PLANTED_SECRET),
+        ),
+        (
+            "secret as the question class",
+            lambda e: e["questions"][0].update(question_class=PLANTED_SECRET),
+        ),
+        (
+            "secret as the timestamp",
+            lambda e: e.update(fetched_at_utc=PLANTED_SECRET),
+        ),
+    ],
+)
+def test_snapshot_errors_never_echo_snapshot_contents(
+    tmp_path: Path, description: str, mutate: Callable[[dict], object]
+) -> None:
+    # Re-review finding 1: the deserialization failure interpolated the
+    # underlying validation exception (which prints input values) and chained
+    # it, so a planted credential surfaced in str(SnapshotError) and in any
+    # traceback rendering. Same rule as ConfigError: snapshot-supplied values
+    # never appear in the error text or its cause chain.
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    mutate(envelope)
+    path = tmp_path / "leaky.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(SnapshotError) as excinfo:
+        load_snapshot(path)
+    assert PLANTED_SECRET not in str(excinfo.value), description
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert PLANTED_SECRET not in rendered, description
 
 
 def test_missing_and_malformed_files_rejected(tmp_path: Path) -> None:

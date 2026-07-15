@@ -146,6 +146,34 @@ def test_cli_reports_malformed_snapshot_cleanly(
     assert "Traceback" not in captured.out
 
 
+def test_cli_snapshot_error_output_never_echoes_snapshot_contents(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Re-review finding 1: the CLI prints str(SnapshotError); a credential
+    # planted in a snapshot payload must not reach stdout or stderr.
+    secret = "privateFAKE123456"
+    data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    data["model"]["name"] = "openrouter/test-model"
+    data["logging"]["file"] = str(tmp_path / "logs" / "bot.jsonl")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    snapshot["questions"][0]["data"] = json.dumps({"question_text": secret})
+    bad_snapshot = tmp_path / "leaky_snapshot.json"
+    bad_snapshot.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    exit_code = main(
+        ["questions", "fetch", "--config", str(config_path), "--snapshot", str(bad_snapshot)]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "does not deserialize" in captured.out
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert "Traceback" not in captured.out
+
+
 def test_cli_fixture_mode_requires_snapshot_path(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -20,14 +20,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from typing import get_args
+
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
+from whiskeyjack_bot.config import GroupQuestionMode
+
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
+
+_VALID_SOURCES = ("live", "fixture")
 
 
 class SnapshotError(Exception):
-    """A snapshot file is unreadable, malformed, or from an unknown schema."""
+    """A snapshot file is unreadable, malformed, or from an unknown schema.
+
+    Same hygiene rule as ``ConfigError``: the message never echoes values read
+    from the snapshot file (a mistakenly pasted credential must not surface
+    through CLI output), and sanitizing raise sites use ``from None`` so the
+    cause chain cannot reprint the raw value through a traceback.
+    """
 
 
 @dataclass(frozen=True)
@@ -94,8 +106,8 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
     version = envelope.get("snapshot_schema_version")
     if version != SNAPSHOT_SCHEMA_VERSION:
         raise SnapshotError(
-            f"snapshot {path} has schema version {version!r}; "
-            f"this build reads {SNAPSHOT_SCHEMA_VERSION!r}"
+            f"snapshot {path} has an unsupported schema version "
+            f"(value withheld; this build reads {SNAPSHOT_SCHEMA_VERSION!r})"
         )
 
     entries = envelope.get("questions")
@@ -113,18 +125,25 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
         question_cls = registry.get(class_name)
         if question_cls is None:
             raise SnapshotError(
-                f"snapshot {path} entry {i} has unknown question_class {class_name!r}"
+                f"snapshot {path} entry {i} has an unrecognized question_class "
+                "(name withheld; it is not in the pinned model registry)"
             )
         if "data" not in entry:
             raise SnapshotError(f"snapshot {path} entry {i} is missing its data payload")
         try:
             questions.append(question_cls.from_json(entry["data"]))
-        except Exception as exc:  # noqa: BLE001 - pinned models raise several shapes
+        except Exception:  # noqa: BLE001 - pinned models raise several shapes
+            # The validation error interpolates payload values, so neither its
+            # text nor its cause chain may reach the SnapshotError the CLI
+            # prints. class_name is safe: it matched the registry above.
             raise SnapshotError(
-                f"snapshot {path} entry {i} does not deserialize as {class_name}: {exc}"
-            ) from exc
+                f"snapshot {path} entry {i} does not deserialize as {class_name} "
+                "(validation detail withheld: it can echo snapshot contents)"
+            ) from None
 
     declared = envelope.get("question_count")
+    if not isinstance(declared, int) or isinstance(declared, bool):
+        raise SnapshotError(f"snapshot {path} question_count must be an integer")
     if declared != len(questions):
         raise SnapshotError(
             f"snapshot {path} declares {declared} questions but contains {len(questions)}"
@@ -137,16 +156,47 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
     ]
     if missing:
         raise SnapshotError(f"snapshot {path} is missing metadata: {', '.join(missing)}")
+
+    # Metadata carries replay provenance; presence alone is not enough
+    # (re-review finding 2). Invalid values are described but never echoed.
+    tournament_id = envelope["tournament_id"]
+    if isinstance(tournament_id, bool) or not isinstance(tournament_id, int | str):
+        raise SnapshotError(
+            f"snapshot {path} tournament_id must be an integer or a non-empty string"
+        )
+    if tournament_id == "":
+        raise SnapshotError(f"snapshot {path} tournament_id must not be an empty string")
+
+    group_question_mode = envelope["group_question_mode"]
+    valid_modes = get_args(GroupQuestionMode)
+    if group_question_mode not in valid_modes:
+        raise SnapshotError(
+            f"snapshot {path} group_question_mode must be one of {sorted(valid_modes)}"
+        )
+
+    source = envelope["source"]
+    if source not in _VALID_SOURCES:
+        raise SnapshotError(f"snapshot {path} source must be one of {sorted(_VALID_SOURCES)}")
+
     try:
         fetched_at = datetime.fromisoformat(envelope["fetched_at_utc"])
-    except (TypeError, ValueError) as exc:
-        raise SnapshotError(f"snapshot {path} has an invalid fetched_at_utc timestamp") from exc
+    except (TypeError, ValueError):
+        # from None: fromisoformat's ValueError echoes the raw input string.
+        raise SnapshotError(
+            f"snapshot {path} has an invalid fetched_at_utc timestamp "
+            "(value withheld: it can echo snapshot contents)"
+        ) from None
+    if fetched_at.utcoffset() is None:
+        raise SnapshotError(
+            f"snapshot {path} fetched_at_utc must be timezone-aware; "
+            "naive timestamps are not valid provenance"
+        )
 
     meta = SnapshotMeta(
-        tournament_id=envelope["tournament_id"],
-        group_question_mode=envelope["group_question_mode"],
-        fetched_at_utc=fetched_at,
-        source=envelope["source"],
+        tournament_id=tournament_id,
+        group_question_mode=group_question_mode,
+        fetched_at_utc=fetched_at.astimezone(timezone.utc),
+        source=source,
         question_count=len(questions),
     )
     return meta, questions
