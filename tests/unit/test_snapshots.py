@@ -2,6 +2,7 @@
 retain question, post, and tournament identity."""
 
 import json
+import traceback
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,7 +92,9 @@ def test_unknown_question_class_rejected(tmp_path: Path) -> None:
     envelope["questions"][0]["question_class"] = "TotallyMadeUpQuestion"
     path = tmp_path / "bad_class.json"
     path.write_text(json.dumps(envelope), encoding="utf-8")
-    with pytest.raises(SnapshotError, match="TotallyMadeUpQuestion"):
+    # Re-review finding 1 tightened the message: the class name comes from the
+    # snapshot file, so it is withheld like every other snapshot value.
+    with pytest.raises(SnapshotError, match="unrecognized question_class"):
         load_snapshot(path)
 
 
@@ -143,6 +146,51 @@ def test_malformed_snapshot_shapes_raise_snapshot_error(
     path.write_text(json.dumps(envelope), encoding="utf-8")
     with pytest.raises(SnapshotError, match=match):
         load_snapshot(path)
+
+
+PLANTED_SECRET = "privateFAKE123456"
+
+
+@pytest.mark.parametrize(
+    ("description", "mutate"),
+    [
+        (
+            "secret in a payload that fails model validation",
+            lambda e: e["questions"][0].update(
+                data=json.dumps({"question_text": PLANTED_SECRET})
+            ),
+        ),
+        (
+            "secret as the schema version",
+            lambda e: e.update(snapshot_schema_version=PLANTED_SECRET),
+        ),
+        (
+            "secret as the question class",
+            lambda e: e["questions"][0].update(question_class=PLANTED_SECRET),
+        ),
+        (
+            "secret as the timestamp",
+            lambda e: e.update(fetched_at_utc=PLANTED_SECRET),
+        ),
+    ],
+)
+def test_snapshot_errors_never_echo_snapshot_contents(
+    tmp_path: Path, description: str, mutate: Callable[[dict], object]
+) -> None:
+    # Re-review finding 1: the deserialization failure interpolated the
+    # underlying validation exception (which prints input values) and chained
+    # it, so a planted credential surfaced in str(SnapshotError) and in any
+    # traceback rendering. Same rule as ConfigError: snapshot-supplied values
+    # never appear in the error text or its cause chain.
+    envelope = json.loads(COMMITTED_SNAPSHOT.read_text(encoding="utf-8"))
+    mutate(envelope)
+    path = tmp_path / "leaky.json"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(SnapshotError) as excinfo:
+        load_snapshot(path)
+    assert PLANTED_SECRET not in str(excinfo.value), description
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert PLANTED_SECRET not in rendered, description
 
 
 def test_missing_and_malformed_files_rejected(tmp_path: Path) -> None:

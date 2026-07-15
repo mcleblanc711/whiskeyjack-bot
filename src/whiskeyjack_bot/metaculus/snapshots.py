@@ -27,7 +27,13 @@ SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 
 
 class SnapshotError(Exception):
-    """A snapshot file is unreadable, malformed, or from an unknown schema."""
+    """A snapshot file is unreadable, malformed, or from an unknown schema.
+
+    Same hygiene rule as ``ConfigError``: the message never echoes values read
+    from the snapshot file (a mistakenly pasted credential must not surface
+    through CLI output), and sanitizing raise sites use ``from None`` so the
+    cause chain cannot reprint the raw value through a traceback.
+    """
 
 
 @dataclass(frozen=True)
@@ -94,8 +100,8 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
     version = envelope.get("snapshot_schema_version")
     if version != SNAPSHOT_SCHEMA_VERSION:
         raise SnapshotError(
-            f"snapshot {path} has schema version {version!r}; "
-            f"this build reads {SNAPSHOT_SCHEMA_VERSION!r}"
+            f"snapshot {path} has an unsupported schema version "
+            f"(value withheld; this build reads {SNAPSHOT_SCHEMA_VERSION!r})"
         )
 
     entries = envelope.get("questions")
@@ -113,16 +119,21 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
         question_cls = registry.get(class_name)
         if question_cls is None:
             raise SnapshotError(
-                f"snapshot {path} entry {i} has unknown question_class {class_name!r}"
+                f"snapshot {path} entry {i} has an unrecognized question_class "
+                "(name withheld; it is not in the pinned model registry)"
             )
         if "data" not in entry:
             raise SnapshotError(f"snapshot {path} entry {i} is missing its data payload")
         try:
             questions.append(question_cls.from_json(entry["data"]))
-        except Exception as exc:  # noqa: BLE001 - pinned models raise several shapes
+        except Exception:  # noqa: BLE001 - pinned models raise several shapes
+            # The validation error interpolates payload values, so neither its
+            # text nor its cause chain may reach the SnapshotError the CLI
+            # prints. class_name is safe: it matched the registry above.
             raise SnapshotError(
-                f"snapshot {path} entry {i} does not deserialize as {class_name}: {exc}"
-            ) from exc
+                f"snapshot {path} entry {i} does not deserialize as {class_name} "
+                "(validation detail withheld: it can echo snapshot contents)"
+            ) from None
 
     declared = envelope.get("question_count")
     if declared != len(questions):
@@ -139,8 +150,12 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
         raise SnapshotError(f"snapshot {path} is missing metadata: {', '.join(missing)}")
     try:
         fetched_at = datetime.fromisoformat(envelope["fetched_at_utc"])
-    except (TypeError, ValueError) as exc:
-        raise SnapshotError(f"snapshot {path} has an invalid fetched_at_utc timestamp") from exc
+    except (TypeError, ValueError):
+        # from None: fromisoformat's ValueError echoes the raw input string.
+        raise SnapshotError(
+            f"snapshot {path} has an invalid fetched_at_utc timestamp "
+            "(value withheld: it can echo snapshot contents)"
+        ) from None
 
     meta = SnapshotMeta(
         tournament_id=envelope["tournament_id"],
