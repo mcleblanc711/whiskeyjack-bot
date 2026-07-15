@@ -1,0 +1,6 @@
+# The backlog CSVs are exported from the authoritative backlog xlsx and use
+# RFC 4180 CRLF line endings — uniformly, in all four files. Keep them
+# byte-for-byte as exported: no end-of-line normalization, and a CR at end of
+# line is not a whitespace error (re-review finding 4: `git diff --check`
+# flagged every edited row).
+docs/backlog/*.csv -text whitespace=cr-at-eol
