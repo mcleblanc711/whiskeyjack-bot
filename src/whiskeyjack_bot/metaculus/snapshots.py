@@ -20,10 +20,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from typing import get_args
+
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.questions import MetaculusQuestion
 
+from whiskeyjack_bot.config import GroupQuestionMode
+
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
+
+_VALID_SOURCES = ("live", "fixture")
 
 
 class SnapshotError(Exception):
@@ -136,6 +142,8 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
             ) from None
 
     declared = envelope.get("question_count")
+    if not isinstance(declared, int) or isinstance(declared, bool):
+        raise SnapshotError(f"snapshot {path} question_count must be an integer")
     if declared != len(questions):
         raise SnapshotError(
             f"snapshot {path} declares {declared} questions but contains {len(questions)}"
@@ -148,6 +156,28 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
     ]
     if missing:
         raise SnapshotError(f"snapshot {path} is missing metadata: {', '.join(missing)}")
+
+    # Metadata carries replay provenance; presence alone is not enough
+    # (re-review finding 2). Invalid values are described but never echoed.
+    tournament_id = envelope["tournament_id"]
+    if isinstance(tournament_id, bool) or not isinstance(tournament_id, int | str):
+        raise SnapshotError(
+            f"snapshot {path} tournament_id must be an integer or a non-empty string"
+        )
+    if tournament_id == "":
+        raise SnapshotError(f"snapshot {path} tournament_id must not be an empty string")
+
+    group_question_mode = envelope["group_question_mode"]
+    valid_modes = get_args(GroupQuestionMode)
+    if group_question_mode not in valid_modes:
+        raise SnapshotError(
+            f"snapshot {path} group_question_mode must be one of {sorted(valid_modes)}"
+        )
+
+    source = envelope["source"]
+    if source not in _VALID_SOURCES:
+        raise SnapshotError(f"snapshot {path} source must be one of {sorted(_VALID_SOURCES)}")
+
     try:
         fetched_at = datetime.fromisoformat(envelope["fetched_at_utc"])
     except (TypeError, ValueError):
@@ -156,12 +186,17 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
             f"snapshot {path} has an invalid fetched_at_utc timestamp "
             "(value withheld: it can echo snapshot contents)"
         ) from None
+    if fetched_at.utcoffset() is None:
+        raise SnapshotError(
+            f"snapshot {path} fetched_at_utc must be timezone-aware; "
+            "naive timestamps are not valid provenance"
+        )
 
     meta = SnapshotMeta(
-        tournament_id=envelope["tournament_id"],
-        group_question_mode=envelope["group_question_mode"],
-        fetched_at_utc=fetched_at,
-        source=envelope["source"],
+        tournament_id=tournament_id,
+        group_question_mode=group_question_mode,
+        fetched_at_utc=fetched_at.astimezone(timezone.utc),
+        source=source,
         question_count=len(questions),
     )
     return meta, questions
