@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    name: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # This public-repository checkout deliberately uses no GitHub token. Fetching
+      # the event ref separately includes the synthetic merge ref used for PR runs.
+      - name: Checkout full history without credentials
+        env:
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          git init .
+          git remote add origin "$SERVER_URL/$REPOSITORY.git"
+          git fetch --no-tags --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*' \
+            '+refs/tags/*:refs/tags/*'
+          git fetch --no-tags origin "$EVENT_REF"
+          git checkout --detach "$EVENT_SHA"
+
+      - name: Gitleaks scan
+        uses: ./.github/actions/gitleaks-full-history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_VERSION: "8.30.1"
+
+      - name: Tracked-artifact hygiene check
+        run: bash .github/scripts/check-tracked-artifacts.sh
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+          version: "0.11.28"
+
+      - name: Provision Python 3.11 with uv
+        run: uv python install 3.11
+
+      - name: Locked dependency sync
+        run: uv sync --locked
+
+      - name: CLI smoke
+        run: uv run whiskeyjack-bot --help
+
+      - name: Offline pytest
+        run: uv run pytest
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Strict mypy
+        run: uv run mypy --strict src

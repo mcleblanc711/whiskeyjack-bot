@@ -27,7 +27,7 @@ packages = ["src/whiskeyjack_bot"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --disable-socket --allow-hosts=127.0.0.0/8,::1"
 
 [tool.ruff]
 line-length = 100
@@ -50,6 +50,7 @@ follow_imports = "skip"
 dev = [
     "mypy>=2.3.0",
     "pytest>=8,<9",
+    "pytest-socket==0.8.0",
     "ruff>=0.15.21",
     "types-pyyaml>=6.0.12.20260518",
 ]
