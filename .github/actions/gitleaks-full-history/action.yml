@@ -1,0 +1,12 @@
+name: Gitleaks full-history scan
+description: Install Gitleaks with its pinned action and scan every Git ref.
+
+runs:
+  using: composite
+  steps:
+    - name: Scan event commits
+      uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+
+    - name: Scan full Git history
+      shell: bash
+      run: gitleaks git --redact --verbose --log-opts=--all .

@@ -14,6 +14,7 @@ work that has not begun.**
 | — (housekeeping) | Canonical layout: `prompts/forecaster.md`, `config/x_accounts.yaml`, backlog CSVs in `docs/backlog/`, `.gitignore`, `retrieval.social` block added to `config.example.yaml` | `chore/repo-layout` branch |
 | M0-001 | Python 3.11 src-layout package `whiskeyjack_bot`, uv-managed venv/lock, argparse CLI, MIT licence | Clean clone: `uv sync` + `whiskeyjack-bot --help` pass |
 | M0-002 | `forecasting-tools==0.2.92` exact pin + pydantic/pyyaml; dev: pytest/ruff/mypy; drift unit test | `test_dependency_pins.py`; lock resolves on CPython 3.11.15 |
+| M0-003 | Read-only Python 3.11 CI gate with full-history secret scanning, tracked-artifact hygiene, locked sync, CLI smoke, offline tests, lint, formatting, and strict types | Stable required status `CI / quality-gate`; network canary requires pytest-socket to reject DNS and a reserved non-loopback connection |
 | M0-005 | Typed config, `extra=forbid`, placeholder rejection (D27), live-submit combinations rejected outright pre-M2, sanitized `ConfigError` (input values withheld) | 21 tests in `test_config.py` |
 | M0-004 | `verify-env`: config validation, dir creation, env-var presence by **name only**; exit codes 0/2/3 | `test_env_verify.py`; manual matrix: no vars → 3, all vars → 0 with zero value leakage, live-submit config → 2 |
 | M0-006 | README quick start | Executed verbatim from a fresh clone: sync, verify-env, offline fixture fetch, 56 tests green with zero credentials |
@@ -186,11 +187,29 @@ Suite is 85 tests after this round. The M0 gate items unchanged: M0-003 +
 independent verification (Codex), owner approval; A-1101 still blocks fixture
 regeneration.
 
+## CI quality gate (M0-003, 2026-07-15)
+
+The read-only GitHub Actions workflow publishes one stable status,
+`CI / quality-gate`, on pull requests and pushes to `master`. It scans the full
+Git history with Gitleaks' default rules, rejects tracked secret/generated
+artifacts, enforces the lockfile, and then runs the documented CLI, test, Ruff,
+and strict-mypy checks on uv-provisioned Python 3.11. All third-party actions are
+pinned to full commit SHAs; the GitHub token is passed only to the Gitleaks step.
+
+The test session now uses `pytest-socket==0.8.0` to permit loopback only and
+block external connections, including DNS resolution. The root-level network
+canary proves both DNS blocking and `SocketConnectBlockedError` for the reserved
+non-loopback address `192.0.2.1`, without changing the implementer-owned fixture
+under `tests/unit/`. Suite: **86 tests**.
+
+After the first successful branch run, protect `master` by requiring
+`CI / quality-gate`; confirm the workflow runs once more after merge.
+
 ## How to review
 
 ```bash
 git log --oneline --graph master   # one branch per issue, IDs in messages
-uv run pytest                      # 85 tests, offline
+uv run pytest                      # 86 tests, offline with loopback only
 uv run whiskeyjack-bot verify-env --config config.yaml
 uv run whiskeyjack-bot questions fetch --config config.yaml \
   --snapshot tests/fixtures/snapshots/minibench_sample_snapshot.json
