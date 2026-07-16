@@ -202,8 +202,9 @@ canary proves both DNS blocking and `SocketConnectBlockedError` for the reserved
 non-loopback address `192.0.2.1`, without changing the implementer-owned fixture
 under `tests/unit/`. Suite: **86 tests**.
 
-After the first successful branch run, protect `master` by requiring
-`CI / quality-gate`; confirm the workflow runs once more after merge.
+Following the first successful branch run, `master` protection now requires
+`CI / quality-gate` (including for administrators). Confirm the workflow runs
+once more after the owner merges the PR.
 
 ## How to review
 
