@@ -103,8 +103,14 @@ def test_count_mismatch_rejected(tmp_path: Path) -> None:
     envelope["question_count"] = 7
     path = tmp_path / "bad_count.json"
     path.write_text(json.dumps(envelope), encoding="utf-8")
-    with pytest.raises(SnapshotError, match="declares 7"):
+    # Re-review finding 1: the message must not echo the snapshot-declared
+    # count. Assert the exact message rather than `"7" not in ...`, since the
+    # tmp_path itself can legitimately contain a "7" (round-3 finding).
+    with pytest.raises(SnapshotError) as excinfo:
         load_snapshot(path)
+    assert str(excinfo.value) == (
+        f"snapshot {path} declared question_count does not match the 3 entries it contains"
+    )
 
 
 @pytest.mark.parametrize(
@@ -138,6 +144,11 @@ def test_count_mismatch_rejected(tmp_path: Path) -> None:
         ("tournament_id a list", lambda e: e.update(tournament_id=[]), "tournament_id"),
         ("tournament_id a bool", lambda e: e.update(tournament_id=True), "tournament_id"),
         ("tournament_id empty", lambda e: e.update(tournament_id=""), "tournament_id"),
+        (
+            "tournament_id whitespace only",
+            lambda e: e.update(tournament_id="   "),
+            "tournament_id",
+        ),
         (
             "group_question_mode a bool",
             lambda e: e.update(group_question_mode=False),
