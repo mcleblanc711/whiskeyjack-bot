@@ -145,8 +145,11 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
     if not isinstance(declared, int) or isinstance(declared, bool):
         raise SnapshotError(f"snapshot {path} question_count must be an integer")
     if declared != len(questions):
+        # Re-review finding 1: honor the class contract literally and do not
+        # echo the snapshot-declared count. len(questions) is computed locally.
         raise SnapshotError(
-            f"snapshot {path} declares {declared} questions but contains {len(questions)}"
+            f"snapshot {path} declared question_count does not match the "
+            f"{len(questions)} entries it contains"
         )
 
     missing = [
@@ -164,8 +167,12 @@ def load_snapshot(path: Path) -> tuple[SnapshotMeta, list[MetaculusQuestion]]:
         raise SnapshotError(
             f"snapshot {path} tournament_id must be an integer or a non-empty string"
         )
-    if tournament_id == "":
-        raise SnapshotError(f"snapshot {path} tournament_id must not be an empty string")
+    if isinstance(tournament_id, str) and not tournament_id.strip():
+        # Re-review finding 2: match config.py's strip()-based check so a
+        # whitespace-only id is not accepted as semantically empty provenance.
+        raise SnapshotError(
+            f"snapshot {path} tournament_id must not be an empty or whitespace-only string"
+        )
 
     group_question_mode = envelope["group_question_mode"]
     valid_modes = get_args(GroupQuestionMode)

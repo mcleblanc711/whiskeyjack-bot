@@ -161,11 +161,36 @@ Suite is 84 tests after this round. The M0 gate items unchanged: M0-003 +
 independent verification (Codex), owner approval; A-1101 still blocks fixture
 regeneration.
 
+## Cross-review remediation, round 3 (2026-07-15)
+
+GPT-5.6 re-reviewed the round-2 remediation: no High findings, approval withheld
+over two Medium and one Low. All three verified as real and fixed.
+
+1. **Medium — count-mismatch error echoed the snapshot-declared count.**
+   `load_snapshot` raised `declares {declared} questions`, interpolating the
+   snapshot's own `question_count` and so contradicting the `SnapshotError`
+   contract that no snapshot-supplied value appears in a message. Reworded to
+   `declared question_count does not match the {len(questions)} entries it
+   contains` — only the locally computed count is shown. The regression test
+   asserts the exact message (an earlier `"7" not in str(exc)` form was flaky:
+   the `tmp_path` can itself contain a `7`).
+2. **Medium — whitespace-only `tournament_id` loaded as valid provenance.** The
+   check rejected only `""`, so `"   "` passed while `config.py`'s validator
+   correctly uses `strip()`. Now `strip()`-based here too; a whitespace-only id
+   is rejected. New shape test covers it.
+3. **Low — this document contradicted itself on the test count.** The "How to
+   review" block still said 68 tests while the round-2 summary said 84; the
+   live reviewer instruction now reflects the current suite.
+
+Suite is 85 tests after this round. The M0 gate items unchanged: M0-003 +
+independent verification (Codex), owner approval; A-1101 still blocks fixture
+regeneration.
+
 ## How to review
 
 ```bash
 git log --oneline --graph master   # one branch per issue, IDs in messages
-uv run pytest                      # 68 tests, offline
+uv run pytest                      # 85 tests, offline
 uv run whiskeyjack-bot verify-env --config config.yaml
 uv run whiskeyjack-bot questions fetch --config config.yaml \
   --snapshot tests/fixtures/snapshots/minibench_sample_snapshot.json
