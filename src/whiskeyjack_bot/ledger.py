@@ -157,12 +157,13 @@ def _reject_newer_database(applied: dict[int, str], migrations: list[tuple[int, 
     if not applied:
         return
     highest_packaged = max((version for version, _, _ in migrations), default=0)
-    highest_applied = max(applied)
-    if highest_applied > highest_packaged:
-        # version numbers are integers, never stored row content.
+    if max(applied) > highest_packaged:
+        # highest_applied is int(stored schema_migrations.version), i.e. row content,
+        # so it must not appear in the message. highest_packaged is derived from the
+        # packaged migration filenames and is safe to name.
         raise LedgerError(
-            f"ledger database schema version {highest_applied} is newer than this build "
-            f"supports (maximum {highest_packaged})"
+            "ledger database was written by a newer build than this one supports "
+            f"(this build's newest migration is {highest_packaged}); refusing to run"
         )
 
 
@@ -212,14 +213,22 @@ def _statements(sql: str) -> list[str]:
     inside a string literal, an inline ``--`` comment, or a ``CREATE TRIGGER ...
     BEGIN ... END;`` body does not falsely end a statement. This is what lets the
     append-only-enforcement triggers deferred to M1-602/M1-603 be applied by this
-    same runner. A non-comment remainder after the last complete statement means
-    the final statement is unterminated and is rejected.
+    same runner.
+
+    The scan emits at every top-level statement terminator, so more than one
+    statement may share a physical line (``CREATE TABLE a(x); CREATE TABLE b(y);``)
+    -- ``conn.execute`` rejects a chunk holding two statements, so the split must be
+    exact, not line-based. A non-comment remainder after the last complete statement
+    means the final statement is unterminated and is rejected.
     """
     statements: list[str] = []
     buffer = ""
-    for line in sql.splitlines(keepends=True):
-        buffer += line
-        if sqlite3.complete_statement(buffer):
+    for char in sql:
+        buffer += char
+        # complete_statement only ever flips to True on a terminating ``;``, so gate
+        # the (cheap but non-trivial) call on that character. It stays False while the
+        # ``;`` sits inside a string literal, a comment, or an unfinished trigger body.
+        if char == ";" and sqlite3.complete_statement(buffer):
             statement = buffer.strip()
             buffer = ""
             if statement:

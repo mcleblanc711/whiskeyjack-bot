@@ -290,26 +290,36 @@ def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
         initialize_ledger(db)
 
 
-def test_newer_database_version_is_rejected(tmp_path: Path) -> None:
-    # A schema_migrations row from a future build must not be silently downgraded.
+# A distinctive numeric version that would be conspicuous if echoed in an error.
+NUMERIC_VERSION_SECRET = 9876543210987654
+
+
+def test_newer_database_version_rejected_without_leaking(tmp_path: Path) -> None:
+    # A schema_migrations row from a future build must be rejected -- and, per the
+    # LedgerError hygiene contract, the rejection must not echo the stored (numeric)
+    # version through the message or a rendered traceback.
     db = tmp_path / "ledger.db"
     initialize_ledger(db)
     conn = connect(db)
     try:
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at_utc, checksum) VALUES (?, ?, ?)",
-            (LEDGER_SCHEMA_VERSION + 1, TS, "future"),
+            (NUMERIC_VERSION_SECRET, TS, "future"),
         )
     finally:
         conn.close()
-    with pytest.raises(LedgerError):
+    with pytest.raises(LedgerError) as excinfo:
         initialize_ledger(db)
+    assert str(NUMERIC_VERSION_SECRET) not in str(excinfo.value)
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert str(NUMERIC_VERSION_SECRET) not in rendered
 
 
-def test_statement_splitter_preserves_triggers_and_literals() -> None:
-    # The runner must apply the append-only triggers deferred to M1-602/603: a
-    # semicolon inside a trigger body or a string literal must not split a statement,
-    # and a trailing inline comment must not create a spurious one.
+def test_statement_splitter_applies_triggers_and_literals() -> None:
+    # The runner must apply the append-only triggers deferred to M1-602/603, so this
+    # executes the split statements for real: a semicolon inside a trigger body or a
+    # string literal must not split a statement, a trailing inline comment must not
+    # create a spurious one, and the applied trigger must actually block UPDATE.
     sql = (
         "CREATE TABLE t (a TEXT);\n"
         "CREATE TRIGGER t_no_update BEFORE UPDATE ON t BEGIN\n"
@@ -319,8 +329,32 @@ def test_statement_splitter_preserves_triggers_and_literals() -> None:
     )
     statements = _statements(sql)
     assert len(statements) == 3
-    assert statements[1].startswith("CREATE TRIGGER")
-    assert statements[1].rstrip().endswith("END;")
+    conn = sqlite3.connect(":memory:")
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        assert conn.execute("SELECT a FROM t").fetchone()[0] == "x;y"
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE t SET a = 'z'")
+    finally:
+        conn.close()
+
+
+def test_statement_splitter_splits_multiple_statements_on_one_line() -> None:
+    # Two complete statements on a single physical line must split into two executable
+    # chunks -- conn.execute rejects a chunk that holds two statements.
+    statements = _statements("CREATE TABLE a (x TEXT); CREATE TABLE b (y TEXT);\n")
+    assert statements == ["CREATE TABLE a (x TEXT);", "CREATE TABLE b (y TEXT);"]
+    conn = sqlite3.connect(":memory:")
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert tables == {"a", "b"}
+    finally:
+        conn.close()
 
 
 def test_statement_splitter_rejects_unterminated_statement() -> None:

@@ -732,3 +732,38 @@ includes `whiskeyjack_bot/migrations/001_initial.sql`.
 migration has not shipped to any real database (feature branch, no production caller
 yet), so rewriting it — and its resulting sha256 — is correct; no forward-migration is
 warranted for a schema that has never been applied outside tests.
+
+---
+
+# Changes since round 2 (please re-review)
+
+Round 2 verdict was **DO-NOT-APPROVE** (1 High remaining, 1 Medium, 1 Low). Both
+graded findings are fixed and the Low is addressed, all in `ledger.py` /
+`tests/unit/test_ledger.py` on `feat/m1-601-ledger-migration`. Toolchain re-verified:
+`pytest` all pass (incl. the new/updated splitter + no-leak tests), `ruff check`,
+`ruff format --check`, `mypy --strict src` all clean.
+
+- **H (round-2) — newer-version message echoed a stored value.** `_reject_newer_database`
+  no longer interpolates `highest_applied` (which is `int(stored schema_migrations.version)`,
+  i.e. row content). The message is now value-free — it names only `highest_packaged`,
+  which is derived from the packaged migration filenames — and the misleading comment is
+  corrected. New regression test `test_newer_database_version_rejected_without_leaking`
+  plants a distinctive numeric version and asserts it appears in neither the message nor
+  the rendered traceback.
+
+- **M (round-2) — two statements on one physical line.** `_statements` now scans
+  character-by-character and emits at each top-level terminator (gating the
+  `sqlite3.complete_statement` call on `;`), so `CREATE TABLE a(x); CREATE TABLE b(y);`
+  splits into two independently executable chunks instead of a single chunk that
+  `conn.execute` would reject. String literals, `--` comments, and `BEGIN…END` trigger
+  bodies are still respected (the semicolon check stays False inside them). The docstring
+  now states multiple statements per line are supported. New test
+  `test_statement_splitter_splits_multiple_statements_on_one_line` splits and executes both.
+
+- **L (round-2) — trigger test now applies the trigger.** `test_statement_splitter_applies_triggers_and_literals`
+  (renamed from `…preserves…`) executes the split statements against an in-memory
+  database and asserts the applied `RAISE(ABORT, …)` trigger actually blocks `UPDATE`,
+  rather than only inspecting the split strings.
+
+Round-2 residuals confirmed still-good in this pass: H1 NOT NULL PKs, H3 checksum/drift,
+H4 non-numeric sanitization, M5 WAL, M6 indexes, wording nits — all unchanged.
