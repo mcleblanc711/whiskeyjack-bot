@@ -767,3 +767,17 @@ graded findings are fixed and the Low is addressed, all in `ledger.py` /
 
 Round-2 residuals confirmed still-good in this pass: H1 NOT NULL PKs, H3 checksum/drift,
 H4 non-numeric sanitization, M5 WAL, M6 indexes, wording nits — all unchanged.
+
+---
+
+# Post-approval nit (round 3)
+
+Round 3 was **APPROVE-WITH-NITS**; the one optional nit is now closed too.
+
+- **Nit — trailing `/* ... */` block comments treated as executable.** `_has_executable_sql`
+  (used only on the remainder after the last complete statement) now strips `/* ... */`
+  block comments as well as `--` line comments before deciding whether a real unterminated
+  statement remains, via a module-level `_BLOCK_COMMENT_RE`. `SELECT 1; /* trailing */`
+  now splits to `["SELECT 1;"]` instead of raising. The splitter docstring documents that
+  trailing block comments are tolerated. New test
+  `test_statement_splitter_ignores_trailing_comments` covers both `--` and `/* */` tails.

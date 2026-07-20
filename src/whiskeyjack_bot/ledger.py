@@ -29,6 +29,7 @@ LEDGER_SCHEMA_VERSION = 1
 
 _MIGRATIONS_PACKAGE = "whiskeyjack_bot.migrations"
 _MIGRATION_NAME_RE = re.compile(r"^(\d+)_.*\.sql$")
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _BUSY_TIMEOUT_MS = 5000
 
 
@@ -218,8 +219,9 @@ def _statements(sql: str) -> list[str]:
     The scan emits at every top-level statement terminator, so more than one
     statement may share a physical line (``CREATE TABLE a(x); CREATE TABLE b(y);``)
     -- ``conn.execute`` rejects a chunk holding two statements, so the split must be
-    exact, not line-based. A non-comment remainder after the last complete statement
-    means the final statement is unterminated and is rejected.
+    exact, not line-based. A remainder after the last complete statement that is not
+    purely ``--`` line comments or ``/* ... */`` block comments means the final
+    statement is unterminated and is rejected.
     """
     statements: list[str] = []
     buffer = ""
@@ -239,8 +241,13 @@ def _statements(sql: str) -> list[str]:
 
 
 def _has_executable_sql(text: str) -> bool:
-    """True if ``text`` holds anything beyond blank lines and ``--`` comments."""
+    """True if ``text`` holds SQL beyond blank lines and ``--`` / ``/* */`` comments.
+
+    Used only on the remainder trailing the last complete statement, where a
+    well-formed migration leaves nothing but whitespace and comments.
+    """
+    without_block_comments = _BLOCK_COMMENT_RE.sub("", text)
     return any(
         stripped and not stripped.startswith("--")
-        for stripped in (line.strip() for line in text.splitlines())
+        for stripped in (line.strip() for line in without_block_comments.splitlines())
     )

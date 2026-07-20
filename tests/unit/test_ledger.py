@@ -357,6 +357,13 @@ def test_statement_splitter_splits_multiple_statements_on_one_line() -> None:
         conn.close()
 
 
+def test_statement_splitter_ignores_trailing_comments() -> None:
+    # A migration may end with trailing -- line or /* block */ comments after the
+    # final terminator; these are not an unterminated statement.
+    assert _statements("SELECT 1; /* trailing; comment */\n") == ["SELECT 1;"]
+    assert _statements("SELECT 1;\n-- trailing line comment\n") == ["SELECT 1;"]
+
+
 def test_statement_splitter_rejects_unterminated_statement() -> None:
     with pytest.raises(LedgerError):
         _statements("CREATE TABLE t (a TEXT)")  # no terminating semicolon
