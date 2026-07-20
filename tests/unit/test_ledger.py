@@ -11,6 +11,7 @@ import pytest
 from whiskeyjack_bot.ledger import (
     LEDGER_SCHEMA_VERSION,
     LedgerError,
+    _statements,
     connect,
     initialize_ledger,
 )
@@ -195,6 +196,10 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_schema_is_deterministic(tmp_path: Path) -> None:
+    # Asserts *schema* (DDL) determinism only: two fresh initializations produce an
+    # identical set of CREATE statements in sqlite_master. It deliberately does not
+    # compare data, file bytes, WAL state, or schema_migrations.applied_at_utc (which
+    # is a wall-clock timestamp and so is expected to differ between runs).
     def schema(db: Path) -> list[tuple[object, ...]]:
         initialize_ledger(db)
         conn = connect(db)
@@ -213,6 +218,12 @@ def test_schema_is_deterministic(tmp_path: Path) -> None:
 PLANTED_SECRET = "privateFAKE123456"
 
 
+def _assert_no_leak(excinfo: pytest.ExceptionInfo[LedgerError]) -> None:
+    assert PLANTED_SECRET not in str(excinfo.value)
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert PLANTED_SECRET not in rendered
+
+
 def test_non_database_file_raises_ledger_error_without_leaking(tmp_path: Path) -> None:
     # A non-SQLite file at the target path makes the first PRAGMA raise; the
     # module wraps it in LedgerError with `from None` so the file's bytes
@@ -221,6 +232,97 @@ def test_non_database_file_raises_ledger_error_without_leaking(tmp_path: Path) -
     db.write_text(PLANTED_SECRET, encoding="utf-8")
     with pytest.raises(LedgerError) as excinfo:
         initialize_ledger(db)
-    assert PLANTED_SECRET not in str(excinfo.value)
-    rendered = "".join(traceback.format_exception(excinfo.value))
-    assert PLANTED_SECRET not in rendered
+    _assert_no_leak(excinfo)
+
+
+def test_malformed_schema_migrations_raises_ledger_error_without_leaking(tmp_path: Path) -> None:
+    # A *valid* SQLite database whose schema_migrations.version holds a non-integer
+    # secret. Reading it converts version with int(); the module must wrap the
+    # resulting ValueError in LedgerError so the planted value never surfaces
+    # through the message or a rendered traceback.
+    db = tmp_path / "planted.db"
+    raw = sqlite3.connect(db)
+    try:
+        raw.execute(
+            "CREATE TABLE schema_migrations (version TEXT, applied_at_utc TEXT, checksum TEXT)"
+        )
+        raw.execute(
+            "INSERT INTO schema_migrations (version, applied_at_utc, checksum) VALUES (?, ?, ?)",
+            (PLANTED_SECRET, TS, "sha"),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+    with pytest.raises(LedgerError) as excinfo:
+        initialize_ledger(db)
+    _assert_no_leak(excinfo)
+
+
+def test_null_textual_primary_key_rejected(tmp_path: Path) -> None:
+    # Textual PKs carry an explicit NOT NULL; without it SQLite rowid tables accept
+    # multiple NULL-identity rows.
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO research_runs (retrieval_run_id, provider, started_at_utc, "
+                "created_at_utc) VALUES (NULL, 'asknews', ?, ?)",
+                (TS, TS),
+            )
+    finally:
+        conn.close()
+
+
+def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
+    # Corrupting the recorded checksum simulates the packaged migration changing
+    # after it was applied; re-initialization must fail rather than silently accept
+    # the drift.
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        conn.execute("UPDATE schema_migrations SET checksum = 'tampered'")
+    finally:
+        conn.close()
+    with pytest.raises(LedgerError):
+        initialize_ledger(db)
+
+
+def test_newer_database_version_is_rejected(tmp_path: Path) -> None:
+    # A schema_migrations row from a future build must not be silently downgraded.
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at_utc, checksum) VALUES (?, ?, ?)",
+            (LEDGER_SCHEMA_VERSION + 1, TS, "future"),
+        )
+    finally:
+        conn.close()
+    with pytest.raises(LedgerError):
+        initialize_ledger(db)
+
+
+def test_statement_splitter_preserves_triggers_and_literals() -> None:
+    # The runner must apply the append-only triggers deferred to M1-602/603: a
+    # semicolon inside a trigger body or a string literal must not split a statement,
+    # and a trailing inline comment must not create a spurious one.
+    sql = (
+        "CREATE TABLE t (a TEXT);\n"
+        "CREATE TRIGGER t_no_update BEFORE UPDATE ON t BEGIN\n"
+        "    SELECT RAISE(ABORT, 'no; updates');\n"
+        "END;\n"
+        "INSERT INTO t (a) VALUES ('x;y'); -- trailing; comment\n"
+    )
+    statements = _statements(sql)
+    assert len(statements) == 3
+    assert statements[1].startswith("CREATE TRIGGER")
+    assert statements[1].rstrip().endswith("END;")
+
+
+def test_statement_splitter_rejects_unterminated_statement() -> None:
+    with pytest.raises(LedgerError):
+        _statements("CREATE TABLE t (a TEXT)")  # no terminating semicolon

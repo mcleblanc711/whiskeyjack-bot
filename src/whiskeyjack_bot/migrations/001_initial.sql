@@ -1,17 +1,23 @@
 -- M1-601: initial attribution-ledger schema.
 --
 -- SQLite is the v1 source of truth (decision D16). The ledger is append-only
--- and replayable: forecasts, their evidence, approvals, submission attempts,
--- resolutions and scores (decision D25 -- never overwrite history).
+-- by policy -- forecasts, their evidence, approvals, submission attempts,
+-- resolutions and scores are never overwritten (decision D25). Database-level
+-- enforcement of that policy (triggers blocking UPDATE/DELETE) lands with
+-- M1-602/M1-603; this migration defines the schema only.
 --
 -- Connection-level settings (WAL journal, foreign_keys, busy_timeout) are set
 -- per connection in whiskeyjack_bot.ledger, not here: PRAGMAs are not part of
 -- the persisted schema and several are ignored inside a transaction.
 --
+-- Textual primary keys carry an explicit NOT NULL: in an ordinary SQLite rowid
+-- table a non-INTEGER PRIMARY KEY does not by itself forbid NULL, which would
+-- permit multiple unaddressable NULL-identity rows.
+--
 -- Timestamps are TEXT ISO-8601 UTC, matching the snapshot convention.
 
 CREATE TABLE forecast_records (
-    record_id             TEXT PRIMARY KEY,
+    record_id             TEXT PRIMARY KEY NOT NULL,
     question_id           INTEGER NOT NULL,
     post_id               INTEGER,
     tournament_id         TEXT NOT NULL,
@@ -35,7 +41,7 @@ CREATE TABLE forecast_records (
 );
 
 CREATE TABLE research_runs (
-    retrieval_run_id     TEXT PRIMARY KEY,
+    retrieval_run_id     TEXT PRIMARY KEY NOT NULL,
     provider             TEXT NOT NULL,
     provider_config_json TEXT,
     queries_json         TEXT,
@@ -49,7 +55,7 @@ CREATE TABLE research_runs (
 );
 
 CREATE TABLE research_documents (
-    document_id       TEXT PRIMARY KEY,
+    document_id       TEXT PRIMARY KEY NOT NULL,
     retrieval_run_id  TEXT NOT NULL REFERENCES research_runs (retrieval_run_id),
     canonical_url     TEXT NOT NULL,
     title             TEXT,
@@ -78,7 +84,7 @@ CREATE TABLE approval_events (
 );
 
 CREATE TABLE submission_attempts (
-    attempt_id                  TEXT PRIMARY KEY,
+    attempt_id                  TEXT PRIMARY KEY NOT NULL,
     forecast_record_id          TEXT NOT NULL REFERENCES forecast_records (record_id),
     idempotency_key             TEXT NOT NULL UNIQUE,
     requested_at_utc            TEXT NOT NULL,
@@ -122,3 +128,17 @@ CREATE TABLE schema_migrations (
     applied_at_utc TEXT NOT NULL,
     checksum       TEXT NOT NULL
 );
+
+-- Supporting indexes for the event-history foreign keys. SQLite auto-indexes
+-- UNIQUE/PRIMARY KEY columns but not plain REFERENCES columns, so ledger-history
+-- lookups ("every event for this forecast/question") would otherwise full-scan.
+CREATE INDEX idx_approval_events_forecast_record_id
+    ON approval_events (forecast_record_id);
+CREATE INDEX idx_submission_attempts_forecast_record_id
+    ON submission_attempts (forecast_record_id);
+CREATE INDEX idx_resolution_events_forecast_record_id
+    ON resolution_events (forecast_record_id);
+CREATE INDEX idx_resolution_events_question_id
+    ON resolution_events (question_id);
+CREATE INDEX idx_score_events_forecast_record_id
+    ON score_events (forecast_record_id);
