@@ -1106,3 +1106,63 @@ leak.
 
 Adapter/write-path behavior and `raw_response_path` bundling remain unimplemented and
 unverifiable here, as in previous rounds.
+
+---
+
+# Round 5 — disposition
+
+Both findings reproduced and are fixed. Gates: **219 passed** (was 205; the M1-301 suite went
+101 → 114), `ruff check` clean, `ruff format --check` clean, `mypy --strict src` clean,
+`git diff --check master...HEAD` clean.
+
+Both findings are **self-inflicted**: each one is a defect in a fix from the previous round,
+not in the original schema. Worth stating plainly, because the shape is now unmistakable —
+round 4's two additions were a blanket category ban and a magnitude ceiling, and both were
+approximations standing in for a rule I did not look up. That is the same "hand-rolled
+enumeration drifts from its claim" pattern named in round 4's own disposition, committed in
+the act of fixing it.
+
+## 1. Blanket `Cf` ban rejects standards-valid IDN hostnames
+
+Both examples reproduced: `نامه‌ای.ir` and `क्‍ष.com` were rejected, and both encode
+cleanly to punycode. This directly falsifies round 4's written claim that "IDN hostnames are
+unaffected (`https://münchen.de/a` still validates)" — that check confirmed the case that
+happened to be safe and generalized from it. U+200C/U+200D are *required* between certain
+scripts' letters; a category-wide ban cannot express "valid here, invalid there".
+
+The underlying theory was still right — U+200B and the bidi overrides are invisible wherever a
+human would check a URL — so the fix keeps the guard and moves it to where the standard has an
+opinion:
+
+- `_is_forbidden_in_url` now rejects whitespace and `Cc` only, everywhere in the URL.
+- The hostname additionally goes through `idna.encode()` (IDNA 2008, including CONTEXTJ), which
+  accepts ZWNJ/ZWJ exactly where the contextual rules do and still refuses U+200B, U+200E and
+  U+202E, which are valid in no context. Its errors are caught and replaced with the same
+  constant message `from None`, since `idna` embeds the offending label in its exceptions.
+
+This adds one direct dependency, `idna>=3.4,<4`. It is **not a new install** — it was already
+in `uv.lock` transitively via httpx — but the schema now imports it, and an undeclared
+transitive import works right up until the intermediate drops it, then fails as a missing
+module at validation time rather than at install time. `test_dependency_pins.py` asserts the
+declaration so it cannot regress to transitive. Flagging the dependency addition explicitly
+rather than letting it pass as an implementation detail on a schema ticket.
+
+## 2. Model and database disagree about valid finite costs
+
+Reproduced: `cost_usd=1.1e308` validates and then fails to persist. Round 4 introduced
+`> 1e308` in the trigger as a stand-in for "infinite" and described it in the migration comment
+as "no real run costs 1e308 dollars" — a plausibility argument where a correctness one was
+needed. The finding is right that this recreates the exact model/table fidelity gap this
+schema exists to close, in the same commit that was closing another instance of it.
+
+Taking the suggested route: the trigger now tests `NEW.cost_usd = 9e999`. SQLite overflows that
+literal to REAL infinity when parsing, making it an infinity **sentinel** rather than a
+magnitude bound, so the SQL and `math.isfinite` now share one definition of finite. Negative
+infinity needs no case of its own — `< 0` already covers it. A parametrized test round-trips
+`0`, `0.02`, `1.1e308` and `1.7976931348623157e308` (the largest float) through both the model
+and the database and asserts they agree.
+
+## Standing items
+
+Adapter/write-path behavior and `raw_response_path` bundling remain unimplemented and
+unverifiable, unchanged across all five rounds.

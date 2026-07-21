@@ -456,10 +456,6 @@ def test_finite_floats_still_round_trip() -> None:
         # only, while its comment claimed to cover both ranges.
         "https://exa\u0085mple.org/a",  # NEL
         "https://exa\u009fmple.org/a",
-        # Cf format characters: invisible wherever a human would check a URL, so
-        # a spoofing vector rather than a typo.
-        "https://exa\u200bmple.org/a",  # zero-width space
-        "https://example.org/\u202ea",  # right-to-left override
     ],
 )
 def test_urls_must_be_absolute_http(url: str) -> None:
@@ -467,6 +463,41 @@ def test_urls_must_be_absolute_http(url: str) -> None:
         validate_document(_document(original_url=url))
     with pytest.raises(ResearchSchemaError):
         validate_document(_document(canonical_url=url))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # U+200C/U+200D are *required* between certain scripts' letters, so IDNA
+        # accepts these labels and so must the schema. A blanket Cf ban did not.
+        "https://\u0646\u0627\u0645\u0647\u200c\u0627\u06cc.ir/a",  # ZWNJ, Persian
+        "https://\u0915\u094d\u200d\u0937.com/a",  # ZWJ, Devanagari
+        "https://münchen.de/a",
+        "https://例え.jp/a",
+        "https://example.org/a",
+    ],
+)
+def test_standards_valid_international_hostnames_are_accepted(url: str) -> None:
+    assert validate_document(_document(original_url=url)).original_url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Cf that IDNA rejects wherever it appears: valid in no context.
+        "https://exa\u200bmple.org/a",  # zero-width space
+        "https://ex\u202eample.org/a",  # right-to-left override
+        "https://ex\u200emple.org/a",  # left-to-right mark
+        # ZWNJ in a context the contextual rules do not permit.
+        "https://ab\u200ccd.com/a",
+        # Not a hostname at all once encoded.
+        "https://-leading-hyphen.com/a",
+        "https://exam ple.org/a",
+    ],
+)
+def test_hostnames_idna_refuses_are_rejected(url: str) -> None:
+    with pytest.raises(ResearchSchemaError):
+        validate_document(_document(original_url=url))
 
 
 def test_url_validation_does_not_rewrite_the_url() -> None:
@@ -626,6 +657,27 @@ def test_database_rejects_wrongly_typed_counters(
     try:
         with pytest.raises(sqlite3.IntegrityError):
             _insert_run(conn, provider="xai_x_search", agent_model="grok-4", **{column: value})
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("cost", [0, 0.02, 1.1e308, 1.7976931348623157e308])
+def test_model_and_database_agree_on_valid_costs(tmp_path: Path, cost: float) -> None:
+    """Anything the model accepts must be storable, up to the largest float.
+
+    An earlier trigger used `> 1e308` as a stand-in for "infinite", which
+    rejected finite costs the model had just validated -- validation passing and
+    persistence failing is the model/table fidelity gap this schema exists to
+    close. The trigger now tests SQLite's infinity sentinel instead, so the two
+    definitions of "finite" are the same definition.
+    """
+    run = validate_run(_run(cost_usd=cost))
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        _insert_run(conn, cost_usd=run.cost_usd)
+        assert conn.execute("SELECT cost_usd FROM research_runs").fetchone()[0] == cost
     finally:
         conn.close()
 

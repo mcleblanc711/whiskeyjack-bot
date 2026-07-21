@@ -34,8 +34,13 @@ Delivered:
   `provenance` on `research_documents`; `agent_model`, `posts_dropped_no_url` and `question_id`
   on `research_runs`, plus the `BEFORE INSERT`/`BEFORE UPDATE` triggers that enforce them.
   `LEDGER_SCHEMA_VERSION` bumped to 2.
-- `tests/unit/test_research.py` — 101 tests. Suite: 205 passed; ruff check + format +
+- `tests/unit/test_research.py` — 114 tests. Suite: 219 passed; ruff check + format +
   `mypy --strict src` clean.
+- `pyproject.toml` — **one new direct dependency, `idna>=3.4,<4`**, for IDNA hostname
+  validation in `model.py`. Not a new install: it was already in the lock transitively via
+  httpx. Declared because the schema imports it directly, and an undeclared transitive import
+  keeps working right up until the intermediate drops it. `tests/unit/test_dependency_pins.py`
+  asserts the declaration so it cannot silently regress to transitive.
 
 Two fields did not exist in M1-601 and are added here rather than by editing `001_initial.sql`
 (which is checksum-pinned):
@@ -78,7 +83,12 @@ Deviations:
 - **`cost_usd` must be finite, explicitly.** `ge=0` rejected `-inf` and `NaN` as a side effect
   (both comparisons are false), which made `+inf` look covered when it was not: it validated and
   then serialized to `null`, so an unbounded cost persisted as *no recorded cost*. Same failure
-  shape as the `provider_config` one, in a field that predated it.
+  shape as the `provider_config` one, in a field that predated it. The SQL side tests SQLite's
+  infinity **sentinel** (`= 9e999`, which overflows to REAL infinity when parsed), not a
+  magnitude ceiling: round 4's `> 1e308` rejected finite costs the model had just accepted, so
+  validation passed and persistence failed — reopening the model/table fidelity gap in the act
+  of closing another one (round 5). Model and database now share one definition of "finite",
+  pinned by a test that round-trips `1.7976931348623157e308` through both.
 - **`reliability_tag` is conditionally required, never unconditionally.** It is NULL for every
   provider with no trust model of its own; it is required only of social documents. Enforced both
   model-side and by trigger.
@@ -109,9 +119,16 @@ Deviations:
   like `:99999` is only caught by touching it. Round 4 then found the character check itself was
   hand-rolled and wrong: it enumerated C0 plus DEL while its comment claimed C0 *and* C1, so U+0085
   and U+009F passed, and raw interior spaces passed because only the ends were checked. It now asks
-  `unicodedata` (`str.isspace()` or category `Cc`/`Cf`) rather than enumerating — `Cf` included
-  because zero-width and bidi-override characters are invisible wherever a human would inspect a
-  URL, making them a spoofing vector rather than a typo. IDN hostnames are unaffected.
+  `unicodedata` (`str.isspace()` or category `Cc`) rather than enumerating. Round 4 also added a
+  blanket `Cf` ban on the theory that zero-width and bidi-override characters are invisible
+  wherever a human would inspect a URL — and the claim made here that "IDN hostnames are
+  unaffected" was **wrong**: U+200C/U+200D are *required* between certain scripts' letters, so
+  the ban rejected standards-valid hostnames like `نامه‌ای.ir` and `क्‍ष.com` (round 5). The
+  theory was right and the blanket rule was not. `Cf` is now judged where it actually matters —
+  the hostname — by `idna.encode()`, which applies IDNA 2008 including CONTEXTJ: it accepts
+  ZWNJ/ZWJ exactly where the standard does and still refuses U+200B and the bidi overrides,
+  which are valid in no context. That keeps the spoofing guard without the collateral, and
+  follows the same delegate-to-the-authority rule as the character checks.
 - **`provider_config` is `dict[str, PersistableJson]`, not `dict[str, Any]` or bare `JsonValue`.**
   The column is `provider_config_json TEXT`; a value that cannot round-trip through JSON is not
   storable, and must fail at validation rather than inside the ledger write, after the run has

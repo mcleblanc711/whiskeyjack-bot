@@ -3437,6 +3437,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "forecasting-tools" },
+    { name = "idna" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -3453,6 +3454,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "forecasting-tools", specifier = "==0.2.92" },
+    { name = "idna", specifier = ">=3.4,<4" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
 ]

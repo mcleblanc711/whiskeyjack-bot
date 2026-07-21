@@ -136,14 +136,18 @@ BEGIN
            OR NEW.posts_dropped_no_url IS NULL);
 
     -- typeof() for the same affinity reason as posts_dropped_no_url, and the
-    -- 1e308 bound because `< 0` alone accepts infinity: SQLite stores it as REAL
-    -- and it serializes back out as null, so an unbounded cost would persist as
-    -- an unrecorded one. No real run costs 1e308 dollars.
+    -- `= 9e999` test because `< 0` alone accepts infinity: SQLite stores it as
+    -- REAL and reads it back out as null, so an unbounded cost would persist as
+    -- an unrecorded one. 9e999 overflows to REAL infinity when SQLite parses it,
+    -- which makes it the infinity *sentinel* rather than a magnitude bound -- an
+    -- earlier `> 1e308` ceiling here rejected finite costs the model accepted,
+    -- so validation passed and persistence failed (review round 5). Negative
+    -- infinity needs no case of its own: it is caught by `< 0`.
     SELECT RAISE(ABORT, 'research_runs: cost_usd must be a finite non-negative number')
     WHERE NEW.cost_usd IS NOT NULL
       AND (typeof(NEW.cost_usd) NOT IN ('integer', 'real')
            OR NEW.cost_usd < 0
-           OR NEW.cost_usd > 1e308);
+           OR NEW.cost_usd = 9e999);
 END;
 
 CREATE TRIGGER research_runs_require_question_on_update
@@ -163,12 +167,16 @@ BEGIN
            OR NEW.posts_dropped_no_url IS NULL);
 
     -- typeof() for the same affinity reason as posts_dropped_no_url, and the
-    -- 1e308 bound because `< 0` alone accepts infinity: SQLite stores it as REAL
-    -- and it serializes back out as null, so an unbounded cost would persist as
-    -- an unrecorded one. No real run costs 1e308 dollars.
+    -- `= 9e999` test because `< 0` alone accepts infinity: SQLite stores it as
+    -- REAL and reads it back out as null, so an unbounded cost would persist as
+    -- an unrecorded one. 9e999 overflows to REAL infinity when SQLite parses it,
+    -- which makes it the infinity *sentinel* rather than a magnitude bound -- an
+    -- earlier `> 1e308` ceiling here rejected finite costs the model accepted,
+    -- so validation passed and persistence failed (review round 5). Negative
+    -- infinity needs no case of its own: it is caught by `< 0`.
     SELECT RAISE(ABORT, 'research_runs: cost_usd must be a finite non-negative number')
     WHERE NEW.cost_usd IS NOT NULL
       AND (typeof(NEW.cost_usd) NOT IN ('integer', 'real')
            OR NEW.cost_usd < 0
-           OR NEW.cost_usd > 1e308);
+           OR NEW.cost_usd = 9e999);
 END;

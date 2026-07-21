@@ -49,6 +49,7 @@ from math import isfinite
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
+import idna
 from pydantic import (
     AfterValidator,
     AwareDatetime,
@@ -104,7 +105,7 @@ _BAD_URL = "must be an absolute http(s) URL with a hostname (offending input wit
 def _is_forbidden_in_url(char: str) -> bool:
     """Characters that may not appear anywhere in a stored URL.
 
-    Three groups, all of which got through an earlier version of this check that
+    Two groups, both of which got through an earlier version of this check that
     enumerated C0 plus DEL by hand (review round 4):
 
     - **Whitespace, anywhere.** A raw space is not a valid URI character; it has
@@ -114,17 +115,20 @@ def _is_forbidden_in_url(char: str) -> bool:
     - **``Cc`` controls.** The hand-rolled set covered C0 and DEL but *not* C1
       (U+0080-U+009F), while its comment claimed both -- so U+0085 (NEL) and
       U+009F sailed through. Asking Unicode keeps the code and the claim in sync.
-    - **``Cf`` format characters.** Zero-width joiners and the bidi overrides are
-      invisible in any renderer a human would check a URL in, which makes them a
-      spoofing vector rather than a typo. Ambiguity rule 4: no legitimate URL
-      carries one unencoded.
+
+    ``Cf`` format characters were briefly rejected here too, on the theory that
+    zero-width and bidi-override characters are invisible wherever a human would
+    check a URL. The theory is sound but the blanket rule was not: U+200C/U+200D
+    are *required* in some IDNA labels, so it rejected standards-valid hostnames
+    like ``نامه‌ای.ir`` (review round 5). Cf is now judged by IDNA contextual
+    rules in the hostname, where it matters -- see :func:`_require_http_url`.
 
     ``urlsplit`` *silently deletes* tab, LF and CR (the WHATWG rule), so this
     cannot be left to the parser -- it reports a clean host while the string
     being stored still carries the character. Rejected rather than stripped:
     this validator does not rewrite.
     """
-    return char.isspace() or unicodedata.category(char) in ("Cc", "Cf")
+    return char.isspace() or unicodedata.category(char) == "Cc"
 
 
 def _require_http_url(value: str) -> str:
@@ -162,7 +166,33 @@ def _require_http_url(value: str) -> str:
         raise ValueError(_BAD_URL)
     if port is not None and not 1 <= port <= 65535:
         raise ValueError(_BAD_URL)
+    _require_encodable_hostname(hostname)
     return value
+
+
+def _require_encodable_hostname(hostname: str) -> None:
+    """Require a hostname the DNS could actually be asked about.
+
+    Delegated to ``idna`` rather than hand-checked, for the same reason the
+    character rules ask ``unicodedata``: this is a standard with contextual
+    rules, and any enumeration of it drifts. ``idna.encode`` applies IDNA 2008
+    including CONTEXTJ, which is what distinguishes the two cases a blanket
+    category ban cannot:
+
+    - U+200C/U+200D **are valid** between particular scripts' letters, so
+      ``نامه‌ای.ir`` and ``क्‍ष.com`` encode successfully and must be accepted.
+    - U+200B and the bidi overrides are valid nowhere, so they are still refused
+      -- which was the point of the round-4 Cf rule, kept without its collateral.
+
+    Pure ASCII hostnames take the same path; ``idna`` accepts them unchanged, so
+    there is no fast-path branch to keep in sync.
+    """
+    try:
+        idna.encode(hostname)
+    except idna.IDNAError:
+        # Constant message and from None, as everywhere in this validator: the
+        # idna exceptions embed the offending label.
+        raise ValueError(_BAD_URL) from None
 
 
 # An absolute http(s) URL, preserved exactly. See _require_http_url.
