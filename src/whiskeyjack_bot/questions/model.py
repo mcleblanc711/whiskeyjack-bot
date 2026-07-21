@@ -89,6 +89,14 @@ class _CanonicalQuestionBase(_StrictModel):
     # subquestions without losing the parent linkage.
     group_question_option: str | None = None
     question_ids_of_group: list[int] | None = None
+    # M1-202. Unpacking builds each subquestion's ``title`` from the subquestion
+    # block and discards the parent post's title, so a subquestion whose own title
+    # is just an option label ("September 2024") is not self-describing on its own.
+    # The parent title is recovered here so the forecaster always receives what is
+    # actually being asked. Only the title is lifted from the raw post payload --
+    # never the payload itself, which carries community-prediction aggregations
+    # that must not reach a forecaster input (v1 hard constraint).
+    group_parent_title: str | None = None
 
 
 class CanonicalBinaryQuestion(_CanonicalQuestionBase):

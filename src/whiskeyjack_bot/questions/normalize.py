@@ -75,6 +75,35 @@ def _sanitize(exc: ValidationError) -> NormalizationError:
     )
 
 
+def _group_parent_title(q: MetaculusQuestion) -> str | None:
+    """The group parent's post title, for a question that is a group member (M1-202).
+
+    Expansion sets a subquestion's ``question_text`` from the subquestion block and
+    drops the parent post's title, so a subquestion titled only with its option label
+    ("September 2024") carries no statement of what is being asked. The parent title
+    survives on the raw post payload the SDK retains, and is lifted back out here.
+
+    Only the title is taken. The payload itself is never carried onto the canonical
+    model: it contains the community-prediction aggregations, and the canonical
+    question is the forecaster's input boundary (community prediction is never a
+    forecaster input in v1).
+
+    Returns ``None`` for a non-group question, and for a group member whose payload
+    is absent -- a question rebuilt from a snapshot has no obligation to carry one.
+    """
+    if not q.question_ids_of_group:
+        return None
+    payload = getattr(q, "api_json", None)
+    if not isinstance(payload, dict):
+        return None
+    title = payload.get("title")
+    # A blank title is no more use than a missing one, and normalizing it here keeps
+    # the "is this self-describing" test downstream a simple None check.
+    if not isinstance(title, str) or not title.strip():
+        return None
+    return title
+
+
 def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
     """Read the fields shared by every supported type off the SDK object."""
     return {
@@ -102,6 +131,7 @@ def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
         ],
         "group_question_option": q.group_question_option,
         "question_ids_of_group": q.question_ids_of_group,
+        "group_parent_title": _group_parent_title(q),
     }
 
 
@@ -173,5 +203,31 @@ def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
 
 
 def normalize_questions(questions: list[MetaculusQuestion]) -> list[CanonicalQuestion]:
-    """Normalize a list of SDK questions; propagates the first failure."""
-    return [normalize_question(q) for q in questions]
+    """Normalize a list of SDK questions; propagates the first failure.
+
+    Enforces that ``question_id`` is unique across the batch (M1-202). Group
+    expansion is where this earns its keep: every subquestion of a group is built by
+    deep-copying the parent post, so siblings share ``post_id``, ``url`` and the
+    parent's framing fields, and ``question_id`` is the only thing telling them
+    apart. A duplicate here means either an expansion defect or the same question
+    fetched twice, and both would collide on the ledger's
+    ``UNIQUE (question_id, tournament_id, forecast_version)`` -- but only after a
+    forecast had been generated and paid for. Failing at the boundary is cheaper.
+    """
+    canonical = [normalize_question(q) for q in questions]
+
+    seen: set[int] = set()
+    duplicates = 0
+    for question in canonical:
+        if question.question_id in seen:
+            duplicates += 1
+        seen.add(question.question_id)
+    if duplicates:
+        # Count only. The colliding id is low-risk content, but the no-echo rule is
+        # unconditional and the softer reading of it has been a review finding.
+        raise NormalizationError(
+            f"question batch contains {duplicates} duplicate question id(s) "
+            "(ids withheld: an error message never echoes record content)"
+        )
+
+    return canonical

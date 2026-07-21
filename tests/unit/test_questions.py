@@ -251,6 +251,8 @@ def fake_sdk_question(**overrides: object) -> SimpleNamespace:
         "categories": [],
         "group_question_option": None,
         "question_ids_of_group": None,
+        # Read only for a group member, to recover the parent post's title (M1-202).
+        "api_json": {},
     }
     # Type-specific attrs are legitimately absent from the base (normalize reads them
     # only for their own type), so they are allowed per-type rather than globally: a
