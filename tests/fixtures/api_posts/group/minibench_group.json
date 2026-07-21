@@ -1,0 +1,77 @@
+{
+  "id": 90004,
+  "title": "[SYNTHETIC FIXTURE] Will the example agency's monthly index exceed 3% in each of the following months?",
+  "published_at": "2026-07-02T09:30:00Z",
+  "nr_forecasters": 21,
+  "forecasts_count": 58,
+  "projects": {
+    "tournament": [
+      {"slug": "minibench", "name": "MiniBench"}
+    ],
+    "category": [
+      {"id": 47, "name": "Economics", "slug": "economics"}
+    ],
+    "default_project": {"id": 90900, "slug": "minibench", "name": "MiniBench"}
+  },
+  "group_of_questions": {
+    "description": "Synthetic fixture group for offline tests. Shaped like a MiniBench group question; never submitted anywhere. The framing below is stated once on the parent and overrides each subquestion.",
+    "resolution_criteria": "Each subquestion resolves YES if the example agency's published monthly index for that month exceeds 3.0%.",
+    "fine_print": "The first published value is used; subsequent revisions are ignored.",
+    "questions": [
+      {
+        "id": 91011,
+        "type": "binary",
+        "title": "September 2026",
+        "label": "September 2026",
+        "status": "open",
+        "open_time": "2026-07-02T09:30:00Z",
+        "scheduled_close_time": "2026-09-30T23:59:00Z",
+        "scheduled_resolve_time": "2026-10-15T12:00:00Z",
+        "cp_reveal_time": "2026-07-09T09:30:00Z",
+        "actual_resolve_time": null,
+        "resolution": null,
+        "include_bots_in_aggregates": true,
+        "question_weight": 0.5,
+        "description": "Subquestion-local description that the parent block overrides.",
+        "resolution_criteria": "Subquestion-local criteria that the parent block overrides.",
+        "fine_print": "Subquestion-local fine print that the parent block overrides.",
+        "unit": "%",
+        "my_forecasts": {"history": null}
+      },
+      {
+        "id": 91017,
+        "type": "binary",
+        "title": "[SYNTHETIC FIXTURE] Will the index exceed 3% in October 2026?",
+        "label": "October 2026",
+        "status": "open",
+        "open_time": "2026-07-02T09:30:00Z",
+        "scheduled_close_time": "2026-10-31T23:59:00Z",
+        "scheduled_resolve_time": "2026-11-16T12:00:00Z",
+        "cp_reveal_time": "2026-07-11T09:30:00Z",
+        "actual_resolve_time": null,
+        "resolution": null,
+        "include_bots_in_aggregates": true,
+        "question_weight": 1.0,
+        "unit": "%",
+        "my_forecasts": {"history": null}
+      },
+      {
+        "id": 91023,
+        "type": "binary",
+        "title": "November 2026",
+        "label": "November 2026",
+        "status": "open",
+        "open_time": "2026-07-04T16:45:00Z",
+        "scheduled_close_time": "2026-11-30T23:59:00Z",
+        "scheduled_resolve_time": "2026-12-14T12:00:00Z",
+        "cp_reveal_time": "2026-07-13T16:45:00Z",
+        "actual_resolve_time": null,
+        "resolution": null,
+        "include_bots_in_aggregates": true,
+        "question_weight": 0.75,
+        "unit": "%",
+        "my_forecasts": {"history": null}
+      }
+    ]
+  }
+}
