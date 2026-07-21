@@ -188,6 +188,14 @@ def test_group_question_mode_must_match_sdk_literal(valid_data: dict) -> None:
     expect_rejection(valid_data, "group_question_mode")
 
 
+@pytest.mark.parametrize("value", ["v1.1.0", "1.1", "1.1.0-rc1", "latest", ""])
+def test_prompt_version_must_be_bare_semver(valid_data: dict, value: str) -> None:
+    """M1-401: config holds the bare form; the 'v' prefix lives only in the
+    prompt's H1, so a prefixed config value is rejected at load."""
+    valid_data["forecast"]["prompt_version"] = value
+    expect_rejection(valid_data, "prompt_version")
+
+
 # ── secret safety in diagnostics ─────────────────────────────────────────────
 
 

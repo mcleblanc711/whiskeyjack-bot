@@ -174,6 +174,20 @@ class ForecastConfig(_StrictModel):
     prompt_path: Path
     prompt_version: str
 
+    @field_validator("prompt_version")
+    @classmethod
+    def _bare_semver(cls, v: str) -> str:
+        # M1-401: the prompt's H1 carries a 'v' prefix, config does not. Bare is
+        # the canonical form -- it is what reaches forecast_records.prompt_version
+        # -- so a 'v'-prefixed config value is rejected here rather than becoming
+        # a confusing prompt/config mismatch at load time.
+        if not re.fullmatch(r"\d+\.\d+\.\d+", v):
+            raise ValueError(
+                "forecast.prompt_version must be a bare MAJOR.MINOR.PATCH version "
+                "with no 'v' prefix"
+            )
+        return v
+
     @model_validator(mode="after")
     def _probability_bounds_ordered(self) -> ForecastConfig:
         if self.min_probability >= self.max_probability:
