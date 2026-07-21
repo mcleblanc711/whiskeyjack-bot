@@ -79,6 +79,11 @@ Standing conventions this branch must honor:
    on any path (proxy env vars, `verify_ssl` cert loading, a lazy auth flow), the
    "fails before a paid call" criterion is not actually met.
 
+   The falsifiers I could think of were tested rather than argued: the construction tests
+   were re-run with `HTTPS_PROXY`/`HTTP_PROXY` pointing at an unroutable address and
+   `SSL_CERT_FILE` set, and still pass under the three network guards. **Find a falsifier
+   I did not think of** — that is more valuable here than re-confirming the ones I did.
+
 2. **Content-hash source rule: `full_text` > `summary` > title.** This defines document
    identity. Known caveat, stated in the notes: AskNews's `summary` is LLM-generated and
    may not be byte-stable across calls, so a `full_text`-less article can hash differently
