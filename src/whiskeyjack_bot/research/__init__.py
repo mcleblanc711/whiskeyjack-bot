@@ -6,7 +6,6 @@ import from here so every provider produces one comparable evidence record.
 
 from whiskeyjack_bot.research.asknews import (
     AskNewsRetrieval,
-    AskNewsRetrievalError,
     build_asknews_client,
     retrieve_news,
 )
@@ -25,7 +24,6 @@ from whiskeyjack_bot.research.model import (
 
 __all__ = [
     "AskNewsRetrieval",
-    "AskNewsRetrievalError",
     "Provenance",
     "ReliabilityTag",
     "ResearchDocument",

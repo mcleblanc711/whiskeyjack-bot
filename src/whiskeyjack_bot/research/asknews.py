@@ -26,10 +26,20 @@ drift into its own rule for the same article. See docs/M1-302-NOTES.md for the
 stability caveat on summary-derived hashes.
 
 Error hygiene: this module handles arbitrary retrieved provider text and an API
-key in the same call frame, so every message raised here is a constant. Nothing
-interpolates an article field, a query, or a credential, and SDK failures are
-re-raised ``from None`` so the underlying exception cannot reprint a value through
-a rendered traceback.
+key in the same call frame, so no string it produces is built from provider data.
+Nothing interpolates an article field, a query, or a credential. Two channels are
+easy to miss and are closed deliberately:
+
+- **Exceptions from the provider are discarded, never inspected or re-raised** —
+  an SDK error may quote the request, the response body, or an auth header.
+- **Pydantic serializer warnings embed the offending value in their text**, so
+  every ``model_dump`` of provider data passes ``warnings=False``. This is not
+  noise suppression; a warning is an egress path to stderr and to captured logs.
+
+The module defines no exception type of its own: provider failure is reported as
+data on the returned :class:`AskNewsRetrieval`, not as a raise (see
+:func:`retrieve_news`). The only exception it raises is ``MissingCredentialError``,
+before any network use.
 """
 
 from __future__ import annotations
@@ -40,6 +50,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
+import httpx
 from asknews_sdk import AskNewsSDK
 
 from whiskeyjack_bot.config import AppConfig
@@ -66,15 +77,6 @@ _STRATEGIES: tuple[_Strategy, ...] = (_STRATEGY_CURRENT, _STRATEGY_HISTORICAL)
 _HOURS_PER_DAY = 24
 
 
-class AskNewsRetrievalError(Exception):
-    """AskNews retrieval failed.
-
-    The message is always a constant: the underlying SDK error may quote the
-    request, the response body, or an auth header, none of which may reach a log
-    or a ledger row.
-    """
-
-
 @dataclass(frozen=True)
 class AskNewsRetrieval:
     """One AskNews retrieval pass over one question's queries.
@@ -83,11 +85,26 @@ class AskNewsRetrieval:
     and replay contract that implies — belongs to M1-306; this adapter writes
     nothing to disk, so ``run.raw_response_path`` and every document's
     ``raw_artifact_path`` stay ``None``.
+
+    ``documents_dropped`` and ``duplicates_collapsed`` are routine bookkeeping,
+    not failure: a run that drops an unusable article or collapses the expected
+    current/historical overlap is a *successful* run. They live here rather than
+    on :class:`ResearchRun` because that model has no counter for them and
+    overloading ``error_summary`` would make ordinary runs look failed to the
+    fallback (M1-303) and validation (M1-504) logic. M1-306 decides whether they
+    become persisted columns.
+
+    ``provider_failed`` is the fallback signal: it is ``True`` when a provider
+    call raised, in which case retrieval stopped early and everything already
+    retrieved is still returned.
     """
 
     run: ResearchRun
     documents: tuple[ResearchDocument, ...]
     raw_responses: tuple[dict[str, Any], ...]
+    documents_dropped: int
+    duplicates_collapsed: int
+    provider_failed: bool
 
 
 def build_asknews_client(config: AppConfig) -> AskNewsSDK:
@@ -96,6 +113,15 @@ def build_asknews_client(config: AppConfig) -> AskNewsSDK:
     Raises :class:`MissingCredentialError` when the configured key variable is
     unset or empty, before any network use and therefore before any billable
     call. An empty string counts as missing.
+
+    Retries are applied by injecting an ``httpx`` transport rather than by
+    passing ``retries=`` to the SDK: asknews 0.13.54 stores that argument
+    (``client.py:73``) and never reads it — the request path calls
+    ``httpx.Client.send()`` directly (``client.py:266``) — so the SDK argument is
+    a no-op. Note the scope precisely: an ``httpx`` transport retries
+    **connection failures only**, not HTTP 5xx. That is the safe kind for a
+    metered API, because a request that reached the server is never re-sent and
+    so cannot be billed twice.
     """
     provider = config.retrieval.primary
     api_key = os.environ.get(provider.api_key_env)
@@ -105,7 +131,8 @@ def build_asknews_client(config: AppConfig) -> AskNewsSDK:
         api_key=api_key,
         scopes={"news"},
         timeout=provider.timeout_seconds,
-        retries=provider.retries,
+        # Forwarded to the httpx.Client constructor via the SDK's **kwargs.
+        transport=httpx.HTTPTransport(retries=provider.retries),
     )
 
 
@@ -174,6 +201,13 @@ def retrieve_news(
     every ``retrieved_at_utc`` are deterministic under test and under replay.
     Queries are supplied by the caller; deriving them from a question is not this
     item's job.
+
+    **Never raises on provider failure.** A run makes up to
+    ``max_queries_per_question * 2`` billable calls; raising partway through would
+    discard the record of every call already paid for, which is precisely the kind
+    of shortcut that weakens the ledger. On failure this stops early, sets
+    ``provider_failed``, records the failure in ``run.error_summary``, and returns
+    everything retrieved so far so M1-306 can still persist and replay it.
     """
     retrieval = config.retrieval
     capped_queries = list(queries)[: retrieval.max_queries_per_question]
@@ -189,8 +223,11 @@ def retrieve_news(
     seen: set[tuple[str, str]] = set()
     dropped = 0
     collapsed = 0
+    provider_failed = False
 
     for query in capped_queries:
+        if provider_failed:
+            break
         for strategy in _STRATEGIES:
             try:
                 response = client.news.search_news(
@@ -202,12 +239,18 @@ def retrieve_news(
                     hours_back=hours_back,
                 )
             except Exception:
-                # The SDK error may quote the request or an auth header.
-                raise AskNewsRetrievalError(
-                    "AskNews search failed (provider detail withheld from this message)"
-                ) from None
+                # Stop, but do not raise: calls already made were billed, and
+                # their responses are the only record of that spend. The SDK
+                # error is discarded entirely rather than inspected -- it may
+                # quote the request, the response body, or an auth header.
+                provider_failed = True
+                break
 
-            raw_responses.append(response.model_dump(mode="json"))
+            # warnings=False is a secret-egress control, not cosmetic noise
+            # suppression: pydantic's serializer warnings embed the offending
+            # *value* in their text, and this dict is built from untrusted
+            # provider data. Do not remove. (GPT review round 1, finding 1.)
+            raw_responses.append(response.model_dump(mode="json", warnings=False))
 
             for article in response.as_dicts or []:
                 try:
@@ -246,7 +289,7 @@ def retrieve_news(
             "completed_at_utc": now,
             "freshness_cutoff_utc": now - timedelta(days=retrieval.freshness_days_default),
             "error_summary": _error_summary(
-                dropped=dropped, collapsed=collapsed, retained=len(documents)
+                provider_failed=provider_failed, retained=len(documents)
             ),
             # AskNews reports usage in credits, not currency, and no credit->USD
             # rate is configured. Recording a converted number would put an
@@ -260,16 +303,28 @@ def retrieve_news(
         run=run,
         documents=tuple(documents),
         raw_responses=tuple(raw_responses),
+        documents_dropped=dropped,
+        duplicates_collapsed=collapsed,
+        provider_failed=provider_failed,
     )
 
 
-def _error_summary(*, dropped: int, collapsed: int, retained: int) -> str | None:
-    """Summarize a run's losses without echoing any retrieved value."""
+def _error_summary(*, provider_failed: bool, retained: int) -> str | None:
+    """Describe an actual failure, or return None for a successful run.
+
+    Scoped to the schema's own meaning for this field — "set when the run failed
+    or returned nothing" (`research/model.py`). Routine drops and intra-run
+    duplicate collapsing are *not* failures and deliberately do not appear here;
+    they ride on :class:`AskNewsRetrieval` instead. Putting them here made
+    ordinary runs indistinguishable from failed ones for the fallback (M1-303)
+    and validation (M1-504) logic that reads this field. (GPT review round 1,
+    finding 3.)
+
+    Built from constants and integers only; no retrieved value reaches it.
+    """
     parts: list[str] = []
+    if provider_failed:
+        parts.append("provider call failed; retrieval stopped early")
     if retained == 0:
         parts.append("no documents retained")
-    if dropped:
-        parts.append(f"{dropped} article(s) dropped: unusable url or shape")
-    if collapsed:
-        parts.append(f"{collapsed} intra-run duplicate(s) collapsed")
     return "; ".join(parts) if parts else None

@@ -17,6 +17,11 @@ dependencies = [
     # stay inside that range or `uv sync --locked` conflicts.
     "asknews>=0.13,<0.14",
     "forecasting-tools==0.2.92",
+    # Imported directly by research.asknews to inject a retrying transport into
+    # the AskNews client (the SDK's own retries= argument is a no-op in 0.13.54).
+    # Transitive via both asknews and forecasting-tools; declared for the same
+    # reason as idna below.
+    "httpx>=0.27,<1",
     # IDNA 2008 + contextual rules, for hostname validation in research.model.
     # Already present transitively (httpx); declared directly because the schema
     # imports it, and an undeclared transitive import breaks whenever the
@@ -38,6 +43,11 @@ packages = ["src/whiskeyjack_bot"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --disable-socket --allow-hosts=127.0.0.0/8,::1"
+# Pydantic serializer warnings quote the offending *value*, so they are a
+# secret-egress channel to stderr and to captured logs, not cosmetic noise.
+# Any such warning anywhere in the suite is a failure. Scoped to this one
+# message so asknews_sdk's unrelated PydanticDeprecatedSince20 still passes.
+filterwarnings = ["error:Pydantic serializer warnings:UserWarning"]
 
 [tool.ruff]
 line-length = 100

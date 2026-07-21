@@ -47,3 +47,18 @@ def test_asknews_is_a_declared_dependency() -> None:
         "research.asknews imports asknews_sdk for news retrieval, but it is not "
         "in the project's declared dependencies"
     )
+
+
+def test_httpx_is_a_declared_dependency() -> None:
+    """httpx is imported directly by research.asknews, so it must be declared.
+
+    The adapter builds an httpx transport to make the retry setting real, because
+    the AskNews SDK accepts a retries argument and never reads it. Same guard as
+    the two above: transitive today, a missing module the day the intermediate
+    drops it.
+    """
+    requires = importlib.metadata.requires("whiskeyjack-bot") or []
+    assert any(req.split(";")[0].strip().startswith("httpx") for req in requires), (
+        "research.asknews imports httpx to inject a retrying transport, but it is "
+        "not in the project's declared dependencies"
+    )

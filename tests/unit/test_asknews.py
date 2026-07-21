@@ -12,10 +12,12 @@ import copy
 import logging
 import traceback
 import uuid
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from asknews_sdk import AskNewsSDK
@@ -26,11 +28,7 @@ from asknews_sdk.dto.news import SearchResponse, SearchResponseDictItem
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.logging_setup import SecretRedactionFilter, configure_logging
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
-from whiskeyjack_bot.research.asknews import (
-    AskNewsRetrievalError,
-    build_asknews_client,
-    retrieve_news,
-)
+from whiskeyjack_bot.research.asknews import build_asknews_client, retrieve_news
 from whiskeyjack_bot.research.hashing import content_sha256
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,13 +101,37 @@ class _FakeSDK:
 
 
 class _ExplodingNewsAPI:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     def search_news(self, **kwargs: Any) -> SearchResponse:
+        self.calls.append(kwargs)
         raise RuntimeError(f"upstream said no; auth header Bearer {SECRET}")
 
 
 class _ExplodingSDK:
     def __init__(self) -> None:
         self.news = _ExplodingNewsAPI()
+
+
+class _FailAfterNewsAPI:
+    """Succeeds for the first N calls, then raises — the partial-spend case."""
+
+    def __init__(self, succeed_calls: int, response: list[SearchResponseDictItem]) -> None:
+        self._succeed_calls = succeed_calls
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
+
+    def search_news(self, **kwargs: Any) -> SearchResponse:
+        self.calls.append(kwargs)
+        if len(self.calls) > self._succeed_calls:
+            raise RuntimeError(f"upstream said no; auth header Bearer {SECRET}")
+        return SearchResponse.model_construct(as_dicts=self._response)
+
+
+class _FailAfterSDK:
+    def __init__(self, succeed_calls: int, response: list[SearchResponseDictItem]) -> None:
+        self.news = _FailAfterNewsAPI(succeed_calls, response)
 
 
 def _retrieve(sdk: Any, config: AppConfig, **overrides: Any) -> Any:
@@ -172,13 +194,34 @@ def test_custom_api_key_env_name_honored(
     assert excinfo.value.env_var_name == "OTHER_ASKNEWS_KEY"
 
 
-def test_timeout_and_retries_reach_the_sdk(
-    config: AppConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_timeout_reaches_the_sdk(config: AppConfig, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ASKNEWS_API_KEY", FAKE_KEY)
     client = build_asknews_client(config)
     assert client.client.timeout == config.retrieval.primary.timeout_seconds
-    assert client.client.retries == config.retrieval.primary.retries
+
+
+def test_retries_reach_the_actual_transport(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assert the retry count lands where retrying happens, not where it is stored.
+
+    asknews 0.13.54 accepts `retries=` and never reads it: the request path calls
+    httpx.Client.send() directly. The previous version of this test asserted
+    `client.client.retries == N`, which passed against a value that did nothing --
+    exactly the false confidence a plumb-through test is supposed to prevent.
+    So reach into the transport's connection pool instead. (GPT review round 1,
+    finding 4.)
+    """
+    data = config.model_dump()
+    data["retrieval"]["primary"]["retries"] = 7
+    custom = validate_config_data(data)
+    monkeypatch.setenv("ASKNEWS_API_KEY", FAKE_KEY)
+
+    client = build_asknews_client(custom)
+
+    transport = client.client._client._transport
+    assert isinstance(transport, httpx.HTTPTransport)
+    assert transport._pool._retries == 7
 
 
 # --- the headline criterion: normalized documents ---------------------------
@@ -282,26 +325,38 @@ def test_config_parameters_plumb_through(config: AppConfig) -> None:
 # --- failure paths that must not fail the run -------------------------------
 
 
-def test_intra_run_duplicates_are_collapsed(config: AppConfig) -> None:
-    """The two passes overlap by design; UNIQUE(run, url, hash) would reject the pair."""
+def test_intra_run_duplicates_are_collapsed_without_marking_the_run_failed(
+    config: AppConfig,
+) -> None:
+    """The two passes overlap by design; UNIQUE(run, url, hash) would reject the pair.
+
+    The overlap is the normal case, so the run must still look successful:
+    error_summary means "failed or returned nothing" per the schema, and a run
+    that collapsed a duplicate did neither. (GPT review round 1, finding 3.)
+    """
     sdk = _FakeSDK([[_article()], [_article()]])
     result = _retrieve(sdk, config)
+
     assert len(result.documents) == 1
-    assert result.run.error_summary is not None
-    assert "duplicate" in result.run.error_summary
+    assert result.duplicates_collapsed == 1
+    assert result.documents_dropped == 0
+    assert result.provider_failed is False
+    assert result.run.error_summary is None
 
 
-def test_unusable_article_is_dropped_not_fatal(config: AppConfig) -> None:
+def test_unusable_article_is_dropped_without_marking_the_run_failed(config: AppConfig) -> None:
     good = _article()
     bad = _article(article_url="not-a-url", as_string_key="k2")
-    sdk = _FakeSDK([[bad, good]])
+    sdk = _FakeSDK([[bad, good], []])
 
     result = _retrieve(sdk, config)
 
     assert len(result.documents) == 1
     assert result.documents[0].original_url == "https://example.org/june-payrolls"
-    assert result.run.error_summary is not None
-    assert "dropped" in result.run.error_summary
+    assert result.documents_dropped == 1
+    # One bad article among good ones is routine, not a run failure.
+    assert result.provider_failed is False
+    assert result.run.error_summary is None
 
 
 def test_zero_documents_is_recorded_not_raised(config: AppConfig) -> None:
@@ -312,11 +367,34 @@ def test_zero_documents_is_recorded_not_raised(config: AppConfig) -> None:
     assert "no documents retained" in result.run.error_summary
 
 
-def test_provider_failure_raises_sanitized_error(config: AppConfig) -> None:
-    with pytest.raises(AskNewsRetrievalError) as excinfo:
-        _retrieve(_ExplodingSDK(), config)
-    assert not _leaks(excinfo.value)
-    assert excinfo.value.__cause__ is None
+def test_provider_failure_returns_partial_run_and_never_raises(config: AppConfig) -> None:
+    """A failed call must not discard the calls already paid for.
+
+    A run makes up to max_queries_per_question * 2 billable calls. Raising partway
+    through would leave the caller with neither a ResearchRun nor the accumulated
+    raw responses, so M1-306 could not persist or replay spend that already
+    happened. (GPT review round 1, finding 2.)
+    """
+    sdk = _FailAfterSDK(succeed_calls=1, response=[_article()])
+    result = _retrieve(sdk, config, queries=["a", "b", "c"])
+
+    assert result.provider_failed is True
+    # The one successful call's response survives.
+    assert len(result.raw_responses) == 1
+    assert len(result.documents) == 1
+    # Retrieval stopped rather than grinding through the remaining queries.
+    assert len(sdk.news.calls) == 2
+    assert result.run.error_summary is not None
+    assert "provider call failed" in result.run.error_summary
+
+
+def test_provider_failure_on_the_very_first_call_still_returns_a_run(config: AppConfig) -> None:
+    result = _retrieve(_ExplodingSDK(), config)
+    assert result.provider_failed is True
+    assert result.documents == ()
+    assert result.raw_responses == ()
+    assert result.run.provider == "asknews"
+    assert result.run.error_summary is not None
 
 
 # --- secret hygiene ---------------------------------------------------------
@@ -335,18 +413,33 @@ def _leaks(exc: BaseException) -> bool:
     ["article_url", "eng_title", "title", "summary", "full_text", "source_id", "domain_url"],
     ids=lambda f: f"planted-in-{f}",
 )
-def test_planted_secret_never_reaches_an_error_or_the_run(config: AppConfig, field: str) -> None:
+def test_planted_secret_never_reaches_any_egress_channel(config: AppConfig, field: str) -> None:
     """Provider text is untrusted: no field of it may surface in a message.
 
     Fields that validate successfully are fine -- the point is that the failing
     ones do not echo, and that nothing lands in provider_config either.
+
+    **Warnings are checked as well as exceptions.** The original version of this
+    test watched only `str(exc)` and the traceback, and was blind to pydantic's
+    serializer warnings, which embed the offending value in their text and go to
+    stderr and to captured logs. That is a distinct egress channel, and missing it
+    is the same class of gap as watching only some fields. (GPT review round 1,
+    finding 1.)
     """
     sdk = _FakeSDK([[_article(**{field: SECRET})]])
-    try:
-        result = _retrieve(sdk, config)
-    except Exception as exc:  # noqa: BLE001 - the assertion is about any raise
-        assert not _leaks(exc), f"{field} leaked through a raised error"
-        return
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            result = _retrieve(sdk, config)
+        except Exception as exc:  # noqa: BLE001 - the assertion is about any raise
+            assert not _leaks(exc), f"{field} leaked through a raised error"
+            return
+
+    for warning in caught:
+        text = str(warning.message)
+        assert SECRET not in text, f"{field} leaked through a {warning.category.__name__}"
+        assert FAKE_KEY not in text
+
     assert SECRET not in str(result.run.provider_config)
     assert SECRET not in (result.run.error_summary or "")
 
