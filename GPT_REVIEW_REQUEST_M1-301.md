@@ -6,6 +6,31 @@ line could be read as either correct or subtly wrong, assume the wrong reading a
 prove it can't happen from the diff. Do **not** rubber-stamp. If you approve, justify
 why each risk area below is actually safe; if you don't, list blocking findings.
 
+## How to get the code
+
+The branch is pushed. Prefer reviewing the working tree over the pasted diff — the diff is
+included below as a fallback, but several questions (does a field have a column? does a
+pydantic symbol exist?) are answerable only against the full files and the pinned dependency
+versions.
+
+```bash
+git clone https://github.com/mcleblanc711/whiskeyjack-bot.git
+cd whiskeyjack-bot
+git checkout feat/m1-301-research-document-schema
+git diff master...HEAD          # this branch's three commits
+
+# optional, to reproduce the gates (needs uv):
+uv sync
+uv run pytest                   # expect 124 passed
+uv run ruff check . && uv run ruff format --check .
+uv run mypy --strict src
+```
+
+Key files: `src/whiskeyjack_bot/research/{model,hashing}.py`,
+`src/whiskeyjack_bot/migrations/002_research_document_fields.sql`,
+`tests/unit/test_research.py`. Read `001_initial.sql` and `ledger.py` from master for the
+schema and migration-runner context those build on.
+
 ## Project context
 
 `whiskeyjack-bot` is a public Metaculus MiniBench forecasting pipeline whose primary
