@@ -30,6 +30,7 @@ from whiskeyjack_bot.questions import (
     CanonicalNumericQuestion,
     CanonicalQuestionAdapter,
     NormalizationError,
+    SourceCategory,
     UnsupportedQuestionTypeError,
     normalize_question,
     normalize_questions,
@@ -88,6 +89,31 @@ def test_identity_and_common_fields_preserved(name: str) -> None:
     assert "minibench" in canonical.tournament_slugs
     assert canonical.question_weight == post["question"]["question_weight"]
     assert canonical.open_time == datetime(2026, 7, 6, 14, 0, tzinfo=timezone.utc)
+
+
+def test_common_fields_are_read_from_the_object_not_hardcoded() -> None:
+    """Every fixture shares one tournament slug, weight and open time, so the
+    fixture-driven assertions above would still pass against constants."""
+    canonical = normalize_question(
+        fake_sdk_question(  # type: ignore[arg-type]
+            tournament_slugs=["aibq4", "minibench-practice"],
+            question_weight=0.25,
+            open_time=datetime(2031, 2, 3, 9, 30, tzinfo=timezone.utc),
+            close_time=datetime(2031, 4, 5, 18, 0, tzinfo=timezone.utc),
+            scheduled_resolution_time=datetime(2031, 5, 6, 12, 0, tzinfo=timezone.utc),
+            unit_of_measure="GW",
+            page_url="https://example.invalid/q/4242",
+            background_info="[SYNTHETIC] background",
+        )
+    )
+    assert canonical.tournament_slugs == ["aibq4", "minibench-practice"]
+    assert canonical.question_weight == 0.25
+    assert canonical.open_time == datetime(2031, 2, 3, 9, 30, tzinfo=timezone.utc)
+    assert canonical.close_time == datetime(2031, 4, 5, 18, 0, tzinfo=timezone.utc)
+    assert canonical.scheduled_resolution_time == datetime(2031, 5, 6, 12, 0, tzinfo=timezone.utc)
+    assert canonical.unit_of_measure == "GW"
+    assert canonical.url == "https://example.invalid/q/4242"
+    assert canonical.background_info == "[SYNTHETIC] background"
 
 
 def test_multiple_choice_options_preserved() -> None:
@@ -226,6 +252,25 @@ def fake_sdk_question(**overrides: object) -> SimpleNamespace:
         "group_question_option": None,
         "question_ids_of_group": None,
     }
+    # Type-specific attrs are legitimately absent from the base (normalize only reads
+    # them for their own type), so allow them explicitly rather than accepting anything.
+    known = base.keys() | {
+        "options",
+        "option_is_instance_of",
+        "lower_bound",
+        "upper_bound",
+        "open_lower_bound",
+        "open_upper_bound",
+        "zero_point",
+        "cdf_size",
+        "nominal_lower_bound",
+        "nominal_upper_bound",
+    }
+    # Without this an override naming a canonical field instead of the SDK attribute
+    # (``url`` for ``page_url``, say) silently sets an attribute nothing reads, and the
+    # test passes against the default value it meant to replace.
+    unknown = overrides.keys() - known
+    assert not unknown, f"override(s) not read by normalize: {sorted(unknown)}"
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -252,7 +297,7 @@ def test_group_identity_is_carried_through() -> None:
 
 def test_source_categories_are_carried_through() -> None:
     """normalize is the only place SDK fields are read, so a dropped category is
-    unrecoverable downstream. Slug wins where present; name is the fallback."""
+    unrecoverable downstream. The full identity triple is preserved."""
     canonical = normalize_question(
         fake_sdk_question(  # type: ignore[arg-type]
             categories=[
@@ -261,7 +306,37 @@ def test_source_categories_are_carried_through() -> None:
             ]
         )
     )
-    assert canonical.source_categories == ["economy", "Geopolitics"]
+    assert canonical.source_categories == [
+        SourceCategory(id=1, name="Economics", slug="economy"),
+        SourceCategory(id=2, name="Geopolitics", slug=None),
+    ]
+
+
+def test_distinct_categories_stay_distinguishable() -> None:
+    """Regression guard for the round-2 finding: a ``slug or name`` mapping renders
+    these two different categories identically, so downstream classification could
+    apply the first one's mapping to the second."""
+    first, second = (
+        normalize_question(fake_sdk_question(categories=[category]))  # type: ignore[arg-type]
+        for category in (
+            Category(id=17, name="Economics", slug="economy"),
+            Category(id=18, name="economy", slug=None),
+        )
+    )
+    assert first.source_categories != second.source_categories
+    assert first.source_categories[0].id != second.source_categories[0].id
+
+
+def test_source_categories_ignore_presentational_sdk_fields() -> None:
+    """emoji/description are deliberately not carried; the identity triple is."""
+    canonical = normalize_question(
+        fake_sdk_question(  # type: ignore[arg-type]
+            categories=[
+                Category(id=3, name="Health", slug="health", emoji="🩺", description="Long text.")
+            ]
+        )
+    )
+    assert canonical.source_categories == [SourceCategory(id=3, name="Health", slug="health")]
 
 
 def test_source_categories_default_to_empty() -> None:
@@ -270,10 +345,38 @@ def test_source_categories_default_to_empty() -> None:
 
 def test_source_categories_survive_the_round_trip() -> None:
     canonical = normalize_question(
-        fake_sdk_question(categories=[Category(id=1, name="Health", slug="health")])  # type: ignore[arg-type]
+        fake_sdk_question(  # type: ignore[arg-type]
+            categories=[
+                Category(id=1, name="Health", slug="health"),
+                Category(id=2, name="Science", slug=None),
+            ]
+        )
     )
     restored = CanonicalQuestionAdapter.validate_json(canonical.model_dump_json())
     assert restored == canonical
+    assert restored.source_categories[0].id == 1
+
+
+def test_malformed_category_arrives_as_a_normalization_error() -> None:
+    """SourceCategory is built by the canonical model, inside the ValidationError
+    fence -- constructing it during the field read would escape the boundary."""
+    with pytest.raises(NormalizationError, match="source_categories"):
+        normalize_question(
+            fake_sdk_question(  # type: ignore[arg-type]
+                categories=[SimpleNamespace(id="not-an-int", name="Economics", slug=None)]
+            )
+        )
+
+
+def test_category_validation_errors_never_echo_the_category() -> None:
+    with pytest.raises(NormalizationError) as excinfo:
+        normalize_question(
+            fake_sdk_question(  # type: ignore[arg-type]
+                categories=[SimpleNamespace(id=PLANTED_SECRET, name=PLANTED_SECRET, slug=None)]
+            )
+        )
+    assert PLANTED_SECRET not in str(excinfo.value)
+    assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
 
 
 @pytest.mark.parametrize(

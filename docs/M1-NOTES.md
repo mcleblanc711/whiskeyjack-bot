@@ -62,7 +62,7 @@ Delivered:
   fixtures, MC options, numeric bounds/cdf, group-identity carry-through, union round-trip,
   malformed-record table, and no-leak planted-secret paths. Suite: 138 passed; ruff check +
   format + `mypy --strict src` clean. (GPT review round 1 raised this to 69 module tests /
-  173 suite — see the round-1 section below.)
+  173 suite; round 2 took it to 178 — see the round sections below.)
 
 Hardening — a question object missing the fields its declared type requires is reported as a
 `NormalizationError`, not a raw `AttributeError`/`TypeError`. This is the same defect class as the
@@ -129,3 +129,35 @@ All three repo fixtures carry an empty category list, so the passthrough is pinn
 synthetic-object tests rather than fixture assertions — a fixture-driven check would have
 passed against a hardcoded `[]`. The same vacuity affected the group-linkage test the review
 flagged (every fixture has a null group parent); it now uses non-null synthetic linkage.
+
+### M1-201 — GPT review round 2
+
+Round 2 confirmed all five round-1 fixes CLOSED and **withdrew the domain finding** on the
+grounds above. One regression introduced by the round-1 category fix, plus two minor items:
+
+- **`source_categories` shape** (Medium, the round-1 fix's own regression). Flattening each
+  category to `slug or name` mixed two namespaces and destroyed identity:
+  `Category(id=17, name="Economics", slug="economy")` and
+  `Category(id=18, name="economy", slug=None)` both rendered as `"economy"`, so downstream
+  classification could apply the first one's mapping to the second. Now carried as an owned
+  `SourceCategory` model (`id`, `name`, `slug`) — ours rather than the SDK's `Category`, for
+  the same reason the question models exist. `id` is the only stable identifier; a slug can be
+  renamed and is optional, a name is not. `emoji`/`description` stay out: presentational and
+  free text respectively, and `description` would widen the no-echo surface for no gain.
+
+  Note the mapping hands the canonical model **plain dicts**, not constructed `SourceCategory`
+  objects. `_common_fields` runs inside the field-read fence, which catches only
+  `AttributeError`/`TypeError`, so constructing a model there would let a `ValidationError`
+  escape `normalize_question` entirely — the exact boundary discipline round 1 established.
+- **Constant-fixture assertions** (Low). Every fixture shares one tournament slug, weight and
+  open time, so `test_identity_and_common_fields_preserved` would pass against hardcoded
+  constants. Added a synthetic-value test covering the common fields with distinct values.
+- **`git diff --check` claim was false** (Nit) at `eac283e`: the round-2 review request embeds a
+  diff whose context lines carry trailing whitespace, so the gate the file itself claimed to
+  pass did not. Whitespace stripped; the claim now holds.
+
+Test-helper hardening (found while fixing the Low, not review-reported): `fake_sdk_question`
+accepted any override key, so an override naming a *canonical* field instead of the SDK
+attribute — `url` for `page_url` — silently set an attribute nothing reads and the test passed
+against the default it meant to replace. It now asserts overrides are actually read. This is the
+third instance of the same vacuity class in this slice, so it is closed at the helper.

@@ -35,6 +35,26 @@ from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
 _Finite = Annotated[float, Field(allow_inf_nan=False)]
 
 
+class SourceCategory(_StrictModel):
+    """One Metaculus category, carried through with its identity intact.
+
+    Ours, not the SDK's ``Category``, so a SDK bump cannot reach downstream code
+    -- the same reason the question models exist. Kept to the identity triple:
+    ``emoji`` is presentational and ``description`` is free text that would widen
+    the no-echo surface for no downstream gain.
+
+    ``id`` is the only stable identifier: a slug can be renamed, and a slug is
+    optional while a name is not. Collapsing the three to one string loses that --
+    ``Category(id=17, name="Economics", slug="economy")`` and
+    ``Category(id=18, name="economy", slug=None)`` are different categories that a
+    ``slug or name`` mapping renders identically.
+    """
+
+    id: int
+    name: str = Field(min_length=1)
+    slug: str | None = None
+
+
 class _CanonicalQuestionBase(_StrictModel):
     """Fields shared by every supported question type.
 
@@ -57,13 +77,14 @@ class _CanonicalQuestionBase(_StrictModel):
     scheduled_resolution_time: datetime | None = None
     tournament_slugs: list[str] = Field(default_factory=list)
     question_weight: _Finite | None = None
-    # Uninterpreted passthrough of the SDK's ``categories`` slugs. NOT the project's
-    # domain tag: that taxonomy lives in config/x_accounts.yaml (econ_data,
-    # space_launch, ...) and has no mechanical mapping from Metaculus categories.
-    # Carried here only because normalize.py is the single place SDK fields are read,
-    # so anything dropped here is unrecoverable downstream without a re-fetch.
-    # Deriving a domain tag from this belongs to M1-307 / the forecast record (M1-602).
-    source_categories: list[str] = Field(default_factory=list)
+    # Uninterpreted passthrough of the SDK's ``categories``. NOT the project's domain
+    # tag: that taxonomy lives in config/x_accounts.yaml (econ_data, space_launch, ...)
+    # and has no mechanical mapping from Metaculus categories. Carried here only
+    # because normalize.py is the single place SDK fields are read, so anything dropped
+    # here is unrecoverable downstream without a re-fetch. Deriving a domain tag from
+    # this belongs to M1-307 / the forecast record (M1-602) -- which is also why the
+    # identity is kept whole rather than flattened to one label per category.
+    source_categories: list[SourceCategory] = Field(default_factory=list)
     # Group-parent identity is carried through unchanged so M1-202 can unpack
     # subquestions without losing the parent linkage.
     group_question_option: str | None = None

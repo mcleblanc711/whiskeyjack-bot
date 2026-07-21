@@ -6,6 +6,7 @@ from whiskeyjack_bot.questions.model import (
     CanonicalNumericQuestion,
     CanonicalQuestion,
     CanonicalQuestionAdapter,
+    SourceCategory,
 )
 from whiskeyjack_bot.questions.normalize import (
     NormalizationError,
@@ -21,6 +22,7 @@ __all__ = [
     "CanonicalQuestion",
     "CanonicalQuestionAdapter",
     "NormalizationError",
+    "SourceCategory",
     "UnsupportedQuestionTypeError",
     "normalize_question",
     "normalize_questions",

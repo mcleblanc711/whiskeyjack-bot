@@ -380,7 +380,7 @@ index cf9c90b..8ecb8cb 100644
 -  format + `mypy --strict src` clean.
 +  format + `mypy --strict src` clean. (GPT review round 1 raised this to 69 module tests /
 +  173 suite — see the round-1 section below.)
- 
+
  Hardening — a question object missing the fields its declared type requires is reported as a
  `NormalizationError`, not a raw `AttributeError`/`TypeError`. This is the same defect class as the
 @@ -86,3 +87,45 @@ Deferred (do not read the absence as an omission):
@@ -434,15 +434,15 @@ index 3eb92ee..87774aa 100644
 --- a/src/whiskeyjack_bot/questions/model.py
 +++ b/src/whiskeyjack_bot/questions/model.py
 @@ -29,6 +29,11 @@ from pydantic import Field, TypeAdapter, model_validator
- 
+
  from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
- 
+
 +# Pydantic accepts NaN and +/-infinity for a bare ``float``, but ``model_dump_json``
 +# serializes them as JSON ``null`` -- which then fails to validate back, breaking the
 +# round-trip the discriminated union promises. Every canonical float is finite.
 +_Finite = Annotated[float, Field(allow_inf_nan=False)]
 +
- 
+
  class _CanonicalQuestionBase(_StrictModel):
      """Fields shared by every supported question type.
 @@ -51,7 +56,14 @@ class _CanonicalQuestionBase(_StrictModel):
@@ -462,7 +462,7 @@ index 3eb92ee..87774aa 100644
      # subquestions without losing the parent linkage.
      group_question_option: str | None = None
 @@ -64,26 +76,42 @@ class CanonicalBinaryQuestion(_CanonicalQuestionBase):
- 
+
  class CanonicalMultipleChoiceQuestion(_CanonicalQuestionBase):
      qtype: Literal["multiple_choice"] = "multiple_choice"
 -    options: list[str] = Field(min_length=1)
@@ -472,7 +472,7 @@ index 3eb92ee..87774aa 100644
 +    # therefore constrained here, at the input contract, rather than downstream.
 +    options: list[str] = Field(min_length=2)
      option_is_instance_of: str | None = None
- 
+
 +    @model_validator(mode="after")
 +    def _options_are_labelled_and_distinct(self) -> CanonicalMultipleChoiceQuestion:
 +        # Do not echo the labels: mirror the project-wide rule that a validation
@@ -483,7 +483,7 @@ index 3eb92ee..87774aa 100644
 +            raise ValueError("multiple-choice options must be distinct")
 +        return self
 +
- 
+
  class CanonicalNumericQuestion(_CanonicalQuestionBase):
      qtype: Literal["numeric"] = "numeric"
 -    lower_bound: float
@@ -502,7 +502,7 @@ index 3eb92ee..87774aa 100644
 -    nominal_upper_bound: float | None = None
 +    nominal_lower_bound: _Finite | None = None
 +    nominal_upper_bound: _Finite | None = None
- 
+
      @model_validator(mode="after")
      def _bounds_ordered(self) -> CanonicalNumericQuestion:
 +        # NaN is refused by the field's allow_inf_nan=False before this runs, so the
@@ -515,13 +515,13 @@ index ece7039..d223099 100644
 --- a/src/whiskeyjack_bot/questions/normalize.py
 +++ b/src/whiskeyjack_bot/questions/normalize.py
 @@ -24,7 +24,7 @@ from __future__ import annotations
- 
+
  from typing import Any, get_args
- 
+
 -from forecasting_tools.data_models.questions import MetaculusQuestion
 +from forecasting_tools.data_models.questions import MetaculusQuestion, QuestionBasicType
  from pydantic import ValidationError
- 
+
  from whiskeyjack_bot.config import SupportedQuestionType
 @@ -38,6 +38,10 @@ from whiskeyjack_bot.questions.model import (
  # Derived from the single source of truth in config (D20), so adding a type
@@ -531,13 +531,13 @@ index ece7039..d223099 100644
 +# error message; any other value reached the tag slot from outside the SDK's own
 +# models and is therefore unvetted content under the no-echo rule.
 +_KNOWN_SDK_TYPES: frozenset[str] = frozenset(get_args(QuestionBasicType))
- 
- 
+
+
  class NormalizationError(Exception):
 @@ -53,9 +57,10 @@ class NormalizationError(Exception):
  class UnsupportedQuestionTypeError(NormalizationError):
      """The question is a type deferred in v1 (date/conditional/discrete, D21).
- 
+
 -    Raised before any model or submission call is made. The ``question_type``
 -    tag it carries is a fixed SDK enum value, not stored content, so naming it
 -    is safe under the no-echo rule.
@@ -546,8 +546,8 @@ index ece7039..d223099 100644
 +    (``_KNOWN_SDK_TYPES``); anything else renders as ``'unknown'``, since an
 +    arbitrary value in that slot is unvetted content under the no-echo rule.
      """
- 
- 
+
+
 @@ -86,6 +91,9 @@ def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
          "scheduled_resolution_time": q.scheduled_resolution_time,
          "tournament_slugs": q.tournament_slugs,
@@ -630,7 +630,7 @@ index ece7039..d223099 100644
 +        raise _sanitize(exc) from None
      # Unreachable: question_type was checked against _SUPPORTED_TYPES above.
      raise AssertionError("unreachable: unhandled supported question type")
- 
+
 diff --git a/tests/unit/test_questions.py b/tests/unit/test_questions.py
 index 52f917b..7d62cb9 100644
 --- a/tests/unit/test_questions.py
@@ -645,8 +645,8 @@ index 52f917b..7d62cb9 100644
      MetaculusQuestion,
 @@ -110,15 +111,6 @@ def test_numeric_bounds_preserved() -> None:
      assert canonical.cdf_size == 201
- 
- 
+
+
 -def test_group_identity_is_carried_through() -> None:
 -    """M1-202 unpacks subquestions; the parent linkage must survive M1-201."""
 -    for sdk, canonical in zip(
@@ -661,8 +661,8 @@ index 52f917b..7d62cb9 100644
          restored = CanonicalQuestionAdapter.validate_python(canonical.model_dump())
 @@ -170,9 +162,17 @@ def test_discrete_question_is_rejected_despite_subclassing_numeric() -> None:
          normalize_question(question)
- 
- 
+
+
 -@pytest.mark.parametrize("tag", ["conditional", "date", "discrete", "", None, 7])
 +@pytest.mark.parametrize(
 +    "tag",
@@ -676,13 +676,13 @@ index 52f917b..7d62cb9 100644
 +    before ``isinstance(tag, str)`` raises a raw ``TypeError`` that escapes the
 +    module's error boundary entirely.
 +    """
- 
+
      class _OnlyTag:
          question_type = tag
 @@ -181,6 +181,25 @@ def test_unsupported_tags_are_refused_without_reading_any_field(tag: object) ->
          normalize_question(_OnlyTag())  # type: ignore[arg-type]
- 
- 
+
+
 +def test_unsupported_tag_error_names_only_known_sdk_types() -> None:
 +    """A tag outside the SDK's own enum is unvetted content, so it is not echoed."""
 +
@@ -703,7 +703,7 @@ index 52f917b..7d62cb9 100644
 +
 +
  # --- malformed records ------------------------------------------------------
- 
+
  PLANTED_SECRET = "privateFAKE123456"
 @@ -203,6 +222,7 @@ def fake_sdk_question(**overrides: object) -> SimpleNamespace:
          "scheduled_resolution_time": None,
@@ -715,8 +715,8 @@ index 52f917b..7d62cb9 100644
      }
 @@ -210,6 +230,52 @@ def fake_sdk_question(**overrides: object) -> SimpleNamespace:
      return SimpleNamespace(**base)
- 
- 
+
+
 +def test_group_identity_is_carried_through() -> None:
 +    """M1-202 unpacks subquestions; the parent linkage must survive M1-201.
 +

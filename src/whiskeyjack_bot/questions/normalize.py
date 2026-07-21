@@ -91,9 +91,15 @@ def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
         "scheduled_resolution_time": q.scheduled_resolution_time,
         "tournament_slugs": q.tournament_slugs,
         "question_weight": q.question_weight,
-        # Slug where the SDK supplies one (it is optional on Category), else the
-        # required name. Carried uninterpreted -- see the field comment in model.py.
-        "source_categories": [category.slug or category.name for category in q.categories],
+        # Handed over as plain dicts, not constructed SourceCategory models: this
+        # function runs inside the field-read fence, which catches only
+        # AttributeError/TypeError, so a ValidationError raised here would escape
+        # normalize_question entirely. Letting the canonical model build them keeps
+        # that failure inside the ValidationError boundary below.
+        "source_categories": [
+            {"id": category.id, "name": category.name, "slug": category.slug}
+            for category in q.categories
+        ],
         "group_question_option": q.group_question_option,
         "question_ids_of_group": q.question_ids_of_group,
     }
