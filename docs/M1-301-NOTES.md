@@ -211,3 +211,76 @@ churn in URL validation. That is why the validator here is deliberately minimal 
 `docs/backlog/backlog.csv` now records URL-validation policy as part of **M1-305**, alongside
 canonicalization — one place that owns the whole question, rather than a schema module growing a
 second-hand version of it.
+
+## M1-302 — AskNews adapter
+
+First producer of `ResearchDocument`s. Acceptance criteria: a mocked call returns
+normalized documents; missing credentials fail before a paid call.
+
+Delivered:
+- `src/whiskeyjack_bot/research/asknews.py` — `build_asknews_client()` (the one construction
+  point for the AskNews client) and `retrieve_news()`, returning a frozen `AskNewsRetrieval`
+  of `(run, documents, raw_responses)`.
+- `RetrievalProviderConfig` gained `timeout_seconds` and `retries`, on the shared provider
+  model so the Exa fallback (M1-303) inherits the same shape rather than inventing its own.
+- `asknews` declared as a direct dependency, with the matching pin test.
+
+### Deliberate choices
+
+**Rejected `forecasting_tools.AskNewsSearcher`.** The pinned SDK ships a wrapper, but
+`get_formatted_news()` returns one pre-formatted markdown string via `_format_articles()`,
+which discards exactly the article-level provenance this item exists to preserve. It also
+reads credentials from the environment itself (bypassing our config contract), hardcodes a
+12-second `asyncio.sleep`, and keeps an on-disk cache we do not control. We call
+`asknews_sdk` directly. This is a case where the maintained path was the wrong path.
+
+**Credential check is provably pre-network.** Verified against asknews==0.13.54 on
+2026-07-21: `AskNewsSDK(api_key=...)` performs no network I/O — it builds an `httpx.Client`
+and an `APIKey` auth object, and API-key mode skips the OAuth token round-trip entirely
+(`BaseAPIClient.__init__`, `security.APIKey`). That is what makes the missing-credential
+test meaningful rather than decorative, and it mirrors the claim already recorded for
+`metaculus/client.py`. Reused `MissingCredentialError` rather than defining a second
+identical error type.
+
+**API-key auth only.** The committed config declares a single `api_key_env`. AskNews also
+supports an OAuth `client_id`/`client_secret` pair, and the forecasting-tools wrapper
+prefers it; supporting both was deliberately not built, per the owner's confirmation that
+the account uses an API key. If that changes, it is a config change plus a branch in
+`build_asknews_client`, not a reshape.
+
+**Only the author's name is taken.** `asknews_sdk.dto.base.Author` also carries `email`.
+That is personal data with no forecasting value, so `_first_author_name()` reads `.name`
+and nothing else.
+
+**`cost_usd` left `None`.** AskNews reports usage as `Usage.credits` — an integer credit
+count, not currency, with no credit-to-USD rate configured. Converting would put an
+unearned number in a ledger whose entire purpose is attribution. The credit count survives
+inside `raw_responses`, so M1-306 (which owns cost capture) loses nothing.
+
+**Intra-run duplicate collapsing is constraint safety, not deduplication.** The current and
+historical passes overlap by design, and `research_documents` carries
+`UNIQUE (retrieval_run_id, canonical_url, content_sha256)`; without collapsing, a perfectly
+normal run would fail at write time. Cross-run dedup, canonicalization and provenance
+merging remain M1-305's. The comment in the code says so, so the two are not conflated later.
+
+**URL validation untouched.** M1-305 owns URL policy. Given rounds 4-6 of the M1-301 review
+were entirely regressions from extending that validator, this adapter sets
+`canonical_url == original_url` and adds no validation of its own.
+
+### Deviations and open questions for review
+
+**Content-hash source rule: `full_text` > `summary` > title.** Pinned in the module
+docstring because it defines document identity. The risk worth naming: AskNews's `summary`
+is LLM-generated and is not guaranteed byte-stable across calls, so an article with no
+`full_text` can hash differently on re-retrieval. This does not break M1-306 replay (replay
+reads saved responses and issues zero provider calls), but it does weaken cross-run dedup on
+`content_sha256` for summary-only articles. Preferring `full_text` minimizes the exposure.
+**M1-305 should decide** whether summary-derived hashes are acceptable dedup keys or whether
+such documents need a different identity rule.
+
+**Drop/collapse counts go in `error_summary`.** `ResearchRun` has no generic counter for
+articles dropped as unusable or collapsed as duplicates. The alternative was a migration
+`003` adding typed columns; that was judged more scope than this item warrants, and
+migration numbers are claimed globally across parallel branches. The string is assembled
+from integers only and never echoes a retrieved value. If M1-306 wants these queryable
+rather than greppable, the typed columns are the follow-up.

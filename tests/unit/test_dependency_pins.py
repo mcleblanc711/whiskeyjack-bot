@@ -32,3 +32,18 @@ def test_idna_is_a_declared_dependency() -> None:
         "research.model imports idna for IDNA hostname validation, but it is not "
         "in the project's declared dependencies"
     )
+
+
+def test_asknews_is_a_declared_dependency() -> None:
+    """asknews is imported directly by research.asknews, so it must be declared.
+
+    It arrived transitively (forecasting-tools) before M1-302 imported it, which
+    is exactly the situation this guards: an undeclared transitive import keeps
+    working right up until the intermediate drops it, and then fails as a
+    missing module at retrieval time rather than at install time.
+    """
+    requires = importlib.metadata.requires("whiskeyjack-bot") or []
+    assert any(req.split(";")[0].strip().startswith("asknews") for req in requires), (
+        "research.asknews imports asknews_sdk for news retrieval, but it is not "
+        "in the project's declared dependencies"
+    )

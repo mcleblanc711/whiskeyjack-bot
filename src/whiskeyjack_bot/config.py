@@ -106,6 +106,11 @@ class ModelConfig(_StrictModel):
 class RetrievalProviderConfig(_StrictModel):
     provider: Literal["asknews", "exa"]
     api_key_env: str
+    # Transport knobs shared by every general retrieval provider so the Exa
+    # fallback (M1-303) inherits the same shape. Defaults match the AskNews
+    # SDK's own (retries=3) and the social block's timeout_seconds.
+    timeout_seconds: float = Field(60.0, gt=0)
+    retries: int = Field(3, ge=0)
 
     @field_validator("api_key_env")
     @classmethod

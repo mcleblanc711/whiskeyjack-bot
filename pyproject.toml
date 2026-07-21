@@ -11,6 +11,11 @@ license = { file = "LICENSE" }
 authors = [{ name = "Chris LeBlanc" }]
 requires-python = ">=3.11,<4.0"
 dependencies = [
+    # The AskNews client used directly by research.asknews (M1-302). Already
+    # present transitively via forecasting-tools, which bounds it >=0.9.1,<0.14.0;
+    # declared here for the same reason as idna below, and the upper bound must
+    # stay inside that range or `uv sync --locked` conflicts.
+    "asknews>=0.13,<0.14",
     "forecasting-tools==0.2.92",
     # IDNA 2008 + contextual rules, for hostname validation in research.model.
     # Already present transitively (httpx); declared directly because the schema

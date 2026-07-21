@@ -30,9 +30,13 @@ retrieval:
   primary:
     provider: "asknews"
     api_key_env: "ASKNEWS_API_KEY"
+    timeout_seconds: 60
+    retries: 3
   fallback:
     provider: "exa"
     api_key_env: "EXA_API_KEY"
+    timeout_seconds: 60
+    retries: 3
   max_queries_per_question: 6
   max_documents_per_query: 8
   freshness_days_default: 30
