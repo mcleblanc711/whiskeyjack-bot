@@ -88,6 +88,26 @@ def test_parent_framing_overrides_every_subquestion() -> None:
     assert {q.background_info for q in canonical} == {group["description"]}
 
 
+def test_explicit_parent_null_overrides_subquestion_value() -> None:
+    """An explicit null is an override, not an absence.
+
+    ``unpack_group_post`` skips parent keys that are *absent*, where the SDK would
+    raise. It does not skip keys carried explicitly as null: those still overwrite,
+    matching the SDK, because the parent stating a field is empty for the whole group
+    is not the same as the parent not addressing it at all.
+
+    Pins the corrected claim from review -- the deviation was first documented as
+    "never erases a subquestion's own value", which this case disproves.
+    """
+    post = raw_group_post()
+    assert post["group_of_questions"]["questions"][0]["fine_print"], (
+        "fixture no longer gives the first subquestion its own fine print"
+    )
+    post["group_of_questions"]["fine_print"] = None
+
+    assert {q.fine_print for q in unpack_group_post(post)} == {None}
+
+
 # --- parent identity --------------------------------------------------------
 
 

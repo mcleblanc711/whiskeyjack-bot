@@ -14,7 +14,7 @@ so :func:`whiskeyjack_bot.questions.normalize.normalize_question` receives
 subquestions already separated. :func:`unpack_group_post` exists because the SDK's
 own expansion is reachable only through a private static method on a
 network-bound client class; owning a public, offline seam is what lets a raw group
-post be exercised as a fixture. ``test_questions.py`` pins our output against the
+post be exercised as a fixture. ``test_groups.py`` pins our output against the
 SDK's on the same fixture, so a semantic change on an SDK bump fails loudly rather
 than silently diverging.
 
@@ -89,9 +89,11 @@ def unpack_group_post(post_json: dict[str, Any]) -> list[MetaculusQuestion]:
     for question_json in question_jsons:
         subquestion = copy.deepcopy(question_json)
         # Deviation from the SDK, which indexes these keys directly and raises
-        # KeyError when a group block omits one. Overriding only the keys actually
-        # present is strictly more tolerant and never erases a subquestion's own
-        # value by replacing it with None.
+        # KeyError when a group block omits one. The tolerance is scoped to *absent*
+        # keys: a key the parent carries explicitly as null still overwrites the
+        # subquestion's own value with None, matching the SDK. That is intended --
+        # an explicit null is the parent stating the field is empty for the whole
+        # group, which is not the same as the parent not addressing it at all.
         for key in _PARENT_OVERRIDES:
             if key in group_json:
                 subquestion[key] = group_json[key]

@@ -105,9 +105,19 @@ has been a review finding before.
 
 The SDK indexes `group_json["fine_print"]`, `["description"]` and `["resolution_criteria"]`
 directly, raising `KeyError` when a group block omits one. `unpack_group_post` overrides only
-the keys actually **present**. This is strictly more tolerant and never erases a
-subquestion's own value by replacing it with `None`. On a well-formed post the two are
-identical, which is what the drift test compares.
+the keys actually **present**.
+
+The tolerance is scoped to **absent** keys only. A key the parent carries explicitly as
+`null` still overwrites the subquestion's own value with `None` — matching the SDK, and
+intended: an explicit null is the parent stating the field is empty for the whole group,
+which is not the same as the parent not addressing it at all. Pinned by
+`test_explicit_parent_null_overrides_subquestion_value`.
+
+(An earlier draft of this note claimed the deviation "never erases a subquestion's own value
+by replacing it with `None`". That was too strong and was corrected after review.)
+
+On a well-formed post the two implementations are identical, which is what the drift test
+compares.
 
 ### Deferred (do not read the absence as an omission)
 
