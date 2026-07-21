@@ -29,6 +29,11 @@ from pydantic import Field, TypeAdapter, model_validator
 
 from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
 
+# Pydantic accepts NaN and +/-infinity for a bare ``float``, but ``model_dump_json``
+# serializes them as JSON ``null`` -- which then fails to validate back, breaking the
+# round-trip the discriminated union promises. Every canonical float is finite.
+_Finite = Annotated[float, Field(allow_inf_nan=False)]
+
 
 class _CanonicalQuestionBase(_StrictModel):
     """Fields shared by every supported question type.
@@ -51,7 +56,14 @@ class _CanonicalQuestionBase(_StrictModel):
     close_time: datetime | None = None
     scheduled_resolution_time: datetime | None = None
     tournament_slugs: list[str] = Field(default_factory=list)
-    question_weight: float | None = None
+    question_weight: _Finite | None = None
+    # Uninterpreted passthrough of the SDK's ``categories`` slugs. NOT the project's
+    # domain tag: that taxonomy lives in config/x_accounts.yaml (econ_data,
+    # space_launch, ...) and has no mechanical mapping from Metaculus categories.
+    # Carried here only because normalize.py is the single place SDK fields are read,
+    # so anything dropped here is unrecoverable downstream without a re-fetch.
+    # Deriving a domain tag from this belongs to M1-307 / the forecast record (M1-602).
+    source_categories: list[str] = Field(default_factory=list)
     # Group-parent identity is carried through unchanged so M1-202 can unpack
     # subquestions without losing the parent linkage.
     group_question_option: str | None = None
@@ -64,26 +76,42 @@ class CanonicalBinaryQuestion(_CanonicalQuestionBase):
 
 class CanonicalMultipleChoiceQuestion(_CanonicalQuestionBase):
     qtype: Literal["multiple_choice"] = "multiple_choice"
-    options: list[str] = Field(min_length=1)
+    # At least two: a one-option multiple-choice question cannot be forecast, and
+    # M1-404 must emit "every exact option once with probabilities summing to one" --
+    # which is unrepresentable if labels collapse as mapping keys. The option set is
+    # therefore constrained here, at the input contract, rather than downstream.
+    options: list[str] = Field(min_length=2)
     option_is_instance_of: str | None = None
+
+    @model_validator(mode="after")
+    def _options_are_labelled_and_distinct(self) -> CanonicalMultipleChoiceQuestion:
+        # Do not echo the labels: mirror the project-wide rule that a validation
+        # message never reprints record content.
+        if any(not option.strip() for option in self.options):
+            raise ValueError("multiple-choice options must not be blank")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("multiple-choice options must be distinct")
+        return self
 
 
 class CanonicalNumericQuestion(_CanonicalQuestionBase):
     qtype: Literal["numeric"] = "numeric"
-    lower_bound: float
-    upper_bound: float
+    lower_bound: _Finite
+    upper_bound: _Finite
     open_lower_bound: bool
     open_upper_bound: bool
-    zero_point: float | None = None
+    zero_point: _Finite | None = None
     # The Metaculus/SDK cdf resolution; agrees with config.expected_cdf_points
     # (Literal[201]). Kept as a plain int here -- calibration-time enforcement
     # of the point count belongs to the validation epic (M1-503), not the model.
     cdf_size: int
-    nominal_lower_bound: float | None = None
-    nominal_upper_bound: float | None = None
+    nominal_lower_bound: _Finite | None = None
+    nominal_upper_bound: _Finite | None = None
 
     @model_validator(mode="after")
     def _bounds_ordered(self) -> CanonicalNumericQuestion:
+        # NaN is refused by the field's allow_inf_nan=False before this runs, so the
+        # comparison cannot be silently false for a non-finite bound.
         if self.lower_bound >= self.upper_bound:
             # Do not echo the bound values: mirror the project-wide rule that a
             # validation message never reprints record content.

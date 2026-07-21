@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.questions import (
+    Category,
     DateQuestion,
     DiscreteQuestion,
     MetaculusQuestion,
@@ -110,15 +111,6 @@ def test_numeric_bounds_preserved() -> None:
     assert canonical.cdf_size == 201
 
 
-def test_group_identity_is_carried_through() -> None:
-    """M1-202 unpacks subquestions; the parent linkage must survive M1-201."""
-    for sdk, canonical in zip(
-        load_fixture_questions(), normalize_questions(load_fixture_questions())
-    ):
-        assert canonical.group_question_option == sdk.group_question_option
-        assert canonical.question_ids_of_group == sdk.question_ids_of_group
-
-
 def test_canonical_questions_round_trip_through_the_union_adapter() -> None:
     for canonical in normalize_questions(load_fixture_questions()):
         restored = CanonicalQuestionAdapter.validate_python(canonical.model_dump())
@@ -170,15 +162,42 @@ def test_discrete_question_is_rejected_despite_subclassing_numeric() -> None:
         normalize_question(question)
 
 
-@pytest.mark.parametrize("tag", ["conditional", "date", "discrete", "", None, 7])
+@pytest.mark.parametrize(
+    "tag",
+    ["conditional", "date", "discrete", "", None, 7, [], {}, ["binary"], {"binary": 1}],
+)
 def test_unsupported_tags_are_refused_without_reading_any_field(tag: object) -> None:
-    """A bare tag is enough to refuse: no field access, so no model call."""
+    """A bare tag is enough to refuse: no field access, so no model call.
+
+    The unhashable cases are the regression guard: testing ``tag in frozenset``
+    before ``isinstance(tag, str)`` raises a raw ``TypeError`` that escapes the
+    module's error boundary entirely.
+    """
 
     class _OnlyTag:
         question_type = tag
 
     with pytest.raises(UnsupportedQuestionTypeError):
         normalize_question(_OnlyTag())  # type: ignore[arg-type]
+
+
+def test_unsupported_tag_error_names_only_known_sdk_types() -> None:
+    """A tag outside the SDK's own enum is unvetted content, so it is not echoed."""
+
+    class _KnownTag:
+        question_type = "conditional"
+
+    class _ForeignTag:
+        question_type = PLANTED_SECRET
+
+    with pytest.raises(UnsupportedQuestionTypeError, match="conditional"):
+        normalize_question(_KnownTag())  # type: ignore[arg-type]
+
+    with pytest.raises(UnsupportedQuestionTypeError) as excinfo:
+        normalize_question(_ForeignTag())  # type: ignore[arg-type]
+    assert PLANTED_SECRET not in str(excinfo.value)
+    assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
+    assert "unknown" in str(excinfo.value)
 
 
 # --- malformed records ------------------------------------------------------
@@ -203,11 +222,58 @@ def fake_sdk_question(**overrides: object) -> SimpleNamespace:
         "scheduled_resolution_time": None,
         "tournament_slugs": ["minibench"],
         "question_weight": 1.0,
+        "categories": [],
         "group_question_option": None,
         "question_ids_of_group": None,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_group_identity_is_carried_through() -> None:
+    """M1-202 unpacks subquestions; the parent linkage must survive M1-201.
+
+    Uses non-null linkage deliberately: every repo fixture has a null group
+    parent, so a fixture-driven check passes even if both fields are mapped to a
+    constant ``None``.
+    """
+    canonical = normalize_question(
+        fake_sdk_question(  # type: ignore[arg-type]
+            group_question_option="Above 3%",
+            question_ids_of_group=[91001, 91002, 91003],
+        )
+    )
+    assert canonical.group_question_option == "Above 3%"
+    assert canonical.question_ids_of_group == [91001, 91002, 91003]
+
+
+# --- source categories (uninterpreted SDK passthrough) ----------------------
+
+
+def test_source_categories_are_carried_through() -> None:
+    """normalize is the only place SDK fields are read, so a dropped category is
+    unrecoverable downstream. Slug wins where present; name is the fallback."""
+    canonical = normalize_question(
+        fake_sdk_question(  # type: ignore[arg-type]
+            categories=[
+                Category(id=1, name="Economics", slug="economy"),
+                Category(id=2, name="Geopolitics", slug=None),
+            ]
+        )
+    )
+    assert canonical.source_categories == ["economy", "Geopolitics"]
+
+
+def test_source_categories_default_to_empty() -> None:
+    assert normalize_question(fake_sdk_question()).source_categories == []  # type: ignore[arg-type]
+
+
+def test_source_categories_survive_the_round_trip() -> None:
+    canonical = normalize_question(
+        fake_sdk_question(categories=[Category(id=1, name="Health", slug="health")])  # type: ignore[arg-type]
+    )
+    restored = CanonicalQuestionAdapter.validate_json(canonical.model_dump_json())
+    assert restored == canonical
 
 
 @pytest.mark.parametrize(
@@ -309,3 +375,103 @@ def test_unsupported_error_is_a_normalization_error() -> None:
 def test_normalize_questions_propagates_the_first_failure() -> None:
     with pytest.raises(UnsupportedQuestionTypeError):
         normalize_questions([*load_fixture_questions(), _synthetic_date_question()])
+
+
+# --- schema integrity: finite floats ----------------------------------------
+
+
+def numeric_kwargs(**overrides: object) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "question_id": 91001,
+        "post_id": 90001,
+        "title": "[SYNTHETIC] How many?",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": True,
+        "cdf_size": 201,
+    }
+    base.update(overrides)
+    return base
+
+
+NON_FINITE = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("value", NON_FINITE)
+@pytest.mark.parametrize(
+    "field",
+    ["lower_bound", "upper_bound", "zero_point", "nominal_lower_bound", "nominal_upper_bound"],
+)
+def test_non_finite_numeric_fields_are_rejected(field: str, value: float) -> None:
+    """NaN slips past ``lower >= upper`` (both comparisons are false) and then
+    serializes to JSON null, so the union adapter cannot read the record back."""
+    with pytest.raises(ValidationError):
+        CanonicalNumericQuestion(**numeric_kwargs(**{field: value}))
+
+
+@pytest.mark.parametrize("value", NON_FINITE)
+def test_non_finite_question_weight_is_rejected(value: float) -> None:
+    with pytest.raises(ValidationError):
+        CanonicalBinaryQuestion(
+            question_id=91001, post_id=90001, title="[SYNTHETIC] Will it?", question_weight=value
+        )
+
+
+def test_numeric_question_survives_a_json_round_trip() -> None:
+    """The positive half of the finite-float contract."""
+    canonical = CanonicalNumericQuestion(
+        **numeric_kwargs(zero_point=1.0, nominal_lower_bound=0.0, nominal_upper_bound=100.0)
+    )
+    restored = CanonicalQuestionAdapter.validate_json(canonical.model_dump_json())
+    assert restored == canonical
+    assert type(restored) is CanonicalNumericQuestion
+
+
+# --- schema integrity: multiple-choice option sets --------------------------
+
+
+def choice_kwargs(options: list[str]) -> dict[str, Any]:
+    return {
+        "question_id": 91001,
+        "post_id": 90001,
+        "title": "[SYNTHETIC] Which?",
+        "options": options,
+    }
+
+
+@pytest.mark.parametrize(
+    ("description", "options"),
+    [
+        ("duplicate labels", ["A", "B", "A"]),
+        ("blank label", ["A", "B", ""]),
+        ("whitespace-only label", ["A", "B", "   "]),
+        ("single option", ["A"]),
+        ("no options", []),
+        ("duplicated blank", ["", ""]),
+    ],
+)
+def test_malformed_option_sets_are_rejected(description: str, options: list[str]) -> None:
+    """M1-404 must emit every exact option once; duplicates collapse as mapping
+    keys and blanks cannot be matched back to a source option."""
+    with pytest.raises(ValidationError):
+        CanonicalMultipleChoiceQuestion(**choice_kwargs(options))
+
+
+def test_well_formed_option_set_is_accepted() -> None:
+    canonical = CanonicalMultipleChoiceQuestion(**choice_kwargs(["Yes", "No", "Too close"]))
+    assert canonical.options == ["Yes", "No", "Too close"]
+
+
+def test_option_validation_errors_never_echo_the_labels() -> None:
+    """Option labels are record content, so the no-echo rule covers them too."""
+    with pytest.raises(NormalizationError) as excinfo:
+        normalize_question(
+            fake_sdk_question(  # type: ignore[arg-type]
+                question_type="multiple_choice",
+                options=[PLANTED_SECRET, PLANTED_SECRET],
+                option_is_instance_of=None,
+            )
+        )
+    assert PLANTED_SECRET not in str(excinfo.value)
+    assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))

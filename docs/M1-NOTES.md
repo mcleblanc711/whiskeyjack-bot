@@ -61,7 +61,8 @@ Delivered:
 - `tests/unit/test_questions.py` — 34 tests: per-type mapping, fine-print retention against the raw
   fixtures, MC options, numeric bounds/cdf, group-identity carry-through, union round-trip,
   malformed-record table, and no-leak planted-secret paths. Suite: 138 passed; ruff check +
-  format + `mypy --strict src` clean.
+  format + `mypy --strict src` clean. (GPT review round 1 raised this to 69 module tests /
+  173 suite — see the round-1 section below.)
 
 Hardening — a question object missing the fields its declared type requires is reported as a
 `NormalizationError`, not a raw `AttributeError`/`TypeError`. This is the same defect class as the
@@ -86,3 +87,45 @@ Deferred (do not read the absence as an omission):
   slice ships only the tests that prove its own model and mapping.
 - `cdf_size` is stored as a plain int. Enforcing the 201-point count (`config.expected_cdf_points`)
   is calibration-time validation, i.e. **M1-503**.
+
+### M1-201 — GPT review round 1
+
+All four mechanical findings reproduced against the pinned SDK and were fixed:
+
+- **Tag handling** (`normalize.py`). Two defects in one expression. An unhashable
+  `question_type` (a list) raised a raw `TypeError` out of the `in _SUPPORTED_TYPES` test,
+  escaping the module's error boundary entirely — `isinstance` is now tested first. And an
+  arbitrary string tag was echoed verbatim, so the tag is now named only when it is a member
+  of `_KNOWN_SDK_TYPES` (derived from the SDK's own `QuestionBasicType`); anything else
+  renders as `'unknown'`. The docstring claim that the tag "is a fixed SDK enum value" is now
+  enforced rather than assumed.
+- **Finite floats** (`model.py`). Pydantic accepts NaN/±inf for a bare `float`; NaN also slips
+  past `_bounds_ordered` because both ordering comparisons are false. `model_dump_json` then
+  writes `null` and the union adapter cannot read the record back — so the round-trip the
+  module advertises was conditionally false. All canonical floats now use
+  `_Finite = Annotated[float, Field(allow_inf_nan=False)]`.
+- **Option-set integrity** (`model.py`). `["A","A",""]` and `["A"]` both validated under the
+  old `min_length=1`. M1-404 must emit "every exact option once with probabilities summing to
+  one", which is unrepresentable when duplicate labels collapse as mapping keys — so the
+  constraint belongs at the input contract, not downstream. Now `min_length=2` plus a
+  validator rejecting blank and duplicate labels (without echoing them).
+- **Catch boundary** (`normalize.py`). One `try` spanned both SDK field reads and canonical
+  model construction, so a future internal `TypeError` in construction would have been
+  reported as a malformed input record. Field reads are now fenced separately; construction
+  errors stay visible.
+
+Decision — **`source_categories` carries the SDK's `categories` slugs through uninterpreted.**
+The review asked for a source-backed *domain* field. No SDK question class has one: the only
+domain-shaped field is `categories: list[Category]`, and this project's domain taxonomy lives
+in `config/x_accounts.yaml` (`econ_data`, `space_launch`, …) with no mechanical mapping from
+Metaculus categories. No backlog item assigns a domain to a *question*; the only spec text is
+one bullet in the downstream **forecast record** list (`CODEX_HANDOFF.md`), owned by M1-602.
+The recoverable half of the concern is real, though — `normalize.py` is the single place SDK
+fields are read, so a field dropped there cannot be recovered downstream without a re-fetch.
+Hence the passthrough, named `source_*` so it is not mistaken for the project's domain tag.
+Deriving an actual domain tag remains **M1-307 / M1-602**.
+
+All three repo fixtures carry an empty category list, so the passthrough is pinned by
+synthetic-object tests rather than fixture assertions — a fixture-driven check would have
+passed against a hardcoded `[]`. The same vacuity affected the group-linkage test the review
+flagged (every fixture has a null group parent); it now uses non-null synthetic linkage.

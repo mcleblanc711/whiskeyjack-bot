@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, get_args
 
-from forecasting_tools.data_models.questions import MetaculusQuestion
+from forecasting_tools.data_models.questions import MetaculusQuestion, QuestionBasicType
 from pydantic import ValidationError
 
 from whiskeyjack_bot.config import SupportedQuestionType
@@ -38,6 +38,10 @@ from whiskeyjack_bot.questions.model import (
 # Derived from the single source of truth in config (D20), so adding a type
 # there cannot leave this dispatch silently out of step.
 _SUPPORTED_TYPES: frozenset[str] = frozenset(get_args(SupportedQuestionType))
+# The SDK's own six-value tag enum. Only a member of this set is safe to name in an
+# error message; any other value reached the tag slot from outside the SDK's own
+# models and is therefore unvetted content under the no-echo rule.
+_KNOWN_SDK_TYPES: frozenset[str] = frozenset(get_args(QuestionBasicType))
 
 
 class NormalizationError(Exception):
@@ -53,9 +57,10 @@ class NormalizationError(Exception):
 class UnsupportedQuestionTypeError(NormalizationError):
     """The question is a type deferred in v1 (date/conditional/discrete, D21).
 
-    Raised before any model or submission call is made. The ``question_type``
-    tag it carries is a fixed SDK enum value, not stored content, so naming it
-    is safe under the no-echo rule.
+    Raised before any model or submission call is made. The message names the
+    ``question_type`` tag only when it is one of the SDK's own enum values
+    (``_KNOWN_SDK_TYPES``); anything else renders as ``'unknown'``, since an
+    arbitrary value in that slot is unvetted content under the no-echo rule.
     """
 
 
@@ -86,6 +91,9 @@ def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
         "scheduled_resolution_time": q.scheduled_resolution_time,
         "tournament_slugs": q.tournament_slugs,
         "question_weight": q.question_weight,
+        # Slug where the SDK supplies one (it is optional on Category), else the
+        # required name. Carried uninterpreted -- see the field comment in model.py.
+        "source_categories": [category.slug or category.name for category in q.categories],
         "group_question_option": q.group_question_option,
         "question_ids_of_group": q.question_ids_of_group,
     }
@@ -98,27 +106,32 @@ def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
     :class:`NormalizationError` if a supported type fails canonical validation.
     """
     question_type = getattr(q, "question_type", None)
-    if question_type not in _SUPPORTED_TYPES:
+    # isinstance before membership: an unhashable tag (a list, say) would raise a raw
+    # TypeError out of the frozenset test itself, escaping the boundary below.
+    if not isinstance(question_type, str) or question_type not in _SUPPORTED_TYPES:
         # Refused before any field is read, so an unsupported type can never
-        # reach a model or submission call (D21). Only the fixed type tag is
-        # named -- it is an SDK enum value, not stored content.
-        tag = question_type if isinstance(question_type, str) and question_type else "unknown"
+        # reach a model or submission call (D21).
+        tag = (
+            question_type
+            if isinstance(question_type, str) and question_type in _KNOWN_SDK_TYPES
+            else "unknown"
+        )
         raise UnsupportedQuestionTypeError(
             f"question type {tag!r} is not supported in v1 (binary, multiple_choice, numeric only)"
         )
+
+    # Field reads are fenced separately from model construction: a TypeError raised
+    # while building a canonical model is our bug, and must stay visible rather than
+    # being reported as a malformed input record.
     try:
-        common = _common_fields(q)
-        if question_type == "binary":
-            return CanonicalBinaryQuestion(**common)
+        fields = _common_fields(q)
         if question_type == "multiple_choice":
-            return CanonicalMultipleChoiceQuestion(
-                **common,
+            fields.update(
                 options=q.options,
                 option_is_instance_of=q.option_is_instance_of,
             )
-        if question_type == "numeric":
-            return CanonicalNumericQuestion(
-                **common,
+        elif question_type == "numeric":
+            fields.update(
                 lower_bound=q.lower_bound,
                 upper_bound=q.upper_bound,
                 open_lower_bound=q.open_lower_bound,
@@ -128,9 +141,6 @@ def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
                 nominal_lower_bound=q.nominal_lower_bound,
                 nominal_upper_bound=q.nominal_upper_bound,
             )
-    except ValidationError as exc:
-        # from None: the ValidationError text echoes the offending input values.
-        raise _sanitize(exc) from None
     except (AttributeError, TypeError):
         # A question object missing the fields its own type declares. Without
         # this the raw AttributeError escapes to callers that only handle
@@ -141,6 +151,17 @@ def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
             f"question object does not expose the fields required for type {question_type!r} "
             "(detail withheld: it can echo question contents)"
         ) from None
+
+    try:
+        if question_type == "binary":
+            return CanonicalBinaryQuestion(**fields)
+        if question_type == "multiple_choice":
+            return CanonicalMultipleChoiceQuestion(**fields)
+        if question_type == "numeric":
+            return CanonicalNumericQuestion(**fields)
+    except ValidationError as exc:
+        # from None: the ValidationError text echoes the offending input values.
+        raise _sanitize(exc) from None
     # Unreachable: question_type was checked against _SUPPORTED_TYPES above.
     raise AssertionError("unreachable: unhandled supported question type")
 
