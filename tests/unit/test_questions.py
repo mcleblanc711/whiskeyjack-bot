@@ -252,25 +252,32 @@ def fake_sdk_question(**overrides: object) -> SimpleNamespace:
         "group_question_option": None,
         "question_ids_of_group": None,
     }
-    # Type-specific attrs are legitimately absent from the base (normalize only reads
-    # them for their own type), so allow them explicitly rather than accepting anything.
-    known = base.keys() | {
-        "options",
-        "option_is_instance_of",
-        "lower_bound",
-        "upper_bound",
-        "open_lower_bound",
-        "open_upper_bound",
-        "zero_point",
-        "cdf_size",
-        "nominal_lower_bound",
-        "nominal_upper_bound",
+    # Type-specific attrs are legitimately absent from the base (normalize reads them
+    # only for their own type), so they are allowed per-type rather than globally: a
+    # global allowlist still admits `fake_sdk_question(options=[...])` on the default
+    # binary type, where nothing reads `options` and the override is vacuous.
+    type_specific: dict[object, set[str]] = {
+        "multiple_choice": {"options", "option_is_instance_of"},
+        "numeric": {
+            "lower_bound",
+            "upper_bound",
+            "open_lower_bound",
+            "open_upper_bound",
+            "zero_point",
+            "cdf_size",
+            "nominal_lower_bound",
+            "nominal_upper_bound",
+        },
     }
+    qtype = overrides.get("question_type", base["question_type"])
+    known = base.keys() | type_specific.get(qtype, set())
     # Without this an override naming a canonical field instead of the SDK attribute
     # (``url`` for ``page_url``, say) silently sets an attribute nothing reads, and the
     # test passes against the default value it meant to replace.
     unknown = overrides.keys() - known
-    assert not unknown, f"override(s) not read by normalize: {sorted(unknown)}"
+    assert not unknown, (
+        f"override(s) not read by normalize for question_type={qtype!r}: {sorted(unknown)}"
+    )
     base.update(overrides)
     return SimpleNamespace(**base)
 
