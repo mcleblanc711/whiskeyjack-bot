@@ -156,3 +156,129 @@ that glob would break **every** existing question test.
 Per M1-201's review history, the fixture varies its subquestion ids, timestamps and question
 weights rather than reusing shared constants — shared-constant vacuity was a repeat finding
 there, and this fixture's entire purpose is that siblings differ.
+
+## M1-203 — Rejecting unsupported types safely
+
+Acceptance: *unsupported types create a diagnostic event and make zero model/submission
+calls.*
+
+### What the criterion is actually guarding against
+
+Half of it already held. `normalize_question` refused an unsupported tag before reading any
+field, so a `date` question could never reach a model or a submission call — that is D21's
+real safety property, and it was pinned from M1-201.
+
+The live defect was the other half. `normalize_questions` propagated the first failure, so a
+single deferred question **discarded the normalization of every supported question fetched
+alongside it**. On a tournament pull containing one date question, the batch returned
+nothing. And "diagnostic event" named a mechanism that existed nowhere in `src/` — neither
+`CODEX_HANDOFF.md` nor `CLAUDE_CODE_PROMPT.md` defines it.
+
+### Delivered
+
+- `questions/events.py` — `DeferralEvent` and `NormalizationResult`, frozen dataclasses.
+- Refusal is now **two-tier**. `normalize_question` (singular) still raises
+  `UnsupportedQuestionTypeError`, message byte-identical. `normalize_questions` (batch)
+  skips, records a `DeferralEvent` and logs at WARNING.
+- `normalize_questions` returns `NormalizationResult`, not `list[CanonicalQuestion]`.
+- Four defensive helpers (`_safe_attr`, `_type_tag`, `_supported_type`, `_safe_int`).
+- 332 tests (up from 323).
+
+### Decision — the event is an in-process value, not a ledger row
+
+The obvious reading of "diagnostic event" is a ledger row. It was rejected for now, on three
+grounds: M1-602 owns ledger writers and is Not Started; there is **no run or tournament
+context at this layer** to key a row on (nothing in `src/` even calls `normalize_questions`
+yet); and every `*_events` table in `001_initial.sql` is FK-bound to `forecast_records`,
+which by definition does not exist for a question refused before forecasting.
+
+A migration `003` would also have collided with two live parallel branches — CLAUDE.md's
+"migration numbers are claimed globally" gotcha.
+
+`DeferralEvent` is shaped so M1-602 can persist it later without rework, and lives in its own
+module importing only `model.py`, so a ledger writer can import it without dragging in the SDK.
+
+### Decision — the event carries `question_id`/`post_id`; the int gate is why that is safe
+
+This is the one deliberate reading of the no-echo rule as **scoped**, and it should be the
+first thing a reviewer pressure-tests.
+
+CLAUDE.md's rule is written about error messages: *"an error message never echoes
+stored/file/field values."* A `DeferralEvent` is not an error message; it is the diagnostic
+artifact the criterion demands. An event that says "3 questions were deferred" without saying
+*which* satisfies the criterion's words and fails its purpose — an operator cannot act on it.
+
+Carrying identity is safe **by construction, not by promise**. `_safe_int` returns `None` for
+anything that is not an `int` (and rejects `bool`, an `int` subclass). So the event contains
+**zero unvetted strings**: `reason` is a module literal, `question_type` is
+`_KNOWN_SDK_TYPES`-gated or `'unknown'`, and both ids are `int | None`. Hand it an object whose
+`id_of_question` is a leaked credential and the event carries `None` —
+`test_deferral_withholds_non_integer_identity` pins exactly that.
+
+**The duplicate-id error is unchanged and still withholds ids.** That is an error message
+interpolating into free prose, the softer reading there was already a review finding, and this
+does not reopen it.
+
+### Decision — `logging_setup.py` was not touched
+
+Values are interpolated into the log **message** with lazy `%` args, because
+`record.getMessage()` is already redacted twice (filter + formatter).
+
+An `extra`-field passthrough would have been *worse*, not just bigger: the redaction
+comprehension in `JsonFormatter.format` is `isinstance(value, str)` over **top-level values
+only**, so a dict or list arriving via `extra` sails past it untouched — a new leak class in
+the one module that must not have one.
+
+Cost, stated plainly: the record is JSON with a string message, so a machine consumer needs a
+regex until M1-602 gives deferrals a real row. Accepted — the machine-readable form today is
+the returned `DeferralEvent`.
+
+`test_deferral_log_record_is_not_a_leak_vector` renders a real record through the real
+`JsonFormatter` rather than asserting on `caplog.text`, since the formatter is what production
+writes.
+
+### Decision — only a deferred *type* is skipped
+
+The stricter reading (CLAUDE.md rule 4). A malformed *supported*-type question and a duplicate
+`question_id` both still raise and abort the batch. D21 defers date and conditional questions;
+it does not make malformed records survivable, and reporting a real defect as "deferred" would
+hide it behind a diagnostic that says the opposite.
+
+Uniqueness is checked over **accepted** questions only: a deferred question has no canonical
+model and never reaches the ledger, so it is not part of the contract that check protects.
+
+### Note — the tripwire test derives from `BaseException` deliberately
+
+`tripwire_question` arms every content attribute to raise on access, making explicit a
+guarantee the older `_OnlyTag` tests held only by accident (an object exposing just a tag
+proves "nothing crashed", not "nothing was read").
+
+It raises `_ContentFieldRead(BaseException)`, **not** `AssertionError`. `_safe_attr` swallows
+`Exception` by design, so an `AssertionError` tripwire would be caught and the test would pass
+vacuously the moment anyone routed a content read through that helper. This was verified by
+mutation: injecting `_safe_attr(q, "resolution_criteria")` into the deferral path fails the
+test.
+
+### Rejected — attaching the event to the exception
+
+`UnsupportedQuestionTypeError.event`, so the batch could catch and read it. It guarantees
+message/event agreement at one construction site, but puts state on a sanitized exception type
+whose entire contract is "nothing but a safe string". Extracting `_type_tag`, shared by both
+the message and the event, delivers the same drift protection without that.
+
+### Deferred (do not read the absence as an omission)
+
+- **Ledger persistence of deferrals → M1-602**, when writers and a run context exist.
+- **Structured `extra` fields on log records** — deliberately not built; see above.
+- **Golden valid/invalid fixture coverage remains Codex's T-901.** The tests here are the
+  minimum to stay honest, and none of them is a golden-record suite.
+
+### Standing note — no production caller yet
+
+Nothing in `src/` calls `normalize_questions`; both callers are tests. That is why the return
+type changed *now* rather than later — it is the cheapest this change will ever be. It also
+means the behavioural check for M1-203 **is** the test suite, with no end-to-end path to
+exercise until the pipeline lands.
+
+The M1-202 bullet above saying a deferred subquestion "still aborts the whole batch … is
+M1-203" is left as written: these notes are a historical record, and this section supersedes it.

@@ -11,9 +11,18 @@ Type dispatch keys on the SDK's ``question_type`` literal rather than
 ``isinstance``: ``DiscreteQuestion`` subclasses ``NumericQuestion`` in the SDK,
 so an ``isinstance(q, NumericQuestion)`` test would silently swallow the
 unsupported ``discrete`` type. Only the three v1 types (D20) map; ``date``,
-``conditional``, ``discrete`` and anything else are refused with
-:class:`UnsupportedQuestionTypeError` (D21). Turning that refusal into a logged
-diagnostic event -- rather than an exception the caller must catch -- is M1-203.
+``conditional``, ``discrete`` and anything else are deferred (D21).
+
+Refusal is two-tier (M1-203). :func:`normalize_question` -- the single-question
+path, and the type-policy chokepoint -- *raises*
+:class:`UnsupportedQuestionTypeError`, so it can never return a question of a
+deferred type. :func:`normalize_questions` -- the batch path -- instead *skips*
+such a question, records a
+:class:`~whiskeyjack_bot.questions.events.DeferralEvent` on its result and logs
+it, so one deferred question no longer throws away the normalization of every
+supported question fetched alongside it. Everything else still aborts the batch:
+D21 defers date and conditional questions, it does not make malformed records
+survivable.
 
 Error hygiene matches ``ConfigError``/``SnapshotError``/``LedgerError``: a
 :class:`NormalizationError` never echoes field values (a mistakenly stored
@@ -22,18 +31,22 @@ secret must not surface), and sanitizing raises use ``from None``.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, get_args
 
 from forecasting_tools.data_models.questions import MetaculusQuestion, QuestionBasicType
 from pydantic import ValidationError
 
 from whiskeyjack_bot.config import SupportedQuestionType
+from whiskeyjack_bot.questions.events import DeferralEvent, NormalizationResult
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestion,
 )
+
+logger = logging.getLogger(__name__)
 
 # Derived from the single source of truth in config (D20), so adding a type
 # there cannot leave this dispatch silently out of step.
@@ -104,6 +117,73 @@ def _group_parent_title(q: MetaculusQuestion) -> str | None:
     return title
 
 
+def _safe_attr(q: MetaculusQuestion, attribute: str) -> object:
+    """Read one attribute with nothing allowed to escape.
+
+    ``getattr``'s default only suppresses ``AttributeError``; a property whose
+    getter raises anything else would escape this module's error boundary. These
+    reads happen on the *refusal* path, where an escaping exception would turn a
+    clean deferral into a crash -- and the value is unusable either way.
+    """
+    try:
+        return getattr(q, attribute, None)
+    except Exception:
+        return None
+
+
+def _type_tag(question_type: object) -> str:
+    """Render the type tag for an error message or a diagnostic event.
+
+    One helper for both so the exception text and the event cannot drift: a tag
+    outside the SDK's own enum reached that slot from outside the SDK's models and
+    is unvetted content under the no-echo rule.
+    """
+    if isinstance(question_type, str) and question_type in _KNOWN_SDK_TYPES:
+        return question_type
+    return "unknown"
+
+
+def _supported_type(q: MetaculusQuestion) -> str | None:
+    """The question's type if v1 supports it (D20), else ``None``.
+
+    isinstance before membership: an unhashable tag (a list, say) would raise a raw
+    ``TypeError`` out of the frozenset test itself, escaping the error boundary.
+    """
+    question_type = _safe_attr(q, "question_type")
+    if isinstance(question_type, str) and question_type in _SUPPORTED_TYPES:
+        return question_type
+    return None
+
+
+def _safe_int(q: MetaculusQuestion, attribute: str) -> int | None:
+    """Read one integer identity field, or ``None`` if it is not an integer.
+
+    The int gate is the no-echo guarantee for :class:`DeferralEvent`: a string in
+    an id slot -- which could be a mistakenly stored credential -- is dropped
+    rather than carried. ``bool`` is excluded explicitly since it subclasses
+    ``int``, and a ``True`` identity is a defect rather than an id.
+    """
+    value = _safe_attr(q, attribute)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _deferral_event(q: MetaculusQuestion) -> DeferralEvent:
+    """Describe a question deferred under D21. Reads identity only.
+
+    No content field is touched, so a deferred question reaches no model and no
+    submission call -- and nothing that could carry a secret reaches the event.
+    """
+    tag = _type_tag(_safe_attr(q, "question_type"))
+    return DeferralEvent(
+        reason="deferred_v1_type" if tag != "unknown" else "unrecognized_type",
+        question_type=tag,
+        question_id=_safe_int(q, "id_of_question"),
+        post_id=_safe_int(q, "id_of_post"),
+    )
+
+
 def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
     """Read the fields shared by every supported type off the SDK object."""
     return {
@@ -140,18 +220,17 @@ def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
 
     Raises :class:`UnsupportedQuestionTypeError` for deferred types (D21) and
     :class:`NormalizationError` if a supported type fails canonical validation.
+
+    The singular path still *raises* on a deferred type, deliberately: it is the
+    type-policy chokepoint, and "an unsupported question can never reach a model"
+    is easiest to guarantee when this function cannot return one. Skipping with a
+    diagnostic event is a batch policy and lives on :func:`normalize_questions`.
     """
-    question_type = getattr(q, "question_type", None)
-    # isinstance before membership: an unhashable tag (a list, say) would raise a raw
-    # TypeError out of the frozenset test itself, escaping the boundary below.
-    if not isinstance(question_type, str) or question_type not in _SUPPORTED_TYPES:
+    question_type = _supported_type(q)
+    if question_type is None:
         # Refused before any field is read, so an unsupported type can never
         # reach a model or submission call (D21).
-        tag = (
-            question_type
-            if isinstance(question_type, str) and question_type in _KNOWN_SDK_TYPES
-            else "unknown"
-        )
+        tag = _type_tag(_safe_attr(q, "question_type"))
         raise UnsupportedQuestionTypeError(
             f"question type {tag!r} is not supported in v1 (binary, multiple_choice, numeric only)"
         )
@@ -202,32 +281,69 @@ def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
     raise AssertionError("unreachable: unhandled supported question type")
 
 
-def normalize_questions(questions: list[MetaculusQuestion]) -> list[CanonicalQuestion]:
-    """Normalize a list of SDK questions; propagates the first failure.
+def normalize_questions(questions: list[MetaculusQuestion]) -> NormalizationResult:
+    """Normalize a batch: defer unsupported types, propagate real failures (M1-203).
 
-    Enforces that ``question_id`` is unique across the batch (M1-202). Group
-    expansion is where this earns its keep: every subquestion of a group is built by
-    deep-copying the parent post, so siblings share ``post_id``, ``url`` and the
-    parent's framing fields, and ``question_id`` is the only thing telling them
-    apart. A duplicate here means either an expansion defect or the same question
-    fetched twice, and both would collide on the ledger's
+    A question whose type is deferred in v1 (D21) does **not** abort the batch. It
+    is skipped before any field is read, recorded as a
+    :class:`~whiskeyjack_bot.questions.events.DeferralEvent` on the result and
+    logged at WARNING -- so it makes zero model and zero submission calls while the
+    batch's supported questions still normalize.
+
+    **Everything else still aborts.** A *supported*-type question that fails
+    canonical validation, and a duplicate ``question_id``, both raise
+    :class:`NormalizationError`. D21 defers date and conditional questions; it does
+    not make malformed records survivable, and the stricter reading of an ambiguous
+    criterion is the project rule.
+
+    ``question_id`` uniqueness (M1-202) is enforced over the **accepted** questions
+    only. Group expansion is where that check earns its keep: every subquestion of a
+    group is built by deep-copying the parent post, so siblings share ``post_id``,
+    ``url`` and the parent's framing fields, and ``question_id`` is the only thing
+    telling them apart. A duplicate means either an expansion defect or the same
+    question fetched twice, and both would collide on the ledger's
     ``UNIQUE (question_id, tournament_id, forecast_version)`` -- but only after a
-    forecast had been generated and paid for. Failing at the boundary is cheaper.
+    forecast had been generated and paid for. A deferred question has no canonical
+    model and never reaches the ledger, so it is not part of that check.
     """
-    canonical = [normalize_question(q) for q in questions]
+    accepted: list[CanonicalQuestion] = []
+    deferrals: list[DeferralEvent] = []
+
+    for question in questions:
+        if _supported_type(question) is None:
+            event = _deferral_event(question)
+            deferrals.append(event)
+            # Logged inside the loop so deferrals stay visible even when a later
+            # question aborts the batch. Interpolated into the message rather than
+            # passed via ``extra``: JsonFormatter builds a fixed payload with no
+            # structured-field passthrough, and the message is a field it redacts,
+            # so every value here is already inside the redaction path.
+            logger.warning(
+                "deferring unsupported question type (D21): reason=%s question_type=%s "
+                "question_id=%s post_id=%s",
+                event.reason,
+                event.question_type,
+                event.question_id,
+                event.post_id,
+            )
+            continue
+        accepted.append(normalize_question(question))
 
     seen: set[int] = set()
     duplicates = 0
-    for question in canonical:
-        if question.question_id in seen:
+    for canonical in accepted:
+        if canonical.question_id in seen:
             duplicates += 1
-        seen.add(question.question_id)
+        seen.add(canonical.question_id)
     if duplicates:
         # Count only. The colliding id is low-risk content, but the no-echo rule is
-        # unconditional and the softer reading of it has been a review finding.
+        # unconditional for an error message and the softer reading of it has been a
+        # review finding. (DeferralEvent does carry ids: it is a diagnostic value
+        # rather than an error message, and its int gate makes a leak impossible --
+        # see events.py.)
         raise NormalizationError(
             f"question batch contains {duplicates} duplicate question id(s) "
             "(ids withheld: an error message never echoes record content)"
         )
 
-    return canonical
+    return NormalizationResult(questions=tuple(accepted), deferrals=tuple(deferrals))
