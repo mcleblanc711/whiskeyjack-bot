@@ -19,6 +19,17 @@ migration and are added by ``002_research_document_fields.sql``:
   rewrite ``canonical_url`` for dedup; without this field the as-retrieved URL
   would be unrecoverable, which is an attribution loss.
 
+The mirroring is not field-for-field, and the two departures are deliberate:
+
+- ``created_at_utc`` (NOT NULL in both tables) is **writer-owned metadata**, not
+  adapter data. It records when the ledger stored the row, so only the write
+  path (M1-602) may set it; letting an adapter supply it would let a caller
+  backdate its own audit trail. The same reasoning as ``document_id``.
+- Two fields are stored serialized: ``provider_config`` maps to the
+  ``provider_config_json`` TEXT column and ``queries`` to ``queries_json``.
+  Hence ``provider_config`` is typed ``dict[str, JsonValue]`` -- a value that
+  cannot round-trip through JSON cannot be persisted, so it is not valid here.
+
 Vocabularies are closed ``Literal`` sets. The handoff does not enumerate
 ``source_type``, so this module enumerates it (ambiguity rule 4: implement the
 stricter reading) -- an unrecognized source type is a normalization bug and must
@@ -34,8 +45,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import AfterValidator, AwareDatetime, Field, ValidationError, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    Field,
+    JsonValue,
+    ValidationError,
+    model_validator,
+)
 
 from whiskeyjack_bot.config import _StrictModel
 
@@ -73,6 +93,34 @@ def _to_utc(value: datetime) -> datetime:
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(_to_utc)]
 
 
+def _require_http_url(value: str) -> str:
+    """Check absolute http(s) syntax without rewriting the URL.
+
+    Deliberately *not* canonicalization -- that is M1-305, and this returns the
+    string byte-for-byte as the provider sent it. What it rejects is input that
+    is not a URL at all: whitespace, a bare title, a relative path, a scheme we
+    never retrieve over. Those are normalization bugs, and a document whose URL
+    does not resolve is an attribution the reader cannot check.
+    """
+    # urlsplit tolerates surrounding whitespace and strips it, so a value that is
+    # only usable after stripping must be caught before parsing: the stored URL
+    # is the one we were given, and " https://x/y " is not that URL.
+    if value != value.strip():
+        raise ValueError("must not have leading or trailing whitespace")
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https"):
+        # No value in the message: a URL is row content, and provider text can
+        # carry anything (same rule as ResearchSchemaError).
+        raise ValueError("must be an absolute http(s) URL (offending input withheld)")
+    if not parts.netloc:
+        raise ValueError("must be an absolute http(s) URL with a host (offending input withheld)")
+    return value
+
+
+# An absolute http(s) URL, preserved exactly. See _require_http_url.
+HttpUrlString = Annotated[str, Field(min_length=1), AfterValidator(_require_http_url)]
+
+
 class ResearchSchemaError(Exception):
     """A research run or document failed validation, with inputs withheld.
 
@@ -98,8 +146,8 @@ class ResearchDocument(_StrictModel):
 
     # As returned by the provider; never rewritten. M1-305 derives canonical_url
     # from it, and until then adapters may set the two to the same value.
-    original_url: str = Field(min_length=1)
-    canonical_url: str = Field(min_length=1)
+    original_url: HttpUrlString
+    canonical_url: HttpUrlString
 
     title: str | None = None
     publisher: str | None = None
@@ -124,6 +172,35 @@ class ResearchDocument(_StrictModel):
     # assigns one, defaulting to unverified_social.
     reliability_tag: ReliabilityTag | None = None
 
+    @model_validator(mode="after")
+    def _social_documents_are_agent_reported_and_tagged(self) -> ResearchDocument:
+        """Bind the trust fields the forecaster prompt's evidence caps depend on.
+
+        Social evidence reaches the pipeline only through the xAI research agent
+        (brief § B): Grok reports posts, so their content and timestamps are
+        claims (``llm_reported``), and every one carries a trust tag assigned
+        from the M1-308 allowlist, defaulting to ``unverified_social``. The
+        prompt caps how load-bearing such a document may be *by reading these two
+        fields*, so a social document missing either silently escapes the cap.
+
+        Ambiguity rule 4 (stricter reading): the brief describes no other route
+        to a social document. A direct X API adapter would produce
+        ``social``/``direct_api`` and require revisiting this -- deliberately a
+        schema change rather than a hole left open in advance.
+        """
+        if self.source_type == "social":
+            if self.provenance != "llm_reported":
+                raise ValueError(
+                    "source_type 'social' requires provenance 'llm_reported': "
+                    "social evidence is reported by the research agent, not retrieved"
+                )
+            if self.reliability_tag is None:
+                raise ValueError(
+                    "source_type 'social' requires a reliability_tag "
+                    "(use 'unverified_social' when the handle is not on the allowlist)"
+                )
+        return self
+
 
 class ResearchRun(_StrictModel):
     """One provider invocation for one question, and how it went."""
@@ -135,7 +212,11 @@ class ResearchRun(_StrictModel):
     question_id: int
 
     provider: RetrievalProvider
-    provider_config: dict[str, Any] | None = None
+    # JsonValue, not Any: this column is provider_config_json TEXT, so a config
+    # holding a non-serializable value is not storable. Typing it Any would let
+    # validation "pass" and fail later at model_dump_json(), inside the ledger
+    # write, where the run has already happened and cannot be re-run for free.
+    provider_config: dict[str, JsonValue] | None = None
     queries: list[str] = Field(default_factory=list)
 
     started_at_utc: UtcDatetime
@@ -164,11 +245,61 @@ class ResearchRun(_StrictModel):
             raise ValueError("completed_at_utc must not precede started_at_utc")
         return self
 
+    @model_validator(mode="after")
+    def _agent_runs_account_for_themselves(self) -> ResearchRun:
+        """Require model identity and drop accounting from the agent provider.
 
-def _sanitize(exc: ValidationError) -> ResearchSchemaError:
+        Both are attribution, not telemetry. D27 forbids a silent model default,
+        so a second model that participated in gathering evidence must be named
+        in the row that records its output -- and ``agent_model`` is
+        config-supplied, so it is known even for a run that failed outright.
+
+        ``posts_dropped_no_url`` is required for the same reason ``0`` and
+        ``None`` must not be the same row: unset means nobody counted, while
+        zero is the auditable claim that no citation was discarded. A run that
+        gathered nothing dropped nothing, and says so.
+        """
+        if self.provider == "xai_x_search":
+            if self.agent_model is None or not self.agent_model.strip():
+                raise ValueError(
+                    "provider 'xai_x_search' requires a non-blank agent_model: "
+                    "an agent's output is attributed to the model that produced it (D27)"
+                )
+            if self.posts_dropped_no_url is None:
+                raise ValueError(
+                    "provider 'xai_x_search' requires posts_dropped_no_url "
+                    "(use 0 for a run that dropped no citations; None means unmeasured)"
+                )
+        return self
+
+
+# Substituted for any error-location part that did not come from the schema. See
+# _sanitize: matches the "offending input withheld" wording config.py uses.
+_WITHHELD = "<withheld>"
+
+
+def _sanitize(exc: ValidationError, model: type[BaseModel]) -> ResearchSchemaError:
+    """Render a ValidationError with every input-controlled fragment removed.
+
+    ``include_input=False`` withholds the offending *value*, but an error's
+    ``loc`` can itself be input: under ``extra="forbid"`` the location of an
+    unexpected key **is** that key, and inside ``provider_config`` it is a
+    caller-supplied dict key. A payload assembled from provider text (or from a
+    misplaced credential) would otherwise print verbatim.
+
+    So a location part survives only if the schema authored it: an ``int`` list
+    index, or a field name declared on ``model``. Everything else is withheld.
+    That is stricter than needed for today's two flat models and stays correct
+    if a later error type puts something new in ``loc``.
+    """
+    known = set(model.model_fields)
     problems = []
     for err in exc.errors(include_input=False, include_url=False):
-        location = ".".join(str(part) for part in err["loc"]) or "<root>"
+        parts = [
+            str(part) if isinstance(part, int) or part in known else _WITHHELD
+            for part in err["loc"]
+        ]
+        location = ".".join(parts) or "<root>"
         problems.append(f"{location}: {err['msg']}")
     return ResearchSchemaError(problems)
 
@@ -184,7 +315,7 @@ def validate_document(data: Any) -> ResearchDocument:
     except ValidationError as exc:
         # from None: a chained __cause__ re-exposes the raw ValidationError (which
         # echoes inputs) whenever this error reaches a traceback renderer.
-        raise _sanitize(exc) from None
+        raise _sanitize(exc, ResearchDocument) from None
 
 
 def validate_run(data: Any) -> ResearchRun:
@@ -192,4 +323,4 @@ def validate_run(data: Any) -> ResearchRun:
     try:
         return ResearchRun.model_validate(data)
     except ValidationError as exc:
-        raise _sanitize(exc) from None
+        raise _sanitize(exc, ResearchRun) from None

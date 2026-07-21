@@ -836,3 +836,107 @@ index 0000000..3e72f42
 +    assert ResearchRun.model_fields["question_id"].annotation is int
 +    assert "document_id" in ResearchDocument.model_fields
 ```
+
+---
+
+# Round 2 — disposition of the DO-NOT-APPROVE review
+
+All eight findings are accepted and fixed. Gates after the changes: **157 passed** (was 124;
+the M1-301 suite went 20 → 53), `ruff check` clean, `ruff format --check` clean,
+`mypy --strict src` clean, `git diff --check master...HEAD` clean.
+
+Two findings are implemented differently from the review's prescription. Both are flagged
+below rather than folded in quietly.
+
+## High
+
+**1. Input-controlled field names leak through sanitized errors — fixed, and widened.**
+`_sanitize` now takes the model class and admits a location part only if the schema authored
+it: an `int` list index, or a name in `model.model_fields`. Anything else renders as
+`<withheld>`. Implemented as a general allowlist rather than an `extra_forbidden` special
+case, because the review's example was not the only instance of the bug — **`provider_config`
+dict keys land in `loc` the same way**, so `{"sk-live-…": <bad value>}` leaked identically
+through a completely different error type. Both are now covered by their own leak test using
+the planted secret as the key, asserting on `str(exc)` and on `traceback.format_exception`.
+A rejected unexpected key still reports `<withheld>: Extra inputs are not permitted`, so the
+diagnostic survives.
+
+**2. xAI runs do not require model identity or citation-drop accounting — fixed.**
+New `_agent_runs_account_for_themselves` validator: `provider == "xai_x_search"` requires a
+non-blank `agent_model` (strip-checked) and a non-`None` `posts_dropped_no_url`. Enforced
+**even when `error_summary` is set** — `agent_model` is config-supplied under D27 so a failed
+run still knows it, and a run that gathered nothing dropped nothing and can say so. This is
+what makes `0` distinguishable from "not measured". Mirrored by a trigger, so the guarantee
+holds against direct SQL too. Non-agent providers are unaffected and still leave both `None`.
+
+**3. Migration 002 permits new provenance-less ledger records — fixed via the third option.**
+Took the trigger route. Note one correction to the finding: it lists `reliability_tag` among
+the fields an insert must not leave NULL, but that field is legitimately NULL for every
+non-social document (`ReliabilityTag | None`) and the brief requires it only of the X
+adapter's output. It is enforced **conditionally** (see 4), never unconditionally. The
+finding also missed `research_runs.question_id`, which has the same unconditional-required
+shape; it is fixed alongside the others.
+
+`BEFORE INSERT` and `BEFORE UPDATE` triggers on both tables now reject NULL `original_url` /
+`provenance` / `source_type` (and `question_id` on runs), close the `source_type`,
+`reliability_tag` and `provider` vocabularies that a CHECK could not be retrofitted onto, and
+enforce the social contract at the storage layer. Columns stay NULLable so pre-002 rows keep
+their honest NULLs — the review agreed a `direct_api` default would be a false attribution.
+Intended consequence, documented in the migration: a legacy row cannot be UPDATEd until it is
+also backfilled. The ledger is append-only, so nothing should be updating it; M1-602/M1-603
+still add the triggers that forbid UPDATE outright.
+
+Migration 002 was edited in place rather than superseded by a 003. It is not on master and
+has never been applied to any database — master ships only `001_initial.sql` at
+`LEDGER_SCHEMA_VERSION = 1` — so the checksum-pinning rule that forbids editing 001 does not
+reach it. No drift is possible.
+
+The review's observation that "the current test helpers already exercise this bypass" was
+exactly right, and it is how the fix was confirmed: adding the triggers immediately failed
+five pre-existing tests whose `_seed_run` / `_seed_document` helpers wrote 001-era columns
+only. Those helpers now supply the required values. A dedicated test also applies 001 alone,
+writes a legacy row, then migrates and asserts the row survives with its NULLs intact while
+the same insert is refused from that point on.
+
+**4. The social-document trust contract is not enforced — fixed.**
+`source_type == "social"` now requires `provenance == "llm_reported"` **and** a non-null
+`reliability_tag`, model-side and by trigger. Rationale recorded in the code and the notes:
+the brief describes exactly one route to a social document (the agent reports it, and it
+always carries a tag defaulting to `unverified_social`), and the forecaster prompt's evidence
+caps read precisely those two fields. Per ambiguity rule 4 this takes the stricter reading;
+a future direct X API adapter would produce `social`/`direct_api` and require a deliberate
+schema change, which is the intent rather than an oversight.
+
+## Medium
+
+**5. `provider_config` is not guaranteed to be JSON-persistable — fixed.** Now
+`dict[str, JsonValue] | None`. Tests cover both the rejection of `{"session": object()}` and
+a nested config round-tripping through `model_dump_json()`. `queries` was already `list[str]`.
+
+**6. URL fields accept whitespace and arbitrary non-URLs — fixed as suggested.** New
+`_require_http_url` `AfterValidator` (mirroring the existing `UtcDatetime` pattern): rejects
+leading/trailing whitespace explicitly *before* parsing, since `urlsplit` would silently strip
+it, then requires an `http`/`https` scheme and a non-empty host. **Returns the string
+unmodified** — canonicalization stays M1-305, and a test pins that a URL with port, query,
+tracking parameter and fragment survives byte-for-byte.
+
+## Optional
+
+**7. Models do not fully mirror the tables — fixed as documentation.** The `model.py`
+docstring now states that `created_at_utc` is writer-owned metadata assigned by the M1-602
+write path (an adapter supplying it could backdate its own audit trail — same reasoning as
+`document_id`), and documents the `provider_config` → `provider_config_json` and
+`queries` → `queries_json` mappings.
+
+**8. `git diff --check` fails — fixed, but not by editing the lines.** Both flagged lines are
+*correct* unified-diff context lines: in diff format a blank source line becomes a line
+containing exactly one space. Stripping them would corrupt the diff under review. Suppressed
+via `.gitattributes` (`GPT_REVIEW_REQUEST_*.md -whitespace`) instead, following the precedent
+already in that file for `docs/backlog/*.csv`. `git diff --check master...HEAD` is now clean.
+
+## Not addressed
+
+The two items the review noted it could not verify — adapter/write-path behavior, and how
+multiple raw responses will be bundled behind the singular `raw_response_path` — remain out
+of scope for M1-301 and are unimplemented on this branch. The second is a real design
+question for M1-307 and is being carried forward rather than resolved here.

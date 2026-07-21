@@ -4,3 +4,10 @@
 # line is not a whitespace error (re-review finding 4: `git diff --check`
 # flagged every edited row).
 docs/backlog/*.csv -text whitespace=cr-at-eol
+
+# The cross-model review requests embed unified diffs verbatim. In diff format a
+# context line is prefixed with a space, so a blank source line becomes a line
+# containing exactly one space — `git diff --check` reads those as trailing
+# whitespace (round-2 finding 8). Stripping them would corrupt the diff being
+# reviewed, so the check is suppressed for these files instead.
+GPT_REVIEW_REQUEST_*.md -whitespace
