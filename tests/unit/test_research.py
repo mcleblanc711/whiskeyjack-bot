@@ -484,6 +484,37 @@ def test_standards_valid_international_hostnames_are_accepted(url: str) -> None:
 @pytest.mark.parametrize(
     "url",
     [
+        # urlsplit strips the brackets, so an IPv6 authority reaches the check as
+        # a bare "::1" -- which IDNA refuses. IPv4 had been passing only because
+        # dotted digits happen to be acceptable IDNA labels, not because anything
+        # checked it.
+        "https://[::1]/a",
+        "https://[2001:db8::1]:443/a",
+        "https://[fe80::1]/a",
+        "https://192.168.1.1/a",
+        "https://8.8.8.8:8080/a",
+    ],
+)
+def test_ip_literal_hosts_are_accepted(url: str) -> None:
+    assert validate_document(_document(original_url=url)).original_url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[::1/a",  # unclosed bracket -- urlsplit itself refuses
+        "https://[gg::1]/a",  # bracketed but not an address
+        "https://[::1]:99999/a",  # IP literal does not exempt the port check
+    ],
+)
+def test_malformed_ip_literal_hosts_are_rejected(url: str) -> None:
+    with pytest.raises(ResearchSchemaError):
+        validate_document(_document(original_url=url))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         # Cf that IDNA rejects wherever it appears: valid in no context.
         "https://exa\u200bmple.org/a",  # zero-width space
         "https://ex\u202eample.org/a",  # right-to-left override

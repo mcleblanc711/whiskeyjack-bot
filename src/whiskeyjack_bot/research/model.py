@@ -43,6 +43,7 @@ and a research document can hold arbitrary retrieved text.
 
 from __future__ import annotations
 
+import ipaddress
 import unicodedata
 from datetime import datetime, timezone
 from math import isfinite
@@ -166,27 +167,42 @@ def _require_http_url(value: str) -> str:
         raise ValueError(_BAD_URL)
     if port is not None and not 1 <= port <= 65535:
         raise ValueError(_BAD_URL)
-    _require_encodable_hostname(hostname)
+    _require_resolvable_hostname(hostname)
     return value
 
 
-def _require_encodable_hostname(hostname: str) -> None:
-    """Require a hostname the DNS could actually be asked about.
+def _require_resolvable_hostname(hostname: str) -> None:
+    """Require a host that is either an IP literal or an encodable domain name.
 
-    Delegated to ``idna`` rather than hand-checked, for the same reason the
-    character rules ask ``unicodedata``: this is a standard with contextual
-    rules, and any enumeration of it drifts. ``idna.encode`` applies IDNA 2008
-    including CONTEXTJ, which is what distinguishes the two cases a blanket
-    category ban cannot:
+    ``urlsplit().hostname`` returns both kinds, and they answer to different
+    standards, so each is checked against its own:
 
-    - U+200C/U+200D **are valid** between particular scripts' letters, so
-      ``نامه‌ای.ir`` and ``क्‍ष.com`` encode successfully and must be accepted.
-    - U+200B and the bidi overrides are valid nowhere, so they are still refused
-      -- which was the point of the round-4 Cf rule, kept without its collateral.
+    - **IP literals.** ``ipaddress`` decides. ``urlsplit`` has already stripped
+      the brackets from an IPv6 authority (and rejects a malformed one itself),
+      so ``https://[::1]/a`` arrives here as ``"::1"``. Sending that to ``idna``
+      rejected valid URLs (review round 6); IPv4 only survived because dotted
+      digits happen to be acceptable IDNA labels, which is luck, not a check.
+    - **Domain names.** ``idna.encode`` applies IDNA 2008 including CONTEXTJ,
+      which is what distinguishes the two cases a blanket category ban cannot:
+      U+200C/U+200D **are valid** between particular scripts' letters, so
+      ``نامه‌ای.ir`` and ``क्‍ष.com`` must be accepted, while U+200B and the bidi
+      overrides are valid nowhere and stay refused.
 
-    Pure ASCII hostnames take the same path; ``idna`` accepts them unchanged, so
-    there is no fast-path branch to keep in sync.
+    Delegated in both directions rather than hand-checked, for the reason the
+    character rules ask ``unicodedata``: these are standards with contextual
+    rules, and any enumeration of them drifts from the comment beside it. Pure
+    ASCII domains need no special case -- ``idna`` accepts them unchanged.
+
+    Whether a *reachable* host is also an appropriate one (loopback, private
+    ranges) is deliberately not decided here: this module validates shape and
+    holds no network code. That question belongs to whatever fetches a URL.
     """
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass  # Not an IP literal, so it has to be a domain name.
+    else:
+        return
     try:
         idna.encode(hostname)
     except idna.IDNAError:

@@ -1166,3 +1166,48 @@ and the database and asserts they agree.
 
 Adapter/write-path behavior and `raw_response_path` bundling remain unimplemented and
 unverifiable, unchanged across all five rounds.
+
+---
+
+# Round 6 — disposition
+
+Reproduced and fixed. Gates: **227 passed** (was 219; the M1-301 suite went 114 → 122),
+`ruff check` clean, `ruff format --check` clean, `mypy --strict src` clean,
+`git diff --check master...HEAD` clean.
+
+## Medium — IDNA validation rejects valid IPv6-literal URLs
+
+Both cases reproduced. `urlsplit` strips the brackets from an IPv6 authority, so
+`https://[::1]/a` reaches the check as the bare string `"::1"`, and `idna.encode` refuses it as
+an invalid codepoint.
+
+The observation that **IPv4 passed only incidentally** is the more important half of the
+finding, and it is correct: `192.168.1.1` satisfies `idna.encode` because dotted digits are
+acceptable IDNA labels. Nothing was validating it as an address. So the class of bug was
+"hostnames are not all one kind of thing", and the IPv4 case was hiding it.
+
+Taking the suggested route: `_require_resolvable_hostname` now tries
+`ipaddress.ip_address(hostname)` first and falls through to `idna.encode` only when that fails,
+so each kind of host is judged against its own standard. Malformed literals are still rejected
+— `urlsplit` refuses an unclosed bracket and a bracketed non-address on its own, and an IP
+literal does not exempt the port check (`https://[::1]:99999/a` is still refused). All of that
+is now pinned by tests, alongside a re-check that the ZWSP/bidi and contextual-ZWNJ cases from
+round 5 still behave.
+
+One thing deliberately **not** added: any judgement about loopback or private ranges. This
+module validates shape and contains no network code, so "is this host appropriate to fetch" is
+not its question. Flagging that explicitly because inventing a guard nobody asked for is what
+produced the last two rounds of findings.
+
+## On the pattern
+
+Rounds 4, 5 and 6 have each found a defect introduced by the previous round's fix — Cf ban →
+broke IDN → IDNA check → broke IP literals. Each fix was correct about the case in front of it
+and wrong about the space around it. The common failure is verifying a fix against the example
+that prompted it rather than against the range of inputs it now governs, and I have stopped
+treating "the reported case now behaves" as evidence the change is safe.
+
+## Standing items
+
+Adapter/write-path behavior and `raw_response_path` bundling remain unimplemented and
+unverifiable, unchanged across all six rounds.

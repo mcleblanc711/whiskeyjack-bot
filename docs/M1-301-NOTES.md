@@ -34,7 +34,7 @@ Delivered:
   `provenance` on `research_documents`; `agent_model`, `posts_dropped_no_url` and `question_id`
   on `research_runs`, plus the `BEFORE INSERT`/`BEFORE UPDATE` triggers that enforce them.
   `LEDGER_SCHEMA_VERSION` bumped to 2.
-- `tests/unit/test_research.py` — 114 tests. Suite: 219 passed; ruff check + format +
+- `tests/unit/test_research.py` — 122 tests. Suite: 227 passed; ruff check + format +
   `mypy --strict src` clean.
 - `pyproject.toml` — **one new direct dependency, `idna>=3.4,<4`**, for IDNA hostname
   validation in `model.py`. Not a new install: it was already in the lock transitively via
@@ -129,6 +129,13 @@ Deviations:
   ZWNJ/ZWJ exactly where the standard does and still refuses U+200B and the bidi overrides,
   which are valid in no context. That keeps the spoofing guard without the collateral, and
   follows the same delegate-to-the-authority rule as the character checks.
+  Round 6 then found that `urlsplit().hostname` returns **IP literals** as well as domain
+  names, and IDNA refuses them: `https://[::1]/a` arrives bracket-stripped as `"::1"` and was
+  rejected. IPv4 had been passing only because dotted digits happen to be acceptable IDNA
+  labels — luck, not a check. The host is now tried as `ipaddress.ip_address()` first and only
+  sent to `idna` if that fails, so each kind of host answers to its own standard. Whether a
+  reachable host is an *appropriate* one (loopback, private ranges) is deliberately not decided
+  here: this module validates shape and holds no network code.
 - **`provider_config` is `dict[str, PersistableJson]`, not `dict[str, Any]` or bare `JsonValue`.**
   The column is `provider_config_json TEXT`; a value that cannot round-trip through JSON is not
   storable, and must fail at validation rather than inside the ledger write, after the run has
