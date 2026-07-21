@@ -78,6 +78,7 @@ def _insert_run(conn: sqlite3.Connection, **overrides: object) -> None:
         "created_at_utc": TS,
         "agent_model": None,
         "posts_dropped_no_url": None,
+        "cost_usd": None,
     }
     row.update(overrides)
     placeholders = ", ".join("?" * len(row))
@@ -238,6 +239,56 @@ def test_validation_error_never_echoes_a_provider_config_key() -> None:
     assert "provider_config" in str(excinfo.value)
 
 
+SECRET = "sk-live-planted-9d2f1a"
+
+
+def _leaks(exc: ResearchSchemaError) -> bool:
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return SECRET in str(exc) or SECRET in rendered
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # urlsplit embeds the offending netloc in its own ValueError for this one
+        # (the NFKC-normalization check), which leaked straight through the
+        # sanitizer: the loc was clean but the *message* was not.
+        f"https://{SECRET}／example.com/a",
+        f"https://{SECRET}\x00/a",
+        f"https://example.org:{SECRET}/a",
+        f"https://user:{SECRET}@/a",
+        f"not-a-url-{SECRET}",
+        f" https://example.org/{SECRET} ",
+    ],
+)
+def test_url_rejection_never_echoes_the_url(url: str) -> None:
+    with pytest.raises(ResearchSchemaError) as excinfo:
+        validate_document(_document(original_url=url))
+    assert not _leaks(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+def test_no_field_leaks_a_planted_secret_through_any_message() -> None:
+    """Blanket net: plant the secret in every field of both models, one at a time.
+
+    The per-field tests above pin the cases that actually leaked; this one exists
+    so that a *new* field, or a validator whose message stops being constant,
+    cannot open a fresh channel without failing a test. It is deliberately
+    indiscriminate about which fields reject the value -- any that accept it are
+    simply skipped.
+    """
+    for factory, validate, model in (
+        (_document, validate_document, ResearchDocument),
+        (_run, validate_run, ResearchRun),
+    ):
+        for field in model.model_fields:
+            for planted in (SECRET, [SECRET], {SECRET: SECRET}, f"https://example.org/{SECRET}"):
+                try:
+                    validate(factory(**{field: planted}))
+                except ResearchSchemaError as exc:
+                    assert not _leaks(exc), f"{model.__name__}.{field} leaked {planted!r}"
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -321,6 +372,36 @@ def test_json_persistable_provider_config_round_trips() -> None:
     assert json.loads(run.model_dump_json())["provider_config"] == config
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda v: {"threshold": v},
+        lambda v: {"nested": {"threshold": v}},
+        lambda v: {"weights": [1.0, v]},
+        lambda v: {"deep": [{"weights": [v]}]},
+    ],
+    ids=["top", "nested-dict", "list", "deep"],
+)
+def test_non_finite_provider_config_values_are_rejected(bad: float, wrap: object) -> None:
+    """NaN/Inf validate as floats but serialize to null -- silent config drift.
+
+    A run that validated as {"threshold": nan} would persist as
+    {"threshold": null}, so replay reconstructs the run against a configuration
+    that was never the one used. Checked at every nesting depth, because the
+    dict[str, ...] annotation only constrains the outermost layer.
+    """
+    with pytest.raises(ResearchSchemaError):
+        validate_run(_run(provider_config=wrap(bad)))  # type: ignore[operator]
+
+
+def test_finite_floats_still_round_trip() -> None:
+    # The guard rejects non-finite values only; ordinary floats are untouched.
+    config = {"threshold": 0.75, "weights": [-1.5, 0.0, 1e300]}
+    run = validate_run(_run(provider_config=config))
+    assert json.loads(run.model_dump_json())["provider_config"] == config
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -332,6 +413,22 @@ def test_json_persistable_provider_config_round_trips() -> None:
         "ftp://example.org/a",
         "javascript:alert(1)",
         "https://",
+        # netloc is non-empty but there is no host in it: userinfo only, or a
+        # port only. Checking netloc alone accepted both.
+        "https://:443/a",
+        "https://user@/a",
+        "https://user:pw@/a",
+        # urlsplit silently deletes these, so the parsed host looks clean while
+        # the string we would store still carries them.
+        "https://exa\nmple.org/a",
+        "https://exa\tmple.org/a",
+        "https://exa\rmple.org/a",
+        "https://example.org/\x00a",
+        # Ports that cannot be dialled.
+        "https://example.org:99999/a",
+        "https://example.org:0/a",
+        "https://example.org:-1/a",
+        "https://example.org:notaport/a",
     ],
 )
 def test_urls_must_be_absolute_http(url: str) -> None:
@@ -442,6 +539,36 @@ def test_database_rejects_unaccountable_agent_runs(tmp_path: Path) -> None:
             with pytest.raises(sqlite3.IntegrityError):
                 _insert_run(conn, provider="xai_x_search", **overrides)
         _insert_run(conn, provider="xai_x_search", agent_model="grok-4", posts_dropped_no_url=0)
+    finally:
+        conn.close()
+
+
+def test_database_rejects_impossible_counts(tmp_path: Path) -> None:
+    """A negative dropped-citation count is an unfalsifiable accountability claim.
+
+    The presence of the counter was already enforced; its value was not, so
+    direct SQL could store -1 and make the run's citation hygiene unauditable in
+    the other direction. cost_usd is guarded alongside it.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_run(
+                conn, provider="xai_x_search", agent_model="grok-4", posts_dropped_no_url=-1
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_run(conn, cost_usd=-0.01)
+        # The boundary is allowed: zero dropped posts and a free run are real.
+        _insert_run(
+            conn,
+            retrieval_run_id="run-ok",
+            provider="xai_x_search",
+            agent_model="grok-4",
+            posts_dropped_no_url=0,
+            cost_usd=0,
+        )
     finally:
         conn.close()
 

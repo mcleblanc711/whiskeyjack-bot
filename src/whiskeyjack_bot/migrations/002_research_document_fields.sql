@@ -27,9 +27,16 @@
 -- The triggers also carry the vocabulary checks that a CHECK constraint cannot
 -- be retrofitted onto the pre-existing `source_type` / `reliability_tag`
 -- columns without the full 12-step table rebuild, and enforce the social-
--- document trust contract that ResearchDocument enforces model-side. Numeric
--- range checks (cost_usd, posts_dropped_no_url) stay model-side: an off-range
--- number is a bad measurement, not a row that cannot be interpreted.
+-- document trust contract that ResearchDocument enforces model-side.
+--
+-- Numeric range checks are here too, revised from the first cut of this
+-- migration, which argued they could stay model-side because an off-range number
+-- is "a bad measurement, not an uninterpretable row". That was wrong in the one
+-- case that matters: posts_dropped_no_url is an accountability counter, so a
+-- stored -1 is not a bad measurement but an unfalsifiable claim about how much
+-- evidence was discarded. Once it is enforced, cost_usd is enforced with it --
+-- the distinction was never principled. posts_dropped_no_url is a new column and
+-- takes a CHECK directly; cost_usd predates 002 and is guarded by the triggers.
 
 -- The URL exactly as the provider returned it. M1-305 rewrites canonical_url
 -- for deduplication; without this column the as-retrieved URL is unrecoverable.
@@ -46,7 +53,10 @@ ALTER TABLE research_runs ADD COLUMN agent_model TEXT;
 
 -- Citation hygiene: agent-reported posts dropped for lacking a resolvable
 -- status URL. Counted so a run's dropped-citation rate stays auditable.
-ALTER TABLE research_runs ADD COLUMN posts_dropped_no_url INTEGER;
+-- A negative count is not a measurement, so the CHECK that ADD COLUMN permits is
+-- attached here; the column is new, so every pre-existing row is NULL and passes.
+ALTER TABLE research_runs ADD COLUMN posts_dropped_no_url INTEGER
+    CHECK (posts_dropped_no_url IS NULL OR posts_dropped_no_url >= 0);
 
 -- The question a run gathered evidence for. Runs are per question, but 001
 -- carried the linkage only in the reverse direction, via
@@ -117,6 +127,9 @@ BEGIN
       AND (NEW.agent_model IS NULL
            OR trim(NEW.agent_model) = ''
            OR NEW.posts_dropped_no_url IS NULL);
+
+    SELECT RAISE(ABORT, 'research_runs: cost_usd must not be negative')
+    WHERE NEW.cost_usd IS NOT NULL AND NEW.cost_usd < 0;
 END;
 
 CREATE TRIGGER research_runs_require_question_on_update
@@ -134,4 +147,7 @@ BEGIN
       AND (NEW.agent_model IS NULL
            OR trim(NEW.agent_model) = ''
            OR NEW.posts_dropped_no_url IS NULL);
+
+    SELECT RAISE(ABORT, 'research_runs: cost_usd must not be negative')
+    WHERE NEW.cost_usd IS NOT NULL AND NEW.cost_usd < 0;
 END;

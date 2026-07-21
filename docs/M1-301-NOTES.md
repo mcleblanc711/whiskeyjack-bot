@@ -34,7 +34,7 @@ Delivered:
   `provenance` on `research_documents`; `agent_model`, `posts_dropped_no_url` and `question_id`
   on `research_runs`, plus the `BEFORE INSERT`/`BEFORE UPDATE` triggers that enforce them.
   `LEDGER_SCHEMA_VERSION` bumped to 2.
-- `tests/unit/test_research.py` — 53 tests. Suite: 157 passed; ruff check + format +
+- `tests/unit/test_research.py` — 85 tests. Suite: 189 passed; ruff check + format +
   `mypy --strict src` clean.
 
 Two fields did not exist in M1-601 and are added here rather than by editing `001_initial.sql`
@@ -59,10 +59,16 @@ Deviations:
   enforcement to M1-602, which would have left the database accepting provenance-less writes
   indefinitely on nothing but convention.)*
 - **The triggers carry the vocabulary checks a CHECK cannot be retrofitted with.** `ADD COLUMN`
-  carries a CHECK (used for `provenance`), but constraining the pre-existing `source_type` /
-  `reliability_tag` columns would require the 12-step table rebuild. The triggers close those
-  vocabularies without it. Numeric range checks (`cost_usd`, `posts_dropped_no_url`) stay
-  model-side: an off-range number is a bad measurement, not a row that cannot be interpreted.
+  carries a CHECK (used for `provenance` and `posts_dropped_no_url`), but constraining the
+  pre-existing `source_type` / `reliability_tag` columns would require the 12-step table rebuild.
+  The triggers close those vocabularies without it.
+- **Numeric range checks are enforced in the database too.** Round 2 of this file argued they could
+  stay model-side because an off-range number is "a bad measurement, not an uninterpretable row".
+  Review round 3 showed that reasoning fails in the case that matters: `posts_dropped_no_url` is an
+  accountability counter, so a stored `-1` is not a bad measurement but an unfalsifiable claim
+  about how much evidence was discarded. Once it is enforced, `cost_usd` is enforced with it — the
+  distinction was never principled. `posts_dropped_no_url` is new and takes a CHECK directly;
+  `cost_usd` predates 002 and is guarded by the triggers.
 - **`reliability_tag` is conditionally required, never unconditionally.** It is NULL for every
   provider with no trust model of its own; it is required only of social documents. Enforced both
   model-side and by trigger.
@@ -83,16 +89,35 @@ Deviations:
   model default, and `agent_model` is config-supplied so it is known even for a run that failed
   outright. `posts_dropped_no_url` is required so that `0` (nothing was discarded) stays
   distinguishable from `NULL` (nobody counted).
-- **URLs must be absolute http(s) and free of surrounding whitespace**, checked without rewriting
-  the string. This is not canonicalization (still M1-305) — the stored URL stays byte-for-byte what
-  the provider returned, tracking parameters and all. It rejects only input that is not a URL.
-- **`provider_config` is `dict[str, JsonValue]`, not `dict[str, Any]`.** The column is
-  `provider_config_json TEXT`; a value that cannot round-trip through JSON is not storable, and
-  must fail at validation rather than inside the ledger write, after the run has already happened.
+- **URLs must be absolute http(s) with a real hostname**, no surrounding whitespace and no control
+  characters, checked without rewriting the string. This is not canonicalization (still M1-305) —
+  the stored URL stays byte-for-byte what the provider returned, tracking parameters and all. It
+  rejects only input that is not a URL. Three traps found in review round 3: `netloc` is non-empty
+  for `https://:443/a` and `https://user@/a` (so the check is on `.hostname`, not `.netloc`);
+  `urlsplit` *silently deletes* tab/LF/CR, so a control character would survive into the stored
+  string while every parser saw a clean host; and `.port` parses lazily, so an unreachable port
+  like `:99999` is only caught by touching it.
+- **`provider_config` is `dict[str, PersistableJson]`, not `dict[str, Any]` or bare `JsonValue`.**
+  The column is `provider_config_json TEXT`; a value that cannot round-trip through JSON is not
+  storable, and must fail at validation rather than inside the ledger write, after the run has
+  already happened. `JsonValue` alone was insufficient: it admits `NaN`/`±Inf`, which
+  `model_dump_json()` renders as `null`, so a run validated with `{"threshold": nan}` would replay
+  against `{"threshold": null}` — silent config drift, caught in review round 3. `PersistableJson`
+  rejects non-finite floats recursively, since the `dict[str, ...]` annotation only constrains the
+  outermost layer.
 - **`_sanitize` withholds error-location parts it did not author.** `include_input=False` withholds
   the offending *value*, but under `extra="forbid"` the location **is** the caller's key (likewise
   for `provider_config` dict keys), so a credential pasted as a key leaked where one pasted as a
   value did not. Only `int` indices and declared field names now survive into a message.
+- **Sanitizing the location is not sufficient: the *message* is unfilterable.** A `ValueError` from
+  any validator becomes `err["msg"]` verbatim, so the companion invariant lives on the validators —
+  every raise in `model.py` uses a constant, value-free message. Review round 3 found the one place
+  that breached it: `_require_http_url` let `urlsplit`'s own `ValueError` propagate, and that
+  exception embeds the offending netloc, leaking a URL through an otherwise airtight sanitizer.
+  All parse errors are now caught and replaced with a constant string `from None`. The invariant is
+  documented in `_sanitize`'s docstring and netted by
+  `test_no_field_leaks_a_planted_secret_through_any_message`, which plants a secret in every field
+  of both models rather than in the handful known to have leaked.
 
 Deferred (do not read the absence as an omission):
 - URL canonicalization policy, duplicate collapsing and stale-flagging are **M1-305**. Adapters

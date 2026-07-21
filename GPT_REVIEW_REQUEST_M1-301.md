@@ -940,3 +940,89 @@ The two items the review noted it could not verify — adapter/write-path behavi
 multiple raw responses will be bundled behind the singular `raw_response_path` — remain out
 of scope for M1-301 and are unimplemented on this branch. The second is a real design
 question for M1-307 and is being carried forward rather than resolved here.
+
+---
+
+# Round 3 — disposition
+
+All four findings reproduced exactly as written, and all four are fixed. No pushback this
+round: each one is a real hole, and two of them defeated defenses this branch had already
+claimed were complete. Gates: **189 passed** (was 157; the M1-301 suite went 53 → 85),
+`ruff check` clean, `ruff format --check` clean, `mypy --strict src` clean,
+`git diff --check master...HEAD` clean.
+
+## 1. High — error hygiene bypassable through `urlsplit()` messages
+
+Reproduced: `https://sk-live-planted-9d2f1a／example.com/a` produced
+`netloc 'sk-live-planted-9d2f1a／example.com' contains invalid characters…`.
+
+The diagnosis is the important part and it was correct: **sanitizing `loc` was never
+sufficient, because `msg` is unfilterable.** A `ValueError` from any validator becomes
+`err["msg"]` verbatim, and `_sanitize` has no way to tell a value-free message from one
+carrying the input. The real invariant lives on the validators — every raise in the module
+must use a constant string — and round 2 breached it the moment it introduced a validator
+that called into a third-party parser.
+
+`_require_http_url` now wraps all parsing in `try/except ValueError` and re-raises a single
+module-level constant `from None`. Every rejection it emits is that one string, so there is
+no message channel left to vary with the input.
+
+Two things beyond the literal fix, since the finding exposed a class rather than an instance:
+
+- The invariant is now written down in `_sanitize`'s docstring, naming this incident, so the
+  next person adding a validator sees why a "helpful" message naming the bad value is a leak.
+- `test_no_field_leaks_a_planted_secret_through_any_message` plants the secret in **every
+  field of both models**, as a bare string, a list, a dict key, and inside a URL. The
+  previous tests only covered the fields already known to have leaked, which is precisely why
+  this one got through. Parametrized URL cases pin the specific shapes from the finding.
+
+## 2. Medium — hostless and control-character URLs
+
+All three inputs reproduced. Three distinct traps, all now closed:
+
+- `netloc` is non-empty for `https://:443/a` (port only) and `https://user@/a` (userinfo
+  only). The check is now on `.hostname`, which excludes both.
+- `urlsplit` **silently deletes** tab/LF/CR per the WHATWG rule, so `https://exa\nmple.org/a`
+  parsed to a clean host while the string being stored still carried the newline — a stored
+  URL that no parser would ever agree with. All C0/C1 control characters are now rejected
+  outright rather than stripped, consistent with this validator never rewriting.
+- `.port` parses lazily, so an unreachable port is only caught by touching it. It is now
+  read inside the guarded block and range-checked to 1–65535.
+
+## 3. Medium — `JsonValue` silently nulls non-finite numbers
+
+Reproduced, and the worst of the four: `{"x": nan}` validated, stored as `nan`, and
+serialized to `{"x": null}`. Infinity behaves the same. A run would replay against a
+configuration that was never the one used, with nothing anywhere recording the substitution —
+exactly the drift the ledger exists to make impossible, arriving through the field added to
+*fix* JSON persistence.
+
+`provider_config` is now `dict[str, PersistableJson]`, whose `AfterValidator` walks the value
+recursively and rejects `NaN`/`±Inf` at any depth. Recursion is not optional here: the
+`dict[str, ...]` annotation only constrains the outermost layer, so `{"a": [{"b": nan}]}`
+would otherwise still pass. Tested at four nesting depths against all three values, with a
+companion test pinning that ordinary floats (including `1e300`) still round-trip.
+
+## 4. Medium — negative dropped-citation count via direct SQL
+
+Reproduced. The finding is also a fair catch on the round-2 write-up: it claimed drop
+accounting was "mirrored by a trigger", which was true of the counter's *presence* and not of
+its value. The claim was broader than the code.
+
+The round-2 rationale for leaving range checks model-side — "an off-range number is a bad
+measurement, not a row that cannot be interpreted" — fails in this specific case, and the
+finding is right that it fails. `posts_dropped_no_url` is an accountability counter: a stored
+`-1` is not a bad measurement, it is an unfalsifiable claim about how much evidence was
+discarded. Taking the suggested route, it now carries a nonnegative CHECK directly (it is a
+new column, so `ADD COLUMN` permits one and every legacy row is NULL and passes).
+
+`cost_usd` is enforced alongside it, by trigger since it predates 002. It was not in the
+finding, but once the principle is conceded the distinction between the two was never real,
+and leaving it would just be the same finding again next round. The migration comment records
+the reversal rather than quietly presenting the new position as the original one.
+
+## Standing items
+
+Unchanged and still unverifiable on this branch: adapter/write-path behavior, and how multiple
+raw responses will be bundled behind the singular `raw_response_path`. The latter remains a
+genuine M1-307 design question being carried forward.

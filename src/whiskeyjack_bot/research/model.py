@@ -44,6 +44,7 @@ and a research document can hold arbitrary retrieved text.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
@@ -93,32 +94,89 @@ def _to_utc(value: datetime) -> datetime:
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(_to_utc)]
 
 
+# Every rejection from _require_http_url uses this one constant string. The
+# message must not vary with the input: a URL is row content, and a "helpful"
+# diagnostic naming what was wrong with it is a channel for echoing it.
+_BAD_URL = "must be an absolute http(s) URL with a hostname (offending input withheld)"
+
+# C0/C1 control characters. urlsplit *silently deletes* tab, LF and CR (WHATWG
+# rule), so "https://exa\nmple.org/a" parses as a clean host while the string we
+# would store still carries the newline -- a stored URL that no longer matches
+# what any parser sees. Rejected outright rather than stripped: this validator
+# does not rewrite, and a control character in a URL is a normalization bug.
+_CONTROL_CHARS = frozenset(chr(c) for c in range(0x20)) | {chr(0x7F)}
+
+
 def _require_http_url(value: str) -> str:
     """Check absolute http(s) syntax without rewriting the URL.
 
     Deliberately *not* canonicalization -- that is M1-305, and this returns the
     string byte-for-byte as the provider sent it. What it rejects is input that
     is not a URL at all: whitespace, a bare title, a relative path, a scheme we
-    never retrieve over. Those are normalization bugs, and a document whose URL
-    does not resolve is an attribution the reader cannot check.
+    never retrieve over, a netloc that is only userinfo or a port. Those are
+    normalization bugs, and a document whose URL does not resolve is an
+    attribution the reader cannot check.
     """
     # urlsplit tolerates surrounding whitespace and strips it, so a value that is
     # only usable after stripping must be caught before parsing: the stored URL
     # is the one we were given, and " https://x/y " is not that URL.
     if value != value.strip():
-        raise ValueError("must not have leading or trailing whitespace")
-    parts = urlsplit(value)
+        raise ValueError(_BAD_URL)
+    if _CONTROL_CHARS.intersection(value):
+        raise ValueError(_BAD_URL)
+    try:
+        parts = urlsplit(value)
+        # .port parses lazily and raises for an out-of-range or non-numeric port;
+        # .hostname is netloc minus userinfo and port, so it is empty for both
+        # "https://user@/a" and "https://:443/a", which netloc alone accepts.
+        port = parts.port
+        hostname = parts.hostname
+    except ValueError:
+        # from None, and a constant message: urlsplit embeds the offending netloc
+        # in some of its own ValueErrors (the NFKC-normalization check does), so
+        # letting either the message or the __cause__ through re-leaks the input
+        # that this validator exists to withhold.
+        raise ValueError(_BAD_URL) from None
     if parts.scheme not in ("http", "https"):
-        # No value in the message: a URL is row content, and provider text can
-        # carry anything (same rule as ResearchSchemaError).
-        raise ValueError("must be an absolute http(s) URL (offending input withheld)")
-    if not parts.netloc:
-        raise ValueError("must be an absolute http(s) URL with a host (offending input withheld)")
+        raise ValueError(_BAD_URL)
+    if not hostname:
+        raise ValueError(_BAD_URL)
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError(_BAD_URL)
     return value
 
 
 # An absolute http(s) URL, preserved exactly. See _require_http_url.
 HttpUrlString = Annotated[str, Field(min_length=1), AfterValidator(_require_http_url)]
+
+
+def _reject_non_finite(value: JsonValue) -> JsonValue:
+    """Reject NaN and +/-Inf anywhere inside a provider config.
+
+    ``JsonValue`` admits them because Python floats carry them, but they have no
+    JSON representation: ``model_dump_json()`` renders all three as ``null``, so
+    a config that validated as ``{"threshold": nan}`` persists as
+    ``{"threshold": null}``. Replay would then reconstruct a run against a
+    *different* configuration than the one that was validated, silently -- the
+    exact class of drift the ledger exists to make impossible.
+
+    Recursive because a provider config is arbitrarily nested; the top-level
+    ``dict[str, JsonValue]`` annotation only constrains the outermost layer.
+    """
+    if isinstance(value, float) and not isfinite(value):
+        # No value in the message: config may hold provider-supplied material.
+        raise ValueError("must not contain NaN or Infinity: they cannot round-trip through JSON")
+    if isinstance(value, dict):
+        for nested in value.values():
+            _reject_non_finite(nested)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_non_finite(item)
+    return value
+
+
+# A JSON value that survives a round trip through the TEXT column it is stored in.
+PersistableJson = Annotated[JsonValue, AfterValidator(_reject_non_finite)]
 
 
 class ResearchSchemaError(Exception):
@@ -216,7 +274,7 @@ class ResearchRun(_StrictModel):
     # holding a non-serializable value is not storable. Typing it Any would let
     # validation "pass" and fail later at model_dump_json(), inside the ledger
     # write, where the run has already happened and cannot be re-run for free.
-    provider_config: dict[str, JsonValue] | None = None
+    provider_config: dict[str, PersistableJson] | None = None
     queries: list[str] = Field(default_factory=list)
 
     started_at_utc: UtcDatetime
@@ -291,6 +349,16 @@ def _sanitize(exc: ValidationError, model: type[BaseModel]) -> ResearchSchemaErr
     index, or a field name declared on ``model``. Everything else is withheld.
     That is stricter than needed for today's two flat models and stays correct
     if a later error type puts something new in ``loc``.
+
+    **The message itself cannot be filtered here**, because a ``ValueError`` from
+    any validator becomes ``err["msg"]`` verbatim. So the companion invariant is
+    on the validators: *every* raise in this module uses a constant, value-free
+    message. That is easy to satisfy by hand and easy to breach by accident --
+    ``_require_http_url`` originally let ``urlsplit``'s own ValueError propagate,
+    and that exception embeds the offending netloc, which leaked a URL through a
+    sanitizer that was otherwise airtight (review round 2, finding 1). Any raise
+    added here must either use a literal string or be caught and replaced with
+    one. ``test_no_field_leaks_a_planted_secret_through_any_message`` is the net.
     """
     known = set(model.model_fields)
     problems = []
