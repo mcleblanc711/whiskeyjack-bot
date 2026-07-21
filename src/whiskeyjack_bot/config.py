@@ -24,6 +24,10 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+# prompt.py imports only stdlib, so this stays acyclic. The semver rule lives
+# there because M1-401 owns it; duplicating it here is what let the two drift.
+from whiskeyjack_bot.prompt import BARE_VERSION_RE
+
 PLACEHOLDER_PREFIX = "REPLACE_WITH"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -181,7 +185,9 @@ class ForecastConfig(_StrictModel):
         # the canonical form -- it is what reaches forecast_records.prompt_version
         # -- so a 'v'-prefixed config value is rejected here rather than becoming
         # a confusing prompt/config mismatch at load time.
-        if not re.fullmatch(r"\d+\.\d+\.\d+", v):
+        # Shared with prompt.py: ASCII-only digits and no leading zeroes, so a
+        # config value and a prompt H1 can never be accepted by different rules.
+        if not BARE_VERSION_RE.fullmatch(v):
             raise ValueError(
                 "forecast.prompt_version must be a bare MAJOR.MINOR.PATCH version "
                 "with no 'v' prefix"

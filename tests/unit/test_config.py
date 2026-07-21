@@ -188,10 +188,27 @@ def test_group_question_mode_must_match_sdk_literal(valid_data: dict) -> None:
     expect_rejection(valid_data, "group_question_mode")
 
 
-@pytest.mark.parametrize("value", ["v1.1.0", "1.1", "1.1.0-rc1", "latest", ""])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "v1.1.0",
+        "1.1",
+        "1.1.0-rc1",
+        "latest",
+        "",
+        "01.1.0",  # leading zero is not canonical SemVer
+        "1.01.0",
+        "١.١.٠",  # Unicode digits: \d matched these before re.ASCII
+        "1.1.0\n",  # terminal newline
+    ],
+)
 def test_prompt_version_must_be_bare_semver(valid_data: dict, value: str) -> None:
     """M1-401: config holds the bare form; the 'v' prefix lives only in the
-    prompt's H1, so a prefixed config value is rejected at load."""
+    prompt's H1, so a prefixed config value is rejected at load.
+
+    Shares one compiled pattern with prompt.py -- these two checks accepting
+    different strings is how a config value and a prompt H1 silently disagree.
+    """
     valid_data["forecast"]["prompt_version"] = value
     expect_rejection(valid_data, "prompt_version")
 

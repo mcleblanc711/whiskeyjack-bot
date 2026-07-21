@@ -40,8 +40,24 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+# The single canonical semver rule for this project. Every version check --
+# prompt H1, ``forecast.prompt_version`` in config -- compiles from this one
+# string so the two cannot drift apart (they had: config used ``fullmatch`` on a
+# looser pattern while this module used ``match`` + ``$``).
+#
+# ``(?:0|[1-9]\d*)`` rejects leading zeroes: ``01.1.0`` is not canonical SemVer,
+# and accepting it lets ``01.1.0`` and ``1.1.0`` name the same prompt while
+# comparing unequal against the ledger column.
+_SEMVER = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+
+# ``re.ASCII`` throughout: without it ``\d`` matches any Unicode decimal, so
+# ``v١.١.٠`` parses as a version and reaches forecast_records.prompt_version as
+# a string no operator can search for.
+BARE_VERSION_RE = re.compile(_SEMVER, re.ASCII)
+"""Config's bare form (``"1.1.0"``), no ``v`` prefix. Use with ``fullmatch``."""
 
 # The version is declared once, in the H1 on the first line, as a trailing
 # ``vMAJOR.MINOR.PATCH``:
@@ -52,12 +68,14 @@ from pathlib import Path
 # carrying ``"schema_version": "1.0.0"`` -- the *output record* schema version,
 # an unrelated number that a document-wide search for a semver would match, and
 # would keep matching, silently and wrongly, once the two versions diverge.
-_H1_VERSION_RE = re.compile(r"^#\s+\S.*\bv(\d+\.\d+\.\d+)\s*$")
-
-# Config stores the bare form (``"1.1.0"``); the prompt H1 carries the ``v``
-# prefix. Bare is canonical -- it is what reaches the ledger column -- so the
-# parser strips the prefix rather than the config growing one.
-_BARE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+#
+# Scanned with ``finditer`` rather than matched as one anchored pattern: an
+# anchored ``.*v(...)$`` silently resolves ``v1.1.0 supersedes v2.0.0`` to
+# 2.0.0, and non-greedy quantifiers do not fix it -- with a trailing anchor the
+# engine just backtracks to the same last token. An H1 declaring two versions is
+# drift, so ``parse_declared_version`` rejects it rather than picking a winner.
+_H1_PREFIX_RE = re.compile(r"#[ \t]+\S")
+_H1_VERSION_TOKEN_RE = re.compile(rf"\bv({_SEMVER})(?![\w.])", re.ASCII)
 
 
 class PromptError(Exception):
@@ -71,11 +89,19 @@ class PromptError(Exception):
 
 @dataclass(frozen=True)
 class LoadedPrompt:
-    """A verified prompt: its declared version, raw-byte digest and text."""
+    """A verified prompt: its declared version, raw-byte digest and text.
+
+    ``text`` is excluded from the repr. The module's error paths are sanitized,
+    but the value object was not: a traceback frame, a failed assertion or a log
+    line rendering this dataclass printed the whole prompt -- including any
+    mistakenly pasted credential, the same hazard the module docstring names.
+    ``version`` and ``sha256`` stay in the repr; both are safe by construction
+    (a matched semver, a hex digest) and a repr without them is useless.
+    """
 
     version: str
     sha256: str
-    text: str
+    text: str = field(repr=False)
 
 
 def prompt_sha256(data: bytes) -> str:
@@ -86,17 +112,35 @@ def prompt_sha256(data: bytes) -> str:
 def parse_declared_version(text: str) -> str:
     """Return the bare version declared in the prompt's H1, ``v`` prefix stripped.
 
-    Raises :class:`PromptError` if the first line is not an H1 declaring one.
+    Raises :class:`PromptError` if the first line is not an H1 declaring exactly
+    one version, as its trailing token.
     """
     first_line = text.split("\n", 1)[0].rstrip("\r")
-    match = _H1_VERSION_RE.match(first_line)
-    if match is None:
-        # Constant message: the offending line is prompt content.
+
+    # All three messages below are constant text: the offending line is prompt
+    # content and must never reach a diagnostic.
+    malformed = PromptError(
+        "prompt does not declare a version: the first line must be an H1 ending in "
+        "'vMAJOR.MINOR.PATCH' (line withheld: it can echo prompt contents)"
+    )
+    if _H1_PREFIX_RE.match(first_line) is None:
+        raise malformed
+
+    matches = list(_H1_VERSION_TOKEN_RE.finditer(first_line))
+    if not matches:
+        raise malformed
+    if len(matches) > 1:
         raise PromptError(
-            "prompt does not declare a version: the first line must be an H1 ending in "
-            "'vMAJOR.MINOR.PATCH' (line withheld: it can echo prompt contents)"
+            "prompt H1 declares more than one version; exactly one is required so the "
+            "version recorded against every forecast is unambiguous (D04) "
+            "(line withheld: it can echo prompt contents)"
         )
-    return match.group(1)
+
+    only = matches[0]
+    if first_line[only.end() :].strip():
+        # The version must be the trailing token, not buried mid-heading.
+        raise malformed
+    return only.group(1)
 
 
 def load_prompt(path: Path, expected_version: str) -> LoadedPrompt:
@@ -105,7 +149,10 @@ def load_prompt(path: Path, expected_version: str) -> LoadedPrompt:
     ``expected_version`` is ``forecast.prompt_version`` from config, in bare
     form. A mismatch against the prompt's own H1 raises :class:`PromptError`.
     """
-    if _BARE_VERSION_RE.match(expected_version) is None:
+    # fullmatch, not match: ``match`` + ``$`` accepts a terminal newline, so
+    # "1.1.0\n" passed this guard and then reached the mismatch diagnostic below
+    # -- exactly the unvalidated-value-in-a-message case the guard exists for.
+    if BARE_VERSION_RE.fullmatch(expected_version) is None:
         # Checked here, not just in config, because the mismatch message below
         # echoes this value: it must be provably a bare semver first, or an
         # arbitrary caller-supplied string reaches a diagnostic.

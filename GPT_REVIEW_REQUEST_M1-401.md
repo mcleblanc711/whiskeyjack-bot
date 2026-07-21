@@ -188,8 +188,27 @@ Branch `feat/m1-401-prompt-version-hash`, one commit off `master` (`a0cbb67`).
 parallel worktrees and that file is the one every branch would append to. Per-epic notes
 merge back into it when the epic completes.
 
-Gates at the tip: `pytest` 331 passed, `ruff check` clean, `ruff format --check` clean,
+Gates at the tip: `pytest` 348 passed, `ruff check` clean, `ruff format --check` clean,
 `mypy --strict src` clean, `uv.lock` untouched.
+
+## Round 2 — response to round-1 findings
+
+All four reproduced before fixing. Three are fixed in code; one is answered with a written
+policy. Please re-pressure-test the parser rewrite in particular.
+
+| # | Finding | Response |
+|---|---------|----------|
+| 1 | `LoadedPrompt` repr exposes the prompt | **Fixed.** `text` is `field(repr=False)`; `version`/`sha256` stay (safe by construction). Two regression tests, including the rendered-locals path. |
+| 2 | Version patterns accept malformed/ambiguous semver | **Fixed.** One `BARE_VERSION_RE` in `prompt.py`, reused by `config.py`. `re.ASCII` kills Unicode numerals; `(?:0\|[1-9]\d*)` kills leading zeroes; `fullmatch` replaces `match` + `$`. Ambiguous H1 now **raises** rather than resolving — see note below. |
+| 3 | Paths reach rendered diagnostics | **Reviewed, kept, documented.** Not local to `prompt.py`: ~30 sites across `config.py`, `ledger.py`, `snapshots.py`, `env_verify.py` do the same. Redacting one module makes it the sole outlier and makes its failures unactionable. The boundary (content withheld, paths shown) is now explicit in `CLAUDE.md` § Error hygiene, with the residual risk stated. Owner decision. **If you still consider this blocking, the argument to make is why the project-wide sweep is in scope for M1-401** — a prompt.py-only change I will push back on again. |
+| 4 | Drift guard misses body drift | **Fixed.** `RELEASED_PROMPT_SHA256` pins `1.1.0` → `7ce2e9e…958da`. Proven by appending one space to the prompt and confirming the test fails. Docstring and `docs/M1-401-NOTES.md` corrected to describe what is actually enforced. |
+
+On finding 2's ambiguity fix specifically: switching to a non-greedy quantifier does **not**
+work — with the trailing anchor the engine backtracks to the same last token, so
+`v1.1.0 supersedes v2.0.0` still resolved to `2.0.0`. The parser instead collects every
+`v<semver>` token in the H1 and raises unless exactly one is present and trailing. This is the
+stricter reading per `CLAUDE.md`: two declared versions is drift, not a pick-one situation.
+Worth checking whether that rule is too strict for any legitimate H1 you can construct.
 
 ## How to get the diff
 

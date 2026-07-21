@@ -51,7 +51,36 @@ Decisions:
   because the mismatch message echoes it — an arbitrary caller-supplied string must not reach a
   diagnostic. Both versions in that message are provably semver before being interpolated.
 - `test_prompt.py`'s regression test loads the *real* prompt and *real* `config.example.yaml` and
-  asserts they agree, so editing the prompt without bumping both places fails CI.
+  asserts they agree, so editing the prompt without bumping both places fails CI. **That alone was
+  not enough** (GPT review): comparing H1-to-config cannot see *body* drift — every byte of the
+  prompt could change while both versions read `1.1.0`. `RELEASED_PROMPT_SHA256` now pins each
+  released version to its exact digest, so a body edit fails CI until the version is bumped *and* a
+  new digest pinned. Verified by transiently appending one space to the prompt and watching the
+  test fail.
+
+### Review round 1 — findings addressed
+
+- **`LoadedPrompt.text` is `field(repr=False)`.** The error paths were sanitized but the value
+  object was not: the default dataclass repr printed the whole prompt through any log line, failed
+  assertion or frame-capturing traceback. `version` and `sha256` stay visible — both are safe by
+  construction and a repr without them is useless.
+- **One shared semver rule.** `prompt.py` and `config.py` each had their own pattern, and they
+  disagreed. Both now compile `BARE_VERSION_RE` from `prompt.py`: ASCII-only (`\d` matched Unicode
+  decimals, so `v١.١.٠` parsed and would have reached the ledger column unsearchable), no leading
+  zeroes (`01.1.0` and `1.1.0` named the same prompt but compared unequal), and `fullmatch` rather
+  than `match` + `$` (which accepted a terminal newline into a rendered diagnostic).
+- **An ambiguous H1 is rejected, not resolved.** `# … v1.1.0 supersedes v2.0.0` parsed as `2.0.0` —
+  the *superseded* version — because the anchored scan was greedy. Non-greedy quantifiers do not
+  fix this: with a trailing anchor the engine backtracks to the same last token. The parser now
+  collects every `v<semver>` token in the H1 and raises unless there is exactly one, trailing. Two
+  declared versions is drift, and D04 exists to catch drift, not to pick a winner from it.
+- **Paths in diagnostics — reviewed and kept**, with the policy now written down rather than
+  implied. GPT was right that the hygiene rule as phrased was ambiguous, but the fix is not local:
+  ~30 sites across `config.py`, `ledger.py`, `metaculus/snapshots.py` and `env_verify.py` render
+  paths, all shipped through prior approved rounds. Redacting `prompt.py` alone would make it the
+  sole outlier and render its load failures unactionable. The boundary — content is withheld, paths
+  are shown — is now explicit in `CLAUDE.md` § Error hygiene. Recorded as a considered decision so
+  the next reviewer does not re-raise it as an oversight.
 
 Deviation — **`prompts/` stays at the repository root** and is not packaged. `pyproject.toml`
 ships only `src/whiskeyjack_bot`, so a relative `prompt_path` resolves against CWD and breaks on a
