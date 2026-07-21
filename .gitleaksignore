@@ -10,17 +10,32 @@
 # planted leak-test secret therefore fails the quality gate on unrelated PRs, and renaming
 # it in a later commit does not help — the original commit stays reachable.
 #
-# Both entries below are the same M1-301 leak-test fixture, `sk-live-planted-9d2f1a`,
+# Every entry below is the same M1-301 leak-test fixture, `sk-live-planted-9d2f1a`,
 # flagged as generic-api-key because `sk-live-` is a realistic key prefix and its entropy
 # is 3.879. It was never a credential. M1-301 renamed it to the low-entropy form
-# `privateFAKE123456` (which the scanner correctly ignores), so no new commit contains the
-# old value and this list is closed — it needs no additions.
+# `privateFAKE123456`, which the scanner correctly ignores.
 #
-# Lesson for future leak tests: a planted secret must be distinctive in program output,
-# not realistic-looking. Use the FAKE-infix low-entropy form.
+# This list was written when only the first two commits existed and said it was closed.
+# That was wrong: M1-301's review rounds 2 and 3 landed *before* the rename, and each added
+# new occurrences of the old value in new commits. Commit-pinning is working exactly as
+# designed here — every new commit carrying the string failed the gate and had to be listed
+# deliberately. The list is closed as of the rename in 0ee2199; anything after that commit
+# containing this value is a real finding, not a known one.
+#
+# Lesson for future leak tests, and the reason there are five entries instead of zero:
+# a planted secret must be distinctive in program output, not realistic-looking. Use the
+# FAKE-infix low-entropy form from the first commit that plants it. Renaming later does not
+# retire the finding, because the original commits stay reachable forever.
 
 # M1-301 leak-test fixture in tests/unit/test_research.py, since renamed.
 55a6337c29b445714d1238b9e8fc6b308b478e85:tests/unit/test_research.py:generic-api-key:151
 
 # The same value quoted inside M1-301's review-request diff.
 2f19c79827627beaba92e2d9489bea179cc55c31:GPT_REVIEW_REQUEST_M1-301.md:generic-api-key:722
+
+# Review round 1's fixes added two more leak tests using the same fixture.
+0c86fe5d1cbfe9a6963dc8e8a5abc1a03eac3f98:tests/unit/test_research.py:generic-api-key:219
+0c86fe5d1cbfe9a6963dc8e8a5abc1a03eac3f98:tests/unit/test_research.py:generic-api-key:234
+
+# Round 2 hoisted the fixture to a module constant; renamed one commit later.
+4fa86811d5e720e999e8585047fcd0f46c899cf0:tests/unit/test_research.py:generic-api-key:242

@@ -35,9 +35,12 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
 
 
 def _seed_run(conn: sqlite3.Connection, run_id: str = "run-1") -> None:
+    # question_id is supplied because migration 002's triggers require it of every
+    # new row. These helpers previously wrote 001-era columns only, which is
+    # exactly the provenance-less write the triggers exist to stop.
     conn.execute(
-        "INSERT INTO research_runs (retrieval_run_id, provider, started_at_utc, created_at_utc) "
-        "VALUES (?, 'asknews', ?, ?)",
+        "INSERT INTO research_runs (retrieval_run_id, provider, question_id, started_at_utc, "
+        "created_at_utc) VALUES (?, 'asknews', 100, ?, ?)",
         (run_id, TS, TS),
     )
 
@@ -84,9 +87,10 @@ def _seed_document(
 ) -> None:
     conn.execute(
         "INSERT INTO research_documents ("
-        "document_id, retrieval_run_id, canonical_url, retrieved_at_utc, content_sha256) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (document_id, run_id, url, TS, sha),
+        "document_id, retrieval_run_id, original_url, canonical_url, retrieved_at_utc, "
+        "source_type, provenance, content_sha256) "
+        "VALUES (?, ?, ?, ?, ?, 'news', 'direct_api', ?)",
+        (document_id, run_id, url, url, TS, sha),
     )
 
 

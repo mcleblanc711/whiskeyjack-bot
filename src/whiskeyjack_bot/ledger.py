@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 _MIGRATIONS_PACKAGE = "whiskeyjack_bot.migrations"
 _MIGRATION_NAME_RE = re.compile(r"^(\d+)_.*\.sql$")
