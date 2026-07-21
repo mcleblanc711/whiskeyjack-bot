@@ -165,8 +165,49 @@ Deferred (do not read the absence as an omission):
   deferred `record_id`; the field is optional on the model for that reason.
 - The allowlist loader that consumes `ReliabilityTag` is **M1-308**; it will import the alias from
   this module rather than restate the values that `config/x_accounts.yaml`'s header pins.
+- **URL-validation *policy* is M1-305's**, not this module's — see the retrospective below. What
+  stays here is the minimum that makes a stored URL an attributable one: absolute http(s), a host
+  that is either an IP literal or an IDNA-encodable domain, no whitespace or `Cc` characters, a
+  dialable port. Anything beyond that (normalization, host allow/deny policy, homograph handling)
+  belongs with canonicalization.
 - `created_at_utc` is **writer-owned metadata** and deliberately absent from both models: it records
   when the ledger stored the row, so only the write path (**M1-602**) may set it. Letting an adapter
   supply it would let a caller backdate its own audit trail — the same reasoning as `document_id`.
   Documented in the `model.py` docstring alongside the `provider_config` → `provider_config_json`
   and `queries` → `queries_json` column mappings.
+
+### Retrospective: where the review rounds actually went
+
+M1-301 took **six rounds** of GPT cross-model review (five DO-NOT-APPROVE, then APPROVE with no
+findings). Recorded here because the distribution is the useful part, not the count.
+
+**Round 1** found real contract gaps in the schema itself: enforcement that the docstrings claimed
+but the code did not have. Those were worth every line of the fix.
+
+**Rounds 4, 5 and 6 each found a defect introduced by the previous round's fix**, all three in the
+same function — the URL validator:
+
+| Round | Fix applied | What it broke |
+|---|---|---|
+| 4 | Blanket Unicode `Cf` ban, to stop invisible spoofing characters | Rejected standards-valid IDN hostnames (`نامه‌ای.ir`); U+200C/U+200D are *required* in some labels |
+| 5 | `idna.encode()` on the hostname, replacing the blanket ban | Rejected IPv6 literals (`https://[::1]/a`); `urlsplit().hostname` returns IP literals too |
+| 6 | `ipaddress.ip_address()` first, `idna` as fallback | — (clean) |
+
+Two lessons, both cheap to state and apparently expensive to learn:
+
+1. **Speculative hardening beyond the reported finding is where the next finding comes from.**
+   Every one of those regressions came from a guard nobody asked for, added on a plausible theory
+   (invisible characters are a spoofing vector — true!) via an approximation standing in for a rule
+   that was never looked up. The pattern generalizes: `_CONTROL_CHARS` claimed C0+C1 and held only
+   C0; `ge=0` was treated as a finiteness check; SQLite `INTEGER` was read as a type; `> 1e308` was
+   used to mean "infinite". The fix in every case was to delegate to the authority — `unicodedata`,
+   `math.isfinite`, `typeof()`, `idna`, `ipaddress` — rather than extend the hand-rolled version.
+2. **Verify a "still works" claim against the case that could falsify it.** The round-4 write-up
+   asserted "IDN hostnames are unaffected" and checked `münchen.de`, which contains no `Cf` at all.
+   The claim was false for exactly the inputs that would have tested it.
+
+**Consequence for scoping:** the schema stabilized after round 3 and every later finding was
+churn in URL validation. That is why the validator here is deliberately minimal and why
+`docs/backlog/backlog.csv` now records URL-validation policy as part of **M1-305**, alongside
+canonicalization — one place that owns the whole question, rather than a schema module growing a
+second-hand version of it.
