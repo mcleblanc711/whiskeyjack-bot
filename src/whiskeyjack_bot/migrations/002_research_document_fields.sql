@@ -55,8 +55,15 @@ ALTER TABLE research_runs ADD COLUMN agent_model TEXT;
 -- status URL. Counted so a run's dropped-citation rate stays auditable.
 -- A negative count is not a measurement, so the CHECK that ADD COLUMN permits is
 -- attached here; the column is new, so every pre-existing row is NULL and passes.
+--
+-- typeof() is part of the constraint because `INTEGER` in SQLite is *affinity*,
+-- not a type: a REAL that cannot be losslessly converted stays REAL, and a
+-- string that is not numeric stays TEXT. Without this, posts_dropped_no_url =
+-- 1.5 and 'garbage' both satisfy `>= 0` and are stored as-is -- 'garbage' >= 0
+-- being true only because SQLite orders TEXT above every number.
 ALTER TABLE research_runs ADD COLUMN posts_dropped_no_url INTEGER
-    CHECK (posts_dropped_no_url IS NULL OR posts_dropped_no_url >= 0);
+    CHECK (posts_dropped_no_url IS NULL
+           OR (typeof(posts_dropped_no_url) = 'integer' AND posts_dropped_no_url >= 0));
 
 -- The question a run gathered evidence for. Runs are per question, but 001
 -- carried the linkage only in the reverse direction, via
@@ -128,8 +135,15 @@ BEGIN
            OR trim(NEW.agent_model) = ''
            OR NEW.posts_dropped_no_url IS NULL);
 
-    SELECT RAISE(ABORT, 'research_runs: cost_usd must not be negative')
-    WHERE NEW.cost_usd IS NOT NULL AND NEW.cost_usd < 0;
+    -- typeof() for the same affinity reason as posts_dropped_no_url, and the
+    -- 1e308 bound because `< 0` alone accepts infinity: SQLite stores it as REAL
+    -- and it serializes back out as null, so an unbounded cost would persist as
+    -- an unrecorded one. No real run costs 1e308 dollars.
+    SELECT RAISE(ABORT, 'research_runs: cost_usd must be a finite non-negative number')
+    WHERE NEW.cost_usd IS NOT NULL
+      AND (typeof(NEW.cost_usd) NOT IN ('integer', 'real')
+           OR NEW.cost_usd < 0
+           OR NEW.cost_usd > 1e308);
 END;
 
 CREATE TRIGGER research_runs_require_question_on_update
@@ -148,6 +162,13 @@ BEGIN
            OR trim(NEW.agent_model) = ''
            OR NEW.posts_dropped_no_url IS NULL);
 
-    SELECT RAISE(ABORT, 'research_runs: cost_usd must not be negative')
-    WHERE NEW.cost_usd IS NOT NULL AND NEW.cost_usd < 0;
+    -- typeof() for the same affinity reason as posts_dropped_no_url, and the
+    -- 1e308 bound because `< 0` alone accepts infinity: SQLite stores it as REAL
+    -- and it serializes back out as null, so an unbounded cost would persist as
+    -- an unrecorded one. No real run costs 1e308 dollars.
+    SELECT RAISE(ABORT, 'research_runs: cost_usd must be a finite non-negative number')
+    WHERE NEW.cost_usd IS NOT NULL
+      AND (typeof(NEW.cost_usd) NOT IN ('integer', 'real')
+           OR NEW.cost_usd < 0
+           OR NEW.cost_usd > 1e308);
 END;

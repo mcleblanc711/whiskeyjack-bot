@@ -34,7 +34,7 @@ Delivered:
   `provenance` on `research_documents`; `agent_model`, `posts_dropped_no_url` and `question_id`
   on `research_runs`, plus the `BEFORE INSERT`/`BEFORE UPDATE` triggers that enforce them.
   `LEDGER_SCHEMA_VERSION` bumped to 2.
-- `tests/unit/test_research.py` — 85 tests. Suite: 189 passed; ruff check + format +
+- `tests/unit/test_research.py` — 101 tests. Suite: 205 passed; ruff check + format +
   `mypy --strict src` clean.
 
 Two fields did not exist in M1-601 and are added here rather than by editing `001_initial.sql`
@@ -69,6 +69,16 @@ Deviations:
   about how much evidence was discarded. Once it is enforced, `cost_usd` is enforced with it — the
   distinction was never principled. `posts_dropped_no_url` is new and takes a CHECK directly;
   `cost_usd` predates 002 and is guarded by the triggers.
+- **The SQL guards check `typeof()`, not just the value.** A column type in SQLite is *affinity*,
+  not a constraint: a REAL that cannot be narrowed losslessly stays REAL, and a non-numeric string
+  stays TEXT — and TEXT sorts above every number, so `'garbage' >= 0` is true. Round 4: without
+  `typeof()`, `posts_dropped_no_url` accepted `1.5` and `'garbage'`, and `cost_usd` accepted
+  `'free'` and `+inf`. Lossless affinity conversion is still allowed (`'3'` → `3`, `1` → `1.0`) and
+  pinned by a test, so the guards cannot be tightened into refusing ordinary driver round-trips.
+- **`cost_usd` must be finite, explicitly.** `ge=0` rejected `-inf` and `NaN` as a side effect
+  (both comparisons are false), which made `+inf` look covered when it was not: it validated and
+  then serialized to `null`, so an unbounded cost persisted as *no recorded cost*. Same failure
+  shape as the `provider_config` one, in a field that predated it.
 - **`reliability_tag` is conditionally required, never unconditionally.** It is NULL for every
   provider with no trust model of its own; it is required only of social documents. Enforced both
   model-side and by trigger.
@@ -89,14 +99,19 @@ Deviations:
   model default, and `agent_model` is config-supplied so it is known even for a run that failed
   outright. `posts_dropped_no_url` is required so that `0` (nothing was discarded) stays
   distinguishable from `NULL` (nobody counted).
-- **URLs must be absolute http(s) with a real hostname**, no surrounding whitespace and no control
-  characters, checked without rewriting the string. This is not canonicalization (still M1-305) —
+- **URLs must be absolute http(s) with a real hostname**, no whitespace anywhere and no Unicode
+  `Cc`/`Cf` characters, checked without rewriting the string. This is not canonicalization (still M1-305) —
   the stored URL stays byte-for-byte what the provider returned, tracking parameters and all. It
   rejects only input that is not a URL. Three traps found in review round 3: `netloc` is non-empty
   for `https://:443/a` and `https://user@/a` (so the check is on `.hostname`, not `.netloc`);
   `urlsplit` *silently deletes* tab/LF/CR, so a control character would survive into the stored
   string while every parser saw a clean host; and `.port` parses lazily, so an unreachable port
-  like `:99999` is only caught by touching it.
+  like `:99999` is only caught by touching it. Round 4 then found the character check itself was
+  hand-rolled and wrong: it enumerated C0 plus DEL while its comment claimed C0 *and* C1, so U+0085
+  and U+009F passed, and raw interior spaces passed because only the ends were checked. It now asks
+  `unicodedata` (`str.isspace()` or category `Cc`/`Cf`) rather than enumerating — `Cf` included
+  because zero-width and bidi-override characters are invisible wherever a human would inspect a
+  URL, making them a spoofing vector rather than a typo. IDN hostnames are unaffected.
 - **`provider_config` is `dict[str, PersistableJson]`, not `dict[str, Any]` or bare `JsonValue`.**
   The column is `provider_config_json TEXT`; a value that cannot round-trip through JSON is not
   storable, and must fail at validation rather than inside the ledger write, after the run has

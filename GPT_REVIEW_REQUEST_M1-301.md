@@ -744,7 +744,7 @@ index 0000000..3e72f42
 +def test_validation_error_never_echoes_retrieved_content() -> None:
 +    # A research document carries arbitrary provider text; a credential pasted
 +    # into a fixture must not surface through a diagnostic or its traceback.
-+    secret = "sk-live-planted-9d2f1a"
++    secret = "privateFAKE123456"
 +    with pytest.raises(ResearchSchemaError) as excinfo:
 +        validate_document(_document(source_type=secret))
 +    rendered = "".join(
@@ -855,7 +855,7 @@ below rather than folded in quietly.
 it: an `int` list index, or a name in `model.model_fields`. Anything else renders as
 `<withheld>`. Implemented as a general allowlist rather than an `extra_forbidden` special
 case, because the review's example was not the only instance of the bug — **`provider_config`
-dict keys land in `loc` the same way**, so `{"sk-live-…": <bad value>}` leaked identically
+dict keys land in `loc` the same way**, so `{"privateFAKE123456": <bad value>}` leaked identically
 through a completely different error type. Both are now covered by their own leak test using
 the planted secret as the key, asserting on `str(exc)` and on `traceback.format_exception`.
 A rejected unexpected key still reports `<withheld>: Extra inputs are not permitted`, so the
@@ -953,8 +953,8 @@ claimed were complete. Gates: **189 passed** (was 157; the M1-301 suite went 53 
 
 ## 1. High — error hygiene bypassable through `urlsplit()` messages
 
-Reproduced: `https://sk-live-planted-9d2f1a／example.com/a` produced
-`netloc 'sk-live-planted-9d2f1a／example.com' contains invalid characters…`.
+Reproduced: `https://privateFAKE123456／example.com/a` produced
+`netloc 'privateFAKE123456／example.com' contains invalid characters…`.
 
 The diagnosis is the important part and it was correct: **sanitizing `loc` was never
 sufficient, because `msg` is unfilterable.** A `ValueError` from any validator becomes
@@ -1026,3 +1026,83 @@ the reversal rather than quietly presenting the new position as the original one
 Unchanged and still unverifiable on this branch: adapter/write-path behavior, and how multiple
 raw responses will be bundled behind the singular `raw_response_path`. The latter remains a
 genuine M1-307 design question being carried forward.
+
+---
+
+# Round 4 — disposition
+
+All three findings reproduced and are fixed. Gates: **205 passed** (was 189; the M1-301 suite
+went 85 → 101), `ruff check` clean, `ruff format --check` clean, `mypy --strict src` clean,
+`git diff --check master...HEAD` clean.
+
+A pattern worth naming, since it now accounts for three rounds of findings: each of these is a
+**hand-rolled enumeration that drifted from the claim written next to it**. `_CONTROL_CHARS`
+said C0 *and* C1 and contained only C0. `ge=0` was treated as a finiteness check because it
+happened to reject two of the three non-finite values. `INTEGER` was read as a type when SQLite
+means it as affinity. In all three the comment was right and the code was narrower. The fixes
+therefore delegate to something authoritative — `unicodedata`, `math.isfinite`, `typeof()` —
+rather than extending the enumeration.
+
+## 1. URL validation accepts raw whitespace and real C1 controls
+
+All four inputs reproduced. Two independent bugs behind them:
+
+- `_CONTROL_CHARS` was `range(0x20)` plus DEL — C0 only, despite the comment claiming C1 too.
+- Whitespace was checked with `value != value.strip()`, which is an *ends* check, so interior
+  spaces were never examined.
+
+Both now go through `_is_forbidden_in_url`, which rejects any character where `str.isspace()`
+is true or `unicodedata.category()` is `Cc` **or `Cf`**. The strip check is gone — the
+character scan subsumes it.
+
+`Cf` is beyond what the finding asked for, and is the ambiguity-rule-4 reading: zero-width
+joiners and bidi overrides (U+200B, U+202E) are invisible in every renderer a human would check
+a URL in, which makes them a spoofing vector rather than a typo, and no legitimate URL carries
+one unencoded. While fixing this I also found NBSP (U+00A0) got through — it is `Zs`, not `Cc`,
+so it would have survived a fix that only widened the control range as specified.
+
+IDN hostnames are unaffected (`https://münchen.de/a` still validates); the rejected categories
+contain no letters. Test cases are written as `\u` escapes with inline names, since every one of
+them is invisible in a source listing.
+
+## 2. SQLite accepts fractional and textual citation-drop counts
+
+Reproduced: `1.5` stored as REAL, `'garbage'` stored as TEXT. The finding's diagnosis is
+exactly right, including the reason `>= 0` does not catch the string — SQLite orders TEXT above
+every number, so `'garbage' >= 0` is true.
+
+The CHECK is now
+`typeof(posts_dropped_no_url) = 'integer' AND posts_dropped_no_url >= 0`.
+
+One deliberate limit: *lossless* affinity conversion is still allowed and now pinned by a test —
+`'3'` is stored as integer `3`, and `1` into the REAL-affinity `cost_usd` as `1.0`. Both are
+ordinary driver behavior, and a guard that refused them would break normal writes. The
+constraint rejects conversions that would *lose* information, not conversion itself.
+
+## 3. Infinite `cost_usd` serializes as null
+
+Reproduced. This is the same defect as round 3's `provider_config` finding, in a field that
+predated it — and the round-3 fix did not generalize because `ge=0` made `cost_usd` *look*
+covered: `-inf < 0` and every `NaN` comparison is false, so two of the three non-finite values
+were already rejected by accident. Only `+inf` got through, which is precisely the one that
+serializes to `null` rather than erroring.
+
+`cost_usd` is now `FiniteFloat` (an explicit `math.isfinite` check) rather than relying on the
+bound. On the SQL side the trigger tests `typeof(NEW.cost_usd) IN ('integer','real')` and
+`NEW.cost_usd > 1e308`, which rejects both `'free'` and infinity — SQLite stores `9e999` as REAL
+infinity, so a `< 0` test could never have caught it.
+
+## Unrelated fix carried in the same commit
+
+The planted leak-test secret is renamed from `sk-live-planted-9d2f1a` to `privateFAKE123456`.
+CI's gitleaks step scans **all** branches' object databases, so this branch's realistic-looking
+fixture was failing the quality gate on unrelated PRs. A leak test needs a value that is
+distinctive in output, not one that looks like a credential; the scanner's `generic-api-key`
+rule fires on the prefix and entropy. Not allowlisted — the secret-hygiene gate is
+non-negotiable, and an allowlist broad enough to pass fixtures is broad enough to pass a real
+leak.
+
+## Standing items
+
+Adapter/write-path behavior and `raw_response_path` bundling remain unimplemented and
+unverifiable here, as in previous rounds.

@@ -180,6 +180,22 @@ def test_negative_counters_are_rejected() -> None:
         validate_run(_run(posts_dropped_no_url=-1))
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_cost_usd_must_be_finite(bad: float) -> None:
+    """ge=0 caught -inf and NaN by accident, which made +inf look covered.
+
+    It was not: +inf validated and then serialized to null, so a run with an
+    unbounded cost persisted as one with no recorded cost at all.
+    """
+    with pytest.raises(ResearchSchemaError):
+        validate_run(_run(cost_usd=bad))
+
+
+def test_finite_cost_usd_still_round_trips() -> None:
+    assert json.loads(validate_run(_run(cost_usd=0.02)).model_dump_json())["cost_usd"] == 0.02
+    assert json.loads(validate_run(_run(cost_usd=0)).model_dump_json())["cost_usd"] == 0
+
+
 def test_content_hash_is_stable_across_cosmetic_variation() -> None:
     base = content_sha256("Payrolls rose in June.")
     assert content_sha256("  Payrolls\n rose\tin   June.  ") == base
@@ -202,7 +218,7 @@ def test_content_hash_pins_a_known_digest() -> None:
 def test_validation_error_never_echoes_retrieved_content() -> None:
     # A research document carries arbitrary provider text; a credential pasted
     # into a fixture must not surface through a diagnostic or its traceback.
-    secret = "sk-live-planted-9d2f1a"
+    secret = "privateFAKE123456"
     with pytest.raises(ResearchSchemaError) as excinfo:
         validate_document(_document(source_type=secret))
     rendered = "".join(
@@ -217,7 +233,7 @@ def test_validation_error_never_echoes_an_input_controlled_field_name() -> None:
     # The companion to the test above: include_input=False withholds the offending
     # *value*, but under extra="forbid" the error's location IS the caller's key.
     # A credential pasted as a key must be withheld exactly as one pasted as a value.
-    secret = "sk-live-planted-9d2f1a"
+    secret = "privateFAKE123456"
     with pytest.raises(ResearchSchemaError) as excinfo:
         validate_document(_document(**{secret: "x"}))
     rendered = "".join(
@@ -232,14 +248,14 @@ def test_validation_error_never_echoes_an_input_controlled_field_name() -> None:
 
 def test_validation_error_never_echoes_a_provider_config_key() -> None:
     # provider_config keys are caller-supplied too, and land in the same loc.
-    secret = "sk-live-planted-9d2f1a"
+    secret = "privateFAKE123456"
     with pytest.raises(ResearchSchemaError) as excinfo:
         validate_run(_run(provider_config={secret: object()}))
     assert secret not in str(excinfo.value)
     assert "provider_config" in str(excinfo.value)
 
 
-SECRET = "sk-live-planted-9d2f1a"
+SECRET = "privateFAKE123456"
 
 
 def _leaks(exc: ResearchSchemaError) -> bool:
@@ -429,6 +445,21 @@ def test_finite_floats_still_round_trip() -> None:
         "https://example.org:0/a",
         "https://example.org:-1/a",
         "https://example.org:notaport/a",
+        # Whitespace *inside* the URL. A raw space is not a valid URI character,
+        # and checking only the ends let these through. Written as escapes on
+        # purpose: every case here is invisible or near-invisible in a source
+        # listing, which is exactly why it is worth pinning.
+        "https://exa mple.org/a",
+        "https://example.org/a b",
+        "https://exa\u00a0mple.org/a",  # NBSP -- Zs, not a control character
+        # C1 controls (U+0080-U+009F). The hand-rolled set covered C0 and DEL
+        # only, while its comment claimed to cover both ranges.
+        "https://exa\u0085mple.org/a",  # NEL
+        "https://exa\u009fmple.org/a",
+        # Cf format characters: invisible wherever a human would check a URL, so
+        # a spoofing vector rather than a typo.
+        "https://exa\u200bmple.org/a",  # zero-width space
+        "https://example.org/\u202ea",  # right-to-left override
     ],
 )
 def test_urls_must_be_absolute_http(url: str) -> None:
@@ -569,6 +600,60 @@ def test_database_rejects_impossible_counts(tmp_path: Path) -> None:
             posts_dropped_no_url=0,
             cost_usd=0,
         )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        # SQLite column types are *affinity*, not constraints. A REAL that cannot
+        # be losslessly narrowed stays REAL, and a non-numeric string stays TEXT
+        # -- and TEXT sorts above every number, so `>= 0` is satisfied by
+        # 'garbage'. Only typeof() actually pins the storage class.
+        ("posts_dropped_no_url", 1.5),
+        ("posts_dropped_no_url", "garbage"),
+        ("cost_usd", "free"),
+        ("cost_usd", float("inf")),
+    ],
+)
+def test_database_rejects_wrongly_typed_counters(
+    tmp_path: Path, column: str, value: object
+) -> None:
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_run(conn, provider="xai_x_search", agent_model="grok-4", **{column: value})
+    finally:
+        conn.close()
+
+
+def test_database_stores_counters_with_their_declared_type(tmp_path: Path) -> None:
+    """The typeof() guards must not reject what affinity legitimately converts.
+
+    Affinity conversion is only rejected where it would be *lossy*: SQLite
+    narrows the numeric string '3' to integer 3, and widens integer 1 to real 1.0
+    for a REAL column, both losslessly. Pinning this stops the guards from being
+    tightened into something that refuses ordinary driver round-trips.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        _insert_run(
+            conn,
+            provider="xai_x_search",
+            agent_model="grok-4",
+            posts_dropped_no_url="3",
+            cost_usd=1,
+        )
+        row = conn.execute(
+            "SELECT posts_dropped_no_url, typeof(posts_dropped_no_url), "
+            "cost_usd, typeof(cost_usd) FROM research_runs"
+        ).fetchone()
+        assert tuple(row) == (3, "integer", 1.0, "real")
     finally:
         conn.close()
 

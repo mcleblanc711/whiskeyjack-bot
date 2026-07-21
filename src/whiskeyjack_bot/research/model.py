@@ -43,6 +43,7 @@ and a research document can hold arbitrary retrieved text.
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime, timezone
 from math import isfinite
 from typing import Annotated, Any, Literal
@@ -99,12 +100,31 @@ UtcDatetime = Annotated[AwareDatetime, AfterValidator(_to_utc)]
 # diagnostic naming what was wrong with it is a channel for echoing it.
 _BAD_URL = "must be an absolute http(s) URL with a hostname (offending input withheld)"
 
-# C0/C1 control characters. urlsplit *silently deletes* tab, LF and CR (WHATWG
-# rule), so "https://exa\nmple.org/a" parses as a clean host while the string we
-# would store still carries the newline -- a stored URL that no longer matches
-# what any parser sees. Rejected outright rather than stripped: this validator
-# does not rewrite, and a control character in a URL is a normalization bug.
-_CONTROL_CHARS = frozenset(chr(c) for c in range(0x20)) | {chr(0x7F)}
+
+def _is_forbidden_in_url(char: str) -> bool:
+    """Characters that may not appear anywhere in a stored URL.
+
+    Three groups, all of which got through an earlier version of this check that
+    enumerated C0 plus DEL by hand (review round 4):
+
+    - **Whitespace, anywhere.** A raw space is not a valid URI character; it has
+      to be percent-encoded. Checking only the ends missed
+      ``https://exa mple.org/a`` and ``https://example.org/a b``, and spelling
+      out ASCII space would still have missed NBSP and the rest of ``Zs``.
+    - **``Cc`` controls.** The hand-rolled set covered C0 and DEL but *not* C1
+      (U+0080-U+009F), while its comment claimed both -- so U+0085 (NEL) and
+      U+009F sailed through. Asking Unicode keeps the code and the claim in sync.
+    - **``Cf`` format characters.** Zero-width joiners and the bidi overrides are
+      invisible in any renderer a human would check a URL in, which makes them a
+      spoofing vector rather than a typo. Ambiguity rule 4: no legitimate URL
+      carries one unencoded.
+
+    ``urlsplit`` *silently deletes* tab, LF and CR (the WHATWG rule), so this
+    cannot be left to the parser -- it reports a clean host while the string
+    being stored still carries the character. Rejected rather than stripped:
+    this validator does not rewrite.
+    """
+    return char.isspace() or unicodedata.category(char) in ("Cc", "Cf")
 
 
 def _require_http_url(value: str) -> str:
@@ -117,12 +137,11 @@ def _require_http_url(value: str) -> str:
     normalization bugs, and a document whose URL does not resolve is an
     attribution the reader cannot check.
     """
-    # urlsplit tolerates surrounding whitespace and strips it, so a value that is
-    # only usable after stripping must be caught before parsing: the stored URL
-    # is the one we were given, and " https://x/y " is not that URL.
-    if value != value.strip():
-        raise ValueError(_BAD_URL)
-    if _CONTROL_CHARS.intersection(value):
+    # Before parsing, because urlsplit both tolerates surrounding whitespace and
+    # silently deletes some interior characters: by the time it has an opinion,
+    # the string it parsed is no longer the string we would store. Covers the
+    # leading/trailing case too -- " https://x/y " is not the URL we were given.
+    if any(_is_forbidden_in_url(char) for char in value):
         raise ValueError(_BAD_URL)
     try:
         parts = urlsplit(value)
@@ -148,6 +167,24 @@ def _require_http_url(value: str) -> str:
 
 # An absolute http(s) URL, preserved exactly. See _require_http_url.
 HttpUrlString = Annotated[str, Field(min_length=1), AfterValidator(_require_http_url)]
+
+
+def _require_finite(value: float) -> float:
+    """Reject a non-finite number on a field that is stored as JSON or REAL.
+
+    ``ge=0`` happened to catch ``-inf`` and ``NaN`` (both comparisons are false),
+    which made ``+inf`` look covered when it was not: it validated, then
+    ``model_dump_json()`` rendered it as ``null``. A cost that reads as "unknown"
+    once persisted is worse than one that reads as absurd, so the check is
+    explicit rather than a side effect of the bound (review round 4).
+    """
+    if not isfinite(value):
+        raise ValueError("must be a finite number: NaN and Infinity cannot be persisted")
+    return value
+
+
+# A number that survives the round trip into storage. See _require_finite.
+FiniteFloat = Annotated[float, AfterValidator(_require_finite)]
 
 
 def _reject_non_finite(value: JsonValue) -> JsonValue:
@@ -286,7 +323,7 @@ class ResearchRun(_StrictModel):
     # evidence: its failure is recorded here and must not fail a research run in
     # which AskNews or Exa succeeded (brief § B, failure mode).
     error_summary: str | None = None
-    cost_usd: float | None = Field(default=None, ge=0)
+    cost_usd: FiniteFloat | None = Field(default=None, ge=0)
 
     # A second model participating in evidence gathering must be identified by
     # name and version; attribution requires it (brief § B).
