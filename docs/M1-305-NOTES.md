@@ -97,8 +97,8 @@ Tests: `tests/unit/test_dedup_freshness.py` (47 cases). Full gate green — `pyt
   collapsed across runs, losing exactly that attribution — corrected in round 1; see below.) On an
   intra-run collision the survivor is the minimum over a **total** order — stronger provenance
   (`direct_api` > `llm_reported`, a defensive tiebreak since intra-run provenance is uniform today
-  but unenforced), then earliest `retrieved_at_utc`, then the document's full `model_dump_json()`
-  serialization as an arbitrary-but-total final tiebreak. That makes the survivor independent of
+  but unenforced), then earliest `retrieved_at_utc`, then `repr(model_dump())` as an
+  arbitrary-but-total final tiebreak. That makes the survivor independent of
   input order and replay-stable (round 1 fix). First-seen order of survivors is preserved.
   `DedupResult.collapsed_count` is exposed so a future writer can record an auditable dedup counter,
   in the spirit of `ResearchRun.posts_dropped_no_url`.
@@ -150,11 +150,29 @@ found no failing host, so the canonicalization design stands.
   first-seen document, contradicting the docstring's "total and order-independent" claim: two
   duplicates equal in provenance and `retrieved_at_utc` but differing in a non-key field (e.g.
   `title`) chose different survivors on reversed input. **Fix:** selection is now a min over a total
-  order `(_PROVENANCE_RANK, retrieved_at_utc, model_dump_json())` — the full serialization is an
-  arbitrary-but-total, replay-stable final tiebreak. Guarded by
+  order `(_PROVENANCE_RANK, retrieved_at_utc, <tiebreak>)`; the tiebreak is a full serialization —
+  see round 2 for why it became `repr(model_dump())`. Guarded by
   `test_exact_tie_survivor_is_order_independent`.
 - **F3 (P2) — empty query segments were silently deleted.** `_strip_tracking` dropped empty
   `split("&")` entries and leading/trailing separators (`?x=1&&y=2` → `?x=1&y=2`), a second,
   undocumented lossy transform an endpoint that signs/dispatches on the raw query can detect.
   **Fix:** empties and separators are preserved; the only query transform is tracking-key removal.
   Guarded by `test_empty_query_segments_are_preserved`.
+
+## Cross-model review round 2 (2026-07-23)
+
+Re-review of the round-1 fixes: **F1 and F3 confirmed resolved**, **F2 not resolved**, one new P2.
+
+- **F2 follow-on (P2) — the serialization tiebreak raised on lone surrogates.** The round-1 fix used
+  `model_dump_json()` as the total-order tiebreak, but a schema-valid text field may hold an unpaired
+  surrogate (`"\ud800"`, e.g. from provider JSON), and JSON serialization UTF-8-encodes, so
+  `model_dump_json()` **raises** `PydanticSerializationError` on it — the "total order" was not total,
+  and the uncaught exception **echoed the offending character** (an error-hygiene breach). Verified in
+  repo: `validate_document` accepts such a title; `model_dump_json()` raises; `repr(model_dump())`
+  does not. **Fix:** the tiebreak is now `repr(document.model_dump())` — Python-mode dump returns
+  objects and never encodes (so it cannot raise), `repr` renders surrogates escaped and is
+  deterministic, and it is used only as an internal sort key (never in a message), so nothing
+  input-derived can leak. After this, `dedup.py` raises nothing input-derived at all. Guarded by
+  `test_dedup_tiebreak_is_surrogate_safe`. Rejecting surrogates at schema validation was rejected as
+  the fix: it would touch the frozen `model.py` for a dedup-local problem, and the schema
+  intentionally accepts arbitrary text — the primitive is what must be robust to it.

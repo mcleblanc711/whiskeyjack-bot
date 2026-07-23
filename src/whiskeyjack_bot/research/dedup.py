@@ -64,15 +64,28 @@ def _sort_key(document: ResearchDocument) -> tuple[int, datetime, str]:
     """A total order over same-key documents, used to pick the survivor.
 
     Stronger provenance first, then the earliest ``retrieved_at_utc`` (the first
-    observation of the artifact), then the document's full canonical serialization
-    -- an arbitrary but total and replay-stable final tiebreak that makes the
-    order independent of input order even when two duplicates differ only in a
-    non-key field such as ``title``.
+    observation of the artifact), then the document's full Python-mode dump as an
+    arbitrary but total and replay-stable final tiebreak -- so the order is
+    independent of input order even when two duplicates differ only in a non-key
+    field such as ``title``.
+
+    The tiebreak is ``repr(model_dump())``, **not** ``model_dump_json()``: a
+    schema-valid text field may hold an unpaired surrogate (``"\\ud800"``, e.g.
+    from provider JSON), and JSON serialization UTF-8-encodes, so
+    ``model_dump_json()`` *raises* ``PydanticSerializationError`` on it -- which
+    both breaks totality and, uncaught, echoes the offending character (cross-model
+    review round 2). ``model_dump()`` returns Python objects and never encodes, so
+    it cannot raise; ``repr`` renders such characters escaped, deterministically
+    (pydantic dumps fields in definition order), and the string is used only as an
+    internal sort key -- never placed in a message -- so nothing input-derived can
+    leak. Two ``repr`` strings always compare (Python orders by code point, and
+    surrogate code points compare fine); equal ``repr`` means equal content, where
+    the choice of survivor is immaterial.
     """
     return (
         _PROVENANCE_RANK[document.provenance],
         document.retrieved_at_utc,
-        document.model_dump_json(),
+        repr(document.model_dump()),
     )
 
 

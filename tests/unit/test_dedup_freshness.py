@@ -305,3 +305,16 @@ def test_exact_tie_survivor_is_order_independent() -> None:
     backward = deduplicate([b, a])
     assert len(forward.documents) == 1
     assert forward.documents[0].title == backward.documents[0].title
+
+
+def test_dedup_tiebreak_is_surrogate_safe() -> None:
+    # A text field may hold an unpaired surrogate (schema-valid; e.g. from provider
+    # JSON). The tiebreak must not raise on it -- model_dump_json() would, and would
+    # leak the character -- and must still be order-independent.
+    body = _hash("surrogate in the title")
+    a = _document(title="\ud800", content_sha256=body)
+    b = _document(title="\ud801", content_sha256=body)
+    forward = deduplicate([a, b])
+    backward = deduplicate([b, a])
+    assert len(forward.documents) == 1
+    assert forward.documents[0].title == backward.documents[0].title
