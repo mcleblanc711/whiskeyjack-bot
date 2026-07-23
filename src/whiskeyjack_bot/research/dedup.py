@@ -62,29 +62,40 @@ def dedup_key(document: ResearchDocument) -> tuple[str, str, str]:
 
 
 def _sort_key(document: ResearchDocument) -> tuple[int, datetime, str]:
-    """A total order over same-key documents, used to pick the survivor.
+    """A total order over same-key documents' **persisted forms**, to pick a survivor.
 
     Stronger provenance first, then the earliest ``retrieved_at_utc`` (the first
     observation of the artifact), then the document's **canonical persisted form**
-    as a total, replay-stable final tiebreak -- so the survivor is independent of
-    input order even when two duplicates differ only in a non-key field.
+    as the final tiebreak -- so the survivor a replay picks is independent of input
+    order even when two duplicates differ only in a non-key field.
 
     The tiebreak keys on ``model_dump(mode="json")``, not the in-memory
-    ``model_dump()``/``repr``: the survivor must be the one a replay would pick,
-    and replay reconstructs documents from the ledger's JSON. The Python form
-    carries distinctions the persisted form drops -- notably ``datetime.fold``,
-    which is absent from ``isoformat`` -- so two timestamps that are equal but
-    differ in ``fold`` would order differently in memory yet identically after a
-    store->replay round-trip, flipping the survivor (cross-model review round 3).
-    ``mode="json"`` renders exactly the stored form, so before == after.
+    ``model_dump()``/``repr``: the survivor must be the one a replay would pick, and
+    replay reconstructs documents from the ledger's JSON. The Python form carries
+    distinctions the persisted form drops -- notably ``datetime.fold``, absent from
+    ``isoformat`` -- so two timestamps that are equal but differ in ``fold`` would
+    order differently in memory yet identically after a store->replay round-trip,
+    flipping the survivor (cross-model review round 3). ``mode="json"`` renders
+    exactly the stored form, so before == after.
 
     ``ensure_ascii=True`` escapes lone surrogates (a schema-valid text field may
     hold ``"\\ud800"`` from provider JSON) instead of UTF-8-encoding them, so it
     does not raise the way plain ``model_dump_json()`` did (round 2).
-    ``sort_keys``/``separators`` make the string canonical. It is total (equal
-    canonical JSON <=> equal persisted content, where the choice is immaterial),
-    comparison never raises (plain ASCII), and it is used only as an internal sort
-    key -- never in a message -- so nothing input-derived can leak.
+    ``sort_keys``/``separators`` make the string canonical. Comparison never raises
+    (plain ASCII), and the key is used only as an internal sort key -- never in a
+    message -- so nothing input-derived can leak.
+
+    The order is total over **persisted forms**, deliberately not over in-memory
+    string identity: two documents whose canonical JSON is identical compare equal
+    here, because the ledger stores them as one row and a replay cannot tell them
+    apart. The clearest case is an astral scalar and its UTF-16 surrogate-pair
+    spelling (``"\\U0001f600"`` vs ``"\\ud83d\\ude00"``): distinct Python strings,
+    but ``json.loads`` recombines the pair, so both persist and replay as the one
+    scalar. Keying them equal is therefore replay-*correct* -- the survivor's
+    persisted form is input-order-invariant even where the in-memory object is not.
+    Making the key injective over in-memory identity (e.g. surrogatepass bytes)
+    would instead diverge it from the stored form and reopen the round-3 bug
+    (cross-model review round 4, resolved by keeping the persisted-form key).
     """
     return (
         _PROVENANCE_RANK[document.provenance],

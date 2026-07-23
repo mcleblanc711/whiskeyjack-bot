@@ -21,8 +21,8 @@ Three pure-primitive modules under `src/whiskeyjack_bot/research/`, mirroring ho
   `assess_document(doc, cutoff)`.
 - **`dedup.py`** — `dedup_key(doc)`, `deduplicate(docs) -> DedupResult`, `DedupResult` (frozen).
 
-Tests: `tests/unit/test_dedup_freshness.py` (55 cases, after review rounds 1–3). Full gate green —
-`pytest` 426 passed, `ruff check`, `ruff format --check`, `mypy --strict src` all clean.
+Tests: `tests/unit/test_dedup_freshness.py` (56 cases, after review rounds 1–4). Full gate green —
+`pytest` 427 passed, `ruff check`, `ruff format --check`, `mypy --strict src` all clean.
 
 ## Deliberate choices
 
@@ -198,4 +198,31 @@ replay-stability was **still not resolved**, with a new **P1**.
   escapes rather than UTF-8-encodes, so it does not raise); `sort_keys`/`separators` make it
   canonical. Guarded by `test_dedup_survivor_is_replay_stable`.
 - **P3 nit — stale test counts.** The "Delivered" line still cited the round-0 numbers (47 cases /
-  418 total); corrected to the current 55 module cases / 426 total.
+  418 total); corrected to the current 56 module cases / 427 total.
+
+## Cross-model review round 4 (2026-07-23)
+
+Re-review of the round-3 fix: **replay-stability (fold) confirmed resolved.** One new **P2**, which
+was **evaluated and its suggested fix declined with evidence** (owner decision) — the only accepted
+part is a test-strengthening.
+
+- **P2 (finding accepted, fix declined) — the tiebreak is not injective over in-memory strings.** An
+  astral scalar (`chr(0x1F600)`, len 1) and its UTF-16 surrogate-pair spelling
+  (`chr(0xD83D)+chr(0xDE00)`, len 2) are distinct Python strings, both schema-valid, but produce the
+  **same** `ensure_ascii=True` canonical JSON, so they collide and the *in-memory* returned survivor
+  is input-order-dependent. GPT proposed an injective key (`ensure_ascii=False` +
+  `.encode("utf-8", "surrogatepass")`). **Declined**, because it is *replay-unstable*: verified
+  in-repo that (a) after a real `json.dumps`→`json.loads` round-trip — what the ledger does —
+  **both documents collapse to the one scalar U+1F600**, i.e. they are the same persisted row; and
+  (b) `gpt_key(pair)` differs before vs after that round-trip, reopening exactly the round-3 bug
+  (key ≠ persisted form). The tiebreak deliberately orders **persisted forms**, not in-memory string
+  identity: two documents the ledger cannot tell apart are keyed equal, and the surviving document's
+  *persisted* form is input-order-invariant (confirmed both ways). A separated surrogate pair also
+  cannot arise from real provider JSON — `json.loads` always recombines `😀` into U+1F600
+  — so the input is schema-valid but not reachable through the retrieval path. Docstring updated to
+  state the "total over persisted forms, not in-memory identity" contract explicitly.
+- **Accepted (test hardening):** GPT correctly noted the round-3 replay test used a bare
+  `model_dump(mode="json")` handoff, which skips JSON text encoding. The `_replayed` helper now
+  crosses a real `json.dumps`→`json.loads`→`validate_document` boundary, and a new test
+  (`test_json_equivalent_titles_collapse_and_persist_identically`) pins that the astral/surrogate
+  pair collapse and persist identically in either order.

@@ -5,6 +5,7 @@ the stronger provenance."""
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -235,6 +236,14 @@ def _hash(text: str) -> str:
     return content_sha256(text)
 
 
+def _replayed(doc: ResearchDocument) -> ResearchDocument:
+    # Cross a REAL json.dumps -> json.loads text boundary, exactly as the ledger
+    # stores and a replay reconstructs -- not a bare model_dump(mode="json") handoff,
+    # which skips JSON encoding and so misses the normalization the boundary imposes.
+    text = json.dumps(doc.model_dump(mode="json"), ensure_ascii=True)
+    return validate_document(json.loads(text))
+
+
 def test_identical_artifacts_collapse() -> None:
     body = _hash("payrolls rose")
     a = _document(content_sha256=body)
@@ -321,16 +330,12 @@ def test_dedup_survivor_is_replay_stable() -> None:
     def survivor(docs: list[ResearchDocument]) -> str | None:
         return deduplicate(docs).documents[0].snippet
 
-    def replayed(doc: ResearchDocument) -> ResearchDocument:
-        # Round-trip through the persisted JSON form, as the ledger + replay would.
-        return validate_document(doc.model_dump(mode="json"))
-
     before = survivor([a, b])
-    after = survivor([replayed(a), replayed(b)])
+    after = survivor([_replayed(a), _replayed(b)])
     assert before == after
     # And it stays order-independent both before and after persistence.
     assert survivor([b, a]) == before
-    assert survivor([replayed(b), replayed(a)]) == after
+    assert survivor([_replayed(b), _replayed(a)]) == after
 
 
 def test_dedup_tiebreak_is_surrogate_safe() -> None:
@@ -344,3 +349,21 @@ def test_dedup_tiebreak_is_surrogate_safe() -> None:
     backward = deduplicate([b, a])
     assert len(forward.documents) == 1
     assert forward.documents[0].title == backward.documents[0].title
+
+
+def test_json_equivalent_titles_collapse_and_persist_identically() -> None:
+    # An astral scalar and its UTF-16 surrogate-pair spelling are distinct Python
+    # strings but the same persisted document: json.loads recombines the pair, so
+    # both round-trip to the one scalar. The tiebreak keys on the persisted form, so
+    # they collide -- correctly -- and whichever the collapse returns, its persisted
+    # form is the same in either input order (replay-stable). Injectivity over
+    # in-memory identity is deliberately not a goal; matching persisted identity is.
+    body = _hash("astral scalar vs its surrogate-pair spelling")
+    astral = _document(title=chr(0x1F600), content_sha256=body)
+    pair = _document(title=chr(0xD83D) + chr(0xDE00), content_sha256=body)
+    assert astral.title != pair.title  # distinct in memory
+    assert len(deduplicate([astral, pair]).documents) == 1  # collide by design
+
+    forward = deduplicate([astral, pair]).documents[0]
+    backward = deduplicate([pair, astral]).documents[0]
+    assert _replayed(forward).title == _replayed(backward).title == chr(0x1F600)
