@@ -56,8 +56,10 @@ Tests: `tests/unit/test_dedup_freshness.py` (47 cases). Full gate green — `pyt
   (owner decision, 2026-07-22). Dedup keys on `canonical_url`, so two provider reports of one
   article differing only by a `utm_*`/`fbclid`/… tag would never collapse unless those tags are
   removed — which is the whole point of the item. `_TRACKING_PARAMS` is a module-level `frozenset`
-  matched case-insensitively against the percent-decoded key; every non-tracking parameter is
-  preserved byte-for-byte in its original position.
+  matched case-insensitively against the percent-decoded key; **tracking-key removal is the only
+  query transform** — every non-tracking parameter, and every empty segment / leading-trailing
+  separator, is preserved byte-for-byte in its original position (the empty-segment preservation was
+  a round-1 review fix; see below).
 
 - **Userinfo is dropped from the canonical URL** — it is not part of the resource identity for
   dedup, and keeping it would write credentials into the stored dedup key. `original_url` still
@@ -86,17 +88,20 @@ Tests: `tests/unit/test_dedup_freshness.py` (47 cases). Full gate green — `pyt
   Splitting them keeps the epic boundary: tagging is evidence about the document, gating is policy
   about the forecast.
 
-- **Dedup preserves the stronger provenance.** `deduplicate` collapses documents sharing
-  `(canonical_url, content_sha256)` — the ledger's UNIQUE minus the run id. The key is the artifact
-  identity, so the scope of a collapse is the input the caller passes: one run's documents for
-  strict per-run semantics, or a question's whole set to dedup across providers (which is where
-  "without losing provenance" bites — within one run, provenance is uniform). On collision the
-  survivor carries the **stronger claim** (`direct_api` > `llm_reported`): a verified retrieval is
-  never silently downgraded to a reported one, nor a reported one upgraded to verified. Ties on equal
-  provenance break to the earliest `retrieved_at_utc`, then first-seen — a total, order-independent
-  rule, so the result is stable. First-seen order is preserved. `DedupResult.collapsed_count` is
-  exposed so a future writer can record an auditable dedup counter, in the spirit of
-  `ResearchRun.posts_dropped_no_url`.
+- **Dedup mirrors the ledger UNIQUE exactly.** `deduplicate` collapses documents sharing
+  `(retrieval_run_id, canonical_url, content_sha256)` — **the ledger's UNIQUE, run id included**. It
+  collapses only true intra-run duplicates (preventing a constraint violation) and **never collapses
+  across runs**: two providers (two runs) that both surface one article are two legitimate ledger
+  rows, and the run id is part of the attribution, so cross-run/cross-provider provenance is
+  preserved *by construction*. (The initial cut keyed on `(canonical_url, content_sha256)` alone and
+  collapsed across runs, losing exactly that attribution — corrected in round 1; see below.) On an
+  intra-run collision the survivor is the minimum over a **total** order — stronger provenance
+  (`direct_api` > `llm_reported`, a defensive tiebreak since intra-run provenance is uniform today
+  but unenforced), then earliest `retrieved_at_utc`, then the document's full `model_dump_json()`
+  serialization as an arbitrary-but-total final tiebreak. That makes the survivor independent of
+  input order and replay-stable (round 1 fix). First-seen order of survivors is preserved.
+  `DedupResult.collapsed_count` is exposed so a future writer can record an auditable dedup counter,
+  in the spirit of `ResearchRun.posts_dropped_no_url`.
 
 ## Error hygiene
 
@@ -114,7 +119,42 @@ already-validated `ResearchDocument`s and pure timestamps.
   did. The consumer contract is documented in each module docstring.
 - **The stale/insufficient-research gate is M1-504** (`fail_on_stale_research` /
   `flag_on_stale_research`), which depends on this item.
+- **A presentation-layer "one card per artifact across providers" view is not built here.** Dedup
+  mirrors the per-run ledger constraint; a cross-provider forecaster view would have to *retain*
+  every contributing run/provenance rather than drop them, and belongs to forecast assembly, not
+  this dedup. Building it now would be speculative scope creep of the kind the M1-301 retrospective
+  warns against.
 - **Host allow/deny policy (loopback, private ranges, homograph adjudication beyond IDNA) is not
   decided here.** `model.py` already states shape-validation holds no network code; canonicalization
   inherits that boundary — whether a *reachable* host is an *appropriate* one belongs to whatever
   fetches a URL.
+
+## Cross-model review round 1 (2026-07-23)
+
+GPT returned **DO-NOT-APPROVE** with three findings, all verified accurate and all fixed on this
+branch. The primary risk I flagged for the reviewer — whether any host survives
+`idna.encode(uts46=True)` in `canonicalize_url` but is then rejected by the schema's strict
+`idna.encode` re-validation — was **cleared**: GPT tested 508k single-code-point label variants and
+found no failing host, so the canonicalization design stands.
+
+- **F1 (P1) — dedup collapsed across runs, losing attribution.** `dedup_key` had been
+  `(canonical_url, content_sha256)`, dropping `retrieval_run_id`, so two providers' reports of one
+  article collapsed to one survivor — but the ledger's `UNIQUE(retrieval_run_id, …)` deliberately
+  keeps both, one per run. This erased which run found the evidence (an attribution loss the ledger
+  exists to prevent) and was input-order-dependent. Root cause: the wrong reading that "duplicate
+  reports collapse" meant *cross-provider* collapse; it means preventing a *single run* from storing
+  the same artifact twice. **Fix:** `retrieval_run_id` is now in the key; dedup mirrors the ledger
+  UNIQUE exactly and never crosses runs. Guarded by
+  `test_same_artifact_from_different_runs_is_not_collapsed`.
+- **F2 (P2) — survivor selection was order-dependent.** `_prefer`'s final branch kept the
+  first-seen document, contradicting the docstring's "total and order-independent" claim: two
+  duplicates equal in provenance and `retrieved_at_utc` but differing in a non-key field (e.g.
+  `title`) chose different survivors on reversed input. **Fix:** selection is now a min over a total
+  order `(_PROVENANCE_RANK, retrieved_at_utc, model_dump_json())` — the full serialization is an
+  arbitrary-but-total, replay-stable final tiebreak. Guarded by
+  `test_exact_tie_survivor_is_order_independent`.
+- **F3 (P2) — empty query segments were silently deleted.** `_strip_tracking` dropped empty
+  `split("&")` entries and leading/trailing separators (`?x=1&&y=2` → `?x=1&y=2`), a second,
+  undocumented lossy transform an endpoint that signs/dispatches on the raw query can detect.
+  **Fix:** empties and separators are preserved; the only query transform is tracking-key removal.
+  Guarded by `test_empty_query_segments_are_preserved`.

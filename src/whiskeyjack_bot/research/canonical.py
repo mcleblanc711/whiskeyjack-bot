@@ -135,13 +135,17 @@ def _strip_tracking(query: str) -> str:
     Splits on the raw ``&`` rather than round-tripping through ``parse_qsl`` /
     ``urlencode`` so a preserved parameter is stored exactly as the provider sent
     it -- re-encoding could alter a value that is part of the resource identity.
+
+    Tracking-key removal is the **only** query transform: empty segments
+    (``a&&b``) and leading/trailing separators are preserved, because an endpoint
+    that dispatches on or signs the raw query can distinguish them, and dropping
+    them was a second, undocumented lossy step (cross-model review round 1,
+    finding 3). A segment goes only if its percent-decoded key is a tracking tag.
     """
     if not query:
         return query
     kept: list[str] = []
     for pair in query.split("&"):
-        if not pair:
-            continue  # An empty segment ("a&&b") carries nothing; not preserved.
         key = pair.split("=", 1)[0]
         if unquote(key).lower() in _TRACKING_PARAMS:
             continue

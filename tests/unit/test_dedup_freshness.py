@@ -142,6 +142,23 @@ def test_canonicalize_rejects_what_the_schema_rejects(url: str) -> None:
         canonicalize_url(url)
 
 
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        # Tracking-key removal is the only query transform: empty segments and
+        # leading/trailing separators survive, because a query-signing or
+        # -dispatching endpoint can distinguish them.
+        ("https://example.org/a?x=1&&y=2", "https://example.org/a?x=1&&y=2"),
+        ("https://example.org/a?a=1&", "https://example.org/a?a=1&"),
+        ("https://example.org/a?&a=1", "https://example.org/a?&a=1"),
+        # Tracking is still stripped; the surrounding structure is left intact.
+        ("https://example.org/a?utm_source=x&a=1", "https://example.org/a?a=1"),
+    ],
+)
+def test_empty_query_segments_are_preserved(url: str, expected: str) -> None:
+    assert canonicalize_url(url) == expected
+
+
 def test_canonicalization_error_never_echoes_the_url() -> None:
     secret = "hunter2-do-not-print"
     try:
@@ -263,3 +280,28 @@ def test_equal_provenance_ties_break_to_earliest_retrieval() -> None:
     result = deduplicate([later, earlier])
     assert len(result.documents) == 1
     assert result.documents[0].retrieved_at_utc == datetime(2026, 7, 17, 6, tzinfo=timezone.utc)
+
+
+def test_same_artifact_from_different_runs_is_not_collapsed() -> None:
+    # The key is (retrieval_run_id, canonical_url, content_sha256), exactly the
+    # ledger's UNIQUE: two providers (two runs) that both surface one article are
+    # two legitimate rows, and collapsing them would erase which run found it.
+    body = _hash("one article, two providers")
+    from_asknews = _document(retrieval_run_id="run-asknews", content_sha256=body)
+    from_exa = _document(retrieval_run_id="run-exa", content_sha256=body)
+    result = deduplicate([from_asknews, from_exa])
+    assert result.collapsed_count == 0
+    assert {d.retrieval_run_id for d in result.documents} == {"run-asknews", "run-exa"}
+
+
+def test_exact_tie_survivor_is_order_independent() -> None:
+    # Same key, same provenance, same retrieved_at, differing only in a non-key
+    # field: the survivor must not depend on input order (the full-serialization
+    # tiebreak makes the selection a min over a total order).
+    body = _hash("one artifact, two records")
+    a = _document(title="Headline A", content_sha256=body)
+    b = _document(title="Headline B", content_sha256=body)
+    forward = deduplicate([a, b])
+    backward = deduplicate([b, a])
+    assert len(forward.documents) == 1
+    assert forward.documents[0].title == backward.documents[0].title

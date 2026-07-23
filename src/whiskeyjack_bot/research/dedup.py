@@ -1,32 +1,38 @@
-"""Provenance-preserving deduplication of research evidence (M1-305).
+"""Deduplication of research evidence, mirroring the ledger constraint (M1-305).
 
-Collapses documents that are the **same underlying artifact** -- identical
-``canonical_url`` *and* identical ``content_sha256`` -- into one, so a forecaster
-is not shown, and the ledger is not asked to store, the same article twice. The
-key mirrors the ledger's ``UNIQUE(retrieval_run_id, canonical_url,
-content_sha256)`` (M1-601) minus the run id: within one run this prevents a
-constraint violation, and across a question's runs it is what lets two providers
-that both surfaced one article collapse to a single piece of evidence. The scope
-of a collapse is the input the caller passes -- one run's documents for strict
-per-run semantics, or a question's whole set to dedup across providers.
+Collapses documents the ledger would refuse as duplicates: the key is
+``(retrieval_run_id, canonical_url, content_sha256)``, **exactly** the ledger's
+``UNIQUE(retrieval_run_id, canonical_url, content_sha256)`` (M1-601). Within one
+run this prevents a constraint violation from two reports of one article; it
+**never collapses across runs**, because two providers (two runs) that both
+surface one article are two legitimate ledger rows -- the run id is part of the
+attribution, and merging them would erase which run found the evidence. So
+cross-run/cross-provider provenance is preserved *by construction*, not by a
+merge rule (an earlier cut keyed on ``(canonical_url, content_sha256)`` alone and
+lost exactly that -- cross-model review round 1, finding 1).
 
-**Without losing provenance** is the acceptance criterion and the delicate part.
 ``provenance`` distinguishes a document the pipeline fetched (``direct_api``) from
 one a research agent merely reported (``llm_reported``), and the forecaster
-prompt's evidence caps read it. When the same artifact arrives both ways, the
-survivor must carry the *stronger* claim (``direct_api``): a verified retrieval is
-never silently downgraded to a reported one, nor a reported one upgraded to
-verified. ``original_url`` is a schema field on whichever document survives, so
-the as-retrieved URL is never lost either.
+prompt's evidence caps read it. Within a single run it is uniform today, but the
+schema does not enforce that, so on an intra-run collision the survivor still
+carries the *stronger* claim (``direct_api``) -- a verified retrieval is never
+silently downgraded, nor a reported one upgraded. ``original_url`` is a schema
+field on whichever document survives, so the as-retrieved URL is never lost.
 
-Pure and deterministic: no I/O, first-seen order preserved, ties broken by a
-total, timestamp-based rule so the same input always yields the same output.
+Pure and deterministic: no I/O, first-seen order preserved, and the survivor of a
+collision is a min over a **total** order (so the choice is independent of input
+order and replay-stable -- round 1, finding 2).
+
+A presentation-layer "one card per artifact across providers" view is deliberately
+*not* built here: it would have to retain every contributing run/provenance rather
+than drop them, and belongs to forecast assembly, not this dedup.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 from whiskeyjack_bot.research.model import Provenance, ResearchDocument
 
@@ -49,36 +55,39 @@ class DedupResult:
     collapsed_count: int
 
 
-def dedup_key(document: ResearchDocument) -> tuple[str, str]:
-    """The artifact identity a collapse is keyed on: ``(canonical_url, hash)``."""
-    return (document.canonical_url, document.content_sha256)
+def dedup_key(document: ResearchDocument) -> tuple[str, str, str]:
+    """The ledger's dedup identity: ``(retrieval_run_id, canonical_url, hash)``."""
+    return (document.retrieval_run_id, document.canonical_url, document.content_sha256)
+
+
+def _sort_key(document: ResearchDocument) -> tuple[int, datetime, str]:
+    """A total order over same-key documents, used to pick the survivor.
+
+    Stronger provenance first, then the earliest ``retrieved_at_utc`` (the first
+    observation of the artifact), then the document's full canonical serialization
+    -- an arbitrary but total and replay-stable final tiebreak that makes the
+    order independent of input order even when two duplicates differ only in a
+    non-key field such as ``title``.
+    """
+    return (
+        _PROVENANCE_RANK[document.provenance],
+        document.retrieved_at_utc,
+        document.model_dump_json(),
+    )
 
 
 def _prefer(current: ResearchDocument, candidate: ResearchDocument) -> ResearchDocument:
-    """Choose the survivor of two same-artifact documents.
-
-    Stronger provenance wins; on equal provenance the earliest ``retrieved_at_utc``
-    wins (the first observation of the artifact); a remaining tie keeps the
-    first-seen document. Total and order-independent, so the result is stable.
-    """
-    current_rank = _PROVENANCE_RANK[current.provenance]
-    candidate_rank = _PROVENANCE_RANK[candidate.provenance]
-    if candidate_rank < current_rank:
-        return candidate
-    if candidate_rank > current_rank:
-        return current
-    if candidate.retrieved_at_utc < current.retrieved_at_utc:
-        return candidate
-    return current
+    """Return whichever of two same-key documents is smaller in ``_sort_key``."""
+    return candidate if _sort_key(candidate) < _sort_key(current) else current
 
 
 def deduplicate(documents: Iterable[ResearchDocument]) -> DedupResult:
-    """Collapse same-artifact documents, preserving the strongest provenance.
+    """Collapse duplicates by the ledger's key, keeping one survivor per key.
 
     Returns the survivors in first-seen order and the count of duplicates removed.
     """
-    survivors: dict[tuple[str, str], ResearchDocument] = {}
-    order: list[tuple[str, str]] = []
+    survivors: dict[tuple[str, str, str], ResearchDocument] = {}
+    order: list[tuple[str, str, str]] = []
     collapsed = 0
     for document in documents:
         key = dedup_key(document)
