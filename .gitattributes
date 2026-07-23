@@ -11,3 +11,10 @@ docs/backlog/*.csv -text whitespace=cr-at-eol
 # whitespace (round-2 finding 8). Stripping them would corrupt the diff being
 # reviewed, so the check is suppressed for these files instead.
 GPT_REVIEW_REQUEST_*.md -whitespace
+
+# The forecaster prompt is hashed over its raw bytes and that digest is pinned in
+# tests/unit/test_prompt.py (D04 drift guard). Without an eol rule, a checkout with
+# core.autocrlf=true can materialize CRLF in the worktree while the tree reads clean,
+# changing the bytes the guard hashes and failing CI on an unmodified prompt. Force LF
+# so every clean checkout receives the released bytes whose digest is pinned.
+prompts/forecaster.md text eol=lf

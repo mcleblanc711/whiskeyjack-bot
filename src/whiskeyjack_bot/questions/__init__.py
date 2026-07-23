@@ -1,5 +1,10 @@
 """Canonical question schema and normalization from the pinned SDK models."""
 
+from whiskeyjack_bot.questions.events import (
+    DeferralEvent,
+    DeferralReason,
+    NormalizationResult,
+)
 from whiskeyjack_bot.questions.groups import is_group_post, unpack_group_post
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
@@ -22,7 +27,10 @@ __all__ = [
     "CanonicalNumericQuestion",
     "CanonicalQuestion",
     "CanonicalQuestionAdapter",
+    "DeferralEvent",
+    "DeferralReason",
     "NormalizationError",
+    "NormalizationResult",
     "SourceCategory",
     "UnsupportedQuestionTypeError",
     "is_group_post",

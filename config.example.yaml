@@ -72,7 +72,7 @@ forecast:
   fail_on_stale_research: false
   flag_on_stale_research: true
   prompt_path: "prompts/forecaster.md"
-  prompt_version: "1.0.0"
+  prompt_version: "1.1.0"
 
 numeric_calibration:
   use_forecasting_tools_standardization: true

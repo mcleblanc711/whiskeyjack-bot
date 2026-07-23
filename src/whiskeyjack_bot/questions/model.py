@@ -10,9 +10,10 @@ objects onto these models.
 
 Scope is fixed by decisions D20 (support binary, multiple-choice and numeric in
 v1) and D21 (defer date and conditional). Only the three supported types have a
-canonical model here; rejecting the deferred types is
-:mod:`whiskeyjack_bot.questions.normalize`'s job (and, as a diagnostic event,
-M1-203's).
+canonical model here; refusing the deferred types is
+:mod:`whiskeyjack_bot.questions.normalize`'s job, either by raising or -- on the
+batch path -- by skipping and recording a
+:class:`~whiskeyjack_bot.questions.events.DeferralEvent` (M1-203).
 
 The models are strict (``extra="forbid"``, reusing ``config._StrictModel``) so a
 malformed record fails validation loudly -- that is the M1-201 acceptance

@@ -54,6 +54,15 @@ always rebuild it with `errors(include_input=False, include_url=False)`.
 Callers only handle the module's own error type, so **every malformed shape must arrive as one** —
 a raw `AttributeError`/`KeyError`/`ValueError` escaping is a review finding (it has been, twice).
 
+**Filesystem paths are the one carve-out** (settled M1-401 review, owner decision). "Values" means
+*content*: file bodies, field values, stored records, secrets. A path is operator-supplied
+configuration, not content, and it is the only thing that makes a load failure actionable — a
+`cannot read forecaster prompt` with no path cannot be fixed. So paths **are** rendered, uniformly:
+`config.py`, `ledger.py`, `metaculus/snapshots.py`, `prompt.py`, `env_verify.py`. The residual risk
+is real but bounded — an operator who pastes a secret into a *path* has already written it to their
+config file in plaintext. Do not redact paths in one module while the rest render them; a lone
+outlier is worse than either consistent policy.
+
 ## Hard constraints
 
 - No reachable submission path until M2; `submission.enabled: false` and `dry_run: true` stay the
