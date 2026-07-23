@@ -118,12 +118,15 @@ def _group_parent_title(q: MetaculusQuestion) -> str | None:
 
 
 def _safe_attr(q: MetaculusQuestion, attribute: str) -> object:
-    """Read one attribute with nothing allowed to escape.
+    """Read one *optional identity* attribute with nothing allowed to escape.
 
     ``getattr``'s default only suppresses ``AttributeError``; a property whose
     getter raises anything else would escape this module's error boundary. These
-    reads happen on the *refusal* path, where an escaping exception would turn a
-    clean deferral into a crash -- and the value is unusable either way.
+    reads happen on the *refusal* path for fields whose absence is tolerable
+    (``id_of_question``/``id_of_post``): an escaping exception would turn a clean
+    deferral into a crash, and the value is unusable either way. It is **not** used
+    for ``question_type`` -- a type that cannot be read is a malformed record, not
+    a missing id (see :func:`_read_question_type`).
     """
     try:
         return getattr(q, attribute, None)
@@ -131,51 +134,79 @@ def _safe_attr(q: MetaculusQuestion, attribute: str) -> object:
         return None
 
 
+def _read_question_type(q: MetaculusQuestion) -> object:
+    """Read ``question_type`` once, turning a failing getter into our own error.
+
+    The type is not optional: a ``question_type`` property that *raises* is a
+    malformed record or an SDK contract violation, and the project rule is that
+    every malformed shape arrives as a :class:`NormalizationError` rather than a
+    raw exception -- or, worse, being swallowed into a deferral that hides the
+    defect. Constant message + ``from None``: the getter's exception can carry the
+    object's field values, so it must not resurface through the text or the cause
+    chain. Best-effort swallowing is reserved for the optional identity reads.
+    """
+    try:
+        return q.question_type
+    except Exception:
+        raise NormalizationError(
+            "cannot read question type (detail withheld: it can echo question contents)"
+        ) from None
+
+
 def _type_tag(question_type: object) -> str:
     """Render the type tag for an error message or a diagnostic event.
 
-    One helper for both so the exception text and the event cannot drift: a tag
-    outside the SDK's own enum reached that slot from outside the SDK's models and
-    is unvetted content under the no-echo rule.
+    One helper for both so the exception text and the event cannot drift. Exact
+    ``type(...) is str`` rather than ``isinstance``: a ``str`` *subclass* can pass
+    a membership check on its value while its ``__str__``/``__repr__`` renders an
+    unvetted payload, so anything that is not exactly ``str`` -- and any value
+    outside the SDK's own enum -- renders as the module-owned literal ``'unknown'``.
     """
-    if isinstance(question_type, str) and question_type in _KNOWN_SDK_TYPES:
+    if type(question_type) is str and question_type in _KNOWN_SDK_TYPES:
         return question_type
     return "unknown"
 
 
-def _supported_type(q: MetaculusQuestion) -> str | None:
-    """The question's type if v1 supports it (D20), else ``None``.
+def _supported_type(question_type: object) -> str | None:
+    """The (already-read) type if v1 supports it (D20), else ``None``.
 
-    isinstance before membership: an unhashable tag (a list, say) would raise a raw
-    ``TypeError`` out of the frozenset test itself, escaping the error boundary.
+    Exact ``type(...) is str`` for the same reason as :func:`_type_tag`: a ``str``
+    subclass is unvetted, so a subclass valued ``"binary"`` is deferred as unknown
+    rather than normalized. The exact-type test also runs before membership, so an
+    unhashable tag (a list, say) never reaches the frozenset test that would raise
+    a raw ``TypeError`` out of the error boundary.
     """
-    question_type = _safe_attr(q, "question_type")
-    if isinstance(question_type, str) and question_type in _SUPPORTED_TYPES:
+    if type(question_type) is str and question_type in _SUPPORTED_TYPES:
         return question_type
     return None
 
 
 def _safe_int(q: MetaculusQuestion, attribute: str) -> int | None:
-    """Read one integer identity field, or ``None`` if it is not an integer.
+    """Read one integer identity field, or ``None`` if it is not a usable id.
 
     The int gate is the no-echo guarantee for :class:`DeferralEvent`: a string in
     an id slot -- which could be a mistakenly stored credential -- is dropped
-    rather than carried. ``bool`` is excluded explicitly since it subclasses
-    ``int``, and a ``True`` identity is a defect rather than an id.
+    rather than carried. Exact ``type(value) is int`` rather than ``isinstance``:
+    it rejects ``bool`` (a ``True`` identity is a defect), an ``IntEnum`` (whose
+    repr embeds its class/member name), and any other ``int`` subclass with an
+    attacker-controlled ``__repr__``. A non-positive id is a defect, not an id.
     """
     value = _safe_attr(q, attribute)
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int or value <= 0:
         return None
     return value
 
 
-def _deferral_event(q: MetaculusQuestion) -> DeferralEvent:
-    """Describe a question deferred under D21. Reads identity only.
+def _deferral_event(q: MetaculusQuestion, question_type: object) -> DeferralEvent:
+    """Describe a question deferred under D21 from its already-read type.
 
-    No content field is touched, so a deferred question reaches no model and no
-    submission call -- and nothing that could carry a secret reaches the event.
+    Takes the single ``question_type`` read threaded from the caller so a stateful
+    getter cannot yield a different tag here than the one classification saw. Reads
+    identity only -- no content field is touched, so a deferred question reaches no
+    model and no submission call, and nothing that could carry a secret reaches the
+    event. ``DeferralEvent`` re-canonicalizes every field regardless (see events.py).
     """
-    tag = _type_tag(_safe_attr(q, "question_type"))
+    tag = _type_tag(question_type)
     return DeferralEvent(
         reason="deferred_v1_type" if tag != "unknown" else "unrecognized_type",
         question_type=tag,
@@ -218,23 +249,35 @@ def _common_fields(q: MetaculusQuestion) -> dict[str, Any]:
 def normalize_question(q: MetaculusQuestion) -> CanonicalQuestion:
     """Map one SDK question onto its canonical model.
 
-    Raises :class:`UnsupportedQuestionTypeError` for deferred types (D21) and
-    :class:`NormalizationError` if a supported type fails canonical validation.
+    Raises :class:`UnsupportedQuestionTypeError` for deferred types (D21),
+    :class:`NormalizationError` if a supported type fails canonical validation, and
+    :class:`NormalizationError` if ``question_type`` itself cannot be read.
 
     The singular path still *raises* on a deferred type, deliberately: it is the
     type-policy chokepoint, and "an unsupported question can never reach a model"
     is easiest to guarantee when this function cannot return one. Skipping with a
     diagnostic event is a batch policy and lives on :func:`normalize_questions`.
     """
-    question_type = _supported_type(q)
-    if question_type is None:
+    question_type = _read_question_type(q)
+    supported = _supported_type(question_type)
+    if supported is None:
         # Refused before any field is read, so an unsupported type can never
-        # reach a model or submission call (D21).
-        tag = _type_tag(_safe_attr(q, "question_type"))
+        # reach a model or submission call (D21). The tag is rendered from the same
+        # single read used for classification.
         raise UnsupportedQuestionTypeError(
-            f"question type {tag!r} is not supported in v1 (binary, multiple_choice, numeric only)"
+            f"question type {_type_tag(question_type)!r} is not supported in v1 "
+            "(binary, multiple_choice, numeric only)"
         )
+    return _build_canonical(q, supported)
 
+
+def _build_canonical(q: MetaculusQuestion, question_type: str) -> CanonicalQuestion:
+    """Construct the canonical model for an already-classified supported type.
+
+    Split out so the batch path (:func:`normalize_questions`) can build an accepted
+    question from the single ``question_type`` read it already has, rather than
+    re-reading it through :func:`normalize_question`.
+    """
     # Field reads are fenced separately from model construction: a TypeError raised
     # while building a canonical model is our bug, and must stay visible rather than
     # being reported as a malformed input record.
@@ -291,10 +334,11 @@ def normalize_questions(questions: list[MetaculusQuestion]) -> NormalizationResu
     batch's supported questions still normalize.
 
     **Everything else still aborts.** A *supported*-type question that fails
-    canonical validation, and a duplicate ``question_id``, both raise
-    :class:`NormalizationError`. D21 defers date and conditional questions; it does
-    not make malformed records survivable, and the stricter reading of an ambiguous
-    criterion is the project rule.
+    canonical validation, a duplicate ``question_id``, and a ``question_type`` that
+    cannot even be read (a failing getter -- a malformed record, not a deferrable
+    type) all raise :class:`NormalizationError`. D21 defers date and conditional
+    questions; it does not make malformed records survivable, and the stricter
+    reading of an ambiguous criterion is the project rule.
 
     ``question_id`` uniqueness (M1-202) is enforced over the **accepted** questions
     only. Group expansion is where that check earns its keep: every subquestion of a
@@ -310,8 +354,14 @@ def normalize_questions(questions: list[MetaculusQuestion]) -> NormalizationResu
     deferrals: list[DeferralEvent] = []
 
     for question in questions:
-        if _supported_type(question) is None:
-            event = _deferral_event(question)
+        # Read the type once: a getter that raises is a malformed record and aborts
+        # the batch (D21 defers unsupported *types*, it does not swallow malformed
+        # records), and threading the single read on avoids a stateful getter
+        # classifying and describing the same question inconsistently.
+        question_type = _read_question_type(question)
+        supported = _supported_type(question_type)
+        if supported is None:
+            event = _deferral_event(question, question_type)
             deferrals.append(event)
             # Logged inside the loop so deferrals stay visible even when a later
             # question aborts the batch. Interpolated into the message rather than
@@ -327,7 +377,7 @@ def normalize_questions(questions: list[MetaculusQuestion]) -> NormalizationResu
                 event.post_id,
             )
             continue
-        accepted.append(normalize_question(question))
+        accepted.append(_build_canonical(question, supported))
 
     seen: set[int] = set()
     duplicates = 0

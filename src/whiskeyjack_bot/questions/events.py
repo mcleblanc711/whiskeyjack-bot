@@ -19,7 +19,9 @@ without widening the no-echo surface the rest of the package maintains.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
+
+from forecasting_tools.data_models.questions import QuestionBasicType
 
 from whiskeyjack_bot.questions.model import CanonicalQuestion
 
@@ -30,6 +32,12 @@ from whiskeyjack_bot.questions.model import CanonicalQuestion
 # distinction is recoverable here without echoing the value.
 DeferralReason = Literal["deferred_v1_type", "unrecognized_type"]
 
+# The exact-type/membership sets ``__post_init__`` canonicalizes against. The SDK's
+# own six-value tag enum is the only vocabulary safe to name; anything else renders
+# as 'unknown'. ``frozenset`` so membership is a hash lookup, not a linear scan.
+_KNOWN_SDK_TYPES: frozenset[str] = frozenset(get_args(QuestionBasicType))
+_REASONS: frozenset[str] = frozenset(get_args(DeferralReason))
+
 
 @dataclass(frozen=True)
 class DeferralEvent:
@@ -39,9 +47,18 @@ class DeferralEvent:
     are ``None`` when the question object does not expose an integer there. They
     are carried at all -- unlike the duplicate-id error, which withholds ids --
     because an operator cannot act on "one question was deferred". The no-echo rule
-    guards against a credential surfacing through free-text field values; the
-    ``int`` gate in ``normalize._safe_int`` makes that impossible here by
-    construction rather than by promise.
+    guards against a credential surfacing through free-text field values.
+
+    The no-echo invariant is enforced here in ``__post_init__``, not only by the
+    ``normalize`` helpers that usually build the event: a frozen dataclass's field
+    annotations do not validate, so a value object exported from the package must
+    uphold the guarantee itself. ``__post_init__`` coerces every field to a safe,
+    module-owned value using **exact-type** checks -- ``type(x) is str``/``int``,
+    not ``isinstance`` -- because a ``str``/``int`` *subclass* (or an ``IntEnum``)
+    can carry attacker-controlled ``__str__``/``__repr__`` whose value slips past a
+    membership check and renders through the log or this dataclass's repr. Anything
+    that is not exactly the built-in type degrades to ``'unknown'``/``None``, so a
+    leak is impossible by construction rather than by promise.
     """
 
     reason: DeferralReason
@@ -49,6 +66,24 @@ class DeferralEvent:
     question_type: str
     question_id: int | None = None
     post_id: int | None = None
+
+    def __post_init__(self) -> None:
+        # Coerce, don't raise: a diagnostic value degrades to a safe placeholder the
+        # same way ids already drop to None, rather than turning a deferral into a
+        # crash. Exact-type checks so only a built-in str/int -- whose rendering can
+        # carry no attacker payload -- is ever kept.
+        if type(self.question_type) is not str or self.question_type not in _KNOWN_SDK_TYPES:
+            object.__setattr__(self, "question_type", "unknown")
+        if type(self.reason) is not str or self.reason not in _REASONS:
+            object.__setattr__(self, "reason", "unrecognized_type")
+        # An 'unknown' tag means the SDK never vouched for this record's type, so the
+        # reason must record that it was unrecognized rather than a routine deferral.
+        if self.question_type == "unknown":
+            object.__setattr__(self, "reason", "unrecognized_type")
+        for field in ("question_id", "post_id"):
+            value = getattr(self, field)
+            if value is not None and (type(value) is not int or value <= 0):
+                object.__setattr__(self, field, None)
 
 
 @dataclass(frozen=True)

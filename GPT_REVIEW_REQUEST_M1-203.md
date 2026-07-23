@@ -251,6 +251,45 @@ A–H is actually safe rather than merely plausible.
 
 ---
 
+# Round-2 addendum — both blocking findings addressed
+
+Round 1 returned **changes requested** on two blocking findings. Both were reproducible and are
+now fixed. Suite 332 → 336; all four gates pass (`pytest`, `ruff check`, `ruff format --check`,
+`mypy --strict src`). Please re-verify against the round-2 diff (`git diff
+origin/master...feat/m1-203-defer-unsupported-types`).
+
+**Finding 1 — subclass rendering bypassed the no-echo gate.** The `isinstance`-based "safe
+primitive" gates accepted subclasses. Fixed with **exact-type checks**:
+
+- `_type_tag` and `_supported_type` now use `type(x) is str` (was `isinstance`). A `str`
+  subclass — even one whose *value* is a known tag — falls through to the module-owned
+  `'unknown'` literal, so only a built-in `str`'s rendering (which carries no payload) runs. A
+  `str`-subclass valued `"binary"` is deferred as unknown rather than normalized (stricter
+  reading).
+- `_safe_int` now uses `type(v) is int` (was `isinstance ... and not bool`), which rejects
+  `bool`, `IntEnum`, and every `int` subclass in one test, plus a `v > 0` sanity bound.
+- **`DeferralEvent.__post_init__` now enforces the invariant on the exported dataclass itself**
+  (annotations do not validate), coercing every unsafe field to a safe module-owned value. It
+  **coerces rather than raises** — deliberately, matching how ids already degrade to `None` and
+  avoiding an events.py↔normalize.py circular import for a sanitized exception. If you still
+  read "drop the ids" as the stronger option, that remains a one-line change; the coercion makes
+  a leak impossible either way.
+
+**Finding 2 — `_safe_attr` on `question_type` hid malformed records.** A getter that *raised*
+was swallowed into an `unrecognized_type` deferral. Fixed with a dedicated `_read_question_type`
+that converts a failing getter into a constant-message `NormalizationError … from None` (aborting
+the batch, as a malformed record must), read **once** and threaded through classification, event
+creation and the error message. `_safe_attr` is now used only for the optional *identity* reads,
+exactly the scope you endorsed. `_build_canonical` was extracted so the batch path reuses the
+single read instead of re-reading through `normalize_question`.
+
+**New regression tests:** `str`-subclass tag (event + log + singular raise); `int`-subclass and
+`IntEnum` ids withheld; direct `DeferralEvent` construction coerced; and a raising
+`question_type` getter aborting as `NormalizationError` (asserted *not*
+`UnsupportedQuestionTypeError`).
+
+---
+
 # Full branch diff (`git diff origin/master...feat/m1-203-defer-unsupported-types`)
 
 ```diff

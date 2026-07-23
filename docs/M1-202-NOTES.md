@@ -282,3 +282,48 @@ exercise until the pipeline lands.
 
 The M1-202 bullet above saying a deferred subquestion "still aborts the whole batch … is
 M1-203" is left as written: these notes are a historical record, and this section supersedes it.
+
+### M1-203 round-2 — GPT cross-model review findings addressed
+
+GPT returned **changes requested** on two blocking findings, both against the *claimed*
+error-hygiene guarantees rather than the batch behaviour (which it accepted). Both were
+reproducible. Suite 332 → 336.
+
+**Finding 1 — `isinstance` gates accept subclasses with attacker-controlled rendering.**
+`_type_tag`'s `isinstance(x, str)` returned a `str` *subclass* unchanged (its value passes the
+`_KNOWN_SDK_TYPES` membership check while its `__str__`/`__repr__` renders anything), and
+`_safe_int`'s `isinstance(x, int)` accepted `int` subclasses and `IntEnum` (whose repr embeds
+its class/member name). GPT reproduced `PLANTED_SECRET` surfacing through both the WARNING log
+(`%s` → `__str__`) and `DeferralEvent`'s generated `__repr__`.
+
+Fix: **exact-type gates** — `type(x) is str` in `_type_tag`/`_supported_type`, `type(v) is int`
+(plus `v > 0`) in `_safe_int`. Anything not exactly the built-in type degrades to
+`'unknown'`/`None`, so only a built-in's rendering — which carries no payload — can ever run. A
+`str`-subclass valued `"binary"` is now deferred as unknown rather than normalized (stricter
+reading). And because field annotations do not validate an exported frozen dataclass, the
+invariant is now **enforced on `DeferralEvent` itself** in `__post_init__`, which coerces every
+unsafe field (subclass reason/tag, `IntEnum` id) to a safe module-owned value regardless of how
+the event was constructed — matching the "by construction, not by promise" line the event's own
+docstring already made.
+
+*Deviation / decision:* `__post_init__` **coerces** rather than **raises**. Coercion was chosen
+(owner-confirmed) because it matches how ids already degrade to `None`, keeps a diagnostic value
+from turning a deferral into a crash, and avoids events.py needing to own or lazy-import a
+sanitized exception to dodge the normalize↔events circular import.
+
+**Finding 2 — reading `question_type` through `_safe_attr` hid malformed records.**
+`_supported_type` read the type via `_safe_attr`, which swallows *all* exceptions → `None` → a
+`question_type` getter that *raises* was silently turned into an `unrecognized_type` deferral,
+hiding the defect and violating the rule that every malformed shape arrives as the module's own
+error. Fix: a dedicated `_read_question_type` reads the type once and converts a failing getter
+into a constant-message `NormalizationError … from None` (so the getter's exception, which can
+echo field values, surfaces in neither message nor traceback). The single read is threaded
+through classification, event creation and the error message — no double getter call, no
+inconsistent result from a stateful getter. Best-effort `_safe_attr` swallowing is now reserved
+for the optional *identity* reads only, exactly as GPT scoped it. Extracted `_build_canonical`
+so the batch path builds an accepted question from that same single read.
+
+Four regression tests added: `str`-subclass tag (event + log + singular raise all render
+`'unknown'`, no leak); `int`-subclass and `IntEnum` ids withheld; direct `DeferralEvent`
+construction coerced; and a raising `question_type` getter aborting as `NormalizationError`
+(asserted *not* `UnsupportedQuestionTypeError`, i.e. not silently deferred).

@@ -7,13 +7,14 @@ golden records are Codex's T-901; this suite covers the model + mapping only.
 """
 
 import dataclasses
+import enum
 import json
 import logging
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from forecasting_tools.data_models.data_organizer import DataOrganizer
@@ -23,6 +24,7 @@ from forecasting_tools.data_models.questions import (
     DiscreteQuestion,
     MetaculusQuestion,
     NumericQuestion,
+    QuestionBasicType,
 )
 from pydantic import ValidationError
 
@@ -32,6 +34,7 @@ from whiskeyjack_bot.questions import (
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestionAdapter,
+    DeferralEvent,
     NormalizationError,
     NormalizationResult,
     SourceCategory,
@@ -42,6 +45,10 @@ from whiskeyjack_bot.questions import (
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 API_POSTS = FIXTURES / "api_posts"
+
+# The SDK's own tag enum, used to prove a str subclass's *value* would pass a
+# membership gate even though its rendering is unvetted.
+_KNOWN_TAG_SET = frozenset(get_args(QuestionBasicType))
 
 
 def load_fixture_questions() -> list[MetaculusQuestion]:
@@ -774,6 +781,153 @@ def test_deferral_log_record_is_not_a_leak_vector() -> None:
     assert "91001" in payload["message"]
     assert "date" in payload["message"]
     assert PLANTED_SECRET not in rendered
+
+
+# --- subclass rendering / exact-type gates (GPT round-2 findings) -----------
+
+
+class _EvilStr(str):
+    """A ``str`` subclass whose value is vetted but whose rendering leaks.
+
+    ``isinstance(x, str)`` accepts it and a membership check passes on its value,
+    yet ``%s``/``repr`` invoke the overridden methods -- the exact bypass the
+    exact-type gates close.
+    """
+
+    def __repr__(self) -> str:
+        return PLANTED_SECRET
+
+    def __str__(self) -> str:
+        return PLANTED_SECRET
+
+
+class _EvilInt(int):
+    """An ``int`` subclass with the same attacker-controlled rendering."""
+
+    def __repr__(self) -> str:
+        return PLANTED_SECRET
+
+    def __str__(self) -> str:
+        return PLANTED_SECRET
+
+
+def test_str_subclass_tag_is_not_carried_into_event_or_log() -> None:
+    """A ``str`` subclass valued as a known tag renders 'unknown', not its payload.
+
+    Its value ``"date"`` would pass any membership check, but ``type() is str`` is
+    false, so the tag drops to the module-owned literal and the leaking ``__str__``/
+    ``__repr__`` never runs on a carried value -- in the event or the WARNING record.
+    """
+    tag = _EvilStr("date")
+    assert tag in _KNOWN_TAG_SET  # sanity: value alone would slip a membership gate
+
+    logger = logging.getLogger("whiskeyjack_bot.questions.normalize")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    try:
+        result = normalize_questions([fake_sdk_question(question_type=tag)])  # type: ignore[list-item]
+    finally:
+        logger.removeHandler(handler)
+
+    (event,) = result.deferrals
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert PLANTED_SECRET not in repr(event)
+
+    (record,) = [r for r in records if r.levelno == logging.WARNING]
+    assert PLANTED_SECRET not in JsonFormatter([]).format(record)
+
+    # The singular path renders the same 'unknown' and never echoes the payload.
+    with pytest.raises(UnsupportedQuestionTypeError) as excinfo:
+
+        class _EvilTag:
+            question_type = tag
+
+        normalize_question(_EvilTag())  # type: ignore[arg-type]
+    assert "unknown" in str(excinfo.value)
+    assert PLANTED_SECRET not in str(excinfo.value)
+    assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
+
+
+def test_int_subclass_and_intenum_ids_are_withheld() -> None:
+    """An ``int`` subclass or ``IntEnum`` in an id slot is dropped, not carried.
+
+    ``isinstance(x, int)`` accepts both; an ``IntEnum``'s repr embeds its class and
+    member name, and an ``int`` subclass can override rendering outright. Exact
+    ``type(v) is int`` rejects them, so ``question_id``/``post_id`` become ``None``.
+    """
+    secret_enum = enum.IntEnum("_QType", {PLANTED_SECRET: 91001})
+    member = secret_enum[PLANTED_SECRET]
+    assert PLANTED_SECRET in repr(member)  # sanity: the IntEnum leak vector is real
+
+    result = normalize_questions(
+        [
+            fake_sdk_question(  # type: ignore[list-item]
+                question_type="date",
+                id_of_question=_EvilInt(91001),
+                id_of_post=member,
+            )
+        ]
+    )
+
+    (event,) = result.deferrals
+    assert event.question_id is None
+    assert event.post_id is None
+    assert PLANTED_SECRET not in repr(event)
+
+
+def test_deferral_event_enforces_no_echo_on_direct_construction() -> None:
+    """The exported dataclass upholds the invariant itself, not only via helpers.
+
+    Field annotations do not validate, so ``__post_init__`` coerces every unsafe
+    field -- a ``str`` subclass reason/tag, an ``IntEnum`` id -- to a safe,
+    module-owned value regardless of how the event was built.
+    """
+    secret_enum = enum.IntEnum("_QType", {PLANTED_SECRET: 91001})
+
+    event = DeferralEvent(
+        reason=_EvilStr("deferred_v1_type"),  # type: ignore[arg-type]
+        question_type=_EvilStr("date"),
+        question_id=secret_enum[PLANTED_SECRET],
+        post_id=_EvilInt(90001),
+    )
+
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert event.question_id is None
+    assert event.post_id is None
+    assert PLANTED_SECRET not in repr(event)
+
+
+def test_unreadable_question_type_aborts_as_normalization_error() -> None:
+    """A ``question_type`` getter that raises is a malformed record, not a deferral.
+
+    Swallowing it into an 'unrecognized_type' deferral would hide the defect; the
+    project rule is that every malformed shape arrives as the module's own error.
+    The getter's exception can echo field values, so it must surface in neither the
+    message nor the traceback.
+    """
+
+    class _RaisingType:
+        id_of_question = 91001
+        id_of_post = 90001
+
+        @property
+        def question_type(self) -> str:
+            raise ValueError(PLANTED_SECRET)
+
+    for call in (
+        lambda: normalize_question(_RaisingType()),  # type: ignore[arg-type]
+        lambda: normalize_questions([_RaisingType()]),  # type: ignore[list-item]
+    ):
+        with pytest.raises(NormalizationError) as excinfo:
+            call()
+        # A malformed read must abort, not be classified as an unsupported type.
+        assert not isinstance(excinfo.value, UnsupportedQuestionTypeError)
+        assert PLANTED_SECRET not in str(excinfo.value)
+        assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
 
 
 def test_duplicate_check_ignores_deferred_questions() -> None:
