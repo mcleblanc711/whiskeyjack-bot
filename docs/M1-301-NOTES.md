@@ -211,3 +211,144 @@ churn in URL validation. That is why the validator here is deliberately minimal 
 `docs/backlog/backlog.csv` now records URL-validation policy as part of **M1-305**, alongside
 canonicalization — one place that owns the whole question, rather than a schema module growing a
 second-hand version of it.
+
+## M1-302 — AskNews adapter
+
+First producer of `ResearchDocument`s. Acceptance criteria: a mocked call returns
+normalized documents; missing credentials fail before a paid call.
+
+Delivered:
+- `src/whiskeyjack_bot/research/asknews.py` — `build_asknews_client()` (the one construction
+  point for the AskNews client) and `retrieve_news()`, returning a frozen `AskNewsRetrieval`
+  of `(run, documents, raw_responses)`.
+- `RetrievalProviderConfig` gained `timeout_seconds` and `retries`, on the shared provider
+  model so the Exa fallback (M1-303) inherits the same shape rather than inventing its own.
+- `asknews` declared as a direct dependency, with the matching pin test.
+
+### Deliberate choices
+
+**Rejected `forecasting_tools.AskNewsSearcher`.** The pinned SDK ships a wrapper, but
+`get_formatted_news()` returns one pre-formatted markdown string via `_format_articles()`,
+which discards exactly the article-level provenance this item exists to preserve. It also
+reads credentials from the environment itself (bypassing our config contract), hardcodes a
+12-second `asyncio.sleep`, and keeps an on-disk cache we do not control. We call
+`asknews_sdk` directly. This is a case where the maintained path was the wrong path.
+
+**Credential check is provably pre-network.** Verified against asknews==0.13.54 on
+2026-07-21: `AskNewsSDK(api_key=...)` performs no network I/O — it builds an `httpx.Client`
+and an `APIKey` auth object, and API-key mode skips the OAuth token round-trip entirely
+(`BaseAPIClient.__init__`, `security.APIKey`). That is what makes the missing-credential
+test meaningful rather than decorative, and it mirrors the claim already recorded for
+`metaculus/client.py`. Reused `MissingCredentialError` rather than defining a second
+identical error type.
+
+**API-key auth only.** The committed config declares a single `api_key_env`. AskNews also
+supports an OAuth `client_id`/`client_secret` pair, and the forecasting-tools wrapper
+prefers it; supporting both was deliberately not built, per the owner's confirmation that
+the account uses an API key. If that changes, it is a config change plus a branch in
+`build_asknews_client`, not a reshape.
+
+**Only the author's name is taken.** `asknews_sdk.dto.base.Author` also carries `email`.
+That is personal data with no forecasting value, so `_first_author_name()` reads `.name`
+and nothing else.
+
+**`cost_usd` left `None`.** AskNews reports usage as `Usage.credits` — an integer credit
+count, not currency, with no credit-to-USD rate configured. Converting would put an
+unearned number in a ledger whose entire purpose is attribution. The credit count survives
+inside `raw_responses`, so M1-306 (which owns cost capture) loses nothing.
+
+**Intra-run duplicate collapsing is constraint safety, not deduplication.** The current and
+historical passes overlap by design, and `research_documents` carries
+`UNIQUE (retrieval_run_id, canonical_url, content_sha256)`; without collapsing, a perfectly
+normal run would fail at write time. Cross-run dedup, canonicalization and provenance
+merging remain M1-305's. The comment in the code says so, so the two are not conflated later.
+
+**URL validation untouched.** M1-305 owns URL policy. Given rounds 4-6 of the M1-301 review
+were entirely regressions from extending that validator, this adapter sets
+`canonical_url == original_url` and adds no validation of its own.
+
+### Deviations and open questions for review
+
+**Content-hash source rule: `full_text` > `summary` > title.** Pinned in the module
+docstring because it defines document identity. The risk worth naming: AskNews's `summary`
+is LLM-generated and is not guaranteed byte-stable across calls, so an article with no
+`full_text` can hash differently on re-retrieval. This does not break M1-306 replay (replay
+reads saved responses and issues zero provider calls), but it does weaken cross-run dedup on
+`content_sha256` for summary-only articles. Preferring `full_text` minimizes the exposure.
+**M1-305 should decide** whether summary-derived hashes are acceptable dedup keys or whether
+such documents need a different identity rule.
+
+**Drop/collapse counts go in `error_summary`.** `ResearchRun` has no generic counter for
+articles dropped as unusable or collapsed as duplicates. The alternative was a migration
+`003` adding typed columns; that was judged more scope than this item warrants, and
+migration numbers are claimed globally across parallel branches. The string is assembled
+from integers only and never echoes a retrieved value. If M1-306 wants these queryable
+rather than greppable, the typed columns are the follow-up.
+
+### M1-302 review round 1 — four findings, all accepted
+
+Two P1, two P2. All four reproduced mechanically before any code changed; two turned out
+to differ materially from the report.
+
+**Finding 1 (P1) — provider text via pydantic serializer warnings. Accepted, narrower
+than reported.** The report characterized this as a live production leak. It is not: the
+SDK calls `SearchResponse.model_validate` on every response (`api/news.py:255`), and a
+*validated* response carrying the secret in every field emits **zero** warnings on
+`model_dump(mode="json")` — verified directly. The warning fires only for objects built
+via `model_construct`, which is a test-fixture shape the SDK never produces.
+
+The finding is still correct and still P1, for a different reason: **the leak test was
+blind to an entire egress channel.** It inspected `str(exc)` and the rendered traceback
+only. Warnings go to stderr and to captured logs, and the suite demonstrably printed
+`privateFAKE123456` into CI output. This is the same class of gap as M1-301's "plant the
+secret in every field", one level up — *every channel*, not just every field.
+
+Closed three ways rather than one, because the channel matters more than the instance:
+`model_dump(..., warnings=False)` at the source; the leak test now records and inspects
+warnings; and a scoped `filterwarnings = ["error:Pydantic serializer warnings:UserWarning"]`
+makes any such warning anywhere in the suite a failure. The scoping matters — an unscoped
+`error` would break on `asknews_sdk`'s unrelated `PydanticDeprecatedSince20`.
+
+**Finding 2 (P1) — partial paid retrievals discarded.** Fully confirmed and the most
+serious of the four. A run makes up to `max_queries_per_question * 2` billable calls, and
+the `raise ... from None` sat *inside* the loop, before `validate_run`. A failure on call
+7 destroyed the record of six calls that had already been paid for — the caller got
+neither a `ResearchRun` nor the accumulated raw responses, so M1-306 could not persist or
+replay that spend.
+
+This is exactly the failure mode `CLAUDE.md` names: a shortcut that weakens the ledger.
+The adapter now **never raises on provider failure**. It stops, sets `provider_failed`,
+records the failure in `error_summary`, and returns everything retrieved so far.
+`AskNewsRetrievalError` became unreachable and was deleted rather than left as a dead
+export.
+
+**Finding 3 (P2) — `error_summary` overloaded with routine bookkeeping.** Confirmed
+against the schema's own wording: "set when the run failed or returned nothing"
+(`research/model.py`). Because the current/historical passes overlap *by design*, nearly
+every successful run was being stamped with a non-null `error_summary` — which the
+fallback (M1-303) and validation (M1-504) logic will read as failure.
+
+Findings 2 and 3 resolve together, and that is the useful part: reclaiming `error_summary`
+for genuine failure is precisely what freed it to record the mid-run failure that finding 2
+needed somewhere to go. Drop and collapse counts moved onto the in-memory
+`AskNewsRetrieval` (`documents_dropped`, `duplicates_collapsed`), which this item owns and
+no schema constrains — no migration, and M1-306 decides whether they become columns.
+
+**Finding 4 (P2) — `retries` was a no-op.** Confirmed: asknews 0.13.54 stores the argument
+(`client.py:73`) and never reads it; the request path calls `httpx.Client.send()` directly
+(`client.py:266`). Fixable rather than removable, though — `AskNewsSDK` forwards `**kwargs`
+to the `httpx.Client` constructor, so `transport=httpx.HTTPTransport(retries=N)` makes the
+knob real. Verified the count reaches `_pool._retries`, and verified construction stays
+I/O-free under blocked socket + DNS so the item's safety property survives the change.
+
+Scope is documented precisely rather than overclaimed: httpx transport retries cover
+**connection failures only, not HTTP 5xx**. That is the safe kind for a metered API — a
+request that reached the server is never re-sent and cannot be billed twice.
+
+The old test asserted `client.client.retries == N` and passed against a value that did
+nothing. **A plumb-through test that asserts assignment rather than effect is worse than no
+test**, because it converts an unverified assumption into apparent evidence. It now reaches
+into the transport's connection pool.
+
+**Carried forward:** `provider_failed` is the signal M1-303 needs for "no silent provider
+switching"; `documents_dropped` / `duplicates_collapsed` are what M1-306 would persist.
