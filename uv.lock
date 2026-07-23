@@ -3436,7 +3436,9 @@ name = "whiskeyjack-bot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "asknews" },
     { name = "forecasting-tools" },
+    { name = "httpx" },
     { name = "idna" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -3453,7 +3455,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asknews", specifier = ">=0.13,<0.14" },
     { name = "forecasting-tools", specifier = "==0.2.92" },
+    { name = "httpx", specifier = ">=0.27,<1" },
     { name = "idna", specifier = ">=3.4,<4" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },

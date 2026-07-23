@@ -42,7 +42,7 @@ def raw_group_post() -> dict[str, Any]:
 
 
 def canonical_group() -> list[Any]:
-    return normalize_questions(unpack_group_post(raw_group_post()))
+    return list(normalize_questions(unpack_group_post(raw_group_post())).questions)
 
 
 # --- acceptance -------------------------------------------------------------
@@ -159,7 +159,7 @@ def test_group_parent_title_is_none_without_a_retained_payload() -> None:
     for question in questions:
         question.api_json = {}
 
-    for canonical in normalize_questions(questions):
+    for canonical in normalize_questions(questions).questions:
         assert canonical.question_ids_of_group
         assert canonical.group_parent_title is None
 
@@ -330,6 +330,14 @@ def test_deferred_subquestion_types_are_refused_by_normalize_not_unpack() -> Non
     questions = unpack_group_post(post)
     assert len(questions) == 3
 
+    # The batch defers it (M1-203) rather than aborting: the group's other two
+    # subquestions are forecastable and must survive their sibling's type.
+    result = normalize_questions(questions)
+    assert len(result.questions) == 2
+    assert len(result.deferrals) == 1
+    assert result.deferrals[0].question_type == "date"
+
+    # The singular path is still the chokepoint: it cannot return a deferred type.
     with pytest.raises(UnsupportedQuestionTypeError) as excinfo:
-        normalize_questions(questions)
+        normalize_question(questions[1])
     assert "date" in str(excinfo.value)
