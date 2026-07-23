@@ -245,6 +245,12 @@ def test_retries_do_not_disable_env_proxy_routing(
     """
     monkeypatch.setenv("ASKNEWS_API_KEY", FAKE_KEY)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:8080")
+    # Pin the routing inputs: a stray NO_PROXY/ALL_PROXY in the host environment
+    # could otherwise steer selection and make this pass or fail for the wrong
+    # reason. httpx routes via urllib.request.getproxies(), which reads these
+    # case-insensitively, so clear both cases. (GPT review round 4, non-blocking.)
+    for var in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
 
     client = build_asknews_client(config)
 
