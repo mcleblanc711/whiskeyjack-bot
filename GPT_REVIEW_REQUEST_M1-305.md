@@ -1,133 +1,76 @@
 # GPT cross-model review request — M1-305 (Deduplicate and freshness-tag evidence)
 
-You are a second model reviewing another model's code before merge. Be adversarial. The full
-branch diff vs `master` is appended verbatim at the end of this file.
+## ROLE
 
-## What M1-305 is
+You are a senior Python reviewer performing an adversarial cross-model review of code written by a
+different AI model, before it merges to `master`. Your job is to find defects, not to praise.
+Assume the author is fluent and confident — that is exactly when subtle errors hide. Prefer one
+confirmed, reproducible finding over ten speculative ones.
 
-Retrieval-epic item. Direct dependent of M1-301 (the research-evidence schema, merged), which
-**deliberately deferred** three things to this item and made it the owner of URL-validation
-**policy** beyond a minimal syntactic gate:
+## CONTEXT
 
-1. **URL canonicalization** — derive `canonical_url` from `original_url` so duplicate provider
-   reports of one artifact collapse. Feeds the ledger's
-   `UNIQUE(retrieval_run_id, canonical_url, content_sha256)`.
-2. **Freshness-tagging** — mark evidence outside a question-specific window, deterministically.
-3. **URL-validation policy consolidation** — see the regression history below.
+Project: whiskeyjack-bot, a Metaculus forecasting pipeline whose product is an immutable, replayable
+attribution ledger. Python 3.11, `src/` layout, pydantic v2 (strict, `extra="forbid"`),
+`mypy --strict`, ruff (line length 100). Append-only ledger; replayability is sacred; error messages
+must never echo stored/field/URL content (filesystem paths are the one carve-out); sanitizing raises
+use `from None`.
 
-**Acceptance criteria:** duplicate reports collapse without losing provenance; stale evidence is
-flagged deterministically.
+The change under review is backlog item **M1-305 — "Deduplicate and freshness-tag evidence."** It
+delivers three pure-primitive modules under `src/whiskeyjack_bot/research/` (`canonical.py`,
+`freshness.py`, `dedup.py`) plus one test module. It makes **NO schema change, NO migration, and
+adds NO dependency** (all deliberate). Acceptance criteria: (1) duplicate reports collapse without
+losing provenance; (2) stale evidence is flagged deterministically.
 
-## Hard constraints it had to honour
+## WHAT TO PRIORITISE (ranked)
 
-- No new runtime dependency, no `uv.lock` change, no new migration (PRs #7/#10 are open; #7 touches
-  the lock). Nothing here touches the DB.
-- CLAUDE.md error hygiene: module-owned sanitized error; messages never echo content
-  (URLs/field values/bodies); sanitizing raises use `from None`; paths are the only carve-out.
-- `from __future__ import annotations`, `mypy --strict`, pydantic v2 strict base / frozen
-  dataclasses, module-level `Literal` enums, line length 100, module docstring names the item.
-- Stricter reading of any ambiguity, and note it.
+1. **URL canonicalization correctness.** This module's predecessor (M1-301) took THREE consecutive
+   review regressions, each caused by the previous fix, all in URL handling: a blanket Unicode `Cf`
+   ban broke valid IDN hostnames; the IDNA check that replaced it broke IPv6 literals. The banked
+   rule: delegate to the authority (`idna`, `ipaddress`, `unicodedata`), never hand-roll, and verify
+   "still works" against the case that could falsify it.
+   - **PRIMARY TARGET:** `canonicalize_url()` normalizes hosts with `idna.encode(host, uts46=True)`,
+     but the schema gate it must round-trip through re-validates with STRICT `idna.encode(host)` (no
+     uts46). Find any host that survives the uts46 path, normalizes to an A-label, and is then
+     REJECTED by strict idna — i.e. a canonicalize output that fails `validate_document()`. A
+     concrete failing input is worth more than any prose finding.
+   - Percent-octet handling (uppercase-only, never decode), query-param splitting on raw `&`,
+     default-port/fragment/userinfo dropping, IPv6 compression + re-bracketing: any input where
+     these produce a wrong or non-round-tripping canonical form?
+2. **Dedup provenance preservation.** Key is `(canonical_url, content_sha256)` — the ledger's UNIQUE
+   minus `retrieval_run_id`. Is dropping the run id from the key ever wrong (could a caller collapse
+   rows the ledger should store separately)? Is the survivor-selection rule (`direct_api` >
+   `llm_reported`, then earliest `retrieved_at`, then first-seen) total and order-independent? Any
+   path where a reported claim displaces a fetched one?
+3. **Freshness determinism.** Confirm no module reads the wall clock. Check the boundary (dated
+   exactly at cutoff → fresh) for off-by-one, and the updated-else-published effective-date rule.
+4. **Error hygiene.** Confirm no raise across the three modules can leak an input-derived value —
+   including via `idna`/`urlsplit`/`ipaddress` exceptions that embed the offending value — and that
+   sanitizing raises use `from None`.
+5. **Convention/typing:** `mypy --strict` soundness, frozen dataclasses for value objects, `Literal`
+   enums, docstring naming the item.
 
-## Design and the deliberate choices (please pressure-test these)
+Do NOT invent scope: no schema/migration/dependency changes are wanted. Flag genuine gaps, but "you
+should have persisted freshness" or "you should add a migration" is out of scope by design
+(freshness is derived at forecast time; fail-vs-flag gating is a separate item, M1-504).
 
-Delivered as **three pure-primitive modules** under `src/whiskeyjack_bot/research/`
-(`canonical.py`, `freshness.py`, `dedup.py`) plus `tests/unit/test_dedup_freshness.py`, mirroring
-how `hashing.py::content_sha256` is a standalone primitive adapters call. **No schema change, no
-migration** — freshness is derived at forecast time from timestamps the schema already carries
-(there is no freshness column), so it is recomputed on replay, not persisted.
+## PROTOCOL
 
-### The URL-policy regression history — the #1 risk area
+Work in two passes. **Pass 1:** read every changed file end to end and build a model of the intended
+behaviour. **Pass 2:** for each candidate defect, construct a concrete input/state that triggers it
+and mentally execute the code to confirm the wrong output — discard anything you cannot make fail.
+Report only what survives pass 2, plus a short list of things you checked and cleared (so I can see
+coverage).
 
-This is the crux and where M1-301 bled. From `docs/M1-301-NOTES.md`, the URL validator took three
-consecutive review regressions, each introduced by the previous round's fix, all in URL handling:
+## OUTPUT FORMAT
 
-| Round | Fix applied | What it broke |
-|---|---|---|
-| 4 | Blanket Unicode `Cf` ban (stop invisible spoofing chars) | Rejected standards-valid IDN hostnames (`نامه‌ای.ir`); U+200C/U+200D are *required* in some labels |
-| 5 | `idna.encode()` on the hostname, replacing the ban | Rejected IPv6 literals (`https://[::1]/a`); `urlsplit().hostname` returns IP literals too |
-| 6 | `ipaddress.ip_address()` first, `idna` as fallback | — (clean) |
+- **Verdict:** APPROVE / APPROVE-WITH-NITS / DO-NOT-APPROVE.
+- **Findings**, most severe first. For each: severity (P1 blocking / P2 should-fix / P3 nit),
+  `file:line`, one-sentence claim, a concrete failing input or scenario, and the minimal fix.
+- **"Checked and cleared"** — 3–8 bullets of things you verified are correct (especially the idna
+  round-trip target above; say whether you found a failing host or confirmed there is none).
+- Keep rationale tight; no code dumps back to me beyond the minimal fix.
 
-Banked lessons: **delegate to the authority** (`unicodedata`, `idna`, `ipaddress`) rather than
-hand-roll; **speculative hardening beyond the reported finding is where the next finding comes
-from**; **verify a "still works" claim against the case that could falsify it**.
-
-How this item applied them, and what I want you to attack:
-
-- `canonicalize_url` **reuses `model._require_http_url` as its syntactic gate** (one definition of
-  "is this a URL", no second copy to drift). Host classification inside canonicalization branches
-  **exactly as `_require_resolvable_hostname`** — `ipaddress` first, `idna` (`uts46=True`) only for
-  what is not an IP literal.
-- Two **agreement tests** pin this: everything `validate_document` accepts, `canonicalize_url`
-  accepts (IDN/IPv6/IPv4 families); everything it rejects, `canonicalize_url` rejects as
-  `CanonicalizationError` (Cf/format-char, ZWNJ-out-of-context, space, malformed-IP). A third test
-  asserts canonicalize output **re-validates** as a `canonical_url` and is **idempotent**.
-- **Please falsify the round-trip claim specifically.** `canonicalize_url` uses
-  `idna.encode(host, uts46=True)`; the schema gate re-validates the punycode output with strict
-  `idna.encode(host)` (no uts46). Is there a host the uts46 path accepts and normalizes to an
-  A-label that strict `idna.encode` would then reject — i.e. a canonicalize output that fails
-  `validate_document`? The idempotence + revalidation tests cover the fixtures I thought of
-  (ZWNJ/ZWJ IDN, IPv6, IPv4, mixed-case IDN); look for a family they miss.
-- Conservative on purpose (the round-4 lesson): canonicalization **does not decode** percent-octets
-  (only uppercases hex), and **does not reorder or re-encode** query params. Is uppercasing
-  `%xx`→`%XX` ever wrong (e.g. inside an already-decoded segment)? Is splitting the raw query on `&`
-  and dropping tracking keys ever lossy for a non-tracking param (e.g. a param literally named
-  `utm_source` that is load-bearing — accepted risk, but call it if you see worse)?
-
-### Tracking-param stripping (owner-approved lossy step)
-
-Dedup keys on `canonical_url`, so two reports differing only by `utm_*`/`fbclid`/… never collapse
-unless stripped — that's the item's whole point. `_TRACKING_PARAMS` is a closed, documented
-`frozenset` matched case-insensitively against the percent-decoded key; every other param is
-preserved byte-for-byte in order. **Attack the allowlist**: any entry that is *not* purely a
-referrer/analytics tag and could select a resource? Any common tag missing that would defeat dedup?
-
-### Userinfo dropped from canonical URL
-
-Not resource identity, and keeps credentials out of the stored dedup key (secret hygiene);
-`original_url` preserves the as-retrieved URL. Agree/disagree?
-
-### Freshness
-
-- **Deterministic by construction**: `assess_freshness` is a pure function of caller-supplied
-  timestamps; **no module reads `datetime.now()`**. Caller derives the window with
-  `freshness_cutoff(reference, days)`.
-- Effective date = `updated_at` if present else `published_at`; `retrieved_at` deliberately unused.
-  **Is "updated overrides published even when older" correct?** I pinned it as the rule (updated is
-  the effective date whenever present); challenge if you think max(published, updated) is righter.
-- **Boundary inclusive at the cutoff** (dated exactly at cutoff → `fresh`). Documented as the
-  stricter-reading choice for a "last N days" window. Off-by-one worth checking.
-- **Undated → `stale`/`undatable`** (owner-approved stricter reading). `undatable` kept distinct
-  from `before_cutoff`. Right call, or does flagging undated evidence over-flag in practice?
-
-### Dedup / provenance preservation — the #2 risk area
-
-- Key = `(canonical_url, content_sha256)` — the ledger UNIQUE minus the run id; scope of a collapse
-  is the caller's input set. **Is dropping the run id from the key correct?** Rationale: within one
-  run it prevents a UNIQUE violation; across a question's runs it is what lets two providers that
-  both surfaced one article collapse (which is where "without losing provenance" bites — within one
-  run, provenance is uniform). Attack: could a caller collapse documents that the ledger would (and
-  should) store as distinct rows?
-- On collision the survivor carries the **stronger** provenance (`direct_api` > `llm_reported`);
-  ties break to earliest `retrieved_at_utc`, then first-seen. Is the merge total and
-  order-independent? Any way a reported claim displaces a fetched one, or vice-versa?
-- The survivor is one whole document; **non-key fields of the collapsed duplicate are discarded**
-  (e.g. a title/snippet the loser had). Is that "losing provenance"? My reading: `original_url` and
-  the stronger provenance are the provenance that matters, and the two are the same artifact by
-  hash. Push on this if you disagree.
-
-### Error hygiene
-
-`CanonicalizationError` is module-owned, constant message (`_BAD_URL`), never echoes the URL, always
-`from None`. A test plants a secret in a rejected URL and asserts absence + `__cause__ is None`.
-Confirm no raise in the three modules can leak an input-derived value (including via `idna`/
-`urlsplit`/`ipaddress` exceptions that embed the offending value).
-
-## Gate status
-
-`uv run pytest` → 418 passed; `ruff check .`, `ruff format --check .`, `mypy --strict src` all
-clean.
-
-## Full branch diff vs master
+The complete branch diff vs `master` follows.
 
 ```diff
 diff --git a/docs/M1-305-NOTES.md b/docs/M1-305-NOTES.md
