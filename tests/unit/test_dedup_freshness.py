@@ -307,6 +307,32 @@ def test_exact_tie_survivor_is_order_independent() -> None:
     assert forward.documents[0].title == backward.documents[0].title
 
 
+def test_dedup_survivor_is_replay_stable() -> None:
+    # Equal UTC instants that differ only in datetime.fold compare equal, so the
+    # tiebreak decides. fold is carried in memory but dropped by JSON/isoformat,
+    # so a tiebreak keyed on the in-memory form would pick a different survivor
+    # before vs after a store->replay round-trip. The canonical-JSON key must not.
+    body = _hash("one artifact, two records with different fold")
+    fold0 = datetime(2026, 7, 17, tzinfo=timezone.utc, fold=0)
+    fold1 = datetime(2026, 7, 17, tzinfo=timezone.utc, fold=1)
+    a = _document(retrieved_at_utc=fold0, snippet="A", content_sha256=body)
+    b = _document(retrieved_at_utc=fold1, snippet="B", content_sha256=body)
+
+    def survivor(docs: list[ResearchDocument]) -> str | None:
+        return deduplicate(docs).documents[0].snippet
+
+    def replayed(doc: ResearchDocument) -> ResearchDocument:
+        # Round-trip through the persisted JSON form, as the ledger + replay would.
+        return validate_document(doc.model_dump(mode="json"))
+
+    before = survivor([a, b])
+    after = survivor([replayed(a), replayed(b)])
+    assert before == after
+    # And it stays order-independent both before and after persistence.
+    assert survivor([b, a]) == before
+    assert survivor([replayed(b), replayed(a)]) == after
+
+
 def test_dedup_tiebreak_is_surrogate_safe() -> None:
     # A text field may hold an unpaired surrogate (schema-valid; e.g. from provider
     # JSON). The tiebreak must not raise on it -- model_dump_json() would, and would

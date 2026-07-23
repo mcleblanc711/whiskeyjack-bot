@@ -21,8 +21,8 @@ Three pure-primitive modules under `src/whiskeyjack_bot/research/`, mirroring ho
   `assess_document(doc, cutoff)`.
 - **`dedup.py`** — `dedup_key(doc)`, `deduplicate(docs) -> DedupResult`, `DedupResult` (frozen).
 
-Tests: `tests/unit/test_dedup_freshness.py` (47 cases). Full gate green — `pytest` 418 passed,
-`ruff check`, `ruff format --check`, `mypy --strict src` all clean.
+Tests: `tests/unit/test_dedup_freshness.py` (55 cases, after review rounds 1–3). Full gate green —
+`pytest` 426 passed, `ruff check`, `ruff format --check`, `mypy --strict src` all clean.
 
 ## Deliberate choices
 
@@ -97,8 +97,9 @@ Tests: `tests/unit/test_dedup_freshness.py` (47 cases). Full gate green — `pyt
   collapsed across runs, losing exactly that attribution — corrected in round 1; see below.) On an
   intra-run collision the survivor is the minimum over a **total** order — stronger provenance
   (`direct_api` > `llm_reported`, a defensive tiebreak since intra-run provenance is uniform today
-  but unenforced), then earliest `retrieved_at_utc`, then `repr(model_dump())` as an
-  arbitrary-but-total final tiebreak. That makes the survivor independent of
+  but unenforced), then earliest `retrieved_at_utc`, then a canonical JSON dump of
+  `model_dump(mode="json")` as a total, replay-stable final tiebreak. That makes the survivor
+  independent of
   input order and replay-stable (round 1 fix). First-seen order of survivors is preserved.
   `DedupResult.collapsed_count` is exposed so a future writer can record an auditable dedup counter,
   in the spirit of `ResearchRun.posts_dropped_no_url`.
@@ -151,7 +152,7 @@ found no failing host, so the canonicalization design stands.
   duplicates equal in provenance and `retrieved_at_utc` but differing in a non-key field (e.g.
   `title`) chose different survivors on reversed input. **Fix:** selection is now a min over a total
   order `(_PROVENANCE_RANK, retrieved_at_utc, <tiebreak>)`; the tiebreak is a full serialization —
-  see round 2 for why it became `repr(model_dump())`. Guarded by
+  see rounds 2 and 3 for how it became a canonical JSON dump. Guarded by
   `test_exact_tie_survivor_is_order_independent`.
 - **F3 (P2) — empty query segments were silently deleted.** `_strip_tracking` dropped empty
   `split("&")` entries and leading/trailing separators (`?x=1&&y=2` → `?x=1&y=2`), a second,
@@ -176,3 +177,25 @@ Re-review of the round-1 fixes: **F1 and F3 confirmed resolved**, **F2 not resol
   `test_dedup_tiebreak_is_surrogate_safe`. Rejecting surrogates at schema validation was rejected as
   the fix: it would touch the frozen `model.py` for a dedup-local problem, and the schema
   intentionally accepts arbitrary text — the primitive is what must be robust to it.
+
+## Cross-model review round 3 (2026-07-23)
+
+Re-review of the round-2 fix: **surrogate crash confirmed resolved**, but F2's total-order/
+replay-stability was **still not resolved**, with a new **P1**.
+
+- **F2 follow-on (P1) — the `repr` tiebreak was not replay-stable.** `repr(model_dump())` keys on the
+  **in-memory** Python form, which carries `datetime.fold`; the **persisted** form (JSON/`isoformat`)
+  drops it. Two same-key documents with equal UTC `retrieved_at_utc` but differing `fold` compare
+  equal (tying that component) yet produce different `repr` — so the survivor chosen in memory could
+  differ from the one a store→replay round-trip would pick, flipping the result. For a
+  replay-attribution ledger that is the class of bug that matters. Verified in repo: `_to_utc`
+  (`astimezone(UTC)`) does not normalize `fold`, so `fold=1` survives validation (reachable via
+  `retrieved_at_utc` and `published_at_utc`), and `repr(model_dump())` differs on it while
+  `model_dump(mode="json")` does not. **Fix:** the tiebreak now keys on the **canonical persisted
+  form** — `json.dumps(document.model_dump(mode="json"), ensure_ascii=True, sort_keys=True,
+  separators=(",", ":"))`. `mode="json"` renders exactly the stored form (fold-invariant), so the
+  survivor is the same before and after persistence; `ensure_ascii=True` keeps it surrogate-safe (it
+  escapes rather than UTF-8-encodes, so it does not raise); `sort_keys`/`separators` make it
+  canonical. Guarded by `test_dedup_survivor_is_replay_stable`.
+- **P3 nit — stale test counts.** The "Delivered" line still cited the round-0 numbers (47 cases /
+  418 total); corrected to the current 55 module cases / 426 total.

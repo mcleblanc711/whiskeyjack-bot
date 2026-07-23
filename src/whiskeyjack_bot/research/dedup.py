@@ -30,6 +30,7 @@ than drop them, and belongs to forecast assembly, not this dedup.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -64,28 +65,36 @@ def _sort_key(document: ResearchDocument) -> tuple[int, datetime, str]:
     """A total order over same-key documents, used to pick the survivor.
 
     Stronger provenance first, then the earliest ``retrieved_at_utc`` (the first
-    observation of the artifact), then the document's full Python-mode dump as an
-    arbitrary but total and replay-stable final tiebreak -- so the order is
-    independent of input order even when two duplicates differ only in a non-key
-    field such as ``title``.
+    observation of the artifact), then the document's **canonical persisted form**
+    as a total, replay-stable final tiebreak -- so the survivor is independent of
+    input order even when two duplicates differ only in a non-key field.
 
-    The tiebreak is ``repr(model_dump())``, **not** ``model_dump_json()``: a
-    schema-valid text field may hold an unpaired surrogate (``"\\ud800"``, e.g.
-    from provider JSON), and JSON serialization UTF-8-encodes, so
-    ``model_dump_json()`` *raises* ``PydanticSerializationError`` on it -- which
-    both breaks totality and, uncaught, echoes the offending character (cross-model
-    review round 2). ``model_dump()`` returns Python objects and never encodes, so
-    it cannot raise; ``repr`` renders such characters escaped, deterministically
-    (pydantic dumps fields in definition order), and the string is used only as an
-    internal sort key -- never placed in a message -- so nothing input-derived can
-    leak. Two ``repr`` strings always compare (Python orders by code point, and
-    surrogate code points compare fine); equal ``repr`` means equal content, where
-    the choice of survivor is immaterial.
+    The tiebreak keys on ``model_dump(mode="json")``, not the in-memory
+    ``model_dump()``/``repr``: the survivor must be the one a replay would pick,
+    and replay reconstructs documents from the ledger's JSON. The Python form
+    carries distinctions the persisted form drops -- notably ``datetime.fold``,
+    which is absent from ``isoformat`` -- so two timestamps that are equal but
+    differ in ``fold`` would order differently in memory yet identically after a
+    store->replay round-trip, flipping the survivor (cross-model review round 3).
+    ``mode="json"`` renders exactly the stored form, so before == after.
+
+    ``ensure_ascii=True`` escapes lone surrogates (a schema-valid text field may
+    hold ``"\\ud800"`` from provider JSON) instead of UTF-8-encoding them, so it
+    does not raise the way plain ``model_dump_json()`` did (round 2).
+    ``sort_keys``/``separators`` make the string canonical. It is total (equal
+    canonical JSON <=> equal persisted content, where the choice is immaterial),
+    comparison never raises (plain ASCII), and it is used only as an internal sort
+    key -- never in a message -- so nothing input-derived can leak.
     """
     return (
         _PROVENANCE_RANK[document.provenance],
         document.retrieved_at_utc,
-        repr(document.model_dump()),
+        json.dumps(
+            document.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     )
 
 
