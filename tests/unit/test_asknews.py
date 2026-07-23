@@ -229,30 +229,28 @@ def test_retries_do_not_disable_env_proxy_routing(
 ) -> None:
     """Applying retries must not cost HTTP(S)_PROXY routing. (GPT review round 2.)
 
-    The earlier fix injected `transport=httpx.HTTPTransport(retries=...)`. But
+    The round-2 fix injected `transport=httpx.HTTPTransport(retries=...)`. But
     `httpx.Client.__init__` computes `allow_env_proxies = trust_env and transport
     is None`, so any explicit transport silently drops env-proxy mounts -- a
     proxy-dependent deployment would lose AskNews connectivity, masked as an
     ordinary provider_failed fallback. Construction does no network I/O, so this
     stays under the socket guards; setting HTTPS_PROXY only wires up transports.
 
-    Guards the two things at once: an env proxy still produces a live mount, and
-    the configured retry count still reaches that mount's pool.
+    Asserts *routing*, via httpx's own selection path: the real AskNews endpoint
+    resolves to the proxy mount rather than the direct transport. Not retries --
+    a proxy pool's retry count is dead storage (httpcore's proxy connection takes
+    no per-connection retries), so asserting it here would prove nothing. Direct-
+    path retries are covered by test_retries_reach_the_actual_transport. (GPT
+    review round 3.)
     """
-    data = config.model_dump()
-    data["retrieval"]["primary"]["retries"] = 7
-    custom = validate_config_data(data)
     monkeypatch.setenv("ASKNEWS_API_KEY", FAKE_KEY)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:8080")
 
-    client = build_asknews_client(custom)
+    client = build_asknews_client(config)
 
-    mounts = client.client._client._mounts
-    proxy_mounts = [t for t in mounts.values() if t is not None]
-    assert proxy_mounts, "env proxy routing was dropped -- no proxy mount configured"
-    for transport in proxy_mounts:
-        assert isinstance(transport, httpx.HTTPTransport)
-        assert transport._pool._retries == 7
+    hc = client.client._client
+    selected = hc._transport_for_url(httpx.URL("https://api.asknews.app"))
+    assert selected is not hc._transport, "AskNews traffic did not route through the proxy mount"
 
 
 # --- the headline criterion: normalized documents ---------------------------

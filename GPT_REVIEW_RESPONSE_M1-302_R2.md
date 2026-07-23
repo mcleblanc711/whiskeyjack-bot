@@ -91,3 +91,36 @@ theory.
 Everything you accepted in round 2 is untouched: the partial-result contract, the revised
 `error_summary`, stop-on-first-failure, and the finding-1 validated-response reasoning. No
 other files changed.
+
+---
+
+# Round 3 — P2: retries on the proxy pool were dead storage
+
+**Confirmed exactly as reported.** `_apply_connection_retries` walked the mounts too and set
+`_pool._retries` on the proxy mount, but that value never reaches a connection:
+`httpcore.HTTPProxy.create_connection` builds `ForwardHTTPConnection`/`TunnelHTTPConnection`
+and threads **no** `retries` into either. So the proxy pool stored 7 while the tunneled
+connection used 0 — and my round-2 test asserted that 7, i.e. asserted dead storage. That is
+the exact plumb-through anti-pattern from round 1, finding 4, one layer down. Good catch.
+
+**Fix — direct-path only, and say so.**
+
+- `_apply_connection_retries` now sets `_pool._retries` on the **direct transport only**; the
+  mount loop is gone. Its docstring records why the proxy pool is deliberately skipped.
+- `build_asknews_client`'s docstring now scopes retries on two axes: *kind* (connection
+  failures, not 5xx) and *path* (direct connections only; a no-op on the proxied hop, accepted
+  M1-302 scope). Env-proxy **routing** — the thing that regressed in round 2 — stays intact.
+- The routing test no longer asserts retries. It now asserts routing through httpx's own
+  selection path, at the real endpoint:
+
+  ```python
+  selected = hc._transport_for_url(httpx.URL("https://api.asknews.app"))
+  assert selected is not hc._transport, "AskNews traffic did not route through the proxy mount"
+  ```
+
+  `https://api.asknews.app` is the SDK's actual `base_url` (verified). This is red against the
+  round-2 `transport=` implementation (selection falls back to the base transport) and green
+  after the fix. Direct-path retries remain covered by `test_retries_reach_the_actual_transport`.
+
+Gate: **356 passed**, ruff check/format clean, `mypy --strict` clean. Two files changed
+(`asknews.py`, `test_asknews.py`).
