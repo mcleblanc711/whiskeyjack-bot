@@ -205,11 +205,15 @@ def _deferral_event(q: MetaculusQuestion, question_type: object) -> DeferralEven
     identity only -- no content field is touched, so a deferred question reaches no
     model and no submission call, and nothing that could carry a secret reaches the
     event. ``DeferralEvent`` re-canonicalizes every field regardless (see events.py).
+
+    ``reason`` is not passed: the event derives it from the canonicalized type alone,
+    so reason/type coherence lives in one place. ``tag`` here is only ever a
+    known-unsupported type or 'unknown' (this runs after ``_supported_type`` returned
+    ``None``), which is exactly what the event maps to ``deferred_v1_type`` /
+    ``unrecognized_type`` respectively -- identical to the value it would derive.
     """
-    tag = _type_tag(question_type)
     return DeferralEvent(
-        reason="deferred_v1_type" if tag != "unknown" else "unrecognized_type",
-        question_type=tag,
+        question_type=_type_tag(question_type),
         question_id=_safe_int(q, "id_of_question"),
         post_id=_safe_int(q, "id_of_post"),
     )

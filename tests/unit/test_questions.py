@@ -901,6 +901,46 @@ def test_deferral_event_enforces_no_echo_on_direct_construction() -> None:
     assert PLANTED_SECRET not in repr(event)
 
 
+@pytest.mark.parametrize(
+    ("in_type", "in_reason", "out_type", "out_reason"),
+    [
+        # A KNOWN SDK type v1 does not support: kept, reason derived as a routine
+        # deferral -- regardless of the reason the constructor was handed.
+        ("date", "deferred_v1_type", "date", "deferred_v1_type"),
+        ("conditional", "deferred_v1_type", "conditional", "deferred_v1_type"),
+        ("discrete", "deferred_v1_type", "discrete", "deferred_v1_type"),
+        # Mismatch #1: a known deferred type mislabeled 'unrecognized_type' is
+        # corrected -- reason follows the type, not the caller.
+        ("date", "unrecognized_type", "date", "deferred_v1_type"),
+        # Mismatch #2: a *supported* type is never deferred, so naming one collapses
+        # the whole event to the unknown/unrecognized pair.
+        ("binary", "deferred_v1_type", "unknown", "unrecognized_type"),
+        ("multiple_choice", "deferred_v1_type", "unknown", "unrecognized_type"),
+        ("numeric", "unrecognized_type", "unknown", "unrecognized_type"),
+        # An unvetted tag the SDK never defined.
+        ("totally_made_up", "deferred_v1_type", "unknown", "unrecognized_type"),
+        ("unknown", "deferred_v1_type", "unknown", "unrecognized_type"),
+    ],
+)
+def test_deferral_event_reason_is_derived_from_type(
+    in_type: str, in_reason: str, out_type: str, out_reason: str
+) -> None:
+    """``reason`` follows the canonicalized type; a contradictory pair cannot survive.
+
+    The exported value object enforces its own invariant: a deferral describes a
+    known SDK type v1 does not support (``deferred_v1_type``), and anything else --
+    a supported type, which is never deferred, or an unvetted tag -- collapses to
+    ``question_type='unknown'``, ``reason='unrecognized_type'``. The constructor's
+    ``reason`` argument is not trusted.
+    """
+    event = DeferralEvent(
+        question_type=in_type,
+        reason=in_reason,  # type: ignore[arg-type]
+    )
+    assert event.question_type == out_type
+    assert event.reason == out_reason
+
+
 def test_unreadable_question_type_aborts_as_normalization_error() -> None:
     """A ``question_type`` getter that raises is a malformed record, not a deferral.
 
@@ -928,6 +968,102 @@ def test_unreadable_question_type_aborts_as_normalization_error() -> None:
         assert not isinstance(excinfo.value, UnsupportedQuestionTypeError)
         assert PLANTED_SECRET not in str(excinfo.value)
         assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
+
+
+class _CountingQuestionType:
+    """Wraps an SDK-shaped namespace, counting each ``question_type`` read.
+
+    A path that honors the read-once contract touches ``question_type`` exactly
+    once. A reintroduced *second* successful read is the regression this pins: the
+    second access raises, so it either surfaces as an error or (if swallowed on some
+    other path) changes the tag away from the one asserted -- either way the outcome
+    assertions fail. Every other attribute delegates to the wrapped namespace.
+    """
+
+    def __init__(self, namespace: SimpleNamespace, tag: str) -> None:
+        self._ns = namespace
+        self._tag = tag
+        self.reads = 0
+
+    @property
+    def question_type(self) -> str:
+        self.reads += 1
+        if self.reads > 1:
+            raise AssertionError("question_type read more than once")
+        return self._tag
+
+    def __getattr__(self, name: str) -> object:
+        # Only reached for names not set on the instance (``question_type`` is a
+        # class property, so it never lands here); ``_ns`` is set first in __init__.
+        return getattr(self._ns, name)
+
+
+def test_batch_path_reads_question_type_once_when_deferring() -> None:
+    """The batch defer path classifies and describes from a single read.
+
+    Threading the one read through ``_deferral_event`` (rather than re-reading it)
+    is what stops a stateful getter from classifying and describing the same
+    question inconsistently.
+    """
+    q = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="date")
+
+    result = normalize_questions([q])  # type: ignore[list-item]
+
+    (event,) = result.deferrals
+    assert not result.questions
+    assert event.question_type == "date"
+    assert event.reason == "deferred_v1_type"
+    assert event.question_id == 91001
+    assert event.post_id == 90001
+    assert q.reads == 1
+
+
+def test_batch_path_reads_question_type_once_when_accepting() -> None:
+    """The batch accept path builds the canonical model from a single read."""
+    q = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="binary")
+
+    result = normalize_questions([q])  # type: ignore[list-item]
+
+    (canonical,) = result.questions
+    assert not result.deferrals
+    assert isinstance(canonical, CanonicalBinaryQuestion)
+    assert q.reads == 1
+
+
+def test_singular_path_reads_question_type_once() -> None:
+    """``normalize_question`` reads the type once on both the accept and refuse paths."""
+    accepted = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="binary")
+    canonical = normalize_question(accepted)  # type: ignore[arg-type]
+    assert isinstance(canonical, CanonicalBinaryQuestion)
+    assert accepted.reads == 1
+
+    refused = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="date")
+    with pytest.raises(UnsupportedQuestionTypeError):
+        normalize_question(refused)  # type: ignore[arg-type]
+    assert refused.reads == 1
+
+
+@pytest.mark.parametrize("tag", [None, [], "totally_made_up"])
+def test_batch_defers_readable_but_unusable_type(tag: object) -> None:
+    """A readable-but-weird type defers; only a *raising* getter aborts the batch.
+
+    ``None``, an (unhashable) list, and a foreign built-in string are all read
+    without error, so they are deferred as ``unknown``/``unrecognized_type`` rather
+    than raising -- the distinction from
+    ``test_unreadable_question_type_aborts_as_normalization_error``, where the getter
+    itself raises. The list case also pins that the exact-type gate runs before the
+    frozenset membership test that would otherwise choke on an unhashable tag.
+    """
+    q = SimpleNamespace(question_type=tag, id_of_question=91001, id_of_post=90001)
+
+    result = normalize_questions([q])  # type: ignore[list-item]
+
+    (event,) = result.deferrals
+    assert not result.questions
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert event.question_id == 91001
+    assert event.post_id == 90001
 
 
 def test_duplicate_check_ignores_deferred_questions() -> None:
