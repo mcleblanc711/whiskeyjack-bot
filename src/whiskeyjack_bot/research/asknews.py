@@ -114,26 +114,53 @@ def build_asknews_client(config: AppConfig) -> AskNewsSDK:
     unset or empty, before any network use and therefore before any billable
     call. An empty string counts as missing.
 
-    Retries are applied by injecting an ``httpx`` transport rather than by
-    passing ``retries=`` to the SDK: asknews 0.13.54 stores that argument
-    (``client.py:73``) and never reads it — the request path calls
-    ``httpx.Client.send()`` directly (``client.py:266``) — so the SDK argument is
-    a no-op. Note the scope precisely: an ``httpx`` transport retries
-    **connection failures only**, not HTTP 5xx. That is the safe kind for a
-    metered API, because a request that reached the server is never re-sent and
+    Retries cannot be applied via ``retries=`` on the SDK: asknews 0.13.54 stores
+    that argument (``client.py:73``) and never reads it — the request path calls
+    ``httpx.Client.send()`` directly (``client.py:266``) — so it is a no-op. Nor
+    can they be applied by passing ``transport=httpx.HTTPTransport(retries=...)``:
+    ``httpx.Client.__init__`` computes ``allow_env_proxies = trust_env and
+    transport is None`` (httpx 0.28), so any explicit transport silently drops
+    ``HTTP(S)_PROXY`` routing — a proxy-dependent deployment would lose AskNews
+    connectivity, surfaced only as an ordinary ``provider_failed`` fallback.
+
+    So we build the SDK normally (env proxies preserved) and set the retry count
+    on the resulting connection pool(s) afterwards; see
+    :func:`_apply_connection_retries`. Scope, precisely: an ``httpx`` transport
+    retries **connection failures only**, not HTTP 5xx. That is the safe kind for
+    a metered API, because a request that reached the server is never re-sent and
     so cannot be billed twice.
     """
     provider = config.retrieval.primary
     api_key = os.environ.get(provider.api_key_env)
     if not api_key:
         raise MissingCredentialError(provider.api_key_env)
-    return AskNewsSDK(
+    sdk = AskNewsSDK(
         api_key=api_key,
         scopes={"news"},
         timeout=provider.timeout_seconds,
-        # Forwarded to the httpx.Client constructor via the SDK's **kwargs.
-        transport=httpx.HTTPTransport(retries=provider.retries),
     )
+    _apply_connection_retries(sdk.client._client, provider.retries)
+    return sdk
+
+
+def _apply_connection_retries(http_client: httpx.Client, retries: int) -> None:
+    """Set connection-failure retries on an already-built httpx client's pools.
+
+    Applied post-construction rather than via ``transport=``: passing a transport
+    to ``httpx.Client`` forces ``allow_env_proxies=False`` (``Client.__init__``,
+    httpx 0.28), which drops ``HTTP(S)_PROXY`` routing entirely. Building the
+    client normally keeps the env-proxy mounts, and we walk the default transport
+    plus every mount to set the retry count. httpcore reads ``_pool._retries``
+    when it lazily creates each connection (``ConnectionPool.create_connection``
+    → ``HTTPConnection(retries=self._retries, ...)``), which happens on the first
+    request — after this runs — so the assignment takes effect. Only
+    ``httpx.HTTPTransport`` exposes a pool with ``_retries``; in this httpx version
+    proxy mounts are themselves ``HTTPTransport``, so they receive it too.
+    """
+    for transport in (http_client._transport, *http_client._mounts.values()):
+        pool = getattr(transport, "_pool", None)
+        if pool is not None:
+            pool._retries = retries
 
 
 def _hash_source(article: Any) -> str:
