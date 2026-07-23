@@ -129,3 +129,27 @@ def test_missing_prompt_file_is_reported(
     report = verify_environment(bad)
     assert report.exit_code == EXIT_ENV_MISSING
     assert any("prompt_path" in p for p in report.filesystem_problems)
+    # One problem, not two: the version check is skipped when the file is absent.
+    assert len(report.filesystem_problems) == 1
+
+
+def test_prompt_version_mismatch_is_reported(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-401: prompt/config version drift is caught before a run, not at the
+    first forecast, when the wrong version would already have been recorded."""
+    set_all_env(monkeypatch)
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["forecast"]["prompt_version"] = "9.9.9"
+    bad = tmp_path / "version-drift.yaml"
+    bad.write_text(yaml.safe_dump(data), encoding="utf-8")
+    report = verify_environment(bad)
+    assert report.exit_code == EXIT_ENV_MISSING
+    assert any("prompt_version" in p for p in report.filesystem_problems)
+
+
+def test_matching_prompt_version_passes(config_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    set_all_env(monkeypatch)
+    report = verify_environment(config_file)
+    assert report.exit_code == EXIT_OK
+    assert any("declares version" in c for c in report.checks_passed)

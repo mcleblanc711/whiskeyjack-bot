@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from whiskeyjack_bot.config import AppConfig, ConfigError, load_config
+from whiskeyjack_bot.prompt import PromptError, load_prompt
 
 EXIT_OK = 0
 EXIT_CONFIG_INVALID = 2
@@ -84,6 +85,27 @@ def _verify_referenced_files(config: AppConfig, report: VerificationReport) -> N
             report.filesystem_problems.append(f"{label} does not exist: {path}")
 
 
+def _verify_prompt_version(config: AppConfig, report: VerificationReport) -> None:
+    """Cross-check the prompt's declared version against config (M1-401).
+
+    Catches prompt/config drift before a run rather than at the first forecast,
+    when the mismatched version would already have been recorded. Skipped when
+    the file is missing so that case reports one problem, not two.
+    """
+    path = config.forecast.prompt_path
+    if not path.is_file():
+        return
+    try:
+        loaded = load_prompt(path, config.forecast.prompt_version)
+    except PromptError as exc:
+        # PromptError is already sanitized; it never echoes prompt contents.
+        report.filesystem_problems.append(str(exc))
+        return
+    report.checks_passed.append(
+        f"forecast.prompt_path declares version {loaded.version} (sha256 {loaded.sha256[:12]}…)"
+    )
+
+
 def _verify_env_vars(config: AppConfig, report: VerificationReport) -> None:
     for name in config.secret_env_var_names():
         # Presence and non-emptiness only; the value itself is not retained.
@@ -103,5 +125,6 @@ def verify_environment(config_path: Path | str) -> VerificationReport:
     report.checks_passed.append(f"config valid: {config_path}")
     _verify_directories(config, report)
     _verify_referenced_files(config, report)
+    _verify_prompt_version(config, report)
     _verify_env_vars(config, report)
     return report
