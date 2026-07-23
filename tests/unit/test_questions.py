@@ -6,12 +6,15 @@ question can never reach a model or submission call. Comprehensive valid/invalid
 golden records are Codex's T-901; this suite covers the model + mapping only.
 """
 
+import dataclasses
+import enum
 import json
+import logging
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from forecasting_tools.data_models.data_organizer import DataOrganizer
@@ -21,15 +24,19 @@ from forecasting_tools.data_models.questions import (
     DiscreteQuestion,
     MetaculusQuestion,
     NumericQuestion,
+    QuestionBasicType,
 )
 from pydantic import ValidationError
 
+from whiskeyjack_bot.logging_setup import JsonFormatter
 from whiskeyjack_bot.questions import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestionAdapter,
+    DeferralEvent,
     NormalizationError,
+    NormalizationResult,
     SourceCategory,
     UnsupportedQuestionTypeError,
     normalize_question,
@@ -38,6 +45,10 @@ from whiskeyjack_bot.questions import (
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 API_POSTS = FIXTURES / "api_posts"
+
+# The SDK's own tag enum, used to prove a str subclass's *value* would pass a
+# membership gate even though its rendering is unvetted.
+_KNOWN_TAG_SET = frozenset(get_args(QuestionBasicType))
 
 
 def load_fixture_questions() -> list[MetaculusQuestion]:
@@ -53,11 +64,11 @@ def raw_post(name: str) -> dict[str, Any]:
 
 
 def normalized_by_type() -> dict[str, Any]:
-    return {q.qtype: q for q in normalize_questions(load_fixture_questions())}
+    return {q.qtype: q for q in normalize_questions(load_fixture_questions()).questions}
 
 
 def test_fixtures_normalize_to_expected_canonical_types() -> None:
-    canonical = normalize_questions(load_fixture_questions())
+    canonical = normalize_questions(load_fixture_questions()).questions
     assert {type(q) for q in canonical} == {
         CanonicalBinaryQuestion,
         CanonicalMultipleChoiceQuestion,
@@ -138,7 +149,7 @@ def test_numeric_bounds_preserved() -> None:
 
 
 def test_canonical_questions_round_trip_through_the_union_adapter() -> None:
-    for canonical in normalize_questions(load_fixture_questions()):
+    for canonical in normalize_questions(load_fixture_questions()).questions:
         restored = CanonicalQuestionAdapter.validate_python(canonical.model_dump())
         assert restored == canonical
         assert type(restored) is type(canonical)
@@ -484,9 +495,32 @@ def test_unsupported_error_is_a_normalization_error() -> None:
     assert issubclass(UnsupportedQuestionTypeError, NormalizationError)
 
 
-def test_normalize_questions_propagates_the_first_failure() -> None:
-    with pytest.raises(UnsupportedQuestionTypeError):
-        normalize_questions([*load_fixture_questions(), _synthetic_date_question()])
+def test_a_deferred_type_does_not_abort_the_batch() -> None:
+    """One deferred question no longer discards the batch it arrived in (M1-203).
+
+    Before M1-203 the batch propagated the first failure, so a single date question
+    in a tournament pull threw away the normalization of every supported question
+    fetched alongside it.
+    """
+    result = normalize_questions([*load_fixture_questions(), _synthetic_date_question()])
+
+    assert len(result.questions) == 3
+    assert len(result.deferrals) == 1
+    assert result.deferrals[0].question_type == "date"
+    assert result.deferrals[0].reason == "deferred_v1_type"
+
+
+def test_a_malformed_supported_question_still_aborts_the_batch() -> None:
+    """D21 defers date and conditional; it does not make malformed records survivable.
+
+    The stricter reading of the M1-203 criterion: only a deferred *type* is skipped.
+    A numeric question missing the bounds its own type declares is a real defect, and
+    silently dropping it would hide it behind a diagnostic that says "deferred".
+    """
+    malformed = fake_sdk_question(question_type="numeric")
+
+    with pytest.raises(NormalizationError, match="does not expose the fields"):
+        normalize_questions([_synthetic_date_question(), malformed])
 
 
 # --- schema integrity: finite floats ----------------------------------------
@@ -587,3 +621,469 @@ def test_option_validation_errors_never_echo_the_labels() -> None:
         )
     assert PLANTED_SECRET not in str(excinfo.value)
     assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
+
+
+# --- deferral events (M1-203) -----------------------------------------------
+
+# Every attribute normalize reads for *content*, as opposed to identity. The
+# deferral path may read id_of_question/id_of_post; touching anything here means a
+# deferred question got further into normalization than D21 allows.
+_CONTENT_ATTRS = (
+    "page_url",
+    "question_text",
+    "background_info",
+    "resolution_criteria",
+    "fine_print",
+    "unit_of_measure",
+    "open_time",
+    "close_time",
+    "scheduled_resolution_time",
+    "tournament_slugs",
+    "question_weight",
+    "categories",
+    "group_question_option",
+    "question_ids_of_group",
+    "api_json",
+    "options",
+    "option_is_instance_of",
+    "lower_bound",
+    "upper_bound",
+    "open_lower_bound",
+    "open_upper_bound",
+    "zero_point",
+    "cdf_size",
+    "nominal_lower_bound",
+    "nominal_upper_bound",
+)
+
+
+class _ContentFieldRead(BaseException):
+    """Raised by a tripwire attribute. Deliberately **not** an ``Exception``.
+
+    ``normalize._safe_attr`` swallows ``Exception`` by design, so a tripwire raising
+    ``AssertionError`` would be caught and the test would pass vacuously the moment
+    someone routed a content read through that helper. Deriving from
+    ``BaseException`` puts the tripwire outside every ``except Exception`` in the
+    module under test, which is the only way it can actually fail the build.
+    """
+
+
+def tripwire_question(tag: object) -> object:
+    """A question whose every content attribute raises when read.
+
+    The explicit form of a guarantee the ``_OnlyTag`` tests hold only by accident:
+    an object exposing just a tag proves "nothing crashed", not "nothing was read".
+    Here identity is readable and content is armed, so the distinction is tested
+    rather than assumed.
+    """
+
+    def _boom(self: object) -> object:
+        raise _ContentFieldRead("normalization read a content field of a deferred question")
+
+    namespace: dict[str, object] = {
+        "question_type": tag,
+        "id_of_question": 91001,
+        "id_of_post": 90001,
+    }
+    for name in _CONTENT_ATTRS:
+        namespace[name] = property(_boom)
+    return type("_Tripwire", (), namespace)()
+
+
+def test_deferral_carries_integer_identity() -> None:
+    """An operator cannot act on "one question was deferred"; the event says which."""
+    result = normalize_questions([fake_sdk_question(question_type="date")])  # type: ignore[list-item]
+
+    assert len(result.questions) == 0
+    (event,) = result.deferrals
+    assert event.question_id == 91001
+    assert event.post_id == 90001
+
+
+def test_deferral_withholds_non_integer_identity() -> None:
+    """The int gate is what makes carrying identity safe under the no-echo rule.
+
+    A credential mistakenly stored in an id slot is dropped rather than carried, so
+    the event holds no unvetted string by construction rather than by promise.
+    """
+    result = normalize_questions(
+        [
+            fake_sdk_question(  # type: ignore[list-item]
+                question_type="date",
+                id_of_question=PLANTED_SECRET,
+                id_of_post=PLANTED_SECRET,
+            )
+        ]
+    )
+
+    (event,) = result.deferrals
+    assert event.question_id is None
+    assert event.post_id is None
+    assert PLANTED_SECRET not in repr(event)
+
+
+def test_deferral_event_names_only_known_sdk_types() -> None:
+    """Same gate as the error message, and the reason records that it fired.
+
+    Collapsing an unvetted tag to 'unknown' would otherwise erase the difference
+    between a type the SDK defines and something arbitrary in the tag slot.
+    """
+
+    class _ForeignTag:
+        question_type = PLANTED_SECRET
+        id_of_question = 91001
+        id_of_post = 90001
+
+    result = normalize_questions([_ForeignTag()])  # type: ignore[list-item]
+
+    (event,) = result.deferrals
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert PLANTED_SECRET not in repr(event)
+
+
+def test_deferral_reads_no_content_field() -> None:
+    """Zero model and zero submission calls, enforced at the field-access level."""
+    result = normalize_questions([tripwire_question("date")])  # type: ignore[list-item]
+
+    assert len(result.questions) == 0
+    assert result.deferrals[0].question_type == "date"
+
+
+def test_deferral_log_record_is_not_a_leak_vector() -> None:
+    """The event is logged, and the rendered record carries no question content.
+
+    Rendered through the real ``JsonFormatter`` rather than asserting on
+    ``caplog.text``: the formatter is what production writes, and the values are
+    interpolated into the message precisely because that field is redacted.
+    """
+    question = fake_sdk_question(
+        question_type="date",
+        resolution_criteria=PLANTED_SECRET,
+        question_text=PLANTED_SECRET,
+    )
+
+    logger = logging.getLogger("whiskeyjack_bot.questions.normalize")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    try:
+        normalize_questions([question])  # type: ignore[list-item]
+    finally:
+        logger.removeHandler(handler)
+
+    (record,) = [r for r in records if r.levelno == logging.WARNING]
+    rendered = JsonFormatter([]).format(record)
+    payload = json.loads(rendered)
+
+    assert payload["level"] == "WARNING"
+    assert "91001" in payload["message"]
+    assert "date" in payload["message"]
+    assert PLANTED_SECRET not in rendered
+
+
+# --- subclass rendering / exact-type gates (GPT round-2 findings) -----------
+
+
+class _EvilStr(str):
+    """A ``str`` subclass whose value is vetted but whose rendering leaks.
+
+    ``isinstance(x, str)`` accepts it and a membership check passes on its value,
+    yet ``%s``/``repr`` invoke the overridden methods -- the exact bypass the
+    exact-type gates close.
+    """
+
+    def __repr__(self) -> str:
+        return PLANTED_SECRET
+
+    def __str__(self) -> str:
+        return PLANTED_SECRET
+
+
+class _EvilInt(int):
+    """An ``int`` subclass with the same attacker-controlled rendering."""
+
+    def __repr__(self) -> str:
+        return PLANTED_SECRET
+
+    def __str__(self) -> str:
+        return PLANTED_SECRET
+
+
+def test_str_subclass_tag_is_not_carried_into_event_or_log() -> None:
+    """A ``str`` subclass valued as a known tag renders 'unknown', not its payload.
+
+    Its value ``"date"`` would pass any membership check, but ``type() is str`` is
+    false, so the tag drops to the module-owned literal and the leaking ``__str__``/
+    ``__repr__`` never runs on a carried value -- in the event or the WARNING record.
+    """
+    tag = _EvilStr("date")
+    assert tag in _KNOWN_TAG_SET  # sanity: value alone would slip a membership gate
+
+    logger = logging.getLogger("whiskeyjack_bot.questions.normalize")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    try:
+        result = normalize_questions([fake_sdk_question(question_type=tag)])  # type: ignore[list-item]
+    finally:
+        logger.removeHandler(handler)
+
+    (event,) = result.deferrals
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert PLANTED_SECRET not in repr(event)
+
+    (record,) = [r for r in records if r.levelno == logging.WARNING]
+    assert PLANTED_SECRET not in JsonFormatter([]).format(record)
+
+    # The singular path renders the same 'unknown' and never echoes the payload.
+    with pytest.raises(UnsupportedQuestionTypeError) as excinfo:
+
+        class _EvilTag:
+            question_type = tag
+
+        normalize_question(_EvilTag())  # type: ignore[arg-type]
+    assert "unknown" in str(excinfo.value)
+    assert PLANTED_SECRET not in str(excinfo.value)
+    assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
+
+
+def test_int_subclass_and_intenum_ids_are_withheld() -> None:
+    """An ``int`` subclass or ``IntEnum`` in an id slot is dropped, not carried.
+
+    ``isinstance(x, int)`` accepts both; an ``IntEnum``'s repr embeds its class and
+    member name, and an ``int`` subclass can override rendering outright. Exact
+    ``type(v) is int`` rejects them, so ``question_id``/``post_id`` become ``None``.
+    """
+    secret_enum = enum.IntEnum("_QType", {PLANTED_SECRET: 91001})
+    member = secret_enum[PLANTED_SECRET]
+    assert PLANTED_SECRET in repr(member)  # sanity: the IntEnum leak vector is real
+
+    result = normalize_questions(
+        [
+            fake_sdk_question(  # type: ignore[list-item]
+                question_type="date",
+                id_of_question=_EvilInt(91001),
+                id_of_post=member,
+            )
+        ]
+    )
+
+    (event,) = result.deferrals
+    assert event.question_id is None
+    assert event.post_id is None
+    assert PLANTED_SECRET not in repr(event)
+
+
+def test_deferral_event_enforces_no_echo_on_direct_construction() -> None:
+    """The exported dataclass upholds the invariant itself, not only via helpers.
+
+    Field annotations do not validate, so ``__post_init__`` coerces every unsafe
+    field -- a ``str`` subclass reason/tag, an ``IntEnum`` id -- to a safe,
+    module-owned value regardless of how the event was built.
+    """
+    secret_enum = enum.IntEnum("_QType", {PLANTED_SECRET: 91001})
+
+    event = DeferralEvent(
+        reason=_EvilStr("deferred_v1_type"),  # type: ignore[arg-type]
+        question_type=_EvilStr("date"),
+        question_id=secret_enum[PLANTED_SECRET],
+        post_id=_EvilInt(90001),
+    )
+
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert event.question_id is None
+    assert event.post_id is None
+    assert PLANTED_SECRET not in repr(event)
+
+
+@pytest.mark.parametrize(
+    ("in_type", "in_reason", "out_type", "out_reason"),
+    [
+        # A KNOWN SDK type v1 does not support: kept, reason derived as a routine
+        # deferral -- regardless of the reason the constructor was handed.
+        ("date", "deferred_v1_type", "date", "deferred_v1_type"),
+        ("conditional", "deferred_v1_type", "conditional", "deferred_v1_type"),
+        ("discrete", "deferred_v1_type", "discrete", "deferred_v1_type"),
+        # Mismatch #1: a known deferred type mislabeled 'unrecognized_type' is
+        # corrected -- reason follows the type, not the caller.
+        ("date", "unrecognized_type", "date", "deferred_v1_type"),
+        # Mismatch #2: a *supported* type is never deferred, so naming one collapses
+        # the whole event to the unknown/unrecognized pair.
+        ("binary", "deferred_v1_type", "unknown", "unrecognized_type"),
+        ("multiple_choice", "deferred_v1_type", "unknown", "unrecognized_type"),
+        ("numeric", "unrecognized_type", "unknown", "unrecognized_type"),
+        # An unvetted tag the SDK never defined.
+        ("totally_made_up", "deferred_v1_type", "unknown", "unrecognized_type"),
+        ("unknown", "deferred_v1_type", "unknown", "unrecognized_type"),
+    ],
+)
+def test_deferral_event_reason_is_derived_from_type(
+    in_type: str, in_reason: str, out_type: str, out_reason: str
+) -> None:
+    """``reason`` follows the canonicalized type; a contradictory pair cannot survive.
+
+    The exported value object enforces its own invariant: a deferral describes a
+    known SDK type v1 does not support (``deferred_v1_type``), and anything else --
+    a supported type, which is never deferred, or an unvetted tag -- collapses to
+    ``question_type='unknown'``, ``reason='unrecognized_type'``. The constructor's
+    ``reason`` argument is not trusted.
+    """
+    event = DeferralEvent(
+        question_type=in_type,
+        reason=in_reason,  # type: ignore[arg-type]
+    )
+    assert event.question_type == out_type
+    assert event.reason == out_reason
+
+
+def test_unreadable_question_type_aborts_as_normalization_error() -> None:
+    """A ``question_type`` getter that raises is a malformed record, not a deferral.
+
+    Swallowing it into an 'unrecognized_type' deferral would hide the defect; the
+    project rule is that every malformed shape arrives as the module's own error.
+    The getter's exception can echo field values, so it must surface in neither the
+    message nor the traceback.
+    """
+
+    class _RaisingType:
+        id_of_question = 91001
+        id_of_post = 90001
+
+        @property
+        def question_type(self) -> str:
+            raise ValueError(PLANTED_SECRET)
+
+    for call in (
+        lambda: normalize_question(_RaisingType()),  # type: ignore[arg-type]
+        lambda: normalize_questions([_RaisingType()]),  # type: ignore[list-item]
+    ):
+        with pytest.raises(NormalizationError) as excinfo:
+            call()
+        # A malformed read must abort, not be classified as an unsupported type.
+        assert not isinstance(excinfo.value, UnsupportedQuestionTypeError)
+        assert PLANTED_SECRET not in str(excinfo.value)
+        assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
+
+
+class _CountingQuestionType:
+    """Wraps an SDK-shaped namespace, counting each ``question_type`` read.
+
+    A path that honors the read-once contract touches ``question_type`` exactly
+    once. A reintroduced *second* successful read is the regression this pins: the
+    second access raises, so it either surfaces as an error or (if swallowed on some
+    other path) changes the tag away from the one asserted -- either way the outcome
+    assertions fail. Every other attribute delegates to the wrapped namespace.
+    """
+
+    def __init__(self, namespace: SimpleNamespace, tag: str) -> None:
+        self._ns = namespace
+        self._tag = tag
+        self.reads = 0
+
+    @property
+    def question_type(self) -> str:
+        self.reads += 1
+        if self.reads > 1:
+            raise AssertionError("question_type read more than once")
+        return self._tag
+
+    def __getattr__(self, name: str) -> object:
+        # Only reached for names not set on the instance (``question_type`` is a
+        # class property, so it never lands here); ``_ns`` is set first in __init__.
+        return getattr(self._ns, name)
+
+
+def test_batch_path_reads_question_type_once_when_deferring() -> None:
+    """The batch defer path classifies and describes from a single read.
+
+    Threading the one read through ``_deferral_event`` (rather than re-reading it)
+    is what stops a stateful getter from classifying and describing the same
+    question inconsistently.
+    """
+    q = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="date")
+
+    result = normalize_questions([q])  # type: ignore[list-item]
+
+    (event,) = result.deferrals
+    assert not result.questions
+    assert event.question_type == "date"
+    assert event.reason == "deferred_v1_type"
+    assert event.question_id == 91001
+    assert event.post_id == 90001
+    assert q.reads == 1
+
+
+def test_batch_path_reads_question_type_once_when_accepting() -> None:
+    """The batch accept path builds the canonical model from a single read."""
+    q = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="binary")
+
+    result = normalize_questions([q])  # type: ignore[list-item]
+
+    (canonical,) = result.questions
+    assert not result.deferrals
+    assert isinstance(canonical, CanonicalBinaryQuestion)
+    assert q.reads == 1
+
+
+def test_singular_path_reads_question_type_once() -> None:
+    """``normalize_question`` reads the type once on both the accept and refuse paths."""
+    accepted = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="binary")
+    canonical = normalize_question(accepted)  # type: ignore[arg-type]
+    assert isinstance(canonical, CanonicalBinaryQuestion)
+    assert accepted.reads == 1
+
+    refused = _CountingQuestionType(fake_sdk_question(question_type="binary"), tag="date")
+    with pytest.raises(UnsupportedQuestionTypeError):
+        normalize_question(refused)  # type: ignore[arg-type]
+    assert refused.reads == 1
+
+
+@pytest.mark.parametrize("tag", [None, [], "totally_made_up"])
+def test_batch_defers_readable_but_unusable_type(tag: object) -> None:
+    """A readable-but-weird type defers; only a *raising* getter aborts the batch.
+
+    ``None``, an (unhashable) list, and a foreign built-in string are all read
+    without error, so they are deferred as ``unknown``/``unrecognized_type`` rather
+    than raising -- the distinction from
+    ``test_unreadable_question_type_aborts_as_normalization_error``, where the getter
+    itself raises. The list case also pins that the exact-type gate runs before the
+    frozenset membership test that would otherwise choke on an unhashable tag.
+    """
+    q = SimpleNamespace(question_type=tag, id_of_question=91001, id_of_post=90001)
+
+    result = normalize_questions([q])  # type: ignore[list-item]
+
+    (event,) = result.deferrals
+    assert not result.questions
+    assert event.question_type == "unknown"
+    assert event.reason == "unrecognized_type"
+    assert event.question_id == 91001
+    assert event.post_id == 90001
+
+
+def test_duplicate_check_ignores_deferred_questions() -> None:
+    """A deferred question has no canonical model and never reaches the ledger.
+
+    The uniqueness check exists to protect the ledger's
+    ``UNIQUE (question_id, tournament_id, forecast_version)``; a deferred question
+    sharing an id with an accepted one is not a collision.
+    """
+    accepted = fake_sdk_question(question_type="binary", id_of_question=91001)
+    deferred = fake_sdk_question(question_type="date", id_of_question=91001)
+
+    result = normalize_questions([accepted, deferred])  # type: ignore[list-item]
+
+    assert len(result.questions) == 1
+    assert len(result.deferrals) == 1
+
+
+def test_normalization_result_is_frozen() -> None:
+    """A value object, per the project convention for internal results."""
+    result = NormalizationResult(questions=(), deferrals=())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.questions = ()  # type: ignore[misc]
