@@ -11,10 +11,12 @@ approval boundary, or replayability, do not take it.**
    M1-307/M1-308 X-retrieval scope). Where they conflict, this wins.
 2. `CODEX_HANDOFF.md` — full spec: interfaces, ledger design, submission seam, pipeline
    boundaries, test requirements, prohibited claims.
-3. `docs/backlog/backlog.csv` — issue-level acceptance criteria (mirror of the `.xlsx`).
-   `docs/backlog/decisions.csv` — the `D##` decisions referenced throughout the code.
+3. `docs/backlog/backlog.csv` — issue-level acceptance criteria, and the single source for
+   backlog state. `docs/backlog/decisions.csv` — the `D##` decisions referenced throughout the code.
 4. `docs/M0-REVIEW.md`, `docs/M1-NOTES.md` — running record of what shipped and what deviated.
-5. `config.example.yaml` — the configuration contract.
+5. `docs/TRACKS.md` — who currently holds the dependency-adding item and the next free migration
+   number. Read it before starting a worktree; claim yours there.
+6. `config.example.yaml` — the configuration contract.
 
 ## Toolchain
 
@@ -28,8 +30,9 @@ uv run mypy --strict src
 ```
 
 CI (`quality-gate`, required on master) runs these plus a gitleaks full-history scan, a
-tracked-artifact hygiene check, `uv sync --locked`, and a CLI smoke test. `uv.lock` must stay in
-step with `pyproject.toml` or the locked sync fails.
+tracked-artifact hygiene check, a backlog lint, a migration hygiene check, a workbook build,
+`uv sync --locked`, and a CLI smoke test. `uv.lock` must stay in step with `pyproject.toml` or the
+locked sync fails. A second required job, `backlog-status`, gates the Done-flip — see below.
 
 ## Code conventions
 
@@ -79,19 +82,48 @@ outlier is worse than either consistent policy.
 ## Workflow
 
 - **One backlog item per branch**, in dependency order; commit messages lead with the issue ID.
-- Parallel tracks use **git worktrees** (`../whiskeyjack-<item>`), one branch each. Each worktree
-  needs its own `uv sync` — `.venv` is gitignored and per-directory. Your main checkout stays on
-  `master`; you `cd` between worktrees rather than switching branches.
-- Branch → PR → **GPT cross-model review** (write a `GPT_REVIEW_REQUEST_<item>.md`: spec,
-  deliberate choices, risk areas to pressure-test, full branch diff) → address findings → merge.
+- Parallel tracks use **git worktrees**, one item each, created by
+  `scripts/start-item.sh <ITEM> <slug> [--deps]`. **One worktree per item, named for its branch
+  (`../whiskeyjack-m1-303` holds `feat/m1-303-…`), created fresh, removed at merge — never reused
+  or renamed.** Each gets its own `uv sync` (`.venv` is gitignored and per-directory). Your main
+  checkout stays on `master`; you `cd` between worktrees rather than switching branches.
+- **Claim deps and migration numbers in `docs/TRACKS.md` before starting** — one dependency-adding
+  item per wave, and migration numbers agreed up front.
+- **Merge `master` into every active branch daily**: `scripts/sync-worktrees.sh --merge` from the
+  main checkout. Reaching a merge 20 commits behind is how one branch pays for all of them at once.
+- Branch → PR → **GPT cross-model review** → address findings → merge → `scripts/finish-item.sh
+  <ITEM>`. Generate the request with `scripts/review-request.py <ITEM>`; it emits everything
+  mechanical and leaves *deliberate choices* and *risk areas* as TODOs for you to write, which is
+  the part that decides whether the review takes one round or six. `GPT_REVIEW_*` files are
+  gitignored scaffolding — never commit them.
+  Do **not** run `gh pr merge --delete-branch`: it fails while the branch is checked out in a
+  sibling worktree. Merge, then `finish-item.sh`.
+- **Fuzz pure functions before the first review.** Any hash, tiebreak, canonicalizer or validator
+  gets a `tests/property/` pass asserting: never raises outside the module's own error type; a
+  total order wherever ordering is claimed; replay-stability across the persisted form
+  (`model_dump(mode="json")` → `json.dumps(ensure_ascii=True, sort_keys=True)` → load); and no
+  value leak in any message. M1-305's tiebreak took five review rounds on one function for three
+  properties a single local run finds.
 - Record what shipped, decisions, and deviations in `docs/M1-NOTES.md`.
 - **Stop points at end of M0 and end of M1** — summarize and get explicit owner go-ahead.
 
 ### Backlog status
 
 Vocabulary: `Not Started` → `In Review` (PR open) → `Done` (**at merge**, not when code lands).
-`Blocked` for owner-gated items. Update **both** `docs/backlog/backlog.csv` and the `.xlsx`
-(often open in LibreOffice — check for a `.~lock` file first).
+`Blocked` for owner-gated items.
+
+`docs/backlog/*.csv` are the **single source**. The `.xlsx` is a build output — untracked,
+gitignored, rebuilt on demand with `uv run python scripts/backlog_xlsx.py`. Never hand-edit it;
+edits there are discarded on the next rebuild. (It was tracked and hand zip-patched until the
+workflow-hardening change; that drifted from the CSV once and made every status flip a two-file
+edit.) CSVs are CRLF and marked `-text` — rewrite them with a `csv.writer` using
+`lineterminator="\r\n"`, or every row shows as changed.
+
+**Flip the row to `Done` on the branch, before the merge.** CI's `backlog-status` job reads the
+branch name (`feat/<item>-*`), finds the row, and fails while it is anything but `Done`; it skips
+`chore/`/`docs/` branches and draft PRs. Expect it red for most of a branch's life — it is a
+checklist item, which is why it is a separate job from `quality-gate`. An item with no backlog
+row fails the gate outright: add the row, with acceptance criteria, before opening the PR.
 
 ### Owner split
 
@@ -107,10 +139,15 @@ tests.**
   `question_type` literal, never `isinstance` — otherwise an unsupported type silently normalizes
   as numeric (a wrong forecast, not an error). See `questions/normalize.py`.
 - **Migration numbers are claimed globally.** `ledger.py` rejects duplicates, so two parallel
-  branches each adding `002_*.sql` will collide. Agree the number before starting.
+  branches each adding `003_*.sql` collide — and if the filenames differ (`003_alpha.sql` vs
+  `003_beta.sql`) git merges both cleanly and the collision only appears at runtime. Claim the
+  number in `docs/TRACKS.md` before writing the file. `.github/scripts/check-migrations.sh` gates
+  uniqueness, contiguity, and the immutability of any migration already on master.
 - **`uv.lock` serializes tracks.** Any item adding a dependency (AskNews, Exa) conflicts messily
-  with another doing the same. Don't run two dependency-adding items concurrently.
-- **The backlog CSV/xlsx predates `CLAUDE_CODE_PROMPT.md`**: M1-307, M1-308 and A-1106 exist in
-  the brief but not in the backlog rows. Don't treat the CSV as the complete scope.
+  with another doing the same. One dependency-adding item per wave, claimed in `docs/TRACKS.md`.
 - **M1-401 is more than its one-line title** — it also applies the forecaster-prompt v1.1.0 patch
   from `CLAUDE_CODE_PROMPT.md` § B and re-hashes.
+- **`content_sha256` raises on a lone surrogate** (`hashing.py`, found by `tests/property/`).
+  Lone surrogates reach the schema from provider JSON, so an adapter hashing provider text can
+  crash with an unsanitized `UnicodeEncodeError` that quotes the offending character. Open —
+  awaiting an owner decision; see the xfail in `tests/property/test_canonical_properties.py`.

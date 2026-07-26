@@ -505,3 +505,60 @@ against a raising getter → abort.
 GPT's approval mutation-tested the read-once guards (a reintroduced second read fails all three),
 verified the `events → config` import is acyclic with identical supported sets at runtime, and
 confirmed no legitimate path constructs an event with a supported type.
+
+## Workflow hardening (chore, not a backlog item)
+
+Five recurring process defects, closed with tooling rather than more discipline. Landed as one
+chore branch **before** the next parallel wave so the `uv.lock` touch could not collide with
+M1-303's Exa dependency.
+
+**1 — The Done-flip miss (M1-203, M1-401, M1-305).** The backlog `.xlsx` is no longer tracked: the
+four `docs/backlog/*.csv` are the single source and `scripts/backlog_xlsx.py` rebuilds the workbook
+on demand. That removes the hand zip-patching, the CSV/xlsx drift fixed in PR #13, and the
+two-file status edit. `.github/scripts/check_backlog.py` adds a `lint` (unique IDs, closed
+vocabularies for Status/Priority/Owner/Complexity, resolvable dependencies) that runs in
+`quality-gate`, and a `gate` that runs as its own required job, `backlog-status`: on a
+`feat/<item>-*` PR the row for `<item>` must read `Done`. Draft PRs and non-item branches skip.
+Kept out of `quality-gate` deliberately — it is expected red for most of a branch's life, and
+mixing that into the code signal would train us to ignore both.
+
+**2 — The GPT-review spiral.** `tests/property/` (hypothesis, dev-only) asserts the invariants
+review has been finding one per round: never raises, strict weak ordering, permutation-invariance,
+replay-stability across the persisted JSON form, and no value leak. The M1-305 tiebreak's five
+rounds map onto four properties in one file. It found a new defect on its first run — see below.
+
+**3 — `GPT_REVIEW_*` files.** Gitignored and blocked by the tracked-artifact check;
+`scripts/review-request.py <ITEM>` generates the request on stdout from the backlog row, its `D##`
+decisions and the branch diff, leaving *deliberate choices* and *risk areas* as explicit TODOs.
+Those two sections are the judgment; the rest was always mechanical.
+
+**4 — Parallel-track collisions.** `docs/TRACKS.md` is a claims registry (who holds the
+dependency-adding item, which migration number is taken).
+`.github/scripts/check-migrations.sh` turns the migration gotcha into a gate: unique and
+contiguous numbers, no number reused from master under a different filename (which git merges
+cleanly and only breaks at runtime), and no edit to a migration already on master.
+
+**5 — Branch drift and worktree cleanup.** `scripts/start-item.sh`, `sync-worktrees.sh --merge`
+and `finish-item.sh` cover create → daily merge → retire. `finish-item.sh` refuses unless the
+branch is an ancestor of `origin/master`, removes the worktree *before* deleting the branch (the
+ordering `gh pr merge --delete-branch` gets wrong when master lives in a sibling worktree), and
+leaves the remote branch alone unless `--delete-remote` is passed.
+
+Also: **M1-307, M1-308 and A-1106 now have backlog rows**, drafted from `CLAUDE_CODE_PROMPT.md`
+§ B. They were in the brief but not the CSV, which the new gate would have rejected on M1-308's
+first PR — and "the CSV is not the complete scope" was a gotcha worth deleting rather than
+documenting. A committed `.claude/settings.json` gives every worktree the same permission
+allowlist (outward-facing actions — `git push`, `gh pr merge` — deliberately left out).
+
+### Open defect found by the new property suite
+
+`research/hashing.py: content_sha256()` raises a raw `UnicodeEncodeError` on a lone surrogate,
+and that exception's message quotes the offending character. Lone surrogates are reachable:
+`json.loads('"\\ud800"')` returns one and `ResearchDocument` accepts it in `title`/`snippet`/
+`summary`, so an adapter hashing provider text can crash with an unsanitized error. Two clean
+fixes exist — reject the document with a sanitized `ResearchError`, or encode with
+`surrogatepass` — and they differ in policy, not mechanism, so this is an owner call. Neither
+changes any existing digest (the inputs in question currently raise rather than hash). Recorded as
+a strict `xfail` in `tests/property/test_canonical_properties.py` so it converts to a hard failure
+the moment it is fixed. **Not** fixed on the branch that found it: that would be scope creep into
+M1-301's module from a workflow chore.

@@ -1,16 +1,10 @@
-# The backlog CSVs are exported from the authoritative backlog xlsx and use
-# RFC 4180 CRLF line endings — uniformly, in all four files. Keep them
-# byte-for-byte as exported: no end-of-line normalization, and a CR at end of
-# line is not a whitespace error (re-review finding 4: `git diff --check`
-# flagged every edited row).
+# The backlog CSVs are the authoritative backlog — the workbook is generated from
+# them (scripts/backlog_xlsx.py) and is not tracked. They keep the RFC 4180 CRLF
+# line endings they were originally exported with, uniformly in all four files:
+# no end-of-line normalization, and a CR at end of line is not a whitespace error
+# (re-review finding 4: `git diff --check` flagged every edited row). Any tool that
+# rewrites them must preserve CRLF, or every row shows as changed.
 docs/backlog/*.csv -text whitespace=cr-at-eol
-
-# The cross-model review requests embed unified diffs verbatim. In diff format a
-# context line is prefixed with a space, so a blank source line becomes a line
-# containing exactly one space — `git diff --check` reads those as trailing
-# whitespace (round-2 finding 8). Stripping them would corrupt the diff being
-# reviewed, so the check is suppressed for these files instead.
-GPT_REVIEW_REQUEST_*.md -whitespace
 
 # The forecaster prompt is hashed over its raw bytes and that digest is pinned in
 # tests/unit/test_prompt.py (D04 drift guard). Without an eol rule, a checkout with

@@ -2,6 +2,9 @@ name: CI
 
 on:
   pull_request:
+    # ready_for_review is added so the backlog-status gate re-runs when a draft PR
+    # is marked ready; the gate is skipped while a PR is still a draft.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - master
@@ -44,6 +47,12 @@ jobs:
       - name: Tracked-artifact hygiene check
         run: bash .github/scripts/check-tracked-artifacts.sh
 
+      - name: Backlog lint
+        run: python3 .github/scripts/check_backlog.py lint
+
+      - name: Migration hygiene check
+        run: bash .github/scripts/check-migrations.sh
+
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -70,3 +79,38 @@ jobs:
 
       - name: Strict mypy
         run: uv run mypy --strict src
+
+      - name: Backlog workbook builds
+        run: uv run python scripts/backlog_xlsx.py --out "${RUNNER_TEMP}/backlog.xlsx"
+
+  backlog-status:
+    # The Done-flip gate, deliberately a separate required check: it is expected to be
+    # red for most of a feature branch's life and turns green when the backlog row is
+    # flipped to Done. Keeping it out of quality-gate leaves that job a clean signal
+    # about the code.
+    name: backlog-status
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # Only the pull-request head tree is needed, so this is a shallow, tokenless
+      # fetch of the event ref (the synthetic merge ref on PR runs) rather than the
+      # full-history checkout quality-gate needs for the gitleaks scan.
+      - name: Checkout the event ref without credentials
+        env:
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          git init .
+          git remote add origin "$SERVER_URL/$REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin "$EVENT_REF"
+          git checkout --detach "$EVENT_SHA"
+
+      - name: Backlog row is flipped to Done
+        env:
+          BRANCH_NAME: ${{ github.head_ref }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/check_backlog.py gate
