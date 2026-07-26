@@ -505,3 +505,230 @@ against a raising getter → abort.
 GPT's approval mutation-tested the read-once guards (a reintroduced second read fails all three),
 verified the `events → config` import is acyclic with identical supported sets at runtime, and
 confirmed no legitimate path constructs an event with a supported type.
+
+## Workflow hardening (chore, not a backlog item)
+
+Five recurring process defects, closed with tooling rather than more discipline. Landed as one
+chore branch **before** the next parallel wave so the `uv.lock` touch could not collide with
+M1-303's Exa dependency.
+
+**1 — The Done-flip miss (M1-203, M1-401, M1-305).** The backlog `.xlsx` is no longer tracked: the
+four `docs/backlog/*.csv` are the single source and `scripts/backlog_xlsx.py` rebuilds the workbook
+on demand. That removes the hand zip-patching, the CSV/xlsx drift fixed in PR #13, and the
+two-file status edit. `.github/scripts/check_backlog.py` adds a `lint` (unique IDs, closed
+vocabularies for Status/Priority/Owner/Complexity, resolvable dependencies) that runs in
+`quality-gate`, and a `gate` that runs as its own required job, `backlog-status`: on a
+`feat/<item>-*` PR the row for `<item>` must read `Done`. Draft PRs and non-item branches skip.
+Kept out of `quality-gate` deliberately — it is expected red for most of a branch's life, and
+mixing that into the code signal would train us to ignore both.
+
+**2 — The GPT-review spiral.** `tests/property/` (hypothesis, dev-only) asserts the invariants
+review has been finding one per round: never raises, strict weak ordering, permutation-invariance,
+replay-stability across the persisted JSON form, and no value leak. The M1-305 tiebreak's five
+rounds map onto four properties in one file. It found a new defect on its first run — see below.
+
+**3 — `GPT_REVIEW_*` files.** Gitignored and blocked by the tracked-artifact check;
+`scripts/review-request.py <ITEM>` generates the request on stdout from the backlog row, its `D##`
+decisions and the branch diff, leaving *deliberate choices* and *risk areas* as explicit TODOs.
+Those two sections are the judgment; the rest was always mechanical.
+
+**4 — Parallel-track collisions.** `docs/TRACKS.md` is a claims registry (who holds the
+dependency-adding item, which migration number is taken).
+`.github/scripts/check-migrations.sh` turns the migration gotcha into a gate: unique and
+contiguous numbers, no number reused from master under a different filename (which git merges
+cleanly and only breaks at runtime), and no edit to a migration already on master.
+
+**5 — Branch drift and worktree cleanup.** `scripts/start-item.sh`, `sync-worktrees.sh --merge`
+and `finish-item.sh` cover create → daily merge → retire. `finish-item.sh` refuses unless the
+branch is an ancestor of `origin/master`, removes the worktree *before* deleting the branch (the
+ordering `gh pr merge --delete-branch` gets wrong when master lives in a sibling worktree), and
+leaves the remote branch alone unless `--delete-remote` is passed.
+
+Also: **M1-307, M1-308 and A-1106 now have backlog rows**, drafted from `CLAUDE_CODE_PROMPT.md`
+§ B. They were in the brief but not the CSV, which the new gate would have rejected on M1-308's
+first PR — and "the CSV is not the complete scope" was a gotcha worth deleting rather than
+documenting. A committed `.claude/settings.json` gives every worktree the same permission
+allowlist (outward-facing actions — `git push`, `gh pr merge` — deliberately left out).
+
+### Open defect found by the new property suite
+
+`research/hashing.py: content_sha256()` raises a raw `UnicodeEncodeError` on a lone surrogate,
+and that exception's message quotes the offending character. Lone surrogates are reachable:
+`json.loads('"\\ud800"')` returns one and `ResearchDocument` accepts it in `title`/`snippet`/
+`summary`, so an adapter hashing provider text can crash with an unsanitized error. Two clean
+fixes exist — reject the document with a sanitized `ResearchError`, or encode with
+`surrogatepass` — and they differ in policy, not mechanism, so this is an owner call. Neither
+changes any existing digest (the inputs in question currently raise rather than hash). Recorded as
+a strict `xfail` in `tests/property/test_canonical_properties.py` so it converts to a hard failure
+the moment it is fixed. **Not** fixed on the branch that found it: that would be scope creep into
+M1-301's module from a workflow chore.
+
+### Workflow hardening — cross-model review round 1
+
+GPT returned CHANGES REQUESTED with five blocking findings. All five reproduced against the
+repo before anything was changed; none were speculative. Two were false claims the tooling
+itself made, which is the category worth being loudest about: a gate that reports success it
+did not establish is worse than no gate, because it is read as evidence.
+
+**1 — The Done-flip gate had two live false-greens.** `BRANCH_PATTERN` was anchored to lower
+case and to `feat|fix`, and every non-matching branch was *skipped*, so `feat/M1-303-x` and
+`feature/m1-303-x` both exited 0 while M1-303 read `Not Started`. The classification now lives
+in `_classify_branch()` — a pure function, which is why it can be tested at all — and sorts into
+item / infrastructure / unrecognized, with **unrecognized failing**. Owner decision: fail closed.
+The cost is that a branch like `chris/experiment` cannot open a PR without a rename or a one-line
+addition to `SKIP_PREFIXES`; the benefit is that no future prefix silently skips.
+`tests/unit/test_check_backlog.py` holds the branch-name table, including GPT's exact
+counterexamples. A branch with no `/` at all is unrecognized too — a bare `chore` used to match
+the skip list on the strength of its whole name (found while writing that table, not by review).
+
+**2 — The migration gate could be bypassed by a stale check.** `check-migrations.sh` compares
+against the `origin/master` of its own run, but master had `required_status_checks.strict =
+false`, so PR A and PR B could each add an `003_*.sql` off the same base, both go green, and B
+merge on its old result. The two files merge cleanly and only collide at runtime. Owner decision:
+`strict: true` on master (set via the `required_status_checks` sub-resource, so `enforce_admins`
+survived). The script's header now records that its central claim depends on that setting.
+
+**3 — The claims registry is advisory, and now says so.** `start-item.sh` read `TRACKS.md` from
+the working copy (which goes stale) and printed the claim row *after* creating the worktree. It
+now reads `git show origin/master:docs/TRACKS.md` after fetching, and prints the claim first.
+Deliberately **not** fixed: the underlying race. A shared atomic reservation means pushing a claim
+commit to a protected branch before every item, which is heavier than the collision it prevents in
+a repo where one person serializes the tracks. `TRACKS.md` now states plainly that it is
+coordination, not a lock, and names `check-migrations.sh` and `uv.lock` conflicts as the actual
+enforcement.
+
+**4 — `review-request.py` asserted the gates passed without running them.** The sentence lived in
+`PROJECT_CONTEXT`, so generating a request on a red branch produced a document opening with a
+falsehood. It now runs all four gates and **exits non-zero with nothing on stdout** if any fail —
+verified by injecting a failing test and confirming a zero-byte redirect. `--no-verify` emits an
+explicit NOT VERIFIED banner rather than going quiet.
+
+**5 — The permission allowlist did not preserve the boundary it implied.** Rules are
+prefix-matched, so `Bash(uv run *)` matched `uv run git push` and `Bash(python3 *)` matched any
+subprocess. Both are replaced by the specific invocations. The file now records what it is (prompt
+reduction, small blast radius) and what it is not (a sandbox) — `Bash(scripts/*)` still reaches
+`finish-item.sh --delete-remote`, and the boundary on outward actions is the operator.
+
+**Non-blocking, all three accepted.** `st.randoms(use_true_random=True)` contradicted the CI
+profile's `derandomize=True`, so the one property whose counterexample *is* an ordering would have
+arrived unreproducible and unshrinkable — now `st.permutations`. Two strategy claims were
+overstated: the astral/surrogate-pair "pair" was one literal written twice, and `TIMESTAMPS` held
+only ISO strings, which cannot carry `datetime.fold`. Both now generate the real distinction —
+`fold` survives the schema because `_to_utc`'s `astimezone` returns `self` when the tzinfo is
+already `timezone.utc`, so the round-3 bug's input class is finally fuzzed rather than only
+unit-tested. And `finish-item.sh` read the backlog status before fast-forwarding master, printing
+a pre-merge `In Review` under the word "now".
+
+### Workflow hardening — cross-model review round 2
+
+Four blocking findings, all reproduced before anything was changed. The theme is sharper than
+round 1's: each of the four mechanisms *claimed* to enforce something it never observed. A check
+that cannot see the state it guards is not a weak check, it is a false one — and three of these
+four had a comment in the file cheerfully describing the hole.
+
+**1 — The claims registry could not see a live claim.** Round 1 moved the `TRACKS.md` read from
+the working copy to `origin/master`, which was the wrong axis: a claim lives on its *own branch*
+until that branch merges, so master is precisely where it is not. The registry was therefore blind
+for the entire lifetime of every claim it existed to record. New `scripts/tracks.py` scans
+`docs/TRACKS.md` across every `refs/remotes/origin/*` plus master, and keeps a row only if its
+branch is still live — the remote ref exists and is not yet an ancestor of `origin/master`. That
+liveness test is what made a hard failure affordable: rows outlive their branches by design
+(`finish-item.sh` tells you to sweep them on your next branch), so without it a merged claim would
+have blocked the next track forever. **Owner decision: `--deps` exits, with no override flag.** If
+the holding branch is genuinely abandoned, delete the branch or drop the row — both are honest
+edits to the registry, and neither is a habit that forms by reflex. Two secondary defects died
+with the old detector: `grep -qi '| *yes *|'` matched a `| yes |` anywhere in the file (the
+Standing claims table included) and missed `Yes (uv.lock)`. Parsing is now scoped to the Worktrees
+section, and an unrecognized deps cell counts as a claim. A row with no readable Branch cell counts
+as live, and a registry unreadable on every ref fails the check: "I could not tell" is not evidence
+that the slot is free. The residual window is now one thing only, and `TRACKS.md` names it —
+between running `start-item.sh` and pushing your row, nobody else can see it.
+
+**2 — A dirty tree produced a truthfully-worded false review request.** The four gates run against
+the working tree; the diff is built from `origin/master...HEAD`. Those are the same code only when
+the tree is clean, so an uncommitted fix yielded four honest passes for a change the reviewer was
+never shown — and an untracked test file changes what pytest collects while appearing in no diff at
+all. `review-request.py` now requires a clean tree before verifying. `--no-verify` remains the one
+way through, because it claims nothing; on a dirty tree its banner gains a second line rather than
+staying quiet about the second reason to distrust the request.
+
+**3 — Branch discovery disagreed with the branch contract.** `finish-item.sh` globbed
+`feat/<id>-*` and `fix/<id>-*` while `check_backlog.py` accepted five prefixes, any casing, and a
+bare `feat/<id>` with no slug. Seven of the eleven forms the gate would merge could never be
+cleaned up afterwards — a branch that passes CI and then strands its own worktree. Fixed by
+deleting the second implementation rather than syncing it: a new `check_backlog.py classify`
+subcommand exposes `_classify_branch` to the shell (single branch, or a batch on stdin so one
+process classifies a whole repo), and `finish-item.sh` filters its output. Verified by comparison
+— against five branch forms the old globs found one and `classify` finds all five.
+
+**4 — The allowlist bypassed the operator it named as the boundary.** `Bash(scripts/*)` reached
+`finish-item.sh --delete-remote` and its `git push origin --delete` with no prompt, while
+`git push` and `gh pr merge` were excluded by intent. That is the same defect as round 1's
+`Bash(uv run *)` one level up, and the file's own comment documented it as accepted. There are now
+no directory wildcards over `scripts/` and no interpreter wildcards; scripts are listed one at a
+time, and `finish-item.sh` is deliberately absent, so it prompts once per merge.
+
+**Beyond the review, in the same lines.** `finish-item.sh --delete-remote` proved only that the
+*local* ref was merged, then deleted the *remote* one — so a review fix pushed from another machine
+was deleted on the strength of a stale local ref. The remote-side ancestor proof now runs before
+anything is removed, so a refusal cannot land halfway. `start-item.sh` validated the backlog row
+against a possibly-stale on-disk CSV *before* fetching (GPT's non-blocking note); it now fetches
+first and falls back to `origin/master`'s copy, read into a variable rather than piped into
+`grep -q`, since grep's early exit SIGPIPEs `git show` and pipefail would turn a found row into a
+failure. And its lint call no longer redirects stdout to `/dev/null`, which was hiding every
+problem detail and showing only the count.
+
+**Tests.** `tests/unit/test_tracks.py` (parsing table, liveness table, and the cross-branch scan
+run for real against a throwaway repo with a local bare `origin`), `tests/unit/test_finish_item.py`
+(every mergeable branch form cleaned up end to end, plus the refusals), `tests/unit/
+test_review_request.py`, and `classify` cases added to `tests/unit/test_check_backlog.py`. The
+first and second are integration tests on purpose: both defects lived in the disagreement *between*
+two internally-consistent components, which no unit test of either one can see. 503 → 612 tests.
+
+### Workflow hardening — cross-model review round 3
+
+Two blocking findings, both false-safe paths in mechanisms whose purpose is to stop an unsafe
+workflow before it starts.
+
+**1 — A malformed claim registry read as an empty registry.** `parse_claims()` returned `[]` for
+a misspelled Worktrees heading, a missing table and a ragged row; `_scan()` then called the ref
+readable and `deps` exited successfully. A typo in a claim's Branch cell also made `is_live()`
+classify it as stale even when the containing ref was still active. Parsing now returns claims and
+structural problems separately, and every readable unmerged ref is validated. Failure to enumerate
+remote refs also blocks instead of becoming an empty ref set. An unknown branch
+whose exact row exists on master is a stale landed claim; an unknown row unique to an unmerged ref
+is invalid and blocks. That provenance distinction preserves cleanup after a merged branch is
+deleted without turning a typo into evidence that the dependency slot is free.
+
+**2 — The remaining script wildcard bypassed the outward-action prompt.** Although direct `git
+push` and the top-level `scripts/*` wildcard were gone, `Bash(bash .github/scripts/*)` could run a
+newly-created helper containing `git push` without prompting. It is replaced by exact entries for
+the migration and tracked-artifact checks; a regression test rejects script-directory wildcards.
+
+**Tests.** Command-level throwaway-repository tests cover the exact singular-heading and mistyped
+cases the review named, plus ragged tables, a deleted branch whose row landed on master, and a
+forced failure of remote-ref enumeration. `tests/unit/test_claude_settings.py` pins the allowlist
+shape. 612 → 624 tests.
+
+**Three follow-ups found while verifying round 3, fixed in the same commit.**
+
+*The registry could not bootstrap itself.* `_scan()` treated an unreadable
+`origin/master:docs/TRACKS.md` as a broken registry, but on the branch that *introduces*
+`TRACKS.md` the file is legitimately not on master yet. So both subcommands exited 1 in this very
+repository, and because `start-item.sh` runs them under `set -euo pipefail`, no item could be
+started until this branch merged — the tool was unusable on the branch that added it. Every
+throwaway-repo test missed it by seeding the registry onto master first. `_scan()` now separates
+"`origin/master` does not resolve" (a problem) from "it resolves and carries no registry" (a
+`NOTE:` on stderr, exit 0), and claims are read from the open branches meanwhile. This does not
+soften the check: with no master rows, the landed-stale-claim exception has nothing to match, so
+every unknown branch still fails closed, and a live dependency claim on a branch still blocks.
+
+*The allowlist regression test covered one round of two.* It asserted only the absence of round
+2's `scripts/*`, leaving round 1's interpreter wildcards — the exact defect the file's own comment
+opens by describing — pinned by nothing. It now also rejects interpreter wildcards by name and by
+shape (any rule whose last token before `*` is an interpreter), asserts `git push` / `gh pr create`
+/ `gh pr merge` / `gh release` are absent, and asserts `finish-item.sh` appears in no rule.
+
+*`is_live()` took an `existing` argument it never read.* Existence needs the cross-ref provenance
+only `live_claims()` has, so the parameter made a half-test look like the whole liveness test.
+Dropped, and its docstring now says why existence is decided elsewhere.

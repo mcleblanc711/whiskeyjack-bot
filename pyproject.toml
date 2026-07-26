@@ -68,7 +68,15 @@ follow_imports = "skip"
 
 [dependency-groups]
 dev = [
+    # Property-based tests for the pure functions (hashes, tiebreaks, canonicalizers).
+    # The invariants they assert -- never raises, total order, replay-stable across the
+    # persisted JSON form, no value leak -- are the ones cross-model review has found by
+    # hand, one round per property. See tests/property/.
+    "hypothesis>=6,<7",
     "mypy>=2.3.0",
+    # scripts/backlog_xlsx.py only. The workbook is a build output of docs/backlog/*.csv,
+    # not a tracked artifact, so this never reaches the runtime dependency set.
+    "openpyxl>=3.1,<4",
     "pytest>=8,<9",
     "pytest-socket==0.8.0",
     "ruff>=0.15.21",

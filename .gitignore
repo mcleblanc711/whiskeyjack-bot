@@ -23,6 +23,21 @@ htmlcov/
 .env
 .env.*
 
+# Generated backlog workbook. docs/backlog/*.csv are authoritative; rebuild the
+# spreadsheet view with `uv run python scripts/backlog_xlsx.py`.
+*.xlsx
+
+# Cross-model review prompts. Scaffolding, not record: generate them with
+# `scripts/review-request.py <ITEM>`; the durable record is docs/*-NOTES.md.
+GPT_REVIEW_*
+
+# Hypothesis's example database (tests/property/)
+.hypothesis/
+
+# Claude Code machine-local settings. The shared project allowlist is the tracked
+# .claude/settings.json; anything machine-specific belongs here instead.
+.claude/settings.local.json
+
 # Generated data (ledger, artifacts, exports, logs, snapshots)
 data/
 *.sqlite3
