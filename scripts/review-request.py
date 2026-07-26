@@ -8,8 +8,11 @@ short review (deliberate choices, risk areas) are emitted as TODO placeholders,
 because those are judgment and a template cannot fake them.
 
 Running it also runs the four toolchain gates and refuses to emit anything if one
-fails, so the request cannot claim a green branch that is not green. ``--no-verify``
-skips them and says so in the output rather than going quiet.
+fails, so the request cannot claim a green branch that is not green. It requires a clean
+working tree first, because the gates run against the tree while the diff is built from
+``HEAD``: with uncommitted work those are different code, and the request would report a
+pass the reviewer cannot see. ``--no-verify`` skips both and says so in the output rather
+than going quiet.
 
     scripts/review-request.py M1-303 > GPT_REVIEW_REQUEST_M1-303.md   # gitignored
     scripts/review-request.py M1-303 --round 2 | xclip -selection clipboard
@@ -64,6 +67,14 @@ GATES: Final = (
 NOT_VERIFIED: Final = """\
 > **NOT VERIFIED.** This request was generated with `--no-verify`; the toolchain gates
 > were **not** run for it. Treat any claim about test or type status as unsubstantiated."""
+
+# The gates run against the working tree; the diff below is built from committed HEAD.
+# Those are the same code only while the tree is clean, so a dirty tree can report four
+# passes for a fix the reviewer cannot see -- and an untracked test file changes what
+# pytest collects without appearing in the diff at all (cross-model review, round 2).
+DIRTY_TREE_NOTE: Final = """\
+> The working tree also had **uncommitted changes** when this was generated, so the diff
+> below is not necessarily the code that was run."""
 
 STANDING_CONVENTIONS: Final = """\
 - **Error hygiene.** Every module owns a sanitized exception (`ConfigError`,
@@ -149,6 +160,44 @@ def _verify_gates() -> str:
     return "\n".join(lines)
 
 
+def _dirty_paths() -> list[str]:
+    """Paths with uncommitted or untracked content. Paths only -- never their contents."""
+    return [line.strip() for line in _run("git", "status", "--porcelain").splitlines() if line]
+
+
+def _require_clean_tree() -> None:
+    """Refuse to verify a tree whose state the diff will not show.
+
+    Running the gates against uncommitted work and then diffing ``HEAD`` is how a request
+    truthfully reports four passes while omitting the change that produced them. The
+    generator cannot vouch for code the reviewer is not being shown, so it stops.
+    """
+    dirty = _dirty_paths()
+    if not dirty:
+        return
+
+    shown = "\n".join(f"  {entry}" for entry in dirty[:10])
+    if len(dirty) > 10:
+        shown += f"\n  ... and {len(dirty) - 10} more"
+    raise SystemExit(
+        "FAIL: the working tree is not clean, so the gates would run against code that is "
+        "not in the diff:\n"
+        f"{shown}\n\n"
+        "Commit or stash, then re-run. --no-verify emits the request anyway, with an "
+        "explicit banner saying the gates were not run and the diff may be incomplete."
+    )
+
+
+def _not_verified_banner(dirty: bool) -> str:
+    """The --no-verify banner, carrying the dirty-tree caveat when it applies.
+
+    ``--no-verify`` stays the one way through, because it makes no claim to be true. What
+    it must not do is stay silent about a second reason to distrust the request, so a
+    dirty tree adds a line rather than being waved past.
+    """
+    return f"{NOT_VERIFIED}\n>\n{DIRTY_TREE_NOTE}" if dirty else NOT_VERIFIED
+
+
 def _load(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
@@ -193,7 +242,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Before anything reaches stdout: a failed gate must leave no partial request
     # behind for a shell redirect to capture.
-    gate_status = NOT_VERIFIED if args.no_verify else _verify_gates()
+    if args.no_verify:
+        gate_status = _not_verified_banner(bool(_dirty_paths()))
+    else:
+        _require_clean_tree()
+        gate_status = _verify_gates()
 
     branch = _run("git", "rev-parse", "--abbrev-ref", "HEAD").strip()
     diffstat = _run("git", "diff", "--stat", f"{args.base}...HEAD").rstrip()

@@ -40,10 +40,23 @@ worktree="$(cd .. && pwd)/whiskeyjack-${item_lower}"
 
 git fetch --prune origin
 
-mapfile -t branches < <(git for-each-ref --format='%(refname:short)' \
-  "refs/heads/feat/${item_lower}-*" "refs/heads/fix/${item_lower}-*")
+# Ask check_backlog.py which branches name this item rather than globbing for them here.
+# The globs this replaced were `feat/<id>-*` and `fix/<id>-*`, which disagreed with the
+# gate's own contract on three axes — it also accepts feature/, bugfix/, hotfix/, every
+# upper-case spelling, and a bare `feat/<id>` with no slug — so a branch the gate was
+# happy to merge could not afterwards be cleaned up (cross-model review, round 2).
+#
+# Assigned through a variable, not piped straight into `< <(...)`: process substitution
+# swallows the exit status, so a broken classifier would read as "no branches found"
+# instead of failing. Through a variable, pipefail and set -e stop the script.
+classified="$(git for-each-ref --format='%(refname:short)' refs/heads \
+  | python3 .github/scripts/check_backlog.py classify)"
+mapfile -t branches < <(
+  awk -F'\t' -v id="$item_id" '$1 == "item" && $2 == id { print $3 }' <<<"$classified"
+)
 if [[ ${#branches[@]} -eq 0 ]]; then
-  echo "No local branch matches feat/${item_lower}-* or fix/${item_lower}-*." >&2
+  echo "No local branch names $item_id. Expected <prefix>/${item_lower}[-slug] with a" >&2
+  echo "prefix the backlog gate recognizes (feat, feature, fix, bugfix, hotfix)." >&2
   exit 1
 fi
 if [[ ${#branches[@]} -gt 1 ]]; then
@@ -56,6 +69,18 @@ if ! git merge-base --is-ancestor "$branch" origin/master; then
   echo "$branch is not merged into origin/master yet. Merge the PR first." >&2
   echo "(If it is merged, run: git fetch origin)" >&2
   exit 1
+fi
+
+# Prove the *remote* branch is merged too, and prove it here — before anything is
+# removed. The check above only covers the local ref, so a review fix pushed from another
+# machine (or committed in the web UI) is invisible to it, and --delete-remote would
+# delete commits that never reached master. Validate everything first, then mutate.
+if [[ $delete_remote -eq 1 ]] && git show-ref --quiet --verify "refs/remotes/origin/$branch"; then
+  if ! git merge-base --is-ancestor "refs/remotes/origin/$branch" origin/master; then
+    echo "origin/$branch has commits that are not in origin/master; refusing to delete it." >&2
+    echo "Fetch and inspect it: git log origin/master..origin/$branch" >&2
+    exit 1
+  fi
 fi
 
 if [[ -d "$worktree" ]]; then

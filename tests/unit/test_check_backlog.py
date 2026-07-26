@@ -14,6 +14,7 @@ by path rather than imported.
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
 from types import ModuleType
 
@@ -138,6 +139,63 @@ def test_a_non_draft_boolean_does_not_skip(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("BRANCH_NAME", "feat/m1-303-x")
     monkeypatch.setenv("IS_DRAFT", "")
     assert check_backlog._gate(_rows()) == 1
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected_line", "expected_code"),
+    [
+        ("feat/m1-303-exa-fallback", "item\tM1-303", 0),
+        # The forms finish-item.sh's old globs could not see. Every one of them can be
+        # merged by the gate, so every one of them has to be cleanable afterwards.
+        ("feature/m1-303-x", "item\tM1-303", 0),
+        ("bugfix/m1-303-x", "item\tM1-303", 0),
+        ("hotfix/M1-305-y", "item\tM1-305", 0),
+        ("FEAT/M1-303-x", "item\tM1-303", 0),
+        ("feat/m1-303", "item\tM1-303", 0),
+        ("chore/workflow-hardening", "skip\tchore", 0),
+        ("chris/experiment", "unknown\tchris/experiment", 1),
+    ],
+)
+def test_classify_command(
+    branch: str,
+    expected_line: str,
+    expected_code: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`classify` is the seam finish-item.sh reads, so its output is a contract."""
+    assert check_backlog.main(["classify", branch]) == expected_code
+    assert capsys.readouterr().out.strip() == expected_line
+
+
+def test_classify_reads_a_batch_from_stdin(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One process per repository rather than one per branch. Blank lines are skipped,
+    and the branch is echoed back so the caller can filter on the disposition."""
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO("feat/m1-303\n\nchore/x\nfeature/M1-305-y\nchris/experiment\n"),
+    )
+
+    assert check_backlog.main(["classify"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "item\tM1-303\tfeat/m1-303",
+        "skip\tchore\tchore/x",
+        "item\tM1-305\tfeature/M1-305-y",
+        "unknown\tchris/experiment\tchris/experiment",
+    ]
+
+
+def test_classify_does_not_read_the_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Classification is a pure function of the branch name. finish-item.sh calls it in
+    repositories that have no backlog CSV at all, so it must not touch one."""
+
+    def _explode() -> list[dict[str, str]]:
+        raise AssertionError("classify must not read the backlog CSV")
+
+    monkeypatch.setattr(check_backlog, "_read_rows", _explode)
+    assert check_backlog.main(["classify", "feat/m1-303-x"]) == 0
 
 
 def test_lint_accepts_the_tracked_backlog() -> None:

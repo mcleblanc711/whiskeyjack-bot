@@ -40,13 +40,6 @@ if [[ ! "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
   exit 1
 fi
 
-python3 .github/scripts/check_backlog.py lint >/dev/null
-if ! grep -q "^${item_id}," docs/backlog/backlog.csv; then
-  echo "$item_id has no row in docs/backlog/backlog.csv. Add the row (with acceptance" >&2
-  echo "criteria) before starting — the CI backlog-status gate looks the item up by ID." >&2
-  exit 1
-fi
-
 item_lower="${item_id,,}"
 branch="feat/${item_lower}-${slug}"
 worktree="../whiskeyjack-${item_lower}"
@@ -60,6 +53,9 @@ if git show-ref --quiet --verify "refs/heads/$branch"; then
   exit 1
 fi
 
+# Fetch before reading anything from origin, and before the backlog row check below:
+# that check used to run against the on-disk CSV of a possibly-stale master, so an item
+# added upstream an hour ago was rejected as having no row (cross-model review, round 2).
 git fetch --prune origin
 
 if git show-ref --quiet --verify "refs/remotes/origin/$branch"; then
@@ -67,26 +63,42 @@ if git show-ref --quiet --verify "refs/remotes/origin/$branch"; then
   exit 1
 fi
 
-# Read the registry from origin/master, not the working copy. The main checkout is
-# whatever `master` was last fast-forwarded to, so grepping the file on disk can report
-# a dependency slot as free after another track has already claimed and pushed it
-# (cross-model review, round 1). The fetch above is what makes this current.
-tracks="$(git show origin/master:docs/TRACKS.md 2>/dev/null || true)"
-if [[ -z "$tracks" ]]; then
-  echo "WARNING: could not read docs/TRACKS.md from origin/master; claims unchecked." >&2
-elif [[ $adds_deps -eq 1 ]] && grep -qi '| *yes *|' <<<"$tracks"; then
-  echo
-  echo "WARNING: origin/master's docs/TRACKS.md already shows an active dependency-adding track." >&2
-  echo "uv.lock serializes tracks: two items adding dependencies at once merge messily." >&2
-  echo "Continuing anyway — check docs/TRACKS.md before you touch pyproject.toml." >&2
-  echo
+# Not `>/dev/null`: check_backlog.py prints the problems themselves to stdout and only
+# the count to stderr, so swallowing stdout reported "3 backlog problem(s)" and not one
+# word about which three.
+python3 .github/scripts/check_backlog.py lint
+# Fall back to origin/master's copy: the working checkout can be behind, and rejecting an
+# item that was added upstream an hour ago is a confusing way to be told to run git pull.
+# Read into a variable rather than piping into `grep -q` — grep exits on the first match,
+# which SIGPIPEs `git show`, and under pipefail that turns a found row into a failure.
+upstream_backlog="$(git show origin/master:docs/backlog/backlog.csv 2>/dev/null || true)"
+if ! grep -q "^${item_id}," docs/backlog/backlog.csv \
+  && ! grep -q "^${item_id}," <<<"$upstream_backlog"; then
+  echo "$item_id has no row in docs/backlog/backlog.csv. Add the row (with acceptance" >&2
+  echo "criteria) before starting — the CI backlog-status gate looks the item up by ID." >&2
+  exit 1
 fi
 
-# Printed before the worktree exists, not after. The registry is advisory — it is a
-# branch-local file, so two tracks started minutes apart can both read "free" and both
-# claim the same slot. Making the claim the first thing you do, against a freshly
-# fetched origin/master, is what keeps the window small; check-migrations.sh and
-# uv.lock conflicts are what actually enforce the outcome.
+# The registry is read across every active origin branch, not just origin/master: a claim
+# lives on its own branch until that branch merges, so reading master alone could not see
+# a claim for the whole period the claim exists to cover (cross-model review, round 2).
+# A dependency conflict is fatal here rather than a warning — it used to print "Continuing
+# anyway", which is a warning about a collision that has already been decided.
+if [[ $adds_deps -eq 1 ]]; then
+  python3 scripts/tracks.py deps
+else
+  claims="$(python3 scripts/tracks.py claims)"
+  if [[ -n "$claims" ]]; then
+    echo
+    echo "Active claims (docs/TRACKS.md, across open branches):"
+    sed 's/^/  /' <<<"$claims"
+  fi
+fi
+
+# Printed before the worktree exists, not after. Claims are now observable across open
+# branches, so the blind spot is down to one window: between this run and the moment you
+# push the row, nobody else can see it. Writing the row first is what closes that, and
+# check-migrations.sh plus uv.lock conflicts are still what enforce the outcome.
 cat <<EOF
 
 About to create $worktree (branch $branch, off origin/master).

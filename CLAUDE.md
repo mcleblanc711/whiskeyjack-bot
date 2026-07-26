@@ -88,7 +88,12 @@ outlier is worse than either consistent policy.
   or renamed.** Each gets its own `uv sync` (`.venv` is gitignored and per-directory). Your main
   checkout stays on `master`; you `cd` between worktrees rather than switching branches.
 - **Claim deps and migration numbers in `docs/TRACKS.md` before starting** — one dependency-adding
-  item per wave, and migration numbers agreed up front.
+  item per wave, and migration numbers agreed up front. `start-item.sh` reads the registry from
+  **every active `origin` branch** (a claim lives on its branch until merge, so reading only
+  `origin/master` was blind to every claim that mattered), ignores rows whose branch is deleted or
+  merged, and `--deps` **exits** on a live claim rather than warning. No override flag: if the
+  holding branch is abandoned, delete it or drop its row. `scripts/tracks.py claims` lists what is
+  live.
 - **Merge `master` into every active branch daily**: `scripts/sync-worktrees.sh --merge` from the
   main checkout. Reaching a merge 20 commits behind is how one branch pays for all of them at once.
 - Branch → PR → **GPT cross-model review** → address findings → merge → `scripts/finish-item.sh
@@ -96,8 +101,10 @@ outlier is worse than either consistent policy.
   mechanical and leaves *deliberate choices* and *risk areas* as TODOs for you to write, which is
   the part that decides whether the review takes one round or six. It **runs the four gates and
   refuses to emit anything if one fails** — it used to assert they passed without checking, which
-  is how a review request could open with a falsehood. `--no-verify` skips them and says so in the
-  output. `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
+  is how a review request could open with a falsehood. It also **requires a clean working tree**:
+  the gates run against the tree while the diff comes from `HEAD`, so with uncommitted work it
+  would report a pass for code the reviewer is never shown. `--no-verify` skips both and says so in
+  the output. `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
   Do **not** run `gh pr merge --delete-branch`: it fails while the branch is checked out in a
   sibling worktree. Merge, then `finish-item.sh`.
 - **Fuzz pure functions before the first review.** Any hash, tiebreak, canonicalizer or validator
@@ -162,10 +169,15 @@ tests.**
   number in `docs/TRACKS.md` before writing the file. `.github/scripts/check-migrations.sh` gates
   uniqueness, contiguity, and the immutability of any migration already on master — but only
   because master requires up-to-date branches; the gate is blind to a collision it never sees.
-  The `TRACKS.md` claim is advisory (it lives on a branch until that branch merges), so the
+  **Migration claims in `TRACKS.md` are still advisory** — nothing reads that column — so the
   check is the enforcement, not the registry.
 - **`uv.lock` serializes tracks.** Any item adding a dependency (AskNews, Exa) conflicts messily
   with another doing the same. One dependency-adding item per wave, claimed in `docs/TRACKS.md`.
+  Unlike migration numbers, the **dependency** claim is checked: `scripts/tracks.py` reads the
+  registry off every active `origin` branch and `start-item.sh --deps` refuses to start while a
+  live claim exists. A malformed Worktrees table or an unresolvable branch unique to an unmerged
+  ref is a hard failure; only a row already present on master proves that a deleted branch is a
+  stale landed claim.
 - **M1-401 is more than its one-line title** — it also applies the forecaster-prompt v1.1.0 patch
   from `CLAUDE_CODE_PROMPT.md` § B and re-hashes.
 - **`content_sha256` raises on a lone surrogate** (`hashing.py`, found by `tests/property/`).

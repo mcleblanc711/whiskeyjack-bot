@@ -290,13 +290,53 @@ def _status(rows: list[dict[str, str]], item_id: str | None) -> int:
     return 0
 
 
+def _classify(branch: str | None) -> int:
+    """Expose ``_classify_branch`` to the shell, so the contract has one home.
+
+    ``finish-item.sh`` used to re-implement branch discovery as two globs
+    (``feat/<id>-*``, ``fix/<id>-*``). That silently disagreed with this file on three
+    axes at once -- three prefixes, every upper-case spelling, and the no-slug form -- so
+    seven of the eleven branch shapes the gate accepts could be merged and then never
+    cleaned up (cross-model review, round 2). A second implementation of a contract is a
+    second thing to keep in step, so there is no second implementation.
+
+    With a branch: prints ``<disposition>\\t<subject>``, exit 1 for ``unknown``. Without
+    one: reads branch names from stdin and prints ``<disposition>\\t<subject>\\t<branch>``
+    per line, so classifying a whole repo costs one process. The batch form exits 0 as
+    long as it read its input -- ``unknown`` branches are a normal part of any repo, and
+    the caller filters on the disposition column.
+    """
+    if branch is not None:
+        disposition, subject = _classify_branch(branch.strip())
+        print(f"{disposition}\t{subject}")
+        return 1 if disposition == "unknown" else 0
+
+    for line in sys.stdin:
+        candidate = line.strip()
+        if not candidate:
+            continue
+        disposition, subject = _classify_branch(candidate)
+        print(f"{disposition}\t{subject}\t{candidate}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("command", choices=("lint", "gate", "status"))
-    parser.add_argument("item", nargs="?", help="item ID, for `status`")
+    parser.add_argument("command", choices=("lint", "gate", "status", "classify"))
+    parser.add_argument(
+        "item",
+        nargs="?",
+        help="item ID for `status`; branch name for `classify` (else read from stdin)",
+    )
     args = parser.parse_args(argv)
+
+    # Before _read_rows(): classification is a pure function of the branch name, and
+    # making it depend on the CSV would couple `finish-item.sh` to a file it does not
+    # need -- including in the temp repositories its tests build.
+    if args.command == "classify":
+        return _classify(args.item)
 
     rows = _read_rows()
 

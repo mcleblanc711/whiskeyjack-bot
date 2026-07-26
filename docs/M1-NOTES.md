@@ -618,3 +618,117 @@ only ISO strings, which cannot carry `datetime.fold`. Both now generate the real
 already `timezone.utc`, so the round-3 bug's input class is finally fuzzed rather than only
 unit-tested. And `finish-item.sh` read the backlog status before fast-forwarding master, printing
 a pre-merge `In Review` under the word "now".
+
+### Workflow hardening — cross-model review round 2
+
+Four blocking findings, all reproduced before anything was changed. The theme is sharper than
+round 1's: each of the four mechanisms *claimed* to enforce something it never observed. A check
+that cannot see the state it guards is not a weak check, it is a false one — and three of these
+four had a comment in the file cheerfully describing the hole.
+
+**1 — The claims registry could not see a live claim.** Round 1 moved the `TRACKS.md` read from
+the working copy to `origin/master`, which was the wrong axis: a claim lives on its *own branch*
+until that branch merges, so master is precisely where it is not. The registry was therefore blind
+for the entire lifetime of every claim it existed to record. New `scripts/tracks.py` scans
+`docs/TRACKS.md` across every `refs/remotes/origin/*` plus master, and keeps a row only if its
+branch is still live — the remote ref exists and is not yet an ancestor of `origin/master`. That
+liveness test is what made a hard failure affordable: rows outlive their branches by design
+(`finish-item.sh` tells you to sweep them on your next branch), so without it a merged claim would
+have blocked the next track forever. **Owner decision: `--deps` exits, with no override flag.** If
+the holding branch is genuinely abandoned, delete the branch or drop the row — both are honest
+edits to the registry, and neither is a habit that forms by reflex. Two secondary defects died
+with the old detector: `grep -qi '| *yes *|'` matched a `| yes |` anywhere in the file (the
+Standing claims table included) and missed `Yes (uv.lock)`. Parsing is now scoped to the Worktrees
+section, and an unrecognized deps cell counts as a claim. A row with no readable Branch cell counts
+as live, and a registry unreadable on every ref fails the check: "I could not tell" is not evidence
+that the slot is free. The residual window is now one thing only, and `TRACKS.md` names it —
+between running `start-item.sh` and pushing your row, nobody else can see it.
+
+**2 — A dirty tree produced a truthfully-worded false review request.** The four gates run against
+the working tree; the diff is built from `origin/master...HEAD`. Those are the same code only when
+the tree is clean, so an uncommitted fix yielded four honest passes for a change the reviewer was
+never shown — and an untracked test file changes what pytest collects while appearing in no diff at
+all. `review-request.py` now requires a clean tree before verifying. `--no-verify` remains the one
+way through, because it claims nothing; on a dirty tree its banner gains a second line rather than
+staying quiet about the second reason to distrust the request.
+
+**3 — Branch discovery disagreed with the branch contract.** `finish-item.sh` globbed
+`feat/<id>-*` and `fix/<id>-*` while `check_backlog.py` accepted five prefixes, any casing, and a
+bare `feat/<id>` with no slug. Seven of the eleven forms the gate would merge could never be
+cleaned up afterwards — a branch that passes CI and then strands its own worktree. Fixed by
+deleting the second implementation rather than syncing it: a new `check_backlog.py classify`
+subcommand exposes `_classify_branch` to the shell (single branch, or a batch on stdin so one
+process classifies a whole repo), and `finish-item.sh` filters its output. Verified by comparison
+— against five branch forms the old globs found one and `classify` finds all five.
+
+**4 — The allowlist bypassed the operator it named as the boundary.** `Bash(scripts/*)` reached
+`finish-item.sh --delete-remote` and its `git push origin --delete` with no prompt, while
+`git push` and `gh pr merge` were excluded by intent. That is the same defect as round 1's
+`Bash(uv run *)` one level up, and the file's own comment documented it as accepted. There are now
+no directory wildcards over `scripts/` and no interpreter wildcards; scripts are listed one at a
+time, and `finish-item.sh` is deliberately absent, so it prompts once per merge.
+
+**Beyond the review, in the same lines.** `finish-item.sh --delete-remote` proved only that the
+*local* ref was merged, then deleted the *remote* one — so a review fix pushed from another machine
+was deleted on the strength of a stale local ref. The remote-side ancestor proof now runs before
+anything is removed, so a refusal cannot land halfway. `start-item.sh` validated the backlog row
+against a possibly-stale on-disk CSV *before* fetching (GPT's non-blocking note); it now fetches
+first and falls back to `origin/master`'s copy, read into a variable rather than piped into
+`grep -q`, since grep's early exit SIGPIPEs `git show` and pipefail would turn a found row into a
+failure. And its lint call no longer redirects stdout to `/dev/null`, which was hiding every
+problem detail and showing only the count.
+
+**Tests.** `tests/unit/test_tracks.py` (parsing table, liveness table, and the cross-branch scan
+run for real against a throwaway repo with a local bare `origin`), `tests/unit/test_finish_item.py`
+(every mergeable branch form cleaned up end to end, plus the refusals), `tests/unit/
+test_review_request.py`, and `classify` cases added to `tests/unit/test_check_backlog.py`. The
+first and second are integration tests on purpose: both defects lived in the disagreement *between*
+two internally-consistent components, which no unit test of either one can see. 503 → 612 tests.
+
+### Workflow hardening — cross-model review round 3
+
+Two blocking findings, both false-safe paths in mechanisms whose purpose is to stop an unsafe
+workflow before it starts.
+
+**1 — A malformed claim registry read as an empty registry.** `parse_claims()` returned `[]` for
+a misspelled Worktrees heading, a missing table and a ragged row; `_scan()` then called the ref
+readable and `deps` exited successfully. A typo in a claim's Branch cell also made `is_live()`
+classify it as stale even when the containing ref was still active. Parsing now returns claims and
+structural problems separately, and every readable unmerged ref is validated. Failure to enumerate
+remote refs also blocks instead of becoming an empty ref set. An unknown branch
+whose exact row exists on master is a stale landed claim; an unknown row unique to an unmerged ref
+is invalid and blocks. That provenance distinction preserves cleanup after a merged branch is
+deleted without turning a typo into evidence that the dependency slot is free.
+
+**2 — The remaining script wildcard bypassed the outward-action prompt.** Although direct `git
+push` and the top-level `scripts/*` wildcard were gone, `Bash(bash .github/scripts/*)` could run a
+newly-created helper containing `git push` without prompting. It is replaced by exact entries for
+the migration and tracked-artifact checks; a regression test rejects script-directory wildcards.
+
+**Tests.** Command-level throwaway-repository tests cover the exact singular-heading and mistyped
+cases the review named, plus ragged tables, a deleted branch whose row landed on master, and a
+forced failure of remote-ref enumeration. `tests/unit/test_claude_settings.py` pins the allowlist
+shape. 612 → 624 tests.
+
+**Three follow-ups found while verifying round 3, fixed in the same commit.**
+
+*The registry could not bootstrap itself.* `_scan()` treated an unreadable
+`origin/master:docs/TRACKS.md` as a broken registry, but on the branch that *introduces*
+`TRACKS.md` the file is legitimately not on master yet. So both subcommands exited 1 in this very
+repository, and because `start-item.sh` runs them under `set -euo pipefail`, no item could be
+started until this branch merged — the tool was unusable on the branch that added it. Every
+throwaway-repo test missed it by seeding the registry onto master first. `_scan()` now separates
+"`origin/master` does not resolve" (a problem) from "it resolves and carries no registry" (a
+`NOTE:` on stderr, exit 0), and claims are read from the open branches meanwhile. This does not
+soften the check: with no master rows, the landed-stale-claim exception has nothing to match, so
+every unknown branch still fails closed, and a live dependency claim on a branch still blocks.
+
+*The allowlist regression test covered one round of two.* It asserted only the absence of round
+2's `scripts/*`, leaving round 1's interpreter wildcards — the exact defect the file's own comment
+opens by describing — pinned by nothing. It now also rejects interpreter wildcards by name and by
+shape (any rule whose last token before `*` is an interpreter), asserts `git push` / `gh pr create`
+/ `gh pr merge` / `gh release` are absent, and asserts `finish-item.sh` appears in no rule.
+
+*`is_live()` took an `existing` argument it never read.* Existence needs the cross-ref provenance
+only `live_claims()` has, so the parameter made a half-test look like the whole liveness test.
+Dropped, and its docstring now says why existence is decided elsewhere.
