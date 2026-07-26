@@ -7,7 +7,6 @@ hand, over four round-trips. Stated as invariants, one local run covers all of t
 from __future__ import annotations
 
 import itertools
-import random
 
 from hypothesis import given, strategies as st
 from strategies import persisted, research_documents, round_trip
@@ -71,15 +70,21 @@ def test_survivor_is_an_input_with_the_minimal_key(documents: list[ResearchDocum
         assert _sort_key(survivor) == min(_sort_key(d) for d in group)
 
 
-@given(DOCUMENT_LISTS, st.randoms(use_true_random=True))
+@given(DOCUMENT_LISTS, st.data())
 def test_deduplicate_is_permutation_invariant(
-    documents: list[ResearchDocument], rng: random.Random
+    documents: list[ResearchDocument], data: st.DataObject
 ) -> None:
     """Round 1, finding 2: the survivor must not depend on the order the providers
     happened to return documents in. Output *order* is first-seen by contract; the
-    surviving set and the collapsed count are not order-dependent at all."""
-    shuffled = list(documents)
-    rng.shuffle(shuffled)
+    surviving set and the collapsed count are not order-dependent at all.
+
+    The permutation is drawn from hypothesis, not from ``st.randoms(use_true_random=
+    True)``: a true-random shuffle is invisible to the engine, so under the CI
+    profile's ``derandomize=True`` a failure here would neither replay nor shrink --
+    the one property whose counterexample is an ordering would arrive as an
+    unreproducible ordering (cross-model review, round 1).
+    """
+    shuffled = data.draw(st.permutations(documents))
     original = deduplicate(documents)
     reordered = deduplicate(shuffled)
     assert original.collapsed_count == reordered.collapsed_count

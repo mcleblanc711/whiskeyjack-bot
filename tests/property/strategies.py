@@ -5,12 +5,20 @@ These are the "keep myself honest" property tests, not Codex's acceptance layer
 property, things a local fuzzer finds in one run: M1-305's survivor tiebreak took
 five rounds on a single function -- a lone-surrogate raise, then ``datetime.fold``,
 then astral-vs-surrogate-pair spelling -- and each of those is an invariant, not an
-example. The strategy below generates exactly those input classes.
+example. The strategies below generate exactly those input classes.
+
+A later review found this docstring had been describing coverage the strategies did
+not have: the astral/surrogate-pair "pair" was one literal written twice, and
+``TIMESTAMPS`` held only ISO strings, which cannot carry ``fold``. Both are now
+generated for real. If you weaken a strategy, weaken the claim in the same commit --
+a fuzzer that documents properties it never exercises is worse than no fuzzer, because
+it is read as evidence.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from hypothesis import strategies as st
@@ -34,7 +42,15 @@ HOSTILE_TEXT = st.one_of(
         [
             "\ud800",
             "😀",
-            "\U0001f600",
+            # An astral scalar and its UTF-16 surrogate-pair spelling. Both have to
+            # be spelled out: the second used to be another astral literal, so the
+            # pair this file claims to generate was the same string twice and the
+            # distinction was never produced (cross-model review, round 1).
+            # json.dumps(ensure_ascii=True) escapes both to the same two \\uXXXX
+            # units and json.loads recombines the pair, so they persist and replay
+            # as one scalar -- which is exactly why the tiebreak keys on the
+            # persisted form and must treat them as equal.
+            "\ud83d\ude00",
             "resumé",
             "resumé",
             "  spaced \n out  ",
@@ -65,7 +81,7 @@ URLS = st.sampled_from(
     ]
 )
 DIGESTS = st.sampled_from(["a" * 64, "b" * 64, "c" * 64])
-TIMESTAMPS = st.sampled_from(
+_TIMESTAMP_STRINGS = st.sampled_from(
     [
         "2026-07-17T00:00:00+00:00",
         "2026-07-17T00:00:00+01:00",
@@ -73,6 +89,26 @@ TIMESTAMPS = st.sampled_from(
         "2026-07-18T12:30:00+00:00",
     ]
 )
+
+# ...and the same instants as aware datetime *objects*, carrying both values of
+# ``datetime.fold``.
+#
+# This exists because the string strategy above cannot produce fold at all: an ISO
+# string has nowhere to put it, so the suite was fuzzing everything except the field
+# whose round-3 bug the replay-stability property is named after (cross-model review,
+# round 1). fold does survive the schema when the value arrives as an object --
+# ``_to_utc`` calls ``astimezone(timezone.utc)``, and CPython returns ``self``
+# unchanged when the tzinfo is already that instance, so ``fold=1`` reaches the model
+# intact. It is then dropped by ``isoformat``, which is the whole point: two documents
+# differing only in fold have identical persisted forms and must key identically, or a
+# replay picks a different survivor than the live run did.
+_FOLDED_DATETIMES = st.builds(
+    lambda spec, fold: datetime(*spec, tzinfo=timezone.utc, fold=fold),
+    st.sampled_from([(2026, 7, 17, 0, 0), (2026, 7, 16, 23, 0), (2026, 7, 18, 12, 30)]),
+    st.sampled_from([0, 1]),
+)
+
+TIMESTAMPS = st.one_of(_TIMESTAMP_STRINGS, _FOLDED_DATETIMES)
 RELIABILITY_TAGS = st.sampled_from(
     ["official_primary", "verified_org", "journalist", "unverified_social"]
 )

@@ -1,12 +1,30 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": [
+    "What this list is: permission-prompt reduction for the commands this project runs",
+    "constantly, narrowed to the actual invocations. What it is NOT: a sandbox or a",
+    "security boundary. Rules are prefix-matched, so the earlier `Bash(uv run *)` and",
+    "`Bash(python3 *)` entries matched `uv run git push` and any Python subprocess --",
+    "an outward action reached through an allowlisted interpreter (cross-model review,",
+    "round 1). Narrowing removes that specific hole and keeps the blast radius small,",
+    "but `Bash(scripts/*)` still covers finish-item.sh --delete-remote, which pushes a",
+    "branch deletion. Nothing here can stop a cooperating agent from reaching the",
+    "network; git push, gh pr create and gh pr merge are absent by intent, and the real",
+    "boundary on outward actions is the operator. Add exact commands as they come up",
+    "rather than widening a prefix back out to an interpreter."
+  ],
   "permissions": {
     "allow": [
-      "Bash(uv run *)",
+      "Bash(uv run pytest*)",
+      "Bash(uv run ruff *)",
+      "Bash(uv run mypy *)",
+      "Bash(uv run whiskeyjack-bot *)",
+      "Bash(uv run python scripts/backlog_xlsx.py*)",
       "Bash(uv sync *)",
       "Bash(uv sync)",
       "Bash(uv lock *)",
-      "Bash(python3 *)",
+      "Bash(python3 .github/scripts/check_backlog.py *)",
+      "Bash(python3 scripts/review-request.py *)",
       "Bash(scripts/*)",
       "Bash(bash scripts/*)",
       "Bash(bash .github/scripts/*)",

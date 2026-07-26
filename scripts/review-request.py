@@ -7,8 +7,13 @@ diffstat and the branch diff -- are generated. The two sections that actually ea
 short review (deliberate choices, risk areas) are emitted as TODO placeholders,
 because those are judgment and a template cannot fake them.
 
+Running it also runs the four toolchain gates and refuses to emit anything if one
+fails, so the request cannot claim a green branch that is not green. ``--no-verify``
+skips them and says so in the output rather than going quiet.
+
     scripts/review-request.py M1-303 > GPT_REVIEW_REQUEST_M1-303.md   # gitignored
     scripts/review-request.py M1-303 --round 2 | xclip -selection clipboard
+    scripts/review-request.py M1-303 --no-verify   # explicit "gates not run" banner
 
 These files are scaffolding and are never committed (.gitignore: GPT_REVIEW_*). The
 durable record of what shipped and why is docs/M1-NOTES.md and the per-epic notes.
@@ -42,9 +47,23 @@ PROJECT_CONTEXT: Final = """\
 product is an **attribution ledger**: an immutable, replayable SQLite record of every
 forecast, its evidence, approvals, submission attempts, resolutions and scores.
 Competing is the venue; attribution is the point. Python 3.11, `src/` layout,
-offline-first (tests run with sockets disabled). The toolchain gates are `pytest`,
-`ruff check`, `ruff format --check` and `mypy --strict src`, all of which pass on this
-branch."""
+offline-first (tests run with sockets disabled)."""
+
+# The four gates, run for real before the request is emitted. This used to be a
+# sentence in PROJECT_CONTEXT asserting they all passed -- a claim the script never
+# checked, so running it on a red branch produced a review request that opened with a
+# falsehood (cross-model review, round 1). A generator may not assert what it has not
+# verified: either it runs them, or it says it did not.
+GATES: Final = (
+    ("pytest", ("uv", "run", "pytest", "-q")),
+    ("ruff check", ("uv", "run", "ruff", "check", ".")),
+    ("ruff format --check", ("uv", "run", "ruff", "format", "--check", ".")),
+    ("mypy --strict src", ("uv", "run", "mypy", "--strict", "src")),
+)
+
+NOT_VERIFIED: Final = """\
+> **NOT VERIFIED.** This request was generated with `--no-verify`; the toolchain gates
+> were **not** run for it. Treat any claim about test or type status as unsubstantiated."""
 
 STANDING_CONVENTIONS: Final = """\
 - **Error hygiene.** Every module owns a sanitized exception (`ConfigError`,
@@ -95,6 +114,41 @@ def _run(*args: str) -> str:
     return result.stdout
 
 
+def _verify_gates() -> str:
+    """Run the four toolchain gates; return the section text, or exit if any fails.
+
+    Refusing to emit is the point. A cross-model review request costs a round-trip and
+    the reviewer's attention, and sending one for a branch whose tests are red spends
+    both on a finding the author could have had in a minute. Failures go to stderr;
+    stdout stays clean so a redirect never captures a half-written request.
+    """
+    lines: list[str] = []
+    failures: list[str] = []
+
+    for label, command in GATES:
+        print(f"  running {label} ...", file=sys.stderr, flush=True)
+        result = subprocess.run(
+            command, cwd=REPO_ROOT, capture_output=True, text=True, check=False, encoding="utf-8"
+        )
+        if result.returncode == 0:
+            lines.append(f"- `{label}` — **pass**")
+        else:
+            lines.append(f"- `{label}` — **FAIL**")
+            failures.append(label)
+            tail = (result.stdout + result.stderr).strip().splitlines()[-20:]
+            print(f"\n--- {label} failed ---", file=sys.stderr)
+            print("\n".join(tail), file=sys.stderr)
+
+    if failures:
+        raise SystemExit(
+            f"\nFAIL: {', '.join(failures)} did not pass, so no review request was written.\n"
+            "Fix the branch first. To send the request anyway, re-run with --no-verify; it "
+            "will say plainly that the gates were not run."
+        )
+
+    return "\n".join(lines)
+
+
 def _load(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
@@ -121,6 +175,11 @@ def main(argv: list[str] | None = None) -> int:
         "--base", default="origin/master", help="diff base (default: origin/master)"
     )
     parser.add_argument("--round", type=int, default=1, help="review round (default: 1)")
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip the four toolchain gates; the request then says so explicitly",
+    )
     args = parser.parse_args(argv)
 
     item_id = args.item.strip().upper()
@@ -131,6 +190,10 @@ def main(argv: list[str] | None = None) -> int:
             f"FAIL: {item_id} has no row in docs/backlog/backlog.csv. "
             "Add the row before requesting a review."
         )
+
+    # Before anything reaches stdout: a failed gate must leave no partial request
+    # behind for a shell redirect to capture.
+    gate_status = NOT_VERIFIED if args.no_verify else _verify_gates()
 
     branch = _run("git", "rev-parse", "--abbrev-ref", "HEAD").strip()
     diffstat = _run("git", "diff", "--stat", f"{args.base}...HEAD").rstrip()
@@ -157,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
         "",
         f"This is **{item_id}** ({row['Epic']}) on branch `{branch}`, diffed against "
         f"`{args.base}`.",
+        "",
+        "## Toolchain gate status",
+        "",
+        gate_status,
         "",
         "## Authoritative spec",
         "",

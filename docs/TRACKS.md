@@ -7,6 +7,17 @@ worktree is created, not discovered afterwards.
 Edit this file on your own branch and merge it like anything else. It is a claims
 registry, not a status board: the backlog CSV is the record of what is done.
 
+**The registry is advisory, and it is worth being precise about why.** A claim lives on
+a branch until that branch merges, so two tracks started before either has pushed can
+both read a slot as free and both take it — the registry narrows the window, it does not
+close it. `scripts/start-item.sh` reads it from `origin/master` after fetching, and
+prints your claim row before it creates the worktree, so the window is "between two
+`start-item.sh` runs" rather than "between two merges". What actually *enforces* the
+outcome is downstream: `.github/scripts/check-migrations.sh` fails a duplicate or
+mutated migration number at merge (master requires branches to be up to date, so that
+check runs against the base that will really be merged), and two branches editing
+`uv.lock` conflict loudly. Treat a claim here as coordination, not as a lock.
+
 ## Standing claims
 
 | Claim | Held by | Notes |

@@ -562,3 +562,59 @@ changes any existing digest (the inputs in question currently raise rather than 
 a strict `xfail` in `tests/property/test_canonical_properties.py` so it converts to a hard failure
 the moment it is fixed. **Not** fixed on the branch that found it: that would be scope creep into
 M1-301's module from a workflow chore.
+
+### Workflow hardening — cross-model review round 1
+
+GPT returned CHANGES REQUESTED with five blocking findings. All five reproduced against the
+repo before anything was changed; none were speculative. Two were false claims the tooling
+itself made, which is the category worth being loudest about: a gate that reports success it
+did not establish is worse than no gate, because it is read as evidence.
+
+**1 — The Done-flip gate had two live false-greens.** `BRANCH_PATTERN` was anchored to lower
+case and to `feat|fix`, and every non-matching branch was *skipped*, so `feat/M1-303-x` and
+`feature/m1-303-x` both exited 0 while M1-303 read `Not Started`. The classification now lives
+in `_classify_branch()` — a pure function, which is why it can be tested at all — and sorts into
+item / infrastructure / unrecognized, with **unrecognized failing**. Owner decision: fail closed.
+The cost is that a branch like `chris/experiment` cannot open a PR without a rename or a one-line
+addition to `SKIP_PREFIXES`; the benefit is that no future prefix silently skips.
+`tests/unit/test_check_backlog.py` holds the branch-name table, including GPT's exact
+counterexamples. A branch with no `/` at all is unrecognized too — a bare `chore` used to match
+the skip list on the strength of its whole name (found while writing that table, not by review).
+
+**2 — The migration gate could be bypassed by a stale check.** `check-migrations.sh` compares
+against the `origin/master` of its own run, but master had `required_status_checks.strict =
+false`, so PR A and PR B could each add an `003_*.sql` off the same base, both go green, and B
+merge on its old result. The two files merge cleanly and only collide at runtime. Owner decision:
+`strict: true` on master (set via the `required_status_checks` sub-resource, so `enforce_admins`
+survived). The script's header now records that its central claim depends on that setting.
+
+**3 — The claims registry is advisory, and now says so.** `start-item.sh` read `TRACKS.md` from
+the working copy (which goes stale) and printed the claim row *after* creating the worktree. It
+now reads `git show origin/master:docs/TRACKS.md` after fetching, and prints the claim first.
+Deliberately **not** fixed: the underlying race. A shared atomic reservation means pushing a claim
+commit to a protected branch before every item, which is heavier than the collision it prevents in
+a repo where one person serializes the tracks. `TRACKS.md` now states plainly that it is
+coordination, not a lock, and names `check-migrations.sh` and `uv.lock` conflicts as the actual
+enforcement.
+
+**4 — `review-request.py` asserted the gates passed without running them.** The sentence lived in
+`PROJECT_CONTEXT`, so generating a request on a red branch produced a document opening with a
+falsehood. It now runs all four gates and **exits non-zero with nothing on stdout** if any fail —
+verified by injecting a failing test and confirming a zero-byte redirect. `--no-verify` emits an
+explicit NOT VERIFIED banner rather than going quiet.
+
+**5 — The permission allowlist did not preserve the boundary it implied.** Rules are
+prefix-matched, so `Bash(uv run *)` matched `uv run git push` and `Bash(python3 *)` matched any
+subprocess. Both are replaced by the specific invocations. The file now records what it is (prompt
+reduction, small blast radius) and what it is not (a sandbox) — `Bash(scripts/*)` still reaches
+`finish-item.sh --delete-remote`, and the boundary on outward actions is the operator.
+
+**Non-blocking, all three accepted.** `st.randoms(use_true_random=True)` contradicted the CI
+profile's `derandomize=True`, so the one property whose counterexample *is* an ordering would have
+arrived unreproducible and unshrinkable — now `st.permutations`. Two strategy claims were
+overstated: the astral/surrogate-pair "pair" was one literal written twice, and `TIMESTAMPS` held
+only ISO strings, which cannot carry `datetime.fold`. Both now generate the real distinction —
+`fold` survives the schema because `_to_utc`'s `astimezone` returns `self` when the tzinfo is
+already `timezone.utc`, so the round-3 bug's input class is finally fuzzed rather than only
+unit-tested. And `finish-item.sh` read the backlog status before fast-forwarding master, printing
+a pre-merge `In Review` under the word "now".

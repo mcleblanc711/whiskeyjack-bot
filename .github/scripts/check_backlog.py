@@ -11,9 +11,13 @@ truth for backlog state since the workbook stopped being tracked):
 
 ``gate``
     The check that exists because the Status flip to ``Done`` was forgotten at merge
-    three times (M1-203, M1-401, M1-305). On a ``feat/<item>-*`` or ``fix/<item>-*``
-    pull request the backlog row for ``<item>`` must already read ``Done``. Draft
-    pull requests and non-item branches (``chore/``, ``docs/``, ``ci/``) are skipped.
+    three times (M1-203, M1-401, M1-305). On an item branch the backlog row for
+    ``<item>`` must already read ``Done``. Draft pull requests and branches whose
+    prefix is on the infrastructure skip list are skipped; **every other branch name
+    fails**, because the first version of this gate skipped anything its pattern did
+    not recognize and a cross-model review found two live false-greens in it
+    (``feat/M1-303-x`` -- upper case -- and ``feature/m1-303-x``). A gate against
+    silently forgetting a step must not itself silently skip.
 
 Standard library only: this runs before ``uv sync`` in CI, and the acceptance column
 carries commas inside quotes, so a shell one-liner cannot parse it safely.
@@ -56,9 +60,43 @@ VALID_OWNERS: Final = frozenset({"Claude Code", "Codex", "Chris", "Chris + Codex
 REQUIRED_CELLS: Final = ("ID", "Epic", "Task", "Description", "Acceptance Criteria")
 
 ID_PATTERN: Final = re.compile(r"[A-Z][0-9]*-[0-9]{3,4}")
-# feat/m1-303-exa-fallback -> M1-303. Only feat/ and fix/ branches name an item;
-# every other prefix is infrastructure work with no backlog row of its own.
-BRANCH_PATTERN: Final = re.compile(r"^(?:feat|fix)/([a-z][0-9]*-[0-9]{3,4})(?:-|$)")
+
+# feat/m1-303-exa-fallback -> M1-303. Matched case-insensitively and across the
+# aliases people actually type: the original pattern was anchored to lower case and
+# to feat|fix alone, so `feat/M1-303-x` and `feature/m1-303-x` fell through to the
+# "not an item branch" arm and reported success on a Not Started row.
+BRANCH_PATTERN: Final = re.compile(r"^([A-Za-z]+)/([A-Za-z][0-9]*-[0-9]{3,4})(?:-|$)")
+
+# Prefixes that name a backlog item. Anything matching one of these *and* the item
+# shape is gated.
+ITEM_PREFIXES: Final = frozenset({"feat", "feature", "fix", "bugfix", "hotfix"})
+
+# Infrastructure work that legitimately has no backlog row. This list is exhaustive
+# by design -- an unrecognized prefix is a failure, not a skip, so adding a new kind
+# of branch is a deliberate edit here rather than an accident nobody notices.
+SKIP_PREFIXES: Final = frozenset(
+    {
+        "chore",
+        "ci",
+        "build",
+        "deps",
+        "dependabot",
+        "docs",
+        "refactor",
+        "release",
+        "revert",
+        "test",
+    }
+)
+
+_RENAME_HINT: Final = (
+    "Rename the branch to <prefix>/<item>-<slug> (prefixes: "
+    + ", ".join(sorted(ITEM_PREFIXES))
+    + ") if it implements a backlog item, or use one of the infrastructure prefixes ("
+    + ", ".join(sorted(SKIP_PREFIXES))
+    + "). If this is a new kind of branch that genuinely owns no backlog row, add its "
+    "prefix to SKIP_PREFIXES in .github/scripts/check_backlog.py in the same PR."
+)
 
 
 def _annotate(level: str, message: str) -> None:
@@ -153,6 +191,34 @@ def _lint(rows: list[dict[str, str]]) -> list[str]:
     return problems
 
 
+def _classify_branch(branch: str) -> tuple[str, str]:
+    """Sort a branch name into ``item`` / ``skip`` / ``unknown``.
+
+    Pure and separate from ``_gate`` so the branch-name table can be tested directly;
+    the classification used to be an inline ``re.match`` inside the gate, which is
+    exactly why its two false-greens went unnoticed until a cross-model review.
+
+    Returns the disposition and its subject: the upper-case item ID for ``item``, the
+    lower-case prefix for ``skip``, and the branch itself for ``unknown``.
+
+    An item-shaped branch under an unlisted prefix is ``unknown`` (fails), and so is a
+    listed item prefix carrying no item ID (``feat/tidy-imports``) -- a branch claiming
+    to implement a feature but naming no backlog row is the case the gate exists for.
+    """
+    prefix, separator, _ = branch.partition("/")
+    if not separator:
+        # No prefix at all: nothing to classify against, so it fails closed rather
+        # than matching a bare branch named `chore` against the skip list.
+        return "unknown", branch
+
+    match = BRANCH_PATTERN.match(branch)
+    if match is not None and prefix.lower() in ITEM_PREFIXES:
+        return "item", match.group(2).upper()
+    if prefix.lower() in SKIP_PREFIXES:
+        return "skip", prefix.lower()
+    return "unknown", branch
+
+
 def _gate(rows: list[dict[str, str]]) -> int:
     branch = os.environ.get("BRANCH_NAME", "").strip()
     if not branch:
@@ -163,16 +229,26 @@ def _gate(rows: list[dict[str, str]]) -> int:
         _annotate("notice", f"backlog-status: {branch} is a draft PR — Done-flip check skipped.")
         return 0
 
-    match = BRANCH_PATTERN.match(branch)
-    if match is None:
+    disposition, subject = _classify_branch(branch)
+
+    if disposition == "skip":
         _annotate(
             "notice",
-            f"backlog-status: {branch} does not name a backlog item "
-            "(only feat/<item>-* and fix/<item>-* do) — Done-flip check skipped.",
+            f"backlog-status: {branch} is {subject}/ infrastructure work with no backlog "
+            "row of its own — Done-flip check skipped.",
         )
         return 0
 
-    item_id = match.group(1).upper()
+    if disposition == "unknown":
+        _annotate(
+            "error",
+            f"backlog-status: {branch} is neither a recognized item branch nor recognized "
+            f"infrastructure work, so the gate cannot tell whether a Done-flip is owed. "
+            f"{_RENAME_HINT}",
+        )
+        return 1
+
+    item_id = subject
     row = next((candidate for candidate in rows if candidate["ID"] == item_id), None)
 
     if row is None:

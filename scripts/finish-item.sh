@@ -58,7 +58,6 @@ if ! git merge-base --is-ancestor "$branch" origin/master; then
   exit 1
 fi
 
-status="$(python3 .github/scripts/check_backlog.py status "$item_id" 2>/dev/null || true)"
 if [[ -d "$worktree" ]]; then
   if [[ -n "$(git -C "$worktree" status --porcelain)" ]]; then
     echo "$worktree has uncommitted changes; refusing to remove it." >&2
@@ -91,6 +90,11 @@ if [[ "$(git rev-parse --abbrev-ref HEAD)" == "master" ]]; then
 else
   echo "Main checkout is not on master; skipping the fast-forward."
 fi
+
+# Read the status *after* the fast-forward, not before. Reading it first reports the
+# pre-merge working tree — typically still 'In Review' — under the word "now", which is
+# the exact confusion this line exists to dispel (cross-model review, round 1).
+status="$(python3 .github/scripts/check_backlog.py status "$item_id" 2>/dev/null || true)"
 
 echo
 echo "Remaining: drop the $item_id row from docs/TRACKS.md on your next branch."

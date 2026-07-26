@@ -7,6 +7,15 @@
 # git merges both cleanly and the collision only surfaces at runtime, against a database
 # that has already recorded one of them. This check makes that a merge-time failure.
 #
+# That last sentence depends on a repository setting, and did not hold when it was first
+# written (cross-model review, round 1). The check compares against the origin/master of
+# the run that produced it, so with stale checks permitted, PR A and PR B could each add
+# an 003_*.sql off the same base, both go green, and B merge on its old result without
+# ever seeing A. master therefore requires branches to be up to date before merging
+# (branch protection: required_status_checks.strict = true), which forces this check to
+# re-run against the base that will actually be merged into. Turning that off silently
+# reopens the collision this script advertises that it closes.
+#
 # Also enforced: a migration that already exists on origin/master is immutable. Editing
 # one changes its recorded checksum and breaks every database that applied the original.
 set -euo pipefail

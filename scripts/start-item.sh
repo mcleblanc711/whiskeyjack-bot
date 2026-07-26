@@ -67,13 +67,38 @@ if git show-ref --quiet --verify "refs/remotes/origin/$branch"; then
   exit 1
 fi
 
-if [[ $adds_deps -eq 1 ]] && grep -qi '| *yes *|' docs/TRACKS.md 2>/dev/null; then
+# Read the registry from origin/master, not the working copy. The main checkout is
+# whatever `master` was last fast-forwarded to, so grepping the file on disk can report
+# a dependency slot as free after another track has already claimed and pushed it
+# (cross-model review, round 1). The fetch above is what makes this current.
+tracks="$(git show origin/master:docs/TRACKS.md 2>/dev/null || true)"
+if [[ -z "$tracks" ]]; then
+  echo "WARNING: could not read docs/TRACKS.md from origin/master; claims unchecked." >&2
+elif [[ $adds_deps -eq 1 ]] && grep -qi '| *yes *|' <<<"$tracks"; then
   echo
-  echo "WARNING: docs/TRACKS.md already shows an active dependency-adding track." >&2
+  echo "WARNING: origin/master's docs/TRACKS.md already shows an active dependency-adding track." >&2
   echo "uv.lock serializes tracks: two items adding dependencies at once merge messily." >&2
   echo "Continuing anyway — check docs/TRACKS.md before you touch pyproject.toml." >&2
   echo
 fi
+
+# Printed before the worktree exists, not after. The registry is advisory — it is a
+# branch-local file, so two tracks started minutes apart can both read "free" and both
+# claim the same slot. Making the claim the first thing you do, against a freshly
+# fetched origin/master, is what keeps the window small; check-migrations.sh and
+# uv.lock conflicts are what actually enforce the outcome.
+cat <<EOF
+
+About to create $worktree (branch $branch, off origin/master).
+
+Claim the track FIRST, in docs/TRACKS.md on the new branch — this row:
+
+  | $item_id | $branch | whiskeyjack-$item_lower | $([[ $adds_deps -eq 1 ]] && echo yes || echo no) | none | $(date -u +%Y-%m-%d) |
+
+If it adds a migration, put the number in that row and in the standing-claims table,
+and push it before you write the .sql file.
+
+EOF
 
 git worktree add -b "$branch" "$worktree" origin/master
 (cd "$worktree" && uv sync)
@@ -83,9 +108,8 @@ cat <<EOF
 Worktree ready: $worktree   (branch $branch, off origin/master)
 
 Next:
-  1. Claim the track in docs/TRACKS.md (on this branch), e.g.
-     | $item_id | $branch | whiskeyjack-$item_lower | $([[ $adds_deps -eq 1 ]] && echo yes || echo no) | none | $(date -u +%Y-%m-%d) |
-  2. Flip $item_id to 'In Review' in docs/backlog/backlog.csv when the PR opens, and to
+  1. cd $worktree
+  2. Add the claim row above to docs/TRACKS.md and commit it.
+  3. Flip $item_id to 'In Review' in docs/backlog/backlog.csv when the PR opens, and to
      'Done' before merge — CI's backlog-status job fails until that flip lands.
-  3. cd $worktree
 EOF

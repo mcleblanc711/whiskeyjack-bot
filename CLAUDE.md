@@ -94,8 +94,10 @@ outlier is worse than either consistent policy.
 - Branch → PR → **GPT cross-model review** → address findings → merge → `scripts/finish-item.sh
   <ITEM>`. Generate the request with `scripts/review-request.py <ITEM>`; it emits everything
   mechanical and leaves *deliberate choices* and *risk areas* as TODOs for you to write, which is
-  the part that decides whether the review takes one round or six. `GPT_REVIEW_*` files are
-  gitignored scaffolding — never commit them.
+  the part that decides whether the review takes one round or six. It **runs the four gates and
+  refuses to emit anything if one fails** — it used to assert they passed without checking, which
+  is how a review request could open with a falsehood. `--no-verify` skips them and says so in the
+  output. `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
   Do **not** run `gh pr merge --delete-branch`: it fails while the branch is checked out in a
   sibling worktree. Merge, then `finish-item.sh`.
 - **Fuzz pure functions before the first review.** Any hash, tiebreak, canonicalizer or validator
@@ -119,11 +121,27 @@ workflow-hardening change; that drifted from the CSV once and made every status 
 edit.) CSVs are CRLF and marked `-text` — rewrite them with a `csv.writer` using
 `lineterminator="\r\n"`, or every row shows as changed.
 
-**Flip the row to `Done` on the branch, before the merge.** CI's `backlog-status` job reads the
-branch name (`feat/<item>-*`), finds the row, and fails while it is anything but `Done`; it skips
-`chore/`/`docs/` branches and draft PRs. Expect it red for most of a branch's life — it is a
-checklist item, which is why it is a separate job from `quality-gate`. An item with no backlog
-row fails the gate outright: add the row, with acceptance criteria, before opening the PR.
+**Flip the row to `Done` on the branch, before the merge.** CI's `backlog-status` job classifies
+the branch name into one of three buckets, and **the third one fails**:
+
+- **Item branch** — `feat|feature|fix|bugfix|hotfix` + `/<item>-<slug>`, matched case-insensitively.
+  The row must read `Done`. Expect this red for most of a branch's life; it is a checklist item,
+  which is why it is a separate job from `quality-gate`. An item with no backlog row fails
+  outright — add the row, with acceptance criteria, before opening the PR.
+- **Infrastructure** — `chore/ ci/ build/ deps/ dependabot/ docs/ refactor/ release/ revert/ test/`.
+  Skipped, along with draft PRs.
+- **Anything else** — **fails**, telling you to rename the branch or add the prefix to
+  `SKIP_PREFIXES` in `.github/scripts/check_backlog.py`. The first version of this gate skipped
+  whatever its pattern missed, and its pattern was anchored to lower case and to `feat|fix`, so
+  `feat/M1-303-x` and `feature/m1-303-x` both reported success on a `Not Started` row. A gate
+  against forgetting a step must not itself skip silently. `tests/unit/test_check_backlog.py`
+  holds the branch-name table; add a case there when you change the rules.
+
+**master requires branches to be up to date before merging** (`required_status_checks.strict`).
+That is not bureaucracy: `check-migrations.sh` compares against the `origin/master` of *its own
+run*, so with stale checks allowed, two PRs off the same base could each add an `003_*.sql`, both
+go green, and the second merge on its old result. Keep syncing daily and the requirement costs
+nothing; turning it off silently reopens that collision.
 
 ### Owner split
 
@@ -142,7 +160,10 @@ tests.**
   branches each adding `003_*.sql` collide — and if the filenames differ (`003_alpha.sql` vs
   `003_beta.sql`) git merges both cleanly and the collision only appears at runtime. Claim the
   number in `docs/TRACKS.md` before writing the file. `.github/scripts/check-migrations.sh` gates
-  uniqueness, contiguity, and the immutability of any migration already on master.
+  uniqueness, contiguity, and the immutability of any migration already on master — but only
+  because master requires up-to-date branches; the gate is blind to a collision it never sees.
+  The `TRACKS.md` claim is advisory (it lives on a branch until that branch merges), so the
+  check is the enforcement, not the registry.
 - **`uv.lock` serializes tracks.** Any item adding a dependency (AskNews, Exa) conflicts messily
   with another doing the same. One dependency-adding item per wave, claimed in `docs/TRACKS.md`.
 - **M1-401 is more than its one-line title** — it also applies the forecaster-prompt v1.1.0 patch
