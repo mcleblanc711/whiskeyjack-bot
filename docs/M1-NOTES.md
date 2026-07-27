@@ -732,3 +732,46 @@ shape (any rule whose last token before `*` is an interpreter), asserts `git pus
 *`is_live()` took an `existing` argument it never read.* Existence needs the cross-ref provenance
 only `live_claims()` has, so the parameter made a half-test look like the whole liveness test.
 Dropped, and its docstring now says why existence is decided elsewhere.
+
+## M1-308 — Account allowlist loader
+
+New `research/allowlist.py`: `AllowlistEntry`/`_AllowlistFile` (pydantic, `extra="forbid"`),
+`AllowlistError`, `AccountAllowlist` (`@dataclass(frozen=True)`) with `lookup_by_username` and
+`match_domain`, and `load_allowlist(path)` mirroring `config.load_config`'s read/parse/validate
+flow (same YAML-error handling, same path-is-the-carve-out rendering). `reliability_tag` reuses
+`research.model.ReliabilityTag` rather than restating it, per that Literal's own comment.
+Username uniqueness is case-insensitive and its violation message names only account indices,
+never the colliding username.
+
+Wired into `env_verify.py` as `_verify_account_allowlist`, run in `verify_environment()` right
+after `_verify_referenced_files` — gated on `retrieval.social.enabled` and the file already
+existing, matching `_verify_prompt_version`'s "skip so a missing file reports one problem, not
+two" convention. This is the "at startup, not at retrieval time" surface the acceptance criteria
+asks for; no `config.py` change was needed since `SocialRetrievalConfig.account_allowlist_path`
+already existed.
+
+**Deliberate scope boundary (owner-confirmed):** `domains` stays free-form `list[str]`, validated
+only for non-emptiness (list and per-element). The 19-tag taxonomy documented in
+`config/x_accounts.yaml`'s header comment is *not* enforced as a closed set in code — the
+acceptance criteria only ask for "non-empty domains", and a code-level taxonomy constant would be
+a second source of truth that could drift from the comment. Only `reliability_tag` gets closed-set
+enforcement (via the existing `ReliabilityTag` Literal).
+
+Verified `match_domain` against the real, committed `config/x_accounts.yaml` for both example
+domains in the acceptance criteria: `econ_data` → `{BLS_gov, BEA_News, stlouisfed, StatCan_eng,
+ONS, EU_Eurostat, IMFNews, EIAgov, Reuters}` (9 accounts), `space_launch` → `{NASA, SpaceX, esa,
+RocketLab, ulalaunch}` (5 accounts).
+
+Property suite (`tests/property/test_allowlist_properties.py`) fuzzes the validation layer
+directly on parsed dicts rather than through file I/O (already covered by the unit tests) —
+same split `test_canonical_properties.py`/`test_dedup_properties.py` use. The "no value leak"
+property is covered deterministically instead of by the fuzzer: every raise in this module is
+either a pydantic error rendered with `include_input=False` or one of the module's own
+constant-shaped, index-only messages, so leak-freedom doesn't depend on which value was
+generated — `tests/unit/test_allowlist.py::test_no_field_leaks_a_planted_secret_through_any_message`
+plants a fixed secret across every field and shape instead. `AllowlistEntry` is not hashable
+(plain `_StrictModel`, not frozen), so the subset property in `test_match_domain_result_is_a_
+subset_and_deterministic` checks identity membership rather than using `set()`.
+
+No migration, no new dependency, no `docs/TRACKS.md` change (already claimed with `none`/`no`),
+no wiring into M1-307 (doesn't exist yet on this branch).

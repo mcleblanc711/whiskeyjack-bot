@@ -19,6 +19,7 @@ from pathlib import Path
 
 from whiskeyjack_bot.config import AppConfig, ConfigError, load_config
 from whiskeyjack_bot.prompt import PromptError, load_prompt
+from whiskeyjack_bot.research.allowlist import AllowlistError, load_allowlist
 
 EXIT_OK = 0
 EXIT_CONFIG_INVALID = 2
@@ -85,6 +86,29 @@ def _verify_referenced_files(config: AppConfig, report: VerificationReport) -> N
             report.filesystem_problems.append(f"{label} does not exist: {path}")
 
 
+def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> None:
+    """Validate the X account allowlist's structure (M1-308).
+
+    Skipped when social retrieval is disabled or the file is already reported missing
+    by _verify_referenced_files, so a missing file reports one problem, not two -- same
+    convention as _verify_prompt_version.
+    """
+    if not config.retrieval.social.enabled:
+        return
+    path = config.retrieval.social.account_allowlist_path
+    if not path.is_file():
+        return
+    try:
+        allowlist = load_allowlist(path)
+    except AllowlistError as exc:
+        # AllowlistError is already sanitized; it never echoes entry content.
+        report.filesystem_problems.append(str(exc))
+        return
+    report.checks_passed.append(
+        f"retrieval.social.account_allowlist_path loads clean: {len(allowlist.entries)} accounts"
+    )
+
+
 def _verify_prompt_version(config: AppConfig, report: VerificationReport) -> None:
     """Cross-check the prompt's declared version against config (M1-401).
 
@@ -125,6 +149,7 @@ def verify_environment(config_path: Path | str) -> VerificationReport:
     report.checks_passed.append(f"config valid: {config_path}")
     _verify_directories(config, report)
     _verify_referenced_files(config, report)
+    _verify_account_allowlist(config, report)
     _verify_prompt_version(config, report)
     _verify_env_vars(config, report)
     return report

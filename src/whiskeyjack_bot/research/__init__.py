@@ -5,6 +5,12 @@ import from here so every provider produces one comparable evidence record.
 Deduplication, freshness-tagging and URL canonicalization are M1-305.
 """
 
+from whiskeyjack_bot.research.allowlist import (
+    AccountAllowlist,
+    AllowlistEntry,
+    AllowlistError,
+    load_allowlist,
+)
 from whiskeyjack_bot.research.asknews import (
     AskNewsRetrieval,
     build_asknews_client,
@@ -34,6 +40,9 @@ from whiskeyjack_bot.research.model import (
 )
 
 __all__ = [
+    "AccountAllowlist",
+    "AllowlistEntry",
+    "AllowlistError",
     "AskNewsRetrieval",
     "CanonicalizationError",
     "DedupResult",
@@ -55,6 +64,7 @@ __all__ = [
     "dedup_key",
     "deduplicate",
     "freshness_cutoff",
+    "load_allowlist",
     "normalize_content",
     "retrieve_news",
     "validate_document",

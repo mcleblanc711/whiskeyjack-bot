@@ -118,6 +118,32 @@ def test_social_enabled_requires_xai_key_and_allowlist(
     assert report.missing_env_vars == ["XAI_API_KEY"]
 
 
+def test_corrupted_allowlist_is_reported_as_filesystem_problem(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_all_env(monkeypatch)
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
+    real_accounts = yaml.safe_load(
+        (REPO_ROOT / "config" / "x_accounts.yaml").read_text(encoding="utf-8")
+    )
+    # Inject a case-insensitive duplicate username into a real, otherwise-valid copy.
+    real_accounts["accounts"].append(dict(real_accounts["accounts"][0]))
+    corrupted = tmp_path / "corrupted_accounts.yaml"
+    corrupted.write_text(yaml.safe_dump(real_accounts), encoding="utf-8")
+
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["retrieval"]["social"]["enabled"] = True
+    data["retrieval"]["social"]["agent_model"] = "grok-fixture"
+    data["retrieval"]["social"]["account_allowlist_path"] = str(corrupted)
+    social = tmp_path / "social.yaml"
+    social.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    report = verify_environment(social)
+    assert report.exit_code == EXIT_ENV_MISSING
+    assert report.missing_env_vars == []
+    assert any("allowlist" in p for p in report.filesystem_problems)
+
+
 def test_missing_prompt_file_is_reported(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
