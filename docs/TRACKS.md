@@ -32,14 +32,14 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Claim | Held by | Notes |
 | --- | --- | --- |
-| Dependency additions (`pyproject.toml` + `uv.lock`) | `M1-303` | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. |
+| Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. Claimed by M1-303 on 2026-07-27 and **released unused**: the Exa adapter calls the HTTP API through `httpx`, already a declared dependency, rather than adding `exa-py` (which would pull in `openai`, `requests` and `python-dotenv` for one POST). Releasing a claim you did not spend is part of holding it. |
 | Next free migration number | `M1-603` | `001_initial.sql`, `002_research_document_fields.sql` are taken; `003` is now claimed by M1-603. Next free is `004`. CI enforces uniqueness and immutability (`.github/scripts/check-migrations.sh`), but only *after* you push. |
 
 ## Worktrees
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-303 | feat/m1-303-exa-fallback | whiskeyjack-m1-303 | yes | none | 2026-07-27 |
+| M1-303 | feat/m1-303-exa-fallback | whiskeyjack-m1-303 | no | none | 2026-07-27 |
 | M1-308 | feat/m1-308-x-account-allowlist | whiskeyjack-m1-308 | no | none | 2026-07-27 |
 | M1-603 | feat/m1-603-lifecycle-events | whiskeyjack-m1-603 | no | 003 | 2026-07-27 |
 
