@@ -72,6 +72,16 @@ def test_validate_raises_only_its_own_error_type(payload: dict[str, object]) -> 
 
 
 @given(_allowlist_payload())
+def test_content_validation_never_produces_a_filesystem_error(payload: dict[str, object]) -> None:
+    """_validate has no file I/O -- every AllowlistError it can raise is a content
+    error (round-3 review finding: filesystem vs. content classification)."""
+    try:
+        _validate(payload)
+    except AllowlistError as exc:
+        assert exc.is_filesystem_error is False
+
+
+@given(_allowlist_payload())
 def test_a_second_validation_pass_agrees_with_the_first(payload: dict[str, object]) -> None:
     """Validation has no hidden state: the same payload is accepted or rejected the
     same way every time."""

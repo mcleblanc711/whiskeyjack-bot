@@ -146,6 +146,65 @@ def test_corrupted_allowlist_is_reported_as_config_problem(
     assert report.filesystem_problems == []
 
 
+def test_disabled_social_with_malformed_allowlist_still_fails_config(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-308 round-3 P1 regression: retrieval.social.enabled stays the committed
+    default (false), but a malformed allowlist at account_allowlist_path must still
+    fail config validation -- the acceptance criterion is unconditional."""
+    set_all_env(monkeypatch)
+    real_accounts = yaml.safe_load(
+        (REPO_ROOT / "config" / "x_accounts.yaml").read_text(encoding="utf-8")
+    )
+    real_accounts["accounts"].append(dict(real_accounts["accounts"][0]))
+    corrupted = tmp_path / "corrupted_accounts.yaml"
+    corrupted.write_text(yaml.safe_dump(real_accounts), encoding="utf-8")
+
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    assert data["retrieval"]["social"]["enabled"] is False
+    data["retrieval"]["social"]["account_allowlist_path"] = str(corrupted)
+    social = tmp_path / "social.yaml"
+    social.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    report = verify_environment(social)
+    assert report.exit_code == EXIT_CONFIG_INVALID
+    assert any("allowlist" in p for p in report.config_problems)
+
+
+def test_unreadable_allowlist_is_reported_as_filesystem_problem(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-308 round-3 P2 regression: a file that exists but can't be read (permission,
+    race) is a filesystem problem, not a config-content one."""
+    set_all_env(monkeypatch)
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
+    unreadable = tmp_path / "unreadable_accounts.yaml"
+    unreadable.write_text(
+        (REPO_ROOT / "config" / "x_accounts.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    original_read_bytes = Path.read_bytes
+
+    def _raise_for_target(self: Path) -> bytes:
+        if self == unreadable:
+            raise PermissionError(13, "Permission denied")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _raise_for_target)
+
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["retrieval"]["social"]["enabled"] = True
+    data["retrieval"]["social"]["agent_model"] = "grok-fixture"
+    data["retrieval"]["social"]["account_allowlist_path"] = str(unreadable)
+    social = tmp_path / "social.yaml"
+    social.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    report = verify_environment(social)
+    assert report.exit_code == EXIT_ENV_MISSING
+    assert any("allowlist" in p for p in report.filesystem_problems)
+    assert report.config_problems == []
+
+
 def test_missing_prompt_file_is_reported(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

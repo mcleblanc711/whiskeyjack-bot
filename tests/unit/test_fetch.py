@@ -187,6 +187,37 @@ def test_cli_fixture_mode_requires_snapshot_path(
     assert "--snapshot" in capsys.readouterr().out
 
 
+def test_cli_fetch_rejects_malformed_allowlist_even_with_social_disabled(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M1-308 round-3 P1 regression: `questions fetch` never calls verify_environment,
+    so it must run its own allowlist preflight -- a malformed committed allowlist must
+    block the command even though retrieval.social.enabled stays the committed default
+    (false), not just when someone happens to run `verify-env` first."""
+    real_accounts = yaml.safe_load(
+        (REPO_ROOT / "config" / "x_accounts.yaml").read_text(encoding="utf-8")
+    )
+    real_accounts["accounts"].append(dict(real_accounts["accounts"][0]))
+    corrupted = tmp_path / "corrupted_accounts.yaml"
+    corrupted.write_text(yaml.safe_dump(real_accounts), encoding="utf-8")
+
+    data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    data["model"]["name"] = "openrouter/test-model"
+    data["logging"]["file"] = str(tmp_path / "logs" / "bot.jsonl")
+    assert data["retrieval"]["social"]["enabled"] is False
+    data["retrieval"]["social"]["account_allowlist_path"] = str(corrupted)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    exit_code = main(
+        ["questions", "fetch", "--config", str(config_path), "--snapshot", str(SNAPSHOT)]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "allowlist" in captured.out
+    assert "Traceback" not in captured.out
+
+
 # ── live mode ────────────────────────────────────────────────────────────────
 
 

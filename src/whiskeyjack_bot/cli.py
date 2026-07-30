@@ -10,8 +10,12 @@ import argparse
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from whiskeyjack_bot import __version__
+
+if TYPE_CHECKING:
+    from whiskeyjack_bot.config import AppConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,8 +83,26 @@ def _run_verify_env(config_path: Path) -> int:
     return report.exit_code
 
 
+def _load_verified_config(path: Path) -> AppConfig:
+    """``load_config()`` plus the unconditional allowlist structural check (M1-308).
+
+    Every config-consuming command must call this instead of ``load_config()``
+    directly: it is the boundary that makes a malformed committed allowlist fail
+    here, for every command -- not just ``verify-env``, and not only when
+    ``retrieval.social.enabled`` happens to be true. Raises ``ConfigError`` or
+    ``AllowlistError``; callers handle both the same way ``verify-env`` does.
+    """
+    from whiskeyjack_bot.config import load_config
+    from whiskeyjack_bot.env_verify import load_and_verify_account_allowlist
+
+    config = load_config(path)
+    load_and_verify_account_allowlist(config)
+    return config
+
+
 def _run_questions_fetch(args: argparse.Namespace) -> int:
-    from whiskeyjack_bot.config import ConfigError, load_config
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING
     from whiskeyjack_bot.logging_setup import configure_logging
     from whiskeyjack_bot.metaculus.client import MissingCredentialError
     from whiskeyjack_bot.metaculus.fetch import (
@@ -88,12 +110,16 @@ def _run_questions_fetch(args: argparse.Namespace) -> int:
         fetch_open_questions_live,
     )
     from whiskeyjack_bot.metaculus.snapshots import SnapshotError, save_snapshot
+    from whiskeyjack_bot.research.allowlist import AllowlistError
 
     try:
-        config = load_config(args.config)
+        config = _load_verified_config(args.config)
     except ConfigError as exc:
         print(exc)
-        return 2
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
     configure_logging(config)
 
     tournament_override: int | str | None = args.tournament

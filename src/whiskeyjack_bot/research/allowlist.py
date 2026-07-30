@@ -20,6 +20,11 @@ Error hygiene matches every other module: :class:`AllowlistError` never echoes s
 values, and :func:`load_allowlist` renders only the *path* it was given (the carve-out this
 project applies uniformly to filesystem paths, alongside ``config.py``, ``ledger.py``,
 ``metaculus/snapshots.py``, ``prompt.py`` and ``env_verify.py``).
+
+:class:`AllowlistError` also carries ``is_filesystem_error``, set only when the file could not
+be read at all. Everything else raised here -- bad UTF-8, malformed YAML, a schema violation --
+is the file's *content* failing to validate, which ``env_verify.py`` and ``cli.py`` route to
+config-invalid rather than environment-missing (see ``env_verify.load_and_verify_account_allowlist``).
 """
 
 from __future__ import annotations
@@ -96,10 +101,17 @@ class AllowlistError(Exception):
     Same hygiene rule as ``ConfigError``/``ResearchSchemaError``: pydantic renders the
     offending input in its message, and an allowlist entry is operator-edited content, so
     consumers print this exception and never a raw ``ValidationError``.
+
+    ``is_filesystem_error`` distinguishes "the file could not be read" (a filesystem/
+    environment concern -- retrying later or fixing permissions can resolve it) from every
+    other case here, which is the file's *content* failing to validate (a config concern,
+    per this item's acceptance criterion). Only the ``read_bytes()`` failure in
+    :func:`load_allowlist` sets it; decode, parse and schema failures are content failures.
     """
 
-    def __init__(self, problems: list[str]):
+    def __init__(self, problems: list[str], *, is_filesystem_error: bool = False):
         self.problems = problems
+        self.is_filesystem_error = is_filesystem_error
         super().__init__("invalid account allowlist:\n" + "\n".join(f"  - {p}" for p in problems))
 
 
@@ -150,9 +162,13 @@ def load_allowlist(path: Path | str) -> AccountAllowlist:
     try:
         raw_bytes = path.read_bytes()
     except OSError as exc:
+        # from None: OSError's cause chain must not ride along into a formatted
+        # traceback (same rule prompt.py's identical read-failure translation follows);
+        # the message already carries exc.strerror, so nothing is lost.
         raise AllowlistError(
-            [f"cannot read account allowlist {path}: {exc.strerror or exc}"]
-        ) from exc
+            [f"cannot read account allowlist {path}: {exc.strerror or exc}"],
+            is_filesystem_error=True,
+        ) from None
     try:
         raw_text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:

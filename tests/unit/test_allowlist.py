@@ -157,6 +157,40 @@ def test_missing_file_rejected(tmp_path: Path) -> None:
         load_allowlist(tmp_path / "no-such-file.yaml")
 
 
+# --- filesystem vs. content classification (round-2 review findings) ---
+
+
+def test_missing_file_is_classified_as_filesystem_error(tmp_path: Path) -> None:
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(tmp_path / "no-such-file.yaml")
+    assert excinfo.value.is_filesystem_error is True
+
+
+def test_missing_file_error_suppresses_its_cause(tmp_path: Path) -> None:
+    """The read failure must not carry a raw OSError as __cause__ into a traceback."""
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(tmp_path / "no-such-file.yaml")
+    assert excinfo.value.__cause__ is None
+
+
+def test_duplicate_username_is_classified_as_content_error(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        [_base_entry(username="BLS_gov"), _base_entry(username="bls_gov")],
+    )
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert excinfo.value.is_filesystem_error is False
+
+
+def test_invalid_utf8_is_classified_as_content_error(tmp_path: Path) -> None:
+    path = tmp_path / "bad-utf8.yaml"
+    path.write_bytes(b"accounts:\n  - username: \xff\xfe\n")
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert excinfo.value.is_filesystem_error is False
+
+
 # --- secret/value hygiene ---
 
 SECRET = "privateFAKE123456"

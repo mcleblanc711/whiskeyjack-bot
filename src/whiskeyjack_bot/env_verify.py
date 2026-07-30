@@ -2,7 +2,9 @@
 
 Checks, in order: the config file parses and validates (which already rejects
 every invalid live-submit combination, M0-005), required data directories
-exist or can be created, referenced files exist, and every required credential
+exist or can be created, referenced files exist, the X account allowlist is
+structurally valid (M1-308, unconditionally -- see
+``load_and_verify_account_allowlist``), and every required credential
 environment variable is present. Reports environment variable *names* only —
 a value is never read further than a presence/emptiness check and never
 echoed.
@@ -19,7 +21,7 @@ from pathlib import Path
 
 from whiskeyjack_bot.config import AppConfig, ConfigError, load_config
 from whiskeyjack_bot.prompt import PromptError, load_prompt
-from whiskeyjack_bot.research.allowlist import AllowlistError, load_allowlist
+from whiskeyjack_bot.research.allowlist import AccountAllowlist, AllowlistError, load_allowlist
 
 EXIT_OK = 0
 EXIT_CONFIG_INVALID = 2
@@ -86,26 +88,44 @@ def _verify_referenced_files(config: AppConfig, report: VerificationReport) -> N
             report.filesystem_problems.append(f"{label} does not exist: {path}")
 
 
-def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> None:
-    """Validate the X account allowlist's structure (M1-308).
+def load_and_verify_account_allowlist(config: AppConfig) -> AccountAllowlist | None:
+    """Load+validate the account allowlist unconditionally (M1-308 round 3).
 
-    Skipped when social retrieval is disabled or the file is already reported missing
-    by _verify_referenced_files, so a missing file reports one problem, not two -- same
-    convention as _verify_prompt_version. A readable-but-invalid allowlist (duplicate
-    username, unknown reliability tag, ...) is a config-content problem, not a filesystem
-    one, so it goes to config_problems -- unlike a missing/unreadable file, it can never be
-    fixed by waiting for the filesystem to change.
+    Runs regardless of ``retrieval.social.enabled``: the committed default file must
+    always be structurally valid, and a malformed one is a config problem the moment it
+    can be read, not only when the feature happens to be turned on. This is the shared
+    boundary every config-consuming command goes through --
+    ``cli._load_verified_config`` calls it too, not just ``verify-env`` -- so an
+    enabled-but-malformed allowlist can no longer reach a command that never runs
+    ``verify_environment()``.
+
+    Returns ``None`` (skips) only when the path doesn't exist; that stays a filesystem
+    concern owned by ``_verify_referenced_files``, not a content one.
     """
-    if not config.retrieval.social.enabled:
-        return
     path = config.retrieval.social.account_allowlist_path
     if not path.is_file():
-        return
+        return None
+    return load_allowlist(path)
+
+
+def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> None:
+    """Report the account allowlist's structural validity (M1-308).
+
+    A readable-but-invalid allowlist (duplicate username, unknown reliability tag, ...)
+    is a config-content problem, not a filesystem one -- unlike a missing/unreadable
+    file, it can never be fixed by waiting for the filesystem to change -- so it goes to
+    config_problems. An unreadable file (permission, race) is still a filesystem
+    problem; the two are told apart by AllowlistError.is_filesystem_error, not by which
+    function raised it.
+    """
     try:
-        allowlist = load_allowlist(path)
+        allowlist = load_and_verify_account_allowlist(config)
     except AllowlistError as exc:
         # AllowlistError is already sanitized; it never echoes entry content.
-        report.config_problems.append(str(exc))
+        bucket = report.filesystem_problems if exc.is_filesystem_error else report.config_problems
+        bucket.append(str(exc))
+        return
+    if allowlist is None:
         return
     report.checks_passed.append(
         f"retrieval.social.account_allowlist_path loads clean: {len(allowlist.entries)} accounts"
