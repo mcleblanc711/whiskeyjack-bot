@@ -744,11 +744,23 @@ Username uniqueness is case-insensitive and its violation message names only acc
 never the colliding username.
 
 Wired into `env_verify.py` as `_verify_account_allowlist`, run in `verify_environment()` right
-after `_verify_referenced_files` — gated on `retrieval.social.enabled` and the file already
-existing, matching `_verify_prompt_version`'s "skip so a missing file reports one problem, not
-two" convention. This is the "at startup, not at retrieval time" surface the acceptance criteria
-asks for; no `config.py` change was needed since `SocialRetrievalConfig.account_allowlist_path`
-already existed.
+after `_verify_referenced_files` — gated on the file already existing (skip so a missing file
+reports one problem, not two, matching `_verify_prompt_version`'s convention). This is the
+"at startup, not at retrieval time" surface the acceptance criteria asks for; no `config.py`
+change was needed since `SocialRetrievalConfig.account_allowlist_path` already existed.
+
+**Round-2/3 cross-model review fixes.** The first cut gated this check on
+`retrieval.social.enabled` — with the committed default (`false`), a malformed allowlist was
+never checked, and `questions fetch` (the only other config-consuming command) called
+`load_config()` directly and never ran `verify_environment()` at all, so even an *enabled*
+malformed allowlist reached nothing that validated it. Fixed by extracting
+`load_and_verify_account_allowlist(config)`, unconditional on `enabled`, and adding
+`cli._load_verified_config()` as the boundary every config-consuming command must call instead
+of raw `load_config()`. Separately, `AllowlistError` gained `is_filesystem_error` (set only on
+the `read_bytes()` failure) so an unreadable file classifies as a filesystem/`EXIT_ENV_MISSING`
+problem rather than a config/`EXIT_CONFIG_INVALID` one, and that same read-failure raise switched
+from `from exc` to `from None` (matching `prompt.py`'s identical translation) so a raw `OSError`
+no longer rides along as `__cause__`.
 
 **Deliberate scope boundary (owner-confirmed):** `domains` stays free-form `list[str]`, validated
 only for non-emptiness (list and per-element). The 19-tag taxonomy documented in
