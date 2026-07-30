@@ -762,6 +762,29 @@ problem rather than a config/`EXIT_CONFIG_INVALID` one, and that same read-failu
 from `from exc` to `from None` (matching `prompt.py`'s identical translation) so a raw `OSError`
 no longer rides along as `__cause__`.
 
+**Round-4 cross-model review fix.** Round 3 closed the hole for *malformed* allowlists and left it
+open for *absent* ones: `load_and_verify_account_allowlist` returned `None` whenever
+`path.is_file()` was false, regardless of `enabled`, and `cli._load_verified_config` discarded that
+return — so `retrieval.social.enabled: true` plus a nonexistent `account_allowlist_path` started
+`questions fetch` clean and exited 0, deferring the failure to retrieval. The docstring justified
+the skip by delegating absence to `_verify_referenced_files`, which was the false part: that
+function only runs inside `verify_environment()`, which `questions fetch` never calls. Now the
+helper skips in exactly one case — disabled *and* absent — and otherwise calls `load_allowlist`,
+which is deliberately left to raise rather than building a second error here: its `OSError` branch
+is already sanitized, `from None`-chained and `is_filesystem_error=True`, and its `strerror` stays
+accurate across every case `is_file()` collapses into one answer (absent, a directory, a dangling
+symlink, unreadable) — an explicit "does not exist" raise would mislabel three of those four.
+`_verify_referenced_files` gave the allowlist up in the same change, or `verify-env` would print
+two lines for one missing file; `tests/unit/test_env_verify.py::test_enabled_social_with_missing_
+allowlist_is_a_filesystem_problem` asserts `len(filesystem_problems) == 1` to hold that.
+
+Left alone deliberately, and stated in the round-4 review response: `_load_verified_config`
+discards the loaded `AccountAllowlist`, so M1-307 will re-parse — worth wiring where a consumer
+exists, not speculatively here; `_load_verified_config` remains enforced by convention rather than
+by a type, adequate at two commands; and `account_allowlist_path` stays CWD-relative
+(`load_config` never rebases it onto the config file's directory), which this fix makes *loud*
+when enabled instead of a silent skip, but re-resolving it is a config-contract change.
+
 **Deliberate scope boundary (owner-confirmed):** `domains` stays free-form `list[str]`, validated
 only for non-emptiness (list and per-element). The 19-tag taxonomy documented in
 `config/x_accounts.yaml`'s header comment is *not* enforced as a closed set in code — the

@@ -76,11 +76,13 @@ def _verify_directories(config: AppConfig, report: VerificationReport) -> None:
 
 
 def _verify_referenced_files(config: AppConfig, report: VerificationReport) -> None:
+    """Existence-check referenced files that nothing else opens (M0-004).
+
+    The account allowlist is deliberately *not* here: ``_verify_account_allowlist``
+    reaches its absence too (M1-308 round 4), and reporting it in both places gave
+    ``verify-env`` two lines for one missing file.
+    """
     references = {"forecast.prompt_path": config.forecast.prompt_path}
-    if config.retrieval.social.enabled:
-        references["retrieval.social.account_allowlist_path"] = (
-            config.retrieval.social.account_allowlist_path
-        )
     for label, path in references.items():
         if path.is_file():
             report.checks_passed.append(f"{label} exists: {path}")
@@ -99,11 +101,22 @@ def load_and_verify_account_allowlist(config: AppConfig) -> AccountAllowlist | N
     enabled-but-malformed allowlist can no longer reach a command that never runs
     ``verify_environment()``.
 
-    Returns ``None`` (skips) only when the path doesn't exist; that stays a filesystem
-    concern owned by ``_verify_referenced_files``, not a content one.
+    Returns ``None`` (skips) in exactly one case: social retrieval is disabled *and* the
+    file is absent. An absent allowlist while ``enabled`` is true is a hard startup
+    failure (round 4) -- it used to skip here too, on the theory that absence belonged to
+    ``_verify_referenced_files``, but that function only runs inside
+    ``verify_environment()``, so ``questions fetch`` started clean with an enabled social
+    config and no allowlist at all.
+
+    The enabled-and-absent raise is delegated to ``load_allowlist`` rather than built
+    here: its ``OSError`` branch already yields a sanitized, ``from None``-chained,
+    ``is_filesystem_error=True`` error, and its ``strerror`` stays accurate across every
+    case ``is_file()`` collapses into one answer -- absent, a directory, a dangling
+    symlink, unreadable.
     """
-    path = config.retrieval.social.account_allowlist_path
-    if not path.is_file():
+    social = config.retrieval.social
+    path = social.account_allowlist_path
+    if not social.enabled and not path.is_file():
         return None
     return load_allowlist(path)
 

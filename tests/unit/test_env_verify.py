@@ -205,6 +205,47 @@ def test_unreadable_allowlist_is_reported_as_filesystem_problem(
     assert report.config_problems == []
 
 
+def test_enabled_social_with_missing_allowlist_is_a_filesystem_problem(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-308 round-4 P1 regression: an enabled social config whose allowlist file is
+    absent must fail startup, and must say so exactly once -- the missing-file report
+    used to come from _verify_referenced_files, which now leaves it to the loader."""
+    set_all_env(monkeypatch)
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["retrieval"]["social"]["enabled"] = True
+    data["retrieval"]["social"]["agent_model"] = "grok-fixture"
+    data["retrieval"]["social"]["account_allowlist_path"] = str(tmp_path / "no-such-accounts.yaml")
+    social = tmp_path / "social.yaml"
+    social.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    report = verify_environment(social)
+    assert report.exit_code == EXIT_ENV_MISSING
+    assert report.config_problems == []
+    # One problem, not two: only the allowlist loader reports the absent file.
+    assert len(report.filesystem_problems) == 1
+    assert "allowlist" in report.filesystem_problems[0]
+
+
+def test_disabled_social_with_missing_allowlist_is_not_a_problem(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of round-4 P1: absence is only fatal while social is enabled. With
+    the committed default (false) a missing allowlist stays a non-event -- the fix must
+    not turn an optional file into a required one for every operator."""
+    set_all_env(monkeypatch)
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    assert data["retrieval"]["social"]["enabled"] is False
+    data["retrieval"]["social"]["account_allowlist_path"] = str(tmp_path / "no-such-accounts.yaml")
+    social = tmp_path / "social.yaml"
+    social.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    report = verify_environment(social)
+    assert report.exit_code == EXIT_OK
+    assert not any("allowlist" in line for line in report.render().splitlines())
+
+
 def test_missing_prompt_file_is_reported(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
