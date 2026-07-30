@@ -118,9 +118,11 @@ def test_social_enabled_requires_xai_key_and_allowlist(
     assert report.missing_env_vars == ["XAI_API_KEY"]
 
 
-def test_corrupted_allowlist_is_reported_as_filesystem_problem(
+def test_corrupted_allowlist_is_reported_as_config_problem(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A readable-but-invalid allowlist is config-content, not filesystem: it fails
+    EXIT_CONFIG_INVALID, same as any other malformed config, not EXIT_ENV_MISSING."""
     set_all_env(monkeypatch)
     monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
     real_accounts = yaml.safe_load(
@@ -139,9 +141,9 @@ def test_corrupted_allowlist_is_reported_as_filesystem_problem(
     social.write_text(yaml.safe_dump(data), encoding="utf-8")
 
     report = verify_environment(social)
-    assert report.exit_code == EXIT_ENV_MISSING
-    assert report.missing_env_vars == []
-    assert any("allowlist" in p for p in report.filesystem_problems)
+    assert report.exit_code == EXIT_CONFIG_INVALID
+    assert any("allowlist" in p for p in report.config_problems)
+    assert report.filesystem_problems == []
 
 
 def test_missing_prompt_file_is_reported(

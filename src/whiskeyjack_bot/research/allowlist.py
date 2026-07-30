@@ -44,6 +44,15 @@ class AllowlistEntry(_StrictModel):
     domains: list[str] = Field(min_length=1)
     notes: str | None = None
 
+    @field_validator("username")
+    @classmethod
+    def _username_is_non_blank(cls, v: str) -> str:
+        # min_length=1 lets "   " through -- that can't identify an X account, so
+        # lookup_by_username() would carry a dead entry with no handle to match.
+        if not v.strip():
+            raise ValueError("username must be non-blank")
+        return v
+
     @field_validator("domains")
     @classmethod
     def _domains_are_non_blank(cls, v: list[str]) -> list[str]:
@@ -139,11 +148,21 @@ def load_allowlist(path: Path | str) -> AccountAllowlist:
     """Load and validate an account allowlist YAML file; raises AllowlistError on failure."""
     path = Path(path)
     try:
-        raw_text = path.read_text(encoding="utf-8")
+        raw_bytes = path.read_bytes()
     except OSError as exc:
         raise AllowlistError(
             [f"cannot read account allowlist {path}: {exc.strerror or exc}"]
         ) from exc
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        # from None: UnicodeDecodeError's message embeds the offending bytes.
+        raise AllowlistError(
+            [
+                f"account allowlist {path} is not valid UTF-8 "
+                "(detail withheld: it can echo file contents)"
+            ]
+        ) from None
     try:
         data: Any = yaml.safe_load(raw_text)
     except yaml.MarkedYAMLError as exc:

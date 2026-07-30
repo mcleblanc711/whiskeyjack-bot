@@ -91,7 +91,10 @@ def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> 
 
     Skipped when social retrieval is disabled or the file is already reported missing
     by _verify_referenced_files, so a missing file reports one problem, not two -- same
-    convention as _verify_prompt_version.
+    convention as _verify_prompt_version. A readable-but-invalid allowlist (duplicate
+    username, unknown reliability tag, ...) is a config-content problem, not a filesystem
+    one, so it goes to config_problems -- unlike a missing/unreadable file, it can never be
+    fixed by waiting for the filesystem to change.
     """
     if not config.retrieval.social.enabled:
         return
@@ -102,7 +105,7 @@ def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> 
         allowlist = load_allowlist(path)
     except AllowlistError as exc:
         # AllowlistError is already sanitized; it never echoes entry content.
-        report.filesystem_problems.append(str(exc))
+        report.config_problems.append(str(exc))
         return
     report.checks_passed.append(
         f"retrieval.social.account_allowlist_path loads clean: {len(allowlist.entries)} accounts"

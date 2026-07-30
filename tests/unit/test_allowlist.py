@@ -125,6 +125,19 @@ def test_blank_domain_string_rejected(tmp_path: Path) -> None:
         load_allowlist(path)
 
 
+def test_whitespace_only_username_rejected(tmp_path: Path) -> None:
+    path = _write(tmp_path, [_base_entry(username="   ")])
+    with pytest.raises(AllowlistError):
+        load_allowlist(path)
+
+
+def test_invalid_utf8_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "bad-utf8.yaml"
+    path.write_bytes(b"accounts:\n  - username: \xff\xfe\n")
+    with pytest.raises(AllowlistError, match="not valid UTF-8"):
+        load_allowlist(path)
+
+
 def test_malformed_yaml_rejected(tmp_path: Path) -> None:
     path = tmp_path / "bad.yaml"
     path.write_text("accounts: [{unbalanced: [", encoding="utf-8")
