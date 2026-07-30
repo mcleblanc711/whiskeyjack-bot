@@ -24,10 +24,13 @@ LEDGER_TABLES = {
     "submission_attempts",
     "resolution_events",
     "score_events",
+    "lifecycle_events",
     "schema_migrations",
 }
 
 TS = "2026-07-17T00:00:00+00:00"
+# Migration 003 requires every new forecast record to carry a 64-hex content hash.
+FORECAST_SHA = "b" * 64
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
@@ -53,15 +56,20 @@ def _seed_forecast(
     version: int = 1,
     status: str = "draft",
     run_id: str = "run-1",
+    forecast_sha256: str | None = FORECAST_SHA,
 ) -> None:
+    # forecast_sha256 is supplied for the same reason _seed_run supplies question_id:
+    # migration 003's triggers require it of every new row, and a record with no content
+    # hash is exactly the unapprovable row that requirement exists to stop.
     conn.execute(
         "INSERT INTO forecast_records ("
         "record_id, question_id, tournament_id, forecast_version, question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
-        "generated_at_utc, final_prediction_json, record_json, created_at_utc) "
+        "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+        "forecast_sha256) "
         "VALUES (?, ?, 'minibench', ?, 'binary', ?, 'anthropic', 'claude', 'v1', 'abc', ?, "
-        "?, '{}', '{}', ?)",
-        (record_id, question_id, version, status, run_id, TS, TS),
+        "?, '{}', '{}', ?, ?)",
+        (record_id, question_id, version, status, run_id, TS, TS, forecast_sha256),
     )
 
 
@@ -159,15 +167,19 @@ def test_research_document_triple_uniqueness_enforced(tmp_path: Path) -> None:
 
 
 def test_foreign_key_enforced(tmp_path: Path) -> None:
+    # score_events rather than approval_events: migration 003 puts a BEFORE INSERT
+    # trigger on approval_events that rejects a row naming an unknown record before the
+    # foreign key is ever reached, so an approval row can no longer reach the FK and
+    # would leave this test asserting a different mechanism than its name claims.
     db = tmp_path / "ledger.db"
     initialize_ledger(db)
     conn = connect(db)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO approval_events ("
-                "forecast_record_id, decision, actor, forecast_sha256, created_at_utc) "
-                "VALUES ('does-not-exist', 'approved', 'chris', 'sha', ?)",
+                "INSERT INTO score_events ("
+                "forecast_record_id, metric, value, implementation_version, computed_at_utc) "
+                "VALUES ('does-not-exist', 'brier', 0.25, 'v1', ?)",
                 (TS,),
             )
     finally:
@@ -175,6 +187,9 @@ def test_foreign_key_enforced(tmp_path: Path) -> None:
 
 
 def test_status_check_rejects_unknown_state(tmp_path: Path) -> None:
+    # 001's CHECK over the seven states is now the second line of defence: migration 003
+    # pins a *new* record to 'draft', so the trigger rejects 'bogus' first and the CHECK
+    # is only reachable by a write path that bypasses the trigger. Both refuse it.
     db = tmp_path / "ledger.db"
     initialize_ledger(db)
     conn = connect(db)

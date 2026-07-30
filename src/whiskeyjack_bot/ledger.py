@@ -1,11 +1,12 @@
 """SQLite attribution-ledger schema and access layer (M1-601).
 
-The ledger is the v1 source of truth (decision D16): an append-only-by-policy,
+The ledger is the v1 source of truth (decision D16): an append-only,
 replayable record of every forecast, its evidence, approvals, submission
 attempts, resolutions and scores. This module owns database connections and
-migration application only; row-writing helpers, forecast versioning and the
-database-level append-only enforcement (UPDATE/DELETE-blocking triggers) land
-with M1-602/M1-603.
+migration application only. The database-level append-only enforcement
+(UPDATE/DELETE-blocking triggers) and the lifecycle state machine shipped with
+M1-603 -- see ``003_lifecycle_events.sql`` and :mod:`whiskeyjack_bot.lifecycle`;
+forecast versioning and its writer are M1-602's.
 
 Migrations live inside the package (:mod:`whiskeyjack_bot.migrations`) rather
 than at the repository root shown in the handoff's proposed tree, so they ship
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
-LEDGER_SCHEMA_VERSION = 2
+LEDGER_SCHEMA_VERSION = 3
 
 _MIGRATIONS_PACKAGE = "whiskeyjack_bot.migrations"
 _MIGRATION_NAME_RE = re.compile(r"^(\d+)_.*\.sql$")
@@ -212,9 +213,9 @@ def _statements(sql: str) -> list[str]:
     semicolon. Splitting uses :func:`sqlite3.complete_statement` (a wrapper over
     C ``sqlite3_complete``) instead of a naive ``str.split(";")``, so a semicolon
     inside a string literal, an inline ``--`` comment, or a ``CREATE TRIGGER ...
-    BEGIN ... END;`` body does not falsely end a statement. This is what lets the
-    append-only-enforcement triggers deferred to M1-602/M1-603 be applied by this
-    same runner.
+    BEGIN ... END;`` body does not falsely end a statement. This is what lets
+    ``003_lifecycle_events.sql``'s state-machine and append-only-enforcement
+    triggers be applied by this same runner.
 
     The scan emits at every top-level statement terminator, so more than one
     statement may share a physical line (``CREATE TABLE a(x); CREATE TABLE b(y);``)
