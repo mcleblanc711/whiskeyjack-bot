@@ -789,7 +789,7 @@ And twice more in round 2, for the same reason:
   `LifecycleError`, the `LifecycleEvent`/`SubmissionAttempt` value objects, a nesting-safe
   `transaction()`, `current_status()`/`read_history()`, and four writers: `record_validation`,
   `record_failure`, `record_approval`, `record_submission_attempt`.
-- `tests/unit/test_lifecycle.py` (143 tests) and `tests/property/test_lifecycle_properties.py`
+- `tests/unit/test_lifecycle.py` (145 tests) and `tests/property/test_lifecycle_properties.py`
   (14, ~12s: one ledger for the session with a fresh record per example, because a database
   per example put the file past two minutes).
 

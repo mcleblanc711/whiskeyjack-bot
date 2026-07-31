@@ -1095,6 +1095,50 @@ def test_the_migration_refuses_a_ledger_holding_a_non_draft_record(
         conn.close()
 
 
+def test_the_upgrade_precondition_leaves_nothing_behind(tmp_path: Path) -> None:
+    """The guard is a temp table, so it must not survive either outcome.
+
+    On the refusal path it is rolled back with the rest of the migration (asserted above,
+    where the database stays at version 2). On the success path it is dropped. A leftover
+    table in either schema would be a migration writing something the schema does not
+    document.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+    conn = connect(db)
+    try:
+        for table in ("sqlite_master", "sqlite_temp_master"):
+            assert (
+                conn.execute(
+                    f"SELECT count(*) FROM {table} WHERE name LIKE 'migration_003%'"
+                ).fetchone()[0]
+                == 0
+            )
+    finally:
+        conn.close()
+
+
+def test_a_refused_upgrade_stays_refused(tmp_path: Path) -> None:
+    # Idempotence in the direction that matters: a second run must not find the database
+    # half-upgraded and carry on from there.
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v2_ledger(db, status="approved")
+    for _ in range(2):
+        with pytest.raises(LedgerError):
+            initialize_ledger(db)
+    conn = connect(db)
+    try:
+        assert conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 2
+        # The ALTER is rolled back with everything else, so the hash column is not there
+        # either -- a half-applied 003 would be the worst of both answers.
+        assert not any(
+            row[1] == "forecast_sha256"
+            for row in conn.execute("PRAGMA table_info(forecast_records)").fetchall()
+        )
+    finally:
+        conn.close()
+
+
 def test_an_approval_written_before_003_cannot_carry_a_record_to_approved(
     tmp_path: Path,
 ) -> None:
