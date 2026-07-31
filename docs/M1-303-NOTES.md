@@ -14,9 +14,8 @@ the configured fallback records why it ran and preserves citations; no silent pr
 - **`src/whiskeyjack_bot/research/transport.py`** — `apply_connection_retries`, moved out of
   `asknews.py` unchanged so both adapters share the one httpx/httpcore workaround rather than a
   copy of it. `asknews.py` imports it; no behaviour change, and its retry tests pass untouched.
-- **`tests/unit/test_exa.py`** (97 cases) and **`tests/property/test_exa_properties.py`** (14
-  properties). Full gate green: 750 passed + 1 xfail, `ruff check`, `ruff format --check`,
-  `mypy --strict src` all clean.
+- **`tests/unit/test_exa.py`** (97 cases; 107 after the round-2 fixes below) and
+  **`tests/property/test_exa_properties.py`** (14 properties). Full gate green.
 
 **No new dependency, no migration, no schema change, no config change.** `httpx` was already a
 declared direct dependency (M1-302), `RetrievalProviderConfig` already carries the `exa` provider
@@ -50,13 +49,15 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   credential lookup. One INFO log line records the engagement, from constants and the integer
   question id only.
 
-- **Every trigger is recorded, not a winner.** `decide_fallback` returns all of
-  `primary_provider_failed`, `primary_returned_no_documents`, `official_source_required` that
-  hold. "AskNews raised" and "AskNews returned nothing" are different facts about a run and the
-  ledger reads them differently (`error_summary` distinguishes the two); collapsing them to a
-  priority order would discard attribution for no benefit. The tuple is deduplicated and
-  normalized to vocabulary order because it is persisted — the stored list must be a function of
-  the triggers, not of the caller's bookkeeping.
+- **`should_run` is exactly the backlog's two conditions; every relevant fact is still recorded
+  once it does.** (Corrected in round 2 — see below.) `decide_fallback` triggers only on
+  `primary_provider_failed` or `official_source_required`; `primary_returned_no_documents` is
+  reported alongside a real trigger when it also holds (a true, useful fact — "AskNews raised" and
+  "AskNews returned nothing" are different things and the ledger reads them differently via
+  `error_summary`) but cannot authorize a call by itself, since a provider that answered with zero
+  documents has not *failed*. The tuple is deduplicated and normalized to vocabulary order because
+  it is persisted — the stored list must be a function of the triggers, not of the caller's
+  bookkeeping.
 
 - **The reason is persisted in `provider_config["fallback_reasons"]`** (owner decision), which maps
   to `research_runs.provider_config_json`, so the ledger alone answers "why was a second provider
@@ -110,6 +111,37 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   non-numeric, negative or non-finite. `NaN`/`Infinity` are reachable in practice: they are not
   valid JSON but `json.loads` accepts them, and a stored non-finite cost would validate here and
   fail at ledger-write time, after the money was spent.
+
+## Round 2 — GPT cross-model review findings (PR #16)
+
+Five P2 findings from the automated cross-model review, all fixed on the same branch before the
+round-2 request:
+
+- **Zero documents alone no longer authorizes a call** (`decide_fallback`). The round-1 version
+  treated "AskNews returned nothing" as a third, independent trigger; the reviewer pointed out that
+  the backlog's acceptance text is a closed pair ("AskNews fails **or** official-source/web
+  retrieval required") and the function's own docstring already conceded a zero-document run "has
+  not failed" — a direct contradiction with letting it trigger anyway. Fixed as described above.
+  This is a real behavior change, not a rewording: an all-success run with nothing retained and no
+  official-source requirement now does **not** spend on Exa.
+- **`retrieval.primary.provider` must be `asknews`.** `build_exa_client` checked only that the
+  *fallback* provider was `exa`; a config naming `exa` as its own primary passed and would let Exa
+  "fall back" to itself. Added the symmetric check, before the credential lookup like the existing
+  one.
+- **`numResults` is capped at Exa's documented ceiling of 100** (`_MAX_NUM_RESULTS`).
+  `RetrievalConfig.max_documents_per_query` only enforces `ge=1` — it is shared with AskNews's
+  `n_articles`, which has no such ceiling — so a value above 100 was previously sent as-is and
+  rejected by Exa, turning a configuration choice into a full run failure. Capped at the transport
+  layer rather than in the shared schema; the capped value is what gets persisted into
+  `provider_config["num_results"]`, so the ledger reflects what was actually sent.
+- **Two `OverflowError` escapes**, both reachable after a billable call had already been made and
+  both outside this module's "never raises" contracts: `_published_at_utc`'s
+  `astimezone(timezone.utc)` on a syntactically valid boundary timestamp (e.g.
+  `0001-01-01T00:00:00+14:00`), and `_call_cost_usd`'s `float(total)` on a `costDollars.total`
+  integer too large to convert (e.g. `10**400`). Both now degrade to `None`, matching every other
+  unusable value these functions already handle. The property-test fixtures
+  (`PUBLISHED_DATES`, `COST_VALUES`) didn't include these boundary values, which is why hypothesis
+  hadn't already caught them; both were added.
 
 ## Notes for downstream items
 

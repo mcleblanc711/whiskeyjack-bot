@@ -59,6 +59,10 @@ PUBLISHED_DATES = st.one_of(
             "  2026-07-20  ",
             "0001-01-01",
             "9999-12-31T23:59:59+14:00",
+            # Boundary timestamps whose UTC conversion overflows datetime's range
+            # (PR #16 round-1 finding): must degrade to None, never raise.
+            "0001-01-01T00:00:00+14:00",
+            "9999-12-31T23:59:59-14:00",
             "2026-13-45",
             "not a date",
             "",
@@ -74,6 +78,9 @@ PUBLISHED_DATES = st.one_of(
 COST_VALUES = st.one_of(
     st.floats(allow_nan=True, allow_infinity=True),
     st.integers(min_value=-10, max_value=10),
+    # JSON integers too large for a float (PR #16 round-1 finding): float(total)
+    # must degrade to None, never raise OverflowError.
+    st.sampled_from([10**400, -(10**400)]),
     st.booleans(),
     st.none(),
     HOSTILE_TEXT,

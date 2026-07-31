@@ -1,12 +1,17 @@
 """Exa fallback retrieval adapter: web/official evidence, and why it was reached (M1-303).
 
-Exa is the *fallback* provider (decision D18): it runs when AskNews fails, when
-AskNews returned nothing, or when official-source/web retrieval is required --
-never as an unannounced substitute. That last clause is the whole point of this
-module's shape, so it is enforced by the API rather than by convention:
+Exa is the *fallback* provider (decision D18): it runs only when AskNews fails or
+when official-source/web retrieval is required -- never as an unannounced
+substitute, and never merely because AskNews succeeded with nothing to show for
+it (a provider that answers with zero documents has not *failed*). That last
+clause is the whole point of this module's shape, so it is enforced by the API
+rather than by convention:
 
-- :func:`decide_fallback` is the pure policy. It returns **every** trigger that
-  holds, not a winner, because each one is a distinct fact about the run.
+- :func:`decide_fallback` is the pure policy, gated on exactly those two
+  conditions. It returns **every** trigger that holds when it does run, not a
+  winner, because each one is a distinct fact about the run -- including
+  ``primary_returned_no_documents`` as an additional fact alongside a real
+  trigger, though it cannot authorize a run on its own.
 - :func:`retrieve_web` **requires** a non-empty ``fallback_reasons`` argument.
   There is no way to spell an Exa call that does not say why it happened.
 - The reasons are persisted on the run (``provider_config["fallback_reasons"]``,
@@ -130,6 +135,13 @@ _MAX_AGE_HOURS: Final = 24
 # the document row keeps a readable excerpt, not a copy of the page.
 _SNIPPET_CHARACTERS: Final = 500
 
+# Exa's documented ceiling for ``numResults``. ``RetrievalConfig.max_documents_per_query``
+# only enforces ``ge=1`` -- it is shared with the AskNews adapter's own, differently
+# bounded, ``n_articles`` -- so a configured value above this is capped here rather than
+# sent as-is: an oversized request is rejected by Exa outright, which would otherwise turn
+# a configuration choice into a full run failure.
+_MAX_NUM_RESULTS: Final = 100
+
 
 class ExaFallbackError(Exception):
     """A fallback call was requested in a way this module refuses to make.
@@ -144,13 +156,17 @@ class ExaFallbackError(Exception):
 
 @dataclass(frozen=True)
 class FallbackDecision:
-    """Whether the fallback should run, and every trigger that says so.
+    """Whether the fallback should run, and every relevant fact about why.
 
     ``reasons`` is a tuple in :data:`_FALLBACK_REASONS` order, so two runs with
-    the same triggers persist byte-identical reason lists. It holds *all* the
-    triggers rather than the highest-priority one: "AskNews raised" and "AskNews
-    returned nothing" are different facts about a run, and collapsing them to a
-    single winner discards attribution for no benefit.
+    the same facts persist byte-identical reason lists, and it is empty whenever
+    ``should_run`` is ``False``. It holds *all* the facts that apply when the
+    fallback does run, not the highest-priority one: "AskNews raised" and
+    "AskNews returned nothing" are different facts about a run, and collapsing
+    them to a single winner discards attribution for no benefit -- even though,
+    per :func:`decide_fallback`, only the first of those two (or an explicit
+    official-source requirement) can put ``should_run`` at ``True`` in the first
+    place.
     """
 
     should_run: bool
@@ -194,11 +210,14 @@ def decide_fallback(
     Pure and total: no I/O, no clock, and the only exception it can raise is
     :class:`ExaFallbackError` for a document count that is not a count.
 
-    The three triggers are exactly the backlog's ("use Exa only when AskNews
-    fails or when official-source/web retrieval is required"), with the
-    zero-document case separated from the raised-exception case because the
-    ledger reads them differently: a provider that answered with nothing has not
-    failed, and ``ResearchRun.error_summary`` distinguishes the two.
+    ``should_run`` is exactly the backlog's two conditions ("use Exa only when
+    AskNews fails or when official-source/web retrieval is required") -- a
+    provider that answered with zero documents has not *failed*, so an
+    all-success run with nothing retained and no official-source requirement
+    does not, by itself, authorize a paid call. When the fallback *does* run for
+    one of the two real reasons, ``primary_returned_no_documents`` is still
+    reported alongside it if it also holds: it is a true fact worth persisting,
+    just not an independent trigger.
 
     ``primary_documents`` is the count of documents the primary provider
     *retained*, not the count it returned.
@@ -209,6 +228,10 @@ def decide_fallback(
     if primary_documents < 0:
         raise ExaFallbackError("primary_documents must not be negative")
 
+    should_run = primary_failed or official_source_required
+    if not should_run:
+        return FallbackDecision(should_run=False, reasons=())
+
     reasons: list[FallbackReason] = []
     if primary_failed:
         reasons.append("primary_provider_failed")
@@ -216,8 +239,7 @@ def decide_fallback(
         reasons.append("primary_returned_no_documents")
     if official_source_required:
         reasons.append("official_source_required")
-    ordered = _canonical_reasons(reasons)
-    return FallbackDecision(should_run=bool(ordered), reasons=ordered)
+    return FallbackDecision(should_run=True, reasons=_canonical_reasons(reasons))
 
 
 def _canonical_reasons(reasons: Sequence[str]) -> tuple[FallbackReason, ...]:
@@ -242,11 +264,15 @@ def _canonical_reasons(reasons: Sequence[str]) -> tuple[FallbackReason, ...]:
 def build_exa_client(config: AppConfig) -> httpx.Client:
     """Construct the one configured Exa client.
 
-    Two refusals, both before any network use and therefore before any billable
+    Three refusals, all before any network use and therefore before any billable
     call:
 
     - the configured fallback provider is not ``exa`` -- calling Exa anyway
       would be precisely the silent provider switch this item forbids;
+    - the configured *primary* provider is not ``asknews`` -- this adapter
+      implements the AskNews-to-Exa fallback specifically, and a config that
+      names Exa as its own primary would let Exa "fall back" to itself, which
+      is the same silent switch under a different config shape;
     - the configured key variable is unset or empty (an empty string counts as
       missing), which raises ``MissingCredentialError``.
 
@@ -262,6 +288,12 @@ def build_exa_client(config: AppConfig) -> httpx.Client:
         raise ExaFallbackError(
             "retrieval.fallback.provider is not 'exa'; refusing to run the Exa "
             "adapter against a differently configured fallback (no silent provider switching)"
+        )
+    if config.retrieval.primary.provider != "asknews":
+        raise ExaFallbackError(
+            "retrieval.primary.provider is not 'asknews'; refusing to run the Exa fallback "
+            "adapter against a configuration where Exa is not a fallback at all "
+            "(no silent provider switching)"
         )
     api_key = os.environ.get(provider.api_key_env)
     if not api_key:
@@ -323,6 +355,9 @@ def retrieve_web(
 
     retrieval = config.retrieval
     capped_queries = list(queries)[: retrieval.max_queries_per_question]
+    # Exa's own contract, not a general retrieval invariant: capped here rather than in
+    # the shared config schema. See _MAX_NUM_RESULTS.
+    num_results = min(retrieval.max_documents_per_query, _MAX_NUM_RESULTS)
     published_after = now - timedelta(days=retrieval.freshness_days_default)
     # See the docstring: the allowlist, not the reason, is what makes a document
     # an official source.
@@ -353,7 +388,7 @@ def retrieve_web(
         payload: dict[str, Any] = {
             "query": query,
             "type": _SEARCH_TYPE,
-            "numResults": retrieval.max_documents_per_query,
+            "numResults": num_results,
             "startPublishedDate": published_after.isoformat(),
             "contents": {
                 "text": {"maxCharacters": _TEXT_MAX_CHARACTERS},
@@ -396,7 +431,7 @@ def retrieve_web(
 
         # Sliced as well as capped in the request: `numResults` is the provider's
         # promise, and the ledger's cost is ours.
-        for result in results[: retrieval.max_documents_per_query]:
+        for result in results[:num_results]:
             try:
                 payload_document = _to_document(
                     result,
@@ -436,7 +471,7 @@ def retrieve_web(
             "provider_config": {
                 "endpoint": _SEARCH_PATH,
                 "search_type": _SEARCH_TYPE,
-                "num_results": retrieval.max_documents_per_query,
+                "num_results": num_results,
                 "text_max_characters": _TEXT_MAX_CHARACTERS,
                 "max_age_hours": _MAX_AGE_HOURS,
                 "start_published_date": published_after.isoformat(),
@@ -580,7 +615,13 @@ def _published_at_utc(value: Any) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         return datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:
+        # A syntactically valid boundary timestamp (e.g. 0001-01-01T00:00:00+14:00)
+        # whose UTC conversion falls outside datetime's representable range. Same
+        # rule as an unparseable date: unusable, not a reason to lose the citation.
+        return None
 
 
 def _call_cost_usd(body: dict[str, Any]) -> float | None:
@@ -599,7 +640,12 @@ def _call_cost_usd(body: dict[str, Any]) -> float | None:
     total = cost.get("total")
     if isinstance(total, bool) or not isinstance(total, (int, float)):
         return None
-    value = float(total)
+    try:
+        value = float(total)
+    except OverflowError:
+        # A JSON integer too large for a float (e.g. 10**400): unusable, dropped
+        # the same as any other malformed cost rather than crashing a paid run.
+        return None
     if not isfinite(value) or value < 0:
         return None
     return value

@@ -136,7 +136,9 @@ def _retrieve(
     [
         (False, 3, False, ()),
         (True, 3, False, ("primary_provider_failed",)),
-        (False, 0, False, ("primary_returned_no_documents",)),
+        # Zero documents alone is not a trigger: AskNews succeeded, and no
+        # official-source/web retrieval was requested (finding: PR #16 round 1).
+        (False, 0, False, ()),
         (False, 3, True, ("official_source_required",)),
         (True, 0, False, ("primary_provider_failed", "primary_returned_no_documents")),
         (True, 3, True, ("primary_provider_failed", "official_source_required")),
@@ -156,7 +158,7 @@ def _retrieve(
 def test_decide_fallback_reports_every_trigger(
     failed: bool, documents: int, official: bool, expected: tuple[str, ...]
 ) -> None:
-    """All triggers are recorded, not just the first: each is a distinct fact."""
+    """Every fact is recorded once the fallback runs; zero documents alone never runs it."""
     decision = decide_fallback(
         primary_failed=failed,
         primary_documents=documents,
@@ -169,6 +171,15 @@ def test_decide_fallback_reports_every_trigger(
 def test_decide_fallback_does_not_run_when_the_primary_succeeded() -> None:
     decision = decide_fallback(
         primary_failed=False, primary_documents=5, official_source_required=False
+    )
+    assert decision.should_run is False
+    assert decision.reasons == ()
+
+
+def test_decide_fallback_does_not_run_on_empty_primary_alone() -> None:
+    """A successful-but-empty AskNews run is not, by itself, an AskNews failure."""
+    decision = decide_fallback(
+        primary_failed=False, primary_documents=0, official_source_required=False
     )
     assert decision.should_run is False
     assert decision.reasons == ()
@@ -245,6 +256,29 @@ def test_provider_mismatch_is_checked_before_the_credential(
 ) -> None:
     data = config.model_dump()
     data["retrieval"]["fallback"]["provider"] = "asknews"
+    custom = validate_config_data(data)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    with pytest.raises(ExaFallbackError):
+        build_exa_client(custom)
+
+
+def test_client_refuses_when_the_primary_is_not_asknews(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exa naming itself as primary too would let it 'fall back' to itself."""
+    data = config.model_dump()
+    data["retrieval"]["primary"]["provider"] = "exa"
+    custom = validate_config_data(data)
+    monkeypatch.setenv("EXA_API_KEY", FAKE_KEY)
+    with pytest.raises(ExaFallbackError):
+        build_exa_client(custom)
+
+
+def test_primary_mismatch_is_checked_before_the_credential(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = config.model_dump()
+    data["retrieval"]["primary"]["provider"] = "exa"
     custom = validate_config_data(data)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     with pytest.raises(ExaFallbackError):
@@ -486,6 +520,30 @@ def test_over_returned_results_are_sliced(config: AppConfig) -> None:
     assert len(result.documents) == config.retrieval.max_documents_per_query
 
 
+def test_num_results_is_capped_at_the_exa_maximum(config: AppConfig) -> None:
+    """A configured value above Exa's documented ceiling must not reach the request."""
+    data = config.model_dump()
+    data["retrieval"]["max_documents_per_query"] = 250
+    custom = validate_config_data(data)
+    over = [_result(url=f"https://example.org/{i}", text=f"body {i}") for i in range(150)]
+    handler = _Exchange(_json_ok(_body(*over)))
+
+    result = retrieve_web(
+        _client(handler),
+        custom,
+        question_id=42,
+        queries=["june payrolls"],
+        retrieval_run_id="run-1",
+        now=NOW,
+        fallback_reasons=REASONS,
+    )
+
+    assert handler.requests[0]["payload"]["numResults"] == 100
+    assert len(result.documents) == 100
+    assert result.run.provider_config is not None
+    assert result.run.provider_config["num_results"] == 100
+
+
 # --- official vs web --------------------------------------------------------
 
 
@@ -605,6 +663,25 @@ def test_a_usable_cost_survives_an_unusable_one(config: AppConfig) -> None:
     assert result.run.cost_usd == pytest.approx(0.02)
 
 
+@pytest.mark.parametrize("huge", [10**400, -(10**400)])
+def test_oversized_integer_cost_is_ignored_not_a_crash(config: AppConfig, huge: int) -> None:
+    """A JSON integer too large for a float must not crash an already-paid run.
+
+    ``float(total)`` raises ``OverflowError`` for these; unrelated to the network
+    call itself, so if this escaped it would crash the whole run, not just drop
+    one result (PR #16 round-1 finding).
+    """
+    handler = _Exchange(_json_ok(_body(_result(), cost=huge)))
+    result = _retrieve(handler, config)
+    assert result.run.cost_usd is None
+    assert result.provider_failed is False
+
+
+def test_call_cost_usd_never_raises_on_an_oversized_integer() -> None:
+    assert exa._call_cost_usd({"costDollars": {"total": 10**400}}) is None
+    assert exa._call_cost_usd({"costDollars": {"total": -(10**400)}}) is None
+
+
 # --- published dates --------------------------------------------------------
 
 
@@ -625,6 +702,11 @@ def test_a_usable_cost_survives_an_unusable_one(config: AppConfig) -> None:
         (None, None),
         (20260720, None),
         ({"date": "2026-07-20"}, None),
+        # Syntactically valid boundary timestamps whose UTC conversion overflows
+        # datetime's representable range (PR #16 round-1 finding): unusable, same
+        # as any other bad date, not a crash of the whole run.
+        ("0001-01-01T00:00:00+14:00", None),
+        ("9999-12-31T23:59:59-14:00", None),
     ],
 )
 def test_published_date_parsing(config: AppConfig, raw: Any, expected: datetime | None) -> None:
@@ -632,6 +714,11 @@ def test_published_date_parsing(config: AppConfig, raw: Any, expected: datetime 
     result = _retrieve(handler, config)
     assert len(result.documents) == 1, "a bad date must not cost the citation"
     assert result.documents[0].published_at_utc == expected
+
+
+def test_published_at_utc_never_raises_on_a_boundary_overflow() -> None:
+    assert exa._published_at_utc("0001-01-01T00:00:00+14:00") is None
+    assert exa._published_at_utc("9999-12-31T23:59:59-14:00") is None
 
 
 # --- failure paths that must not fail the run -------------------------------
