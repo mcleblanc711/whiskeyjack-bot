@@ -211,6 +211,14 @@ def test_retrieve_web_refuses_a_reason_outside_the_vocabulary(config: AppConfig)
     assert handler.requests == []
 
 
+def test_retrieve_web_refuses_a_non_authorizing_reason_alone(config: AppConfig) -> None:
+    """primary_returned_no_documents is a fact worth recording, not a trigger."""
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, reasons=("primary_returned_no_documents",))
+    assert handler.requests == [], "refusal must happen before any billable call"
+
+
 def test_reasons_are_persisted_on_the_run(config: AppConfig) -> None:
     """The acceptance criterion: the ledger alone says why the fallback ran."""
     handler = _Exchange(_json_ok(_body(_result())))
@@ -834,6 +842,41 @@ def test_tracking_parameters_do_not_defeat_the_collapse(config: AppConfig) -> No
     result = _retrieve(handler, config, queries=["a", "b"])
     assert len(result.documents) == 1
     assert result.duplicates_collapsed == 1
+
+
+def test_duplicate_survivor_is_order_independent(config: AppConfig) -> None:
+    """Two equivalent results differing only in a non-key field: the deterministic
+    total order picks the survivor, not arrival order (cross-model review round 2,
+    finding 2 -- a local first-seen set let provider result order decide it)."""
+    first = _result(author="A. Reporter")
+    second = _result(author="Z. Other Reporter")
+
+    forward = _Exchange(_json_ok(_body(first)), _json_ok(_body(second)))
+    forward_result = _retrieve(forward, config, queries=["a", "b"])
+
+    swapped = _Exchange(_json_ok(_body(second)), _json_ok(_body(first)))
+    swapped_result = _retrieve(swapped, config, queries=["a", "b"])
+
+    assert len(forward_result.documents) == 1
+    assert len(swapped_result.documents) == 1
+    assert forward_result.duplicates_collapsed == 1
+    assert swapped_result.duplicates_collapsed == 1
+    assert forward_result.documents[0].author == swapped_result.documents[0].author
+
+
+def test_cumulative_cost_overflow_is_dropped_not_raised(config: AppConfig) -> None:
+    """Two valid, finite per-call costs whose sum overflows to inf must not crash
+    validate_run (cross-model review round 2, finding 3): failure stays data, not
+    an exception, exactly as the module promises for provider-side failures."""
+    handler = _Exchange(
+        _json_ok(_body(_result(), cost=1e308)),
+        _json_ok(_body(_result(url="https://example.org/other-payrolls"), cost=1e308)),
+    )
+    result = _retrieve(handler, config, queries=["a", "b"])
+
+    assert result.provider_failed is False
+    assert result.run.cost_usd is None
+    assert len(result.documents) == 2
 
 
 # --- secret hygiene ---------------------------------------------------------

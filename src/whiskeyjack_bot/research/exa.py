@@ -12,8 +12,13 @@ rather than by convention:
   winner, because each one is a distinct fact about the run -- including
   ``primary_returned_no_documents`` as an additional fact alongside a real
   trigger, though it cannot authorize a run on its own.
-- :func:`retrieve_web` **requires** a non-empty ``fallback_reasons`` argument.
-  There is no way to spell an Exa call that does not say why it happened.
+- :func:`retrieve_web` **requires** a non-empty ``fallback_reasons`` argument,
+  and requires at least one of those reasons to be an authorizing one
+  (``primary_provider_failed`` or ``official_source_required``):
+  ``primary_returned_no_documents`` alone is rejected, matching
+  :func:`decide_fallback`'s own policy that it cannot authorize a run by
+  itself. There is no way to spell an Exa call that does not say why it
+  happened, nor one authorized only by a non-authorizing fact.
 - The reasons are persisted on the run (``provider_config["fallback_reasons"]``,
   stored in ``research_runs.provider_config_json``) and logged once, so the
   switch is auditable from the ledger alone.
@@ -88,6 +93,7 @@ import httpx
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 from whiskeyjack_bot.research.canonical import CanonicalizationError, canonicalize_url
+from whiskeyjack_bot.research.dedup import deduplicate
 from whiskeyjack_bot.research.hashing import content_sha256
 from whiskeyjack_bot.research.model import (
     ResearchDocument,
@@ -110,6 +116,15 @@ FallbackReason = Literal[
 ]
 
 _FALLBACK_REASONS: Final[tuple[FallbackReason, ...]] = get_args(FallbackReason)
+
+# The subset of _FALLBACK_REASONS that can put should_run at True in
+# decide_fallback. primary_returned_no_documents is a true fact worth
+# persisting alongside one of these, but per the module docstring it cannot
+# authorize a fallback call on its own -- retrieve_web enforces that directly,
+# since nothing upstream of it does yet.
+_AUTHORIZING_REASONS: Final[frozenset[FallbackReason]] = frozenset(
+    {"primary_provider_failed", "official_source_required"}
+)
 
 _BASE_URL: Final = "https://api.exa.ai"
 _SEARCH_PATH: Final = "/search"
@@ -351,6 +366,12 @@ def retrieve_web(
             "fallback_reasons must be non-empty: an Exa call has to record why "
             "it ran (no silent provider switching)"
         )
+    if not any(reason in _AUTHORIZING_REASONS for reason in reasons):
+        raise ExaFallbackError(
+            "fallback_reasons must include primary_provider_failed or "
+            "official_source_required; primary_returned_no_documents cannot "
+            "authorize the fallback on its own"
+        )
     domains = _validated_domains(include_domains)
 
     retrieval = config.retrieval
@@ -374,12 +395,7 @@ def retrieve_web(
 
     raw_responses: list[dict[str, Any]] = []
     documents: list[ResearchDocument] = []
-    # Constraint safety, not M1-305's cross-run deduplication: two queries can
-    # surface the same page, and research_documents carries
-    # UNIQUE (retrieval_run_id, canonical_url, content_sha256).
-    seen: set[tuple[str, str]] = set()
     dropped = 0
-    collapsed = 0
     provider_failed = False
     cost_total = 0.0
     cost_reported = False
@@ -456,12 +472,24 @@ def retrieve_web(
                 dropped += 1
                 continue
 
-            key = (document.canonical_url, document.content_sha256)
-            if key in seen:
-                collapsed += 1
-                continue
-            seen.add(key)
             documents.append(document)
+
+    # Two queries can surface the same page, and research_documents carries
+    # UNIQUE (retrieval_run_id, canonical_url, content_sha256). Every document
+    # here shares one retrieval_run_id, so this collapses on the same
+    # (canonical_url, content_sha256) identity a local set would -- but picks
+    # the survivor via M1-305's deterministic total order instead of
+    # first-seen, so the retained author/URL does not depend on provider
+    # result order (cross-model review round 2, finding 2).
+    dedup_result = deduplicate(documents)
+
+    if cost_reported and not isfinite(cost_total):
+        # Each call's own cost was finite (_call_cost_usd already checked
+        # isfinite); only the sum overflowed. Drop it the same way an
+        # unusable per-call cost is dropped, rather than let validate_run's
+        # finite-check turn two billed, successful calls into a run failure
+        # (cross-model review round 2, finding 3).
+        cost_reported = False
 
     run = validate_run(
         {
@@ -486,7 +514,7 @@ def retrieve_web(
             "completed_at_utc": now,
             "freshness_cutoff_utc": published_after,
             "error_summary": _error_summary(
-                provider_failed=provider_failed, retained=len(documents)
+                provider_failed=provider_failed, retained=len(dedup_result.documents)
             ),
             # Exa reports a per-request dollar estimate, unlike AskNews's
             # unconvertible credits, so this is a real figure -- but the API
@@ -497,10 +525,10 @@ def retrieve_web(
 
     return ExaRetrieval(
         run=run,
-        documents=tuple(documents),
+        documents=dedup_result.documents,
         raw_responses=tuple(raw_responses),
         documents_dropped=dropped,
-        duplicates_collapsed=collapsed,
+        duplicates_collapsed=dedup_result.collapsed_count,
         provider_failed=provider_failed,
         fallback_reasons=reasons,
     )
