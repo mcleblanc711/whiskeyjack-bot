@@ -178,9 +178,16 @@ def test_unknown_reasons_raise_without_echoing_the_value(reasons: list[str]) -> 
         return
     with pytest.raises(ExaFallbackError) as excinfo:
         _canonical_reasons(reasons)
+    message = str(excinfo.value)
+    # The message always names the module's own fixed vocabulary (deliberate --
+    # "the vocabulary itself is ours to name"), so a caller-supplied fragment
+    # that happens to be a substring of one of those constant words (e.g. "pro"
+    # inside "primary_provider_failed") appears regardless of the input; that is
+    # not an echo of caller data, so it is excluded from the leak check.
+    vocabulary_text = ", ".join(REASONS)
     for reason in reasons:
-        if reason not in REASONS and len(reason) > 2:
-            assert reason not in str(excinfo.value)
+        if reason not in REASONS and len(reason) > 2 and reason not in vocabulary_text:
+            assert reason not in message
 
 
 def test_a_planted_secret_in_a_reason_never_reaches_the_message() -> None:
