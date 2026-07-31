@@ -44,7 +44,8 @@ class LedgerError(Exception):
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    """Open the ledger with WAL, foreign keys and explicit-transaction mode.
+    """Open the ledger with WAL, foreign keys, recursive triggers and explicit
+    transactions.
 
     Purely local file I/O: no network access on any path through here.
     """
@@ -64,6 +65,16 @@ def connect(path: Path) -> sqlite3.Connection:
         journal_mode_row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
+        # The append-only guarantee depends on this one. `INSERT OR REPLACE` (and
+        # `UPDATE OR REPLACE`) resolve a constraint conflict by DELETING the row in the
+        # way -- and with recursive_triggers off, which is SQLite's default, those
+        # deletes do not fire BEFORE DELETE triggers. Every block trigger in migration
+        # 003 is therefore bypassable by a single REPLACE: an approval row can be
+        # rewritten to 'rejected' underneath the event that points at it, a verified
+        # submission attempt downgraded to success=0, or event_seq 1 erased so a history
+        # begins at 2. Found in GPT review round 1, reproduced on all three counts.
+        conn.execute("PRAGMA recursive_triggers = ON")
+        recursive_triggers_row = conn.execute("PRAGMA recursive_triggers").fetchone()
     except sqlite3.Error:
         conn.close()
         raise LedgerError(f"cannot open ledger database at {path}") from None
@@ -75,6 +86,15 @@ def connect(path: Path) -> sqlite3.Connection:
     if journal_mode != "wal":
         conn.close()
         raise LedgerError(f"ledger database at {path} does not support WAL journal mode")
+    # Read back for the same reason: an unknown or ignored PRAGMA is a silent no-op in
+    # SQLite, and a silently-off recursive_triggers restores the hole invisibly. The
+    # setting is per *connection*, so this makes the append-only guarantee one about
+    # connections opened here -- a raw `sqlite3` CLI session against the file can still
+    # REPLACE, and SQLite offers no schema-level defence against that.
+    recursive_triggers = int(recursive_triggers_row[0]) if recursive_triggers_row is not None else 0
+    if recursive_triggers != 1:
+        conn.close()
+        raise LedgerError(f"ledger database at {path} does not support recursive triggers")
     return conn
 
 

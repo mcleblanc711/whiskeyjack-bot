@@ -23,7 +23,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, get_args
 
 import pytest
@@ -54,6 +54,50 @@ WHEN = datetime(2026, 7, 27, tzinfo=timezone.utc)
 SHA = "b" * 64
 PLANTED_SECRET = "privateFAKE123456"
 
+
+class HostileTimezone(tzinfo):
+    """A `tzinfo` whose `utcoffset` raises, planting a secret in the message.
+
+    A `datetime` carrying this passes every type gate the module has -- it *is* exactly a
+    `datetime` -- and only fails when the writer converts it, running this method. GPT
+    round 1 found the unguarded version leaking the message and traceback.
+    """
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        raise ValueError(PLANTED_SECRET)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "hostile"
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+
+class FlakyTimezone(tzinfo):
+    """A `tzinfo` that answers the aware-ness check and then fails the conversion.
+
+    `_require_utc` reads the offset twice -- once itself, once inside `astimezone` -- so
+    the two calls need separate guards, and only a *stateful* tzinfo distinguishes them.
+    A single check plus an unguarded conversion would pass every stateless probe and
+    still leak here.
+    """
+
+    def __init__(self) -> None:
+        self._answered = False
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        if self._answered:
+            raise ValueError(PLANTED_SECRET)
+        self._answered = True
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "flaky"
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+
 # Anything at all, including the values that have broken this code before. `_require_*`
 # takes `object`, so the strategy has to as well -- a fuzzer restricted to str would
 # never reach the branches that exist because a caller can pass something else.
@@ -62,11 +106,18 @@ ANYTHING = st.one_of(
     st.none(),
     st.booleans(),
     st.integers(),
+    # Beyond SQLite's signed 64-bit INTEGER, where sqlite3 raises OverflowError while
+    # binding the parameter -- not a sqlite3.Error, so not caught by the obvious wrapper.
+    st.integers(min_value=2**63, max_value=2**80),
+    st.integers(min_value=-(2**80), max_value=-(2**63) - 1),
     st.floats(allow_nan=True, allow_infinity=True),
     st.binary(max_size=8),
     st.lists(st.integers(), max_size=3),
     st.datetimes(),
     st.datetimes(timezones=st.just(timezone.utc)),
+    # Aware datetimes whose tzinfo is caller-supplied code, not a fixed offset.
+    st.builds(datetime, st.just(2026), st.just(7), st.just(27), tzinfo=st.just(HostileTimezone())),
+    st.builds(datetime, st.just(2026), st.just(7), st.just(27), tzinfo=st.builds(FlakyTimezone)),
     st.sampled_from([SHA, "draft", "approved", "validated", object()]),
 )
 
@@ -141,6 +192,8 @@ def test_the_approval_writer_raises_only_lifecycle_error(
     success=ANYTHING,
     verified=ANYTHING,
     body=st.none() | ANYTHING,
+    http_status=st.none() | ANYTHING,
+    requested_at=st.just(WHEN) | ANYTHING,
     detail_code=st.none() | st.sampled_from(FAILURE_CODES) | ANYTHING,
 )
 @settings(max_examples=60, deadline=None)
@@ -151,17 +204,20 @@ def test_the_submission_writer_raises_only_lifecycle_error(
     success: object,
     verified: object,
     body: object,
+    http_status: object,
+    requested_at: object,
     detail_code: object,
 ) -> None:
     with _ledger() as (conn, valid_id):
         attempt = SubmissionAttempt(
             attempt_id=attempt_id,  # type: ignore[arg-type]
             idempotency_key=key,  # type: ignore[arg-type]
-            requested_at_utc=WHEN,
+            requested_at_utc=requested_at,  # type: ignore[arg-type]
             request_payload_sha256=payload_sha,  # type: ignore[arg-type]
             success=success,  # type: ignore[arg-type]
             verified_by_refetch=verified,  # type: ignore[arg-type]
             response_body=body,  # type: ignore[arg-type]
+            http_status=http_status,  # type: ignore[arg-type]
         )
         try:
             lifecycle.record_submission_attempt(
@@ -173,6 +229,45 @@ def test_the_submission_writer_raises_only_lifecycle_error(
             )
         except LifecycleError:
             pass
+        assert not conn.in_transaction
+
+
+class HostileAttempt(SubmissionAttempt):
+    """A subclass that turns one field read into caller-supplied code."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name in ("idempotency_key", "request_payload_sha256", "response_body"):
+            raise RuntimeError(PLANTED_SECRET)
+        return object.__getattribute__(self, name)
+
+
+@given(field_values=st.lists(ANYTHING, min_size=6, max_size=6))
+@settings(max_examples=60, deadline=None)
+def test_a_hostile_attempt_subclass_raises_only_lifecycle_error(
+    field_values: list[object],
+) -> None:
+    """`isinstance` admitted subclasses; every field read then ran foreign code.
+
+    Fuzzed over the field values as well, so the refusal cannot depend on the payload
+    being well formed -- it has to come from the type gate, before any attribute is read.
+    (GPT round 1, finding 3.)
+    """
+    with _ledger() as (conn, valid_id):
+        attempt = HostileAttempt(
+            attempt_id=field_values[0],  # type: ignore[arg-type]
+            idempotency_key=field_values[1],  # type: ignore[arg-type]
+            requested_at_utc=field_values[2],  # type: ignore[arg-type]
+            request_payload_sha256=field_values[3],  # type: ignore[arg-type]
+            success=field_values[4],  # type: ignore[arg-type]
+            verified_by_refetch=field_values[5],  # type: ignore[arg-type]
+        )
+        try:
+            lifecycle.record_submission_attempt(
+                conn, record_id=valid_id, attempt=attempt, occurred_at=WHEN
+            )
+        except LifecycleError as exc:
+            assert PLANTED_SECRET not in str(exc)
+            assert PLANTED_SECRET not in "".join(traceback.format_exception(exc))
         assert not conn.in_transaction
 
 

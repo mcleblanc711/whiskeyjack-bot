@@ -17,7 +17,7 @@ import sqlite3
 import traceback
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from importlib.resources import files
 from pathlib import Path
 from typing import get_args
@@ -149,6 +149,38 @@ def _attempt(
     )
 
 
+class HostileTimezone(tzinfo):
+    """A `tzinfo` whose `utcoffset` raises, planting a secret in the message.
+
+    `tzinfo` is an abstract base class, so a `datetime` that passes every type gate can
+    still run caller-supplied code during the UTC conversion. Without a guard that code's
+    exception -- and its text -- propagates straight out of the writer.
+    """
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        raise ValueError(PLANTED_SECRET)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "hostile"
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+
+class HostileAttempt(SubmissionAttempt):
+    """A `SubmissionAttempt` subclass that makes every attribute read hostile.
+
+    Shadowing a field with a property fails at construction on a frozen dataclass, so the
+    realistic shape is `__getattribute__`: it survives `__init__` and turns each
+    `attempt.<field>` read in the writer into a call the writer did not know it made.
+    """
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "idempotency_key":
+            raise RuntimeError(PLANTED_SECRET)
+        return object.__getattribute__(self, name)
+
+
 def _counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {
         table: int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
@@ -221,6 +253,199 @@ def test_ledger_rows_can_be_neither_updated_nor_deleted(
         conn.execute(f"UPDATE {table} SET {UPDATABLE_COLUMN[table]} = ?", ("changed",))
 
 
+def test_an_event_must_name_a_forecast_record(draft: tuple[sqlite3.Connection, str]) -> None:
+    """``forecast_record_id`` is nullable in the DDL and mandatory in the trigger.
+
+    The column is declared nullable only so M1-606 can add attempt-scoped events without
+    rebuilding an append-only table (SQLite cannot relax NOT NULL in place). The
+    constraint actually in force must still be NOT NULL, or the forward-compatibility
+    gesture has quietly weakened the schema it was meant to leave alone.
+    """
+    conn, _ = draft
+    with pytest.raises(sqlite3.IntegrityError, match="forecast_record_id is required"):
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, occurred_at_utc, created_at_utc) "
+            "VALUES (NULL, 1, 'validated', 'draft', 'validated', ?, ?)",
+            (TS, TS),
+        )
+
+
+def _replace_row(conn: sqlite3.Connection, table: str, **changes: object) -> None:
+    """Re-insert an existing row through ``INSERT OR REPLACE``, optionally altered.
+
+    Rebuilt from ``SELECT *`` so the statement is well-formed for any of the six tables
+    and the only thing that can refuse it is the append-only trigger.
+    """
+    stored = dict(conn.execute(f"SELECT * FROM {table} LIMIT 1").fetchone())
+    stored.update(changes)
+    columns = ", ".join(stored)
+    placeholders = ", ".join("?" for _ in stored)
+    conn.execute(
+        f"INSERT OR REPLACE INTO {table} ({columns}) VALUES ({placeholders})",
+        tuple(stored.values()),
+    )
+
+
+@pytest.mark.parametrize("table", APPEND_ONLY_TABLES)
+def test_replace_cannot_overwrite_a_row_through_its_primary_key(
+    ledger: sqlite3.Connection, table: str
+) -> None:
+    """``INSERT OR REPLACE`` is a DELETE the block triggers must still see.
+
+    SQLite resolves a REPLACE conflict by deleting the row in the way, and with
+    ``PRAGMA recursive_triggers`` off -- its default -- those deletes fire no BEFORE
+    DELETE trigger at all, which made every append-only trigger in migration 003
+    bypassable by one statement. ``ledger.connect()`` turns the pragma on and verifies
+    the readback; this is the statement-level half of that guarantee. (GPT review round
+    1, finding 1, reproduced against all three tables it named.)
+
+    Asserted as "refused, and nothing was erased" rather than on the message: for five
+    of the six tables the append-only delete trigger is what fires, but on
+    ``lifecycle_events`` the state-machine trigger gets there first, and which guard
+    catches it matters less than that the stored rows survive. The two named scenarios
+    below pin the specific guards.
+    """
+    conn = ledger
+    record_id = _seed_draft(conn)
+    _walk_to(conn, record_id, "scored")
+    before = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+    assert before
+    with pytest.raises(sqlite3.IntegrityError):
+        _replace_row(conn, table)
+    after = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+    assert [tuple(row) for row in after] == [tuple(row) for row in before]
+
+
+def test_replace_cannot_overwrite_a_row_through_a_secondary_unique_key(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The primary key is not the only way into REPLACE's delete path.
+
+    A conflict on *any* uniqueness constraint triggers the same replacement delete, so
+    the two secondary UNIQUE keys need their own probe: a new attempt_id reusing a
+    stored idempotency_key, and a new record_id reusing a stored
+    (question_id, tournament_id, forecast_version).
+    """
+    conn = ledger
+    record_id = _seed_draft(conn)
+    _walk_to(conn, record_id, "submitted")
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        _replace_row(conn, "submission_attempts", attempt_id="att-usurper")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        _replace_row(conn, "forecast_records", record_id="rec-usurper")
+
+
+def test_replace_cannot_renumber_an_event_through_its_sequence_key(
+    ledger: sqlite3.Connection,
+) -> None:
+    """``lifecycle_events``' UNIQUE key is guarded twice, and the first guard wins.
+
+    A REPLACE aimed at (forecast_record_id, event_seq) never reaches conflict resolution:
+    the BEFORE INSERT state-machine trigger runs first and requires the record's *next*
+    sequence number, which by definition does not collide with a stored one. The
+    append-only delete trigger is the second line, exercised by the primary-key test
+    above -- so both routes to erasing an event are closed, by different guards.
+    """
+    conn = ledger
+    record_id = _seed_draft(conn)
+    _walk_to(conn, record_id, "validated")
+    with pytest.raises(sqlite3.IntegrityError, match="next sequence number"):
+        _replace_row(conn, "lifecycle_events", event_id=None)
+
+
+def test_replace_cannot_flip_a_stored_approval_decision(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """GPT round 1, scenario 1: an approved event left pointing at a rejected row.
+
+    The exact-hash approval binding is only as good as the immutability of the row it
+    binds to.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    record_approval(
+        conn,
+        record_id=record_id,
+        decision="approved",
+        actor="chris",
+        forecast_sha256=SHA,
+        occurred_at=WHEN,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        _replace_row(conn, "approval_events", decision="rejected", actor="usurper")
+    assert conn.execute("SELECT decision FROM approval_events").fetchone()[0] == "approved"
+
+
+def test_replace_cannot_downgrade_a_verified_submission(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """GPT round 1, scenario 2: a submitted event left pointing at success=0.
+
+    ``submitted`` means "posted and confirmed by refetch" only because the attempt row
+    it points at says so; rewriting that row underneath it is an unearned claim.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    record_approval(
+        conn,
+        record_id=record_id,
+        decision="approved",
+        actor="chris",
+        forecast_sha256=SHA,
+        occurred_at=WHEN,
+    )
+    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        _replace_row(conn, "submission_attempts", success=0, verified_by_refetch=0)
+    stored = conn.execute("SELECT success, verified_by_refetch FROM submission_attempts").fetchone()
+    assert tuple(stored) == (1, 1)
+    assert current_status(conn, record_id) == "submitted"
+
+
+def test_replace_cannot_erase_the_first_event_of_a_history(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """GPT round 1, scenario 3: a history left as ``[(1, 2, 'approved')]``.
+
+    Event contiguity from 1 is what makes a *missing* event detectable, and REPLACE
+    could delete seq 1 while inserting seq 2 under the same event_id -- passing the
+    state-machine trigger, which sees the old row still in place when it runs.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    first = conn.execute("SELECT event_id FROM lifecycle_events WHERE event_seq = 1").fetchone()[0]
+    approval_id = conn.execute(
+        "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+        "created_at_utc) VALUES (?, 'approved', 'usurper', ?, ?)",
+        (record_id, SHA, TS),
+    ).lastrowid
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "INSERT OR REPLACE INTO lifecycle_events (event_id, forecast_record_id, event_seq, "
+            "event_type, from_status, to_status, approval_event_id, occurred_at_utc, "
+            "created_at_utc) VALUES (?, ?, 2, 'approved', 'validated', 'approved', ?, ?, ?)",
+            (first, record_id, approval_id, TS, TS),
+        )
+    history = [(event.event_seq, event.event_type) for event in read_history(conn, record_id)]
+    assert history == [(1, "validated")]
+
+
+@pytest.mark.parametrize("table", APPEND_ONLY_TABLES)
+def test_update_or_replace_is_refused_before_it_can_delete(
+    ledger: sqlite3.Connection, table: str
+) -> None:
+    # UPDATE OR REPLACE also deletes conflicting rows, but the BEFORE UPDATE block fires
+    # first, so this one never reaches conflict resolution. Pinned so the ordering is not
+    # something a later migration can quietly change.
+    conn = ledger
+    record_id = _seed_draft(conn)
+    _walk_to(conn, record_id, "scored")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(f"UPDATE OR REPLACE {table} SET {UPDATABLE_COLUMN[table]} = ?", ("changed",))
+
+
 def test_evidence_rows_may_be_completed_but_never_deleted(ledger: sqlite3.Connection) -> None:
     # The deliberate asymmetry: D25 names forecast versions and lifecycle events, and a
     # research run is a row M1-306 starts and later finishes. Completable, not erasable.
@@ -232,10 +457,48 @@ def test_evidence_rows_may_be_completed_but_never_deleted(ledger: sqlite3.Connec
         (TS,),
     )
     ledger.execute("UPDATE research_runs SET completed_at_utc = ?", (TS,))
+    ledger.execute("UPDATE research_runs SET error_summary = 'provider timed out'")
+    ledger.execute("UPDATE research_documents SET title = 'a better title'")
     with pytest.raises(sqlite3.IntegrityError):
         ledger.execute("DELETE FROM research_runs")
     with pytest.raises(sqlite3.IntegrityError):
         ledger.execute("DELETE FROM research_documents")
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("research_runs", "retrieval_run_id", "run-usurper"),
+        ("research_runs", "provider", "somewhere-else"),
+        ("research_runs", "started_at_utc", "2020-01-01T00:00:00+00:00"),
+        ("research_runs", "created_at_utc", "2020-01-01T00:00:00+00:00"),
+        ("research_documents", "document_id", "doc-usurper"),
+        ("research_documents", "retrieval_run_id", "run-2"),
+        ("research_documents", "canonical_url", "https://example.test/elsewhere"),
+        ("research_documents", "content_sha256", "hash-2"),
+        ("research_documents", "retrieved_at_utc", "2020-01-01T00:00:00+00:00"),
+    ],
+)
+def test_evidence_may_be_annotated_but_never_re_identified(
+    ledger: sqlite3.Connection, table: str, column: str, value: str
+) -> None:
+    """The other half of the carve-out: completable does not mean rewritable.
+
+    Blocking only DELETE left a stored run's provider or a document's URL and content
+    hash open to being rewritten in place, which detaches the evidence from what was
+    actually retrieved as effectively as erasing it. (GPT round 1, non-blocking
+    observation.)
+    """
+    ledger.execute(
+        "INSERT INTO research_documents (document_id, retrieval_run_id, original_url, "
+        "canonical_url, retrieved_at_utc, source_type, provenance, content_sha256) "
+        "VALUES ('doc-1', 'run-1', 'https://example.test/a', 'https://example.test/a', ?, "
+        "'news', 'direct_api', 'hash-1')",
+        (TS,),
+    )
+    _seed_run(ledger, run_id="run-2")
+    with pytest.raises(sqlite3.IntegrityError, match="never re-identified"):
+        ledger.execute(f"UPDATE {table} SET {column} = ?", (value,))
 
 
 # --------------------------------------------------------------------------------------
@@ -433,8 +696,8 @@ def test_failed_is_terminal(draft: tuple[sqlite3.Connection, str]) -> None:
     record_failure(
         conn,
         record_id=record_id,
-        event_type="research_failed",
-        detail_code="provider_error",
+        event_type="validation_failed",
+        detail_code="schema_invalid",
         occurred_at=WHEN,
     )
     assert current_status(conn, record_id) == "failed"
@@ -959,6 +1222,50 @@ def test_a_failing_commit_raises_lifecycle_error_and_closes_the_transaction(
         conn.close()
 
 
+class _FailingRelease(sqlite3.Connection):
+    """A real connection whose savepoint RELEASE fails; same construction as above."""
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        if sql.startswith("RELEASE "):
+            raise sqlite3.OperationalError("database is locked")
+        return super().execute(sql, parameters)  # type: ignore[arg-type]
+
+
+def test_a_failing_release_raises_lifecycle_error_and_spares_the_outer_transaction(
+    tmp_path: Path,
+) -> None:
+    """The nested counterpart of the failing-COMMIT test (GPT round 1, risk area 1).
+
+    A `RELEASE` that fails must unwind only the inner block: `ROLLBACK TO` first, then
+    the paired `RELEASE` to pop the savepoint -- and `_unwind` has to attempt the second
+    even though the first is what just failed, or the savepoint is leaked onto a
+    connection the caller goes on using. The caller's own transaction stays open and
+    committable, because it is not this module's to end.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = sqlite3.connect(db, factory=_FailingRelease)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.isolation_level = None
+        _seed_run(conn)
+        with transaction(conn):  # the caller's transaction: BEGIN, never RELEASEd
+            _seed_draft(conn, record_id="rec-outer")
+            with pytest.raises(LifecycleError):
+                with transaction(conn):  # nested: SAVEPOINT, whose RELEASE fails
+                    _seed_draft(conn, record_id="rec-inner", question_id=103)
+            assert conn.in_transaction
+        # The inner block is gone, the outer one committed, and no savepoint survived to
+        # strand the next write on this connection.
+        stored = conn.execute(
+            "SELECT record_id FROM forecast_records ORDER BY record_id"
+        ).fetchall()
+        assert [row[0] for row in stored] == ["rec-outer"]
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
 def test_transaction_refuses_an_implicit_transaction_connection(tmp_path: Path) -> None:
     db = tmp_path / "ledger.sqlite3"
     initialize_ledger(db)
@@ -1069,6 +1376,21 @@ def _leak_cases(
             occurred_at=WHEN,
         )
 
+    def submit_subclass() -> LifecycleEvent:
+        return record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=HostileAttempt(
+                attempt_id="att-1",
+                idempotency_key="idem-1",
+                requested_at_utc=WHEN,
+                request_payload_sha256=PAYLOAD_SHA,
+                success=True,
+                verified_by_refetch=True,
+            ),
+            occurred_at=WHEN,
+        )
+
     return {
         "record_id": lambda: approve(record_id=PLANTED_SECRET),
         "actor_over_cap": lambda: approve(actor=PLANTED_SECRET * 40),
@@ -1078,6 +1400,13 @@ def _leak_cases(
         "idempotency_key": lambda: submit(key=PLANTED_SECRET),
         "response_body_over_cap": lambda: submit(response_body=PLANTED_SECRET * 6000),
         "error_message": lambda: submit(error_message=PLANTED_SECRET * 6000),
+        # The three GPT round 1 found: the value is not a field this module reads, but
+        # something it *calls* -- a timezone, an attribute, an integer conversion -- so
+        # the leak arrives as an exception raised elsewhere rather than as stored text.
+        "hostile_timezone": lambda: approve(
+            occurred_at=datetime(2026, 7, 27, tzinfo=HostileTimezone())
+        ),
+        "hostile_attempt_subclass": submit_subclass,
     }
 
 
@@ -1092,6 +1421,8 @@ def _leak_cases(
         "idempotency_key",
         "response_body_over_cap",
         "error_message",
+        "hostile_timezone",
+        "hostile_attempt_subclass",
     ],
 )
 def test_no_planted_secret_reaches_an_error_message_or_traceback(
@@ -1104,3 +1435,80 @@ def test_no_planted_secret_reaches_an_error_message_or_traceback(
     assert PLANTED_SECRET not in str(excinfo.value)
     rendered = "".join(traceback.format_exception(excinfo.value))
     assert PLANTED_SECRET not in rendered
+
+
+def test_an_oversized_integer_is_refused_at_the_field(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """Python ints are unbounded; SQLite's are signed 64-bit.
+
+    Without the range check `sqlite3` raises `OverflowError` while binding the parameter
+    -- and `OverflowError` is not a `sqlite3.Error`, so it escaped the wrapper in
+    `_insert` and reached the caller as an undocumented type. (GPT round 1, finding 3.)
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    record_approval(
+        conn,
+        record_id=record_id,
+        decision="approved",
+        actor="chris",
+        forecast_sha256=SHA,
+        occurred_at=WHEN,
+    )
+    with pytest.raises(LifecycleError, match="outside the range"):
+        record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=_attempt(http_status=10**100),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_attempts"] == 0
+    assert not conn.in_transaction
+
+
+def test_the_binding_wrapper_also_catches_an_oversized_integer(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # The field validator is the first line; this pins the second, since a later writer
+    # could reach _insert with an integer that never passed through _require_optional_int.
+    conn, _ = draft
+    with pytest.raises(LifecycleError, match="the ledger rejected this write"):
+        lifecycle._insert(
+            conn,
+            "INSERT INTO resolution_events (question_id, ingested_at_utc) VALUES (?, ?)",
+            (10**100, TS),
+        )
+
+
+def test_a_submission_attempt_subclass_is_refused(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # isinstance would admit it, and every `attempt.<field>` read after that is a call
+    # into caller-supplied code -- between the two writes, where a raised exception is
+    # most expensive.
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    record_approval(
+        conn,
+        record_id=record_id,
+        decision="approved",
+        actor="chris",
+        forecast_sha256=SHA,
+        occurred_at=WHEN,
+    )
+    with pytest.raises(LifecycleError, match="must be a SubmissionAttempt"):
+        record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=HostileAttempt(
+                attempt_id="att-1",
+                idempotency_key="idem-1",
+                requested_at_utc=WHEN,
+                request_payload_sha256=PAYLOAD_SHA,
+                success=True,
+                verified_by_refetch=True,
+            ),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_attempts"] == 0

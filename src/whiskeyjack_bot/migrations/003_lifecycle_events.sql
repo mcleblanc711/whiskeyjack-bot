@@ -23,20 +23,36 @@
 --
 -- WHAT IS NOT PROTECTED HERE, and why:
 --
--- * `research_runs` / `research_documents` get a DELETE block but no UPDATE block.
---   D25's wording is "append forecast versions and lifecycle events", and the handoff
---   describes a research run as carrying started *and* completed timestamps, an error
---   summary and a cost -- i.e. a row M1-306 starts and later finishes. Blocking UPDATE
---   here would decide that unstarted item's write shape from outside it. Evidence may
---   be completed; it may never be erased. 002's completeness triggers stay live and
---   remain the enforcement on that pair (migrations are immutable, so they cannot be
+-- * `research_runs` / `research_documents` get a DELETE block and a *partial* UPDATE
+--   block, not a total one. D25's wording is "append forecast versions and lifecycle
+--   events", and the handoff describes a research run as carrying started *and*
+--   completed timestamps, an error summary and a cost -- i.e. a row M1-306 starts and
+--   later finishes. Blocking UPDATE outright would decide that unstarted item's write
+--   shape from outside it. So the rule is narrower and says what it means: evidence may
+--   be completed and annotated, but never re-identified and never erased. The identity
+--   and provenance columns are pinned at the bottom of this file; everything M1-306 has
+--   to fill in stays writable. 002's completeness triggers stay live and remain the
+--   enforcement on the rest of that pair (migrations are immutable, so they cannot be
 --   removed even where they overlap).
 -- * `schema_migrations` is untouched. It is the migration runner's own bookkeeping,
 --   not ledger content, and ledger.py's schema-drift detection is tested by corrupting
 --   it deliberately.
 --
+-- WHAT THIS MIGRATION CANNOT RECORD, and who owns it:
+--
+-- Every event here is scoped to a forecast record, and 001 requires a forecast record
+-- to carry a non-null final_prediction_json, record_json and retrieval_run_id. So no
+-- record exists until generation has already succeeded, and a research or generation
+-- failure -- which happens before that -- has nothing to attach to. The first draft
+-- shipped `research_failed`/`generation_failed` event types anyway; they were
+-- unreachable, and are removed rather than left as a promise the schema cannot keep
+-- (GPT review round 1, finding 2). M1-606 owns pre-forecast failures and the
+-- attempt-scoped identity they need, in migration 004. `forecast_record_id` is declared
+-- nullable-with-a-trigger below so that item does not have to rebuild an append-only
+-- table to get there.
+--
 -- There is no `phase` column. Every event type names its own pipeline phase already
--- (`research_failed` happens in research), so a phase column would be a second
+-- (`submission_failed` happens at submission), so a phase column would be a second
 -- spelling of `event_type` that has to be kept in agreement with it. The *reason* a
 -- phase failed is `detail_code`, which is not derivable and so is stored.
 --
@@ -78,12 +94,25 @@ ALTER TABLE forecast_records ADD COLUMN forecast_sha256 TEXT;
 -- content. Same reasoning as the derived `DeferralReason` in questions/events.py.
 CREATE TABLE lifecycle_events (
     event_id              INTEGER PRIMARY KEY,
-    forecast_record_id    TEXT NOT NULL REFERENCES forecast_records (record_id),
+    -- Nullable in the DDL, mandatory in the trigger. Every event type defined today is
+    -- scoped to a forecast record and the trigger's first probe rejects a NULL, so the
+    -- constraint in force is exactly NOT NULL. The column is declared nullable so that
+    -- M1-606 can add pre-forecast, attempt-scoped events without rebuilding this table:
+    -- SQLite's ALTER TABLE cannot relax NOT NULL, and rebuilding an append-only table
+    -- means dropping and recreating its block triggers, which is precisely the operation
+    -- the ledger exists to make impossible. Cheap insurance, no change in behaviour.
+    --
+    -- For M1-606: UNIQUE (forecast_record_id, event_seq) below treats NULLs as distinct,
+    -- so an attempt-scoped event will need its own uniqueness over its own identity.
+    forecast_record_id    TEXT REFERENCES forecast_records (record_id),
     event_seq             INTEGER NOT NULL,
+    -- Kept in step with whiskeyjack_bot.lifecycle.LifecycleEventType, which explains why
+    -- `research_failed` and `generation_failed` are not here: no forecast_records row
+    -- exists until generation has succeeded, so those events had nothing to attach to.
     event_type            TEXT NOT NULL CHECK (
         event_type IN (
-            'validated', 'research_failed', 'generation_failed', 'validation_failed',
-            'rejected', 'approved', 'submitted', 'submission_failed', 'resolved', 'scored'
+            'validated', 'validation_failed', 'rejected', 'approved',
+            'submitted', 'submission_failed', 'resolved', 'scored'
         )
     ),
     from_status           TEXT NOT NULL CHECK (
@@ -130,6 +159,12 @@ CREATE TRIGGER lifecycle_events_validate_on_insert
 BEFORE INSERT ON lifecycle_events
 FOR EACH ROW
 BEGIN
+    -- The column is nullable in the DDL and mandatory here; see the note above it. This
+    -- probe runs first so a NULL gets its own message rather than falling through to the
+    -- record-exists probe, whose NOT EXISTS would also be true.
+    SELECT RAISE(ABORT, 'lifecycle_events: forecast_record_id is required')
+    WHERE NEW.forecast_record_id IS NULL;
+
     -- A BEFORE INSERT trigger runs ahead of the foreign-key check, so an unknown record
     -- fails here and carries this schema's own message rather than a generic FK one.
     SELECT RAISE(ABORT, 'lifecycle_events: forecast_record_id does not name a stored forecast record')
@@ -160,8 +195,6 @@ BEGIN
     SELECT RAISE(ABORT, 'lifecycle_events: (event_type, from_status, to_status) is not a legal transition')
     WHERE NOT (
            (NEW.event_type = 'validated'         AND NEW.from_status = 'draft'     AND NEW.to_status = 'validated')
-        OR (NEW.event_type = 'research_failed'   AND NEW.from_status = 'draft'     AND NEW.to_status = 'failed')
-        OR (NEW.event_type = 'generation_failed' AND NEW.from_status = 'draft'     AND NEW.to_status = 'failed')
         OR (NEW.event_type = 'validation_failed' AND NEW.from_status = 'draft'     AND NEW.to_status = 'failed')
         OR (NEW.event_type = 'validation_failed' AND NEW.from_status = 'validated' AND NEW.to_status = 'failed')
         OR (NEW.event_type = 'rejected'          AND NEW.from_status = 'validated' AND NEW.to_status = 'validated')
@@ -208,7 +241,7 @@ BEGIN
            OR NEW.resolution_event_id IS NOT NULL);
 
     SELECT RAISE(ABORT, 'lifecycle_events: this event type carries no detail row')
-    WHERE NEW.event_type IN ('validated', 'research_failed', 'generation_failed', 'validation_failed')
+    WHERE NEW.event_type IN ('validated', 'validation_failed')
       AND (NEW.approval_event_id IS NOT NULL
            OR NEW.submission_attempt_id IS NOT NULL
            OR NEW.resolution_event_id IS NOT NULL
@@ -430,4 +463,45 @@ BEFORE DELETE ON research_documents
 FOR EACH ROW
 BEGIN
     SELECT RAISE(ABORT, 'research_documents is append-only: retrieved evidence is never deleted');
+END;
+
+-- ... but "completable" is not "rewritable". The DELETE blocks above stop evidence being
+-- erased and left nothing stopping it being re-identified in place: a stored run could
+-- have its provider or start time rewritten, or a document its URL and content hash,
+-- which detaches the evidence from what was actually retrieved just as effectively as
+-- deleting it (GPT review round 1, non-blocking observation).
+--
+-- So identity and provenance are pinned and the completion columns stay open. What is
+-- deliberately still writable: research_runs.completed_at_utc / error_summary / cost_usd
+-- / raw_response_path / queries_json / provider_config_json / freshness_cutoff_utc /
+-- agent_model / posts_dropped_no_url / question_id -- the fields M1-306 fills in when a
+-- run finishes -- and every descriptive field of a document (title, publisher, summary,
+-- reliability_tag and the rest), which M1-305 may refine. 002's completeness triggers
+-- remain the enforcement on that pair and are unaffected.
+--
+-- `IS NOT` rather than `<>`: `<>` is NULL when either side is NULL, so a NULL comparison
+-- is neither true nor false and the guard would silently not fire. Every column named
+-- here is NOT NULL today, which is exactly why the operator must not depend on that.
+
+CREATE TRIGGER research_runs_block_identity_update
+BEFORE UPDATE ON research_runs
+FOR EACH ROW
+WHEN NEW.retrieval_run_id IS NOT OLD.retrieval_run_id
+  OR NEW.provider         IS NOT OLD.provider
+  OR NEW.started_at_utc   IS NOT OLD.started_at_utc
+  OR NEW.created_at_utc   IS NOT OLD.created_at_utc
+BEGIN
+    SELECT RAISE(ABORT, 'research_runs: a run may be completed but never re-identified; retrieval_run_id, provider and its timestamps are fixed at creation');
+END;
+
+CREATE TRIGGER research_documents_block_identity_update
+BEFORE UPDATE ON research_documents
+FOR EACH ROW
+WHEN NEW.document_id      IS NOT OLD.document_id
+  OR NEW.retrieval_run_id IS NOT OLD.retrieval_run_id
+  OR NEW.canonical_url    IS NOT OLD.canonical_url
+  OR NEW.content_sha256   IS NOT OLD.content_sha256
+  OR NEW.retrieved_at_utc IS NOT OLD.retrieved_at_utc
+BEGIN
+    SELECT RAISE(ABORT, 'research_documents: a document may be annotated but never re-identified; document_id, retrieval_run_id, canonical_url, content_sha256 and retrieved_at_utc are fixed at creation');
 END;

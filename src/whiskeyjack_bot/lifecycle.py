@@ -54,10 +54,19 @@ LifecycleStatus = Literal[
 # What can happen to a forecast record. Each event type names its own pipeline phase,
 # which is why there is no separate `phase` column: it would be a second spelling of
 # this one that has to be kept in agreement with it.
+#
+# Every member is scoped to a *forecast record*, and that is what bounds the list. An
+# earlier draft also carried `research_failed` and `generation_failed`; both were
+# structurally unreachable, because `forecast_records` (001) requires a non-null
+# `final_prediction_json`, `record_json` and `retrieval_run_id`, so no record exists
+# until generation has already succeeded. There was no row for those events to attach
+# to, and no honest one to invent. They are removed rather than left as an API that can
+# only raise "unknown record"; M1-606 owns pre-forecast failures and the attempt-scoped
+# identity they need. (GPT review round 1, finding 2.) A research failure already has a
+# home in the meantime: `research_runs.error_summary`, per CLAUDE_CODE_PROMPT.md's
+# retrieval section.
 LifecycleEventType = Literal[
     "validated",
-    "research_failed",
-    "generation_failed",
     "validation_failed",
     "rejected",
     "approved",
@@ -67,10 +76,13 @@ LifecycleEventType = Literal[
     "scored",
 ]
 
-# The subset :func:`record_failure` writes: failures that happen before a record is
-# approved, and so carry no detail row. A submission failure is not here -- it has an
-# attempt row and is written by :func:`record_submission_attempt`.
-PipelineFailureEvent = Literal["research_failed", "generation_failed", "validation_failed"]
+# The subset :func:`record_failure` writes: failures that happen once the draft record
+# exists but before it is approved, and so carry no detail row. One member today, kept as
+# a named alias because M1-606 is expected to widen it, and because it keeps
+# `record_failure`'s vocabulary gate honest about which events it will accept. A
+# submission failure is not here -- it has an attempt row and is written by
+# :func:`record_submission_attempt`.
+PipelineFailureEvent = Literal["validation_failed"]
 
 # The 001 vocabulary of `approval_events.decision`, reused verbatim: the decision and
 # the lifecycle event type are the same word, which is what lets the migration's trigger
@@ -117,8 +129,6 @@ _PIPELINE_FAILURE_EVENTS: frozenset[str] = frozenset(get_args(PipelineFailureEve
 _LEGAL_TRANSITIONS: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("validated", "draft", "validated"),
-        ("research_failed", "draft", "failed"),
-        ("generation_failed", "draft", "failed"),
         ("validation_failed", "draft", "failed"),
         ("validation_failed", "validated", "failed"),
         ("rejected", "validated", "validated"),
@@ -149,6 +159,11 @@ _MAX_NOTE = 4000
 _MAX_BODY = 65536
 
 _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
+
+# What SQLite's INTEGER can actually hold. Python's int is unbounded, so this is a real
+# boundary rather than a defensive nicety; see _require_optional_int.
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
 
 
 class LifecycleError(Exception):
@@ -289,10 +304,21 @@ def _require_bool(value: object, field: str) -> int:
 
 
 def _require_optional_int(value: object, field: str) -> int | None:
+    """Return ``value`` as a storable integer, or raise naming only the *field*.
+
+    The range check is not decoration. Python integers are unbounded and SQLite's are
+    signed 64-bit, so ``sqlite3`` raises a raw ``OverflowError`` when it binds one that
+    does not fit -- and ``OverflowError`` is not a ``sqlite3.Error``, so it sails past
+    the wrapper in :func:`_insert` and reaches the caller as an exception type this
+    module does not document. Rejecting it here makes it a field-level message instead.
+    (GPT review round 1, finding 3.)
+    """
     if value is None:
         return None
     if type(value) is not int:
         raise LifecycleError(f"{field} must be an integer")
+    if not _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
+        raise LifecycleError(f"{field} is outside the range the ledger can store")
     return value
 
 
@@ -302,12 +328,32 @@ def _require_utc(value: object, field: str) -> str:
     Exact type rather than ``isinstance``: a ``datetime`` subclass can override
     ``isoformat()`` and write arbitrary text into a NOT NULL timestamp column, which
     would put unvetted content into a field the ledger's replay ordering depends on.
+
+    The conversion itself is guarded, and broadly. ``tzinfo`` is an abstract base class,
+    so ``value.utcoffset()`` and ``astimezone()`` run *caller-supplied code* on a value
+    that has passed every type gate above -- a ``datetime`` carrying a hostile ``tzinfo``
+    whose ``utcoffset`` raises will propagate whatever that method raises, message and
+    traceback included. ``except Exception`` is the right width precisely because the
+    set of exceptions arbitrary code can raise is not enumerable.
     """
     if type(value) is not datetime:
         raise LifecycleError(f"{field} must be a datetime")
-    if value.tzinfo is None or value.utcoffset() is None:
+    try:
+        aware = value.tzinfo is not None and value.utcoffset() is not None
+    except Exception:
+        # from None: the tzinfo's own exception text and traceback are attacker-shaped.
+        raise LifecycleError(
+            f"{field} has a timezone that could not be read "
+            "(detail withheld: it can echo the value)"
+        ) from None
+    if not aware:
         raise LifecycleError(f"{field} must be timezone-aware")
-    return value.astimezone(timezone.utc).isoformat()
+    try:
+        return value.astimezone(timezone.utc).isoformat()
+    except Exception:
+        raise LifecycleError(
+            f"{field} could not be converted to UTC (detail withheld: it can echo the value)"
+        ) from None
 
 
 def _require_optional_utc(value: object, field: str) -> str | None:
@@ -413,12 +459,17 @@ def _unwind(conn: sqlite3.Connection, *statements: str) -> None:
 
     If the rollback itself fails the connection is already unusable, and surfacing that
     instead of the original error would hide why the block failed in the first place.
+
+    Every statement is attempted, including those after one that failed. The two-part
+    savepoint unwind is why: ``ROLLBACK TO`` leaves the savepoint on the stack and only
+    the paired ``RELEASE`` pops it, so abandoning the sequence at the first failure would
+    leak a savepoint onto a connection the caller goes on using.
     """
     for statement in statements:
         try:
             conn.execute(statement)
         except sqlite3.Error:
-            return
+            continue
 
 
 def current_status(conn: sqlite3.Connection, record_id: str) -> LifecycleStatus:
@@ -493,12 +544,18 @@ def record_failure(
     detail_code: FailureCode,
     occurred_at: datetime,
 ) -> LifecycleEvent:
-    """Record a pre-approval failure: research, generation or validation.
+    """Record a pre-approval failure of a stored draft: validation, today.
 
     These carry no detail row -- there is no provider receipt to point at -- so
     ``detail_code`` is the whole account of what went wrong and is required. A failed
     record is terminal: a further attempt is a new forecast version (M1-602), which is
     why there is no transition out of ``failed``.
+
+    ``event_type`` is a one-member vocabulary rather than a fixed literal because the
+    events this *cannot* record are the interesting ones: a research or generation
+    failure happens before any ``forecast_records`` row exists, so it has no record to
+    name here. That is M1-606's problem to solve, with an attempt-scoped identity and
+    migration 004; see :data:`LifecycleEventType`.
     """
     _require_member(event_type, _PIPELINE_FAILURE_EVENTS, "event_type")
     _require_member(detail_code, _FAILURE_CODES, "detail_code")
@@ -576,7 +633,13 @@ def record_submission_attempt(
     Persistence only. Nothing here contacts Metaculus; the gateways that do are M2-703
     and M2-704, and ``submission.enabled``/``dry_run`` remain what they are until then.
     """
-    if not isinstance(attempt, SubmissionAttempt):
+    # Exact type, not isinstance -- the same gate every validator below uses, and for a
+    # stronger reason. A subclass can override __getattribute__ or shadow a field with a
+    # property, so each `attempt.<field>` read here becomes a call into caller-supplied
+    # code that can raise anything, from anywhere between the two writes. The field
+    # validators cannot help: they only see what the attribute access returns.
+    # (GPT review round 1, finding 3.)
+    if type(attempt) is not SubmissionAttempt:
         raise LifecycleError("attempt must be a SubmissionAttempt")
     identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
     occurred = _require_utc(occurred_at, "occurred_at")
@@ -819,10 +882,16 @@ def _insert(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...]) 
     contract, and this module's guarantee is not allowed to depend on it. The
     actionable cases (illegal transition, unknown record, hash mismatch, malformed
     field) are all raised with their own messages before the statement runs.
+
+    ``OverflowError`` is caught alongside ``sqlite3.Error`` because it is not one:
+    ``sqlite3`` raises it while *binding* a Python int too large for a signed 64-bit
+    column, before any database code runs. :func:`_require_optional_int` now rejects
+    those at the field, so this is the second line -- but the two must both hold, since
+    a later writer could pass an integer that never went through that validator.
     """
     try:
         cursor = conn.execute(sql, parameters)
-    except sqlite3.Error:
+    except (sqlite3.Error, OverflowError):
         # from None: the underlying error's text and traceback can carry stored values.
         raise LifecycleError(
             "the ledger rejected this write (detail withheld: a database message can "
@@ -839,7 +908,7 @@ def _fetch_one(
 ) -> sqlite3.Row | None:
     try:
         row = conn.execute(sql, parameters).fetchone()
-    except sqlite3.Error:
+    except (sqlite3.Error, OverflowError):  # OverflowError: see _insert
         raise LifecycleError(
             "the ledger could not be read (detail withheld: a database message can "
             "echo stored values)"
@@ -852,7 +921,7 @@ def _fetch_all(
 ) -> list[sqlite3.Row]:
     try:
         rows = conn.execute(sql, parameters).fetchall()
-    except sqlite3.Error:
+    except (sqlite3.Error, OverflowError):  # OverflowError: see _insert
         raise LifecycleError(
             "the ledger could not be read (detail withheld: a database message can "
             "echo stored values)"

@@ -120,6 +120,11 @@ def test_connect_enables_wal_and_foreign_keys(tmp_path: Path) -> None:
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        # Not a stylistic pragma: with this off (SQLite's default), the deletes that
+        # `INSERT OR REPLACE` performs to clear a constraint conflict skip every BEFORE
+        # DELETE trigger, which is the whole of migration 003's append-only enforcement.
+        # tests/unit/test_lifecycle.py exercises the REPLACE statements themselves.
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
     finally:
         conn.close()
 

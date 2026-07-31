@@ -770,16 +770,19 @@ The stricter reading was taken twice more, per the ambiguity rule:
 
 ### Delivered
 
-- `src/whiskeyjack_bot/migrations/003_lifecycle_events.sql` — `lifecycle_events` (the ordered
-  spine, `UNIQUE (forecast_record_id, event_seq)`), `forecast_records.forecast_sha256`, the
-  state-machine trigger, the draft-only and hash-binding triggers, and fourteen append-only
-  triggers. `LEDGER_SCHEMA_VERSION` 2 → 3.
+- `src/whiskeyjack_bot/migrations/003_lifecycle_events.sql` — nineteen triggers: the state
+  machine, the draft-only and hash-binding insert guards, fourteen append-only blocks and two
+  evidence identity pins. Plus `lifecycle_events` (the ordered spine,
+  `UNIQUE (forecast_record_id, event_seq)`) and `forecast_records.forecast_sha256`.
+  `LEDGER_SCHEMA_VERSION` 2 → 3.
+- `src/whiskeyjack_bot/ledger.py` — `connect()` also sets and verifies
+  `PRAGMA recursive_triggers = ON`, without which none of the above holds; see the round-1 section.
 - `src/whiskeyjack_bot/lifecycle.py` — the `Literal` vocabularies, `_LEGAL_TRANSITIONS`,
   `LifecycleError`, the `LifecycleEvent`/`SubmissionAttempt` value objects, a nesting-safe
   `transaction()`, `current_status()`/`read_history()`, and four writers: `record_validation`,
   `record_failure`, `record_approval`, `record_submission_attempt`.
-- `tests/unit/test_lifecycle.py` (64 tests) and `tests/property/test_lifecycle_properties.py`
-  (13, ~10s: one ledger for the session with a fresh record per example, because a database
+- `tests/unit/test_lifecycle.py` (97 tests) and `tests/property/test_lifecycle_properties.py`
+  (14, ~12s: one ledger for the session with a fresh record per example, because a database
   per example put the file past two minutes).
 
 ### Decision — approval binds to a stored hash, enforced by the database
@@ -799,13 +802,21 @@ in the trigger is what draws that line, since no 64-character hex string equals 
 
 `UPDATE` and `DELETE` are both blocked on `forecast_records`, `lifecycle_events`,
 `approval_events`, `submission_attempts`, `resolution_events` and `score_events`. `research_runs`
-and `research_documents` get a `DELETE` block only.
+and `research_documents` get a `DELETE` block and a *partial* `UPDATE` block.
 
 D25's wording is "append forecast versions and lifecycle events", and the handoff describes a
 research run as carrying started *and* completed timestamps, an error summary and a cost — a row
-M1-306 starts and later finishes. Blocking `UPDATE` there would decide that unstarted item's write
-shape from outside it. Evidence may be completed; it may never be erased. 002's completeness
-triggers stay live on that pair and remain the enforcement there.
+M1-306 starts and later finishes. Blocking `UPDATE` outright would decide that unstarted item's
+write shape from outside it. So the rule is narrower and says what it means: **evidence may be
+completed and annotated, but never re-identified and never erased.** Identity and provenance —
+`retrieval_run_id`, `provider` and the run's timestamps; a document's `document_id`,
+`retrieval_run_id`, `canonical_url`, `content_sha256` and `retrieved_at_utc` — are pinned by two
+`BEFORE UPDATE` triggers; everything M1-306 fills in on completion stays writable. 002's
+completeness triggers stay live on that pair and remain the enforcement on the rest.
+
+The first cut blocked `DELETE` only, which left a stored run's provider or a document's URL and
+content hash rewritable in place — detaching the evidence from what was actually retrieved as
+effectively as erasing it. GPT round 1 raised it as a non-blocking observation; it was worth taking.
 
 `schema_migrations` is deliberately untouched: it is the migration runner's own bookkeeping, and
 `test_ledger.py::test_checksum_drift_is_rejected` corrupts it on purpose.
@@ -829,7 +840,7 @@ so every attempt has exactly one legal event and `detail_code` (`refetch_mismatc
 
 ### Decision — no `phase` column, and no free text on the event row
 
-Every event type names its own pipeline phase (`research_failed` happens in research), so a
+Every event type names its own pipeline phase (`submission_failed` happens at submission), so a
 `phase` column would be a second spelling of `event_type` that has to be kept in agreement with
 it. What is *not* derivable is why a phase failed, and that is `detail_code` — a closed
 vocabulary, checked by the schema.
@@ -846,7 +857,7 @@ real foreign key and comparing it would mean `CAST`ing across SQLite's affinity 
 
 `_LEGAL_TRANSITIONS` in Python and the trigger in SQL describe the same machine. The database is
 the enforcement; the Python table is the writer. `test_database_accepts_exactly_the_legal_
-transitions` drives all 490 `(event_type, from_status, to_status)` triples through the trigger
+transitions` drives all 392 `(event_type, from_status, to_status)` triples through the trigger
 against a record actually sitting in each `from_status`, inside a rolled-back savepoint, and
 asserts the accepted set equals `_LEGAL_TRANSITIONS` exactly. Drift between the two is the obvious
 failure mode of duplicating a table, and it is the one thing no happy-path test would catch.
@@ -932,8 +943,94 @@ whole migration to walk back, while leaving the door open costs nothing — no w
 `detail_code` on a non-failure event, and none can without a Python change M2-701 would be making
 anyway.
 
+### Round 1 review (GPT) — three blocking findings, all reproduced
+
+All three were real. Each was reproduced against the branch before the fix and re-run after.
+
+**1. `INSERT OR REPLACE` bypassed every append-only trigger.** SQLite resolves a REPLACE conflict
+by *deleting* the row in the way, and with `PRAGMA recursive_triggers` off — its default — those
+deletes fire no `BEFORE DELETE` trigger. Fourteen triggers, one statement past all of them.
+Reproduced on all three of the paths GPT named: an approval row rewritten to `decision='rejected'`
+underneath the `approved` event pointing at it; a refetch-verified attempt downgraded to
+`success=0, verified_by_refetch=0` while the `submitted` event stood; and a history reduced to
+`[(1, 2, 'approved')]` by replacing event 1 with a row at seq 2 — which passes the state-machine
+trigger, because when that trigger runs the row it is about to delete is still there.
+
+`ledger.connect()` now sets `PRAGMA recursive_triggers = ON` and **verifies the readback**, the
+same shape as the existing WAL check: an ignored PRAGMA is a silent no-op in SQLite, and a silently
+off setting here restores the hole invisibly. `UPDATE OR REPLACE` can delete conflicting rows too,
+but the `BEFORE UPDATE` block pre-empts it; that ordering is now pinned by a test rather than
+assumed.
+
+The residual risk, stated plainly: **this is a per-connection setting**, so the guarantee is over
+connections opened through `connect()`. A raw `sqlite3` CLI session against the file can still
+REPLACE, and SQLite offers no schema-level defence. That is a real limit of enforcing append-only
+in SQLite at all, not something this migration can close.
+
+This is also the honest verdict on the item's own risk-area 3. "Only inserts, plus appended events"
+was asserted as a structural claim, and REPLACE falsified it. The claim holds now because a pragma
+makes it hold — one line of connection setup, load-bearing for the entire ledger.
+
+**2. `research_failed` and `generation_failed` were unreachable, so they are gone.** 001 requires a
+`forecast_records` row to carry a non-null `final_prediction_json`, `record_json` and
+`retrieval_run_id`. No record exists until generation has already *succeeded* — so a research or
+generation failure, which happens before that, had no row to attach to, and `record_failure` could
+only ever answer "unknown record". Both types are removed from `LifecycleEventType`, from
+`_LEGAL_TRANSITIONS` and from 003's `event_type` CHECK and transition disjunction.
+`PipelineFailureEvent` is a one-member `Literal` today, kept as a named alias because M1-606 is
+expected to widen it. `validation_failed` is unaffected: the draft is persisted before validation.
+
+**Owner decision.** The alternative — inventing an attempt-scoped identity table here so those
+events had somewhere to live — was considered and not taken: it decides M1-602's record-minting
+shape from outside it, and it is a second event scope bolted into an item whose acceptance
+criterion is about the first. Better to remove an API that cannot work than to ship it. A research
+failure already has a home in the meantime (`research_runs.error_summary`, per
+CLAUDE_CODE_PROMPT.md's retrieval section); **M1-606** is filed for the generation case and owns
+migration 004.
+
+One forward-compatibility gesture, because migrations are immutable and this is the last moment it
+is free: `lifecycle_events.forecast_record_id` is now declared **nullable**, with the trigger's
+first probe rejecting a NULL. The constraint in force is exactly `NOT NULL` — a test pins that —
+but M1-606 can add attempt-scoped events without rebuilding the table, which SQLite's `ALTER TABLE`
+cannot do in place and which for an append-only table would mean dropping and recreating the very
+block triggers the ledger exists to make permanent.
+
+**3. Three raw, value-bearing exceptions escaped the error boundary.** All three are the same
+mistake in different clothes: a value that passes every type gate and then gets *called*.
+
+- A `datetime` carrying a hostile `tzinfo` — `tzinfo` is an abstract base class, so `utcoffset()`
+  is caller-supplied code — propagated its own `ValueError`, message and traceback included.
+  `_require_utc` now guards both reads, and it takes two guards, not one: `astimezone()` calls
+  `utcoffset()` a *second* time, so only a stateful timezone distinguishes them. The property suite
+  has one of each.
+- `http_status=10**100` passed `_require_optional_int` (it is exactly an `int`) and leaked a raw
+  `OverflowError` from parameter binding — which is not a `sqlite3.Error`, so the wrapper in
+  `_insert` never saw it. Bounded at the field to SQLite's signed 64-bit range, and `_insert` /
+  `_fetch_*` now catch `OverflowError` as the second line.
+- A `SubmissionAttempt` subclass passed the module's one `isinstance` check, and every
+  `attempt.<field>` read after it is a call into foreign code, positioned between the two writes.
+  Now `type(attempt) is not SubmissionAttempt`, which is the gate every other validator in the
+  module already used and had a written rationale for.
+
+`except Exception` is deliberate in the first case. The set of exceptions arbitrary caller code can
+raise is not enumerable, and a narrow catch here is a guess about someone else's `tzinfo`.
+
+**Also fixed, found while confirming the above:** `_unwind` returned at the first failing statement
+instead of continuing, so a failed `ROLLBACK TO <sp>` skipped its paired `RELEASE <sp>` and leaked
+a savepoint onto a connection the caller goes on using — contradicting the two-part unwind contract
+`_control` documents. GPT's risk-area 1 asked for a direct failing-`RELEASE` regression test; there
+is now one, built like the failing-`COMMIT` test on a real `sqlite3.Connection` subclass, and it
+asserts the caller's outer transaction survives and commits.
+
+**Non-blocking, corrected:** the round-1 review request said 003 adds 16 triggers. It had 17
+`CREATE TRIGGER` statements, of which 14 were append-only blocks — the request's number was simply
+wrong. It is 19 and 14 now.
+
 ### Deferred (do not read the absence as an omission)
 
+- **Pre-forecast research and generation failures → M1-606.** Not an oversight and not a gap left
+  open silently: the event types that claimed to cover them were removed because the schema cannot
+  store them. See finding 2 above.
 - **`approve` / `reject` CLI commands → M2-701.** Adding them here would put a reachable approval
   path in the tree ahead of its item. This slice is library-only and makes zero network calls.
 - **Resolution and score writers → M4-802 / M5-803.** Their *transitions* are defined here because
