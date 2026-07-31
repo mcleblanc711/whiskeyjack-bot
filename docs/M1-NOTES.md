@@ -768,20 +768,28 @@ The stricter reading was taken twice more, per the ambiguity rule:
 - **`submitted` requires a refetch-verified attempt.** M2-704's "success requires refetch
   confirmation" is enforced by trigger, not left as a convention for that item to keep.
 
+And twice more in round 2, for the same reason:
+
+- **A submission receipt must carry its completion time**, because the table is append-only and
+  the ledger only hears about an attempt once it is over.
+- **The upgrade is refused rather than reconciled** when a ledger already holds a non-draft
+  record. The looser reading — migrate what can be migrated — means synthesizing events nobody
+  recorded.
+
 ### Delivered
 
-- `src/whiskeyjack_bot/migrations/003_lifecycle_events.sql` — nineteen triggers: the state
-  machine, the draft-only and hash-binding insert guards, fourteen append-only blocks and two
-  evidence identity pins. Plus `lifecycle_events` (the ordered spine,
-  `UNIQUE (forecast_record_id, event_seq)`) and `forecast_records.forecast_sha256`.
-  `LEDGER_SCHEMA_VERSION` 2 → 3.
+- `src/whiskeyjack_bot/migrations/003_lifecycle_events.sql` — twenty triggers: the state
+  machine, the draft-only, hash-binding and submission-receipt insert guards, fourteen
+  append-only blocks and two evidence identity pins. Plus `lifecycle_events` (the ordered spine,
+  `UNIQUE (forecast_record_id, event_seq)`), `forecast_records.forecast_sha256`, and an upgrade
+  precondition that refuses a ledger holding a non-draft record. `LEDGER_SCHEMA_VERSION` 2 → 3.
 - `src/whiskeyjack_bot/ledger.py` — `connect()` also sets and verifies
   `PRAGMA recursive_triggers = ON`, without which none of the above holds; see the round-1 section.
 - `src/whiskeyjack_bot/lifecycle.py` — the `Literal` vocabularies, `_LEGAL_TRANSITIONS`,
   `LifecycleError`, the `LifecycleEvent`/`SubmissionAttempt` value objects, a nesting-safe
   `transaction()`, `current_status()`/`read_history()`, and four writers: `record_validation`,
   `record_failure`, `record_approval`, `record_submission_attempt`.
-- `tests/unit/test_lifecycle.py` (97 tests) and `tests/property/test_lifecycle_properties.py`
+- `tests/unit/test_lifecycle.py` (143 tests) and `tests/property/test_lifecycle_properties.py`
   (14, ~12s: one ledger for the session with a fresh record per example, because a database
   per example put the file past two minutes).
 
@@ -809,14 +817,17 @@ research run as carrying started *and* completed timestamps, an error summary an
 M1-306 starts and later finishes. Blocking `UPDATE` outright would decide that unstarted item's
 write shape from outside it. So the rule is narrower and says what it means: **evidence may be
 completed and annotated, but never re-identified and never erased.** Identity and provenance —
-`retrieval_run_id`, `provider` and the run's timestamps; a document's `document_id`,
-`retrieval_run_id`, `canonical_url`, `content_sha256` and `retrieved_at_utc` — are pinned by two
-`BEFORE UPDATE` triggers; everything M1-306 fills in on completion stays writable. 002's
-completeness triggers stay live on that pair and remain the enforcement on the rest.
+`retrieval_run_id`, `provider`, `question_id` and the run's timestamps; a document's
+`document_id`, `retrieval_run_id`, `canonical_url`, `original_url`, `content_sha256`,
+`retrieved_at_utc`, `provenance` and `source_type` — are pinned by two `BEFORE UPDATE` triggers;
+everything M1-306 fills in on completion stays writable. 002's completeness triggers stay live on
+that pair and remain the enforcement on the rest.
 
 The first cut blocked `DELETE` only, which left a stored run's provider or a document's URL and
 content hash rewritable in place — detaching the evidence from what was actually retrieved as
-effectively as erasing it. GPT round 1 raised it as a non-blocking observation; it was worth taking.
+effectively as erasing it. GPT round 1 raised it as a non-blocking observation; it was worth
+taking. Round 2 then showed the pinned set was drawn on the wrong test — "NOT NULL in 001" rather
+than "established at creation" — and widened it; see finding 4 below.
 
 `schema_migrations` is deliberately untouched: it is the migration runner's own bookkeeping, and
 `test_ledger.py::test_checksum_drift_is_rejected` corrupts it on purpose.
@@ -828,14 +839,27 @@ the last valid record intact". So a rejection records a decision without moving 
 self-transition. `failed` is terminal by omission: a retry is a new forecast *version* (M1-602),
 not a resurrected record.
 
-### Decision — `submitted` and `submission_failed` are exact complements
+### Decision — a submission has three outcomes, not two *(revised in round 2)*
 
 The first cut required `success = 0` for `submission_failed`, which the migration's own smoke test
 showed left a hole: an attempt that posted successfully but whose refetch did not confirm it —
 M2-704's uncertain timeout — satisfied neither event's precondition and so could record no
-lifecycle event at all. That is a verification mismatch with no ledger event, which the handoff's
-failure-boundary rule forbids. `submission_failed` now requires *not* a refetch-verified success,
-so every attempt has exactly one legal event and `detail_code` (`refetch_mismatch`,
+lifecycle event at all. The fix then was to make the two events exact complements, so every attempt
+had exactly one legal event.
+
+That was still wrong, and round 2 caught it: the complement put the uncertain attempt in
+`submission_failed`, whose destination is terminal `failed`. See the round-2 section below. The
+three events now partition the `(success, verified_by_refetch)` pair:
+
+| success | verified | event | destination |
+|---------|----------|-------|-------------|
+| `True` | `True` | `submitted` | `submitted` |
+| `True` | `False` | `submission_uncertain` | `approved` (unchanged) |
+| `False` | `True` | `submission_uncertain` | `approved` (unchanged) |
+| `False` | `False` | `submission_failed` | `failed` |
+
+Total and disjoint, so every attempt still has exactly one legal event — and the two signals
+disagreeing is now its own outcome rather than a failure. `detail_code` (`refetch_mismatch`,
 `refetch_missing`, `timeout`, `http_error`) carries which case.
 
 ### Decision — no `phase` column, and no free text on the event row
@@ -939,13 +963,22 @@ raises during parameter binding rather than during validation.
 So: **"never raises outside our own error type" is only as strong as the assumption that inputs
 are inert**, and that assumption is false for anything with a dunder, an ABC in its ancestry, or
 an unbounded representation. A fuzzer restricted to data can only find data bugs. The strategy now
-carries one instance of each shape — including a *stateful* `tzinfo`, because `_require_utc` reads
+carries one instance of each shape — including a *stateful* `tzinfo`, because the UTC guard reads
 the offset twice (once itself, once inside `astimezone`) and a stateless hostile timezone cannot
 tell the two guards apart.
 
 This generalizes past this item, and is the thing to carry into M1-604's exporters and M2-703's
 gateway: when fuzzing a boundary that takes `object`, ask what in the input the code *calls*, not
 just what it stores.
+
+**Round 2 adds the other half of the same lesson.** With the strategy fixed, the suite was green
+again and missed all eight findings — because five of them (1, 2, 6, 7's SQL half, 8) are only
+reachable by a writer that does not go through this module at all, and two more (3, 5) are about
+what the writer records *correctly* being the wrong thing to record. A property suite over the
+public writers can only ever test the writers. The invariants that matter here are the database's,
+and the tests that find holes in them are the ones that reach past the module with raw SQL — which
+is why the exhaustive transition test drives triples through the trigger rather than through
+`_append_event`, and why every fix in round 2 has a raw-SQL test beside its writer test.
 
 ### Decision — both readers answer an unknown record the same way
 
@@ -955,16 +988,24 @@ missing record, and these two functions are the read seam M1-604 and `show` are 
 caller would report "this record has no events yet" while looking at nothing at all. `read_history`
 now raises `LifecycleError` too. The stricter reading, per the ambiguity rule.
 
-### Decision — `detail_code` is required on failure, not forbidden elsewhere
+### Decision — `detail_code` is required where it is the account, forbidden where it contradicts *(revised in round 2)*
 
-The trigger requires `detail_code` when `to_status = 'failed'` and says nothing about the other
+The first cut required `detail_code` when `to_status = 'failed'` and said nothing about the other
 events, so a non-failure event *may* carry one. Forbidding it outright was considered and
-deliberately not taken: `rejected_by_reviewer` is in the vocabulary, a rejection ends at
-`validated` rather than `failed`, and M2-701 is the item that decides whether a rejection records
-its reason that way. Since migrations are immutable, a trigger forbidding it now would cost a
-whole migration to walk back, while leaving the door open costs nothing — no writer here sets
-`detail_code` on a non-failure event, and none can without a Python change M2-701 would be making
-anyway.
+deliberately not taken, on the reasoning that `rejected_by_reviewer` was in the vocabulary, a
+rejection ends at `validated` rather than `failed`, and M2-701 is the item that decides whether a
+rejection records its reason that way — so leaving the door open cost nothing while closing it
+later would cost a migration.
+
+Round 2 showed the cost was not nothing: the immutable history could hold `validated ...
+detail_code='internal_error'`, a success annotated with a failure, reachable by any raw-SQL writer.
+The rule is now three probes — required when `to_status = 'failed'`, required on
+`submission_uncertain` (a reason that does not end in failure), forbidden on the six events that
+are neither. **Owner decision** on the case that motivated the original hesitation: a rejection
+carries no code. It is a decision, not a failure, and its account is the actor and note on the
+`approval_events` row the event cites. `rejected_by_reviewer` is therefore unwritable, and is
+removed from `FailureCode` and from 003's CHECK rather than shipped as dead vocabulary in an
+immutable migration — the same call round 1 made on `research_failed`.
 
 ### Round 1 review (GPT) — three blocking findings, all reproduced
 
@@ -1023,7 +1064,7 @@ mistake in different clothes: a value that passes every type gate and then gets 
 
 - A `datetime` carrying a hostile `tzinfo` — `tzinfo` is an abstract base class, so `utcoffset()`
   is caller-supplied code — propagated its own `ValueError`, message and traceback included.
-  `_require_utc` now guards both reads, and it takes two guards, not one: `astimezone()` calls
+  `_require_aware_utc` now guards both reads, and it takes two guards, not one: `astimezone()` calls
   `utcoffset()` a *second* time, so only a stateful timezone distinguishes them. The property suite
   has one of each.
 - `http_status=10**100` passed `_require_optional_int` (it is exactly an `int`) and leaked a raw
@@ -1047,7 +1088,82 @@ asserts the caller's outer transaction survives and commits.
 
 **Non-blocking, corrected:** the round-1 review request said 003 adds 16 triggers. It had 17
 `CREATE TRIGGER` statements, of which 14 were append-only blocks — the request's number was simply
-wrong. It is 19 and 14 now.
+wrong. It is 20 and 14 now.
+
+### Round 2 review (GPT) — eight findings, all reproduced
+
+Four P1 and four P2, every one of them a hole in what the *schema* guarantees rather than a broken
+test: CI was green and all 111 lifecycle tests passed at the time. Each was reproduced against the
+branch before the fix and the same reproduction re-run after. Migration 003 was still unmerged, so
+all of it landed in 003 itself rather than in a migration 004.
+
+**1 (P1). An upgraded ledger could hold an approved record with no history.** 001 permitted any of
+the seven statuses on a new record; 003's draft-only trigger constrains inserts only. Reproduced:
+`current_status()` answered `'approved'` for a record whose `read_history()` was empty, with the
+append-only triggers leaving nothing that could correct it. **Owner decision: refuse the upgrade.**
+The alternative was to synthesize the missing events, which means inventing transitions, actors and
+timestamps nobody recorded — fabricated attribution data in the one table that exists to be
+trusted. `RAISE()` is legal only in a trigger body, so the refusal is a temp table whose `CHECK` the
+offending row violates and whose *name* is the reason; `ledger.py` applies each migration inside
+`BEGIN`/`COMMIT`, so a refused upgrade leaves the database untouched at version 2. A pre-003
+*draft* is unaffected — it keeps its NULL hash and stays unapprovable, which is the case the hash
+column was written for.
+
+**2 (P1). A pre-003 approval row bypassed the hash binding.** `approval_events`' own insert trigger
+cannot see a row written before it, and every pre-003 record's hash is NULL after the ALTER — so an
+approval carrying an arbitrary digest could be linked by a raw insert and carry the record to
+`approved`, bound to no content at all. Reproduced end to end. The binding is now checked **at the
+link** as well as at the insert: an `approved`/`rejected` event's approval row must carry the hash
+the record stores, and that hash must be non-NULL. Checking it where the decision becomes the
+record's state is the durable half; finding 1's precondition is not what closes this one.
+
+**3 (P1). An uncertain submission was terminal.** `success=True, verified_by_refetch=False` mapped
+to `submission_failed`, whose destination is `failed`, from which nothing is legal. So a later
+confirming refetch could never be recorded, the ledger would disagree with the platform for good,
+and the only way forward was the blind retry the handoff exists to prevent — while the handoff's
+actual requirement is that an uncertain attempt *block* retry until a refetch resolves the state.
+The migration's own comment had already conceded the third state existed before collapsing it into
+the second. **Owner decision: `submission_uncertain`, `approved → approved`**, with a required
+`detail_code`; see the revised decision section above for the full partition. Deciding it here
+rather than deferring to M2-704 is the reasoning the resolution and score transitions are already
+defined here for: migrations are immutable, and a missing event type later costs a whole migration.
+
+**4 (P1). Evidence provenance was rewritable.** Round 1's identity pins named only the columns 001
+declared NOT NULL, which is the wrong test for what identity is: 002 *requires*
+`research_runs.question_id` and `research_documents.original_url` / `provenance` / `source_type` of
+every row it inserts, so they are established at creation too — nullable only because ADD COLUMN
+cannot retrofit NOT NULL. Reproduced on all four: a run reassigned to another question, and a
+document retrieved from a provider API rewritten as an agent's claim, which is a provenance
+forgery. Now pinned — but as `OLD.x IS NOT NULL AND NEW.x IS NOT OLD.x`, one-way. A row written
+under 001 holds an honest NULL in each and 002's triggers refuse *any* update to it until they are
+filled in, so an unconditional pin would have frozen exactly the rows 002 anticipated backfilling.
+NULL → value once; value → anything else never.
+
+**5 (P2). A receipt could omit its completion time.** `SubmissionAttempt.completed_at_utc`
+defaulted to `None` and `submission_attempts` is append-only, so a verified submission could be
+recorded with no completion time, permanently. The field is now required, and a new
+`BEFORE INSERT` trigger requires it of any writer that bypasses this module. There is no in-flight
+row to leave open: the ledger only hears about an attempt once it is over. The writer also rejects
+a receipt that completed before it was requested — not asked for, but the same row and the same
+permanence.
+
+**6 (P2). A resolution could resolve the wrong question.** `resolution_events` carries its own
+`question_id`, and the link probe checked only `forecast_record_id` — so another question's outcome
+could resolve this forecast and M5-803 would then score it against that outcome. Reproduced. A
+second probe now requires the linked resolution's `question_id` to equal the record's.
+
+**7 (P2). Malformed HTTP statuses were stored.** Half of this was closed in round 1: the oversized
+case no longer escapes as a raw `OverflowError`. The other half stood — `-1`, `0`, `600` and
+`2**63-1` all persisted as audit data, indistinguishable from a status a responder returned.
+Now validated to 100..599 in the writer and by the same new receipt trigger, with `typeof()` in the
+SQL for the affinity reason 002 documents. Worth recording that `'200'` **is** accepted by the
+trigger and deliberately not in the test table: INTEGER affinity converts a well-formed integer
+literal before any trigger sees `NEW`, so that row is correct rather than rejected.
+
+**8 (P2). A success could carry a failure code.** See the revised `detail_code` decision above.
+
+Two of the eight (2 and 4) were not on the PR as review threads; six were. Nothing was found that
+did not reproduce.
 
 ### Deferred (do not read the absence as an omission)
 
@@ -1070,4 +1186,9 @@ wrong. It is 19 and 14 now.
   event; it can do both inside one `transaction()`.
 - **M1-306** keeps its started-then-completed write shape on `research_runs`.
 - **M2-701** builds its commands on `record_approval`; the hash binding is already enforced.
-- **M2-704** cannot record a `submitted` state without a refetch-verified attempt row.
+- **M2-704** cannot record a `submitted` state without a refetch-verified attempt row, and gets a
+  non-terminal `submission_uncertain` to park an unconfirmed post in while it blocks the retry.
+  Every attempt it records must carry `completed_at_utc`, and an `http_status` if there was one.
+- **Operators** cannot upgrade a ledger holding a non-draft forecast record. Nothing has written
+  one — M1-602 is the record writer and is unstarted — so the population is expected to be empty;
+  if it is not, the ledger predates the guarantee and a fresh one is the honest answer.

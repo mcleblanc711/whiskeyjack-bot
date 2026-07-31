@@ -6,6 +6,12 @@ appended :data:`lifecycle_events` row, so a record's **current status is derived
 ``to_status`` of its highest ``event_seq``, or its stored ``status`` while it has no
 events. ``003_lifecycle_events.sql`` holds the reasoning and the enforcement.
 
+Not every event moves the record. A rejection and an *uncertain* submission -- one whose
+refetch neither confirmed nor refuted the post -- are recorded where they happened and
+leave the status where it was, because in both cases the record has not gone anywhere and
+moving it would be a claim nothing supports. That is why a submission has three outcomes
+here and not two; see :func:`record_submission_attempt`.
+
 That is what M1-603's acceptance criterion reduces to. "Injected failures cannot leave
 an approved/submitted state without its event record" is not a property of the code
 below; it is a property of the schema, because there is nowhere else for the state to
@@ -65,12 +71,21 @@ LifecycleStatus = Literal[
 # identity they need. (GPT review round 1, finding 2.) A research failure already has a
 # home in the meantime: `research_runs.error_summary`, per CLAUDE_CODE_PROMPT.md's
 # retrieval section.
+#
+# `submission_uncertain` is the one member that exists because the alternative was a
+# false claim. An attempt that posted but whose refetch did not confirm it is neither a
+# verified success nor an outright failure; recording it as `submission_failed` moved the
+# record to terminal `failed`, so a later confirming refetch had no legal event and the
+# ledger would disagree with the platform permanently -- the opposite of the handoff's
+# "an uncertain timeout blocks blind retry until a refetch resolves the state". It leaves
+# the record `approved`. (GPT review round 2, finding 3.)
 LifecycleEventType = Literal[
     "validated",
     "validation_failed",
     "rejected",
     "approved",
     "submitted",
+    "submission_uncertain",
     "submission_failed",
     "resolved",
     "scored",
@@ -89,10 +104,18 @@ PipelineFailureEvent = Literal["validation_failed"]
 # check that a lifecycle event cites an approval row recording the same decision.
 ApprovalDecision = Literal["approved", "rejected"]
 
-# Why something failed. A closed vocabulary, because this is the only "reason" the
-# lifecycle log carries and it must be safe to export and log without review. Provider
-# text stays in `submission_attempts.error_message`/`response_body`, which the event
-# row points at rather than copies.
+# Why something failed, or why a submission is unconfirmed. A closed vocabulary, because
+# this is the only "reason" the lifecycle log carries and it must be safe to export and
+# log without review. Provider text stays in
+# `submission_attempts.error_message`/`response_body`, which the event row points at
+# rather than copies.
+#
+# `rejected_by_reviewer` was a member and is deliberately gone. A rejection is a decision,
+# not a failure: it lands validated -> validated, its account is the actor and note on the
+# `approval_events` row the event cites, and the migration forbids a `detail_code` on it.
+# Nothing could ever write the code, so it is removed rather than shipped as dead
+# vocabulary in an immutable migration -- the call round 1 made on `research_failed`.
+# (Owner decision, round 2 finding 8.)
 FailureCode = Literal[
     "provider_error",
     "provider_unavailable",
@@ -101,7 +124,6 @@ FailureCode = Literal[
     "malformed_response",
     "schema_invalid",
     "calibration_invalid",
-    "rejected_by_reviewer",
     "http_error",
     "timeout",
     "refetch_mismatch",
@@ -125,7 +147,9 @@ _PIPELINE_FAILURE_EVENTS: frozenset[str] = frozenset(get_args(PipelineFailureEve
 # resurrected record. `rejected` is validated -> validated because the seven states have
 # no 'rejected' member and a rejected approval must "leave the last valid record intact"
 # (CODEX_HANDOFF, pipeline and failure boundaries) -- it records a decision without
-# moving the record.
+# moving the record. `submission_uncertain` is approved -> approved for the reason given
+# at its vocabulary member: an unresolved submission must stay somewhere a later refetch
+# can still move it, and `approved` is where the record was.
 _LEGAL_TRANSITIONS: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("validated", "draft", "validated"),
@@ -134,6 +158,7 @@ _LEGAL_TRANSITIONS: frozenset[tuple[str, str, str]] = frozenset(
         ("rejected", "validated", "validated"),
         ("approved", "validated", "approved"),
         ("submitted", "approved", "submitted"),
+        ("submission_uncertain", "approved", "approved"),
         ("submission_failed", "approved", "failed"),
         ("resolved", "submitted", "resolved"),
         ("scored", "resolved", "scored"),
@@ -222,15 +247,20 @@ class SubmissionAttempt:
     row, so only the write path may set it. Letting a caller supply it would let a
     caller backdate its own audit trail -- the rule ``research/model.py`` already states
     for the same column.
+
+    ``completed_at_utc`` is **required**, and was optional in the first cut. The ledger
+    only hears about an attempt once it is over -- there is no in-flight row to leave open
+    -- and ``submission_attempts`` is append-only, so a receipt written without a
+    completion time could never acquire one. (GPT review round 2, finding 5.)
     """
 
     attempt_id: str
     idempotency_key: str
     requested_at_utc: datetime
+    completed_at_utc: datetime
     request_payload_sha256: str
     success: bool
     verified_by_refetch: bool
-    completed_at_utc: datetime | None = None
     http_status: int | None = None
     response_body: str | None = None
     response_headers: str | None = None
@@ -322,12 +352,30 @@ def _require_optional_int(value: object, field: str) -> int | None:
     return value
 
 
-def _require_utc(value: object, field: str) -> str:
-    """Return an aware datetime as an ISO-8601 UTC string, or raise.
+def _require_http_status(value: object, field: str) -> int | None:
+    """Return ``value`` as an HTTP status code, or raise naming only the *field*.
+
+    A status is either absent -- no response arrived -- or a status code. Storing -1, 0 or
+    2**63-1 puts a number that no HTTP responder can have produced into an append-only
+    receipt, where it is indistinguishable from a real one. :func:`_require_optional_int`
+    is the wider gate underneath (a Python int too large to bind raises ``OverflowError``,
+    which is not a ``sqlite3.Error``); this narrows it to the range the field means.
+    (GPT review round 2, finding 7.)
+    """
+    status = _require_optional_int(value, field)
+    if status is not None and not 100 <= status <= 599:
+        raise LifecycleError(f"{field} must be an HTTP status code between 100 and 599")
+    return status
+
+
+def _require_aware_utc(value: object, field: str) -> datetime:
+    """Return an aware datetime converted to UTC, or raise.
 
     Exact type rather than ``isinstance``: a ``datetime`` subclass can override
     ``isoformat()`` and write arbitrary text into a NOT NULL timestamp column, which
     would put unvetted content into a field the ledger's replay ordering depends on.
+    (It is also what makes the conversion below safe to call ``isoformat()`` on:
+    ``astimezone`` returns the same class it was given.)
 
     The conversion itself is guarded, and broadly. ``tzinfo`` is an abstract base class,
     so ``value.utcoffset()`` and ``astimezone()`` run *caller-supplied code* on a value
@@ -335,6 +383,9 @@ def _require_utc(value: object, field: str) -> str:
     whose ``utcoffset`` raises will propagate whatever that method raises, message and
     traceback included. ``except Exception`` is the right width precisely because the
     set of exceptions arbitrary code can raise is not enumerable.
+
+    Separate from :func:`_require_utc` so a caller that has to *compare* two timestamps
+    can do it on datetimes rather than on their rendered text.
     """
     if type(value) is not datetime:
         raise LifecycleError(f"{field} must be a datetime")
@@ -349,15 +400,16 @@ def _require_utc(value: object, field: str) -> str:
     if not aware:
         raise LifecycleError(f"{field} must be timezone-aware")
     try:
-        return value.astimezone(timezone.utc).isoformat()
+        return value.astimezone(timezone.utc)
     except Exception:
         raise LifecycleError(
             f"{field} could not be converted to UTC (detail withheld: it can echo the value)"
         ) from None
 
 
-def _require_optional_utc(value: object, field: str) -> str | None:
-    return None if value is None else _require_utc(value, field)
+def _require_utc(value: object, field: str) -> str:
+    """Return an aware datetime as an ISO-8601 UTC string, or raise."""
+    return _require_aware_utc(value, field).isoformat()
 
 
 def _require_member(value: object, allowed: frozenset[str], field: str) -> str:
@@ -623,12 +675,26 @@ def record_submission_attempt(
 ) -> LifecycleEvent:
     """Append a submission attempt and its lifecycle event, atomically.
 
-    The event type is **derived from the attempt**, not chosen by the caller: an attempt
-    that both succeeded and was confirmed by refetch is ``submitted``; anything else --
-    an error, a timeout, or a post whose refetch did not confirm it -- is
-    ``submission_failed`` and requires a ``detail_code``. That is M2-704's "success
-    requires refetch confirmation" and the handoff's "uncertain timeout blocks blind
-    retry", expressed as the only two states an attempt can produce.
+    The event type is **derived from the attempt**, not chosen by the caller, and the
+    ``(success, verified_by_refetch)`` pair partitions into three outcomes rather than
+    two::
+
+        (True,  True)   submitted             the post went through, a refetch confirmed it
+        (True,  False)  submission_uncertain  it went through; the refetch did not confirm
+        (False, True)   submission_uncertain  it errored; the refetch says something is there
+        (False, False)  submission_failed     it did not go through and nothing is there
+
+    ``submitted`` is M2-704's "success requires refetch confirmation". The middle two are
+    the handoff's uncertain timeout: the two signals disagree, which is a third outcome
+    and not a failure. Recording those as ``submission_failed`` moved the record to
+    terminal ``failed``, so a later confirming refetch had nowhere to land and blind retry
+    was the only thing left -- exactly what the handoff says the ledger must prevent
+    (GPT review round 2, finding 3). An uncertain attempt leaves the record ``approved``,
+    which is what lets M2-704 block the retry and then record the resolution when it
+    comes: another attempt from ``approved`` can still reach ``submitted`` or ``failed``.
+
+    ``detail_code`` is required for both non-verified outcomes and refused for
+    ``submitted``.
 
     Persistence only. Nothing here contacts Metaculus; the gateways that do are M2-703
     and M2-704, and ``submission.enabled``/``dry_run`` remain what they are until then.
@@ -647,18 +713,29 @@ def record_submission_attempt(
     attempt_id = _require_text(attempt.attempt_id, "attempt.attempt_id", max_length=_MAX_IDENTIFIER)
     success = _require_bool(attempt.success, "attempt.success")
     verified = _require_bool(attempt.verified_by_refetch, "attempt.verified_by_refetch")
-    verified_success = success == 1 and verified == 1
 
-    event_type: LifecycleEventType = "submitted" if verified_success else "submission_failed"
-    if verified_success:
+    event_type: LifecycleEventType
+    if success == 1 and verified == 1:
+        event_type = "submitted"
         if detail_code is not None:
             raise LifecycleError("detail_code is not applicable to a verified submission")
     else:
+        # The two signals disagreeing is the uncertain case; both saying no is the failure.
+        event_type = "submission_uncertain" if success != verified else "submission_failed"
         if detail_code is None:
             raise LifecycleError(
                 "detail_code is required for an attempt that is not a refetch-verified success"
             )
         _require_member(detail_code, _FAILURE_CODES, "detail_code")
+
+    # Both timestamps as datetimes, so the ordering check below compares instants rather
+    # than rendered text. A receipt that finished before it was requested is not a clock
+    # curiosity here: `requested_at_utc` is what an idempotency key is reasoned about
+    # against, and the row is append-only, so a reversed pair is permanent.
+    requested = _require_aware_utc(attempt.requested_at_utc, "attempt.requested_at_utc")
+    completed = _require_aware_utc(attempt.completed_at_utc, "attempt.completed_at_utc")
+    if completed < requested:
+        raise LifecycleError("attempt.completed_at_utc is earlier than attempt.requested_at_utc")
 
     values = (
         attempt_id,
@@ -666,10 +743,10 @@ def record_submission_attempt(
         _require_text(
             attempt.idempotency_key, "attempt.idempotency_key", max_length=_MAX_IDENTIFIER
         ),
-        _require_utc(attempt.requested_at_utc, "attempt.requested_at_utc"),
-        _require_optional_utc(attempt.completed_at_utc, "attempt.completed_at_utc"),
+        requested.isoformat(),
+        completed.isoformat(),
         _require_sha256(attempt.request_payload_sha256, "attempt.request_payload_sha256"),
-        _require_optional_int(attempt.http_status, "attempt.http_status"),
+        _require_http_status(attempt.http_status, "attempt.http_status"),
         _require_optional_text(
             attempt.response_body, "attempt.response_body", max_length=_MAX_BODY
         ),

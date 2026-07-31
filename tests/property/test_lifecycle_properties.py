@@ -135,8 +135,9 @@ def test_validators_raise_only_lifecycle_error(value: object) -> None:
         lambda: lifecycle._require_sha256(value, "field"),
         lambda: lifecycle._require_bool(value, "field"),
         lambda: lifecycle._require_optional_int(value, "field"),
+        lambda: lifecycle._require_http_status(value, "field"),
         lambda: lifecycle._require_utc(value, "field"),
-        lambda: lifecycle._require_optional_utc(value, "field"),
+        lambda: lifecycle._require_aware_utc(value, "field"),
         lambda: lifecycle._require_member(value, lifecycle._STATUSES, "field"),
     )
     for validator in validators:
@@ -192,8 +193,14 @@ def test_the_approval_writer_raises_only_lifecycle_error(
     success=ANYTHING,
     verified=ANYTHING,
     body=st.none() | ANYTHING,
-    http_status=st.none() | ANYTHING,
+    # Both ends of what SQLite can hold plus the HTTP range's own edges: a status outside
+    # 100..599 is not a status, and one outside the signed 64-bit range raises
+    # OverflowError while *binding*, which is not a sqlite3.Error.
+    http_status=st.none()
+    | st.sampled_from([-1, 0, 99, 100, 599, 600, 2**63 - 1, 2**63, -(2**70)])
+    | ANYTHING,
     requested_at=st.just(WHEN) | ANYTHING,
+    completed_at=st.just(WHEN) | ANYTHING,
     detail_code=st.none() | st.sampled_from(FAILURE_CODES) | ANYTHING,
 )
 @settings(max_examples=60, deadline=None)
@@ -206,6 +213,7 @@ def test_the_submission_writer_raises_only_lifecycle_error(
     body: object,
     http_status: object,
     requested_at: object,
+    completed_at: object,
     detail_code: object,
 ) -> None:
     with _ledger() as (conn, valid_id):
@@ -213,6 +221,7 @@ def test_the_submission_writer_raises_only_lifecycle_error(
             attempt_id=attempt_id,  # type: ignore[arg-type]
             idempotency_key=key,  # type: ignore[arg-type]
             requested_at_utc=requested_at,  # type: ignore[arg-type]
+            completed_at_utc=completed_at,  # type: ignore[arg-type]
             request_payload_sha256=payload_sha,  # type: ignore[arg-type]
             success=success,  # type: ignore[arg-type]
             verified_by_refetch=verified,  # type: ignore[arg-type]
@@ -241,7 +250,7 @@ class HostileAttempt(SubmissionAttempt):
         return object.__getattribute__(self, name)
 
 
-@given(field_values=st.lists(ANYTHING, min_size=6, max_size=6))
+@given(field_values=st.lists(ANYTHING, min_size=7, max_size=7))
 @settings(max_examples=60, deadline=None)
 def test_a_hostile_attempt_subclass_raises_only_lifecycle_error(
     field_values: list[object],
@@ -257,9 +266,10 @@ def test_a_hostile_attempt_subclass_raises_only_lifecycle_error(
             attempt_id=field_values[0],  # type: ignore[arg-type]
             idempotency_key=field_values[1],  # type: ignore[arg-type]
             requested_at_utc=field_values[2],  # type: ignore[arg-type]
-            request_payload_sha256=field_values[3],  # type: ignore[arg-type]
-            success=field_values[4],  # type: ignore[arg-type]
-            verified_by_refetch=field_values[5],  # type: ignore[arg-type]
+            completed_at_utc=field_values[3],  # type: ignore[arg-type]
+            request_payload_sha256=field_values[4],  # type: ignore[arg-type]
+            success=field_values[5],  # type: ignore[arg-type]
+            verified_by_refetch=field_values[6],  # type: ignore[arg-type]
         )
         try:
             lifecycle.record_submission_attempt(
@@ -622,19 +632,28 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
         "created_at_utc) VALUES (?, 'rejected', 'chris', ?, ?)",
         (record_id, SHA, TS),
     ).lastrowid
-    attempts = {"att_ok": f"att-ok-{record_id}", "att_bad": f"att-bad-{record_id}"}
-    for key, verified in (("att_ok", 1), ("att_bad", 0)):
+    attempts = {
+        "att_ok": f"att-ok-{record_id}",
+        "att_unsure": f"att-unsure-{record_id}",
+        "att_bad": f"att-bad-{record_id}",
+    }
+    for key, success, verified in (("att_ok", 1, 1), ("att_unsure", 1, 0), ("att_bad", 0, 0)):
         attempt_id = attempts[key]
         conn.execute(
             "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
-            "requested_at_utc, request_payload_sha256, success, verified_by_refetch, "
-            "created_at_utc) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
-            (attempt_id, record_id, f"idem-{attempt_id}", TS, "d" * 64, verified, TS),
+            "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+            "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (attempt_id, record_id, f"idem-{attempt_id}", TS, TS, "d" * 64, success, verified, TS),
         )
+    # The resolution must name this record's own question, not a constant: a row may point
+    # at the right record and still resolve a different question.
+    question_id = conn.execute(
+        "SELECT question_id FROM forecast_records WHERE record_id = ?", (record_id,)
+    ).fetchone()[0]
     resolution = conn.execute(
         "INSERT INTO resolution_events (question_id, forecast_record_id, ingested_at_utc) "
-        "VALUES (100, ?, ?)",
-        (record_id, TS),
+        "VALUES (?, ?, ?)",
+        (question_id, record_id, TS),
     ).lastrowid
     score = conn.execute(
         "INSERT INTO score_events (forecast_record_id, metric, value, implementation_version, "
@@ -645,6 +664,7 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
         "approved": approved,
         "rejected": rejected,
         "att_ok": attempts["att_ok"],
+        "att_unsure": attempts["att_unsure"],
         "att_bad": attempts["att_bad"],
         "resolved": resolution,
         "scored": score,
@@ -670,6 +690,8 @@ def _insert_event(
         links["approval_event_id"] = detail[event_type]
     elif event_type == "submitted":
         links["submission_attempt_id"] = detail["att_ok"]
+    elif event_type == "submission_uncertain":
+        links["submission_attempt_id"] = detail["att_unsure"]
     elif event_type == "submission_failed":
         links["submission_attempt_id"] = detail["att_bad"]
     elif event_type == "resolved":
@@ -687,7 +709,11 @@ def _insert_event(
             event_type,
             from_status,
             to_status,
-            "internal_error" if to_status == "failed" else None,
+            (
+                "internal_error"
+                if to_status == "failed" or event_type == "submission_uncertain"
+                else None
+            ),
             links["approval_event_id"],
             links["submission_attempt_id"],
             links["resolution_event_id"],

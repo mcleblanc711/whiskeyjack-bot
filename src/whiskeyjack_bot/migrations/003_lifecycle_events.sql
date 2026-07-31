@@ -59,6 +59,34 @@
 -- Timestamps are TEXT ISO-8601 UTC, matching 001. Trigger messages name fields and
 -- never interpolate row values, per the project-wide error-hygiene rule.
 
+-- PRECONDITION: every forecast record already stored must be a draft.
+--
+-- Everything below constrains rows written from here on. A ledger that already holds a
+-- non-draft record is a different problem: its status sits where this migration says no
+-- status may be written, and once the append-only triggers exist no statement can
+-- reconcile it. current_status() would answer 'approved' for a record whose read_history()
+-- is empty -- an approved state with no approval event, which is the exact failure this
+-- item is accepted against (GPT review round 2, finding 1; reproduced).
+--
+-- Two answers were available: synthesize the missing history, or refuse the upgrade.
+-- Synthesizing it would invent transitions, actors and timestamps nobody recorded --
+-- fabricated attribution data, in the one table that exists to be trusted -- so this
+-- refuses. RAISE() is legal only inside a trigger body, so the refusal is a CHECK that
+-- the offending row violates and the table's name carries the reason; ledger.py wraps
+-- the failure without echoing it, and applies each migration inside BEGIN/COMMIT with a
+-- ROLLBACK on error, so a refused upgrade leaves the database exactly at version 2.
+--
+-- A pre-003 *draft* is unaffected. It keeps its honest NULL hash, stays readable, and is
+-- unapprovable -- the case the hash column below is written for.
+CREATE TEMP TABLE migration_003_requires_every_forecast_record_to_be_a_draft (
+    violation TEXT NOT NULL CHECK (violation = 'none')
+);
+
+INSERT INTO migration_003_requires_every_forecast_record_to_be_a_draft (violation)
+SELECT 'non_draft_record' FROM forecast_records WHERE status <> 'draft' LIMIT 1;
+
+DROP TABLE migration_003_requires_every_forecast_record_to_be_a_draft;
+
 -- The content hash a forecast record's approval binds to (CLAUDE.md: "approval binds
 -- to an exact forecast hash; any content change invalidates it"). Without a stored
 -- hash that rule can only ever be a Python-side convention, and M2-701's "changed
@@ -112,7 +140,7 @@ CREATE TABLE lifecycle_events (
     event_type            TEXT NOT NULL CHECK (
         event_type IN (
             'validated', 'validation_failed', 'rejected', 'approved',
-            'submitted', 'submission_failed', 'resolved', 'scored'
+            'submitted', 'submission_uncertain', 'submission_failed', 'resolved', 'scored'
         )
     ),
     from_status           TEXT NOT NULL CHECK (
@@ -121,12 +149,18 @@ CREATE TABLE lifecycle_events (
     to_status             TEXT NOT NULL CHECK (
         to_status IN ('draft', 'validated', 'approved', 'submitted', 'failed', 'resolved', 'scored')
     ),
+    -- 'rejected_by_reviewer' was here in the first draft and is deliberately gone. A
+    -- rejection is a decision, not a failure: it lands validated -> validated, its account
+    -- is the actor and note on the approval_events row it cites, and the probe below
+    -- forbids a detail_code on it -- so the code had no reachable writer. Removed rather
+    -- than shipped as dead vocabulary in an immutable migration, which is the same call
+    -- round 1 made on research_failed/generation_failed. (Round 2, finding 8.)
     detail_code           TEXT CHECK (
         detail_code IS NULL OR detail_code IN (
             'provider_error', 'provider_unavailable', 'no_evidence', 'stale_evidence',
             'malformed_response', 'schema_invalid', 'calibration_invalid',
-            'rejected_by_reviewer', 'http_error', 'timeout', 'refetch_mismatch',
-            'refetch_missing', 'internal_error'
+            'http_error', 'timeout', 'refetch_mismatch', 'refetch_missing',
+            'internal_error'
         )
     ),
     approval_event_id     INTEGER REFERENCES approval_events (event_id),
@@ -150,6 +184,20 @@ CREATE TABLE lifecycle_events (
 -- states in 001's CHECK have no 'rejected' member, and the handoff requires a rejected
 -- approval to "leave the last valid record intact". Rejection records a decision; it
 -- does not move the record.
+--
+-- `submission_uncertain` is approved -> approved for a related reason, and it is the one
+-- transition that exists because terminality would be a lie. An attempt that posted but
+-- whose refetch did not confirm it (M2-704's uncertain timeout) is neither a verified
+-- success nor an outright failure; the first draft recorded it as `submission_failed` and
+-- so moved the record to terminal `failed`, at which point a later confirming refetch had
+-- no legal event to record and the ledger would disagree with the platform for good --
+-- while the handoff requires exactly the opposite, that an uncertain attempt "block retry
+-- until a refetch resolves the state" (GPT review round 2, finding 3; reproduced). Owner
+-- decision: the record stays `approved`, the uncertainty is recorded with its
+-- detail_code, and the next attempt can still reach `submitted` or `failed`. Deciding it
+-- here rather than in M2-704 is the same reasoning the resolution and score transitions
+-- are defined here for -- migrations are immutable, and a missing event type later costs
+-- a whole migration.
 --
 -- The same table is spelled out in whiskeyjack_bot.lifecycle._LEGAL_TRANSITIONS. The
 -- duplication is deliberate -- the database is the enforcement, the Python table is the
@@ -194,22 +242,43 @@ BEGIN
 
     SELECT RAISE(ABORT, 'lifecycle_events: (event_type, from_status, to_status) is not a legal transition')
     WHERE NOT (
-           (NEW.event_type = 'validated'         AND NEW.from_status = 'draft'     AND NEW.to_status = 'validated')
-        OR (NEW.event_type = 'validation_failed' AND NEW.from_status = 'draft'     AND NEW.to_status = 'failed')
-        OR (NEW.event_type = 'validation_failed' AND NEW.from_status = 'validated' AND NEW.to_status = 'failed')
-        OR (NEW.event_type = 'rejected'          AND NEW.from_status = 'validated' AND NEW.to_status = 'validated')
-        OR (NEW.event_type = 'approved'          AND NEW.from_status = 'validated' AND NEW.to_status = 'approved')
-        OR (NEW.event_type = 'submitted'         AND NEW.from_status = 'approved'  AND NEW.to_status = 'submitted')
-        OR (NEW.event_type = 'submission_failed' AND NEW.from_status = 'approved'  AND NEW.to_status = 'failed')
-        OR (NEW.event_type = 'resolved'          AND NEW.from_status = 'submitted' AND NEW.to_status = 'resolved')
-        OR (NEW.event_type = 'scored'            AND NEW.from_status = 'resolved'  AND NEW.to_status = 'scored')
+           (NEW.event_type = 'validated'            AND NEW.from_status = 'draft'     AND NEW.to_status = 'validated')
+        OR (NEW.event_type = 'validation_failed'    AND NEW.from_status = 'draft'     AND NEW.to_status = 'failed')
+        OR (NEW.event_type = 'validation_failed'    AND NEW.from_status = 'validated' AND NEW.to_status = 'failed')
+        OR (NEW.event_type = 'rejected'             AND NEW.from_status = 'validated' AND NEW.to_status = 'validated')
+        OR (NEW.event_type = 'approved'             AND NEW.from_status = 'validated' AND NEW.to_status = 'approved')
+        OR (NEW.event_type = 'submitted'            AND NEW.from_status = 'approved'  AND NEW.to_status = 'submitted')
+        OR (NEW.event_type = 'submission_uncertain' AND NEW.from_status = 'approved'  AND NEW.to_status = 'approved')
+        OR (NEW.event_type = 'submission_failed'    AND NEW.from_status = 'approved'  AND NEW.to_status = 'failed')
+        OR (NEW.event_type = 'resolved'             AND NEW.from_status = 'submitted' AND NEW.to_status = 'resolved')
+        OR (NEW.event_type = 'scored'               AND NEW.from_status = 'resolved'  AND NEW.to_status = 'scored')
     );
 
     -- A failure that does not say why is an unfalsifiable claim about the pipeline,
     -- which is the same objection 002 raised against an unconstrained accountability
-    -- counter.
+    -- counter. Keyed on the destination, so a later event type that ends in `failed`
+    -- inherits the requirement without anyone remembering to add it.
     SELECT RAISE(ABORT, 'lifecycle_events: an event ending in failed requires detail_code')
     WHERE NEW.to_status = 'failed' AND NEW.detail_code IS NULL;
+
+    -- ... and the one event that carries a reason without ending in `failed`. An
+    -- uncertain submission is only interesting for *why* it is uncertain --
+    -- refetch_missing, refetch_mismatch, timeout -- and without the code it is a record
+    -- that something unspecified went unconfirmed, which no later attempt can act on.
+    SELECT RAISE(ABORT, 'lifecycle_events: an uncertain submission requires detail_code')
+    WHERE NEW.event_type = 'submission_uncertain' AND NEW.detail_code IS NULL;
+
+    -- The converse, which the first draft left open: nothing stopped a `validated` or
+    -- `submitted` event carrying detail_code = 'internal_error', so the immutable history
+    -- could hold a success annotated with a failure (round 2, finding 8; reproduced).
+    -- The list is spelled out rather than written as a NOT IN of the failure types, so a
+    -- later event type is unconstrained until someone classifies it deliberately --
+    -- an omission that shows up as an unenforced rule rather than as a wrong one.
+    SELECT RAISE(ABORT, 'lifecycle_events: this event type carries no detail_code')
+    WHERE NEW.event_type IN (
+             'validated', 'rejected', 'approved', 'submitted', 'resolved', 'scored'
+         )
+      AND NEW.detail_code IS NOT NULL;
 
     -- Exactly one detail foreign key, and the right one for the event type.
     SELECT RAISE(ABORT, 'lifecycle_events: an approval event must link exactly one approval_events row')
@@ -220,7 +289,7 @@ BEGIN
            OR NEW.score_event_id IS NOT NULL);
 
     SELECT RAISE(ABORT, 'lifecycle_events: a submission event must link exactly one submission_attempts row')
-    WHERE NEW.event_type IN ('submitted', 'submission_failed')
+    WHERE NEW.event_type IN ('submitted', 'submission_uncertain', 'submission_failed')
       AND (NEW.submission_attempt_id IS NULL
            OR NEW.approval_event_id IS NOT NULL
            OR NEW.resolution_event_id IS NOT NULL
@@ -258,6 +327,28 @@ BEGIN
              AND decision = NEW.event_type
       );
 
+    -- ... and it must bind the hash the record actually stores. The approval_events
+    -- insert trigger below makes that true of every approval written from here on, but it
+    -- never sees a row that predates this migration -- and every such row's record has a
+    -- NULL hash after the ALTER above, so an approval carrying an arbitrary digest could
+    -- be linked and carry the record to `approved` unbound to any content (round 2,
+    -- finding 2; reproduced by raw insert against an upgraded v2 ledger). Checked at the
+    -- link, which is the moment the decision becomes the record's state.
+    --
+    -- `f.forecast_sha256 IS NOT NULL` is not redundant with the equality: both sides NULL
+    -- would make `=` NULL rather than true, so the probe would fire -- but only by
+    -- accident of three-valued logic, and a reader has to be able to see that a record
+    -- with no hash is unapprovable by construction, not by side effect.
+    SELECT RAISE(ABORT, 'lifecycle_events: the linked approval_events row does not bind the forecast hash this record stores')
+    WHERE NEW.approval_event_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM approval_events a
+            JOIN forecast_records f ON f.record_id = NEW.forecast_record_id
+           WHERE a.event_id = NEW.approval_event_id
+             AND f.forecast_sha256 IS NOT NULL
+             AND a.forecast_sha256 = f.forecast_sha256
+      );
+
     SELECT RAISE(ABORT, 'lifecycle_events: the linked submission_attempts row is for another forecast record')
     WHERE NEW.submission_attempt_id IS NOT NULL
       AND NOT EXISTS (
@@ -266,10 +357,20 @@ BEGIN
              AND forecast_record_id = NEW.forecast_record_id
       );
 
-    -- M2-704's "success requires refetch confirmation", made a constraint instead of a
-    -- convention. A `submitted` state that no refetch confirmed is precisely the
-    -- unverified claim the ledger exists to prevent; an attempt that timed out or whose
-    -- refetch disagreed is a failure with a detail_code, not a submission.
+    -- The three submission events partition the (success, verified_by_refetch) pair, and
+    -- the partition is total: every attempt has exactly one legal event, so no outcome
+    -- can be recorded as something it was not and none is left with no event at all.
+    --
+    --   (1, 1)  submitted             the post went through and a refetch confirmed it
+    --   (1, 0)  submission_uncertain  it went through; the refetch did not confirm it
+    --   (0, 1)  submission_uncertain  it errored; the refetch says something is there
+    --   (0, 0)  submission_failed     it did not go through and nothing is there
+    --
+    -- The first line is M2-704's "success requires refetch confirmation" as a constraint
+    -- rather than a convention: a `submitted` state no refetch confirmed is precisely the
+    -- unverified claim the ledger exists to prevent. The middle two are why the pair is
+    -- read rather than `success` alone -- the two signals disagreeing is a third outcome,
+    -- not a failure, and collapsing it into one was round 2's finding 3.
     SELECT RAISE(ABORT, 'lifecycle_events: a submitted event requires a successful, refetch-verified attempt')
     WHERE NEW.event_type = 'submitted'
       AND NOT EXISTS (
@@ -279,21 +380,21 @@ BEGIN
              AND verified_by_refetch = 1
       );
 
-    -- The exact complement of the probe above, and it has to be the complement rather
-    -- than `success = 0`: an attempt that posted successfully but whose refetch did not
-    -- confirm it (M2-704's uncertain timeout) is neither a verified success nor an
-    -- outright failure. Requiring success = 0 here would leave that state unable to
-    -- record any lifecycle event at all -- a verification mismatch with no ledger
-    -- event, which the handoff's failure-boundary rule forbids. Complementary probes
-    -- mean every attempt has exactly one legal event, and `detail_code`
-    -- (refetch_mismatch / refetch_missing / timeout / http_error) carries which case.
-    SELECT RAISE(ABORT, 'lifecycle_events: a submission_failed event requires an attempt that is not a refetch-verified success')
-    WHERE NEW.event_type = 'submission_failed'
-      AND EXISTS (
+    SELECT RAISE(ABORT, 'lifecycle_events: an uncertain submission requires an attempt whose success and refetch disagree')
+    WHERE NEW.event_type = 'submission_uncertain'
+      AND NOT EXISTS (
           SELECT 1 FROM submission_attempts
            WHERE attempt_id = NEW.submission_attempt_id
-             AND success = 1
-             AND verified_by_refetch = 1
+             AND success <> verified_by_refetch
+      );
+
+    SELECT RAISE(ABORT, 'lifecycle_events: a submission_failed event requires an attempt that neither succeeded nor was confirmed')
+    WHERE NEW.event_type = 'submission_failed'
+      AND NOT EXISTS (
+          SELECT 1 FROM submission_attempts
+           WHERE attempt_id = NEW.submission_attempt_id
+             AND success = 0
+             AND verified_by_refetch = 0
       );
 
     SELECT RAISE(ABORT, 'lifecycle_events: the linked resolution_events row is for another forecast record')
@@ -302,6 +403,21 @@ BEGIN
           SELECT 1 FROM resolution_events
            WHERE event_id = NEW.resolution_event_id
              AND forecast_record_id = NEW.forecast_record_id
+      );
+
+    -- A resolution_events row carries its own question_id (001), and it is nullable in
+    -- the reverse direction -- forecast_record_id is a nullable REFERENCES -- so pointing
+    -- at the right record is not the same claim as resolving the right question. Without
+    -- this, another question's outcome could resolve this forecast and M5-803 would then
+    -- score it against that outcome (round 2, finding 6; reproduced). A separate probe
+    -- from the one above so the two failures are told apart in the log.
+    SELECT RAISE(ABORT, 'lifecycle_events: the linked resolution_events row resolves a different question than this forecast')
+    WHERE NEW.resolution_event_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM resolution_events r
+            JOIN forecast_records f ON f.record_id = NEW.forecast_record_id
+           WHERE r.event_id = NEW.resolution_event_id
+             AND r.question_id = f.question_id
       );
 
     SELECT RAISE(ABORT, 'lifecycle_events: the linked score_events row is for another forecast record')
@@ -353,6 +469,36 @@ BEGIN
         (SELECT forecast_sha256 FROM forecast_records WHERE record_id = NEW.forecast_record_id),
         ''
     );
+END;
+
+-- A submission receipt is written once, after the attempt has finished, and the
+-- append-only blocks below mean it can never be completed later. So the two fields that
+-- make it a receipt rather than an assertion are required at insert:
+--
+-- * `completed_at_utc`. 001 left it nullable because it predates that rule, and the
+--   writer's own dataclass defaulted it to None -- so a verified submission could be
+--   recorded with no completion time at all, permanently (round 2, finding 5;
+--   reproduced). There is no in-flight row to leave open: the ledger only hears about an
+--   attempt once it is over.
+-- * `http_status`, when there is one. A status is either absent (no response arrived) or
+--   an HTTP status code; -1, 0, 600 and 2**63-1 all persisted as audit data before this
+--   (round 2, finding 7). typeof() is part of the constraint for the affinity reason 002
+--   documents for posts_dropped_no_url: INTEGER is affinity, not a type.
+--
+-- INSERT only. UPDATE and DELETE on this table are refused outright below, so there is
+-- no second path a row can arrive by.
+CREATE TRIGGER submission_attempts_require_receipt_on_insert
+BEFORE INSERT ON submission_attempts
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'submission_attempts: completed_at_utc is required; an attempt is recorded once, after it has finished')
+    WHERE NEW.completed_at_utc IS NULL;
+
+    SELECT RAISE(ABORT, 'submission_attempts: http_status must be an integer HTTP status code between 100 and 599')
+    WHERE NEW.http_status IS NOT NULL
+      AND (typeof(NEW.http_status) <> 'integer'
+           OR NEW.http_status < 100
+           OR NEW.http_status > 599);
 END;
 
 -- Append-only enforcement (D25). SQLite has no multi-event trigger, so UPDATE and
@@ -474,14 +620,29 @@ END;
 -- So identity and provenance are pinned and the completion columns stay open. What is
 -- deliberately still writable: research_runs.completed_at_utc / error_summary / cost_usd
 -- / raw_response_path / queries_json / provider_config_json / freshness_cutoff_utc /
--- agent_model / posts_dropped_no_url / question_id -- the fields M1-306 fills in when a
--- run finishes -- and every descriptive field of a document (title, publisher, summary,
--- reliability_tag and the rest), which M1-305 may refine. 002's completeness triggers
--- remain the enforcement on that pair and are unaffected.
+-- agent_model / posts_dropped_no_url -- the fields M1-306 fills in when a run finishes --
+-- and every descriptive field of a document (title, publisher, summary, reliability_tag
+-- and the rest), which M1-305 may refine. 002's completeness triggers remain the
+-- enforcement on that pair and are unaffected.
+--
+-- The first cut of these pins named only the columns 001 declared NOT NULL, and that was
+-- the wrong test for what identity is. 002 requires research_runs.question_id and
+-- research_documents.original_url / provenance / source_type of every row it inserts, so
+-- they are established at creation like the rest -- nullable only because ADD COLUMN
+-- cannot retrofit NOT NULL, which is a fact about SQLite and not about the data. Leaving
+-- them open let a stored run be reassigned to another question and a document retrieved
+-- from a provider API be rewritten as an agent's claim, which is a provenance forgery
+-- (round 2, finding 4; reproduced on all four columns).
+--
+-- Those four are guarded as `OLD.x IS NOT NULL AND NEW.x IS NOT OLD.x` rather than
+-- unconditionally, because a row that predates the migration that required them holds an
+-- honest NULL, and 002's update triggers refuse *any* update to such a row until it is
+-- backfilled. An unconditional pin would make the backfill 002 anticipates impossible and
+-- freeze those rows for good. NULL -> value once; value -> anything else never.
 --
 -- `IS NOT` rather than `<>`: `<>` is NULL when either side is NULL, so a NULL comparison
--- is neither true nor false and the guard would silently not fire. Every column named
--- here is NOT NULL today, which is exactly why the operator must not depend on that.
+-- is neither true nor false and the guard would silently not fire. The columns above the
+-- carve-out are NOT NULL today, which is exactly why the operator must not depend on that.
 
 CREATE TRIGGER research_runs_block_identity_update
 BEFORE UPDATE ON research_runs
@@ -490,8 +651,9 @@ WHEN NEW.retrieval_run_id IS NOT OLD.retrieval_run_id
   OR NEW.provider         IS NOT OLD.provider
   OR NEW.started_at_utc   IS NOT OLD.started_at_utc
   OR NEW.created_at_utc   IS NOT OLD.created_at_utc
+  OR (OLD.question_id IS NOT NULL AND NEW.question_id IS NOT OLD.question_id)
 BEGIN
-    SELECT RAISE(ABORT, 'research_runs: a run may be completed but never re-identified; retrieval_run_id, provider and its timestamps are fixed at creation');
+    SELECT RAISE(ABORT, 'research_runs: a run may be completed but never re-identified; retrieval_run_id, provider, question_id and its timestamps are fixed at creation');
 END;
 
 CREATE TRIGGER research_documents_block_identity_update
@@ -502,6 +664,9 @@ WHEN NEW.document_id      IS NOT OLD.document_id
   OR NEW.canonical_url    IS NOT OLD.canonical_url
   OR NEW.content_sha256   IS NOT OLD.content_sha256
   OR NEW.retrieved_at_utc IS NOT OLD.retrieved_at_utc
+  OR (OLD.original_url IS NOT NULL AND NEW.original_url IS NOT OLD.original_url)
+  OR (OLD.provenance   IS NOT NULL AND NEW.provenance   IS NOT OLD.provenance)
+  OR (OLD.source_type  IS NOT NULL AND NEW.source_type  IS NOT OLD.source_type)
 BEGIN
-    SELECT RAISE(ABORT, 'research_documents: a document may be annotated but never re-identified; document_id, retrieval_run_id, canonical_url, content_sha256 and retrieved_at_utc are fixed at creation');
+    SELECT RAISE(ABORT, 'research_documents: a document may be annotated but never re-identified; document_id, retrieval_run_id, canonical_url, original_url, content_sha256, retrieved_at_utc, provenance and source_type are fixed at creation');
 END;
