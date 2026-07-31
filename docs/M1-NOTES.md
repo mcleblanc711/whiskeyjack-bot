@@ -924,6 +924,29 @@ authoring pass, since the section was drafted before the property file could run
 surrogate-pair spelling does break naive object-equality while leaving the encoding idempotent,
 and `'1'`/`1.0` are converted and stored as integers while `'abc'`/`1.5` are refused.
 
+### What the property suite missed, and why — the generalizable lesson
+
+The suite was green in round 1 and still missed all three parts of finding 3. Worth writing down,
+because the fix is not "more examples".
+
+The properties were right; the **strategy** was wrong. `ANYTHING` contained hostile text, `None`,
+bools, ints, floats, bytes, lists, datetimes and a bare `object()` — every one of them **inert
+data**. All three escapes were values that *run code* when the module touches them: a `tzinfo`
+whose `utcoffset()` raises (`tzinfo` is an abstract base class, so it is caller-supplied code), a
+`SubmissionAttempt` subclass whose `__getattribute__` raises, and an unbounded Python `int` that
+raises during parameter binding rather than during validation.
+
+So: **"never raises outside our own error type" is only as strong as the assumption that inputs
+are inert**, and that assumption is false for anything with a dunder, an ABC in its ancestry, or
+an unbounded representation. A fuzzer restricted to data can only find data bugs. The strategy now
+carries one instance of each shape — including a *stateful* `tzinfo`, because `_require_utc` reads
+the offset twice (once itself, once inside `astimezone`) and a stateless hostile timezone cannot
+tell the two guards apart.
+
+This generalizes past this item, and is the thing to carry into M1-604's exporters and M2-703's
+gateway: when fuzzing a boundary that takes `object`, ask what in the input the code *calls*, not
+just what it stores.
+
 ### Decision — both readers answer an unknown record the same way
 
 `read_history()` first returned `()` for a `record_id` that does not exist, while
