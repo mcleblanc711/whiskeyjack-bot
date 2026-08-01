@@ -12,12 +12,16 @@ leave the status where it was, because in both cases the record has not gone any
 moving it would be a claim nothing supports. That is why a submission has three outcomes
 here and not two; see :func:`record_submission_attempt`.
 
-An uncertainty is not a resting place, though. While one stands, no further attempt may be
-recorded, and the only thing that resolves it is a refetch --
+An uncertainty is not a resting place, though. What resolves it is a refetch --
 :func:`record_submission_verification`, which writes what the platform actually showed and
 carries the record to ``submitted`` or to ``failed``. Recording that observation as another
 *attempt* would mean claiming a second live post, which is the retry the handoff exists to
 block; see :class:`SubmissionVerification`.
+
+Blocking that retry is **not** something this module can do, and round 4 removed the
+attempt to. Every writer here runs after the fact it records, so refusing a write cannot
+prevent an action -- it can only lose the evidence of one. The rule lives in front of the
+request instead: :func:`unresolved_uncertainties` is what a submitter asks *before* posting.
 
 That is what M1-603's acceptance criterion reduces to. "Injected failures cannot leave
 an approved/submitted state without its event record" is not a property of the code
@@ -181,11 +185,10 @@ _PIPELINE_FAILURE_EVENTS: frozenset[str] = frozenset(get_args(PipelineFailureEve
 # terminal `failed`, the same destination a (0, 0) attempt reaches and for the same
 # reason: the post is not there, and the retry is a new forecast version.
 #
-# This table is not the whole rule. Two transitions out of `approved` are legal here and
-# still refused by the migration: while an uncertain event stands unresolved, no further
-# attempt may be recorded at all. That guard depends on the record's *history* rather than
-# on its current status, so it cannot be expressed as a triple; the database holds it, and
-# :func:`record_submission_attempt` checks it up front for a readable message.
+# This table is the whole rule again, as of round 4. Round 3 added a history-dependent
+# guard on top of it -- no further attempt while an uncertainty stood -- which is not a
+# transition rule and, more to the point, not a rule a record of past events can enforce.
+# See :func:`unresolved_uncertainties`.
 _LEGAL_TRANSITIONS: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("validated", "draft", "validated"),
@@ -324,6 +327,11 @@ class SubmissionVerification:
     ``absent`` to terminal ``failed``. The attempt named here must be one this ledger
     recorded as ``submission_uncertain``; an attempt already accounted for as submitted or
     failed is not open to being re-decided by a later refetch.
+
+    ``refetched_forecast_snapshot`` is optional in the type and **required for a
+    ``confirmed`` outcome** by both the writer and the schema: a confirmation with nothing
+    stored is a claim about the platform with no evidence behind it, and it is the claim
+    that moves the record to ``submitted``.
 
     ``created_at_utc`` is absent for :class:`SubmissionAttempt`'s reason -- it is when the
     ledger stored the row, so only the write path may set it.
@@ -473,9 +481,40 @@ def _require_aware_utc(value: object, field: str) -> datetime:
         ) from None
 
 
+def _utc_text(value: datetime) -> str:
+    """Render an aware UTC datetime in the canonical stored form.
+
+    One function, because the form is a contract with ``003_lifecycle_events.sql`` rather
+    than a formatting preference: the migration pins this exact shape on the columns it
+    orders, so a second rendering anywhere would be refused by our own schema. That is not
+    hypothetical -- the attempt writer rendered its two timestamps with a bare
+    ``isoformat()`` while :func:`_require_utc` had been made canonical, and every write
+    through it failed until both agreed.
+
+    Takes an **already validated** datetime: :func:`_require_aware_utc`'s output or
+    :func:`_utcnow`'s. The ``astimezone`` here is a normalization, not a guard -- given a
+    caller's raw datetime it would run that caller's ``tzinfo`` code unprotected, which is
+    what :func:`_require_aware_utc` exists to wrap.
+    """
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 def _require_utc(value: object, field: str) -> str:
-    """Return an aware datetime as an ISO-8601 UTC string, or raise."""
-    return _require_aware_utc(value, field).isoformat()
+    """Return an aware datetime as a *canonical* ISO-8601 UTC string, or raise.
+
+    ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00``: fixed width 32, always UTC, microseconds always
+    present. Plain ``isoformat()`` omits the fractional part when it is zero, which makes
+    the rendered width vary and the ordering of two stored values depend on which shape
+    each happens to have.
+
+    That matters because the schema compares two of these columns, and it can only do so
+    exactly by comparing the text: ``julianday()`` is a float day number, so microseconds
+    fall below its precision and two instants a microsecond apart compare equal (GPT review
+    round 4, finding 3). ``003_lifecycle_events.sql`` pins this exact form on the columns it
+    orders; rendering it here for *every* timestamp keeps the stored ledger uniform rather
+    than uniform-where-checked.
+    """
+    return _utc_text(_require_aware_utc(value, field))
 
 
 def _require_member(value: object, allowed: frozenset[str], field: str) -> str:
@@ -638,6 +677,38 @@ def read_history(conn: sqlite3.Connection, record_id: str) -> tuple[LifecycleEve
     return tuple(_event_from_row(row) for row in rows)
 
 
+def unresolved_uncertainties(conn: sqlite3.Connection, record_id: str) -> tuple[str, ...]:
+    """Attempt ids this record recorded as uncertain that no refetch has resolved yet.
+
+    **Ask this before submitting, not after.** It is the ledger's half of the handoff's
+    "an uncertain timeout blocks blind retry until a refetch resolves the state": an empty
+    tuple means nothing is outstanding, and a non-empty one names the attempts M2-704 has
+    to refetch and pass to :func:`record_submission_verification` first.
+
+    Round 3 tried to enforce that rule at write time instead, in the trigger and in
+    :func:`record_submission_attempt`. Both run on a *finished* receipt, so refusing there
+    could not stop a second post -- only stop it being recorded, which loses the fact
+    instead of preventing the act, and left the attempt row committed with its event
+    refused (GPT review round 4, finding 1). A rule about what to do next belongs in front
+    of the action; this is that seam, and it is a reader.
+
+    "Unresolved" is: an uncertain event whose record is *still* ``approved``. A refetch
+    that resolved one carried the record to ``submitted`` or ``failed``, and no submission
+    is legal from either -- so once the record has moved, nothing here is outstanding.
+    """
+    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    if current_status(conn, identifier) != "approved":
+        return ()
+    rows = _fetch_all(
+        conn,
+        "SELECT submission_attempt_id FROM lifecycle_events "
+        "WHERE forecast_record_id = ? AND event_type = 'submission_uncertain' "
+        "ORDER BY event_seq",
+        (identifier,),
+    )
+    return tuple(_stored_text(row[0], "submission_attempt_id") for row in rows)
+
+
 def record_validation(
     conn: sqlite3.Connection, *, record_id: str, occurred_at: datetime
 ) -> LifecycleEvent:
@@ -720,7 +791,7 @@ def record_approval(
             "INSERT INTO approval_events "
             "(forecast_record_id, decision, actor, forecast_sha256, note, created_at_utc) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (identifier, decision, actor_text, digest, note_text, _utcnow().isoformat()),
+            (identifier, decision, actor_text, digest, note_text, _utc_text(_utcnow())),
         )
         return _append_event(
             conn,
@@ -757,12 +828,12 @@ def record_submission_attempt(
     was the only thing left -- exactly what the handoff says the ledger must prevent
     (GPT review round 2, finding 3). An uncertain attempt leaves the record ``approved``.
 
-    An uncertain attempt also **blocks this writer** until it is resolved. That is the
-    other half of the same handoff rule, and it was missing: nothing stopped a second
-    attempt from being recorded, and because a resolving refetch had no event of its own,
-    a second attempt was the only way to reach ``submitted`` at all -- so the ledger's one
-    documented route out of uncertainty was the blind retry (round 3, finding 1). The
-    route now is :func:`record_submission_verification`.
+    A second attempt made while an earlier one is still uncertain **is recorded**, not
+    refused. Round 3 refused it here and in the trigger; round 4 withdrew that, because
+    this function is handed a receipt for a post that has already happened, and the only
+    thing a refusal achieves is a live post with no ledger row. Whether to make that
+    request is decided before it is made -- see :func:`unresolved_uncertainties` -- and a
+    record may therefore hold more than one uncertain attempt, each with its own event.
 
     ``detail_code`` is required for both non-verified outcomes and refused for
     ``submitted``.
@@ -814,8 +885,8 @@ def record_submission_attempt(
         _require_text(
             attempt.idempotency_key, "attempt.idempotency_key", max_length=_MAX_IDENTIFIER
         ),
-        requested.isoformat(),
-        completed.isoformat(),
+        _utc_text(requested),
+        _utc_text(completed),
         _require_sha256(attempt.request_payload_sha256, "attempt.request_payload_sha256"),
         _require_http_status(attempt.http_status, "attempt.http_status"),
         _require_optional_text(
@@ -837,11 +908,10 @@ def record_submission_attempt(
             "attempt.refetched_forecast_snapshot",
             max_length=_MAX_BODY,
         ),
-        _utcnow().isoformat(),
+        _utc_text(_utcnow()),
     )
 
     with transaction(conn):
-        _require_no_unresolved_uncertainty(conn, identifier)
         _insert(
             conn,
             "INSERT INTO submission_attempts "
@@ -882,13 +952,15 @@ def record_submission_verification(
     As with :func:`record_submission_attempt`, the event type is **derived** and never
     chosen by the caller. ``detail_code`` is required for ``absent`` -- ``refetch_missing``
     is the usual one -- and refused for ``confirmed``, which is a success and carries no
-    failure code.
+    failure code. ``refetched_forecast_snapshot`` runs the other way: **required for
+    ``confirmed``**, because it is the evidence that carries the record to ``submitted``,
+    and empty for ``absent``, which saw nothing to store.
 
-    Until this is written, the ledger refuses to record any further attempt on the record:
-    that is the handoff's "block retry until refetch resolves state", enforced by the
-    migration rather than left to M2-704's write path. ``submission_disconfirmed`` is
-    terminal, so a genuinely lost post is retried as a new forecast version (M1-602),
-    which is what every other route to ``failed`` already means.
+    Until this is written the uncertainty is outstanding, and
+    :func:`unresolved_uncertainties` keeps saying so -- which is what M2-704 consults
+    before deciding to post again. ``submission_disconfirmed`` is terminal, so a genuinely
+    lost post is retried as a new forecast version (M1-602), which is what every other
+    route to ``failed`` already means.
 
     Persistence only. Nothing here contacts Metaculus; M2-704 owns the refetch itself.
     """
@@ -917,6 +989,14 @@ def record_submission_verification(
         event_type = "submission_confirmed"
         if detail_code is not None:
             raise LifecycleError("detail_code is not applicable to a confirmed submission")
+        # A confirmation carries the record to `submitted`, and what it saw is the whole
+        # of the evidence for that. Round 3 wrote the snapshot column and left it
+        # optional, so a confirmation could be recorded on nothing (round 4, finding 2).
+        if snapshot is None or not snapshot.strip():
+            raise LifecycleError(
+                "verification.refetched_forecast_snapshot is required for a confirmed "
+                "refetch; a confirmation is only auditable if it stores what it saw"
+            )
     else:
         event_type = "submission_disconfirmed"
         if detail_code is None:
@@ -932,7 +1012,7 @@ def record_submission_verification(
             "INSERT INTO submission_verifications "
             "(submission_attempt_id, outcome, observed_at_utc, "
             "refetched_forecast_snapshot, created_at_utc) VALUES (?, ?, ?, ?, ?)",
-            (attempt_id, outcome, observed, snapshot, _utcnow().isoformat()),
+            (attempt_id, outcome, observed, snapshot, _utc_text(_utcnow())),
         )
         return _append_event(
             conn,
@@ -1007,7 +1087,7 @@ def _append_event(
                 submission_attempt_id,
                 submission_verification_id,
                 occurred_at_utc,
-                _utcnow().isoformat(),
+                _utc_text(_utcnow()),
             ),
         )
         row = _fetch_one(
@@ -1047,36 +1127,6 @@ def _require_hash_binds(conn: sqlite3.Connection, record_id: str, digest: str) -
         )
 
 
-def _require_no_unresolved_uncertainty(conn: sqlite3.Connection, record_id: str) -> None:
-    """Fail readably when an uncertain submission is still waiting on its refetch.
-
-    The migration refuses the write either way; this is what makes the refusal say which
-    rule was broken. A caller that sees only "the ledger rejected this write" learns
-    nothing about *what to do next*, and here the answer is specific: refetch, then record
-    what you saw.
-
-    "Unresolved" is an uncertain event on a record that is *still* ``approved``: a refetch
-    that resolved one carried the record to ``submitted`` or ``failed``, and neither is a
-    state this writer is legal from. The trigger can therefore test the history alone,
-    where this runs before the transition is derived and has to make the same distinction
-    itself -- otherwise it would answer "refetch first" to a caller whose real problem is
-    that the record is already submitted.
-    """
-    if current_status(conn, record_id) != "approved":
-        return
-    row = _fetch_one(
-        conn,
-        "SELECT 1 FROM lifecycle_events WHERE forecast_record_id = ? "
-        "AND event_type = 'submission_uncertain' LIMIT 1",
-        (record_id,),
-    )
-    if row is not None:
-        raise LifecycleError(
-            "this record has an unresolved uncertain submission; record a refetch with "
-            "record_submission_verification before attempting another submission"
-        )
-
-
 def _require_verifiable_attempt(
     conn: sqlite3.Connection, record_id: str, attempt_id: str, observed_at_utc: str
 ) -> None:
@@ -1085,9 +1135,15 @@ def _require_verifiable_attempt(
     Both halves are re-derived by the migration's trigger, which is the binding check.
     The attempt must be one *this* record recorded as uncertain -- which subsumes
     ownership, since the uncertain event names both -- and the observation cannot predate
-    the attempt it observes. The comparison is left to SQLite's ``julianday`` rather than
-    parsed here: the stored value is text this module did not necessarily write, and
-    ``fromisoformat`` on it would be one more place a stored value can raise.
+    the attempt it observes.
+
+    The ordering comparison is left to SQL rather than parsed here, because the stored
+    value is text this module did not necessarily write and ``fromisoformat`` on it would
+    be one more place a stored value can raise. It compares TEXT, not ``julianday``: a
+    float day number cannot represent microseconds, so that comparison called two instants
+    a microsecond apart equal (round 4, finding 3). Both sides are the canonical fixed-width
+    UTC form :func:`_require_utc` renders and the migration pins, which is what makes a
+    text comparison exact.
     """
     row = _fetch_one(
         conn,
@@ -1102,8 +1158,7 @@ def _require_verifiable_attempt(
         )
     row = _fetch_one(
         conn,
-        "SELECT 1 FROM submission_attempts WHERE attempt_id = ? "
-        "AND julianday(completed_at_utc) > julianday(?)",
+        "SELECT 1 FROM submission_attempts WHERE attempt_id = ? AND completed_at_utc > ?",
         (attempt_id, observed_at_utc),
     )
     if row is not None:

@@ -788,10 +788,11 @@ And twice more in round 2, for the same reason:
   `PRAGMA recursive_triggers = ON`, without which none of the above holds; see the round-1 section.
 - `src/whiskeyjack_bot/lifecycle.py` — the `Literal` vocabularies, `_LEGAL_TRANSITIONS`,
   `LifecycleError`, the `LifecycleEvent`/`SubmissionAttempt`/`SubmissionVerification` value
-  objects, a nesting-safe `transaction()`, `current_status()`/`read_history()`, and five writers:
+  objects, a nesting-safe `transaction()`, three readers —
+  `current_status()`/`read_history()`/`unresolved_uncertainties()` — and five writers:
   `record_validation`, `record_failure`, `record_approval`, `record_submission_attempt`,
   `record_submission_verification`.
-- `tests/unit/test_lifecycle.py` (176 tests) and `tests/property/test_lifecycle_properties.py`
+- `tests/unit/test_lifecycle.py` (188 tests) and `tests/property/test_lifecycle_properties.py`
   (17, ~15s: one ledger for the session with a fresh record per example, because a database
   per example put the file past two minutes).
 
@@ -1219,11 +1220,10 @@ Two new event types cite it, and they are the *refetch's* transitions rather tha
 | `absent` | `submission_disconfirmed` | `approved → failed` (terminal) |
 
 `absent` is terminal for the same reason a `(0, 0)` attempt is: the post is not there, and the
-retry is a new forecast version. And the retry block is now structural — while a record holds an
-uncertain event that no verification has resolved, **no further submission event is accepted at
-all**. A bare `EXISTS` in the trigger is exact rather than approximate: a resolved uncertainty has
-already carried the record to `submitted` or `failed`, and no submission event is legal from
-either, so the only rows the probe can see are unresolved ones.
+retry is a new forecast version. Round 3 also made the retry block structural — no further
+submission event while an uncertainty stood — and **round 4 withdrew that**; see finding 1 below.
+The verification table and the two event types are what survived, and they are the part that
+mattered.
 
 The verification vocabulary is deliberately two-valued. A refetch that could not be *performed*
 observed nothing, changes no state, and would be a detail row no event can cite; the uncertainty
@@ -1254,17 +1254,72 @@ pinned by its own test.
 checked in the writer only — the one rule in this item enforced in a single layer, while the
 sibling test two functions away pins both layers for the NULL case. Reproduced with a completion a
 day before its request, permanent on an append-only table whose `requested_at_utc` is what an
-idempotency key is reasoned about against. The receipt trigger now compares them with `julianday`,
-preceded by a `typeof`/`julianday IS NULL` probe that is not a second rule but what makes the first
-one well defined: `julianday` returns NULL for what it cannot parse, and a NULL comparison is
-neither true nor false, so without it the ordering check silently would not fire on exactly the
-inputs that need it. It stops there on purpose — 001 pins no timestamp *format* anywhere, and
-pinning one on this table alone would make it the lone outlier. (A bare number is worth knowing
-about: SQLite reads `2451545` as a Julian day number, so it parses, as the year 2000, and is caught
-by the ordering probe instead. Its own test says so.)
+idempotency key is reasoned about against. The receipt trigger compared them with `julianday`,
+preceded by a `typeof`/`julianday IS NULL` probe — and the comparison itself turned out to be
+lossy, which is round 4's finding 3 below. The rule and its second layer are right; the operator
+was wrong.
 
 The same treatment went to the new table: a verification names an attempt this ledger holds and
 cannot have been observed before that attempt finished.
+
+### Round 4 review (GPT) — three findings, all reproduced
+
+One P1 and two P2, and the P1 overturns a round-3 owner decision. All three landed in 003, which is
+still unmerged.
+
+**1 (P1). The retry block was enforced where it could not work.** `record_submission_attempt` is
+handed a *completed receipt* — this module is persistence, by design and by its own docstring — so
+refusing the write cannot prevent a second post. It can only make a post that already happened
+**unrecordable**. The SQL half was worse: the guard sat on `lifecycle_events` alone, so a writer
+that records the attempt row and then its event ends up with the attempt committed and the event
+refused. Reproduced: **two `submission_attempts` rows against one event**, an orphan receipt in an
+append-only table, which is the exact inverse of what this item is accepted against.
+
+**Owner decision: the ledger records; the pipeline decides.** The trigger and the writer guard are
+gone. In their place `lifecycle.unresolved_uncertainties(conn, record_id)` returns the attempt ids
+awaiting a refetch — a **reader**, asked *before* posting, which is the only point at which the
+rule can be kept. M2-704 owns the pre-request guard and the durable reservation that serializes
+concurrent submitters; neither is expressible as a constraint on a table of past events.
+
+Two consequences worth stating. A record may now hold several `submission_uncertain` events, one
+per attempt — and the round-3 unique index is what stops two of them citing the same receipt, which
+makes that index *reachable* rather than defence in depth, so it now has a real reproduction rather
+than a schema-shape assertion. And the property suite's walk generator lost its
+`_BLOCKED_WHILE_UNCERTAIN` rule, which immediately made its fixture reuse one attempt row across
+two uncertain events — the same shortcut the schema forbids the writer, found the same way as in
+round 3.
+
+The general lesson, which is not specific to this rule: **a module that only ever runs after the
+fact cannot enforce a rule about whether the fact should happen.** Every guard here is a guard on
+the record, and the strongest thing a record can say about an action it disapproves of is to
+describe it accurately.
+
+**2 (P2). A confirmation could reach `submitted` with no evidence.**
+`submission_verifications.refetched_forecast_snapshot` was unconditionally nullable and the writer
+accepted `None` — reproduced, a `submission_confirmed` transition with NULL stored — while the
+column's own comment said the snapshot is what makes a confirmation auditable rather than taken on
+faith. A stated guarantee with no constraint behind it is the failure this file exists to prevent.
+Now required for `confirmed` in both layers, with empty-or-whitespace counting as absent; `absent`
+outcomes stay nullable, which is why the column cannot simply be NOT NULL.
+
+**3 (P2). `julianday()` cannot order microseconds.** It returns a float *day* number, so at ~2.46e6
+days a double has no bits left below ~10µs: two timestamps one microsecond apart compare exactly
+equal (confirmed — the difference is `0.0`, while milliseconds survive). The schema therefore
+accepted a reversed receipt that the Python writer rejects, which is the same two-layer
+disagreement round 3 set out to close.
+
+Exactness needs a form that orders lexicographically, so `_require_utc` now renders a canonical
+`YYYY-MM-DDTHH:MM:SS.ffffff+00:00` (fixed width 32, always UTC, microseconds always present) for
+every timestamp this module writes, and 003 pins that shape on the three columns it compares —
+`requested_at_utc`, `completed_at_utc`, `observed_at_utc` — then compares them as TEXT.
+
+**This reverses round 3's "no format pin, do not become the lone outlier" reasoning, narrowly and
+on purpose.** That argument holds for a column nothing is compared against. It does not survive a
+column an ordering claim rests on, where the choice is not "pin or stay uniform" but "pin or
+compare wrongly". `occurred_at_utc` and `created_at_utc` stay unpinned because nothing orders them
+— event order is `event_seq`. Where a stored `completed_at_utc` is *not* canonical (a hypothetical
+pre-003 row), the verification trigger **refuses rather than guesses**: a lexicographic comparison
+against an unknown format is a coin toss that reads like a check.
 
 ### Deferred (do not read the absence as an omission)
 
@@ -1288,11 +1343,12 @@ cannot have been observed before that attempt finished.
 - **M1-306** keeps its started-then-completed write shape on `research_runs`.
 - **M2-701** builds its commands on `record_approval`; the hash binding is already enforced.
 - **M2-704** cannot record a `submitted` state without a refetch-verified attempt row, and gets a
-  non-terminal `submission_uncertain` to park an unconfirmed post in. It does **not** have to
-  implement the retry block: the ledger refuses a further attempt while an uncertainty stands, and
-  `record_submission_verification` is the only way through. Every attempt it records must carry
-  `completed_at_utc`, and an `http_status` if there was one; a refetch it performs but that answers
-  nothing is not a ledger event.
+  non-terminal `submission_uncertain` to park an unconfirmed post in. It **does** own the retry
+  guard: call `unresolved_uncertainties()` before posting and do not post while it is non-empty,
+  because the ledger cannot refuse an action it only hears about afterwards (round 4, finding 1).
+  Serializing concurrent submitters needs a durable reservation, also M2-704's. Every attempt it
+  records must carry `completed_at_utc`, and an `http_status` if there was one; a confirming refetch
+  must carry the snapshot it saw; a refetch that answers nothing is not a ledger event.
 - **Operators** cannot upgrade a ledger holding a non-draft forecast record. Nothing has written
   one — M1-602 is the record writer and is unstarted — so the population is expected to be empty;
   if it is not, the ledger predates the guarantee and a fresh one is the honest answer.

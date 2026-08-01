@@ -70,10 +70,21 @@
 -- resolution and score transitions are: `event_type` is a CHECK constraint, SQLite cannot
 -- alter one, and adding a member later means rebuilding an append-only table.
 --
--- The retry itself is blocked by trigger rather than by convention: while a record holds
--- an uncertain event that no verification has resolved, no further submission event is
--- accepted. "Block retry until refetch resolves state" is then a property of the ledger
--- and not a promise M2-704's write path keeps.
+-- The retry itself is NOT blocked here, and round 3's attempt to block it was withdrawn.
+-- A trigger refusing a second submission event looked like "block retry until refetch
+-- resolves state" and was not: everything this schema sees arrives *after* the fact.
+-- `record_submission_attempt` is handed a finished receipt, so refusing it cannot stop a
+-- post -- it can only make a post that already happened unrecordable, and the SQL half
+-- was worse still, since the attempt row commits before the event is refused (GPT review
+-- round 4, finding 1; reproduced two stored attempts against one event).
+--
+-- A ledger that refuses a fact does not prevent the act, it deletes the evidence. So the
+-- rule stays where it can be kept: M2-704 asks *before* it posts, and
+-- `whiskeyjack_bot.lifecycle.unresolved_uncertainties()` is what it asks. What this
+-- schema contributes is the uncertain state itself, the two events that resolve it, and
+-- an honest record of every attempt that was made -- including one that should not have
+-- been. Serializing concurrent submitters needs a durable reservation, which is M2-704's
+-- to build and cannot be a constraint on a table of past events either.
 --
 -- There is no `phase` column. Every event type names its own pipeline phase already
 -- (`submission_failed` happens at submission), so a phase column would be a second
@@ -141,8 +152,13 @@ ALTER TABLE forecast_records ADD COLUMN forecast_sha256 TEXT;
 --
 -- `refetched_forecast_snapshot` mirrors the column of the same name on
 -- `submission_attempts` (001): what the platform actually returned, so the confirmation
--- can be audited rather than taken on faith. Nullable, because an `absent` outcome has no
--- snapshot to store.
+-- can be audited rather than taken on faith. Nullable in the DDL, and **required for a
+-- `confirmed` outcome** by the insert trigger below -- an `absent` outcome has nothing to
+-- store, which is why the column cannot simply be NOT NULL. Round 3 wrote the rationale
+-- above and left the column unconditionally nullable, so a confirmation could carry the
+-- record to `submitted` on no evidence at all while this comment claimed otherwise (GPT
+-- review round 4, finding 2; reproduced). A stated guarantee with no constraint behind it
+-- is the failure mode this file exists to avoid.
 --
 -- There is deliberately no uniqueness over `submission_attempt_id`. A refetch can be
 -- repeated, and each run is a true observation at its own time -- a post that was absent
@@ -536,23 +552,12 @@ BEGIN
              AND verified_by_refetch = 0
       );
 
-    -- Until a refetch resolves it, an uncertain post is the last thing that happened to
-    -- this record: no further attempt may be recorded. This is the handoff's "block retry
-    -- until refetch resolves state" as a constraint rather than a convention M2-704 keeps
-    -- (round 3, finding 1) -- and it is the reason the resolution had to become a real
-    -- event first, since without one the record could reach neither a retry nor a
-    -- confirmation and the block would be a deadlock.
-    --
-    -- A bare EXISTS is exact, not approximate: a resolved uncertainty has already carried
-    -- the record to `submitted` or `failed`, and none of these three events is legal from
-    -- there anyway. So the only rows this can see are unresolved ones.
-    SELECT RAISE(ABORT, 'lifecycle_events: this record has an unresolved uncertain submission; a refetch must confirm or disconfirm it before another attempt is recorded')
-    WHERE NEW.event_type IN ('submitted', 'submission_uncertain', 'submission_failed')
-      AND EXISTS (
-          SELECT 1 FROM lifecycle_events
-           WHERE forecast_record_id = NEW.forecast_record_id
-             AND event_type = 'submission_uncertain'
-      );
+    -- A second attempt while an uncertainty stands is deliberately NOT refused here; see
+    -- "WHY A REFETCH IS NOT AN ATTEMPT" in the header for what replaced round 3's probe.
+    -- The consequence to notice is that a record may now hold several
+    -- `submission_uncertain` events -- one per attempt -- and each still cites its own
+    -- attempt row, because the partial unique index below allows a detail row to back
+    -- exactly one event.
 
     -- The verification's attempt is what ties it to this record; the row itself stores no
     -- forecast_record_id, so the join is the ownership check.
@@ -693,14 +698,25 @@ END;
 --   3, finding 3; reproduced). Every other rule in this item holds in both layers; this
 --   one held in one.
 --
---   The typeof/julianday probe is not a separate rule but what makes the ordering one
---   well defined. julianday() reads a bare integer as a Julian day *number* and returns
---   NULL for anything it cannot parse, and a NULL comparison is neither true nor false --
---   so without it the ordering check would silently not fire on exactly the inputs that
---   most need it. It stops there deliberately: 001 pins no timestamp *format* on any
---   column, and pinning one here alone would make this table the lone outlier, which is
---   worse than either consistent policy (the argument CLAUDE.md settles the path
---   carve-out with).
+--   Round 3 made that comparison with julianday(), and julianday() is a *float day
+--   number*: a day is 86400 seconds, a double has ~16 significant digits, so microseconds
+--   fall off the end. Two timestamps one microsecond apart compare exactly equal -- the
+--   schema accepted a reversed receipt the Python writer rejects, which is the same
+--   two-layer disagreement round 3 set out to close (GPT review round 4, finding 3;
+--   reproduced at .000001 vs .000002, milliseconds survive and microseconds do not).
+--
+--   Exactness needs a form that orders lexicographically, so these columns are pinned to
+--   one: `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`, fixed width 32, always UTC, microseconds
+--   always present -- what `lifecycle._require_utc` now renders for every timestamp it
+--   writes. Then `<` on TEXT is the comparison, and it is exact.
+--
+--   This reverses round 3's "no format pin, do not become the lone outlier" reasoning,
+--   deliberately and narrowly. That argument holds for a column nothing is compared
+--   against; it does not survive a column an *ordering claim* rests on, where the choice
+--   is not "pin or stay uniform" but "pin or compare wrongly". So the pin covers exactly
+--   the three columns that are compared -- requested_at_utc, completed_at_utc and
+--   submission_verifications.observed_at_utc -- and `occurred_at_utc` / `created_at_utc`
+--   stay unpinned, because event order is `event_seq` and nothing orders those.
 --
 -- INSERT only. UPDATE and DELETE on this table are refused outright below, so there is
 -- no second path a row can arrive by.
@@ -711,14 +727,17 @@ BEGIN
     SELECT RAISE(ABORT, 'submission_attempts: completed_at_utc is required; an attempt is recorded once, after it has finished')
     WHERE NEW.completed_at_utc IS NULL;
 
-    SELECT RAISE(ABORT, 'submission_attempts: requested_at_utc and completed_at_utc must be text timestamps SQLite can order')
+    SELECT RAISE(ABORT, 'submission_attempts: requested_at_utc and completed_at_utc must be UTC timestamps of the form YYYY-MM-DDTHH:MM:SS.ffffff+00:00')
     WHERE typeof(NEW.requested_at_utc) <> 'text'
        OR typeof(NEW.completed_at_utc) <> 'text'
-       OR julianday(NEW.requested_at_utc) IS NULL
-       OR julianday(NEW.completed_at_utc) IS NULL;
+       OR length(NEW.requested_at_utc) <> 32
+       OR length(NEW.completed_at_utc) <> 32
+       OR NEW.requested_at_utc NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
+       OR NEW.completed_at_utc NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00';
 
+    -- Exact, because both sides are pinned to the same fixed-width UTC form above.
     SELECT RAISE(ABORT, 'submission_attempts: completed_at_utc is earlier than requested_at_utc')
-    WHERE julianday(NEW.completed_at_utc) < julianday(NEW.requested_at_utc);
+    WHERE NEW.completed_at_utc < NEW.requested_at_utc;
 
     SELECT RAISE(ABORT, 'submission_attempts: http_status must be an integer HTTP status code between 100 and 599')
     WHERE NEW.http_status IS NOT NULL
@@ -728,9 +747,16 @@ BEGIN
 END;
 
 -- A verification is a receipt too, and gets the same treatment: it names an attempt this
--- ledger holds, and it cannot have been observed before that attempt finished. The
--- attempt-exists probe runs ahead of the foreign key so the message is this schema's own,
--- as with lifecycle_events above.
+-- ledger holds, it carries what it saw when it says it saw something, and it cannot have
+-- been observed before that attempt finished. The attempt-exists probe runs ahead of the
+-- foreign key so the message is this schema's own, as with lifecycle_events above.
+--
+-- The comparison against the attempt's own `completed_at_utc` **refuses rather than
+-- guesses** when that stored value is not in the pinned form. A row written before this
+-- migration could hold any shape, and a lexicographic comparison against an unknown format
+-- is not a comparison -- it is a coin toss that reads like a check. The population is
+-- expected to be empty (this module is the only writer of that table and is new here), so
+-- the honest failure costs nothing and the silent wrong answer would cost everything.
 CREATE TRIGGER submission_verifications_require_receipt_on_insert
 BEFORE INSERT ON submission_verifications
 FOR EACH ROW
@@ -740,13 +766,29 @@ BEGIN
         SELECT 1 FROM submission_attempts WHERE attempt_id = NEW.submission_attempt_id
     );
 
-    SELECT RAISE(ABORT, 'submission_verifications: observed_at_utc must be a text timestamp SQLite can order')
+    SELECT RAISE(ABORT, 'submission_verifications: a confirmed refetch must carry the forecast snapshot it saw')
+    WHERE NEW.outcome = 'confirmed'
+      AND (NEW.refetched_forecast_snapshot IS NULL
+           OR typeof(NEW.refetched_forecast_snapshot) <> 'text'
+           OR trim(NEW.refetched_forecast_snapshot) = '');
+
+    SELECT RAISE(ABORT, 'submission_verifications: observed_at_utc must be a UTC timestamp of the form YYYY-MM-DDTHH:MM:SS.ffffff+00:00')
     WHERE typeof(NEW.observed_at_utc) <> 'text'
-       OR julianday(NEW.observed_at_utc) IS NULL;
+       OR length(NEW.observed_at_utc) <> 32
+       OR NEW.observed_at_utc NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00';
+
+    SELECT RAISE(ABORT, 'submission_verifications: the attempt this verifies stores a completion time in a form that cannot be ordered against an observation')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM submission_attempts
+         WHERE attempt_id = NEW.submission_attempt_id
+           AND typeof(completed_at_utc) = 'text'
+           AND length(completed_at_utc) = 32
+           AND completed_at_utc GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
+    );
 
     SELECT RAISE(ABORT, 'submission_verifications: observed_at_utc is earlier than the completion of the attempt it verifies')
-    WHERE julianday(NEW.observed_at_utc) < (
-        SELECT julianday(completed_at_utc) FROM submission_attempts
+    WHERE NEW.observed_at_utc < (
+        SELECT completed_at_utc FROM submission_attempts
          WHERE attempt_id = NEW.submission_attempt_id
     );
 END;

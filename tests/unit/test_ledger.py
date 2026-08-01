@@ -29,7 +29,8 @@ LEDGER_TABLES = {
     "schema_migrations",
 }
 
-TS = "2026-07-17T00:00:00+00:00"
+# Canonical UTC form: 003 pins it on the columns it orders (see test_lifecycle.py).
+TS = "2026-07-17T00:00:00.000000+00:00"
 # Migration 003 requires every new forecast record to carry a 64-hex content hash.
 FORECAST_SHA = "b" * 64
 

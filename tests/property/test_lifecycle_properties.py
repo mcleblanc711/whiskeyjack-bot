@@ -50,9 +50,13 @@ STATUSES: tuple[str, ...] = get_args(LifecycleStatus)
 EVENT_TYPES: tuple[str, ...] = get_args(LifecycleEventType)
 FAILURE_CODES: tuple[str, ...] = get_args(lifecycle.FailureCode)
 
-TS = "2026-07-27T00:00:00+00:00"
+# Canonical UTC form: 003 pins it on the columns it orders (see test_lifecycle.py).
+TS = "2026-07-27T00:00:00.000000+00:00"
 WHEN = datetime(2026, 7, 27, tzinfo=timezone.utc)
 SHA = "b" * 64
+# What a confirming refetch saw. Required for a `confirmed` outcome: a confirmation
+# with nothing stored is what carries a record to `submitted` on no evidence.
+SNAPSHOT = '{"probability": 0.6}'
 PLANTED_SECRET = "privateFAKE123456"
 
 
@@ -371,13 +375,15 @@ def test_the_readers_raise_only_lifecycle_error(record_id: object) -> None:
 
 
 # The one rule the transition table cannot express, because it turns on the record's
-# history rather than on its current status: an unresolved uncertain submission blocks
-# every further attempt, and the refetch's own two events exist only once there is an
-# uncertainty for them to resolve. Both directions are enforced by the migration, so a
-# walk that ignored them would be rejected by the database and the fuzzer would be testing
-# its own generator.
+# history rather than on its current status: the refetch's two events exist only once
+# there is an uncertainty for them to resolve. A walk that ignored it would be rejected by
+# the database and the fuzzer would be testing its own generator.
+#
+# There is no rule in the other direction. Round 3 blocked a further attempt while an
+# uncertainty stood; round 4 withdrew that (finding 1), so a walk may hold several
+# `submission_uncertain` events -- which is why `_insert_event` mints a fresh attempt row
+# per submission event rather than reusing one from the fixture.
 _AFTER_UNCERTAINTY = frozenset({"submission_confirmed", "submission_disconfirmed"})
-_BLOCKED_WHILE_UNCERTAIN = frozenset({"submitted", "submission_uncertain", "submission_failed"})
 
 
 @st.composite
@@ -391,11 +397,10 @@ def legal_walks(draw: st.DrawFn) -> tuple[tuple[str, str, str], ...]:
     uncertain = False
     walk: list[tuple[str, str, str]] = []
     for _ in range(draw(st.integers(min_value=0, max_value=8))):
-        blocked = _BLOCKED_WHILE_UNCERTAIN if uncertain else _AFTER_UNCERTAINTY
         options = sorted(
             (event_type, to_status)
             for (event_type, from_status), to_status in lifecycle._DESTINATIONS.items()
-            if from_status == status and event_type not in blocked
+            if from_status == status and (uncertain or event_type not in _AFTER_UNCERTAINTY)
         )
         if not options:
             break
@@ -810,10 +815,12 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
     verifications = {
         f"verified_{outcome}": conn.execute(
             "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
-            "observed_at_utc, created_at_utc) VALUES (?, ?, ?, ?)",
-            (attempts["att_unsure"], outcome, TS, TS),
+            "observed_at_utc, refetched_forecast_snapshot, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (attempts["att_unsure"], outcome, TS, snapshot, TS),
         ).lastrowid
-        for outcome in ("confirmed", "absent")
+        # A confirmation must carry what it saw; an `absent` one has nothing to store.
+        for outcome, snapshot in (("confirmed", SNAPSHOT), ("absent", None))
     }
     return {
         "approved": approved,
@@ -825,6 +832,37 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
         "scored": score,
         **verifications,
     }
+
+
+def _uncited_attempt(
+    conn: sqlite3.Connection, record_id: str, attempt_id: object, success: int, verified: int
+) -> object:
+    """The fixture's attempt while nothing cites it, then fresh ones shaped like it.
+
+    A detail row backs at most one event (round 3's index), and since round 4 withdrew the
+    retry block a walk may hold several `submission_uncertain` events -- so the second one
+    needs a receipt of its own. That is also the truthful shape: two uncertain posts are two
+    requests, and the fixture reusing one row for both was the same shortcut the schema
+    forbids the writer.
+
+    The first uncertain event keeps the fixture's `att_unsure`, which is what the
+    verification rows in `_detail_rows` were written against.
+    """
+    if (
+        conn.execute(
+            "SELECT 1 FROM lifecycle_events WHERE submission_attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        is None
+    ):
+        return attempt_id
+    fresh = f"{attempt_id}-{next(_SERIAL)}"
+    conn.execute(
+        "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
+        "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+        "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fresh, record_id, f"idem-{fresh}", TS, TS, "d" * 64, success, verified, TS),
+    )
+    return fresh
 
 
 def _insert_event(
@@ -854,11 +892,13 @@ def _insert_event(
             (record_id, event_type, SHA, TS),
         ).lastrowid
     elif event_type == "submitted":
-        links["submission_attempt_id"] = detail["att_ok"]
+        links["submission_attempt_id"] = _uncited_attempt(conn, record_id, detail["att_ok"], 1, 1)
     elif event_type == "submission_uncertain":
-        links["submission_attempt_id"] = detail["att_unsure"]
+        links["submission_attempt_id"] = _uncited_attempt(
+            conn, record_id, detail["att_unsure"], 1, 0
+        )
     elif event_type == "submission_failed":
-        links["submission_attempt_id"] = detail["att_bad"]
+        links["submission_attempt_id"] = _uncited_attempt(conn, record_id, detail["att_bad"], 0, 0)
     elif event_type == "submission_confirmed":
         links["submission_verification_id"] = detail["verified_confirmed"]
     elif event_type == "submission_disconfirmed":

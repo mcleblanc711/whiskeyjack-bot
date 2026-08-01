@@ -46,6 +46,7 @@ from whiskeyjack_bot.lifecycle import (
     record_submission_verification,
     record_validation,
     transaction,
+    unresolved_uncertainties,
 )
 
 
@@ -56,11 +57,18 @@ def _checksum_of(name: str) -> str:
     ).hexdigest()
 
 
-TS = "2026-07-27T00:00:00+00:00"
+# The canonical form `lifecycle._require_utc` renders and 003 pins on the three columns it
+# orders: fixed width 32, always UTC, microseconds always present. Raw-SQL fixtures write
+# it too, so they exercise the same shape the writers store rather than a second one the
+# schema would have to tolerate.
+TS = "2026-07-27T00:00:00.000000+00:00"
 WHEN = datetime(2026, 7, 27, tzinfo=timezone.utc)
 SHA = "b" * 64
 OTHER_SHA = "c" * 64
 PAYLOAD_SHA = "d" * 64
+# What a confirming refetch saw. Required for a `confirmed` outcome: a confirmation
+# with nothing stored is what carries a record to `submitted` on no evidence.
+SNAPSHOT = '{"probability": 0.6}'
 
 # Low-entropy by convention: a realistic-looking secret in a tracked file fails the
 # gitleaks full-history scan on every branch, not just this one.
@@ -150,7 +158,7 @@ def _attempt(
     return SubmissionAttempt(
         attempt_id=attempt_id,
         idempotency_key=key,
-        requested_at_utc=WHEN,
+        requested_at_utc=extra.pop("requested_at_utc", WHEN),  # type: ignore[arg-type]
         completed_at_utc=extra.pop("completed_at_utc", WHEN),  # type: ignore[arg-type]
         request_payload_sha256=PAYLOAD_SHA,
         success=success,
@@ -321,6 +329,35 @@ def test_one_approval_decision_cannot_back_two_lifecycle_events(
     assert len(read_history(conn, record_id)) == 2
 
 
+def test_one_attempt_cannot_back_two_lifecycle_events(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """The second reachable case, and it only became reachable again in round 4.
+
+    `submission_uncertain` is a self-transition, so a record can hold two of them -- and
+    with round 3's retry probe withdrawn, nothing but this index stops both citing the same
+    receipt. That would be one post recorded as two, in an append-only log.
+    """
+    conn, record_id = draft
+    _approve(conn, record_id)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(success=True, verified=False),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, detail_code, submission_attempt_id, occurred_at_utc, "
+            "created_at_utc) VALUES (?, 4, 'submission_uncertain', 'approved', 'approved', "
+            "'refetch_missing', 'att-1', ?, ?)",
+            (record_id, TS, TS),
+        )
+    assert len(read_history(conn, record_id)) == 3
+
+
 @pytest.mark.parametrize(
     "link",
     [
@@ -332,19 +369,18 @@ def test_one_approval_decision_cannot_back_two_lifecycle_events(
     ],
 )
 def test_every_link_column_is_unique(ledger: sqlite3.Connection, link: str) -> None:
-    """The same rule for all five, and only one of them can be reproduced through it.
+    """The same rule for all five, two of which can be reproduced through it.
 
-    The approval case above is reachable because `rejected` is a self-transition. For the
-    other four the state machine refuses a second citation first -- an attempt's is now
-    blocked by the unresolved-uncertainty probe, and `resolved`/`scored`/a verification all
-    move the record somewhere no second event of that type is legal from. That makes those
-    four defence in depth, and defence in depth is exactly what "not reachable today"
-    warrants: it is a fact about the current transition table, which M4-802 and M5-803 have
-    yet to add to, and not a property of this table.
+    `rejected` and `submission_uncertain` are self-transitions, so both of those are
+    reachable and have their own reproductions above and below. The other three move the
+    record somewhere no second event of that type is legal from, which makes them defence
+    in depth -- and defence in depth is exactly what "not reachable today" warrants: that
+    is a fact about the current transition table, which M4-802 and M5-803 have yet to add
+    to, and not a property of this table.
 
-    So the assertion is on the constraint rather than on a contrived path to it: asserting
-    a refusal that some *other* guard produces would be a test that passes whether or not
-    the index exists.
+    So the assertion here is on the constraint rather than on a contrived path to it:
+    asserting a refusal that some *other* guard produces would be a test that passes
+    whether or not the index exists.
     """
     indexes = {
         row["name"]: row
@@ -770,10 +806,12 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
     verifications = {
         f"verified_{outcome}": conn.execute(
             "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
-            "observed_at_utc, created_at_utc) VALUES (?, ?, ?, ?)",
-            (f"att-unsure-{suffix}", outcome, TS, TS),
+            "observed_at_utc, refetched_forecast_snapshot, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (f"att-unsure-{suffix}", outcome, TS, snapshot, TS),
         ).lastrowid
-        for outcome in ("confirmed", "absent")
+        # A confirmation must carry what it saw; an `absent` one has nothing to store.
+        for outcome, snapshot in (("confirmed", SNAPSHOT), ("absent", None))
     }
     return {
         "approved": approved,
@@ -1439,10 +1477,15 @@ def _verification(
     outcome: str = "confirmed",
     **extra: object,
 ) -> SubmissionVerification:
+    # The snapshot defaults to present because the default outcome is `confirmed`, which
+    # requires one; pass None explicitly to test that rule.
     return SubmissionVerification(
         submission_attempt_id=attempt_id,
         outcome=outcome,  # type: ignore[arg-type]
         observed_at_utc=extra.pop("observed_at_utc", WHEN),  # type: ignore[arg-type]
+        refetched_forecast_snapshot=extra.pop(  # type: ignore[arg-type]
+            "refetched_forecast_snapshot", SNAPSHOT
+        ),
         **extra,  # type: ignore[arg-type]
     )
 
@@ -1546,8 +1589,9 @@ def test_the_verification_link_is_checked_against_the_database_too(
         return int(
             ledger.execute(
                 "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
-                "observed_at_utc, created_at_utc) VALUES (?, 'confirmed', ?, ?)",
-                (attempt_id, TS, TS),
+                "observed_at_utc, refetched_forecast_snapshot, created_at_utc) "
+                "VALUES (?, 'confirmed', ?, ?, ?)",
+                (attempt_id, TS, SNAPSHOT, TS),
             ).lastrowid
             or 0
         )
@@ -1569,62 +1613,97 @@ def test_the_verification_link_is_checked_against_the_database_too(
         cite("rec-2", 3, verify("att-2"))
 
 
-def test_an_unresolved_uncertainty_blocks_another_attempt(
+def test_a_second_attempt_while_uncertain_is_recorded_not_refused(
     draft: tuple[sqlite3.Connection, str],
 ) -> None:
-    """ "Block retry until refetch resolves state", as a property of the ledger.
+    """Round 4, finding 1: the ledger records what happened, including what should not have.
 
-    Both layers: the writer refuses with a message that says what to do, and the raw SQL
-    the writer would have run is refused too -- the guard has to hold against a caller
-    that never goes through this module.
+    Round 3 refused this write, in the trigger and in the writer, and called it "block
+    retry until refetch resolves state". It is not: `record_submission_attempt` is handed a
+    receipt for a post that has *already been made*, so refusing it cannot un-make the post
+    -- it only leaves a live submission with no ledger row. The SQL half was worse, because
+    the attempt row committed and only its event was refused: two stored attempts, one
+    event, an orphan receipt in an append-only table.
+
+    So both attempts and both events are stored, and the state stays `approved` because
+    neither refetch confirmed anything.
     """
     conn, record_id = draft
     _leave_uncertain(conn, record_id)
 
-    with pytest.raises(LifecycleError, match="unresolved uncertain submission"):
-        record_submission_attempt(
-            conn,
-            record_id=record_id,
-            attempt=_attempt(attempt_id="att-2", key="idem-2"),
-            occurred_at=WHEN,
-        )
-    assert _counts(conn)["submission_attempts"] == 1
-
-    conn.execute(
-        "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
-        "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
-        "verified_by_refetch, created_at_utc) "
-        "VALUES ('att-raw', ?, 'idem-raw', ?, ?, ?, 1, 1, ?)",
-        (record_id, TS, TS, PAYLOAD_SHA, TS),
+    second = record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, verified=False),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
     )
-    with pytest.raises(sqlite3.IntegrityError, match="unresolved uncertain submission"):
-        conn.execute(
-            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
-            "from_status, to_status, submission_attempt_id, occurred_at_utc, created_at_utc) "
-            "VALUES (?, 4, 'submitted', 'approved', 'submitted', 'att-raw', ?, ?)",
-            (record_id, TS, TS),
-        )
+    assert second.event_type == "submission_uncertain"
+    assert _counts(conn)["submission_attempts"] == 2
+    assert [event.event_type for event in read_history(conn, record_id)] == [
+        "validated",
+        "approved",
+        "submission_uncertain",
+        "submission_uncertain",
+    ]
     assert current_status(conn, record_id) == "approved"
+    # No orphan: every stored attempt is cited by exactly one event.
+    cited = [
+        row[0]
+        for row in conn.execute(
+            "SELECT submission_attempt_id FROM lifecycle_events "
+            "WHERE submission_attempt_id IS NOT NULL"
+        )
+    ]
+    assert sorted(cited) == ["att-1", "att-2"]
 
 
-def test_the_resolution_frees_the_record_from_the_retry_block(
+def test_unresolved_uncertainties_is_the_pre_request_seam(
     draft: tuple[sqlite3.Connection, str],
 ) -> None:
-    # The block must not outlive what it is blocking on. Once resolved, the record has
-    # left `approved` -- and the states it can be in are ones no submission event is legal
-    # from, which is the whole of why the bare EXISTS in the trigger is exact.
+    """What M2-704 asks *before* posting, since the writers only ever run after.
+
+    The three states that matter: nothing outstanding, one outstanding, and resolved. A
+    record that has left `approved` has nothing outstanding by construction -- no
+    submission event is legal from `submitted` or `failed`.
+    """
     conn, record_id = draft
-    _leave_uncertain(conn, record_id)
-    record_submission_verification(
-        conn, record_id=record_id, verification=_verification(), occurred_at=WHEN
+    _approve(conn, record_id)
+    assert unresolved_uncertainties(conn, record_id) == ()
+
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(success=True, verified=False),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
     )
-    with pytest.raises(LifecycleError, match="not a legal transition"):
-        record_submission_attempt(
-            conn,
-            record_id=record_id,
-            attempt=_attempt(attempt_id="att-2", key="idem-2"),
-            occurred_at=WHEN,
-        )
+    assert unresolved_uncertainties(conn, record_id) == ("att-1",)
+
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, verified=False),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+    )
+    assert unresolved_uncertainties(conn, record_id) == ("att-1", "att-2")
+
+    record_submission_verification(
+        conn,
+        record_id=record_id,
+        verification=_verification(refetched_forecast_snapshot="{}"),
+        occurred_at=WHEN,
+    )
+    assert current_status(conn, record_id) == "submitted"
+    assert unresolved_uncertainties(conn, record_id) == ()
+
+
+def test_unresolved_uncertainties_rejects_an_unknown_record(ledger: sqlite3.Connection) -> None:
+    # Same answer as the other two readers: a caller that cannot tell "nothing
+    # outstanding" from "no such record" would post on the strength of the second.
+    with pytest.raises(LifecycleError):
+        unresolved_uncertainties(ledger, "no-such-record")
 
 
 def test_a_refetch_cannot_resolve_an_attempt_that_was_never_uncertain(
@@ -1691,8 +1770,9 @@ def test_a_refetch_cannot_be_observed_before_the_attempt_it_verifies(
     with pytest.raises(sqlite3.IntegrityError, match="earlier than the completion"):
         conn.execute(
             "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
-            "observed_at_utc, created_at_utc) VALUES ('att-1', 'confirmed', ?, ?)",
-            ("2020-01-01T00:00:00+00:00", TS),
+            "observed_at_utc, refetched_forecast_snapshot, created_at_utc) "
+            "VALUES ('att-1', 'confirmed', ?, ?, ?)",
+            ("2020-01-01T00:00:00.000000+00:00", SNAPSHOT, TS),
         )
 
 
@@ -1732,6 +1812,66 @@ def test_a_confirmed_refetch_rejects_a_detail_code(
             occurred_at=WHEN,
             detail_code="refetch_missing",
         )
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "message"),
+    [
+        (None, "required for a confirmed refetch"),
+        # Refused one rule earlier, by the field validator every text field goes through:
+        # an empty string is not a value this ledger stores anywhere.
+        ("", "must be a non-empty string"),
+        ("   ", "required for a confirmed refetch"),
+    ],
+)
+def test_a_confirmed_refetch_must_carry_what_it_saw(
+    draft: tuple[sqlite3.Connection, str], snapshot: str | None, message: str
+) -> None:
+    """Round 4, finding 2: the column's rationale and its constraint disagreed.
+
+    The snapshot is what makes a confirmation auditable rather than taken on faith, and it
+    is the evidence that carries the record to `submitted` -- yet the column was
+    unconditionally nullable and the writer took None. Reproduced: a `submission_confirmed`
+    transition with NULL stored. Both layers now refuse it, and empty-but-present counts as
+    absent because a whitespace snapshot is a snapshot of nothing.
+    """
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    with pytest.raises(LifecycleError, match=message):
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=_verification(refetched_forecast_snapshot=snapshot),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_verifications"] == 0
+    assert current_status(conn, record_id) == "approved"
+
+    with pytest.raises(sqlite3.IntegrityError, match="must carry the forecast snapshot"):
+        conn.execute(
+            "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+            "observed_at_utc, refetched_forecast_snapshot, created_at_utc) "
+            "VALUES ('att-1', 'confirmed', ?, ?, ?)",
+            (TS, snapshot, TS),
+        )
+
+
+def test_a_disconfirming_refetch_needs_no_snapshot(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # The converse, and why the column cannot simply be NOT NULL: a refetch that found
+    # nothing has nothing to store, and requiring one would mean inventing it.
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    event = record_submission_verification(
+        conn,
+        record_id=record_id,
+        verification=_verification(outcome="absent", refetched_forecast_snapshot=None),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+    )
+    assert event.event_type == "submission_disconfirmed"
+    assert current_status(conn, record_id) == "failed"
 
 
 def test_a_disconfirmed_refetch_requires_a_detail_code(
@@ -1901,8 +2041,8 @@ def test_a_receipt_cannot_complete_before_it_was_requested(
 
     The writer compared the two instants and the schema did not, so a direct insert could
     store an attempt that completed a day before it was requested -- permanently, on an
-    append-only table. Compared as instants rather than as rendered text on the Python
-    side, and by ``julianday`` on the SQL side.
+    append-only table. Compared as instants on the Python side, and as canonical text on
+    the SQL side.
     """
     conn, record_id = draft
     _approve(conn, record_id)
@@ -1915,38 +2055,113 @@ def test_a_receipt_cannot_complete_before_it_was_requested(
         )
     assert _counts(conn)["submission_attempts"] == 0
     with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
-        _insert_attempt(conn, record_id, requested=TS, completed="2026-07-26T00:00:00+00:00")
+        _insert_attempt(conn, record_id, requested=TS, completed="2026-07-26T00:00:00.000000+00:00")
     assert _counts(conn)["submission_attempts"] == 0
 
 
-@pytest.mark.parametrize("completed", ["", "not-a-timestamp", "2026-13-45T99:00:00Z", b"\x00"])
-def test_a_receipt_whose_timestamps_cannot_be_ordered_is_refused(
-    draft: tuple[sqlite3.Connection, str], completed: object
+def test_a_receipt_reversed_by_one_microsecond_is_refused(
+    draft: tuple[sqlite3.Connection, str],
 ) -> None:
-    """What makes the ordering probe above well defined rather than merely present.
+    """Round 4, finding 3: the two layers disagreed at the bottom of the resolution.
 
-    ``julianday`` returns NULL for anything it cannot parse, and a comparison against NULL
-    is neither true nor false -- so without this the ordering check would silently not fire
-    on exactly the values that need it most. A blob is the case the ``typeof`` half is
-    for: TEXT affinity converts a number to text but leaves a blob a blob.
+    Round 3 compared with ``julianday``, which is a float *day* number -- microseconds fall
+    below its precision, so two instants a microsecond apart compared exactly equal and the
+    schema accepted a reversed receipt the writer rejects. Milliseconds survived, which is
+    what made it look like it worked. Both layers now refuse it.
     """
     conn, record_id = draft
     _approve(conn, record_id)
-    with pytest.raises(sqlite3.IntegrityError, match="SQLite can order"):
+    requested = WHEN + timedelta(microseconds=2)
+    completed = WHEN + timedelta(microseconds=1)
+    with pytest.raises(LifecycleError, match="earlier than"):
+        record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=_attempt(requested_at_utc=requested, completed_at_utc=completed),
+            occurred_at=WHEN,
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
+        _insert_attempt(
+            conn,
+            record_id,
+            requested=requested.isoformat(timespec="microseconds"),
+            completed=completed.isoformat(timespec="microseconds"),
+        )
+    assert _counts(conn)["submission_attempts"] == 0
+
+
+def test_a_refetch_observed_one_microsecond_too_early_is_refused(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # The same precision failure on the other pair, which GPT reproduced through the
+    # public writer rather than raw SQL.
+    conn, record_id = draft
+    _approve(conn, record_id)
+    completed = WHEN + timedelta(microseconds=2)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(success=True, verified=False, completed_at_utc=completed),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+    )
+    with pytest.raises(LifecycleError, match="earlier than the completion"):
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=_verification(observed_at_utc=WHEN + timedelta(microseconds=1)),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_verifications"] == 0
+
+
+@pytest.mark.parametrize(
+    "completed",
+    [
+        "",
+        "not-a-timestamp",
+        "2026-13-45T99:00:00Z",
+        b"\x00",
+        2451545,
+        # Real instants in shapes the pin refuses: no microseconds, `Z` instead of the
+        # offset, and a non-UTC offset. Each of them breaks a lexicographic comparison
+        # against a canonical value, which is the whole reason the shape is pinned.
+        "2026-07-27T00:00:00+00:00",
+        "2026-07-27T00:00:00.000000Z",
+        "2026-07-27T00:00:00.000000-05:00",
+    ],
+)
+def test_a_receipt_timestamp_outside_the_canonical_form_is_refused(
+    draft: tuple[sqlite3.Connection, str], completed: object
+) -> None:
+    """The pin is what makes the TEXT comparison above exact.
+
+    Ordering two stored strings only means anything if both are the same fixed-width UTC
+    shape: `2026-07-27T00:00:00+00:00` sorts *before* `2026-07-27T00:00:00.000001+00:00`
+    by luck (`+` < `.`), and `...00Z` sorts *after* `...00.5Z` by the same accident going
+    the other way. A blob is the case the `typeof` half is for -- TEXT affinity converts a
+    number to text but leaves a blob a blob.
+    """
+    conn, record_id = draft
+    _approve(conn, record_id)
+    with pytest.raises(sqlite3.IntegrityError, match="YYYY-MM-DDTHH:MM:SS"):
         _insert_attempt(conn, record_id, requested=TS, completed=completed)
 
 
-def test_a_bare_number_is_not_a_receipt_timestamp(
+def test_the_writer_renders_the_canonical_form(
     draft: tuple[sqlite3.Connection, str],
 ) -> None:
-    # The value that motivates reading julianday's result rather than trusting it: SQLite
-    # accepts a bare number as a *Julian day number*, so 2451545 parses -- as the year
-    # 2000. It is caught by the ordering probe rather than the format one, which is the
-    # honest thing for a schema that pins no timestamp format to say about it.
+    # The writer's rendering and the schema's pin have to be the same string, or every
+    # write through this module would be refused by its own migration. A whole-second
+    # instant is the case plain isoformat() gets wrong: it drops the fractional part.
     conn, record_id = draft
     _approve(conn, record_id)
-    with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
-        _insert_attempt(conn, record_id, requested=TS, completed=2451545)
+    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    stored = conn.execute(
+        "SELECT requested_at_utc, completed_at_utc FROM submission_attempts"
+    ).fetchone()
+    assert tuple(stored) == (TS, TS)
+    assert len(TS) == 32
 
 
 @pytest.mark.parametrize("status", [-1, 0, 99, 600, 1000, 2**63 - 1, 2**63])
