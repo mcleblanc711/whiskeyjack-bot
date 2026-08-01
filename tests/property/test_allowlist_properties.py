@@ -15,6 +15,7 @@ generated -- fuzzing it again would test the same invariant less precisely.
 
 from __future__ import annotations
 
+import pytest
 from hypothesis import given, strategies as st
 from strategies import HOSTILE_TEXT, RELIABILITY_TAGS
 from pydantic import ValidationError
@@ -216,6 +217,65 @@ def test_accepted_usernames_do_not_collide_once_normalized(payload: dict[str, ob
         return
     keys = [entry.username.strip().casefold() for entry in allowlist.entries]
     assert len(set(keys)) == len(keys)
+
+
+# Keys YAML can produce that are not strings: ints (the round-5 finding's shape -- an
+# unquoted 987654321 parses as one), floats, bools, dates, None. Values are chosen to be
+# distinctive when rendered, since the assertion is that str(key) does not appear in the
+# message: ints stay away from 0..3 so a genuine list index can never be mistaken for a
+# leaked key, and the float/bool/None draws exercise the non-int branch alongside them.
+_NON_STRING_KEYS = st.one_of(
+    st.integers(min_value=4, max_value=10**15),
+    st.integers(min_value=-(10**15), max_value=-4),
+    st.floats(min_value=4.5, max_value=1e12, allow_nan=False, allow_infinity=False),
+    st.booleans(),
+    st.none(),
+    st.dates(),
+)
+
+
+@st.composite
+def _payload_with_a_non_string_key(draw: st.DrawFn) -> tuple[dict[object, object], object]:
+    """A payload that is otherwise well-formed, carrying one non-string key at the top
+    level or inside an entry. Well-formed on purpose: a payload rejected for six other
+    reasons drowns the one error this property is about."""
+    key = draw(_NON_STRING_KEYS)
+    entry: dict[object, object] = {
+        "username": "blsgov",
+        "display_name": "Bureau",
+        "reliability_tag": "official_primary",
+        "domains": ["econ_data"],
+    }
+    payload: dict[object, object] = {"accounts": [entry]}
+    if draw(st.booleans()):
+        payload[key] = "x"
+    else:
+        entry[key] = "x"
+    return payload, key
+
+
+@given(_payload_with_a_non_string_key())
+def test_a_non_string_mapping_key_never_reaches_the_message(
+    case: tuple[dict[object, object], object],
+) -> None:
+    """The round-5 finding, as an invariant rather than one shape.
+
+    pydantic reports an invalid key by putting *the key itself* in ``loc``, so every
+    non-string key is file content sitting in a field the sanitizer renders. A round-trip
+    or "does it raise" property cannot see this -- it only shows up by asserting the drawn
+    value's absence from the rendered message. Checked against the pre-fix ``_sanitize``:
+    it fails there on the int draws, which is the evidence it is not vacuous.
+
+    The raise is asserted rather than caught: a draw that validated instead would satisfy
+    an ``except``-only body while proving nothing, and every key shape drawn here *is*
+    rejected (``invalid_key``), so a passing validation is a regression in the schema, not
+    a case to skip.
+    """
+    payload, key = case
+    with pytest.raises(AllowlistError) as excinfo:
+        _validate(payload)
+    rendered = str(excinfo.value) + "".join(excinfo.value.problems)
+    assert str(key) not in rendered, (rendered, key)
 
 
 def _accounts() -> st.SearchStrategy[AllowlistEntry]:

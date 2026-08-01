@@ -90,6 +90,26 @@ def _verify_referenced_files(config: AppConfig, report: VerificationReport) -> N
             report.filesystem_problems.append(f"{label} does not exist: {path}")
 
 
+def _nothing_exists_at(path: Path) -> bool:
+    """True only for ENOENT -- nothing at that path at all.
+
+    ``Path.is_file()`` cannot answer this: it returns False for a directory, a dangling
+    symlink and a stat failure exactly as it does for a missing file, so every one of
+    those read as "the optional file is absent" (round-5 review finding 2). ``lstat``,
+    not ``stat``: a dangling symlink *is* an object at the configured path, so it is
+    reported rather than skipped. Every non-ENOENT failure -- an unsearchable parent, a
+    path component that is not a directory -- falls through to ``load_allowlist``, whose
+    ``OSError`` branch reports it with an accurate ``strerror``.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def load_and_verify_account_allowlist(config: AppConfig) -> AccountAllowlist | None:
     """Load+validate the account allowlist unconditionally (M1-308 round 3).
 
@@ -101,22 +121,37 @@ def load_and_verify_account_allowlist(config: AppConfig) -> AccountAllowlist | N
     enabled-but-malformed allowlist can no longer reach a command that never runs
     ``verify_environment()``.
 
-    Returns ``None`` (skips) in exactly one case: social retrieval is disabled *and* the
-    file is absent. An absent allowlist while ``enabled`` is true is a hard startup
-    failure (round 4) -- it used to skip here too, on the theory that absence belonged to
+    The full truth table, at **both** entry points (the hole moved between rounds 3, 4 and
+    5 because only part of it was ever enumerated):
+
+    ==========  ==========================  ==================================
+    enabled     what is at the path         result
+    ==========  ==========================  ==================================
+    true        nothing (ENOENT)            AllowlistError, filesystem
+    true        a valid file                loaded
+    true        an invalid file             AllowlistError, content
+    true        anything else / stat fails  AllowlistError, filesystem
+    false       nothing (ENOENT)            ``None`` -- the one skip
+    false       a valid file                loaded
+    false       an invalid file             AllowlistError, content
+    false       anything else / stat fails  AllowlistError, filesystem
+    ==========  ==========================  ==================================
+
+    So ``enabled`` buys exactly one thing: permission for the file to be *absent*. It
+    never excuses a directory, a dangling symlink, an unreadable file or malformed
+    content. An absent allowlist while ``enabled`` is true is a hard startup failure
+    (round 4) -- it used to skip here too, on the theory that absence belonged to
     ``_verify_referenced_files``, but that function only runs inside
     ``verify_environment()``, so ``questions fetch`` started clean with an enabled social
     config and no allowlist at all.
 
-    The enabled-and-absent raise is delegated to ``load_allowlist`` rather than built
-    here: its ``OSError`` branch already yields a sanitized, ``from None``-chained,
-    ``is_filesystem_error=True`` error, and its ``strerror`` stays accurate across every
-    case ``is_file()`` collapses into one answer -- absent, a directory, a dangling
-    symlink, unreadable.
+    Every raise is delegated to ``load_allowlist`` rather than built here: its ``OSError``
+    branch already yields a sanitized, ``from None``-chained, ``is_filesystem_error=True``
+    error whose ``strerror`` names the actual condition.
     """
     social = config.retrieval.social
     path = social.account_allowlist_path
-    if not social.enabled and not path.is_file():
+    if not social.enabled and _nothing_exists_at(path):
         return None
     return load_allowlist(path)
 

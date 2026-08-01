@@ -31,7 +31,11 @@ this module satisfies is "non-empty domains", not "domains drawn from a closed s
 Error hygiene matches every other module: :class:`AllowlistError` never echoes stored/file/field
 values, and :func:`load_allowlist` renders only the *path* it was given (the carve-out this
 project applies uniformly to filesystem paths, alongside ``config.py``, ``ledger.py``,
-``metaculus/snapshots.py``, ``prompt.py`` and ``env_verify.py``).
+``metaculus/snapshots.py``, ``prompt.py`` and ``env_verify.py``). That extends to a validation
+error's *location*, not just its input: under ``extra="forbid"`` the location of an unexpected
+key **is** that key, so a part of ``loc`` survives only if the schema authored it -- a declared
+field name, or an index under a list-valued field. An ``int`` is not self-evidently an index;
+see :func:`_sanitize`.
 
 :class:`AllowlistError` also carries ``is_filesystem_error``, set only when the file could not
 be read at all. Everything else raised here -- bad UTF-8, malformed YAML, a schema violation --
@@ -44,7 +48,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_origin
 
 import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -146,14 +150,42 @@ _WITHHELD = "<withheld>"
 # are allowed through; nothing else is.
 _KNOWN_FIELDS = set(_AllowlistFile.model_fields) | set(AllowlistEntry.model_fields)
 
+# The list-valued fields, derived rather than restated: a hardcoded {"accounts", "domains"}
+# drifts the moment a field is added, and this set decides what gets *rendered*. Derived by
+# annotation, so a later ``list[str] | None`` field (origin UnionType, not list) drops out
+# and its indices are withheld -- over-redacting, which is the fail-safe direction.
+_SEQUENCE_FIELDS = {
+    name
+    for model in (_AllowlistFile, AllowlistEntry)
+    for name, info in model.model_fields.items()
+    if get_origin(info.annotation) is list
+}
+
 
 def _sanitize(exc: ValidationError) -> AllowlistError:
+    """Render a ValidationError with every file-controlled fragment removed.
+
+    An ``int`` in ``loc`` is a list index only when the part before it names a list-valued
+    field. Anywhere else it is a *mapping key lifted from the file*: pydantic's
+    ``invalid_key`` error sets ``loc`` to the key itself, and an unquoted numeric YAML key
+    parses as an int, so ``987654321: x`` used to be echoed verbatim by a sanitizer that
+    trusted every int as an index (round-5 review finding 1). Withholding all ints would
+    close it too, but ``accounts.<withheld>.username`` cannot be acted on against a
+    46-entry file, and the index is schema-authored, not content.
+
+    String parts need no such positional test: a key that is not a declared field name is
+    withheld outright, which already covers ``extra="forbid"`` reporting an unknown key.
+    """
     problems = []
     for err in exc.errors(include_input=False, include_url=False):
-        parts = [
-            str(part) if isinstance(part, int) or part in _KNOWN_FIELDS else _WITHHELD
-            for part in err["loc"]
-        ]
+        parts: list[str] = []
+        previous: str | int = ""
+        for part in err["loc"]:
+            if isinstance(part, int):
+                parts.append(str(part) if previous in _SEQUENCE_FIELDS else _WITHHELD)
+            else:
+                parts.append(part if part in _KNOWN_FIELDS else _WITHHELD)
+            previous = part
         location = ".".join(parts) or "<root>"
         problems.append(f"{location}: {err['msg']}")
     return AllowlistError(problems)

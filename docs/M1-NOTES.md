@@ -874,5 +874,74 @@ rather than an inline lambda: hypothesis prints the strategy's callable in every
 deletes. Its merge conflicts here; resolve by dropping the added block and pointing its test
 imports at `research.exa`.
 
+**Round-6 cross-model review fixes.** (This file numbers *fix* rounds; the commit messages number
+the *review* round that raised the findings, so this section is `close round-5 review findings` in
+the log. The two sequences have been one apart since the round-2/3 section and are left that way
+rather than renumbering shipped history.) Two blocking findings, both reproduced first.
+
+*1 — `_sanitize` leaked integer YAML keys.* It rendered every `int` in a pydantic `loc` tuple as
+if it were a list index. But under `extra="forbid"` the location of an unexpected key **is** that
+key, and pydantic's `invalid_key` error puts it in `loc` — so an unquoted numeric key, which YAML
+parses as an `int`, came straight back out: `987654321: Keys should be strings`, and
+`accounts.0.424242: ...` for the nested case. A digits-only value is exactly the shape of an
+account id or a numeric token, so this is the leak rule's own failure mode, not a technicality.
+Fixed by making the discrimination positional: an `int` renders only when the preceding `loc` part
+names a list-valued field, tracked in `_SEQUENCE_FIELDS` — derived from each model's `model_fields`
+annotations (`get_origin(...) is list`) rather than hardcoded as `{"accounts", "domains"}`, so a
+field added later cannot silently start rendering, and a later `list[str] | None` (origin
+`UnionType`) drops out and over-redacts, which is the fail-safe direction. Withholding *every* int
+would also close the finding and was rejected: `accounts.<withheld>.username` cannot be acted on
+against a 46-entry file, and an index under a list field is schema-authored, not file content.
+String parts need no positional test — a part that is not a declared field name is withheld
+outright, which already covered unknown *string* keys.
+
+*2 — the startup skip was `Path.is_file()`, which answers False for far more than absence.* The
+contract is "skip only when social is disabled *and* the file is absent", but `is_file()` returns
+False for a directory, a dangling symlink and any stat failure exactly as it does for a missing
+file — so with the committed default (`enabled: false`), an `account_allowlist_path` pointing at a
+directory, at a broken symlink, or inside an unsearchable parent started clean at both entry
+points. Fixed with `_nothing_exists_at()`: `os.lstat`, and only `FileNotFoundError` counts as
+absence. `lstat` not `stat` on purpose — a dangling symlink *is* an object at the configured path,
+and following it would relabel an operator's broken link as "optional file not present". Every
+other condition falls through to `load_allowlist`, whose `OSError` branch already yields a
+sanitized, `from None`-chained, `is_filesystem_error=True` error carrying the real `strerror`.
+
+The docstring now carries the full eight-row truth table, and — because this hole has moved in
+three consecutive rounds (round 3: enabled-and-malformed; round 4: enabled-and-absent; round 5:
+disabled-and-not-a-regular-file), each round having tested only the case it had just been shown —
+the table is now enumerated mechanically in `tests/unit/test_env_verify.py` at **both** entry
+points (`verify_environment` and `cli._load_verified_config`), with "anything else" expanded into
+the three shapes that reach it. `enabled` buys exactly one thing: permission for the file to be
+*absent*. The named regression tests are kept alongside it; they carry the *why*, the table carries
+the completeness.
+
+Two test-rigor defects found while checking those fixes, both in the same class as the round-5
+property lessons above:
+
+- The new non-string-key property was written as `try: ... except AllowlistError:` with no
+  assertion on the non-raising path, so any draw that validated would have passed while proving
+  nothing. Now `pytest.raises`; every key shape it draws (int, float, bool, `None`, date) is in
+  fact rejected as `invalid_key`, so a passing validation is a schema regression, not a case to
+  skip.
+- `test_disabled_social_with_missing_allowlist_is_not_a_problem` asserted the skip is silent with
+  `"allowlist" not in report.render()` — but every path line in the render contains `tmp_path`,
+  which pytest names after the test, and this one passes only because pytest truncates the name to
+  30 characters *before* reaching "allowlist". Copying the assertion into a shorter-named test
+  failed immediately. All of these now key on the check's own wording (`loads clean`, and the
+  loader's `invalid account allowlist` prefix) rather than on a word that a temp path can supply.
+
+Every test added this round was re-run against the pre-fix `src/` and **fails** there — including
+all three disabled/non-regular rows of the new table at both entry points. The `enabled` rows pass
+pre-fix, correctly: the guard short-circuited on `enabled`, so that half of the table was already
+right.
+
+Non-blocking, and answered rather than changed: deleting the `research/__init__.py` re-exports does
+break a hypothetical external `from whiskeyjack_bot.research import ResearchDocument`. Nothing in
+`src/` or `tests/` imports from the package, the package is not published, and a
+one-line-docstring `__init__.py` is what CLAUDE.md's conventions prescribe — a compatibility shim
+would reinstate the import coupling the finding was about. The PR description was also stale
+(still describing the check as gated on `retrieval.social.enabled`, which round 3 made false) and
+has been rewritten.
+
 No migration, no new dependency, no `docs/TRACKS.md` change (already claimed with `none`/`no`),
 no wiring into M1-307 (doesn't exist yet on this branch).

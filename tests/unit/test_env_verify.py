@@ -2,20 +2,24 @@
 non-zero on invalid live-submit settings, and never echoes a secret value."""
 
 import copy
+import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import yaml
 
-from whiskeyjack_bot.cli import main
+from whiskeyjack_bot.cli import _load_verified_config, main
 from whiskeyjack_bot.env_verify import (
     EXIT_CONFIG_INVALID,
     EXIT_ENV_MISSING,
     EXIT_OK,
     verify_environment,
 )
+from whiskeyjack_bot.research.allowlist import AllowlistError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -245,7 +249,245 @@ def test_disabled_social_with_missing_allowlist_is_not_a_problem(
 
     report = verify_environment(social)
     assert report.exit_code == EXIT_OK
-    assert not any("allowlist" in line for line in report.render().splitlines())
+    # The check's own wording: "allowlist" alone would also match tmp_path, which pytest
+    # names after the test -- this one survives only because pytest truncates it first.
+    assert not any("loads clean" in c for c in report.checks_passed), report.checks_passed
+    assert report.config_problems == []
+    assert report.filesystem_problems == []
+
+
+def _config_with_allowlist(
+    tmp_path: Path, config_file: Path, allowlist_path: Path, *, name: str, enabled: bool = False
+) -> Path:
+    """A copy of the valid config pointing at allowlist_path, social off unless asked.
+
+    The committed default is off, so that is the default here too -- an enabled variant
+    also needs agent_model, which config validation requires alongside it.
+    """
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    assert data["retrieval"]["social"]["enabled"] is False
+    data["retrieval"]["social"]["account_allowlist_path"] = str(allowlist_path)
+    if enabled:
+        data["retrieval"]["social"]["enabled"] = True
+        data["retrieval"]["social"]["agent_model"] = "grok-fixture"
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path
+
+
+# --- disabled social, path present but not a readable file (round-5 review finding 2) ---
+#
+# The skip is documented as "disabled *and* absent", but it was written with
+# Path.is_file(), which answers False for a directory, a dangling symlink and a stat
+# failure just as it does for a missing file -- so each of those started clean.
+
+
+@pytest.mark.parametrize("kind", ["directory", "dangling_symlink"])
+def test_disabled_social_with_a_non_regular_allowlist_path_is_a_filesystem_problem(
+    kind: str, tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Something exists at the configured path and it cannot be loaded: that is a real
+    misconfiguration, and only true absence is the optional-file case."""
+    set_all_env(monkeypatch)
+    target = tmp_path / f"accounts_{kind}"
+    if kind == "directory":
+        target.mkdir()
+    else:
+        target.symlink_to(tmp_path / "no-such-target.yaml")
+
+    report = verify_environment(
+        _config_with_allowlist(tmp_path, config_file, target, name=f"{kind}.yaml")
+    )
+    assert report.exit_code == EXIT_ENV_MISSING
+    assert any("allowlist" in p for p in report.filesystem_problems)
+    assert report.config_problems == []
+
+
+def test_disabled_social_with_an_unsearchable_allowlist_parent_is_a_filesystem_problem(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stat failure is not evidence of absence. Under the old is_file() guard the
+    permission error was swallowed and startup reported OK."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory permission bits this test relies on")
+    set_all_env(monkeypatch)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    target = locked / "accounts.yaml"
+    target.write_text("accounts: []\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        report = verify_environment(
+            _config_with_allowlist(tmp_path, config_file, target, name="locked.yaml")
+        )
+        assert report.exit_code == EXIT_ENV_MISSING
+        assert any("allowlist" in p for p in report.filesystem_problems)
+    finally:
+        locked.chmod(0o700)
+
+
+def test_second_entry_point_also_rejects_a_non_regular_allowlist_path(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cli._load_verified_config is the boundary every other command goes through, and it
+    is where the round-3 and round-4 regressions actually landed -- verify-env was fine
+    both times. Assert the truth table at both entry points, not one."""
+    set_all_env(monkeypatch)
+    directory = tmp_path / "accounts_dir"
+    directory.mkdir()
+    social = _config_with_allowlist(tmp_path, config_file, directory, name="cli-dir.yaml")
+
+    with pytest.raises(AllowlistError) as excinfo:
+        _load_verified_config(social)
+    assert excinfo.value.is_filesystem_error is True
+
+    # And the case that must stay silent: nothing at the path at all.
+    absent = _config_with_allowlist(
+        tmp_path, config_file, tmp_path / "no-such-accounts.yaml", name="cli-absent.yaml"
+    )
+    assert _load_verified_config(absent) is not None
+
+
+# --- the whole truth table, at both entry points ---
+#
+# The hole in load_and_verify_account_allowlist moved in rounds 3, 4 and 5 (enabled-and-
+# malformed, then enabled-and-absent, then disabled-and-not-a-regular-file) because each
+# round tested the case it had just been shown. The rows below are the docstring's table
+# enumerated mechanically, with "anything else" expanded into the three shapes that reach
+# it, so a future change to the guard is checked against the whole contract rather than
+# against the last reported symptom. Overlap with the named regression tests above is
+# deliberate: those carry the *why*, this carries the completeness.
+
+_PATH_KINDS = ("absent", "valid", "invalid", "directory", "dangling_symlink", "unsearchable_parent")
+
+# (enabled, path kind) -> outcome. "enabled" buys exactly one thing: permission for the
+# file to be absent. It never excuses a directory, a dangling symlink, an unreachable file
+# or malformed content.
+_TRUTH_TABLE = [
+    (enabled, kind, _expected)
+    for enabled in (True, False)
+    for kind, _expected in (
+        ("absent", "filesystem" if enabled else "skipped"),
+        ("valid", "loaded"),
+        ("invalid", "config"),
+        ("directory", "filesystem"),
+        ("dangling_symlink", "filesystem"),
+        ("unsearchable_parent", "filesystem"),
+    )
+]
+
+
+@contextmanager
+def _allowlist_at(tmp_path: Path, kind: str) -> Iterator[Path]:
+    """Materialize one column of the table and clean up after it."""
+    real = (REPO_ROOT / "config" / "x_accounts.yaml").read_text(encoding="utf-8")
+    if kind == "absent":
+        yield tmp_path / "no-such-accounts.yaml"
+        return
+    if kind == "valid":
+        target = tmp_path / "valid_accounts.yaml"
+        target.write_text(real, encoding="utf-8")
+        yield target
+        return
+    if kind == "invalid":
+        # A real, otherwise-valid copy with a case-insensitive duplicate username.
+        data = yaml.safe_load(real)
+        data["accounts"].append(dict(data["accounts"][0]))
+        target = tmp_path / "invalid_accounts.yaml"
+        target.write_text(yaml.safe_dump(data), encoding="utf-8")
+        yield target
+        return
+    if kind == "directory":
+        target = tmp_path / "accounts_dir"
+        target.mkdir()
+        yield target
+        return
+    if kind == "dangling_symlink":
+        target = tmp_path / "accounts_link.yaml"
+        target.symlink_to(tmp_path / "no-such-target.yaml")
+        yield target
+        return
+    assert kind == "unsearchable_parent", kind
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory permission bits this case relies on")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    target = locked / "accounts.yaml"
+    target.write_text(real, encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        yield target
+    finally:
+        locked.chmod(0o700)
+
+
+@pytest.mark.parametrize(("enabled", "kind", "expected"), _TRUTH_TABLE)
+def test_allowlist_truth_table_at_verify_env(
+    enabled: bool,
+    kind: str,
+    expected: str,
+    tmp_path: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_all_env(monkeypatch)
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
+    with _allowlist_at(tmp_path, kind) as allowlist_path:
+        report = verify_environment(
+            _config_with_allowlist(
+                tmp_path, config_file, allowlist_path, name="table.yaml", enabled=enabled
+            )
+        )
+
+    if expected == "loaded":
+        assert report.exit_code == EXIT_OK, report.render()
+        assert any("loads clean" in c for c in report.checks_passed), report.checks_passed
+    elif expected == "skipped":
+        assert report.exit_code == EXIT_OK, report.render()
+        # Silent, not merely non-fatal: no line at all, not even a passing one. Keyed on
+        # the check's own wording, not on "allowlist" appearing anywhere in the render --
+        # every path line carries tmp_path, whose name is derived from this test's name.
+        assert not any("loads clean" in c for c in report.checks_passed), report.checks_passed
+        assert report.config_problems == []
+        assert report.filesystem_problems == []
+    elif expected == "config":
+        assert report.exit_code == EXIT_CONFIG_INVALID, report.render()
+        # The loader's own prefix, not a bare "allowlist": the reported path lives under
+        # tmp_path, which pytest names after this test.
+        assert any(p.startswith("invalid account allowlist") for p in report.config_problems)
+        assert report.filesystem_problems == []
+    else:
+        assert report.exit_code == EXIT_ENV_MISSING, report.render()
+        assert report.config_problems == []
+        # One problem, not two: only the loader reports the path.
+        assert len(report.filesystem_problems) == 1, report.filesystem_problems
+        assert report.filesystem_problems[0].startswith("invalid account allowlist")
+
+
+@pytest.mark.parametrize(("enabled", "kind", "expected"), _TRUTH_TABLE)
+def test_allowlist_truth_table_at_the_cli_boundary(
+    enabled: bool,
+    kind: str,
+    expected: str,
+    tmp_path: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cli._load_verified_config is where the round-3 and round-4 regressions actually
+    landed -- verify-env was fine both times. It discards the loaded allowlist, so the
+    observable here is raise-or-not plus the classification the CLI maps to an exit code."""
+    set_all_env(monkeypatch)
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
+    with _allowlist_at(tmp_path, kind) as allowlist_path:
+        config_path = _config_with_allowlist(
+            tmp_path, config_file, allowlist_path, name="table-cli.yaml", enabled=enabled
+        )
+        if expected in ("loaded", "skipped"):
+            assert _load_verified_config(config_path) is not None
+            return
+        with pytest.raises(AllowlistError) as excinfo:
+            _load_verified_config(config_path)
+    assert excinfo.value.is_filesystem_error is (expected == "filesystem")
 
 
 def test_missing_prompt_file_is_reported(
