@@ -39,6 +39,7 @@ from whiskeyjack_bot.lifecycle import (
     LifecycleEventType,
     LifecycleStatus,
     SubmissionAttempt,
+    SubmissionVerification,
     current_status,
     read_history,
     record_approval,
@@ -281,6 +282,78 @@ def test_a_hostile_attempt_subclass_raises_only_lifecycle_error(
         assert not conn.in_transaction
 
 
+@given(
+    attempt_id=ANYTHING,
+    outcome=st.sampled_from(["confirmed", "absent"]) | ANYTHING,
+    observed_at=st.just(WHEN) | ANYTHING,
+    snapshot=st.none() | ANYTHING,
+    detail_code=st.none() | st.sampled_from(FAILURE_CODES) | ANYTHING,
+)
+@settings(max_examples=60, deadline=None)
+def test_the_verification_writer_raises_only_lifecycle_error(
+    attempt_id: object,
+    outcome: object,
+    observed_at: object,
+    snapshot: object,
+    detail_code: object,
+) -> None:
+    """The round-3 writer, held to the same bar as the two before it.
+
+    Its first act is a query the *caller's* text goes into (`_require_verifiable_attempt`),
+    and its second is a two-row write -- so both the reader and the rollback path see fuzzed
+    input, and neither may raise anything but a LifecycleError or leave a transaction open.
+    """
+    with _ledger() as (conn, valid_id):
+        verification = SubmissionVerification(
+            submission_attempt_id=attempt_id,  # type: ignore[arg-type]
+            outcome=outcome,  # type: ignore[arg-type]
+            observed_at_utc=observed_at,  # type: ignore[arg-type]
+            refetched_forecast_snapshot=snapshot,  # type: ignore[arg-type]
+        )
+        try:
+            lifecycle.record_submission_verification(
+                conn,
+                record_id=valid_id,
+                verification=verification,
+                occurred_at=WHEN,
+                detail_code=detail_code,  # type: ignore[arg-type]
+            )
+        except LifecycleError:
+            pass
+        assert not conn.in_transaction
+
+
+class HostileVerification(SubmissionVerification):
+    """The subclass trick against the writer that reads a verification between two writes."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name in ("outcome", "observed_at_utc", "refetched_forecast_snapshot"):
+            raise RuntimeError(PLANTED_SECRET)
+        return object.__getattribute__(self, name)
+
+
+@given(field_values=st.lists(ANYTHING, min_size=4, max_size=4))
+@settings(max_examples=60, deadline=None)
+def test_a_hostile_verification_subclass_raises_only_lifecycle_error(
+    field_values: list[object],
+) -> None:
+    with _ledger() as (conn, valid_id):
+        verification = HostileVerification(
+            submission_attempt_id=field_values[0],  # type: ignore[arg-type]
+            outcome=field_values[1],  # type: ignore[arg-type]
+            observed_at_utc=field_values[2],  # type: ignore[arg-type]
+            refetched_forecast_snapshot=field_values[3],  # type: ignore[arg-type]
+        )
+        try:
+            lifecycle.record_submission_verification(
+                conn, record_id=valid_id, verification=verification, occurred_at=WHEN
+            )
+        except LifecycleError as exc:
+            assert PLANTED_SECRET not in str(exc)
+            assert PLANTED_SECRET not in "".join(traceback.format_exception(exc))
+        assert not conn.in_transaction
+
+
 @given(record_id=ANYTHING)
 @settings(max_examples=60, deadline=None)
 def test_the_readers_raise_only_lifecycle_error(record_id: object) -> None:
@@ -297,6 +370,16 @@ def test_the_readers_raise_only_lifecycle_error(record_id: object) -> None:
 # --------------------------------------------------------------------------------------
 
 
+# The one rule the transition table cannot express, because it turns on the record's
+# history rather than on its current status: an unresolved uncertain submission blocks
+# every further attempt, and the refetch's own two events exist only once there is an
+# uncertainty for them to resolve. Both directions are enforced by the migration, so a
+# walk that ignored them would be rejected by the database and the fuzzer would be testing
+# its own generator.
+_AFTER_UNCERTAINTY = frozenset({"submission_confirmed", "submission_disconfirmed"})
+_BLOCKED_WHILE_UNCERTAIN = frozenset({"submitted", "submission_uncertain", "submission_failed"})
+
+
 @st.composite
 def legal_walks(draw: st.DrawFn) -> tuple[tuple[str, str, str], ...]:
     """A random walk of legal transitions starting from ``draft``.
@@ -305,17 +388,20 @@ def legal_walks(draw: st.DrawFn) -> tuple[tuple[str, str, str], ...]:
     machine is fuzzed the day it is added.
     """
     status = "draft"
+    uncertain = False
     walk: list[tuple[str, str, str]] = []
     for _ in range(draw(st.integers(min_value=0, max_value=8))):
+        blocked = _BLOCKED_WHILE_UNCERTAIN if uncertain else _AFTER_UNCERTAINTY
         options = sorted(
             (event_type, to_status)
             for (event_type, from_status), to_status in lifecycle._DESTINATIONS.items()
-            if from_status == status
+            if from_status == status and event_type not in blocked
         )
         if not options:
             break
         event_type, to_status = draw(st.sampled_from(options))
         walk.append((event_type, status, to_status))
+        uncertain = uncertain or event_type == "submission_uncertain"
         status = to_status
     return tuple(walk)
 
@@ -344,6 +430,47 @@ def test_the_derived_status_is_the_fold_over_the_event_sequence(
         # order is what makes the fold above well defined.
         assert [event.event_seq for event in history] == list(range(1, len(walk) + 1))
         assert [event.event_type for event in history] == [step[0] for step in walk]
+
+
+@given(walk=legal_walks())
+@settings(max_examples=100, deadline=None)
+def test_no_detail_row_backs_more_than_one_event(
+    walk: tuple[tuple[str, str, str], ...],
+) -> None:
+    """Round 3, finding 2, as a property rather than as the one example that reproduced it.
+
+    The reproduction was two `rejected` events citing one approval decision, but the claim
+    is about every link column at once: a lifecycle history is a sequence of distinct
+    facts, and two events resting on one detail row means the log counts a thing that
+    happened once as having happened twice.
+
+    Worth stating over walks rather than trusting the indexes: this property is what makes
+    the fixture's own shortcut visible. Reusing a stored approval row for a second
+    rejection is precisely what the writer must not do either, and the first run of this
+    file after the index landed failed here, in the fixture.
+    """
+    links = (
+        "approval_event_id",
+        "submission_attempt_id",
+        "submission_verification_id",
+        "resolution_event_id",
+        "score_event_id",
+    )
+    with _ledger(validated=False) as (conn, record_id):
+        detail = _detail_rows(conn, record_id)
+        for index, (event_type, from_status, to_status) in enumerate(walk, start=1):
+            _insert_event(conn, record_id, index, event_type, from_status, to_status, detail)
+
+        for link in links:
+            cited = [
+                row[0]
+                for row in conn.execute(
+                    f"SELECT {link} FROM lifecycle_events WHERE forecast_record_id = ? "
+                    f"AND {link} IS NOT NULL",
+                    (record_id,),
+                )
+            ]
+            assert len(cited) == len(set(cited)), link
 
 
 @given(walk=legal_walks())
@@ -407,6 +534,7 @@ def test_events_survive_the_persisted_json_form_unchanged(
         detail_code=None,
         approval_event_id=None,
         submission_attempt_id=attempt_id,
+        submission_verification_id=None,
         resolution_event_id=None,
         score_event_id=None,
         occurred_at_utc=occurred,
@@ -485,22 +613,38 @@ def test_a_rejected_value_never_reaches_a_validator_message(value: object) -> No
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("guarded", ["approved", "submitted"])
-def test_a_guarded_state_is_unreachable_without_its_own_event(guarded: str) -> None:
+@pytest.mark.parametrize(
+    ("guarded", "recording_events"),
+    [
+        ("approved", ("approved",)),
+        # Two events mean "this forecast is on the platform": the attempt that posted and
+        # was confirmed on the spot, and the refetch that confirmed one left uncertain.
+        ("submitted", ("submitted", "submission_confirmed")),
+    ],
+)
+def test_a_guarded_state_is_unreachable_without_its_own_event(
+    guarded: str, recording_events: tuple[str, ...]
+) -> None:
     """Exhaustive over the graph, not sampled.
 
-    Breadth-first from ``draft`` over every legal transition *except* the one that names
+    Breadth-first from ``draft`` over every legal transition *except* the ones that record
     the guarded state. If the state is still reachable, then some other event can produce
     it and "an approved state always has an approval event" is false. Because a record is
     born a ``draft`` and the schema admits no other way to change its status, this
     settles the acceptance criterion for the state machine as a whole.
+
+    ``recording_events`` is written out rather than derived from ``_DESTINATIONS``, and
+    that is the point: deriving it would remove every edge into the state and make the
+    result vacuous. Spelled out, a future event type that reaches ``submitted`` fails this
+    test until someone decides deliberately that it belongs on the list -- which is how
+    round 3's `submission_confirmed` got there.
     """
     reachable = {"draft"}
     queue = deque(["draft"])
     while queue:
         status = queue.popleft()
         for (event_type, from_status), to_status in lifecycle._DESTINATIONS.items():
-            if from_status != status or event_type == guarded:
+            if from_status != status or event_type in recording_events:
                 continue
             if to_status not in reachable:
                 reachable.add(to_status)
@@ -660,6 +804,17 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
         "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
         (record_id, TS),
     ).lastrowid
+    # What a refetch of the uncertain attempt could have seen. Storable up front: the
+    # verification table only requires its attempt to exist, and it is the *link* that
+    # requires the uncertainty.
+    verifications = {
+        f"verified_{outcome}": conn.execute(
+            "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+            "observed_at_utc, created_at_utc) VALUES (?, ?, ?, ?)",
+            (attempts["att_unsure"], outcome, TS, TS),
+        ).lastrowid
+        for outcome in ("confirmed", "absent")
+    }
     return {
         "approved": approved,
         "rejected": rejected,
@@ -668,6 +823,7 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
         "att_bad": attempts["att_bad"],
         "resolved": resolution,
         "scored": score,
+        **verifications,
     }
 
 
@@ -683,26 +839,39 @@ def _insert_event(
     links: dict[str, object] = {
         "approval_event_id": None,
         "submission_attempt_id": None,
+        "submission_verification_id": None,
         "resolution_event_id": None,
         "score_event_id": None,
     }
     if event_type in ("approved", "rejected"):
-        links["approval_event_id"] = detail[event_type]
+        # A fresh decision per event, not the one _detail_rows made. `rejected` is a
+        # self-transition, so a walk can hold several -- and since round 3 a detail row may
+        # back only one event, which is the truthful shape anyway: two rejections are two
+        # decisions, each with its own actor, note and timestamp.
+        links["approval_event_id"] = conn.execute(
+            "INSERT INTO approval_events (forecast_record_id, decision, actor, "
+            "forecast_sha256, created_at_utc) VALUES (?, ?, 'chris', ?, ?)",
+            (record_id, event_type, SHA, TS),
+        ).lastrowid
     elif event_type == "submitted":
         links["submission_attempt_id"] = detail["att_ok"]
     elif event_type == "submission_uncertain":
         links["submission_attempt_id"] = detail["att_unsure"]
     elif event_type == "submission_failed":
         links["submission_attempt_id"] = detail["att_bad"]
+    elif event_type == "submission_confirmed":
+        links["submission_verification_id"] = detail["verified_confirmed"]
+    elif event_type == "submission_disconfirmed":
+        links["submission_verification_id"] = detail["verified_absent"]
     elif event_type == "resolved":
         links["resolution_event_id"] = detail["resolved"]
     elif event_type == "scored":
         links["score_event_id"] = detail["scored"]
     conn.execute(
         "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
-        "to_status, detail_code, approval_event_id, submission_attempt_id, resolution_event_id, "
-        "score_event_id, occurred_at_utc, created_at_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "to_status, detail_code, approval_event_id, submission_attempt_id, "
+        "submission_verification_id, resolution_event_id, score_event_id, occurred_at_utc, "
+        "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record_id,
             seq,
@@ -716,6 +885,7 @@ def _insert_event(
             ),
             links["approval_event_id"],
             links["submission_attempt_id"],
+            links["submission_verification_id"],
             links["resolution_event_id"],
             links["score_event_id"],
             TS,

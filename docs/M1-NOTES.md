@@ -778,20 +778,27 @@ And twice more in round 2, for the same reason:
 
 ### Delivered
 
-- `src/whiskeyjack_bot/migrations/003_lifecycle_events.sql` — twenty triggers: the state
-  machine, the draft-only, hash-binding and submission-receipt insert guards, fourteen
-  append-only blocks and two evidence identity pins. Plus `lifecycle_events` (the ordered spine,
-  `UNIQUE (forecast_record_id, event_seq)`), `forecast_records.forecast_sha256`, and an upgrade
+- `src/whiskeyjack_bot/migrations/003_lifecycle_events.sql` — twenty-three triggers: the state
+  machine, the draft-only, hash-binding and two receipt insert guards, sixteen append-only blocks
+  and two evidence identity pins. Plus `lifecycle_events` (the ordered spine,
+  `UNIQUE (forecast_record_id, event_seq)` and a partial unique index on each of its five detail
+  links), `submission_verifications`, `forecast_records.forecast_sha256`, and an upgrade
   precondition that refuses a ledger holding a non-draft record. `LEDGER_SCHEMA_VERSION` 2 → 3.
 - `src/whiskeyjack_bot/ledger.py` — `connect()` also sets and verifies
   `PRAGMA recursive_triggers = ON`, without which none of the above holds; see the round-1 section.
 - `src/whiskeyjack_bot/lifecycle.py` — the `Literal` vocabularies, `_LEGAL_TRANSITIONS`,
-  `LifecycleError`, the `LifecycleEvent`/`SubmissionAttempt` value objects, a nesting-safe
-  `transaction()`, `current_status()`/`read_history()`, and four writers: `record_validation`,
-  `record_failure`, `record_approval`, `record_submission_attempt`.
-- `tests/unit/test_lifecycle.py` (145 tests) and `tests/property/test_lifecycle_properties.py`
-  (14, ~12s: one ledger for the session with a fresh record per example, because a database
+  `LifecycleError`, the `LifecycleEvent`/`SubmissionAttempt`/`SubmissionVerification` value
+  objects, a nesting-safe `transaction()`, `current_status()`/`read_history()`, and five writers:
+  `record_validation`, `record_failure`, `record_approval`, `record_submission_attempt`,
+  `record_submission_verification`.
+- `tests/unit/test_lifecycle.py` (176 tests) and `tests/property/test_lifecycle_properties.py`
+  (17, ~15s: one ledger for the session with a fresh record per example, because a database
   per example put the file past two minutes).
+
+003 was edited in place through three review rounds rather than superseded, so
+`LEDGER_SCHEMA_VERSION` stays 3 and its checksum changed with it. A database migrated from an
+earlier cut of the branch therefore fails `ledger.py`'s checksum-drift check by design; nothing on
+master has ever been at version 3, so the affected population is local scratch databases.
 
 ### Decision — approval binds to a stored hash, enforced by the database
 
@@ -862,6 +869,11 @@ Total and disjoint, so every attempt still has exactly one legal event — and t
 disagreeing is now its own outcome rather than a failure. `detail_code` (`refetch_mismatch`,
 `refetch_missing`, `timeout`, `http_error`) carries which case.
 
+Round 3 added the exits, which round 2's fix described but could not record: an uncertain record
+stays `approved` and *only* a `submission_verifications` row moves it, to `submitted` or to
+terminal `failed`. Until one does, no further attempt is accepted. See round 3, finding 1 — the
+partition above is unchanged, including `(False, True)`.
+
 ### Decision — no `phase` column, and no free text on the event row
 
 Every event type names its own pipeline phase (`submission_failed` happens at submission), so a
@@ -872,18 +884,22 @@ vocabulary, checked by the schema.
 There is deliberately no free-text column on `lifecycle_events` at all. A failure's
 provider-supplied text stays in `submission_attempts.error_message`/`response_body`, which the
 event row points at through a typed foreign key rather than copying. That is what lets a lifecycle
-history be logged and exported without a redaction pass. The detail link is four typed nullable
+history be logged and exported without a redaction pass. The detail link is five typed nullable
 FKs rather than a polymorphic `(related_table, related_id)` pair: a polymorphic pair cannot be a
 real foreign key and comparing it would mean `CAST`ing across SQLite's affinity rules — the trap
-002 documents for `posts_dropped_no_url`.
+002 documents for `posts_dropped_no_url`. Exactly one is set per event, which one is fixed by
+`event_type`, and since round 3 each of them backs **at most one** event.
 
 ### Decision — the transition table is written twice, and pinned
 
 `_LEGAL_TRANSITIONS` in Python and the trigger in SQL describe the same machine. The database is
 the enforcement; the Python table is the writer. `test_database_accepts_exactly_the_legal_
-transitions` drives all 392 `(event_type, from_status, to_status)` triples through the trigger
+transitions` drives all 539 `(event_type, from_status, to_status)` triples through the trigger
 against a record actually sitting in each `from_status`, inside a rolled-back savepoint, and
-asserts the accepted set equals `_LEGAL_TRANSITIONS` exactly. Drift between the two is the obvious
+asserts the accepted set equals `_LEGAL_TRANSITIONS` exactly. Since round 3 there are two records
+sitting in `approved` — one waiting on a refetch and one not — because the retry block means the
+two populations refuse opposite things; which record a triple is probed against is the only place
+that rule appears in the test, and the assertion is unchanged. Drift between the two is the obvious
 failure mode of duplicating a table, and it is the one thing no happy-path test would catch.
 
 ### `BEGIN IMMEDIATE`, and nesting
@@ -979,6 +995,15 @@ public writers can only ever test the writers. The invariants that matter here a
 and the tests that find holes in them are the ones that reach past the module with raw SQL — which
 is why the exhaustive transition test drives triples through the trigger rather than through
 `_append_event`, and why every fix in round 2 has a raw-SQL test beside its writer test.
+
+**Round 3 is the third variant, and the sharpest.** Finding 2 was reachable through the *public
+writers* — two rejections, both legal — and the suite still missed it, because no property said
+anything about a detail row being cited twice. The strategy was not the problem this time and
+neither was the layer; the invariant simply had not been written down. There is now a property over
+every legal walk asserting each link column's citations are distinct, and it earns its place
+immediately: the first run after the index landed failed inside the *fixture*, which had been
+reusing one stored approval row for every rejection — the same shortcut the schema now forbids the
+writer. A property that fails in the fixture is a property that was measuring the fixture.
 
 ### Decision — both readers answer an unknown record the same way
 
@@ -1165,6 +1190,82 @@ literal before any trigger sees `NEW`, so that row is correct rather than reject
 Two of the eight (2 and 4) were not on the PR as review threads; six were. Nothing was found that
 did not reproduce.
 
+### Round 3 review (GPT) — three findings, all reproduced
+
+Two P1 and one P2. All three landed in 003, which was still unmerged; the first of them could not
+have been deferred, because it needs new `event_type` members and SQLite cannot alter a CHECK
+constraint — adding one later means rebuilding an append-only table, which is the operation this
+whole item exists to make impossible.
+
+**1 (P1). An uncertain submission had no way out that was not a second live post.** Round 2's fix
+made the state non-terminal *so that* a later refetch could resolve it, and then gave the refetch
+nothing to write. `submission_attempts` is append-only, so the original attempt cannot be updated
+to say "confirmed after all", and 001 declares `idempotency_key` NOT NULL UNIQUE — so the only
+route to `submitted` was a second attempt row with a new key, which is a second live post. The test
+that certified the fix (`test_an_uncertain_submission_can_still_be_confirmed`) did exactly that,
+with `att-2`/`idem-2`: it asserted the workflow while performing the thing the workflow exists to
+prevent. Nothing about the retry was blocked either — the handoff's "block retry until refetch
+resolves state" was a promise M2-704 would have had to keep unaided.
+
+**Owner decision: record the observation, not a fake request.** `submission_verifications` is a new
+append-only table — the attempt it verifies, what it saw (`confirmed` / `absent`), when it was
+observed, and the snapshot it saw it in. It carries no `forecast_record_id`: the attempt already
+names one, and the link probe joins through it rather than storing a second copy of the same claim.
+Two new event types cite it, and they are the *refetch's* transitions rather than an attempt's:
+
+| outcome | event | transition |
+|---------|-------|------------|
+| `confirmed` | `submission_confirmed` | `approved → submitted` |
+| `absent` | `submission_disconfirmed` | `approved → failed` (terminal) |
+
+`absent` is terminal for the same reason a `(0, 0)` attempt is: the post is not there, and the
+retry is a new forecast version. And the retry block is now structural — while a record holds an
+uncertain event that no verification has resolved, **no further submission event is accepted at
+all**. A bare `EXISTS` in the trigger is exact rather than approximate: a resolved uncertainty has
+already carried the record to `submitted` or `failed`, and no submission event is legal from
+either, so the only rows the probe can see are unresolved ones.
+
+The verification vocabulary is deliberately two-valued. A refetch that could not be *performed*
+observed nothing, changes no state, and would be a detail row no event can cite; the uncertainty
+and its `detail_code` already record that the post is unconfirmed. That is a judgment call inside
+an immutable CHECK, and it is written down in the migration as one: if M2-704 needs failed check
+attempts recorded, they are telemetry and want their own table, not a third outcome meaning "no
+outcome".
+
+**`(success=0, verified=1)` stays uncertain (owner decision).** GPT read it as already
+refetch-confirmed. `success = 0` means no receipt, and the handoff's prohibited claims forbid
+saying a live call succeeded without one — so the stricter reading holds, and the confirming
+refetch now has an event of its own to be recorded as. The partition table above is unchanged.
+
+**2 (P1). One detail row could back several lifecycle events.** The link probes checked that a
+detail row belonged to this record and recorded this outcome, and never that it had not already
+been cited. Because `rejected` and `submission_uncertain` are self-transitions, two immutable
+events could rest on one approval decision or one attempt — a history showing a decision taken
+twice on the evidence of one row. Reproduced on both. Closed with a partial unique index on **each**
+of the five link columns, not only the two that were reachable: "not reachable today" is a fact
+about the current transition table, which M4-802 and M5-803 have yet to add to. An index rather
+than a probe, because a UNIQUE violation names the column and never a value, and because the
+constraint doubles as the foreign-key index these columns lacked. Note the consequence for
+`INSERT OR REPLACE`: each index is a new conflict target whose replacement DELETE must be caught by
+the append-only trigger, which is another thing `PRAGMA recursive_triggers` is load-bearing for —
+pinned by its own test.
+
+**3 (P2). Raw SQL could persist a reversed receipt.** `completed_at_utc >= requested_at_utc` was
+checked in the writer only — the one rule in this item enforced in a single layer, while the
+sibling test two functions away pins both layers for the NULL case. Reproduced with a completion a
+day before its request, permanent on an append-only table whose `requested_at_utc` is what an
+idempotency key is reasoned about against. The receipt trigger now compares them with `julianday`,
+preceded by a `typeof`/`julianday IS NULL` probe that is not a second rule but what makes the first
+one well defined: `julianday` returns NULL for what it cannot parse, and a NULL comparison is
+neither true nor false, so without it the ordering check silently would not fire on exactly the
+inputs that need it. It stops there on purpose — 001 pins no timestamp *format* anywhere, and
+pinning one on this table alone would make it the lone outlier. (A bare number is worth knowing
+about: SQLite reads `2451545` as a Julian day number, so it parses, as the year 2000, and is caught
+by the ordering probe instead. Its own test says so.)
+
+The same treatment went to the new table: a verification names an attempt this ledger holds and
+cannot have been observed before that attempt finished.
+
 ### Deferred (do not read the absence as an omission)
 
 - **Pre-forecast research and generation failures → M1-606.** Not an oversight and not a gap left
@@ -1187,8 +1288,11 @@ did not reproduce.
 - **M1-306** keeps its started-then-completed write shape on `research_runs`.
 - **M2-701** builds its commands on `record_approval`; the hash binding is already enforced.
 - **M2-704** cannot record a `submitted` state without a refetch-verified attempt row, and gets a
-  non-terminal `submission_uncertain` to park an unconfirmed post in while it blocks the retry.
-  Every attempt it records must carry `completed_at_utc`, and an `http_status` if there was one.
+  non-terminal `submission_uncertain` to park an unconfirmed post in. It does **not** have to
+  implement the retry block: the ledger refuses a further attempt while an uncertainty stands, and
+  `record_submission_verification` is the only way through. Every attempt it records must carry
+  `completed_at_utc`, and an `http_status` if there was one; a refetch it performs but that answers
+  nothing is not a ledger event.
 - **Operators** cannot upgrade a ledger holding a non-draft forecast record. Nothing has written
   one — M1-602 is the record writer and is unstarted — so the population is expected to be empty;
   if it is not, the ledger predates the guarantee and a fresh one is the honest answer.

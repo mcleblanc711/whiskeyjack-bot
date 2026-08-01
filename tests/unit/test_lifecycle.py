@@ -37,11 +37,13 @@ from whiskeyjack_bot.lifecycle import (
     LifecycleEventType,
     LifecycleStatus,
     SubmissionAttempt,
+    SubmissionVerification,
     current_status,
     read_history,
     record_approval,
     record_failure,
     record_submission_attempt,
+    record_submission_verification,
     record_validation,
     transaction,
 )
@@ -75,6 +77,7 @@ APPEND_ONLY_TABLES = (
     "lifecycle_events",
     "approval_events",
     "submission_attempts",
+    "submission_verifications",
     "resolution_events",
     "score_events",
 )
@@ -86,6 +89,7 @@ UPDATABLE_COLUMN = {
     "lifecycle_events": "occurred_at_utc",
     "approval_events": "note",
     "submission_attempts": "response_body",
+    "submission_verifications": "refetched_forecast_snapshot",
     "resolution_events": "outcome",
     "score_events": "comparison_baseline",
 }
@@ -155,6 +159,23 @@ def _attempt(
     )
 
 
+def _insert_attempt(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    attempt_id: str = "att-raw",
+    requested: object = TS,
+    completed: object = TS,
+) -> None:
+    """Write a `submission_attempts` row directly, bypassing the writer's validation."""
+    conn.execute(
+        "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
+        "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+        "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)",
+        (attempt_id, record_id, f"idem-{attempt_id}", requested, completed, PAYLOAD_SHA, TS),
+    )
+
+
 class HostileTimezone(tzinfo):
     """A `tzinfo` whose `utcoffset` raises, planting a secret in the message.
 
@@ -183,6 +204,15 @@ class HostileAttempt(SubmissionAttempt):
 
     def __getattribute__(self, name: str) -> object:
         if name == "idempotency_key":
+            raise RuntimeError(PLANTED_SECRET)
+        return object.__getattribute__(self, name)
+
+
+class HostileVerification(SubmissionVerification):
+    """The same trick against the verification writer, which has the same two writes."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "outcome":
             raise RuntimeError(PLANTED_SECRET)
         return object.__getattribute__(self, name)
 
@@ -257,6 +287,83 @@ def test_ledger_rows_can_be_neither_updated_nor_deleted(
         conn.execute(f"DELETE FROM {table}")
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(f"UPDATE {table} SET {UPDATABLE_COLUMN[table]} = ?", ("changed",))
+
+
+def test_one_approval_decision_cannot_back_two_lifecycle_events(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """Round 3, finding 2, at its most reachable point.
+
+    The link probes checked that a detail row belonged to this record and recorded this
+    decision, and never that it had not already been cited. `rejected` is
+    validated -> validated, so the second event satisfies every other constraint: the
+    history then shows two rejections on the evidence of one decision, immutably.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    approval_id = conn.execute(
+        "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+        "created_at_utc) VALUES (?, 'rejected', 'chris', ?, ?)",
+        (record_id, SHA, TS),
+    ).lastrowid
+
+    def cite(seq: int) -> None:
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, approval_event_id, occurred_at_utc, created_at_utc) "
+            "VALUES (?, ?, 'rejected', 'validated', 'validated', ?, ?, ?)",
+            (record_id, seq, approval_id, TS, TS),
+        )
+
+    cite(2)
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        cite(3)
+    assert len(read_history(conn, record_id)) == 2
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "approval_event_id",
+        "submission_attempt_id",
+        "submission_verification_id",
+        "resolution_event_id",
+        "score_event_id",
+    ],
+)
+def test_every_link_column_is_unique(ledger: sqlite3.Connection, link: str) -> None:
+    """The same rule for all five, and only one of them can be reproduced through it.
+
+    The approval case above is reachable because `rejected` is a self-transition. For the
+    other four the state machine refuses a second citation first -- an attempt's is now
+    blocked by the unresolved-uncertainty probe, and `resolved`/`scored`/a verification all
+    move the record somewhere no second event of that type is legal from. That makes those
+    four defence in depth, and defence in depth is exactly what "not reachable today"
+    warrants: it is a fact about the current transition table, which M4-802 and M5-803 have
+    yet to add to, and not a property of this table.
+
+    So the assertion is on the constraint rather than on a contrived path to it: asserting
+    a refusal that some *other* guard produces would be a test that passes whether or not
+    the index exists.
+    """
+    indexes = {
+        row["name"]: row
+        for row in ledger.execute("PRAGMA index_list('lifecycle_events')")
+        if row["unique"]
+    }
+    covering = {
+        name: [
+            column["name"]
+            for column in ledger.execute(f"PRAGMA index_info('{name}')")
+            if column["name"] is not None
+        ]
+        for name in indexes
+    }
+    assert [link] in covering.values(), f"no unique index on {link} alone"
+    name = next(key for key, columns in covering.items() if columns == [link])
+    # Partial: an unlinked event is the normal case, and there are far more of those than
+    # linked ones.
+    assert indexes[name]["partial"] == 1
 
 
 def test_an_event_must_name_a_forecast_record(draft: tuple[sqlite3.Connection, str]) -> None:
@@ -341,6 +448,40 @@ def test_replace_cannot_overwrite_a_row_through_a_secondary_unique_key(
         _replace_row(conn, "submission_attempts", attempt_id="att-usurper")
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         _replace_row(conn, "forecast_records", record_id="rec-usurper")
+
+
+def test_replace_cannot_erase_an_event_through_its_detail_link(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """Each link index is a new conflict target, and so a new route into REPLACE's delete.
+
+    Unlike the sequence key, this one is reachable: a second `rejected` event citing the
+    same approval row passes every trigger probe -- next sequence number, matching
+    from_status, legal transition, right detail row -- and only then collides, on the index
+    added in round 3. The append-only delete trigger is what has to catch it, which it can
+    only do with `PRAGMA recursive_triggers` on.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    approval_id = conn.execute(
+        "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+        "created_at_utc) VALUES (?, 'rejected', 'chris', ?, ?)",
+        (record_id, SHA, TS),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
+        "to_status, approval_event_id, occurred_at_utc, created_at_utc) "
+        "VALUES (?, 2, 'rejected', 'validated', 'validated', ?, ?, ?)",
+        (record_id, approval_id, TS, TS),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "INSERT OR REPLACE INTO lifecycle_events (forecast_record_id, event_seq, "
+            "event_type, from_status, to_status, approval_event_id, occurred_at_utc, "
+            "created_at_utc) VALUES (?, 3, 'rejected', 'validated', 'validated', ?, ?, ?)",
+            (record_id, approval_id, TS, TS),
+        )
+    assert [event.event_seq for event in read_history(conn, record_id)] == [1, 2]
 
 
 def test_replace_cannot_renumber_an_event_through_its_sequence_key(
@@ -622,6 +763,18 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
         "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
         (record_id, TS),
     ).lastrowid
+    # Both observations a refetch of the uncertain attempt could have made. They are
+    # storable whether or not this record ever recorded that attempt as uncertain -- the
+    # verification table only requires the attempt to exist -- which is what lets the
+    # exhaustive probe below ask the *link* whether it checks for the uncertainty.
+    verifications = {
+        f"verified_{outcome}": conn.execute(
+            "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+            "observed_at_utc, created_at_utc) VALUES (?, ?, ?, ?)",
+            (f"att-unsure-{suffix}", outcome, TS, TS),
+        ).lastrowid
+        for outcome in ("confirmed", "absent")
+    }
     return {
         "approved": approved,
         "rejected": rejected,
@@ -630,6 +783,7 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
         "att_bad": f"att-bad-{suffix}",
         "resolved": resolution,
         "scored": score,
+        **verifications,
     }
 
 
@@ -658,6 +812,7 @@ def _insert_event(
     links: dict[str, object] = {
         "approval_event_id": None,
         "submission_attempt_id": None,
+        "submission_verification_id": None,
         "resolution_event_id": None,
         "score_event_id": None,
     }
@@ -669,15 +824,19 @@ def _insert_event(
         links["submission_attempt_id"] = detail["att_unsure"]
     elif event_type == "submission_failed":
         links["submission_attempt_id"] = detail["att_bad"]
+    elif event_type == "submission_confirmed":
+        links["submission_verification_id"] = detail["verified_confirmed"]
+    elif event_type == "submission_disconfirmed":
+        links["submission_verification_id"] = detail["verified_absent"]
     elif event_type == "resolved":
         links["resolution_event_id"] = detail["resolved"]
     elif event_type == "scored":
         links["score_event_id"] = detail["scored"]
     conn.execute(
         "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
-        "to_status, detail_code, approval_event_id, submission_attempt_id, resolution_event_id, "
-        "score_event_id, occurred_at_utc, created_at_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "to_status, detail_code, approval_event_id, submission_attempt_id, "
+        "submission_verification_id, resolution_event_id, score_event_id, occurred_at_utc, "
+        "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             record_id,
             seq,
@@ -695,6 +854,7 @@ def _insert_event(
             ),
             links["approval_event_id"],
             links["submission_attempt_id"],
+            links["submission_verification_id"],
             links["resolution_event_id"],
             links["score_event_id"],
             TS,
@@ -738,7 +898,21 @@ _ROUTES: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("resolved", "submitted", "resolved"),
         ("scored", "resolved", "scored"),
     ),
+    # Not an eighth status -- the record is `approved` either way -- but the two are not
+    # interchangeable, and that is the point. From a plain `approved` record a submission
+    # may be attempted and a refetch may not resolve anything; from one holding an
+    # unresolved uncertainty it is the other way round. Both halves of that are transitions
+    # the exhaustive probe below has to be able to reach, so it needs both records.
+    "approved_uncertain": (
+        ("validated", "draft", "validated"),
+        ("approved", "validated", "approved"),
+        ("submission_uncertain", "approved", "approved"),
+    ),
 }
+
+# The two event types that need a record with an unresolved uncertainty to be legal at
+# all. Everything else is probed from the plain route to its `from_status`.
+_NEEDS_UNCERTAINTY = frozenset({"submission_confirmed", "submission_disconfirmed"})
 
 
 def _walk_to(conn: sqlite3.Connection, record_id: str, status: str) -> dict[str, object]:
@@ -768,26 +942,36 @@ def test_database_accepts_exactly_the_legal_transitions(ledger: sqlite3.Connecti
     database is the enforcement, the Python table is the writer -- and this is what stops
     them drifting apart, which is a class of bug no amount of example-based testing over
     the happy path would catch.
+
+    Two of the triples are probed against a *different* approved record: the refetch's own
+    transitions exist only for a record waiting on one, and the retry block means the two
+    populations refuse opposite things. Which record a triple is probed against is the
+    only place this test knows about that rule -- the assertion below is unchanged.
     """
     detail: dict[str, dict[str, object]] = {}
-    for index, status in enumerate(STATUSES):
-        record_id = f"rec-{status}"
+    for index, route in enumerate((*STATUSES, "approved_uncertain")):
+        record_id = f"rec-{route}"
         _seed_draft(ledger, record_id=record_id, question_id=300 + index)
-        detail[status] = _walk_to(ledger, record_id, status)
+        detail[route] = _walk_to(ledger, record_id, route)
 
     accepted: set[tuple[str, str, str]] = set()
     for event_type in EVENT_TYPES:
         for from_status in STATUSES:
+            route = (
+                "approved_uncertain"
+                if from_status == "approved" and event_type in _NEEDS_UNCERTAINTY
+                else from_status
+            )
             for to_status in STATUSES:
                 ledger.execute("SAVEPOINT probe")
                 try:
                     _insert_event(
                         ledger,
-                        f"rec-{from_status}",
+                        f"rec-{route}",
                         event_type,
                         from_status,
                         to_status,
-                        detail[from_status],
+                        detail[route],
                     )
                 except sqlite3.IntegrityError:
                     pass
@@ -1249,18 +1433,22 @@ def test_the_attempt_pair_decides_the_event(
     assert current_status(conn, record_id) == status
 
 
-def test_an_uncertain_submission_can_still_be_confirmed(
-    draft: tuple[sqlite3.Connection, str],
-) -> None:
-    """The workflow the terminal mapping made impossible.
+def _verification(
+    *,
+    attempt_id: str = "att-1",
+    outcome: str = "confirmed",
+    **extra: object,
+) -> SubmissionVerification:
+    return SubmissionVerification(
+        submission_attempt_id=attempt_id,
+        outcome=outcome,  # type: ignore[arg-type]
+        observed_at_utc=extra.pop("observed_at_utc", WHEN),  # type: ignore[arg-type]
+        **extra,  # type: ignore[arg-type]
+    )
 
-    An attempt that posted but was not confirmed leaves the record `approved`, so when a
-    later refetch resolves the state the ledger can record what actually happened. Under
-    the first cut the record was `failed` and no `submitted` event was legal from there,
-    so the ledger disagreed with the platform permanently and the only way forward was
-    the blind retry the handoff forbids.
-    """
-    conn, record_id = draft
+
+def _leave_uncertain(conn: sqlite3.Connection, record_id: str) -> None:
+    """Approve, post, and have the refetch not confirm it: the state under test."""
     _approve(conn, record_id)
     record_submission_attempt(
         conn,
@@ -1271,20 +1459,318 @@ def test_an_uncertain_submission_can_still_be_confirmed(
     )
     assert current_status(conn, record_id) == "approved"
 
-    confirmed = record_submission_attempt(
+
+def test_an_uncertain_submission_is_resolved_by_a_refetch_not_a_second_post(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """Round 3, finding 1: the workflow round 2's fix described but could not record.
+
+    An unconfirmed post leaves the record `approved` so a later refetch can still move it
+    -- but the only event that reached `submitted` required a `submission_attempts` row,
+    and `idempotency_key` is UNIQUE, so recording the resolution meant minting a second
+    key for a post that was never made. The ledger's one route out of uncertainty was the
+    blind retry the handoff exists to block.
+
+    The assertion that matters is the count: one attempt, because only one request was
+    ever sent.
+    """
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+
+    confirmed = record_submission_verification(
         conn,
         record_id=record_id,
-        attempt=_attempt(attempt_id="att-2", key="idem-2"),
+        verification=_verification(refetched_forecast_snapshot='{"probability": 0.6}'),
         occurred_at=WHEN,
     )
-    assert confirmed.event_type == "submitted"
+    assert confirmed.event_type == "submission_confirmed"
+    assert confirmed.submission_verification_id is not None
+    assert confirmed.submission_attempt_id is None
     assert current_status(conn, record_id) == "submitted"
     assert [event.event_type for event in read_history(conn, record_id)] == [
         "validated",
         "approved",
         "submission_uncertain",
-        "submitted",
+        "submission_confirmed",
     ]
+    assert _counts(conn)["submission_attempts"] == 1
+
+
+def test_a_refetch_that_finds_nothing_ends_the_record(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """The other resolution, and it is terminal.
+
+    `absent` means the post is not there, which is what a (0, 0) attempt means -- and that
+    lands in `failed` too. A retry from here is a new forecast version (M1-602), not a
+    second attempt against a record whose history says the submission failed.
+    """
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+
+    disconfirmed = record_submission_verification(
+        conn,
+        record_id=record_id,
+        verification=_verification(outcome="absent"),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+    )
+    assert disconfirmed.event_type == "submission_disconfirmed"
+    assert current_status(conn, record_id) == "failed"
+
+
+def test_the_verification_link_is_checked_against_the_database_too(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Both halves of the link probe, reached with raw SQL rather than through the writer.
+
+    The writer's own guard is what produces the readable message, and it is the thing a
+    bypassing caller does not run: the trigger has to re-derive that the verification's
+    attempt belongs to *this* record and that this record recorded it as uncertain. The
+    two cases here are one probe each -- another record's uncertain attempt, and this
+    record's attempt with no uncertain event to its name.
+
+    rec-2's attempt row is written directly, without its lifecycle event, because through
+    the writers there is no such thing: every attempt this module records lands one, and an
+    attempt that is not uncertain has moved the record somewhere `submission_confirmed` is
+    illegal from anyway. Which is the point of testing the probe rather than trusting the
+    reachability argument that made it look unnecessary.
+    """
+    _seed_draft(ledger, record_id="rec-1")
+    _seed_draft(ledger, record_id="rec-2", question_id=101)
+    _leave_uncertain(ledger, "rec-1")
+    _approve(ledger, "rec-2")
+    _insert_attempt(ledger, "rec-2", attempt_id="att-2")
+
+    def verify(attempt_id: str) -> int:
+        return int(
+            ledger.execute(
+                "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+                "observed_at_utc, created_at_utc) VALUES (?, 'confirmed', ?, ?)",
+                (attempt_id, TS, TS),
+            ).lastrowid
+            or 0
+        )
+
+    def cite(record_id: str, seq: int, verification_id: int) -> None:
+        ledger.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, submission_verification_id, occurred_at_utc, "
+            "created_at_utc) VALUES (?, ?, 'submission_confirmed', 'approved', 'submitted', "
+            "?, ?, ?)",
+            (record_id, seq, verification_id, TS, TS),
+        )
+
+    # rec-1's uncertain attempt, cited by rec-2's history.
+    with pytest.raises(sqlite3.IntegrityError, match="attempt on another forecast record"):
+        cite("rec-2", 3, verify("att-1"))
+    # rec-2's own attempt, which was submitted outright and so has nothing to resolve.
+    with pytest.raises(sqlite3.IntegrityError, match="not recorded as uncertain"):
+        cite("rec-2", 3, verify("att-2"))
+
+
+def test_an_unresolved_uncertainty_blocks_another_attempt(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """ "Block retry until refetch resolves state", as a property of the ledger.
+
+    Both layers: the writer refuses with a message that says what to do, and the raw SQL
+    the writer would have run is refused too -- the guard has to hold against a caller
+    that never goes through this module.
+    """
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+
+    with pytest.raises(LifecycleError, match="unresolved uncertain submission"):
+        record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=_attempt(attempt_id="att-2", key="idem-2"),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_attempts"] == 1
+
+    conn.execute(
+        "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
+        "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+        "verified_by_refetch, created_at_utc) "
+        "VALUES ('att-raw', ?, 'idem-raw', ?, ?, ?, 1, 1, ?)",
+        (record_id, TS, TS, PAYLOAD_SHA, TS),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="unresolved uncertain submission"):
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, submission_attempt_id, occurred_at_utc, created_at_utc) "
+            "VALUES (?, 4, 'submitted', 'approved', 'submitted', 'att-raw', ?, ?)",
+            (record_id, TS, TS),
+        )
+    assert current_status(conn, record_id) == "approved"
+
+
+def test_the_resolution_frees_the_record_from_the_retry_block(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # The block must not outlive what it is blocking on. Once resolved, the record has
+    # left `approved` -- and the states it can be in are ones no submission event is legal
+    # from, which is the whole of why the bare EXISTS in the trigger is exact.
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    record_submission_verification(
+        conn, record_id=record_id, verification=_verification(), occurred_at=WHEN
+    )
+    with pytest.raises(LifecycleError, match="not a legal transition"):
+        record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=_attempt(attempt_id="att-2", key="idem-2"),
+            occurred_at=WHEN,
+        )
+
+
+def test_a_refetch_cannot_resolve_an_attempt_that_was_never_uncertain(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """An attempt already accounted for is not open to being re-decided.
+
+    A `submitted` attempt has its own event; letting a later refetch attach a second one
+    would put two contradicting accounts of one request into an append-only log.
+    """
+    conn, record_id = draft
+    _approve(conn, record_id)
+    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    assert current_status(conn, record_id) == "submitted"
+
+    with pytest.raises(LifecycleError, match="nothing for a refetch to resolve"):
+        record_submission_verification(
+            conn, record_id=record_id, verification=_verification(), occurred_at=WHEN
+        )
+    assert _counts(conn)["submission_verifications"] == 0
+
+
+def test_a_refetch_cannot_resolve_another_records_attempt(
+    ledger: sqlite3.Connection,
+) -> None:
+    # The verification row stores no forecast_record_id, so "belongs to this record" is a
+    # join through the attempt. Getting that wrong would let one record's refetch carry
+    # another record to `submitted`.
+    _seed_draft(ledger, record_id="rec-1")
+    _seed_draft(ledger, record_id="rec-2", question_id=101)
+    _leave_uncertain(ledger, "rec-1")
+    _approve(ledger, "rec-2")
+    record_submission_attempt(
+        ledger,
+        record_id="rec-2",
+        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, verified=False),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+    )
+
+    with pytest.raises(LifecycleError, match="nothing for a refetch to resolve"):
+        record_submission_verification(
+            ledger,
+            record_id="rec-2",
+            verification=_verification(attempt_id="att-1"),
+            occurred_at=WHEN,
+        )
+
+
+def test_a_refetch_cannot_be_observed_before_the_attempt_it_verifies(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # A receipt for an interval that ran backwards, in the other direction: the
+    # observation of a post cannot predate the post finishing.
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    with pytest.raises(LifecycleError, match="earlier than the completion"):
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=_verification(observed_at_utc=WHEN - timedelta(seconds=1)),
+            occurred_at=WHEN,
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="earlier than the completion"):
+        conn.execute(
+            "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+            "observed_at_utc, created_at_utc) VALUES ('att-1', 'confirmed', ?, ?)",
+            ("2020-01-01T00:00:00+00:00", TS),
+        )
+
+
+def test_a_verification_event_must_match_what_the_refetch_saw(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # Raw SQL: the outcome decides the event, so a refetch that found nothing cannot back
+    # a `submission_confirmed`.
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    absent = conn.execute(
+        "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+        "observed_at_utc, created_at_utc) VALUES ('att-1', 'absent', ?, ?)",
+        (TS, TS),
+    ).lastrowid
+    with pytest.raises(sqlite3.IntegrityError, match="different observation"):
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, submission_verification_id, occurred_at_utc, "
+            "created_at_utc) VALUES (?, 4, 'submission_confirmed', 'approved', 'submitted', "
+            "?, ?, ?)",
+            (record_id, absent, TS, TS),
+        )
+
+
+def test_a_confirmed_refetch_rejects_a_detail_code(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # A confirmation is a success, and the schema forbids a failure code on one.
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    with pytest.raises(LifecycleError, match="not applicable"):
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=_verification(),
+            occurred_at=WHEN,
+            detail_code="refetch_missing",
+        )
+
+
+def test_a_disconfirmed_refetch_requires_a_detail_code(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    with pytest.raises(LifecycleError, match="detail_code is required"):
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=_verification(outcome="absent"),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_verifications"] == 0
+
+
+def test_a_refetch_rolls_back_its_own_verification_row(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """The atomicity property, for the new pair.
+
+    A second confirmation of the same attempt writes a valid `submission_verifications`
+    row and only then discovers there is no transition out of `submitted`. Without one
+    transaction around both, the ledger would keep an observation that never became an
+    event.
+    """
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    record_submission_verification(
+        conn, record_id=record_id, verification=_verification(), occurred_at=WHEN
+    )
+    before = _counts(conn)
+    with pytest.raises(LifecycleError):
+        record_submission_verification(
+            conn, record_id=record_id, verification=_verification(), occurred_at=WHEN
+        )
+    assert _counts(conn) == before
+    assert current_status(conn, record_id) == "submitted"
 
 
 def test_an_uncertain_submission_requires_a_detail_code(
@@ -1411,9 +1897,13 @@ def test_a_receipt_without_a_completion_time_is_refused(
 def test_a_receipt_cannot_complete_before_it_was_requested(
     draft: tuple[sqlite3.Connection, str],
 ) -> None:
-    # Compared as instants rather than as rendered text, and rejected because the row is
-    # append-only: a reversed pair is permanent, and `requested_at_utc` is what an
-    # idempotency key is reasoned about against.
+    """Round 3, finding 3: the one rule this item enforced in a single layer.
+
+    The writer compared the two instants and the schema did not, so a direct insert could
+    store an attempt that completed a day before it was requested -- permanently, on an
+    append-only table. Compared as instants rather than as rendered text on the Python
+    side, and by ``julianday`` on the SQL side.
+    """
     conn, record_id = draft
     _approve(conn, record_id)
     with pytest.raises(LifecycleError):
@@ -1424,6 +1914,39 @@ def test_a_receipt_cannot_complete_before_it_was_requested(
             occurred_at=WHEN,
         )
     assert _counts(conn)["submission_attempts"] == 0
+    with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
+        _insert_attempt(conn, record_id, requested=TS, completed="2026-07-26T00:00:00+00:00")
+    assert _counts(conn)["submission_attempts"] == 0
+
+
+@pytest.mark.parametrize("completed", ["", "not-a-timestamp", "2026-13-45T99:00:00Z", b"\x00"])
+def test_a_receipt_whose_timestamps_cannot_be_ordered_is_refused(
+    draft: tuple[sqlite3.Connection, str], completed: object
+) -> None:
+    """What makes the ordering probe above well defined rather than merely present.
+
+    ``julianday`` returns NULL for anything it cannot parse, and a comparison against NULL
+    is neither true nor false -- so without this the ordering check would silently not fire
+    on exactly the values that need it most. A blob is the case the ``typeof`` half is
+    for: TEXT affinity converts a number to text but leaves a blob a blob.
+    """
+    conn, record_id = draft
+    _approve(conn, record_id)
+    with pytest.raises(sqlite3.IntegrityError, match="SQLite can order"):
+        _insert_attempt(conn, record_id, requested=TS, completed=completed)
+
+
+def test_a_bare_number_is_not_a_receipt_timestamp(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # The value that motivates reading julianday's result rather than trusting it: SQLite
+    # accepts a bare number as a *Julian day number*, so 2451545 parses -- as the year
+    # 2000. It is caught by the ordering probe rather than the format one, which is the
+    # honest thing for a schema that pins no timestamp format to say about it.
+    conn, record_id = draft
+    _approve(conn, record_id)
+    with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
+        _insert_attempt(conn, record_id, requested=TS, completed=2451545)
 
 
 @pytest.mark.parametrize("status", [-1, 0, 99, 600, 1000, 2**63 - 1, 2**63])
@@ -1951,6 +2474,28 @@ def _leak_cases(
             occurred_at=WHEN,
         )
 
+    def verify(**overrides: object) -> LifecycleEvent:
+        # Refused for the transition (the record is only `validated`), after the fields
+        # have been read -- the same shape as `submit`.
+        return record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=_verification(**overrides),  # type: ignore[arg-type]
+            occurred_at=WHEN,
+        )
+
+    def verify_subclass() -> LifecycleEvent:
+        return record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=HostileVerification(
+                submission_attempt_id="att-1",
+                outcome="confirmed",
+                observed_at_utc=WHEN,
+            ),
+            occurred_at=WHEN,
+        )
+
     return {
         "record_id": lambda: approve(record_id=PLANTED_SECRET),
         "actor_over_cap": lambda: approve(actor=PLANTED_SECRET * 40),
@@ -1960,6 +2505,10 @@ def _leak_cases(
         "idempotency_key": lambda: submit(key=PLANTED_SECRET),
         "response_body_over_cap": lambda: submit(response_body=PLANTED_SECRET * 6000),
         "error_message": lambda: submit(error_message=PLANTED_SECRET * 6000),
+        "verified_attempt_id": lambda: verify(attempt_id=PLANTED_SECRET),
+        "verified_outcome": lambda: verify(outcome=PLANTED_SECRET),
+        "snapshot_over_cap": lambda: verify(refetched_forecast_snapshot=PLANTED_SECRET * 6000),
+        "hostile_verification_subclass": verify_subclass,
         # The three GPT round 1 found: the value is not a field this module reads, but
         # something it *calls* -- a timezone, an attribute, an integer conversion -- so
         # the leak arrives as an exception raised elsewhere rather than as stored text.
@@ -1981,6 +2530,10 @@ def _leak_cases(
         "idempotency_key",
         "response_body_over_cap",
         "error_message",
+        "verified_attempt_id",
+        "verified_outcome",
+        "snapshot_over_cap",
+        "hostile_verification_subclass",
         "hostile_timezone",
         "hostile_attempt_subclass",
     ],
@@ -2073,3 +2626,24 @@ def test_a_submission_attempt_subclass_is_refused(
             occurred_at=WHEN,
         )
     assert _counts(conn)["submission_attempts"] == 0
+
+
+def test_a_submission_verification_subclass_is_refused(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    # The same exact-type gate on the second writer that reads a caller's dataclass
+    # between two writes.
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+    with pytest.raises(LifecycleError, match="must be a SubmissionVerification"):
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=HostileVerification(
+                submission_attempt_id="att-1",
+                outcome="confirmed",
+                observed_at_utc=WHEN,
+            ),
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["submission_verifications"] == 0

@@ -12,6 +12,13 @@ leave the status where it was, because in both cases the record has not gone any
 moving it would be a claim nothing supports. That is why a submission has three outcomes
 here and not two; see :func:`record_submission_attempt`.
 
+An uncertainty is not a resting place, though. While one stands, no further attempt may be
+recorded, and the only thing that resolves it is a refetch --
+:func:`record_submission_verification`, which writes what the platform actually showed and
+carries the record to ``submitted`` or to ``failed``. Recording that observation as another
+*attempt* would mean claiming a second live post, which is the retry the handoff exists to
+block; see :class:`SubmissionVerification`.
+
 That is what M1-603's acceptance criterion reduces to. "Injected failures cannot leave
 an approved/submitted state without its event record" is not a property of the code
 below; it is a property of the schema, because there is nowhere else for the state to
@@ -79,6 +86,14 @@ LifecycleStatus = Literal[
 # ledger would disagree with the platform permanently -- the opposite of the handoff's
 # "an uncertain timeout blocks blind retry until a refetch resolves the state". It leaves
 # the record `approved`. (GPT review round 2, finding 3.)
+#
+# `submission_confirmed` and `submission_disconfirmed` are the two ways back out of that
+# state, and they belong to the *refetch* rather than to another attempt. Without them the
+# only route to `submitted` ran through a second `submission_attempts` row, which needs a
+# new idempotency key (001 declares it UNIQUE) and therefore claims a second live post --
+# the blind retry the handoff forbids, reached by way of the mechanism that was supposed
+# to prevent it. (GPT review round 3, finding 1.) They cite a `submission_verifications`
+# row; see :func:`record_submission_verification`.
 LifecycleEventType = Literal[
     "validated",
     "validation_failed",
@@ -87,6 +102,8 @@ LifecycleEventType = Literal[
     "submitted",
     "submission_uncertain",
     "submission_failed",
+    "submission_confirmed",
+    "submission_disconfirmed",
     "resolved",
     "scored",
 ]
@@ -98,6 +115,15 @@ LifecycleEventType = Literal[
 # submission failure is not here -- it has an attempt row and is written by
 # :func:`record_submission_attempt`.
 PipelineFailureEvent = Literal["validation_failed"]
+
+# What a refetch saw. Two-valued for the reason the migration gives: a refetch that could
+# not be *performed* observed nothing and changes no state, so it has no lifecycle event
+# to produce and would be a detail row nothing can cite. Like `ApprovalDecision`, the
+# member and the event type are deliberately different words -- `confirmed`/`absent`
+# describe the platform, `submission_confirmed`/`submission_disconfirmed` describe what
+# that does to the record -- so the migration maps one to the other explicitly rather than
+# comparing two columns that happen to agree.
+VerificationOutcome = Literal["confirmed", "absent"]
 
 # The 001 vocabulary of `approval_events.decision`, reused verbatim: the decision and
 # the lifecycle event type are the same word, which is what lets the migration's trigger
@@ -135,6 +161,7 @@ _STATUSES: frozenset[str] = frozenset(get_args(LifecycleStatus))
 _EVENT_TYPES: frozenset[str] = frozenset(get_args(LifecycleEventType))
 _FAILURE_CODES: frozenset[str] = frozenset(get_args(FailureCode))
 _APPROVAL_DECISIONS: frozenset[str] = frozenset(get_args(ApprovalDecision))
+_VERIFICATION_OUTCOMES: frozenset[str] = frozenset(get_args(VerificationOutcome))
 _PIPELINE_FAILURE_EVENTS: frozenset[str] = frozenset(get_args(PipelineFailureEvent))
 
 # The state machine, spelled out here and again as a trigger in
@@ -149,7 +176,16 @@ _PIPELINE_FAILURE_EVENTS: frozenset[str] = frozenset(get_args(PipelineFailureEve
 # (CODEX_HANDOFF, pipeline and failure boundaries) -- it records a decision without
 # moving the record. `submission_uncertain` is approved -> approved for the reason given
 # at its vocabulary member: an unresolved submission must stay somewhere a later refetch
-# can still move it, and `approved` is where the record was.
+# can still move it, and `approved` is where the record was. The refetch is what moves it
+# from there -- `submission_confirmed` to `submitted`, `submission_disconfirmed` to
+# terminal `failed`, the same destination a (0, 0) attempt reaches and for the same
+# reason: the post is not there, and the retry is a new forecast version.
+#
+# This table is not the whole rule. Two transitions out of `approved` are legal here and
+# still refused by the migration: while an uncertain event stands unresolved, no further
+# attempt may be recorded at all. That guard depends on the record's *history* rather than
+# on its current status, so it cannot be expressed as a triple; the database holds it, and
+# :func:`record_submission_attempt` checks it up front for a readable message.
 _LEGAL_TRANSITIONS: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("validated", "draft", "validated"),
@@ -160,6 +196,8 @@ _LEGAL_TRANSITIONS: frozenset[tuple[str, str, str]] = frozenset(
         ("submitted", "approved", "submitted"),
         ("submission_uncertain", "approved", "approved"),
         ("submission_failed", "approved", "failed"),
+        ("submission_confirmed", "approved", "submitted"),
+        ("submission_disconfirmed", "approved", "failed"),
         ("resolved", "submitted", "resolved"),
         ("scored", "resolved", "scored"),
     }
@@ -228,6 +266,7 @@ class LifecycleEvent:
     detail_code: FailureCode | None
     approval_event_id: int | None
     submission_attempt_id: str | None
+    submission_verification_id: int | None
     resolution_event_id: int | None
     score_event_id: int | None
     occurred_at_utc: str
@@ -266,6 +305,33 @@ class SubmissionAttempt:
     response_headers: str | None = None
     error_type: str | None = None
     error_message: str | None = None
+    refetched_forecast_snapshot: str | None = None
+
+
+@dataclass(frozen=True)
+class SubmissionVerification:
+    """A refetch, and what it saw of an attempt whose outcome was left uncertain.
+
+    Deliberately **not** a ``SubmissionAttempt``. An attempt is the record of a request:
+    it carries an idempotency key (unique, per 001), a request payload hash and an HTTP
+    status, and none of those exist for an observation. Resolving an uncertainty by
+    writing a second attempt row meant minting a second key -- which is to say, claiming a
+    second live post -- so the thing the handoff asks for ("block retry until refetch
+    resolves state") could only be recorded by doing the thing it forbids. (GPT review
+    round 3, finding 1.)
+
+    ``outcome`` decides the event: ``confirmed`` carries the record to ``submitted``,
+    ``absent`` to terminal ``failed``. The attempt named here must be one this ledger
+    recorded as ``submission_uncertain``; an attempt already accounted for as submitted or
+    failed is not open to being re-decided by a later refetch.
+
+    ``created_at_utc`` is absent for :class:`SubmissionAttempt`'s reason -- it is when the
+    ledger stored the row, so only the write path may set it.
+    """
+
+    submission_attempt_id: str
+    outcome: VerificationOutcome
+    observed_at_utc: datetime
     refetched_forecast_snapshot: str | None = None
 
 
@@ -689,9 +755,14 @@ def record_submission_attempt(
     and not a failure. Recording those as ``submission_failed`` moved the record to
     terminal ``failed``, so a later confirming refetch had nowhere to land and blind retry
     was the only thing left -- exactly what the handoff says the ledger must prevent
-    (GPT review round 2, finding 3). An uncertain attempt leaves the record ``approved``,
-    which is what lets M2-704 block the retry and then record the resolution when it
-    comes: another attempt from ``approved`` can still reach ``submitted`` or ``failed``.
+    (GPT review round 2, finding 3). An uncertain attempt leaves the record ``approved``.
+
+    An uncertain attempt also **blocks this writer** until it is resolved. That is the
+    other half of the same handoff rule, and it was missing: nothing stopped a second
+    attempt from being recorded, and because a resolving refetch had no event of its own,
+    a second attempt was the only way to reach ``submitted`` at all -- so the ledger's one
+    documented route out of uncertainty was the blind retry (round 3, finding 1). The
+    route now is :func:`record_submission_verification`.
 
     ``detail_code`` is required for both non-verified outcomes and refused for
     ``submitted``.
@@ -770,6 +841,7 @@ def record_submission_attempt(
     )
 
     with transaction(conn):
+        _require_no_unresolved_uncertainty(conn, identifier)
         _insert(
             conn,
             "INSERT INTO submission_attempts "
@@ -790,10 +862,92 @@ def record_submission_attempt(
         )
 
 
+def record_submission_verification(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str,
+    verification: SubmissionVerification,
+    occurred_at: datetime,
+    detail_code: FailureCode | None = None,
+) -> LifecycleEvent:
+    """Append a refetch observation and its lifecycle event, atomically.
+
+    This is how an uncertain submission ends. The attempt named by ``verification`` must
+    be one this record's history holds a ``submission_uncertain`` event for; what the
+    refetch saw then decides where the record goes::
+
+        confirmed  submission_confirmed     approved -> submitted
+        absent     submission_disconfirmed  approved -> failed
+
+    As with :func:`record_submission_attempt`, the event type is **derived** and never
+    chosen by the caller. ``detail_code`` is required for ``absent`` -- ``refetch_missing``
+    is the usual one -- and refused for ``confirmed``, which is a success and carries no
+    failure code.
+
+    Until this is written, the ledger refuses to record any further attempt on the record:
+    that is the handoff's "block retry until refetch resolves state", enforced by the
+    migration rather than left to M2-704's write path. ``submission_disconfirmed`` is
+    terminal, so a genuinely lost post is retried as a new forecast version (M1-602),
+    which is what every other route to ``failed`` already means.
+
+    Persistence only. Nothing here contacts Metaculus; M2-704 owns the refetch itself.
+    """
+    # Exact type, for the reason spelled out in record_submission_attempt: a subclass can
+    # turn every attribute read below into a call into caller-supplied code.
+    if type(verification) is not SubmissionVerification:
+        raise LifecycleError("verification must be a SubmissionVerification")
+    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    occurred = _require_utc(occurred_at, "occurred_at")
+
+    attempt_id = _require_text(
+        verification.submission_attempt_id,
+        "verification.submission_attempt_id",
+        max_length=_MAX_IDENTIFIER,
+    )
+    outcome = _require_member(verification.outcome, _VERIFICATION_OUTCOMES, "verification.outcome")
+    observed = _require_utc(verification.observed_at_utc, "verification.observed_at_utc")
+    snapshot = _require_optional_text(
+        verification.refetched_forecast_snapshot,
+        "verification.refetched_forecast_snapshot",
+        max_length=_MAX_BODY,
+    )
+
+    event_type: LifecycleEventType
+    if outcome == "confirmed":
+        event_type = "submission_confirmed"
+        if detail_code is not None:
+            raise LifecycleError("detail_code is not applicable to a confirmed submission")
+    else:
+        event_type = "submission_disconfirmed"
+        if detail_code is None:
+            raise LifecycleError(
+                "detail_code is required for a refetch that did not find the forecast"
+            )
+        _require_member(detail_code, _FAILURE_CODES, "detail_code")
+
+    with transaction(conn):
+        _require_verifiable_attempt(conn, identifier, attempt_id, observed)
+        verification_id = _insert(
+            conn,
+            "INSERT INTO submission_verifications "
+            "(submission_attempt_id, outcome, observed_at_utc, "
+            "refetched_forecast_snapshot, created_at_utc) VALUES (?, ?, ?, ?, ?)",
+            (attempt_id, outcome, observed, snapshot, _utcnow().isoformat()),
+        )
+        return _append_event(
+            conn,
+            record_id=identifier,
+            event_type=event_type,
+            detail_code=detail_code,
+            submission_verification_id=verification_id,
+            occurred_at_utc=occurred,
+        )
+
+
 _EVENT_COLUMNS = (
     "event_id, forecast_record_id, event_seq, event_type, from_status, to_status, "
-    "detail_code, approval_event_id, submission_attempt_id, resolution_event_id, "
-    "score_event_id, occurred_at_utc, created_at_utc"
+    "detail_code, approval_event_id, submission_attempt_id, submission_verification_id, "
+    "resolution_event_id, score_event_id, occurred_at_utc, created_at_utc"
 )
 
 
@@ -805,6 +959,7 @@ def _append_event(
     detail_code: FailureCode | None = None,
     approval_event_id: int | None = None,
     submission_attempt_id: str | None = None,
+    submission_verification_id: int | None = None,
     occurred_at_utc: str,
 ) -> LifecycleEvent:
     """Append one lifecycle row, in a transaction, and return it as stored.
@@ -838,8 +993,9 @@ def _append_event(
             conn,
             "INSERT INTO lifecycle_events "
             "(forecast_record_id, event_seq, event_type, from_status, to_status, "
-            "detail_code, approval_event_id, submission_attempt_id, occurred_at_utc, "
-            "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "detail_code, approval_event_id, submission_attempt_id, "
+            "submission_verification_id, occurred_at_utc, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
                 event_seq,
@@ -849,6 +1005,7 @@ def _append_event(
                 detail_code,
                 approval_event_id,
                 submission_attempt_id,
+                submission_verification_id,
                 occurred_at_utc,
                 _utcnow().isoformat(),
             ),
@@ -890,6 +1047,71 @@ def _require_hash_binds(conn: sqlite3.Connection, record_id: str, digest: str) -
         )
 
 
+def _require_no_unresolved_uncertainty(conn: sqlite3.Connection, record_id: str) -> None:
+    """Fail readably when an uncertain submission is still waiting on its refetch.
+
+    The migration refuses the write either way; this is what makes the refusal say which
+    rule was broken. A caller that sees only "the ledger rejected this write" learns
+    nothing about *what to do next*, and here the answer is specific: refetch, then record
+    what you saw.
+
+    "Unresolved" is an uncertain event on a record that is *still* ``approved``: a refetch
+    that resolved one carried the record to ``submitted`` or ``failed``, and neither is a
+    state this writer is legal from. The trigger can therefore test the history alone,
+    where this runs before the transition is derived and has to make the same distinction
+    itself -- otherwise it would answer "refetch first" to a caller whose real problem is
+    that the record is already submitted.
+    """
+    if current_status(conn, record_id) != "approved":
+        return
+    row = _fetch_one(
+        conn,
+        "SELECT 1 FROM lifecycle_events WHERE forecast_record_id = ? "
+        "AND event_type = 'submission_uncertain' LIMIT 1",
+        (record_id,),
+    )
+    if row is not None:
+        raise LifecycleError(
+            "this record has an unresolved uncertain submission; record a refetch with "
+            "record_submission_verification before attempting another submission"
+        )
+
+
+def _require_verifiable_attempt(
+    conn: sqlite3.Connection, record_id: str, attempt_id: str, observed_at_utc: str
+) -> None:
+    """Fail readably when a refetch names an attempt it cannot be resolving.
+
+    Both halves are re-derived by the migration's trigger, which is the binding check.
+    The attempt must be one *this* record recorded as uncertain -- which subsumes
+    ownership, since the uncertain event names both -- and the observation cannot predate
+    the attempt it observes. The comparison is left to SQLite's ``julianday`` rather than
+    parsed here: the stored value is text this module did not necessarily write, and
+    ``fromisoformat`` on it would be one more place a stored value can raise.
+    """
+    row = _fetch_one(
+        conn,
+        "SELECT 1 FROM lifecycle_events WHERE forecast_record_id = ? "
+        "AND submission_attempt_id = ? AND event_type = 'submission_uncertain' LIMIT 1",
+        (record_id, attempt_id),
+    )
+    if row is None:
+        raise LifecycleError(
+            "this record has no uncertain submission attempt by that identifier, so there "
+            "is nothing for a refetch to resolve"
+        )
+    row = _fetch_one(
+        conn,
+        "SELECT 1 FROM submission_attempts WHERE attempt_id = ? "
+        "AND julianday(completed_at_utc) > julianday(?)",
+        (attempt_id, observed_at_utc),
+    )
+    if row is not None:
+        raise LifecycleError(
+            "verification.observed_at_utc is earlier than the completion of the attempt it verifies"
+        )
+
+
 def _next_seq(conn: sqlite3.Connection, record_id: str) -> int:
     row = _fetch_one(
         conn,
@@ -926,10 +1148,15 @@ def _event_from_row(row: sqlite3.Row) -> LifecycleEvent:
         submission_attempt_id=(
             None if row[8] is None else _stored_text(row[8], "submission_attempt_id")
         ),
-        resolution_event_id=None if row[9] is None else _stored_int(row[9], "resolution_event_id"),
-        score_event_id=None if row[10] is None else _stored_int(row[10], "score_event_id"),
-        occurred_at_utc=_stored_text(row[11], "occurred_at_utc"),
-        created_at_utc=_stored_text(row[12], "created_at_utc"),
+        submission_verification_id=(
+            None if row[9] is None else _stored_int(row[9], "submission_verification_id")
+        ),
+        resolution_event_id=None
+        if row[10] is None
+        else _stored_int(row[10], "resolution_event_id"),
+        score_event_id=None if row[11] is None else _stored_int(row[11], "score_event_id"),
+        occurred_at_utc=_stored_text(row[12], "occurred_at_utc"),
+        created_at_utc=_stored_text(row[13], "created_at_utc"),
     )
 
 

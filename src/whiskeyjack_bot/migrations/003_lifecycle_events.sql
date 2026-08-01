@@ -51,6 +51,30 @@
 -- nullable-with-a-trigger below so that item does not have to rebuild an append-only
 -- table to get there.
 --
+-- WHY A REFETCH IS NOT AN ATTEMPT:
+--
+-- Round 2 made an unconfirmed post non-terminal (`submission_uncertain`, approved ->
+-- approved) so that a later refetch could resolve it. It gave that refetch nothing to
+-- write. `submission_attempts` is append-only, so the original attempt can never be
+-- updated to say "confirmed after all", and 001 declares `idempotency_key` NOT NULL
+-- UNIQUE -- so the only way to reach `submitted` was a second attempt row carrying a
+-- *new* key, which is a second live post. That is the blind retry the handoff forbids
+-- ("uncertain timeout where posting may have succeeded: block retry until refetch
+-- resolves state"), and it was the ledger's only documented way out of uncertainty
+-- (GPT review round 3, finding 1; reproduced).
+--
+-- So `submission_verifications` below records the *observation* -- the refetch -- as its
+-- own append-only row, and `submission_confirmed` / `submission_disconfirmed` carry the
+-- record out of the uncertain state without inventing a request that never happened.
+-- The two new event types are defined here rather than left to M2-704 for the reason the
+-- resolution and score transitions are: `event_type` is a CHECK constraint, SQLite cannot
+-- alter one, and adding a member later means rebuilding an append-only table.
+--
+-- The retry itself is blocked by trigger rather than by convention: while a record holds
+-- an uncertain event that no verification has resolved, no further submission event is
+-- accepted. "Block retry until refetch resolves state" is then a property of the ledger
+-- and not a promise M2-704's write path keeps.
+--
 -- There is no `phase` column. Every event type names its own pipeline phase already
 -- (`submission_failed` happens at submission), so a phase column would be a second
 -- spelling of `event_type` that has to be kept in agreement with it. The *reason* a
@@ -100,6 +124,47 @@ DROP TABLE migration_003_requires_every_forecast_record_to_be_a_draft;
 -- approved.
 ALTER TABLE forecast_records ADD COLUMN forecast_sha256 TEXT;
 
+-- What a refetch saw, recorded as evidence in its own right. This is the row that
+-- resolves an uncertain submission; see "WHY A REFETCH IS NOT AN ATTEMPT" in the header.
+--
+-- It carries no `forecast_record_id`. The attempt it verifies already names one, and the
+-- link probe below joins through it -- a second copy would be a second claim about the
+-- same fact, with nothing keeping the two in agreement.
+--
+-- `outcome` is two-valued on purpose. A refetch that could not be *performed* -- the API
+-- was down, the request timed out -- observed nothing, changes no state, and produces no
+-- lifecycle event; recording it here would be a detail row no event can cite. The
+-- uncertainty and its `detail_code` already say the post is unconfirmed, and an operator
+-- record of failed check attempts is telemetry rather than attribution. This is a
+-- judgment call in an immutable CHECK: if M2-704 finds it needs those observations, they
+-- need their own table, not a third outcome whose meaning is "no outcome".
+--
+-- `refetched_forecast_snapshot` mirrors the column of the same name on
+-- `submission_attempts` (001): what the platform actually returned, so the confirmation
+-- can be audited rather than taken on faith. Nullable, because an `absent` outcome has no
+-- snapshot to store.
+--
+-- There is deliberately no uniqueness over `submission_attempt_id`. A refetch can be
+-- repeated, and each run is a true observation at its own time -- a post that was absent
+-- at 12:00 and present at 12:05 is two facts, not one fact rewritten. What is bounded is
+-- how many of them become *state*: the partial unique index on the link column allows one
+-- lifecycle event per verification, and the first one to land carries the record out of
+-- `approved`, from where neither resolution is legal again. So the log can hold several
+-- observations of an attempt and the history still shows exactly one resolution.
+CREATE TABLE submission_verifications (
+    verification_id             INTEGER PRIMARY KEY,
+    submission_attempt_id       TEXT NOT NULL REFERENCES submission_attempts (attempt_id),
+    outcome                     TEXT NOT NULL CHECK (outcome IN ('confirmed', 'absent')),
+    observed_at_utc             TEXT NOT NULL,
+    refetched_forecast_snapshot TEXT,
+    created_at_utc              TEXT NOT NULL
+);
+
+-- 001's reason for its explicit foreign-key indexes: SQLite does not auto-index a plain
+-- REFERENCES column, and every read of this table starts from the attempt.
+CREATE INDEX idx_submission_verifications_attempt
+    ON submission_verifications (submission_attempt_id);
+
 -- The lifecycle spine: one row per state transition, ordered per record.
 --
 -- `event_seq` is per record and contiguous from 1, which is a stronger claim than the
@@ -109,11 +174,18 @@ ALTER TABLE forecast_records ADD COLUMN forecast_sha256 TEXT;
 -- into a loud IntegrityError instead of a silently reordered history. (The writers
 -- take the write lock up front with BEGIN IMMEDIATE, so this is defence in depth.)
 --
--- The detail row is referenced through four typed, nullable foreign keys rather than a
+-- The detail row is referenced through five typed, nullable foreign keys rather than a
 -- polymorphic (related_table, related_id) pair. A polymorphic pair cannot be a real
 -- foreign key, and comparing it would mean CASTing across SQLite's affinity rules --
 -- the same trap 002 documents for posts_dropped_no_url. Exactly one is set, and which
 -- one is fixed by event_type; the trigger enforces both.
+--
+-- ... and each of them is cited by at most one event, which is the partial unique index
+-- below rather than another probe. The trigger checked that a detail row belonged to this
+-- record and recorded this outcome, and never that it had not already been used: since
+-- `rejected` and `submission_uncertain` are self-transitions, two immutable events could
+-- cite one approval decision or one attempt, so the history could show a post attempted
+-- twice on the evidence of a single receipt (round 3, finding 2; reproduced).
 --
 -- `detail_code` is a CLOSED vocabulary, not free text, and there is deliberately no
 -- free-text column on this table at all. A failure's provider-supplied text lives in
@@ -140,7 +212,8 @@ CREATE TABLE lifecycle_events (
     event_type            TEXT NOT NULL CHECK (
         event_type IN (
             'validated', 'validation_failed', 'rejected', 'approved',
-            'submitted', 'submission_uncertain', 'submission_failed', 'resolved', 'scored'
+            'submitted', 'submission_uncertain', 'submission_failed',
+            'submission_confirmed', 'submission_disconfirmed', 'resolved', 'scored'
         )
     ),
     from_status           TEXT NOT NULL CHECK (
@@ -165,6 +238,7 @@ CREATE TABLE lifecycle_events (
     ),
     approval_event_id     INTEGER REFERENCES approval_events (event_id),
     submission_attempt_id TEXT REFERENCES submission_attempts (attempt_id),
+    submission_verification_id INTEGER REFERENCES submission_verifications (verification_id),
     resolution_event_id   INTEGER REFERENCES resolution_events (event_id),
     score_event_id        INTEGER REFERENCES score_events (event_id),
     -- When the thing being recorded happened (caller-supplied, so a replayed run can
@@ -177,6 +251,38 @@ CREATE TABLE lifecycle_events (
 -- No separate index on forecast_record_id: 001 added those because SQLite does not
 -- auto-index a plain REFERENCES column, and the UNIQUE above already indexes this one
 -- with forecast_record_id leftmost.
+
+-- One event per detail row. Every link column gets the same rule, not just the two whose
+-- self-transitions made the hole reachable: a rule that only covers the cases someone
+-- could reproduce today is a rule that has to be revisited when M4-802 and M5-803 write
+-- the other two.
+--
+-- Partial rather than plain, though SQLite already treats NULLs in a UNIQUE index as
+-- distinct: writing the predicate out says that "unlinked" is the normal case rather than
+-- leaving it to a reader to know that rule. They double as the foreign-key indexes these
+-- columns otherwise lack.
+--
+-- An index rather than a trigger probe, which the schema would otherwise prefer for the
+-- sake of its own message: a UNIQUE violation here reports the index's column, never a
+-- value, so the error-hygiene rule holds either way, and this way the constraint is also
+-- the access path M1-604's join uses. Note the consequence for INSERT OR REPLACE: each of
+-- these is another conflict target whose replacement DELETE must be caught by
+-- lifecycle_events_block_delete, which is what `PRAGMA recursive_triggers` (ledger.py) is
+-- load-bearing for.
+CREATE UNIQUE INDEX lifecycle_events_one_event_per_approval
+    ON lifecycle_events (approval_event_id) WHERE approval_event_id IS NOT NULL;
+
+CREATE UNIQUE INDEX lifecycle_events_one_event_per_attempt
+    ON lifecycle_events (submission_attempt_id) WHERE submission_attempt_id IS NOT NULL;
+
+CREATE UNIQUE INDEX lifecycle_events_one_event_per_verification
+    ON lifecycle_events (submission_verification_id) WHERE submission_verification_id IS NOT NULL;
+
+CREATE UNIQUE INDEX lifecycle_events_one_event_per_resolution
+    ON lifecycle_events (resolution_event_id) WHERE resolution_event_id IS NOT NULL;
+
+CREATE UNIQUE INDEX lifecycle_events_one_event_per_score
+    ON lifecycle_events (score_event_id) WHERE score_event_id IS NOT NULL;
 
 -- The state machine. `to_status = 'failed'` is terminal by omission -- there is no
 -- transition out of it, because a retry is a new forecast *version* (M1-602), not a
@@ -194,10 +300,24 @@ CREATE TABLE lifecycle_events (
 -- while the handoff requires exactly the opposite, that an uncertain attempt "block retry
 -- until a refetch resolves the state" (GPT review round 2, finding 3; reproduced). Owner
 -- decision: the record stays `approved`, the uncertainty is recorded with its
--- detail_code, and the next attempt can still reach `submitted` or `failed`. Deciding it
+-- detail_code, and a refetch can still carry it to `submitted` or `failed`. Deciding it
 -- here rather than in M2-704 is the same reasoning the resolution and score transitions
 -- are defined here for -- migrations are immutable, and a missing event type later costs
 -- a whole migration.
+--
+-- What round 2 left missing is `submission_confirmed` / `submission_disconfirmed`, the
+-- two ways out of that state. They are the *refetch's* transitions, not another attempt's:
+-- they cite a `submission_verifications` row, so reaching `submitted` no longer requires
+-- minting a second idempotency key for a post that was never made (round 3, finding 1).
+-- `submission_disconfirmed` lands in terminal `failed` for the same reason a (0, 0)
+-- attempt does -- the post is not there, and the retry is a new forecast version.
+--
+-- (0, 1) -- the request errored but a refetch found the forecast -- stays `uncertain`
+-- rather than becoming `submitted` (owner decision, round 3). `success = 0` means no
+-- receipt, and the handoff's prohibited claims forbid saying a live call succeeded
+-- without one. A confirming refetch is exactly what `submission_confirmed` is for, and
+-- routing it through a verification row keeps the confirmation itself in the ledger
+-- instead of inferring it from an attempt that failed.
 --
 -- The same table is spelled out in whiskeyjack_bot.lifecycle._LEGAL_TRANSITIONS. The
 -- duplication is deliberate -- the database is the enforcement, the Python table is the
@@ -250,6 +370,8 @@ BEGIN
         OR (NEW.event_type = 'submitted'            AND NEW.from_status = 'approved'  AND NEW.to_status = 'submitted')
         OR (NEW.event_type = 'submission_uncertain' AND NEW.from_status = 'approved'  AND NEW.to_status = 'approved')
         OR (NEW.event_type = 'submission_failed'    AND NEW.from_status = 'approved'  AND NEW.to_status = 'failed')
+        OR (NEW.event_type = 'submission_confirmed' AND NEW.from_status = 'approved'  AND NEW.to_status = 'submitted')
+        OR (NEW.event_type = 'submission_disconfirmed' AND NEW.from_status = 'approved' AND NEW.to_status = 'failed')
         OR (NEW.event_type = 'resolved'             AND NEW.from_status = 'submitted' AND NEW.to_status = 'resolved')
         OR (NEW.event_type = 'scored'               AND NEW.from_status = 'resolved'  AND NEW.to_status = 'scored')
     );
@@ -276,7 +398,8 @@ BEGIN
     -- an omission that shows up as an unenforced rule rather than as a wrong one.
     SELECT RAISE(ABORT, 'lifecycle_events: this event type carries no detail_code')
     WHERE NEW.event_type IN (
-             'validated', 'rejected', 'approved', 'submitted', 'resolved', 'scored'
+             'validated', 'rejected', 'approved', 'submitted', 'submission_confirmed',
+             'resolved', 'scored'
          )
       AND NEW.detail_code IS NOT NULL;
 
@@ -285,6 +408,7 @@ BEGIN
     WHERE NEW.event_type IN ('approved', 'rejected')
       AND (NEW.approval_event_id IS NULL
            OR NEW.submission_attempt_id IS NOT NULL
+           OR NEW.submission_verification_id IS NOT NULL
            OR NEW.resolution_event_id IS NOT NULL
            OR NEW.score_event_id IS NOT NULL);
 
@@ -292,6 +416,18 @@ BEGIN
     WHERE NEW.event_type IN ('submitted', 'submission_uncertain', 'submission_failed')
       AND (NEW.submission_attempt_id IS NULL
            OR NEW.approval_event_id IS NOT NULL
+           OR NEW.submission_verification_id IS NOT NULL
+           OR NEW.resolution_event_id IS NOT NULL
+           OR NEW.score_event_id IS NOT NULL);
+
+    -- The refetch's own two events cite the observation, not the attempt. Linking the
+    -- attempt instead would be the second-post problem again: the attempt row is the
+    -- record of a request, and no request was made.
+    SELECT RAISE(ABORT, 'lifecycle_events: a submission verification event must link exactly one submission_verifications row')
+    WHERE NEW.event_type IN ('submission_confirmed', 'submission_disconfirmed')
+      AND (NEW.submission_verification_id IS NULL
+           OR NEW.approval_event_id IS NOT NULL
+           OR NEW.submission_attempt_id IS NOT NULL
            OR NEW.resolution_event_id IS NOT NULL
            OR NEW.score_event_id IS NOT NULL);
 
@@ -300,6 +436,7 @@ BEGIN
       AND (NEW.resolution_event_id IS NULL
            OR NEW.approval_event_id IS NOT NULL
            OR NEW.submission_attempt_id IS NOT NULL
+           OR NEW.submission_verification_id IS NOT NULL
            OR NEW.score_event_id IS NOT NULL);
 
     SELECT RAISE(ABORT, 'lifecycle_events: a score event must link exactly one score_events row')
@@ -307,12 +444,14 @@ BEGIN
       AND (NEW.score_event_id IS NULL
            OR NEW.approval_event_id IS NOT NULL
            OR NEW.submission_attempt_id IS NOT NULL
+           OR NEW.submission_verification_id IS NOT NULL
            OR NEW.resolution_event_id IS NOT NULL);
 
     SELECT RAISE(ABORT, 'lifecycle_events: this event type carries no detail row')
     WHERE NEW.event_type IN ('validated', 'validation_failed')
       AND (NEW.approval_event_id IS NOT NULL
            OR NEW.submission_attempt_id IS NOT NULL
+           OR NEW.submission_verification_id IS NOT NULL
            OR NEW.resolution_event_id IS NOT NULL
            OR NEW.score_event_id IS NOT NULL);
 
@@ -395,6 +534,69 @@ BEGIN
            WHERE attempt_id = NEW.submission_attempt_id
              AND success = 0
              AND verified_by_refetch = 0
+      );
+
+    -- Until a refetch resolves it, an uncertain post is the last thing that happened to
+    -- this record: no further attempt may be recorded. This is the handoff's "block retry
+    -- until refetch resolves state" as a constraint rather than a convention M2-704 keeps
+    -- (round 3, finding 1) -- and it is the reason the resolution had to become a real
+    -- event first, since without one the record could reach neither a retry nor a
+    -- confirmation and the block would be a deadlock.
+    --
+    -- A bare EXISTS is exact, not approximate: a resolved uncertainty has already carried
+    -- the record to `submitted` or `failed`, and none of these three events is legal from
+    -- there anyway. So the only rows this can see are unresolved ones.
+    SELECT RAISE(ABORT, 'lifecycle_events: this record has an unresolved uncertain submission; a refetch must confirm or disconfirm it before another attempt is recorded')
+    WHERE NEW.event_type IN ('submitted', 'submission_uncertain', 'submission_failed')
+      AND EXISTS (
+          SELECT 1 FROM lifecycle_events
+           WHERE forecast_record_id = NEW.forecast_record_id
+             AND event_type = 'submission_uncertain'
+      );
+
+    -- The verification's attempt is what ties it to this record; the row itself stores no
+    -- forecast_record_id, so the join is the ownership check.
+    SELECT RAISE(ABORT, 'lifecycle_events: the linked submission_verifications row verifies an attempt on another forecast record')
+    WHERE NEW.submission_verification_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM submission_verifications v
+            JOIN submission_attempts s ON s.attempt_id = v.submission_attempt_id
+           WHERE v.verification_id = NEW.submission_verification_id
+             AND s.forecast_record_id = NEW.forecast_record_id
+      );
+
+    -- ... and what it saw decides which event it can back, the same way an approval's
+    -- `decision` does. Without this, a refetch that found nothing could carry the record
+    -- to `submitted`.
+    SELECT RAISE(ABORT, 'lifecycle_events: the linked submission_verifications row records a different observation than this event')
+    WHERE NEW.submission_verification_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM submission_verifications
+           WHERE verification_id = NEW.submission_verification_id
+             AND outcome = CASE NEW.event_type
+                               WHEN 'submission_confirmed' THEN 'confirmed'
+                               WHEN 'submission_disconfirmed' THEN 'absent'
+                           END
+      );
+
+    -- A verification resolves an *uncertainty*. An attempt this ledger recorded as
+    -- `submitted` or `submission_failed` has already been accounted for, and re-deciding
+    -- it from a later refetch would overwrite that account with a second, contradicting
+    -- one -- which is what append-only exists to prevent.
+    --
+    -- `e.forecast_record_id = NEW.forecast_record_id` is implied by the ownership probe
+    -- above -- an attempt belongs to one record, and an event citing it had to pass that
+    -- same probe -- and is written out anyway. A constraint that holds only because
+    -- another constraint holds is one refactor away from holding for no reason, and this
+    -- one is cheap.
+    SELECT RAISE(ABORT, 'lifecycle_events: the verified submission attempt was not recorded as uncertain, so there is nothing for a refetch to resolve')
+    WHERE NEW.submission_verification_id IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM submission_verifications v
+            JOIN lifecycle_events e ON e.submission_attempt_id = v.submission_attempt_id
+           WHERE v.verification_id = NEW.submission_verification_id
+             AND e.event_type = 'submission_uncertain'
+             AND e.forecast_record_id = NEW.forecast_record_id
       );
 
     SELECT RAISE(ABORT, 'lifecycle_events: the linked resolution_events row is for another forecast record')
@@ -484,6 +686,21 @@ END;
 --   an HTTP status code; -1, 0, 600 and 2**63-1 all persisted as audit data before this
 --   (round 2, finding 7). typeof() is part of the constraint for the affinity reason 002
 --   documents for posts_dropped_no_url: INTEGER is affinity, not a type.
+-- * ... and it must be a receipt for an interval that ran forwards. The writer compared
+--   the two instants and the schema did not, so a direct insert could persist an attempt
+--   that completed a day before it was requested -- permanently, on an append-only table
+--   whose `requested_at_utc` is what an idempotency key is reasoned about against (round
+--   3, finding 3; reproduced). Every other rule in this item holds in both layers; this
+--   one held in one.
+--
+--   The typeof/julianday probe is not a separate rule but what makes the ordering one
+--   well defined. julianday() reads a bare integer as a Julian day *number* and returns
+--   NULL for anything it cannot parse, and a NULL comparison is neither true nor false --
+--   so without it the ordering check would silently not fire on exactly the inputs that
+--   most need it. It stops there deliberately: 001 pins no timestamp *format* on any
+--   column, and pinning one here alone would make this table the lone outlier, which is
+--   worse than either consistent policy (the argument CLAUDE.md settles the path
+--   carve-out with).
 --
 -- INSERT only. UPDATE and DELETE on this table are refused outright below, so there is
 -- no second path a row can arrive by.
@@ -494,11 +711,44 @@ BEGIN
     SELECT RAISE(ABORT, 'submission_attempts: completed_at_utc is required; an attempt is recorded once, after it has finished')
     WHERE NEW.completed_at_utc IS NULL;
 
+    SELECT RAISE(ABORT, 'submission_attempts: requested_at_utc and completed_at_utc must be text timestamps SQLite can order')
+    WHERE typeof(NEW.requested_at_utc) <> 'text'
+       OR typeof(NEW.completed_at_utc) <> 'text'
+       OR julianday(NEW.requested_at_utc) IS NULL
+       OR julianday(NEW.completed_at_utc) IS NULL;
+
+    SELECT RAISE(ABORT, 'submission_attempts: completed_at_utc is earlier than requested_at_utc')
+    WHERE julianday(NEW.completed_at_utc) < julianday(NEW.requested_at_utc);
+
     SELECT RAISE(ABORT, 'submission_attempts: http_status must be an integer HTTP status code between 100 and 599')
     WHERE NEW.http_status IS NOT NULL
       AND (typeof(NEW.http_status) <> 'integer'
            OR NEW.http_status < 100
            OR NEW.http_status > 599);
+END;
+
+-- A verification is a receipt too, and gets the same treatment: it names an attempt this
+-- ledger holds, and it cannot have been observed before that attempt finished. The
+-- attempt-exists probe runs ahead of the foreign key so the message is this schema's own,
+-- as with lifecycle_events above.
+CREATE TRIGGER submission_verifications_require_receipt_on_insert
+BEFORE INSERT ON submission_verifications
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'submission_verifications: submission_attempt_id does not name a stored submission attempt')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM submission_attempts WHERE attempt_id = NEW.submission_attempt_id
+    );
+
+    SELECT RAISE(ABORT, 'submission_verifications: observed_at_utc must be a text timestamp SQLite can order')
+    WHERE typeof(NEW.observed_at_utc) <> 'text'
+       OR julianday(NEW.observed_at_utc) IS NULL;
+
+    SELECT RAISE(ABORT, 'submission_verifications: observed_at_utc is earlier than the completion of the attempt it verifies')
+    WHERE julianday(NEW.observed_at_utc) < (
+        SELECT julianday(completed_at_utc) FROM submission_attempts
+         WHERE attempt_id = NEW.submission_attempt_id
+    );
 END;
 
 -- Append-only enforcement (D25). SQLite has no multi-event trigger, so UPDATE and
@@ -564,6 +814,20 @@ BEFORE DELETE ON submission_attempts
 FOR EACH ROW
 BEGIN
     SELECT RAISE(ABORT, 'submission_attempts is append-only: an attempt is never deleted');
+END;
+
+CREATE TRIGGER submission_verifications_block_update
+BEFORE UPDATE ON submission_verifications
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'submission_verifications is append-only: what a refetch saw is never rewritten; record a new observation');
+END;
+
+CREATE TRIGGER submission_verifications_block_delete
+BEFORE DELETE ON submission_verifications
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'submission_verifications is append-only: a recorded observation is never deleted');
 END;
 
 CREATE TRIGGER resolution_events_block_update

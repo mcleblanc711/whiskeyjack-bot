@@ -22,6 +22,7 @@ LEDGER_TABLES = {
     "research_documents",
     "approval_events",
     "submission_attempts",
+    "submission_verifications",
     "resolution_events",
     "score_events",
     "lifecycle_events",
