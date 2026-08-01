@@ -596,6 +596,13 @@ def test_a_result_outside_the_allowlist_stays_web(config: AppConfig) -> None:
     assert all(d.source_type == "web" for d in result.documents)
 
 
+def test_a_string_suffix_coincidence_is_not_a_subdomain_match(config: AppConfig) -> None:
+    """``notbls.gov`` must not earn ``official`` off the ``bls.gov`` allowlist."""
+    handler = _Exchange(_json_ok(_body(_result(url="https://notbls.gov/page"))))
+    result = _retrieve(handler, config, include_domains=("bls.gov",))
+    assert all(d.source_type == "web" for d in result.documents)
+
+
 def test_official_reason_alone_does_not_make_a_document_official(config: AppConfig) -> None:
     """The allowlist earns the label; the reason does not."""
     handler = _Exchange(_json_ok(_body(_result())))

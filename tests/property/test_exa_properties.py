@@ -21,13 +21,14 @@ import pytest
 from hypothesis import given, strategies as st
 from strategies import HOSTILE_TEXT, URL_CANDIDATES, persisted, round_trip
 
-from whiskeyjack_bot.research.canonical import CanonicalizationError
+from whiskeyjack_bot.research.canonical import CanonicalizationError, canonicalize_url
 from whiskeyjack_bot.research.exa import (
     ExaFallbackError,
     FallbackReason,
     _call_cost_usd,
     _canonical_reasons,
     _hash_source,
+    _matches_official_domain,
     _published_at_utc,
     _to_document,
     decide_fallback,
@@ -307,3 +308,49 @@ def test_costs_are_finite_non_negative_or_absent(value: Any) -> None:
 def test_a_malformed_cost_block_is_never_a_raise(block: Any) -> None:
     assert _call_cost_usd({"costDollars": block}) is None
     assert _call_cost_usd({}) is None
+
+
+# --- official-domain matching (PR #16 round-3 finding 2) --------------------
+
+_DOMAIN_LABEL = st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1, max_size=8)
+
+_BASE_DOMAINS = ("bls.gov", "sec.gov", "who.int")
+
+
+@given(URL_CANDIDATES, st.lists(HOSTILE_TEXT, max_size=4))
+def test_domain_match_never_raises(url: str, domains: list[str]) -> None:
+    """Total over any canonical URL and any allowlist a caller could pass."""
+    try:
+        canonical = canonicalize_url(url)
+    except CanonicalizationError:
+        return
+    assert isinstance(_matches_official_domain(canonical, domains), bool)
+
+
+@given(st.sampled_from(_BASE_DOMAINS), st.none() | _DOMAIN_LABEL)
+def test_domain_match_is_exact_or_subdomain(domain: str, subdomain: str | None) -> None:
+    """The bare domain matches itself; any subdomain of it matches too."""
+    host = domain if subdomain is None else f"{subdomain}.{domain}"
+    canonical = canonicalize_url(f"https://{host}/path")
+    assert _matches_official_domain(canonical, (domain,)) is True
+
+
+@given(URL_CANDIDATES)
+def test_domain_match_is_false_with_no_allowlist(url: str) -> None:
+    try:
+        canonical = canonicalize_url(url)
+    except CanonicalizationError:
+        return
+    assert _matches_official_domain(canonical, ()) is False
+
+
+def test_domain_match_rejects_a_different_domain() -> None:
+    """A result outside the allowlist must not match merely because a run requested one."""
+    canonical = canonicalize_url("https://example.org/june-payrolls")
+    assert _matches_official_domain(canonical, ("bls.gov",)) is False
+
+
+def test_domain_match_does_not_match_on_a_bare_suffix() -> None:
+    """``notbls.gov`` must not match ``bls.gov``: string-suffix, not subdomain, coincidence."""
+    canonical = canonicalize_url("https://notbls.gov/page")
+    assert _matches_official_domain(canonical, ("bls.gov",)) is False
