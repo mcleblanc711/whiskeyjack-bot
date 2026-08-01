@@ -104,25 +104,29 @@ def _json_ok(body: dict[str, Any]) -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
-def _client(handler: _Exchange) -> httpx.Client:
-    return httpx.Client(base_url="https://api.exa.ai", transport=httpx.MockTransport(handler))
+def _client(handler: _Exchange, base_url: str = "https://api.exa.ai") -> httpx.Client:
+    return httpx.Client(base_url=base_url, transport=httpx.MockTransport(handler))
 
 
 def _retrieve(
     handler: _Exchange,
     config: AppConfig,
     *,
-    queries: list[str] | None = None,
+    queries: Any = None,
     reasons: tuple[exa.FallbackReason, ...] = REASONS,
-    include_domains: tuple[str, ...] = (),
+    include_domains: Any = (),
+    base_url: str = "https://api.exa.ai",
+    question_id: Any = 42,
+    retrieval_run_id: Any = "run-1",
+    now: Any = NOW,
 ) -> ExaRetrieval:
     return retrieve_web(
-        _client(handler),
+        _client(handler, base_url),
         config,
-        question_id=42,
+        question_id=question_id,
         queries=["june payrolls"] if queries is None else queries,
-        retrieval_run_id="run-1",
-        now=NOW,
+        retrieval_run_id=retrieval_run_id,
+        now=now,
         fallback_reasons=reasons,
         include_domains=include_domains,
     )
@@ -192,6 +196,26 @@ def test_decide_fallback_rejects_a_count_that_is_not_a_count(documents: Any) -> 
         decide_fallback(
             primary_failed=False, primary_documents=documents, official_source_required=False
         )
+
+
+@pytest.mark.parametrize("flag", ["false", "", 0, 1, None, [], object()])
+@pytest.mark.parametrize("name", ["primary_failed", "official_source_required"])
+def test_decide_fallback_rejects_a_flag_that_is_not_a_bool(name: str, flag: Any) -> None:
+    """Truthiness is not the test (round 4, finding 3).
+
+    ``primary_failed="false"`` is truthy: it authorized a paid call and persisted
+    ``primary_provider_failed`` as the reason it happened -- an attribution
+    nothing had established. The falsy non-bools are here for the same reason:
+    both directions are a caller mistake, not a decision.
+    """
+    kwargs: dict[str, Any] = {
+        "primary_failed": False,
+        "primary_documents": 0,
+        "official_source_required": False,
+    }
+    kwargs[name] = flag
+    with pytest.raises(ExaFallbackError):
+        decide_fallback(**kwargs)
 
 
 # --- no silent provider switching -------------------------------------------
@@ -314,6 +338,142 @@ def test_retrieve_web_refuses_when_primary_is_not_asknews(config: AppConfig) -> 
     with pytest.raises(ExaFallbackError):
         _retrieve(handler, custom)
     assert handler.requests == [], "refusal must happen before any billable call"
+
+
+# --- the client must actually address Exa (round 4, finding 1) --------------
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # A valid Exa config with a client pointed elsewhere: the request went to
+        # the other host while the run recorded provider="exa".
+        "https://other-provider.example",
+        # Right host, wrong service: the merged URL is /v1/search.
+        "https://api.exa.ai/v1",
+        "http://api.exa.ai",
+        "https://api.exa.ai:8443",
+        # A credential riding along in the base URL.
+        "https://user:pass@api.exa.ai",
+        # No base_url at all.
+        "",
+    ],
+)
+def test_retrieve_web_refuses_a_client_pointed_away_from_exa(
+    config: AppConfig, base_url: str
+) -> None:
+    """Config proves what was configured; it says nothing about where the client posts."""
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, base_url=base_url)
+    assert handler.requests == [], "refusal must happen before any billable call"
+
+
+def test_a_trailing_slash_in_the_base_url_is_still_exa(config: AppConfig) -> None:
+    """The check is structural: httpx spells the same destination two ways."""
+    handler = _Exchange(_json_ok(_body(_result())))
+    result = _retrieve(handler, config, base_url="https://api.exa.ai/")
+    assert handler.requests[0]["url"] == "https://api.exa.ai/search"
+    assert result.run.provider == "exa"
+
+
+def test_the_client_build_exa_client_returns_is_accepted(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one client this module builds must pass the check it also enforces."""
+    monkeypatch.setenv(config.retrieval.fallback.api_key_env, FAKE_KEY)
+    exa._require_exa_client(build_exa_client(config))
+
+
+# --- caller arguments are validated before billing (round 4, findings 2/4) ---
+
+
+@pytest.mark.parametrize("queries", ["inflation", b"inflation", ("q", 42), ("q", ""), ("q", None)])
+def test_retrieve_web_refuses_malformed_queries_before_any_call(
+    config: AppConfig, queries: Any
+) -> None:
+    """A bare str satisfies Sequence[str], and iterating it bills one call per character."""
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, queries=queries)
+    assert handler.requests == [], "refusal must happen before any billable call"
+
+
+def test_a_bare_string_allowlist_is_refused_before_any_call(config: AppConfig) -> None:
+    """include_domains="bls.gov" expanded into seven single-character filters."""
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, include_domains="bls.gov")
+    assert handler.requests == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        # ResearchRun is not strict about question_id -- pydantic coerces "42"
+        # and True -- so these reached the %d in the engagement log, and the POST,
+        # before anything rejected them.
+        ("question_id", "42"),
+        ("question_id", True),
+        ("question_id", None),
+        ("question_id", 4.2),
+        ("retrieval_run_id", ""),
+        ("retrieval_run_id", 42),
+        ("retrieval_run_id", None),
+        ("now", datetime(2026, 7, 27, 12, 0)),
+        ("now", "2026-07-27T12:00:00Z"),
+        # Aware, but the freshness bound underflows datetime's range.
+        ("now", datetime(1, 1, 1, tzinfo=timezone.utc)),
+    ],
+)
+def test_malformed_run_metadata_is_refused_before_any_call(
+    config: AppConfig, field: str, value: Any
+) -> None:
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, **{field: value})
+    assert handler.requests == [], "refusal must happen before any billable call"
+
+
+def test_a_malformed_question_id_leaks_through_no_channel(
+    config: AppConfig, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A string question_id used to reach logging's %d and print itself to stderr.
+
+    stderr is the channel: logging catches the interpolation TypeError itself
+    and writes a "--- Logging error ---" report containing the raw arguments, so
+    a leak test that checked only the exception message and caplog would pass on
+    the broken code.
+    """
+    handler = _Exchange()
+    with caplog.at_level(logging.INFO, logger="whiskeyjack_bot.research.exa"):
+        with pytest.raises(ExaFallbackError) as excinfo:
+            _retrieve(handler, config, question_id=f"Q-{SECRET}")
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in repr(excinfo.value)
+    assert all(SECRET not in record.getMessage() for record in caplog.records)
+    captured = capsys.readouterr()
+    assert SECRET not in captured.err
+    assert SECRET not in captured.out
+    assert handler.requests == []
+
+
+def test_a_malformed_query_leaks_through_no_channel(
+    config: AppConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError) as excinfo:
+        _retrieve(handler, config, queries=[SECRET.encode("ascii")])
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in capsys.readouterr().err
+
+
+def test_a_bare_string_of_reasons_is_refused(config: AppConfig) -> None:
+    """fallback_reasons is a Sequence too; a bare str iterates to characters."""
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, reasons="primary_provider_failed")  # type: ignore[arg-type]
+    assert handler.requests == []
 
 
 def test_fallback_engagement_is_logged_without_provider_text(
@@ -610,7 +770,31 @@ def test_official_reason_alone_does_not_make_a_document_official(config: AppConf
     assert all(d.source_type == "web" for d in result.documents)
 
 
-@pytest.mark.parametrize("domains", [("",), ("   ",), (None,), (42,)])
+@pytest.mark.parametrize(
+    "domains",
+    [
+        ("",),
+        ("   ",),
+        (None,),
+        (42,),
+        # Filter shapes Exa documents and accepts, but that this module cannot
+        # verify per result: it would send them and then label every result they
+        # selected `web` (round 4, finding 5).
+        ("*.substack.com",),
+        ("exa.ai/blog",),
+        ("https://huggingface.co/blog",),
+        # Not bare hosts either -- and canonicalization would silently reduce
+        # both to "bls.gov" rather than reject them.
+        ("bls.gov:443",),
+        ("user@bls.gov",),
+        (" bls.gov",),
+        ("bls.gov ",),
+        ("bls .gov",),
+        # Unresolvable as a host at all.
+        ("-",),
+        ("..",),
+    ],
+)
 def test_malformed_domain_allowlist_is_refused_before_any_call(
     config: AppConfig, domains: tuple[Any, ...]
 ) -> None:
@@ -618,6 +802,29 @@ def test_malformed_domain_allowlist_is_refused_before_any_call(
     with pytest.raises(ExaFallbackError):
         _retrieve(handler, config, include_domains=domains)
     assert handler.requests == []
+
+
+def test_an_idn_allowlist_entry_matches_an_idn_result(config: AppConfig) -> None:
+    """The allowlist and the result host must be canonicalized by the same code.
+
+    A U-label entry was only lowercased, while the result's canonical host is an
+    IDNA A-label, so a genuinely official IDN source was labelled `web`.
+    """
+    handler = _Exchange(_json_ok(_body(_result(url="https://daten.bücher.de/bericht"))))
+    result = _retrieve(handler, config, include_domains=("bücher.de",))
+    assert all(d.source_type == "official" for d in result.documents)
+    # The canonical form is what Exa is sent and what the ledger records: the
+    # filter that was actually applied and matched, not the caller's spelling.
+    assert handler.requests[0]["payload"]["includeDomains"] == ["xn--bcher-kva.de"]
+    assert result.run.provider_config is not None
+    assert result.run.provider_config["include_domains"] == ["xn--bcher-kva.de"]
+
+
+def test_an_allowlist_entry_is_case_folded(config: AppConfig) -> None:
+    handler = _Exchange(_json_ok(_body(_result(url="https://data.bls.gov/x"))))
+    result = _retrieve(handler, config, include_domains=("BLS.GOV",))
+    assert handler.requests[0]["payload"]["includeDomains"] == ["bls.gov"]
+    assert all(d.source_type == "official" for d in result.documents)
 
 
 # --- the run record ---------------------------------------------------------

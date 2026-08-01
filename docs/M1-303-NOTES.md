@@ -14,9 +14,10 @@ the configured fallback records why it ran and preserves citations; no silent pr
 - **`src/whiskeyjack_bot/research/transport.py`** — `apply_connection_retries`, moved out of
   `asknews.py` unchanged so both adapters share the one httpx/httpcore workaround rather than a
   copy of it. `asknews.py` imports it; no behaviour change, and its retry tests pass untouched.
-- **`tests/unit/test_exa.py`** (97 cases at round 1; **114** after the three review rounds below)
-  and **`tests/property/test_exa_properties.py`** (14 properties at round 1; **19** after round 3
-  added the official-domain matcher). Full gate green.
+- **`tests/unit/test_exa.py`** (97 cases at round 1; **167** after the four review rounds below)
+  and **`tests/property/test_exa_properties.py`** (14 properties at round 1; **28** after round 4
+  added the allowlist validator and the non-boolean flag generators). Full gate green: 836 passed,
+  1 xfailed.
 
 **No new dependency, no migration, no schema change, no config change.** `httpx` was already a
 declared direct dependency (M1-302), `RetrievalProviderConfig` already carries the `exa` provider
@@ -97,7 +98,9 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   for an exact or subdomain match, because Exa's own enforcement of `includeDomains` is not this
   module's to trust. Tagging on the strength of the *reason* would be worse still — it would let
   `official_source_required` label whatever the open web returned, an unearned attribution claim
-  (ambiguity rule 4: stricter reading).
+  (ambiguity rule 4: stricter reading). Round 4 completed this: both sides of the comparison are now
+  canonicalized by the same function, and only bare hosts — filter shapes this module can actually
+  verify per result — are accepted at all.
 
 - **`publisher` stays `None`.** Exa returns no publisher field, and deriving one from the hostname
   would put a value in the ledger that no provider asserted. `summary` likewise stays `None` (it is
@@ -109,10 +112,20 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   `provider_failed`, fills `error_summary` with the same constants-only wording AskNews uses, and
   returns everything already retrieved. A 200 whose body is not a mapping, or carries no `results`
   list, is treated the same way — it is a contract breach, not an empty answer, and continuing
-  would pay for more calls against a provider that is not answering in the documented shape. The
-  body is recorded first either way, because the call was billed. Provider exceptions are
-  **discarded, never inspected**: an httpx error can quote the request, and the request carries the
-  API key in a header.
+  would pay for more calls against a provider that is not answering in the documented shape.
+  Provider exceptions are **discarded, never inspected**: an httpx error can quote the request, and
+  the request carries the API key in a header.
+
+  **What reaches `raw_responses`, precisely** (corrected in round 4 — this previously claimed "the
+  body is recorded first either way", which held for only one of the three failure shapes). A 200
+  whose body is a `dict` **is** retained, including one carrying no `results` list. A body that is
+  valid JSON but not a mapping, and one that does not parse at all, are **not**: the field is
+  `tuple[dict[str, Any], ...]` and there is nowhere in it for a bare list, scalar or byte string to
+  go. The spend is still marked rather than lost — `calls_attempted` counts the call the moment the
+  POST is about to be issued, so an unrecordable body forces the run's `cost_usd` to `None` under
+  the complete-or-nothing rule. If those failures must be *replayable*, M1-306 needs a raw
+  byte/status representation; inventing one here would be inventing the raw-artifact shape that
+  item owns, on a branch that adds no schema and no migration.
 
 - **Cost is recorded but qualified, and it is complete-or-nothing.** A per-call `costDollars.total`
   is unusable when it is `bool` (an `int` subclass — `true` would otherwise be recorded as one
@@ -201,7 +214,10 @@ Three P2 findings, fixed in `d2ca86c` with property coverage added in `844e389`:
   subdomain against the canonical host (`data.bls.gov` counts for `bls.gov`; a federal agency's
   data desk is still the agency), and deliberately `host == d or host.endswith(f".{d}")` rather
   than `host.endswith(d)`, so `notbls.gov` does not earn the label off `bls.gov`. A malformed or
-  typo'd allowlist entry fails safe — nothing matches, the result stays `web`.
+  typo'd allowlist entry fails safe — nothing matches, the result stays `web`. (Round 4 replaced
+  that last sentence's behaviour: a malformed entry is now **refused before the run starts** rather
+  than silently matching nothing. Failing safe was the right direction but the wrong altitude — it
+  made an unusable allowlist indistinguishable from a genuinely unofficial result.)
 - **`cost_usd` is complete-or-nothing.** It was set whenever *any* call reported a usable figure,
   so a run where a later call omitted its cost or failed after reaching Exa stored a subtotal that
   looked exactly like a complete total — an undercount against `max_cost_usd` with nothing marking
@@ -211,6 +227,96 @@ Three P2 findings, fixed in `d2ca86c` with property coverage added in `844e389`:
   `ResearchRun.cost_usd` is already nullable, so `None` says "run spend unknown" with no schema
   field, no migration and no change to the shared M1-301 schema. See the downstream note below —
   `None` means *unknown*, not *free*.
+
+## Round 4 — GPT cross-model review findings (PR #16)
+
+Five blocking findings, all reproduced locally before being fixed. Every one is the same defect
+class the module already claimed to have closed, and the module docstring said so outright — "all
+of them fire before any network use, and therefore before any billing". Findings 1–4 were
+counterexamples to that sentence. Each fix is now pinned by a test that **fails against the pre-fix
+code** (verified by stashing `src/whiskeyjack_bot/research/exa.py` and re-running).
+
+- **The client was never bound to Exa.** `retrieve_web` takes a bare `httpx.Client` and posts to the
+  relative `_SEARCH_PATH`, so a client built with `base_url="https://other-provider.example"` sent
+  the query to that host while the run persisted `provider="exa"` — a silent provider switch reached
+  from the side the round-3 fix did not cover. The round-3 config check proves what was
+  *configured*; it says nothing about where the client argument points. `_require_exa_client` now
+  compares `base_url` **structurally** against `httpx.URL(_BASE_URL)` — scheme, host, port,
+  `path.rstrip("/")` and an empty `userinfo`. String comparison would not do: httpx spells the same
+  destination as both `https://api.exa.ai` and `https://api.exa.ai/` depending on the caller, and a
+  prefix test would admit `https://api.exa.ai/v1`, whose merged request URL is
+  `https://api.exa.ai/v1/search`. `userinfo` is checked because a base URL is the one place a
+  credential could ride into the request. The round-3 `ExaClient` marker type stays rejected for the
+  reason recorded above — every test injects a `MockTransport`, and one carrying the right
+  `base_url` still passes. Stated limit, not overclaimed: this binds the *destination*, not the
+  transport, and an absolute URL handed to `.post()` would bypass `base_url` — unreachable, since
+  the path is a module constant.
+- **A bare `str` was accepted as a sequence of queries.** `str` *satisfies* `Sequence[str]`, so
+  `mypy --strict` cannot catch it, and `list("inflation")` became six billable single-character
+  searches with `run.queries == ['i','n','f','l','a','t']` in the ledger. `include_domains="bls.gov"`
+  became seven single-character filters the same way. `_string_list` now refuses `str`/`bytes`/
+  `bytearray` containers outright and requires every element to be a non-blank string, and it wraps
+  `list(values)` so a container whose `__iter__` raises still arrives as this module's error.
+  `fallback_reasons` needed no change — no single character is in the vocabulary, so a bare string
+  there already failed — but that is now pinned by a test rather than assumed.
+- **Truthiness was standing in for a boolean.** `decide_fallback(primary_failed="false", …)`
+  returned `should_run=True` with `primary_provider_failed` among the reasons: a paid call
+  authorized, and a fabricated attribution persisted as the reason it happened. `primary_documents`
+  was already gated on its exact type; the two flags were not, and the asymmetry *was* the finding.
+  Both now require exact `bool`.
+- **Caller metadata was validated only after the money was spent.** `question_id`,
+  `retrieval_run_id` and `now` reached `validate_run` at the *end* of the run, so a malformed one
+  let every billable call happen and then raised — discarding the record of the spend, which is the
+  one thing this module promises not to do — and raised `ResearchSchemaError`, a sibling module's
+  error rather than its own. Worse, the engagement log interpolates `question_id` with `%d`: given a
+  string, `logging` catches its own `TypeError` and writes a `--- Logging error ---` report to
+  **stderr containing the raw argument**. That is a value leak through a channel neither the
+  exception message nor `caplog` sees, so the new leak test asserts on `capsys` as well (the M1-302
+  rule: cover every egress channel, not every message). `_require_run_metadata` now gates all three
+  before the log line and before the first POST.
+  - `question_id` is gated **more strictly than the schema, deliberately**. `ResearchRun` is not
+    strict about it: pydantic coerces `"42"` to `42` and `True` to `1`, so a string id would
+    validate happily *after* the stderr leak had already happened and the run would have succeeded
+    with a coerced value. An exact `int` closes the channel at its source.
+  - Found while reproducing, not in the review: an aware `now` near `datetime.min` makes
+    `now - timedelta(days=freshness_days_default)` raise a raw `OverflowError`. Same class — a
+    caller mistake escaping as somebody else's exception type — so it is converted to
+    `ExaFallbackError` too.
+- **The allowlist and the result host were normalized by different code.** `_matches_official_domain`
+  compared a canonical A-label host against a merely lowercased entry, so an allowlist of
+  `("bücher.de",)` never matched a result at `https://bücher.de/` (canonical host
+  `xn--bcher-kva.de`) and a genuinely official IDN source was labelled `web`. Separately, Exa's
+  `includeDomains` also documents path prefixes (`exa.ai/blog`) and subdomain wildcards
+  (`*.substack.com`) — confirmed against Exa's published changelog and search reference — and this
+  adapter forwarded both while being structurally unable to match either.
+  - `_validated_domains` now **rejects everything but a bare host** and canonicalizes what survives
+    through the same public `canonicalize_url` that produces the `canonical_url` it is compared
+    against. That shared code path is the fix; a private import of `canonical._canonical_host` would
+    have worked but would not have guaranteed *the same* path.
+  - The character screen is not redundant with canonicalization: `canonicalize_url` silently
+    *reduces* `bls.gov:443` and `user@bls.gov` to `bls.gov`, so an entry meaning something other
+    than a bare host has to be refused before it is normalized into one that looks fine.
+  - Rejecting rather than implementing wildcard/path semantics is the stricter reading (CLAUDE.md
+    ambiguity rule 4), and it follows from the design already in place: per-result verification
+    exists precisely because Exa's filter is the provider's promise, not ours. A filter shape this
+    module cannot verify per result is one it must not accept — forwarding it means Exa honours the
+    restriction and the ledger then under-attributes every result it selected. Widening to those
+    forms means pinning down semantics Exa does not document at the edges (does `*.substack.com`
+    match bare `substack.com`?), which is a deliberate future change and not an adaptation to make
+    mid-review.
+  - **Behaviour change to note:** `provider_config["include_domains"]` and the `includeDomains` sent
+    to Exa now hold the *canonical* form (`bücher.de` → `xn--bcher-kva.de`, `BLS.GOV` → `bls.gov`),
+    not the caller's spelling. The ledger records the filter that was actually applied and matched.
+  - `_matches_official_domain` correspondingly drops its own `.strip().lower()`: both sides arrive
+    canonical, and normalizing at the comparison would mask an un-normalized allowlist reaching it
+    while fixing only one of the two forms (a U-label needs IDNA, not `str.lower`).
+- Deliberately **not** done: rejecting single-label entries such as `"gov"`, which would promote
+  every `.gov` host. Beyond the finding, and inventing allowlist policy on a round-4 review is how
+  a review reaches round six.
+
+Two non-blocking observations were also acted on — the `max_cost_usd` path below, and the
+"body is recorded first either way" claim in the failure-handling note, which was wrong for two of
+the three failure shapes and has been corrected.
 
 ## Notes for downstream items
 
@@ -224,12 +330,26 @@ Three P2 findings, fixed in `d2ca86c` with property coverage added in `844e389`:
 - **Whoever wires budget enforcement must decide what `cost_usd is None` means, explicitly.**
   Under round 3's complete-or-nothing rule it means **unknown**, never *free*: the run may have
   spent real money whose total this adapter could not vouch for. Summing a column of costs and
-  treating `None` as zero reintroduces exactly the undercount against `retrieval.max_cost_usd`
+  treating `None` as zero reintroduces exactly the undercount against `run_limits.max_cost_usd`
   that the round-3 finding was about — and it would do so on precisely the runs where a paid call
   failed, i.e. the ones most likely to be retried. Nothing reads the field today: `max_cost_usd`
-  exists only as a config field (`config.py`, `config.example.yaml`) with no consumer, and the
-  AskNews adapter always writes `None` because its credits are unconvertible. So this is a note
-  for M1-306/M1-504, not a live defect.
+  exists only as a config field (`RunLimitsConfig` in `config.py`, `run_limits:` in
+  `config.example.yaml`) with no consumer, and the AskNews adapter always writes `None` because its
+  credits are unconvertible. So this is a note for M1-306/M1-504, not a live defect. (Round 4
+  corrected the path here: it read `retrieval.max_cost_usd`, which does not exist.)
+- **The AskNews adapter has the same two caller-preflight holes round 4 closed here, and M1-302 is
+  already merged.** `retrieve_news` (`asknews.py`) takes `queries: Sequence[str]` and does
+  `list(queries)[:n]` with no container or element check, so a bare `str` expands into one billable
+  search *per character* — and AskNews makes **two** calls per query (current and historical), so
+  the same mistake costs twice as much there. Its `question_id`, `retrieval_run_id` and `now`
+  likewise reach `validate_run` only at the end of the run, so a malformed one discards the record
+  of every call already paid for and surfaces as `ResearchSchemaError` rather than the module's own
+  error. It is *less* exposed in one respect: it has no `_LOGGER` call, so it lacks the stderr
+  leak channel that made finding 4 a hygiene defect as well as a billing one.
+  Fixed here rather than there per CLAUDE.md's one-item-per-branch rule, and filed as its own
+  backlog row (**M1-309**) rather than left in a notes file. Whoever takes it should lift
+  `_string_list` and `_require_run_metadata` into a shared module next to `transport.py` rather than
+  copy them, so the two adapters cannot drift again.
 - The known **`content_sha256` lone-surrogate defect** (CLAUDE.md gotcha, open owner decision)
   reaches this adapter through Exa's `text`. It degrades to a counted drop rather than a crash,
   because `UnicodeEncodeError` is a `ValueError` and the per-result catch includes it. The property

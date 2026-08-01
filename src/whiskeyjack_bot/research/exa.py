@@ -28,6 +28,16 @@ rather than by convention:
   independently, so a caller holding any ``httpx.Client`` -- not only one
   built by :func:`build_exa_client` -- cannot use it to run Exa against a
   config that never named Exa at all.
+- Config alone was not enough, though: it proves what was *configured*, not
+  where the ``client`` argument sends a request. :func:`retrieve_web` also
+  requires the client's ``base_url`` to address the Exa API
+  (:func:`_require_exa_client`), because a client pointed at another host while
+  the run records ``provider="exa"`` is the same silent switch reached from the
+  other side.
+- ``include_domains`` accepts only bare hostnames, canonicalized through the
+  same code that canonicalizes result URLs. Exa also documents path and
+  wildcard filters; this module refuses them rather than forward a restriction
+  it cannot then verify per result. See :func:`_validated_domains`.
 
 Transport: the Exa HTTP API directly, over ``httpx``.
 
@@ -132,6 +142,18 @@ _AUTHORIZING_REASONS: Final[frozenset[FallbackReason]] = frozenset(
 
 _BASE_URL: Final = "https://api.exa.ai"
 _SEARCH_PATH: Final = "/search"
+
+# Characters that mean an allowlist entry is not a bare host: a path or wildcard
+# filter, a scheme, a port, userinfo, or an escape. See _validated_domains for
+# why those forms are refused rather than forwarded unverifiable.
+_DISALLOWED_IN_DOMAIN: Final[frozenset[str]] = frozenset("/:@*?#%[]\\ \t\r\n\v\f")
+
+# One constant for every allowlist refusal: the entry is caller content, and a
+# message that named which rule it broke would narrow it.
+_BAD_DOMAIN: Final = (
+    "include_domains entries must be bare hostnames -- no scheme, path, port, "
+    "userinfo or wildcard (offending input withheld)"
+)
 
 # ``auto`` is Exa's default mode and the only one whose cost is a flat per-search
 # charge; the deep/agentic modes bill per reasoning step. A retrieval fallback
@@ -240,9 +262,20 @@ def decide_fallback(
 
     ``primary_documents`` is the count of documents the primary provider
     *retained*, not the count it returned.
+
+    All three arguments are gated on their exact types. The two flags are not
+    tested for truthiness: ``primary_failed="false"`` is truthy, and would
+    otherwise authorize a paid call and persist ``primary_provider_failed`` as
+    the reason it happened -- a fabricated attribution, from a caller mistake
+    the annotation cannot catch at runtime (cross-model review round 4,
+    finding 3).
     """
-    if isinstance(primary_documents, bool) or not isinstance(primary_documents, int):
+    if not isinstance(primary_failed, bool):
         # Constant message: the value could be anything a caller computed.
+        raise ExaFallbackError("primary_failed must be a bool (offending input withheld)")
+    if not isinstance(official_source_required, bool):
+        raise ExaFallbackError("official_source_required must be a bool (offending input withheld)")
+    if isinstance(primary_documents, bool) or not isinstance(primary_documents, int):
         raise ExaFallbackError("primary_documents must be an int (offending input withheld)")
     if primary_documents < 0:
         raise ExaFallbackError("primary_documents must not be negative")
@@ -308,6 +341,102 @@ def _ensure_exa_is_configured_fallback(config: AppConfig) -> None:
             "adapter against a configuration where Exa is not a fallback at all "
             "(no silent provider switching)"
         )
+
+
+def _require_exa_client(client: httpx.Client) -> None:
+    """Refuse a client that does not address the Exa API.
+
+    The config checks above prove that *configuration* names Exa; they say
+    nothing about where the ``client`` argument actually sends a request. A
+    client built with ``base_url="https://other-provider.example"`` posts to
+    that host while this module writes ``provider="exa"`` on the run -- the
+    silent provider switch, arrived at from the other side (cross-model review
+    round 4, finding 1).
+
+    Compared structurally rather than as a string: ``str(base_url)`` differs by
+    a trailing slash depending on how the caller spelled it, and a prefix
+    comparison would admit ``https://api.exa.ai/v1``, whose merged request URL
+    is ``https://api.exa.ai/v1/search``. ``userinfo`` must be empty too -- a
+    base URL is the one place a credential could ride along into the request.
+
+    What this does **not** do, deliberately, is constrain the transport: every
+    test injects a ``MockTransport`` client, and the ledger's claim is about
+    which service was asked, not which socket layer carried it. A marker type
+    only :func:`build_exa_client` could produce was considered and rejected in
+    round 2 for that same reason. An absolute URL passed to ``.post()`` would
+    bypass ``base_url`` entirely, but no caller can reach that: the path is the
+    module constant ``_SEARCH_PATH``.
+    """
+    expected = httpx.URL(_BASE_URL)
+    base = client.base_url
+    actual = (base.scheme, base.host, base.port, base.path.rstrip("/"), bytes(base.userinfo))
+    if actual != (
+        expected.scheme,
+        expected.host,
+        expected.port,
+        expected.path.rstrip("/"),
+        b"",
+    ):
+        raise ExaFallbackError(
+            "client base_url does not address the Exa API; refusing to run the Exa adapter "
+            "against another destination (no silent provider switching; "
+            "offending input withheld)"
+        )
+
+
+def _string_list(values: Sequence[str], message: str) -> list[str]:
+    """Return ``values`` as a list of non-blank strings, or raise ``message``.
+
+    ``str`` **satisfies** ``Sequence[str]``, so ``mypy --strict`` cannot catch a
+    caller passing one, and iterating it yields characters: ``queries="inflation"``
+    silently became six billable single-character searches, and
+    ``include_domains="bls.gov"`` became seven single-character filters
+    (cross-model review round 4, finding 2). ``bytes``/``bytearray`` are refused
+    with them -- they iterate to ints, not strings, but the mistake is the same
+    shape and the error should be too.
+
+    ``list(values)`` is wrapped because a caller can pass any object at runtime:
+    an ``__iter__`` that raises must arrive as this module's error like every
+    other malformed shape, not as whatever it happened to throw.
+
+    ``message`` is a constant chosen by the call site, never caller data.
+    """
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ExaFallbackError(message)
+    try:
+        items = list(values)
+    except Exception:
+        raise ExaFallbackError(message) from None
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise ExaFallbackError(message)
+    return items
+
+
+def _require_run_metadata(*, question_id: int, retrieval_run_id: str, now: datetime) -> None:
+    """Refuse caller metadata the run record would reject -- before any billing.
+
+    These three reach :func:`validate_run` at the *end* of a run, which is far
+    too late: a malformed one let every billable call happen and then raised,
+    discarding the record of the spend, and it raised
+    ``ResearchSchemaError`` -- a sibling module's error, not this module's
+    (cross-model review round 4, finding 4).
+
+    ``question_id`` is gated **more strictly than the schema**, on purpose.
+    ``ResearchRun`` is not strict about it: pydantic coerces ``"42"`` to ``42``
+    and ``True`` to ``1``, so a string id would validate happily *after* the
+    ``%d`` in the engagement log had already handed it to ``logging``, which
+    prints the raw argument to stderr in its internal error report. An exact
+    ``int`` closes that channel at the source.
+    """
+    if isinstance(question_id, bool) or not isinstance(question_id, int):
+        raise ExaFallbackError("question_id must be an int (offending input withheld)")
+    if not isinstance(retrieval_run_id, str) or not retrieval_run_id:
+        raise ExaFallbackError(
+            "retrieval_run_id must be a non-empty string (offending input withheld)"
+        )
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ExaFallbackError("now must be a timezone-aware datetime (offending input withheld)")
 
 
 def build_exa_client(config: AppConfig) -> httpx.Client:
@@ -389,6 +518,7 @@ def retrieve_web(
     returns everything retrieved so far.
     """
     _ensure_exa_is_configured_fallback(config)
+    _require_exa_client(client)
     reasons = _canonical_reasons(fallback_reasons)
     if not reasons:
         raise ExaFallbackError(
@@ -401,18 +531,33 @@ def retrieve_web(
             "official_source_required; primary_returned_no_documents cannot "
             "authorize the fallback on its own"
         )
+    _require_run_metadata(question_id=question_id, retrieval_run_id=retrieval_run_id, now=now)
+    validated_queries = _string_list(
+        queries, "queries entries must be non-blank strings (offending input withheld)"
+    )
     domains = _validated_domains(include_domains)
 
     retrieval = config.retrieval
-    capped_queries = list(queries)[: retrieval.max_queries_per_question]
+    capped_queries = validated_queries[: retrieval.max_queries_per_question]
     # Exa's own contract, not a general retrieval invariant: capped here rather than in
     # the shared config schema. See _MAX_NUM_RESULTS.
     num_results = min(retrieval.max_documents_per_query, _MAX_NUM_RESULTS)
-    published_after = now - timedelta(days=retrieval.freshness_days_default)
+    try:
+        published_after = now - timedelta(days=retrieval.freshness_days_default)
+    except OverflowError:
+        # An aware datetime near datetime.min: the freshness bound falls outside
+        # the representable range. A caller mistake like any other here, and it
+        # must arrive as this module's error rather than a raw OverflowError.
+        raise ExaFallbackError(
+            "now is too early to compute a freshness bound (offending input withheld)"
+        ) from None
 
     # Logged once, before the first call, so an engagement is on the record even
     # if every call then fails. Constants and an integer id only -- no query
-    # text, no URLs, nothing provider-derived.
+    # text, no URLs, nothing provider-derived. `%d` is safe *only* because
+    # _require_run_metadata has already proved question_id is an int: given a
+    # string, logging fails to interpolate and prints the raw argument to
+    # stderr in its own error report, which is a value leak by another route.
     _LOGGER.info(
         "exa fallback engaged for question %d (reasons: %s)",
         question_id,
@@ -574,20 +719,59 @@ def retrieve_web(
 
 
 def _validated_domains(include_domains: Sequence[str]) -> list[str]:
-    """Return the domain allowlist as a list of non-blank strings.
+    """Return the allowlist as canonical bare hosts, or refuse it.
 
     Validated rather than trusted because it is persisted into
-    ``provider_config`` and sent to the provider: a non-string entry would fail
-    at ``model_dump_json`` time inside a later ledger write, long after the
-    billable calls happened.
+    ``provider_config``, sent to the provider, and matched against every result:
+    a non-string entry would fail at ``model_dump_json`` time inside a later
+    ledger write, long after the billable calls happened.
+
+    Two rules, both from cross-model review round 4, finding 5.
+
+    **Only bare hosts are accepted.** Exa's ``includeDomains`` also documents
+    path prefixes (``exa.ai/blog``) and subdomain wildcards (``*.substack.com``).
+    This module forwarded both and could never match either, so every result they
+    selected stayed ``web`` -- the run asked for official sources, Exa honoured
+    it, and the ledger under-attributed the answer. Since per-result
+    verification is the whole design (Exa's enforcement is not ours to trust), a
+    filter shape this module cannot verify is one it must not accept: refused
+    here, before the network, rather than silently under-labelled afterwards.
+    Widening to those forms means pinning down semantics Exa does not document
+    at the edges (does ``*.substack.com`` match bare ``substack.com``?), which
+    is a deliberate future change, not an adaptation to make in passing.
+
+    **Accepted entries are canonicalized**, through the same public
+    :func:`canonicalize_url` that produced the ``canonical_url`` they are
+    compared against -- that shared code path *is* the fix. Previously an entry
+    was merely lowercased, so the IDN ``bücher.de`` never matched a result at
+    ``https://bücher.de/``, whose canonical host is the A-label
+    ``xn--bcher-kva.de``. The canonical form is what gets sent to Exa and what
+    reaches ``provider_config["include_domains"]``: the ledger records the
+    filter that was actually applied and matched, not the caller's spelling of
+    it.
+
+    The character screen is not redundant with canonicalization.
+    ``canonicalize_url`` *silently drops* a port and userinfo (``bls.gov:443``
+    and ``user@bls.gov`` both reduce to ``bls.gov``), so an entry meaning
+    something other than a bare host has to be refused before it is normalized
+    into one that looks fine.
     """
-    domains = list(include_domains)
+    domains = _string_list(
+        include_domains,
+        "include_domains entries must be non-blank strings (offending input withheld)",
+    )
+    canonical: list[str] = []
     for domain in domains:
-        if not isinstance(domain, str) or not domain.strip():
-            raise ExaFallbackError(
-                "include_domains entries must be non-blank strings (offending input withheld)"
-            )
-    return domains
+        if _DISALLOWED_IN_DOMAIN.intersection(domain) or domain.strip() != domain:
+            raise ExaFallbackError(_BAD_DOMAIN)
+        try:
+            host = urlsplit(canonicalize_url(f"https://{domain}")).hostname
+        except CanonicalizationError:
+            raise ExaFallbackError(_BAD_DOMAIN) from None
+        if host is None:
+            raise ExaFallbackError(_BAD_DOMAIN)
+        canonical.append(host)
+    return canonical
 
 
 def _matches_official_domain(canonical_url: str, domains: Sequence[str]) -> bool:
@@ -595,21 +779,24 @@ def _matches_official_domain(canonical_url: str, domains: Sequence[str]) -> bool
 
     Exact match or subdomain match against ``domains`` -- ``data.bls.gov``
     counts as a match for ``bls.gov``, since a federal agency's data desk is
-    still the agency. ``domains`` are the bare, lowercase entries this module
-    already validates and sends as Exa's ``includeDomains``; Exa's own
-    enforcement of that filter is not this module's to trust (Exa can return a
-    result outside it), so each result's host is checked here independently
-    rather than assuming the run-level allowlist applies to every result it
-    returned.
+    still the agency. Exa's own enforcement of ``includeDomains`` is not this
+    module's to trust (Exa can return a result outside it), so each result's
+    host is checked here independently rather than assuming the run-level
+    allowlist applies to every result it returned.
+
+    Both sides are already canonical: ``domains`` comes from
+    :func:`_validated_domains` and the URL from :func:`canonicalize_url`, so
+    the comparison is exact. It deliberately does **not** lowercase or strip
+    here as well -- normalizing at the comparison would mask an un-normalized
+    allowlist reaching this function, and only one of the two forms would be
+    fixed by it (a U-label entry needs IDNA, not ``str.lower``).
+
+    Total: any string pair is a valid question with a ``bool`` answer.
     """
     host = urlsplit(canonical_url).hostname
     if host is None:
         return False
-    for domain in domains:
-        normalized = domain.strip().lower()
-        if host == normalized or host.endswith(f".{normalized}"):
-            return True
-    return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
 
 
 def _to_document(

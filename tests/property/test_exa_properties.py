@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from hypothesis import given, strategies as st
@@ -31,6 +32,7 @@ from whiskeyjack_bot.research.exa import (
     _matches_official_domain,
     _published_at_utc,
     _to_document,
+    _validated_domains,
     decide_fallback,
 )
 from whiskeyjack_bot.research.model import ResearchSchemaError, validate_document, validate_run
@@ -161,6 +163,61 @@ def test_a_non_count_raises_only_the_module_error(documents: Any) -> None:
             primary_documents=documents,
             official_source_required=False,
         )
+
+
+# Everything a caller could hand a bool parameter that is not one. The previous
+# generators drew flags with st.booleans() only, so they could not have found
+# round 4's finding 3 -- a truthy non-bool authorizing a paid call.
+NON_BOOLS = st.one_of(
+    st.none(),
+    st.integers(),
+    st.floats(allow_nan=True, allow_infinity=True),
+    HOSTILE_TEXT,
+    st.lists(st.integers(), max_size=2),
+    st.dictionaries(st.text(max_size=2), st.integers(), max_size=1),
+)
+
+
+@given(NON_BOOLS, st.integers(min_value=0, max_value=50), st.booleans())
+def test_a_non_bool_primary_failed_raises_only_the_module_error(
+    failed: Any, documents: int, official: bool
+) -> None:
+    """Truthiness must not be the test: "false" is truthy, and 0 and "" are not bools."""
+    with pytest.raises(ExaFallbackError):
+        decide_fallback(
+            primary_failed=failed,
+            primary_documents=documents,
+            official_source_required=official,
+        )
+
+
+@given(st.booleans(), st.integers(min_value=0, max_value=50), NON_BOOLS)
+def test_a_non_bool_official_flag_raises_only_the_module_error(
+    failed: bool, documents: int, official: Any
+) -> None:
+    with pytest.raises(ExaFallbackError):
+        decide_fallback(
+            primary_failed=failed,
+            primary_documents=documents,
+            official_source_required=official,
+        )
+
+
+@pytest.mark.parametrize(
+    "name", ["primary_failed", "primary_documents", "official_source_required"]
+)
+def test_a_planted_secret_in_any_argument_never_reaches_the_message(name: str) -> None:
+    """Planted, not drawn: a generator that cannot produce SECRET proves nothing about it."""
+    kwargs: dict[str, Any] = {
+        "primary_failed": False,
+        "primary_documents": 0,
+        "official_source_required": False,
+    }
+    kwargs[name] = SECRET
+    with pytest.raises(ExaFallbackError) as excinfo:
+        decide_fallback(**kwargs)
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in repr(excinfo.value)
 
 
 @given(st.lists(st.sampled_from(REASONS), max_size=8))
@@ -317,6 +374,29 @@ _DOMAIN_LABEL = st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_siz
 _BASE_DOMAINS = ("bls.gov", "sec.gov", "who.int")
 
 
+# IDN and A-label spellings of the same hosts, which the ASCII-only generators
+# above could not produce -- and which is the whole of round 4's finding 5: the
+# allowlist was lowercased while the result host was IDNA-encoded, so the two
+# forms of one domain never met.
+_IDN_DOMAINS = ("bücher.de", "xn--bcher-kva.de", "нэб.рф", "παράδειγμα.δοκιμή")
+
+# Filter shapes Exa documents and accepts, which this module cannot verify per
+# result and therefore refuses outright.
+_UNVERIFIABLE_FILTERS = (
+    "*.substack.com",
+    "exa.ai/blog",
+    "https://huggingface.co/blog",
+    "bls.gov:443",
+    "user@bls.gov",
+    " bls.gov",
+)
+
+# What a bare host cannot contain, stated here rather than imported from the
+# module under test: a post-condition asserted against the implementation's own
+# constant cannot catch a mistake *in* that constant.
+_NOT_IN_A_BARE_HOST = frozenset("/:@*?#% \t\r\n")
+
+
 @given(URL_CANDIDATES, st.lists(HOSTILE_TEXT, max_size=4))
 def test_domain_match_never_raises(url: str, domains: list[str]) -> None:
     """Total over any canonical URL and any allowlist a caller could pass."""
@@ -325,6 +405,108 @@ def test_domain_match_never_raises(url: str, domains: list[str]) -> None:
     except CanonicalizationError:
         return
     assert isinstance(_matches_official_domain(canonical, domains), bool)
+
+
+# --- the validated allowlist (round 4, finding 5) ---------------------------
+
+
+@given(
+    st.one_of(
+        st.lists(HOSTILE_TEXT, max_size=4),
+        st.lists(st.sampled_from(_IDN_DOMAINS + _BASE_DOMAINS + _UNVERIFIABLE_FILTERS), max_size=4),
+        st.lists(st.one_of(st.none(), st.integers(), st.booleans()), max_size=3),
+        HOSTILE_TEXT,
+        st.sampled_from(["bls.gov", b"bls.gov"]),
+    )
+)
+def test_validated_domains_raises_only_the_module_error(domains: Any) -> None:
+    """Total, and the output is always a bare host this module can match against.
+
+    The post-condition is the discriminating half: asserting only "a non-empty
+    string comes back" passes on the pre-fix code, which returned entries
+    untouched. What has to hold is that nothing survives validation unless it is
+    already the exact form ``_matches_official_domain`` compares hostnames to.
+    """
+    try:
+        validated = _validated_domains(domains)
+    except ExaFallbackError:
+        return
+    for domain in validated:
+        assert isinstance(domain, str) and domain
+        assert not _NOT_IN_A_BARE_HOST.intersection(domain)
+        assert domain == domain.strip().lower()
+        # The entry and a result's host must come out of the same canonicalizer.
+        assert urlsplit(canonicalize_url(f"https://{domain}")).hostname == domain
+
+
+@given(
+    st.lists(st.sampled_from(_IDN_DOMAINS + _BASE_DOMAINS), max_size=4)
+    | st.lists(HOSTILE_TEXT, max_size=3)
+    | st.lists(st.sampled_from(_UNVERIFIABLE_FILTERS), max_size=2)
+)
+def test_a_validated_allowlist_is_a_fixed_point(domains: list[str]) -> None:
+    """Validating twice must not move it: the stored form is what gets matched.
+
+    Paired with the entry-shape assertion, since a fixed point alone is trivially
+    true of the identity function the pre-fix code was.
+    """
+    try:
+        once = _validated_domains(domains)
+    except ExaFallbackError:
+        return
+    assert _validated_domains(once) == once
+    assert all(not _NOT_IN_A_BARE_HOST.intersection(domain) for domain in once)
+
+
+@given(st.sampled_from(_UNVERIFIABLE_FILTERS))
+def test_a_filter_this_module_cannot_verify_is_refused(entry: str) -> None:
+    """Forwarding one and then labelling its results `web` is silent under-attribution."""
+    with pytest.raises(ExaFallbackError):
+        _validated_domains((entry,))
+
+
+@given(URL_CANDIDATES)
+def test_a_hosts_as_written_form_matches_a_result_on_that_host(url: str) -> None:
+    """The property finding 5 broke: an allowlist entry must match a result on that host.
+
+    The entry is taken from the URL **as written**, not from its canonical form.
+    That distinction is the entire finding: a caller writes ``bücher.de``, the
+    result's canonical host is ``xn--bcher-kva.de``, and the two never met.
+    Sourcing the entry from the already-canonicalized URL instead would pass on
+    the pre-fix code, because both sides would already be A-labels.
+    """
+    try:
+        canonical = canonicalize_url(url)
+    except CanonicalizationError:
+        return
+    as_written = urlsplit(url).hostname
+    if as_written is None:
+        return
+    try:
+        domains = _validated_domains((as_written,))
+    except ExaFallbackError:
+        # An IP literal or a host urlsplit spells with syntax a bare host cannot
+        # carry (an IPv6 address arrives with colons).
+        return
+    assert _matches_official_domain(canonical, domains) is True
+
+
+@given(st.sampled_from(_IDN_DOMAINS), st.none() | _DOMAIN_LABEL)
+def test_an_idn_allowlist_entry_matches_its_own_subdomains(
+    domain: str, subdomain: str | None
+) -> None:
+    """Both spellings of one IDN domain must select the same results."""
+    validated = _validated_domains((domain,))
+    host = domain if subdomain is None else f"{subdomain}.{domain}"
+    canonical = canonicalize_url(f"https://{host}/path")
+    assert _matches_official_domain(canonical, validated) is True
+
+
+def test_a_planted_secret_in_an_allowlist_entry_never_reaches_the_message() -> None:
+    with pytest.raises(ExaFallbackError) as excinfo:
+        _validated_domains((f"{SECRET}/path",))
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in repr(excinfo.value)
 
 
 @given(st.sampled_from(_BASE_DOMAINS), st.none() | _DOMAIN_LABEL)
