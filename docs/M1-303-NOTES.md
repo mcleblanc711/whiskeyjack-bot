@@ -14,8 +14,9 @@ the configured fallback records why it ran and preserves citations; no silent pr
 - **`src/whiskeyjack_bot/research/transport.py`** — `apply_connection_retries`, moved out of
   `asknews.py` unchanged so both adapters share the one httpx/httpcore workaround rather than a
   copy of it. `asknews.py` imports it; no behaviour change, and its retry tests pass untouched.
-- **`tests/unit/test_exa.py`** (97 cases; 107 after the round-2 fixes below) and
-  **`tests/property/test_exa_properties.py`** (14 properties). Full gate green.
+- **`tests/unit/test_exa.py`** (97 cases at round 1; **114** after the three review rounds below)
+  and **`tests/property/test_exa_properties.py`** (14 properties at round 1; **19** after round 3
+  added the official-domain matcher). Full gate green.
 
 **No new dependency, no migration, no schema change, no config change.** `httpx` was already a
 declared direct dependency (M1-302), `RetrievalProviderConfig` already carries the `exa` provider
@@ -42,12 +43,15 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   understanding.
 
 - **"No silent provider switching" is enforced by the signature, not by discipline.**
-  `retrieve_web` **requires** a non-empty `fallback_reasons`; an empty sequence or a value outside
-  the vocabulary raises `ExaFallbackError` before any billable call. `build_exa_client` refuses
-  when `retrieval.fallback.provider` is not `exa` — running this adapter against a differently
-  configured fallback *is* the silent switch — and that refusal is checked **before** the
-  credential lookup. One INFO log line records the engagement, from constants and the integer
-  question id only.
+  `retrieve_web` **requires** a non-empty `fallback_reasons`; an empty sequence, a value outside
+  the vocabulary, or (since round 2) a set carrying no *authorizing* reason raises
+  `ExaFallbackError` before any billable call. The config refusal — `retrieval.fallback.provider`
+  must be `exa` and `retrieval.primary.provider` must be `asknews`, since running this adapter
+  against a differently configured fallback *is* the silent switch — lives in
+  `_ensure_exa_is_configured_fallback` and is applied at **both** entry points, `build_exa_client`
+  and `retrieve_web` (tightened in round 3; a `client` argument carries no memory of which config
+  built it). In `build_exa_client` it is checked **before** the credential lookup. One INFO log
+  line records the engagement, from constants and the integer question id only.
 
 - **`should_run` is exactly the backlog's two conditions; every relevant fact is still recorded
   once it does.** (Corrected in round 2 — see below.) `decide_fallback` triggers only on
@@ -86,9 +90,13 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   alternative — discarding the only date the provider gave — makes every document undated, and
   M1-305's owner decision treats undated as stale. A bad date never costs the citation.
 
-- **`source_type` is `official` only when the search was constrained to a caller-supplied
-  `include_domains` allowlist**, otherwise `web`. Tagging on the strength of the *reason* would let
-  `official_source_required` label whatever the open web returned — an unearned attribution claim
+- **`source_type` is `official` only when the result's own host matches the caller-supplied
+  `include_domains` allowlist**, otherwise `web`. (Tightened in round 3 — see below; it was
+  previously decided once per *run*, from whether an allowlist was supplied at all.) The allowlist
+  is a precondition, not the proof: `_matches_official_domain` checks each result's canonical host
+  for an exact or subdomain match, because Exa's own enforcement of `includeDomains` is not this
+  module's to trust. Tagging on the strength of the *reason* would be worse still — it would let
+  `official_source_required` label whatever the open web returned, an unearned attribution claim
   (ambiguity rule 4: stricter reading).
 
 - **`publisher` stays `None`.** Exa returns no publisher field, and deriving one from the hostname
@@ -106,19 +114,23 @@ and `EXA_API_KEY`, and `RetrievalProvider`, migration 002's trigger vocabulary a
   **discarded, never inspected**: an httpx error can quote the request, and the request carries the
   API key in a header.
 
-- **Cost is recorded but qualified.** `costDollars.total` is summed across calls, skipping values
-  that are `bool` (an `int` subclass — `true` would otherwise be recorded as one dollar),
-  non-numeric, negative or non-finite. `NaN`/`Infinity` are reachable in practice: they are not
-  valid JSON but `json.loads` accepts them, and a stored non-finite cost would validate here and
-  fail at ledger-write time, after the money was spent.
+- **Cost is recorded but qualified, and it is complete-or-nothing.** A per-call `costDollars.total`
+  is unusable when it is `bool` (an `int` subclass — `true` would otherwise be recorded as one
+  dollar), non-numeric, negative or non-finite. `NaN`/`Infinity` are reachable in practice: they
+  are not valid JSON but `json.loads` accepts them, and a stored non-finite cost would validate
+  here and fail at ledger-write time, after the money was spent. **A single unusable per-call cost
+  drops the whole run's `cost_usd` to `None`, not just that call's contribution** (tightened in
+  round 3 — see below): a total is only published when every *attempted* call, including one that
+  raised after reaching Exa, also reported a usable figure. Anything less is a subtotal, and a
+  subtotal stored in `cost_usd` looks exactly like a complete one.
 
-## Round 2 — GPT cross-model review findings (PR #16)
+## Round 1 — GPT cross-model review findings (PR #16)
 
-Five P2 findings from the automated cross-model review, all fixed on the same branch before the
-round-2 request:
+Five P2 findings from the automated cross-model review (the inline Codex threads on PR #16), all
+fixed on the same branch in `d82f6f6`, before the round-2 request:
 
-- **Zero documents alone no longer authorizes a call** (`decide_fallback`). The round-1 version
-  treated "AskNews returned nothing" as a third, independent trigger; the reviewer pointed out that
+- **Zero documents alone no longer authorizes a call** (`decide_fallback`). The as-submitted
+  version treated "AskNews returned nothing" as a third, independent trigger; the reviewer noted that
   the backlog's acceptance text is a closed pair ("AskNews fails **or** official-source/web
   retrieval required") and the function's own docstring already conceded a zero-document run "has
   not failed" — a direct contradiction with letting it trigger anyway. Fixed as described above.
@@ -143,6 +155,63 @@ round-2 request:
   (`PUBLISHED_DATES`, `COST_VALUES`) didn't include these boundary values, which is why hypothesis
   hadn't already caught them; both were added.
 
+## Round 2 — GPT cross-model review findings (PR #16)
+
+Three P2 findings, all fixed in `07060ea`:
+
+- **An *authorizing* reason is now required, not merely a non-empty one** (`_AUTHORIZING_REASONS`,
+  enforced in `retrieve_web` before any network call). `decide_fallback` already refused to let
+  `primary_returned_no_documents` trigger a run on its own, but `retrieve_web` accepted it as the
+  sole reason, so a caller assembling the tuple by hand could spell an Exa call authorized only by
+  a fact the policy says cannot authorize one. The two entry points now agree. A behavior change
+  for hand-assembled callers; `decide_fallback`'s own output could never hit it, because that
+  function never emits the non-authorizing reason alone.
+- **Intra-run duplicate collapsing reuses M1-305's `deduplicate()`** instead of a local first-seen
+  set. Both collapse on the same identity — every document in a run shares one
+  `retrieval_run_id`, so the local set matched `research_documents`' `UNIQUE (retrieval_run_id,
+  canonical_url, content_sha256)` — but first-seen made the *survivor* a function of provider
+  result order, so the retained author/URL could differ between two replays of the same evidence.
+  `deduplicate()` picks it by M1-305's deterministic total order. A real behavior change, and the
+  reason to prefer the shared function over a four-line local one: the tiebreak is the part that
+  took five review rounds to get right in M1-305, and it should exist once.
+- **The cumulative cost sum is guarded against overflow to `inf`.** Each per-call figure is
+  already checked with `isfinite`, but their *sum* can still overflow, and `ResearchRun.cost_usd`
+  requires a finite value — so two billed, successful calls could crash `validate_run` after the
+  money was spent. The post-loop guard drops the total the same way an unusable per-call cost is
+  dropped, rather than turning a paid run into a failure.
+
+## Round 3 — GPT cross-model review findings (PR #16)
+
+Three P2 findings, fixed in `d2ca86c` with property coverage added in `844e389`:
+
+- **The config preflight is applied at both entry points.** `build_exa_client` refused to build a
+  client against a config that did not name Exa as the fallback, but `retrieve_web` re-checked
+  nothing, and it takes a bare `httpx.Client` — so a caller holding a client built any other way
+  could run Exa against a config naming `asknews` as the fallback, and the run would persist
+  `provider="exa"`. That is precisely the silent switch the acceptance criterion forbids. The two
+  checks moved into `_ensure_exa_is_configured_fallback`, called from both. Rejected alternative:
+  a marker type (`ExaClient`) that only `build_exa_client` can construct, making the bypass
+  unrepresentable rather than re-checked — disproportionate for a pure config inspection with no
+  I/O, and it would change `retrieve_web`'s signature out from under every test that injects a
+  `MockTransport` client.
+- **`official` is decided per result, from that result's own URL** (`_matches_official_domain`),
+  not inherited from whether the run requested an allowlist at all. A real behavior change: a
+  result Exa returns *outside* `includeDomains` — which it can, the filter is the provider's
+  promise, not ours to trust — used to be labelled `official` anyway. The match is exact-or-
+  subdomain against the canonical host (`data.bls.gov` counts for `bls.gov`; a federal agency's
+  data desk is still the agency), and deliberately `host == d or host.endswith(f".{d}")` rather
+  than `host.endswith(d)`, so `notbls.gov` does not earn the label off `bls.gov`. A malformed or
+  typo'd allowlist entry fails safe — nothing matches, the result stays `web`.
+- **`cost_usd` is complete-or-nothing.** It was set whenever *any* call reported a usable figure,
+  so a run where a later call omitted its cost or failed after reaching Exa stored a subtotal that
+  looked exactly like a complete total — an undercount against `max_cost_usd` with nothing marking
+  it as partial. A call now counts as attempted the moment the loop is about to issue the POST, and
+  the total is published only when every attempted call also reported a usable cost. The reviewer
+  offered two options; this took "withhold the total" over "persist a completeness marker" because
+  `ResearchRun.cost_usd` is already nullable, so `None` says "run spend unknown" with no schema
+  field, no migration and no change to the shared M1-301 schema. See the downstream note below —
+  `None` means *unknown*, not *free*.
+
 ## Notes for downstream items
 
 - **M1-306** owns persistence and replay: `raw_responses` are in memory only, and
@@ -152,6 +221,15 @@ round-2 request:
 - **M1-504** reads `error_summary`, and this adapter keeps its meaning identical to the AskNews
   adapter's: set when the run failed or returned nothing, never for routine drops or intra-run
   duplicate collapsing (those ride on `ExaRetrieval`).
+- **Whoever wires budget enforcement must decide what `cost_usd is None` means, explicitly.**
+  Under round 3's complete-or-nothing rule it means **unknown**, never *free*: the run may have
+  spent real money whose total this adapter could not vouch for. Summing a column of costs and
+  treating `None` as zero reintroduces exactly the undercount against `retrieval.max_cost_usd`
+  that the round-3 finding was about — and it would do so on precisely the runs where a paid call
+  failed, i.e. the ones most likely to be retried. Nothing reads the field today: `max_cost_usd`
+  exists only as a config field (`config.py`, `config.example.yaml`) with no consumer, and the
+  AskNews adapter always writes `None` because its credits are unconvertible. So this is a note
+  for M1-306/M1-504, not a live defect.
 - The known **`content_sha256` lone-surrogate defect** (CLAUDE.md gotcha, open owner decision)
   reaches this adapter through Exa's `text`. It degrades to a counted drop rather than a crash,
   because `UnicodeEncodeError` is a `ValueError` and the per-result catch includes it. The property
