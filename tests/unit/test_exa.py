@@ -14,7 +14,7 @@ import json
 import logging
 import traceback
 import warnings
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +102,19 @@ class _Exchange:
 
 def _json_ok(body: dict[str, Any]) -> httpx.Response:
     return httpx.Response(200, json=body)
+
+
+class _BrokenTz(tzinfo):
+    """A tzinfo that raises from utcoffset(), which datetime calls on the caller's behalf."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        raise RuntimeError("deliberately broken tzinfo")
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "BROKEN"
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
 
 
 def _client(handler: _Exchange, base_url: str = "https://api.exa.ai") -> httpx.Client:
@@ -424,6 +437,8 @@ def test_a_bare_string_allowlist_is_refused_before_any_call(config: AppConfig) -
         ("now", "2026-07-27T12:00:00Z"),
         # Aware, but the freshness bound underflows datetime's range.
         ("now", datetime(1, 1, 1, tzinfo=timezone.utc)),
+        # A caller-supplied tzinfo runs code inside utcoffset().
+        ("now", datetime(2026, 7, 27, 12, 0, tzinfo=_BrokenTz())),
     ],
 )
 def test_malformed_run_metadata_is_refused_before_any_call(

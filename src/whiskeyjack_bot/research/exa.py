@@ -435,7 +435,18 @@ def _require_run_metadata(*, question_id: int, retrieval_run_id: str, now: datet
         raise ExaFallbackError(
             "retrieval_run_id must be a non-empty string (offending input withheld)"
         )
-    if not isinstance(now, datetime) or now.utcoffset() is None:
+    if not isinstance(now, datetime):
+        raise ExaFallbackError("now must be a timezone-aware datetime (offending input withheld)")
+    try:
+        # A caller-supplied tzinfo runs code here: utcoffset() can raise, and a
+        # broken one must arrive as this module's error like every other
+        # malformed shape rather than as whatever it happened to throw.
+        offset = now.utcoffset()
+    except Exception:
+        raise ExaFallbackError(
+            "now must be a timezone-aware datetime (offending input withheld)"
+        ) from None
+    if offset is None:
         raise ExaFallbackError("now must be a timezone-aware datetime (offending input withheld)")
 
 
