@@ -808,5 +808,71 @@ plants a fixed secret across every field and shape instead. `AllowlistEntry` is 
 (plain `_StrictModel`, not frozen), so the subset property in `test_match_domain_result_is_a_
 subset_and_deterministic` checks identity membership rather than using `set()`.
 
+**Round-5 cross-model review fixes.** Two P2 findings, both reproduced before anything changed.
+
+*1 — `verify-env` was importing the whole provider stack.* `env_verify.py` imports
+`research.allowlist`, and importing any submodule executes the package `__init__.py`, which
+re-exported from `research.asknews` → `metaculus.client` → `forecasting_tools`. Measured in a
+fresh process: `import whiskeyjack_bot.env_verify` took **7.0s** and printed a Metaculus-token
+warning, a model-cost warning and a Streamlit cache warning into the output of the one command
+whose entire job is to report cleanly on the environment. Fixed by reducing
+`research/__init__.py` to a one-line docstring — which is what CLAUDE.md's conventions already
+prescribe ("Subpackages get a one-line-docstring `__init__.py`"); `research/` was the only
+subpackage that deviated, and the deviation *was* the coupling. Nothing in `src/` imported from
+the package (every internal import was already submodule-level); the five test files that did now
+import from the owning submodule. Import is now **0.204s** with no output. The lazy-`__getattr__`
+alternative was rejected: it keeps a re-export surface no `src/` module uses, at the price of an
+importlib indirection, an `-> Any` escape hatch under `mypy --strict`, and a name→module table to
+keep in step with `__all__`. `research.asknews` itself is as costly as before, correctly — the
+AskNews adapter needs that stack; `verify-env` never did.
+
+Guarded by `tests/unit/test_env_verify.py::test_startup_module_does_not_import_provider_sdks`,
+which must run **in a subprocess**: inside pytest the SDKs are already in `sys.modules` from the
+adapter suites, so an in-process assertion would pass for the wrong reason. A companion test
+imports `research.asknews` through the same probe and asserts it *does* report both SDKs — a
+negative test with a misspelled module name or a marker that never prints is a test of nothing.
+
+*2 — Surrounding whitespace defeated username validation, uniqueness and lookup.* `" BLS_gov "`
+passed the non-blank check, stored padded, counted as **distinct** from `"BLS_gov"` for the
+case-insensitive uniqueness check, and was then unreachable through
+`lookup_by_username("BLS_gov")`. That fails *open*: M1-307 finds no match and applies the
+`unverified_social` default to an account the operator believed was tagged `official_primary`.
+Fixed by validating `username` against the actual X handle rule — `[A-Za-z0-9_]{1,15}` via
+`re.fullmatch` (never a `$` anchor: `$` also matches before a trailing newline, so `"BLS_gov\n"`
+would pass — the same greedy-anchor trap M1-401 hit). Owner decision to take the charset over a
+whitespace-only check: `username` is not free text but the key both accessors and the uniqueness
+check use, and one predicate closes the whole class — padding, interior spaces, a leading `@`, a
+zero-width character — instead of the one reported instance. Verified to accept all 46 committed
+entries unchanged. `domains` has the identical hazard (`match_domain` compares exactly, so
+`" econ_data "` matches nothing) and gets the whitespace half only, since it stays free-form.
+
+Neither accessor normalizes its argument: validation is strict at load, and stripping at query
+time would be a second contract `lookup_by_username` and `match_domain` would each have to keep
+in step with.
+
+The property suite gained the invariant whose absence let this through — and getting it right
+took three attempts worth recording, since the first two would have shipped as false assurance:
+
+- Stated as a round trip (`lookup_by_username(entry.username)`), it **passes on the broken code**:
+  looking an entry up by the exact bytes it was stored with succeeds even for `" BLS_gov "`. The
+  property has to be stated against the key *a caller actually has* — the normalized form.
+- The existing `_entry_payload` fuzzes hostile text into every field and adds a forbidden extra
+  key half the time, so only **1 in ~300** of its allowlists validates. Any property of the form
+  "an accepted allowlist guarantees X" was therefore asserting nothing. Added
+  `_plausible_payload`, weighted 7:1 toward valid values per field, because validity compounds
+  across twelve values in a three-entry file.
+- The companion uniqueness property (no two accepted entries collide once normalized) still
+  passed against the pre-fix validator at 800 examples, because it needs two entries whose
+  usernames differ *only* by padding and independent 15-character draws never collide. Usernames
+  for that strategy now come from an eight-handle pool.
+
+Both properties were then re-run against the pre-fix validator and **fail** there, which is the
+only evidence that either is worth having. The same check is why `_mostly` uses a named picker
+rather than an inline lambda: hypothesis prints the strategy's callable in every counterexample.
+
+*Cross-track note:* M1-303 (PR #16) is adding Exa names to the re-export block this change
+deletes. Its merge conflicts here; resolve by dropping the added block and pointing its test
+imports at `research.exa`.
+
 No migration, no new dependency, no `docs/TRACKS.md` change (already claimed with `none`/`no`),
 no wiring into M1-307 (doesn't exist yet on this branch).

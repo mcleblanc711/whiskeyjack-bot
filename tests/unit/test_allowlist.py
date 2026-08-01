@@ -125,8 +125,43 @@ def test_blank_domain_string_rejected(tmp_path: Path) -> None:
         load_allowlist(path)
 
 
+def test_padded_domain_string_rejected(tmp_path: Path) -> None:
+    # match_domain compares exactly, so " econ_data " matches no question domain.
+    path = _write(tmp_path, [_base_entry(domains=[" econ_data "])])
+    with pytest.raises(AllowlistError):
+        load_allowlist(path)
+
+
 def test_whitespace_only_username_rejected(tmp_path: Path) -> None:
     path = _write(tmp_path, [_base_entry(username="   ")])
+    with pytest.raises(AllowlistError):
+        load_allowlist(path)
+
+
+@pytest.mark.parametrize(
+    "username",
+    [
+        " BLS_gov ",  # round-4 review finding: validated, stored padded, never found again
+        "BLS_gov\n",  # a "$"-anchored pattern would accept this one
+        "BLS gov",
+        "@BLS_gov",
+        "BLS\u200bgov",  # zero-width space: not whitespace to str.strip()
+        "sixteen_chars_16",
+        "",
+    ],
+)
+def test_username_that_is_not_an_x_handle_is_rejected(tmp_path: Path, username: str) -> None:
+    """Every one of these would validate, store as written, count as its own entry for
+    uniqueness, and then be unfindable by lookup_by_username() -- failing open to the
+    unverified_social default for an account the operator believed was tagged."""
+    path = _write(tmp_path, [_base_entry(username=username)])
+    with pytest.raises(AllowlistError):
+        load_allowlist(path)
+
+
+def test_padded_username_does_not_hide_from_the_uniqueness_check(tmp_path: Path) -> None:
+    """The padded form used to be a *distinct* username, so this file loaded clean."""
+    path = _write(tmp_path, [_base_entry(username="BLS_gov"), _base_entry(username=" BLS_gov ")])
     with pytest.raises(AllowlistError):
         load_allowlist(path)
 

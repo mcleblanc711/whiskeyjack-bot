@@ -2,6 +2,8 @@
 non-zero on invalid live-submit settings, and never echoes a secret value."""
 
 import copy
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -281,3 +283,47 @@ def test_matching_prompt_version_passes(config_file: Path, monkeypatch: pytest.M
     report = verify_environment(config_file)
     assert report.exit_code == EXIT_OK
     assert any("declares version" in c for c in report.checks_passed)
+
+
+# --- startup cost (round-4 review finding) ---
+
+# Provider SDKs that must not be loaded just to validate config and an allowlist. Both are
+# slow and noisy at import: forecasting_tools alone took ~7s and printed a Metaculus token
+# warning, a model-cost warning and a Streamlit cache warning into verify-env's output.
+_PROVIDER_MODULES = ("forecasting_tools", "asknews_sdk")
+
+# The marker is load-bearing: an imported SDK can print to stdout as well as stderr, so the
+# answer has to be findable in output it does not control.
+_PROBE = """
+import importlib, sys
+importlib.import_module({module!r})
+print("LOADED:" + ",".join(sorted(m for m in sys.modules if m in {providers!r})))
+"""
+
+
+def _providers_loaded_by(module: str) -> list[str]:
+    probe = _PROBE.format(module=module, providers=_PROVIDER_MODULES)
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    marked = [line for line in result.stdout.splitlines() if line.startswith("LOADED:")]
+    assert len(marked) == 1, result.stdout
+    return [name for name in marked[0].removeprefix("LOADED:").split(",") if name]
+
+
+@pytest.mark.parametrize("module", ["whiskeyjack_bot.env_verify", "whiskeyjack_bot.cli"])
+def test_startup_module_does_not_import_provider_sdks(module: str) -> None:
+    """Must run in a fresh interpreter: inside pytest the SDKs are already in sys.modules
+    from the adapter suites, so an in-process assertion would fail for the wrong reason.
+
+    The coupling this guards is invisible at the import site -- env_verify imports
+    ``research.allowlist``, and it was the *package* __init__ that pulled in the AskNews
+    adapter and, through it, forecasting_tools.
+    """
+    assert _providers_loaded_by(module) == []
+
+
+def test_the_provider_probe_would_notice_a_regression() -> None:
+    """The test above passes trivially if the probe is wrong -- misspelled SDK names, a
+    marker that never prints. Importing the AskNews adapter must make it report both."""
+    assert _providers_loaded_by("whiskeyjack_bot.research.asknews") == sorted(_PROVIDER_MODULES)

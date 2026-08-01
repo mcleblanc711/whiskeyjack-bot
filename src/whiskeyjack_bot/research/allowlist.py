@@ -9,12 +9,24 @@ structural validation only; handle verification against live X is the owner's jo
 restating its values -- that Literal's own comment says as much, and a second copy of the closed
 set would be one more place for the two to drift.
 
-``domains`` is deliberately **not** validated against the taxonomy the YAML file's header comment
-documents. That taxonomy is documentation for humans adding entries, not a schema: encoding it
-here as a second, code-level source of truth would drift the moment someone edits the comment
-without touching this module. The acceptance criterion this module satisfies is "non-empty
-domains", not "domains drawn from a closed set" -- so only non-emptiness (of the list, and of each
-element) is enforced.
+``username`` is validated against the X handle rule (1-15 characters of ``A-Za-z0-9_``) rather
+than merely being non-blank, because it is not free text: it is the key for both the
+case-insensitive uniqueness check and :meth:`AccountAllowlist.lookup_by_username`. A value that
+cannot round-trip through its own lookup is a dead entry that *fails open* -- the M1-307 adapter
+finds no match and falls back to the ``unverified_social`` default for an account the operator
+believed was tagged ``official_primary``. ``" BLS_gov "`` used to validate, store padded, count as
+distinct from ``"BLS_gov"`` for uniqueness, and never be found again; so did ``"@BLS_gov"`` and a
+handle with an interior space or a zero-width character. One charset predicate closes the class
+instead of the one instance, and it accepts every entry of the committed file unchanged.
+
+``domains`` is the opposite case: free-form, so only the hazard that mirrors the username one is
+closed. :meth:`AccountAllowlist.match_domain` compares exactly, so a blank or whitespace-padded
+element matches no question domain and the tag is dead weight; both are rejected, and nothing
+else about the value is. In particular ``domains`` is deliberately **not** validated against the
+taxonomy the YAML file's header comment documents. That taxonomy is documentation for humans
+adding entries, not a schema: encoding it here as a second, code-level source of truth would
+drift the moment someone edits the comment without touching this module. The acceptance criterion
+this module satisfies is "non-empty domains", not "domains drawn from a closed set".
 
 Error hygiene matches every other module: :class:`AllowlistError` never echoes stored/file/field
 values, and :func:`load_allowlist` renders only the *path* it was given (the carve-out this
@@ -29,6 +41,7 @@ config-invalid rather than environment-missing (see ``env_verify.load_and_verify
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +51,11 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 
 from whiskeyjack_bot.config import _StrictModel
 from whiskeyjack_bot.research.model import ReliabilityTag
+
+# The X handle rule. Matched with re.fullmatch, never a ``$`` anchor: ``$`` also matches
+# just before a trailing newline, so "BLS_gov\n" would pass a "$"-anchored pattern and
+# reach lookup_by_username() as an unfindable key -- the same greedy-anchor trap M1-401 hit.
+_HANDLE = re.compile(r"[A-Za-z0-9_]{1,15}")
 
 
 class AllowlistEntry(_StrictModel):
@@ -51,21 +69,25 @@ class AllowlistEntry(_StrictModel):
 
     @field_validator("username")
     @classmethod
-    def _username_is_non_blank(cls, v: str) -> str:
-        # min_length=1 lets "   " through -- that can't identify an X account, so
-        # lookup_by_username() would carry a dead entry with no handle to match.
-        if not v.strip():
-            raise ValueError("username must be non-blank")
+    def _username_is_a_handle(cls, v: str) -> str:
+        # min_length=1 lets through "   ", " BLS_gov ", "@BLS_gov" and "BLS gov" -- none of
+        # which can identify an X account, and each of which would be stored as written,
+        # counted as its own entry by the uniqueness check, and then never returned by
+        # lookup_by_username(). The handle rule rejects all of them at load time.
+        if _HANDLE.fullmatch(v) is None:
+            raise ValueError("username must be 1-15 characters of A-Z, a-z, 0-9 or _")
         return v
 
     @field_validator("domains")
     @classmethod
     def _domains_are_non_blank(cls, v: list[str]) -> list[str]:
-        # list-level min_length catches an empty list but not domains: [""] -- a blank
-        # element would silently never match any question domain, which is worth
-        # rejecting at load time rather than leaving a dead entry in the allowlist.
-        if any(not domain.strip() for domain in v):
-            raise ValueError("domains entries must be non-blank")
+        # list-level min_length catches an empty list but not domains: [""] or [" econ_data "].
+        # match_domain() compares exactly, so a blank or padded element silently never
+        # matches any question domain -- a dead tag, worth rejecting at load time.
+        if any(not domain.strip() or domain != domain.strip() for domain in v):
+            raise ValueError(
+                "domains entries must be non-blank and free of leading/trailing whitespace"
+            )
         return v
 
 

@@ -11,8 +11,8 @@ import itertools
 from hypothesis import given, strategies as st
 from strategies import persisted, research_documents, round_trip
 
-from whiskeyjack_bot.research import ResearchDocument
 from whiskeyjack_bot.research.dedup import _sort_key, dedup_key, deduplicate
+from whiskeyjack_bot.research.model import ResearchDocument
 
 DOCUMENT_LISTS = st.lists(research_documents(), max_size=6)
 
