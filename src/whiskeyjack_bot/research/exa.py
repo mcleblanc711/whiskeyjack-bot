@@ -24,7 +24,10 @@ rather than by convention:
   switch is auditable from the ledger alone.
 - :func:`build_exa_client` refuses to build a client when the configured
   fallback provider is not ``exa``. Running Exa while config names something
-  else *is* the silent switch.
+  else *is* the silent switch. :func:`retrieve_web` repeats the same check
+  independently, so a caller holding any ``httpx.Client`` -- not only one
+  built by :func:`build_exa_client` -- cannot use it to run Exa against a
+  config that never named Exa at all.
 
 Transport: the Exa HTTP API directly, over ``httpx``.
 
@@ -87,6 +90,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
 from typing import Any, Final, Literal, get_args
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -276,30 +280,24 @@ def _canonical_reasons(reasons: Sequence[str]) -> tuple[FallbackReason, ...]:
     return tuple(reason for reason in _FALLBACK_REASONS if reason in present)
 
 
-def build_exa_client(config: AppConfig) -> httpx.Client:
-    """Construct the one configured Exa client.
+def _ensure_exa_is_configured_fallback(config: AppConfig) -> None:
+    """Refuse to proceed unless ``config`` actually names Exa as the fallback.
 
-    Three refusals, all before any network use and therefore before any billable
-    call:
+    Shared by :func:`build_exa_client` and :func:`retrieve_web` so the check
+    cannot be bypassed by calling ``retrieve_web`` with a client built some
+    other way -- the client carries no memory of which config built it, so
+    the check has to be repeated at the point that actually spends money.
+
+    Two refusals:
 
     - the configured fallback provider is not ``exa`` -- calling Exa anyway
       would be precisely the silent provider switch this item forbids;
     - the configured *primary* provider is not ``asknews`` -- this adapter
       implements the AskNews-to-Exa fallback specifically, and a config that
       names Exa as its own primary would let Exa "fall back" to itself, which
-      is the same silent switch under a different config shape;
-    - the configured key variable is unset or empty (an empty string counts as
-      missing), which raises ``MissingCredentialError``.
-
-    Retries are applied to the connection pool after construction rather than
-    through ``transport=``; see
-    :func:`whiskeyjack_bot.research.transport.apply_connection_retries` for why
-    an explicit transport would silently drop ``HTTP(S)_PROXY`` routing, and for
-    the scope of what a retry covers (connection failures only, so a request
-    that reached Exa is never re-sent and cannot be billed twice).
+      is the same silent switch under a different config shape.
     """
-    provider = config.retrieval.fallback
-    if provider.provider != "exa":
+    if config.retrieval.fallback.provider != "exa":
         raise ExaFallbackError(
             "retrieval.fallback.provider is not 'exa'; refusing to run the Exa "
             "adapter against a differently configured fallback (no silent provider switching)"
@@ -310,6 +308,27 @@ def build_exa_client(config: AppConfig) -> httpx.Client:
             "adapter against a configuration where Exa is not a fallback at all "
             "(no silent provider switching)"
         )
+
+
+def build_exa_client(config: AppConfig) -> httpx.Client:
+    """Construct the one configured Exa client.
+
+    Three refusals, all before any network use and therefore before any billable
+    call: the two config checks in :func:`_ensure_exa_is_configured_fallback`,
+    plus:
+
+    - the configured key variable is unset or empty (an empty string counts as
+      missing), which raises ``MissingCredentialError``.
+
+    Retries are applied to the connection pool after construction rather than
+    through ``transport=``; see
+    :func:`whiskeyjack_bot.research.transport.apply_connection_retries` for why
+    an explicit transport would silently drop ``HTTP(S)_PROXY`` routing, and for
+    the scope of what a retry covers (connection failures only, so a request
+    that reached Exa is never re-sent and cannot be billed twice).
+    """
+    _ensure_exa_is_configured_fallback(config)
+    provider = config.retrieval.fallback
     api_key = os.environ.get(provider.api_key_env)
     if not api_key:
         raise MissingCredentialError(provider.api_key_env)
@@ -339,16 +358,25 @@ def retrieve_web(
 ) -> ExaRetrieval:
     """Retrieve web evidence for ``queries`` as normalized documents.
 
+    Refuses, before any network use, to run against a ``config`` that does not
+    name Exa as its fallback (see :func:`_ensure_exa_is_configured_fallback`) --
+    repeated here rather than trusted from :func:`build_exa_client`, since the
+    ``client`` argument carries no memory of which config built it.
+
     ``fallback_reasons`` is required and must be non-empty: this adapter cannot
     be invoked without recording why the pipeline left its primary provider.
     Pass :attr:`FallbackDecision.reasons` from :func:`decide_fallback`.
 
-    ``include_domains`` restricts the search to a caller-supplied allowlist. It
-    is also what promotes the resulting documents from ``web`` to ``official``:
-    a document is only called an official source when retrieval was actually
-    constrained to official domains. Tagging on the strength of the *reason*
-    instead would let ``official_source_required`` label whatever the open web
-    returned, which is an unearned attribution claim.
+    ``include_domains`` restricts the search to a caller-supplied allowlist and
+    is sent to Exa as ``includeDomains``, but Exa's own enforcement of that
+    restriction is not this module's to trust: each *result* is promoted from
+    ``web`` to ``official`` only if its own URL's host actually matches (or is a
+    subdomain of) an allowlisted domain -- see :func:`_matches_official_domain`.
+    A result whose host falls outside the allowlist stays ``web`` even though
+    the run requested official domains and Exa returned it anyway. Tagging on
+    the strength of the *reason* instead would let ``official_source_required``
+    label whatever the open web returned, which is an unearned attribution
+    claim.
 
     ``now`` is injected rather than read from the clock so ``started_at_utc``,
     every ``retrieved_at_utc`` and the published-date bound are deterministic
@@ -360,6 +388,7 @@ def retrieve_web(
     early, sets ``provider_failed``, records it in ``run.error_summary``, and
     returns everything retrieved so far.
     """
+    _ensure_exa_is_configured_fallback(config)
     reasons = _canonical_reasons(fallback_reasons)
     if not reasons:
         raise ExaFallbackError(
@@ -380,9 +409,6 @@ def retrieve_web(
     # the shared config schema. See _MAX_NUM_RESULTS.
     num_results = min(retrieval.max_documents_per_query, _MAX_NUM_RESULTS)
     published_after = now - timedelta(days=retrieval.freshness_days_default)
-    # See the docstring: the allowlist, not the reason, is what makes a document
-    # an official source.
-    source_type: SourceType = "official" if domains else "web"
 
     # Logged once, before the first call, so an engagement is on the record even
     # if every call then fails. Constants and an integer id only -- no query
@@ -398,7 +424,13 @@ def retrieve_web(
     dropped = 0
     provider_failed = False
     cost_total = 0.0
-    cost_reported = False
+    # A published cost_usd has to be the whole run's spend, not whichever calls
+    # happened to report a usable figure. calls_attempted counts every billable
+    # attempt (including one that then raises, or returns a malformed body);
+    # calls_with_cost counts only those that yielded a usable costDollars.total.
+    # cost_reported is derived below, only once every attempted call matched.
+    calls_attempted = 0
+    calls_with_cost = 0
 
     for query in capped_queries:
         payload: dict[str, Any] = {
@@ -414,6 +446,7 @@ def retrieve_web(
         if domains:
             payload["includeDomains"] = domains
 
+        calls_attempted += 1
         try:
             response = client.post(_SEARCH_PATH, json=payload)
             response.raise_for_status()
@@ -434,7 +467,7 @@ def retrieve_web(
         call_cost = _call_cost_usd(body)
         if call_cost is not None:
             cost_total += call_cost
-            cost_reported = True
+            calls_with_cost += 1
 
         results = body.get("results")
         if not isinstance(results, list):
@@ -453,7 +486,7 @@ def retrieve_web(
                     result,
                     retrieval_run_id=retrieval_run_id,
                     retrieved_at=now,
-                    source_type=source_type,
+                    domains=domains,
                 )
                 document = validate_document(payload_document)
             except (
@@ -483,6 +516,12 @@ def retrieve_web(
     # result order (cross-model review round 2, finding 2).
     dedup_result = deduplicate(documents)
 
+    # Complete-or-nothing: a total is only trustworthy when every attempted
+    # call -- including one that raised or returned a malformed body -- also
+    # yielded a usable cost. Anything less is a subtotal, and publishing a
+    # subtotal as cost_usd would make an incomplete figure look complete
+    # (cross-model review round 3, finding 3).
+    cost_reported = calls_attempted > 0 and calls_with_cost == calls_attempted
     if cost_reported and not isfinite(cost_total):
         # Each call's own cost was finite (_call_cost_usd already checked
         # isfinite); only the sum overflowed. Drop it the same way an
@@ -551,17 +590,44 @@ def _validated_domains(include_domains: Sequence[str]) -> list[str]:
     return domains
 
 
+def _matches_official_domain(canonical_url: str, domains: Sequence[str]) -> bool:
+    """Return whether ``canonical_url``'s host earns the ``official`` label.
+
+    Exact match or subdomain match against ``domains`` -- ``data.bls.gov``
+    counts as a match for ``bls.gov``, since a federal agency's data desk is
+    still the agency. ``domains`` are the bare, lowercase entries this module
+    already validates and sends as Exa's ``includeDomains``; Exa's own
+    enforcement of that filter is not this module's to trust (Exa can return a
+    result outside it), so each result's host is checked here independently
+    rather than assuming the run-level allowlist applies to every result it
+    returned.
+    """
+    host = urlsplit(canonical_url).hostname
+    if host is None:
+        return False
+    for domain in domains:
+        normalized = domain.strip().lower()
+        if host == normalized or host.endswith(f".{normalized}"):
+            return True
+    return False
+
+
 def _to_document(
     result: Any,
     *,
     retrieval_run_id: str,
     retrieved_at: datetime,
-    source_type: SourceType,
+    domains: Sequence[str],
 ) -> dict[str, Any]:
     """Build the document payload for one Exa result (unvalidated).
 
     Raises a constant-message ``TypeError`` for a result that is not a mapping
     or carries no URL string; :func:`retrieve_web` counts those as drops.
+
+    ``source_type`` is decided per result, from its own URL, via
+    :func:`_matches_official_domain` -- not inherited from whether the run
+    requested an allowlist at all. See that function and the module docstring
+    for why the run-level allowlist alone is not proof for every result.
 
     ``publisher`` stays ``None``: Exa returns no publisher field, and deriving
     one from the hostname would put a value in the ledger that no provider
@@ -575,11 +641,15 @@ def _to_document(
     if not isinstance(url, str):
         raise TypeError("exa result url must be a string (offending input withheld)")
 
+    canonical_url = canonicalize_url(url)
+    source_type: SourceType = (
+        "official" if _matches_official_domain(canonical_url, domains) else "web"
+    )
     text = _optional_text(result.get("text"))
     return {
         "retrieval_run_id": retrieval_run_id,
         "original_url": url,
-        "canonical_url": canonicalize_url(url),
+        "canonical_url": canonical_url,
         "title": _optional_text(result.get("title")),
         "publisher": None,
         "author": _optional_text(result.get("author")),

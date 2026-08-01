@@ -293,6 +293,29 @@ def test_primary_mismatch_is_checked_before_the_credential(
         build_exa_client(custom)
 
 
+def test_retrieve_web_refuses_when_fallback_provider_is_not_exa(config: AppConfig) -> None:
+    """A client built some other way must not let retrieve_web run against a
+    config that never named Exa as the fallback -- build_exa_client's own
+    refusal is not the only path to this function."""
+    data = config.model_dump()
+    data["retrieval"]["fallback"]["provider"] = "asknews"
+    custom = validate_config_data(data)
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, custom)
+    assert handler.requests == [], "refusal must happen before any billable call"
+
+
+def test_retrieve_web_refuses_when_primary_is_not_asknews(config: AppConfig) -> None:
+    data = config.model_dump()
+    data["retrieval"]["primary"]["provider"] = "exa"
+    custom = validate_config_data(data)
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, custom)
+    assert handler.requests == [], "refusal must happen before any billable call"
+
+
 def test_fallback_engagement_is_logged_without_provider_text(
     config: AppConfig, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -556,12 +579,21 @@ def test_num_results_is_capped_at_the_exa_maximum(config: AppConfig) -> None:
 
 
 def test_domain_allowlist_promotes_documents_to_official(config: AppConfig) -> None:
-    handler = _Exchange(_json_ok(_body(_result())))
+    """Subdomains of an allowlisted domain count as official too."""
+    handler = _Exchange(_json_ok(_body(_result(url="https://data.bls.gov/june-payrolls"))))
     result = _retrieve(handler, config, include_domains=("bls.gov",))
     assert handler.requests[0]["payload"]["includeDomains"] == ["bls.gov"]
     assert all(d.source_type == "official" for d in result.documents)
     assert result.run.provider_config is not None
     assert result.run.provider_config["include_domains"] == ["bls.gov"]
+
+
+def test_a_result_outside_the_allowlist_stays_web(config: AppConfig) -> None:
+    """Exa returning a result outside includeDomains must not earn the label anyway."""
+    handler = _Exchange(_json_ok(_body(_result())))  # default url is example.org
+    result = _retrieve(handler, config, include_domains=("bls.gov",))
+    assert handler.requests[0]["payload"]["includeDomains"] == ["bls.gov"]
+    assert all(d.source_type == "web" for d in result.documents)
 
 
 def test_official_reason_alone_does_not_make_a_document_official(config: AppConfig) -> None:
@@ -662,13 +694,16 @@ def test_non_finite_cost_literals_are_ignored(config: AppConfig, literal: str) -
     assert result.provider_failed is False
 
 
-def test_a_usable_cost_survives_an_unusable_one(config: AppConfig) -> None:
+def test_an_unusable_per_call_cost_drops_the_run_total(config: AppConfig) -> None:
+    """One call's cost is a subtotal, not the run total -- publishing it as
+    cost_usd would understate real spend rather than admit the figure is
+    incomplete."""
     handler = _Exchange(
         _json_ok(_body(_result(), cost="nonsense")),
         _json_ok(_body(_result(url="https://example.org/b", text="b"), cost=0.02)),
     )
     result = _retrieve(handler, config, queries=["a", "b"])
-    assert result.run.cost_usd == pytest.approx(0.02)
+    assert result.run.cost_usd is None
 
 
 @pytest.mark.parametrize("huge", [10**400, -(10**400)])
@@ -767,7 +802,11 @@ def test_a_failed_call_keeps_what_earlier_calls_paid_for(config: AppConfig) -> N
     assert result.provider_failed is True
     assert len(result.documents) == 1
     assert len(result.raw_responses) == 1
-    assert result.run.cost_usd == pytest.approx(0.005)
+    # The first call's $0.005 is real and billed, but it is not the whole run's
+    # spend: the second call also reached Exa before failing, and its own cost
+    # is unknown. Publishing the known figure alone would understate spend
+    # while looking like a complete total (cross-model review round 3, finding 3).
+    assert result.run.cost_usd is None
     # Retrieval stopped rather than grinding through the remaining queries.
     assert len(handler.requests) == 2
     assert result.run.error_summary is not None

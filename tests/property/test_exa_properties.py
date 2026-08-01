@@ -122,7 +122,7 @@ ALLOWED = (
 
 
 def _map(result: Any) -> dict[str, Any]:
-    return _to_document(result, retrieval_run_id="run-1", retrieved_at=NOW, source_type="web")
+    return _to_document(result, retrieval_run_id="run-1", retrieved_at=NOW, domains=())
 
 
 # --- the fallback policy ----------------------------------------------------
