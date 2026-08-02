@@ -7,6 +7,16 @@ diffstat and the branch diff -- are generated. The two sections that actually ea
 short review (deliberate choices, risk areas) are emitted as TODO placeholders,
 because those are judgment and a template cannot fake them.
 
+The request also carries the round's stopping condition, because a review with no
+termination condition does not terminate: across M1-201 through M1-305, 47 of 121
+non-merge commits were review-round commits, and the two items that closed cheapest
+(M1-202, M1-401, two round commits each) differ from the ten-round ones only in how much
+of the reasoning was written down before round 1. Round 1 is the broad implementation
+review, round 2 verifies its remediation, and from round 3 the stopping rule is active.
+Three tests disqualify an observation from blocking regardless of merit: it falls outside
+the declared trust boundary, it applies unchanged to the diff base, or it was reproduced
+against a commit that is not this request's HEAD.
+
 Running it also runs the four toolchain gates and refuses to emit anything if one
 fails, so the request cannot claim a green branch that is not green. It requires a clean
 working tree first, because the gates run against the tree while the diff is built from
@@ -15,7 +25,8 @@ pass the reviewer cannot see. ``--no-verify`` skips both and says so in the outp
 than going quiet.
 
     scripts/review-request.py M1-303 > GPT_REVIEW_REQUEST_M1-303.md   # gitignored
-    scripts/review-request.py M1-303 --round 2 | xclip -selection clipboard
+    scripts/review-request.py M1-303 --round 2 --previous-reviewed 42a57ed \
+      | xclip -selection clipboard
     scripts/review-request.py M1-303 --no-verify   # explicit "gates not run" banner
 
 These files are scaffolding and are never committed (.gitignore: GPT_REVIEW_*). The
@@ -40,10 +51,10 @@ DECISION_REFERENCE: Final = re.compile(r"\bD(\d{1,2})\b")
 
 ROLE_PROMPT: Final = """\
 You are a rigorous senior reviewer performing an independent cross-model review of
-code authored by another AI model (Claude). Apply the **stricter reading**: when a
-line could be read as either correct or subtly wrong, assume the wrong reading and
-prove it can't happen from the diff. Do **not** rubber-stamp. If you approve, justify
-why each risk area below is actually safe; if you don't, list blocking findings."""
+code authored by another AI model (Claude). Apply the stricter reading where the
+authoritative spec is ambiguous, but keep that skepticism bounded by the review-round
+contract below. Do not rubber-stamp, and do not turn an item review into an unbounded
+hardening exercise."""
 
 PROJECT_CONTEXT: Final = """\
 `whiskeyjack-bot` is a public Metaculus MiniBench forecasting pipeline whose primary
@@ -77,6 +88,15 @@ DIRTY_TREE_NOTE: Final = """\
 > below is not necessarily the code that was run."""
 
 STANDING_CONVENTIONS: Final = """\
+- **Trust boundary.** *Trusted*: `config.yaml`, every filesystem path in it, the local
+  filesystem, the operator's shell, and anything reachable only by monkeypatching module
+  internals. *Untrusted*: provider JSON (AskNews, Exa), Metaculus API payloads, LLM output,
+  any value read back out of the ledger, and config *values* that fail validation. A
+  reproduction that requires a hostile local filesystem -- a FIFO or device at a configured
+  path, a directory swapped in mid-read, a permission flipped between check and use -- does
+  not clear the blocking bar; propose it as a backlog row instead. This is the same
+  reasoning as the settled M1-401 path carve-out: an operator-supplied path is
+  configuration, not content, and an operator who can plant a FIFO can edit the config.
 - **Error hygiene.** Every module owns a sanitized exception (`ConfigError`,
   `SnapshotError`, `LedgerError`, `NormalizationError`, `ResearchError`). A message
   never echoes stored, file or field *values*, and sanitizing raises use `from None`
@@ -105,14 +125,149 @@ STANDING_CONVENTIONS: Final = """\
   persisted JSON form, and no value leak. Findings that a fuzzer should have caught are
   worth calling out as process failures, not just code ones."""
 
-OUTPUT_FORMAT: Final = """\
+FIRST_REVIEW_POLICY: Final = """\
+This is the **implementation review**. Inspect the full branch against the authoritative
+spec, standing conventions and declared risk areas. A blocking finding must identify:
+
+1. the exact acceptance criterion or standing convention the current code violates;
+2. a reachable product path or public module boundary, using input or persisted state
+   that the current contract accepts;
+3. a deterministic reproduction against the reviewed commit and the wrong outcome; and
+4. the smallest in-scope fix.
+
+Missing one of those makes the observation non-blocking. Defensive hardening can still
+be valuable, but value alone does not make it a release blocker."""
+
+# Appended to every round's policy rather than written into each. These three are not
+# judgment calls about severity -- they are mechanical facts about a finding, checkable
+# before its merit is argued, and each is here because it cost real rounds: the trust
+# boundary because a FIFO planted at a configured path was reported as a blocker; the
+# diff-base test because M1-303's round 4 reported holes that were equally present in
+# already-merged AskNews code (they became M1-309, after the branch paid 791 lines of
+# churn); the staleness test because three separate rounds restated findings that were
+# already closed on a newer tree.
+DISQUALIFYING_TESTS: Final = """\
+
+Three tests disqualify an observation from blocking regardless of its merit. Check them
+before arguing severity:
+
+- **Outside the trust boundary.** A reproduction that requires a hostile local filesystem,
+  monkeypatched module internals, or any other input listed as trusted under **Trust
+  boundary** in the standing conventions below is not a blocker here.
+- **Already on the diff base.** If the same finding applies unchanged to code that is
+  already merged, it is a pre-existing condition, not a defect this branch introduced.
+  Propose the backlog row; do not withhold approval for it.
+- **Stale.** State the commit hash you actually examined. If it is not this request's
+  `HEAD`, say so and stop: the round is void and will be regenerated. Do not restate
+  findings against an older tree.
+
+Each of the three is a *backlog candidate*, not a dismissal. Say what you found."""
+
+REMEDIATION_REVIEW_POLICY: Final = """\
+This is the **remediation review**. Your primary job is to verify the preceding review's
+blocking findings against the remediation delta. Use the full branch diff only for the
+context needed to assess those fixes and for regressions introduced by them; do not
+restart a blank-slate implementation audit or reopen a settled choice without a new
+reproduction against the current commit.
+
+A remaining or newly introduced blocker must identify the violated acceptance criterion
+or standing convention, a reachable product path or public module boundary, a
+deterministic reproduction against the current commit, the observed wrong outcome, and
+the smallest in-scope fix. Otherwise classify it as a non-blocking follow-up."""
+
+STOPPING_RULE_POLICY: Final = """\
+This is a **post-remediation review; the stopping rule is active**. This is not another
+blank-slate audit. Confirm the prior blockers and remediation first. Approval is required
+when those blockers are closed unless the current commit still has a release-blocking
+failure that satisfies every item below:
+
+1. Quote the exact acceptance criterion or standing convention that is violated.
+2. Name the reachable product path or public module boundary. Use input or persisted
+   state the current contract accepts -- not arbitrary monkeypatching, a deliberately
+   trusted injection boundary, a hypothetical external consumer, or a new requirement.
+3. Give a deterministic reproduction against the current reviewed commit, including the
+   concrete input/state, observed result and required result.
+4. Explain the user, ledger-integrity, security or paid-call impact and why existing
+   tests/gates do not already rule it out.
+5. Give the smallest fix that stays inside this backlog item's scope.
+
+If any item is missing, the observation is non-blocking. Put useful out-of-scope
+hardening in a proposed backlog follow-up with a one-sentence acceptance criterion, and
+do **not** withhold approval for it. A theoretically possible edge case is not by itself
+a reason to continue the review loop."""
+
+
+# The five headings M1-202 and M1-401 were written under -- the only two items to date that
+# closed in two review-round commits instead of six to ten. Their notes say what a reviewer
+# would otherwise have to infer from the diff, so round 1 had nothing left to discover. The
+# headings are emitted rather than described because "write the deliberate choices" is advice
+# and a named empty heading is a checklist: anything still carrying its TODO comment when the
+# request is sent is a section the author skipped, visible to the reviewer and to the author.
+DELIBERATE_CHOICES_TEMPLATE: Final = """\
+### Decision — <the call>, and why
+<!-- TODO(author): each non-obvious call, with its reason. Not what the code does: why this
+     and not the obvious alternative. -->
+
+### Deviation — where this departs from the SDK, the spec or a sibling module
+<!-- TODO(author): the departure and what forced it. If there is none, write "none". -->
+
+### Rejected — <the alternative>, and why not
+<!-- TODO(author): the designs considered and dropped. A reviewer who cannot see that you
+     already weighed an option will propose it as a finding. -->
+
+### Deferred (do not read the absence as an omission)
+<!-- TODO(author): boundaries deliberately not crossed, each naming the backlog item that
+     owns it. An unclaimed gap gets reported; a claimed one does not. -->
+
+### Standing risk — not verifiable offline
+<!-- TODO(author): what the offline suite structurally cannot prove, and what you did
+     instead (package version read, recorded fixture, property test). -->"""
+
+
+def _review_policy(round_number: int) -> str:
+    """Return the review contract for this round.
+
+    One broad implementation review and one focused remediation review are enough to
+    expose and then verify ordinary defects. From round three onward, another blocker
+    must clear the explicit stopping-rule bar rather than merely identify more possible
+    hardening.
+
+    ``DISQUALIFYING_TESTS`` is appended to all three rather than written into each. Every
+    round it was ever omitted from is a round where it was needed: a pre-existing condition
+    or a stale reproduction is as reportable in the first review as in the fifth, and a rule
+    the reviewer only sees from round 3 has already let rounds 1 and 2 spend on it.
+    """
+    if round_number == 1:
+        policy = FIRST_REVIEW_POLICY
+    elif round_number == 2:
+        policy = REMEDIATION_REVIEW_POLICY
+    else:
+        policy = STOPPING_RULE_POLICY
+    return policy + "\n" + DISQUALIFYING_TESTS
+
+
+def _output_format(round_number: int) -> str:
+    late_round_verdict = (
+        " If the stopping-rule bar is not met, the verdict must be APPROVE."
+        if round_number >= 3
+        else ""
+    )
+    return f"""\
 Reply with:
-1. **Verdict** — APPROVE, or CHANGES REQUESTED.
-2. **Blocking findings** — each with the file, the concrete failure scenario (inputs or
-   state that produce the wrong result), and the minimal fix. No speculative hardening:
-   if you cannot state inputs that break it, it is not blocking.
-3. **Non-blocking observations** — clearly separated from the above.
-4. For each risk area listed above, one line on whether it is actually safe and why."""
+1. **Reviewed commit** — the exact hash you examined, first, before anything else. If it
+   is not this request's `HEAD`, stop there and say so: the round is void.
+2. **Verdict** — APPROVE, or CHANGES REQUESTED.{late_round_verdict}
+3. **Prior findings** — for a remediation round, mark each prior blocker CLOSED or OPEN
+   with evidence from the current commit; otherwise write "first review".
+4. **Blocking findings** — each must include the violated acceptance criterion or
+   standing convention, reachable path, deterministic reproduction against the reviewed
+   commit, observed and required outcomes, impact, and minimal in-scope fix. No
+   speculative hardening: if the required evidence is absent, it is not blocking. State
+   for each that it is inside the trust boundary above and does not apply unchanged to
+   the diff base.
+5. **Non-blocking observations / backlog candidates** — clearly separated. For useful
+   out-of-scope hardening, propose a backlog title and one-sentence acceptance criterion.
+6. For each risk area listed above, one line on whether it is actually safe and why."""
 
 
 def _run(*args: str) -> str:
@@ -217,13 +372,71 @@ def _decision_blocks(reference: str, decisions: list[dict[str, str]]) -> list[st
     return blocks
 
 
+def _positive_round(value: str) -> int:
+    """Argparse type for a one-based review round."""
+    try:
+        round_number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("review round must be a positive integer") from exc
+    if round_number < 1:
+        raise argparse.ArgumentTypeError("review round must be at least 1")
+    return round_number
+
+
+def _reviewed_revision(round_number: int, requested: str | None) -> str | None:
+    """Resolve and validate the commit reviewed before a remediation round.
+
+    Naming the prior commit prevents the stale-review failure mode: without it, a pasted
+    response can critique an older tree while the author unknowingly applies the same fix
+    again. It also gives the next reviewer a mechanically generated remediation delta
+    instead of inviting another full audit from scratch.
+    """
+    if round_number == 1:
+        if requested is not None:
+            raise SystemExit("FAIL: --previous-reviewed is only valid with --round 2 or later.")
+        return None
+    if requested is None:
+        raise SystemExit(
+            "FAIL: --round 2 or later requires --previous-reviewed <commit>. "
+            "Use the exact commit named in the preceding review."
+        )
+
+    try:
+        reviewed = _run("git", "rev-parse", "--verify", f"{requested}^{{commit}}").strip()
+    except SystemExit:
+        raise SystemExit(
+            f"FAIL: --previous-reviewed {requested!r} does not resolve to a commit."
+        ) from None
+    head = _run("git", "rev-parse", "HEAD").strip()
+    if reviewed == head:
+        raise SystemExit(
+            "FAIL: --previous-reviewed resolves to HEAD, so there is no remediation "
+            "delta to review."
+        )
+    try:
+        _run("git", "merge-base", "--is-ancestor", reviewed, "HEAD")
+    except SystemExit:
+        raise SystemExit(
+            "FAIL: --previous-reviewed must be an ancestor of HEAD; the named review "
+            "does not describe this branch's remediation history."
+        ) from None
+    return reviewed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("item", help="backlog item ID, e.g. M1-303")
     parser.add_argument(
         "--base", default="origin/master", help="diff base (default: origin/master)"
     )
-    parser.add_argument("--round", type=int, default=1, help="review round (default: 1)")
+    parser.add_argument(
+        "--round", type=_positive_round, default=1, help="review round (default: 1)"
+    )
+    parser.add_argument(
+        "--previous-reviewed",
+        metavar="COMMIT",
+        help="exact commit named by the preceding review (required from round 2 onward)",
+    )
     parser.add_argument(
         "--no-verify",
         action="store_true",
@@ -239,6 +452,8 @@ def main(argv: list[str] | None = None) -> int:
             f"FAIL: {item_id} has no row in docs/backlog/backlog.csv. "
             "Add the row before requesting a review."
         )
+
+    reviewed_revision = _reviewed_revision(args.round, args.previous_reviewed)
 
     # Before anything reaches stdout: a failed gate must leave no partial request
     # behind for a shell redirect to capture.
@@ -262,10 +477,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.round > 1:
         heading += f" (round {args.round})"
 
+    remediation: list[str] = []
+    remediation_diff = ""
+    if reviewed_revision is not None:
+        remediation_diffstat = _run("git", "diff", "--stat", f"{reviewed_revision}..HEAD").rstrip()
+        remediation_diff = _run("git", "diff", f"{reviewed_revision}..HEAD")
+        remediation = [
+            "## Previous review and remediation delta",
+            "",
+            f"The preceding review examined commit `{reviewed_revision}`. Review the current",
+            "`HEAD` against that exact baseline before considering any new finding.",
+            "",
+            "<!-- TODO(author): list every preceding blocker and its disposition: fixed,",
+            "     disputed with evidence, or intentionally moved to a named backlog item. -->",
+            "",
+            "```",
+            remediation_diffstat or "(no committed remediation delta)",
+            "```",
+            "",
+        ]
+
     out: list[str] = [
         heading,
         "",
         ROLE_PROMPT,
+        "",
+        "## Review-round contract",
+        "",
+        _review_policy(args.round),
         "",
         "## Project context",
         "",
@@ -295,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
         for block in blocks:
             out += [block, ""]
 
+    out += remediation
+
     out += [
         "## Standing conventions this branch must honor",
         "",
@@ -303,10 +544,7 @@ def main(argv: list[str] | None = None) -> int:
         "## Deliberate choices / out of scope "
         "(challenge the rationale, but these are not omissions)",
         "",
-        "<!-- TODO(author): every non-obvious call, with the reason. This section is what",
-        "     turns a six-round review into a one-round review: say what you rejected and",
-        "     why, and name the boundaries you deliberately did not cross (which later",
-        "     backlog item owns them). Invite challenge explicitly. -->",
+        DELIBERATE_CHOICES_TEMPLATE,
         "",
         "## Risk areas to pressure-test",
         "",
@@ -333,9 +571,20 @@ def main(argv: list[str] | None = None) -> int:
         "",
         "## Output format",
         "",
-        OUTPUT_FORMAT,
+        _output_format(args.round),
         "",
-        f"# Full branch diff (`git diff {args.base}...HEAD`)",
+    ]
+
+    if reviewed_revision is not None:
+        out += [
+            f"# Remediation diff (`git diff {reviewed_revision}..HEAD`)",
+            "",
+            remediation_diff.rstrip("\n"),
+            "",
+        ]
+
+    out += [
+        f"# Full branch diff for context only (`git diff {args.base}...HEAD`)",
         "",
         diff.rstrip("\n"),
         "",
