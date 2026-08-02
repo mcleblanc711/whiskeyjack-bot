@@ -183,6 +183,46 @@ def test_every_round_carries_the_three_disqualifying_tests() -> None:
         assert "backlog" in policy.casefold(), round_number
 
 
+def _render(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *argv: str) -> str:
+    """Assemble a real request with git stubbed out, and return the emitted document.
+
+    Asserting on the constants alone cannot see the order they are placed in, which is the
+    only thing a cross-reference depends on.
+    """
+
+    def fake_run(*args: str) -> str:
+        if args[:2] == ("git", "rev-parse"):
+            return "chore/under-test\n"
+        if args[:2] == ("git", "diff"):
+            return " src/whiskeyjack_bot/research/exa.py | 1 +\n"
+        return ""
+
+    monkeypatch.setattr(review_request, "_run", fake_run)
+    review_request.main(["M1-305", "--no-verify", *argv])
+    return capsys.readouterr().out
+
+
+def test_the_contracts_cross_references_point_the_right_way(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cross-reference has to match the order the document is actually assembled in.
+
+    The disqualifier cites the trust boundary, which lives in the standing conventions --
+    emitted *after* the review-round contract, not before it. The first draft said "above".
+    """
+    body = _render(monkeypatch, capsys)
+    contract = body.index("Three tests disqualify")
+    conventions = body.index("**Trust boundary.**")
+    output_format = body.index("## Output format")
+    assert contract < conventions < output_format
+
+    # Scoped to what precedes the definition. "the trust boundary above" is correct under
+    # ## Output format, which renders after the conventions -- a blanket ban on the phrase
+    # fails on a document that is right.
+    assert "trust boundary above" not in body[:conventions].casefold()
+    assert "trust boundary above" in body[conventions:].casefold()
+
+
 def test_the_reviewed_commit_is_demanded_before_the_verdict() -> None:
     """Order is the point, not mere presence.
 

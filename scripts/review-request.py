@@ -152,8 +152,8 @@ Three tests disqualify an observation from blocking regardless of its merit. Che
 before arguing severity:
 
 - **Outside the trust boundary.** A reproduction that requires a hostile local filesystem,
-  monkeypatched module internals, or any other input the trust boundary above lists as
-  trusted is not a blocker here.
+  monkeypatched module internals, or any other input listed as trusted under **Trust
+  boundary** in the standing conventions below is not a blocker here.
 - **Already on the diff base.** If the same finding applies unchanged to code that is
   already merged, it is a pre-existing condition, not a defect this branch introduced.
   Propose the backlog row; do not withhold approval for it.
