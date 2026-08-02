@@ -160,6 +160,15 @@ ALTER TABLE forecast_records ADD COLUMN forecast_sha256 TEXT;
 -- review round 4, finding 2; reproduced). A stated guarantee with no constraint behind it
 -- is the failure mode this file exists to avoid.
 --
+-- Round 4's fix said "empty-or-whitespace counts as absent, in both layers", and round 5
+-- found that only one layer meant it. The writer blanks with Python's `str.strip()`, which
+-- removes all 29 Unicode whitespace codepoints; the trigger used SQLite's one-argument
+-- `trim()`, which removes U+0020 and nothing else. A snapshot of "\n\t" was refused by the
+-- writer, accepted here, and carried a record to `submitted` on two bytes of nothing --
+-- the same guarantee-without-a-constraint defect as round 4, one layer down. The trigger
+-- now spells its whitespace set out (see below) instead of inheriting a default that had
+-- never been compared against the writer's.
+--
 -- There is deliberately no uniqueness over `submission_attempt_id`. A refetch can be
 -- repeated, and each run is a true observation at its own time -- a post that was absent
 -- at 12:00 and present at 12:05 is two facts, not one fact rewritten. What is bounded is
@@ -766,11 +775,21 @@ BEGIN
         SELECT 1 FROM submission_attempts WHERE attempt_id = NEW.submission_attempt_id
     );
 
+    -- The character set is the writer's, written out rather than assumed. SQLite's
+    -- one-argument `trim()` strips U+0020 alone, so tabs, newlines and NBSP -- all
+    -- whitespace to the `str.strip()` this mirrors -- passed straight through it
+    -- (round 5). These are the 29 codepoints where Python's `str.isspace()` is true.
+    -- Frozen here the moment this migration lands: a test asserts the two definitions
+    -- still agree over the whole set, so a later Unicode change surfaces as a failed
+    -- test and a migration 004, not as a silently reopened hole.
     SELECT RAISE(ABORT, 'submission_verifications: a confirmed refetch must carry the forecast snapshot it saw')
     WHERE NEW.outcome = 'confirmed'
       AND (NEW.refetched_forecast_snapshot IS NULL
            OR typeof(NEW.refetched_forecast_snapshot) <> 'text'
-           OR trim(NEW.refetched_forecast_snapshot) = '');
+           OR trim(NEW.refetched_forecast_snapshot,
+                   char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
+                        8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                        8232, 8233, 8239, 8287, 12288)) = '');
 
     SELECT RAISE(ABORT, 'submission_verifications: observed_at_utc must be a UTC timestamp of the form YYYY-MM-DDTHH:MM:SS.ffffff+00:00')
     WHERE typeof(NEW.observed_at_utc) <> 'text'

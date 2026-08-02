@@ -14,6 +14,7 @@ already gone in.
 import hashlib
 import json
 import sqlite3
+import sys
 import traceback
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
@@ -1822,6 +1823,12 @@ def test_a_confirmed_refetch_rejects_a_detail_code(
         # an empty string is not a value this ledger stores anywhere.
         ("", "must be a non-empty string"),
         ("   ", "required for a confirmed refetch"),
+        # Round 5: the three cases that separate the two layers. Every one of these is
+        # whitespace to `str.strip()` and so refused by the writer, and every one of them
+        # reached `submitted` through the schema until the trigger pinned its own set.
+        ("\n\t", "required for a confirmed refetch"),
+        (" \t ", "required for a confirmed refetch"),
+        ("\xa0", "required for a confirmed refetch"),
     ],
 )
 def test_a_confirmed_refetch_must_carry_what_it_saw(
@@ -1834,6 +1841,16 @@ def test_a_confirmed_refetch_must_carry_what_it_saw(
     unconditionally nullable and the writer took None. Reproduced: a `submission_confirmed`
     transition with NULL stored. Both layers now refuse it, and empty-but-present counts as
     absent because a whitespace snapshot is a snapshot of nothing.
+
+    Round 5 found that claim was only half true, and this test is why it went unnoticed: it
+    asserted both layers from the first, but every case it supplied was a *space*, the one
+    whitespace character the two layers already agreed on. The writer strips by
+    `str.strip()`, which removes all 29 Unicode whitespace codepoints; the trigger used
+    SQLite's one-argument `trim()`, which removes U+0020 and nothing else. A snapshot of
+    "\\n\\t" was refused by the writer and accepted by the schema, and carried a record to
+    `submitted` on two bytes of nothing. The parameters above now cover a case the default
+    `trim()` misses (tab/newline), a mixed one (a real value's whitespace is rarely
+    uniform), and a non-ASCII one (NBSP arrives from real JSON).
     """
     conn, record_id = draft
     _leave_uncertain(conn, record_id)
@@ -1854,6 +1871,49 @@ def test_a_confirmed_refetch_must_carry_what_it_saw(
             "VALUES ('att-1', 'confirmed', ?, ?, ?)",
             (TS, snapshot, TS),
         )
+
+
+def test_the_schemas_blank_snapshot_rule_is_the_writers_rule(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """The two layers agree on *which* characters are whitespace, over the whole set.
+
+    Round 5's defect was not that the trigger was missing -- it was that the trigger and
+    the writer each had a definition of "blank" and nobody had compared them. Three
+    hand-picked parameters would not have caught it either; a space is whitespace under
+    both, which is exactly why five rounds of review did not see it.
+
+    So this asserts the equivalence directly, over every codepoint Python calls
+    whitespace, against the character set the trigger pins. It is also a drift guard:
+    `str.strip()` follows the Unicode data of whatever Python is running, while the
+    trigger's literal is frozen the moment migration 003 lands on master. If a future
+    release adds a whitespace codepoint, this fails loudly and the gap gets migration
+    004 -- rather than reopening, in silence, the hole it was written to close.
+    """
+    conn, record_id = draft
+    _leave_uncertain(conn, record_id)
+
+    def insert(snapshot: str) -> None:
+        conn.execute(
+            "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
+            "observed_at_utc, refetched_forecast_snapshot, created_at_utc) "
+            "VALUES ('att-1', 'confirmed', ?, ?, ?)",
+            (TS, snapshot, TS),
+        )
+
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: if this ever comes back empty the loop below passes while
+    # asserting nothing, which is the failure mode M1-303's property tests were built on.
+    assert len(whitespace) == 29
+    for cp in whitespace:
+        with pytest.raises(sqlite3.IntegrityError, match="must carry the forecast snapshot"):
+            insert(chr(cp) * 3)
+
+    # The other direction, so the pinned set cannot quietly grow into rejecting real
+    # content: U+200B is not whitespace to Python, and a snapshot made of it is a value
+    # this ledger stores rather than a snapshot of nothing.
+    insert("\u200b")
+    assert _counts(conn)["submission_verifications"] == 1
 
 
 def test_a_disconfirming_refetch_needs_no_snapshot(

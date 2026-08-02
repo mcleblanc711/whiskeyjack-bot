@@ -1367,6 +1367,49 @@ compare wrongly". `occurred_at_utc` and `created_at_utc` stay unpinned because n
 pre-003 row), the verification trigger **refuses rather than guesses**: a lexicographic comparison
 against an unknown format is a coin toss that reads like a check.
 
+### Round 5 review (GPT) — one finding, reproduced
+
+Findings 1 and 3 above confirmed closed. Finding 2 came back: the fix was real but only half
+applied, and the half that was missing is the half this file is about.
+
+**1 (P2). The schema still permitted an evidence-free confirmation.** Round 4's note one section
+up says the snapshot is "required for `confirmed` in both layers, with empty-or-whitespace counting
+as absent". Both layers did require it. They did not agree on what whitespace *is*. The writer
+blanks with Python's `str.strip()`, which removes all 29 codepoints where `str.isspace()` holds;
+the trigger used SQLite's **one-argument** `trim()`, which removes U+0020 and nothing else.
+
+Reproduced at `4ef7328` — real writers to reach the uncertain state, then raw SQL, which is the
+boundary the trigger exists to defend:
+
+```
+VERIFICATION INSERT ACCEPTED: len=2 hex=0A09
+EVENT ACCEPTED -> status: submitted
+history: ['validated', 'approved', 'submission_uncertain', 'submission_confirmed']
+```
+
+A record reached `submitted` — the ledger asserting the platform confirmed the post — on a
+snapshot of one newline and one tab. The `submission_confirmed` event trigger checks only that the
+linked row's `outcome` is `confirmed`, so that `trim()` was the sole gate on whether a confirmation
+carried any evidence at all.
+
+The trigger now spells its whitespace set out as `trim(x, char(9, 10, 11, ..., 12288))` — the 29
+`str.isspace()` codepoints — instead of inheriting a default nobody had compared against the
+writer. `lifecycle.py` is unchanged; it was the layer that was already right.
+
+**The lesson is about the test, not the trigger.** `test_a_confirmed_refetch_must_carry_what_it_saw`
+had asserted *both* layers since round 4 and still missed this, because all three of its parameters
+were spaces — the one character the two definitions already agreed on. Two-layer parity is not
+tested by exercising both layers; it is tested by exercising a case where they could differ. It now
+carries tab/newline, mixed and NBSP parameters, and a companion test asserts the equivalence over
+the entire `str.isspace()` set rather than over hand-picked examples.
+
+**Standing risk — the pinned literal is frozen against a moving definition.** `str.strip()` follows
+the Unicode data of whichever Python is running; the trigger's set is fixed once 003 lands on
+master and migrations are immutable. The equivalence test is the guard: a future release that adds
+a whitespace codepoint fails it, and the answer is migration 004. That is the intended outcome — a
+loud failure rather than a silent reopening — but it is a real maintenance obligation, recorded
+here so it is not rediscovered as a surprise.
+
 ### Deferred (do not read the absence as an omission)
 
 - **Pre-forecast research and generation failures → M1-606.** Not an oversight and not a gap left
@@ -1381,6 +1424,20 @@ against an unknown format is a coin toss that reads like a check.
   would mean updating a stored forecast version, which is what D25 forbids. `current_status()` and
   `read_history()` are the seam.
 - **`record_id` minting (UUIDv7/ULID) → M1-602**, unchanged from M1-601's note.
+- **Evidence on an *immediately* confirmed attempt.** An attempt with
+  `success=True, verified_by_refetch=True` reaches `submitted` in one write, and its
+  `refetched_forecast_snapshot` may be NULL — the substance rule above binds
+  `submission_verifications`, not that path. Raised as a non-blocking observation in round 5 and
+  left alone deliberately: it is unchanged from `42550b1`, predating this branch's verification
+  work, and M1-603's acceptance criterion does not require the field on the initial receipt.
+  Tightening it means deciding whether M2-704 can always produce a snapshot at post time, which is
+  M2-704's call to make, not this item's.
+- **Calendar validity of the pinned timestamps.** The round-4 GLOB pins *shape* — 32 characters in
+  `YYYY-MM-DDTHH:MM:SS.ffffff+00:00` form — not that the digits name a real instant, so a direct
+  insert of month `00` is shape-valid. Nothing this module writes can produce one (`_require_utc`
+  takes a `datetime`), which is why it stayed non-blocking in round 5. Enforcing it in SQL means
+  either a much larger GLOB set or a `strftime()` round-trip probe, and the honest place to decide
+  that is alongside the pre-003 legacy-row question the verification trigger already refuses on.
 
 ### Consequences for other items
 
