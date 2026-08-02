@@ -79,6 +79,26 @@ outlier is worse than either consistent policy.
 - If spec and observed package behaviour conflict, **stop and ask** — do not silently adapt.
 - If an acceptance criterion is ambiguous, implement the **stricter reading** and note it.
 
+### Trust boundary
+
+The stricter-reading rule above says how to resolve an ambiguous *criterion*. It does not
+license hardening against an arbitrary threat, and without a stated boundary that distinction
+is argued fresh every review round.
+
+**Trusted** — `config.yaml` and every filesystem path in it, the local filesystem, the
+operator's shell, and anything reachable only by monkeypatching module internals.
+**Untrusted** — provider JSON (AskNews, Exa), Metaculus API payloads, LLM output, any value
+read back out of the ledger, and config *values* that fail validation.
+
+A defect whose reproduction requires a hostile local filesystem — a FIFO or device at a
+configured path, a directory swapped in mid-read, a permission flipped between check and use —
+is a **backlog row, not a blocker**, for the author writing the code and for the reviewer
+reading it. This is the same reasoning that settled the M1-401 path carve-out: an
+operator-supplied path is configuration, not content, and an operator who can plant a FIFO can
+edit the config. This is a floor, not a ceiling — nothing here weakens the ledger, the approval
+boundary, replayability, secret hygiene, or the rule that every malformed shape arrives as the
+module's own error type. Those hold against trusted input too.
+
 ## Workflow
 
 - **One backlog item per branch**, in dependency order; commit messages lead with the issue ID.
@@ -107,6 +127,27 @@ outlier is worse than either consistent policy.
   the output. `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
   Do **not** run `gh pr merge --delete-branch`: it fails while the branch is checked out in a
   sibling worktree. Merge, then `finish-item.sh`.
+- **The review has a stopping rule; pass `--round` so the request carries it.** Round 1 is the
+  broad implementation review, round 2 verifies the remediation of round 1's findings, and from
+  round 3 approval is required unless a finding clears an explicit five-item bar. Rounds 2+
+  **require `--previous-reviewed <commit>`** — the exact commit the preceding review names — and
+  the request then leads with that commit-to-`HEAD` delta so the next round is not another
+  blank-slate audit. Three things disqualify a finding from blocking regardless of merit: it
+  falls outside the trust boundary above, it applies unchanged to the diff base (a pre-existing
+  condition — file the backlog row), or it was reproduced against a commit that is not the
+  request's `HEAD`.
+- **A pasted review may be stale.** Before writing any fix code, diff the commit the review
+  names against `HEAD` and reproduce each finding by execution. This has cost three full rounds
+  (M1-308 r6, M1-603 r4, M1-303) — each time a review restated findings that were already closed
+  on a newer tree. A finding you cannot reproduce gets a rebuttal, not a fix.
+- **Write the deliberate choices before round 1, not after round 5.** 47 of the project's first
+  121 non-merge commits were review-round commits, but M1-202 and M1-401 closed in two each
+  while M1-305 took ten. The difference is `docs/M1-NOTES.md:165-307` — M1-202's notes are
+  written as `### Decision — X, and why`, `### Deviation`, `### Rejected — X, and why not`,
+  `### Deferred (do not read the absence as an omission)`, `### Standing risk — not verifiable
+  offline`. `review-request.py` emits those five headings; a reviewer who can see that you
+  already weighed an option does not propose it as a finding. **M1-202 is the worked example** —
+  read it before filling the section.
 - **Fuzz pure functions before the first review.** Any hash, tiebreak, canonicalizer or validator
   gets a `tests/property/` pass asserting: never raises outside the module's own error type; a
   total order wherever ordering is claimed; replay-stability across the persisted form
