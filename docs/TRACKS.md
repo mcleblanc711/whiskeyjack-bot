@@ -32,14 +32,16 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Claim | Held by | Notes |
 | --- | --- | --- |
-| Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. |
-| Next free migration number | `003` | `001_initial.sql`, `002_research_document_fields.sql` are taken. Claim the number here before you write the file. CI enforces uniqueness and immutability (`.github/scripts/check-migrations.sh`), but only *after* you push. |
+| Dependency additions (`pyproject.toml` + `uv.lock`) | `M1-303` | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. |
+| Next free migration number | `M1-603` | `001_initial.sql`, `002_research_document_fields.sql` are taken; `003` is now claimed by M1-603. Next free is `004`. CI enforces uniqueness and immutability (`.github/scripts/check-migrations.sh`), but only *after* you push. |
 
 ## Worktrees
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| _(none)_ | | | | | |
+| M1-303 | feat/m1-303-exa-fallback | whiskeyjack-m1-303 | yes | none | 2026-07-27 |
+| M1-308 | feat/m1-308-x-account-allowlist | whiskeyjack-m1-308 | no | none | 2026-07-27 |
+| M1-603 | feat/m1-603-lifecycle-events | whiskeyjack-m1-603 | no | 003 | 2026-07-27 |
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per

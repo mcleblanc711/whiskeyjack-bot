@@ -22,12 +22,17 @@ LEDGER_TABLES = {
     "research_documents",
     "approval_events",
     "submission_attempts",
+    "submission_verifications",
     "resolution_events",
     "score_events",
+    "lifecycle_events",
     "schema_migrations",
 }
 
-TS = "2026-07-17T00:00:00+00:00"
+# Canonical UTC form: 003 pins it on the columns it orders (see test_lifecycle.py).
+TS = "2026-07-17T00:00:00.000000+00:00"
+# Migration 003 requires every new forecast record to carry a 64-hex content hash.
+FORECAST_SHA = "b" * 64
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
@@ -53,15 +58,20 @@ def _seed_forecast(
     version: int = 1,
     status: str = "draft",
     run_id: str = "run-1",
+    forecast_sha256: str | None = FORECAST_SHA,
 ) -> None:
+    # forecast_sha256 is supplied for the same reason _seed_run supplies question_id:
+    # migration 003's triggers require it of every new row, and a record with no content
+    # hash is exactly the unapprovable row that requirement exists to stop.
     conn.execute(
         "INSERT INTO forecast_records ("
         "record_id, question_id, tournament_id, forecast_version, question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
-        "generated_at_utc, final_prediction_json, record_json, created_at_utc) "
+        "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+        "forecast_sha256) "
         "VALUES (?, ?, 'minibench', ?, 'binary', ?, 'anthropic', 'claude', 'v1', 'abc', ?, "
-        "?, '{}', '{}', ?)",
-        (record_id, question_id, version, status, run_id, TS, TS),
+        "?, '{}', '{}', ?, ?)",
+        (record_id, question_id, version, status, run_id, TS, TS, forecast_sha256),
     )
 
 
@@ -71,9 +81,9 @@ def _seed_attempt(
     conn.execute(
         "INSERT INTO submission_attempts ("
         "attempt_id, forecast_record_id, idempotency_key, requested_at_utc, "
-        "request_payload_sha256, success, verified_by_refetch, created_at_utc) "
-        "VALUES (?, ?, ?, ?, 'deadbeef', 0, 0, ?)",
-        (attempt_id, record_id, key, TS, TS),
+        "completed_at_utc, request_payload_sha256, success, verified_by_refetch, "
+        "created_at_utc) VALUES (?, ?, ?, ?, ?, 'deadbeef', 0, 0, ?)",
+        (attempt_id, record_id, key, TS, TS, TS),
     )
 
 
@@ -112,6 +122,11 @@ def test_connect_enables_wal_and_foreign_keys(tmp_path: Path) -> None:
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        # Not a stylistic pragma: with this off (SQLite's default), the deletes that
+        # `INSERT OR REPLACE` performs to clear a constraint conflict skip every BEFORE
+        # DELETE trigger, which is the whole of migration 003's append-only enforcement.
+        # tests/unit/test_lifecycle.py exercises the REPLACE statements themselves.
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
     finally:
         conn.close()
 
@@ -159,15 +174,19 @@ def test_research_document_triple_uniqueness_enforced(tmp_path: Path) -> None:
 
 
 def test_foreign_key_enforced(tmp_path: Path) -> None:
+    # score_events rather than approval_events: migration 003 puts a BEFORE INSERT
+    # trigger on approval_events that rejects a row naming an unknown record before the
+    # foreign key is ever reached, so an approval row can no longer reach the FK and
+    # would leave this test asserting a different mechanism than its name claims.
     db = tmp_path / "ledger.db"
     initialize_ledger(db)
     conn = connect(db)
     try:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO approval_events ("
-                "forecast_record_id, decision, actor, forecast_sha256, created_at_utc) "
-                "VALUES ('does-not-exist', 'approved', 'chris', 'sha', ?)",
+                "INSERT INTO score_events ("
+                "forecast_record_id, metric, value, implementation_version, computed_at_utc) "
+                "VALUES ('does-not-exist', 'brier', 0.25, 'v1', ?)",
                 (TS,),
             )
     finally:
@@ -175,6 +194,9 @@ def test_foreign_key_enforced(tmp_path: Path) -> None:
 
 
 def test_status_check_rejects_unknown_state(tmp_path: Path) -> None:
+    # 001's CHECK over the seven states is now the second line of defence: migration 003
+    # pins a *new* record to 'draft', so the trigger rejects 'bogus' first and the CHECK
+    # is only reachable by a write path that bypasses the trigger. Both refuse it.
     db = tmp_path / "ledger.db"
     initialize_ledger(db)
     conn = connect(db)
