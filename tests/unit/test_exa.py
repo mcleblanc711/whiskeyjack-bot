@@ -15,6 +15,7 @@ import logging
 import traceback
 import warnings
 from datetime import datetime, timedelta, timezone, tzinfo
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,19 @@ def _json_ok(body: dict[str, Any]) -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
+class _RaisingIterable:
+    """A container whose __iter__ raises, which `list()` propagates unchanged."""
+
+    def __iter__(self) -> Any:
+        raise RuntimeError("deliberately broken __iter__")
+
+
+class _QuestionId(IntEnum):
+    """An int subclass, which `isinstance(x, int)` accepts and `type(x) is int` does not."""
+
+    FIRST = 42
+
+
 class _BrokenTz(tzinfo):
     """A tzinfo that raises from utcoffset(), which datetime calls on the caller's behalf."""
 
@@ -117,8 +131,14 @@ class _BrokenTz(tzinfo):
         return None
 
 
-def _client(handler: _Exchange, base_url: str = "https://api.exa.ai") -> httpx.Client:
-    return httpx.Client(base_url=base_url, transport=httpx.MockTransport(handler))
+def _client(
+    handler: _Exchange,
+    base_url: str = "https://api.exa.ai",
+    client_kwargs: dict[str, Any] | None = None,
+) -> httpx.Client:
+    return httpx.Client(
+        base_url=base_url, transport=httpx.MockTransport(handler), **(client_kwargs or {})
+    )
 
 
 def _retrieve(
@@ -126,15 +146,16 @@ def _retrieve(
     config: AppConfig,
     *,
     queries: Any = None,
-    reasons: tuple[exa.FallbackReason, ...] = REASONS,
+    reasons: Any = REASONS,
     include_domains: Any = (),
     base_url: str = "https://api.exa.ai",
+    client_kwargs: dict[str, Any] | None = None,
     question_id: Any = 42,
     retrieval_run_id: Any = "run-1",
     now: Any = NOW,
 ) -> ExaRetrieval:
     return retrieve_web(
-        _client(handler, base_url),
+        _client(handler, base_url, client_kwargs),
         config,
         question_id=question_id,
         queries=["june payrolls"] if queries is None else queries,
@@ -370,6 +391,16 @@ def test_retrieve_web_refuses_when_primary_is_not_asknews(config: AppConfig) -> 
         "https://user:pass@api.exa.ai",
         # No base_url at all.
         "",
+        # Round 5, finding 2: these three passed the round-4 structural check
+        # -- which never looked at the query or the fragment, and collapsed
+        # repeated slashes with rstrip("/") -- and then addressed something
+        # other than /search. The merged request URL is named beside each.
+        "https://api.exa.ai?x=1",  # -> https://api.exa.ai/?x=1/search
+        "https://api.exa.ai//",  # -> https://api.exa.ai//search
+        "https://api.exa.ai#f",  # -> https://api.exa.ai/search#f
+        # Round 4 rejected this one; it is here so the merged-URL rewrite is
+        # shown not to have loosened anything on the way past.
+        "https://api.exa.ai/search",  # -> https://api.exa.ai/search/search
     ],
 )
 def test_retrieve_web_refuses_a_client_pointed_away_from_exa(
@@ -382,12 +413,80 @@ def test_retrieve_web_refuses_a_client_pointed_away_from_exa(
     assert handler.requests == [], "refusal must happen before any billable call"
 
 
+def test_client_level_params_are_refused(config: AppConfig) -> None:
+    """base_url is not the only thing httpx merges into the request URL (round 5, finding 2)."""
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, client_kwargs={"params": {"k": "v"}})
+    assert handler.requests == []
+
+
 def test_a_trailing_slash_in_the_base_url_is_still_exa(config: AppConfig) -> None:
-    """The check is structural: httpx spells the same destination two ways."""
+    """The check is on the merged request URL: httpx spells the same destination two ways."""
     handler = _Exchange(_json_ok(_body(_result())))
     result = _retrieve(handler, config, base_url="https://api.exa.ai/")
     assert handler.requests[0]["url"] == "https://api.exa.ai/search"
     assert result.run.provider == "exa"
+
+
+# --- redirects are refused, never followed (round 5, finding 1) --------------
+
+
+def test_a_cross_origin_redirect_is_not_followed(config: AppConfig) -> None:
+    """Following one hands `x-api-key` to the other host while the run says provider="exa".
+
+    ``httpx`` strips ``Authorization`` when a redirect leaves the origin but
+    forwards every other header, so the credential rides along. ``retrieve_web``
+    pins ``follow_redirects=False`` at the *call site*, which is why this test
+    hands it a client whose own default is ``True``.
+    """
+    handler = _Exchange(
+        httpx.Response(307, headers={"location": "https://other-provider.example/search"}),
+        _json_ok(_body(_result())),
+    )
+    result = _retrieve(
+        handler,
+        config,
+        client_kwargs={"follow_redirects": True, "headers": {"x-api-key": FAKE_KEY}},
+    )
+
+    assert len(handler.requests) == 1, "the redirect must not produce a second request"
+    assert handler.requests[0]["url"] == "https://api.exa.ai/search"
+    assert all(request["url"].startswith("https://api.exa.ai/") for request in handler.requests), (
+        "no request may leave the Exa origin"
+    )
+    assert all(FAKE_KEY not in json.dumps(request) for request in handler.requests[1:])
+    # A redirect is a provider failure, not an empty answer: recorded, never raised.
+    assert result.provider_failed is True
+    assert result.documents == ()
+    assert result.run.provider == "exa"
+    assert result.run.error_summary is not None
+
+
+@pytest.mark.parametrize("follows", [True, False])
+def test_a_redirect_is_a_provider_failure_whatever_the_client_default(
+    config: AppConfig, follows: bool
+) -> None:
+    """A redirect body is never recorded as an answer, and never billed as one.
+
+    ``follows=False`` is a guard rather than a regression test -- the pre-fix
+    code passed it, because the pinned httpx already treats a 3xx as an error
+    status. It is here so that the explicit ``is_redirect`` branch stays pinned
+    if that ever changes: a redirect carrying a JSON body must not parse as a
+    real answer from a host that never sent one. ``follows=True`` is the case
+    that fails without the fix.
+    """
+    handler = _Exchange(
+        httpx.Response(307, headers={"location": "https://api.exa.ai/v2/search"}, json=_body()),
+    )
+    result = _retrieve(handler, config, client_kwargs={"follow_redirects": follows})
+    # One query, one POST. A following client chases this same-origin redirect
+    # until httpx gives up at max_redirects -- 21 requests for one query, every
+    # one of them billable.
+    assert len(handler.requests) == 1
+    assert result.raw_responses == ()
+    assert result.provider_failed is True
+    assert result.documents == ()
 
 
 def test_the_client_build_exa_client_returns_is_accepted(
@@ -430,6 +529,9 @@ def test_a_bare_string_allowlist_is_refused_before_any_call(config: AppConfig) -
         ("question_id", True),
         ("question_id", None),
         ("question_id", 4.2),
+        # An int subclass is not an int: isinstance accepted it, which made the
+        # module's "exact int" claim untrue (round 5, observation 1).
+        ("question_id", _QuestionId.FIRST),
         ("retrieval_run_id", ""),
         ("retrieval_run_id", 42),
         ("retrieval_run_id", None),
@@ -437,6 +539,12 @@ def test_a_bare_string_allowlist_is_refused_before_any_call(config: AppConfig) -
         ("now", "2026-07-27T12:00:00Z"),
         # Aware, but the freshness bound underflows datetime's range.
         ("now", datetime(1, 1, 1, tzinfo=timezone.utc)),
+        # Aware, and the freshness subtraction succeeds -- it is converting *now*
+        # to UTC that overflows. Round 4 converted only inside validate_run, at
+        # the end of the run, so this billed a call and then raised a raw
+        # OverflowError (round 5, finding 3).
+        ("now", datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(-timedelta(hours=14)))),
+        ("now", datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=14)))),
         # A caller-supplied tzinfo runs code inside utcoffset().
         ("now", datetime(2026, 7, 27, 12, 0, tzinfo=_BrokenTz())),
     ],
@@ -483,12 +591,51 @@ def test_a_malformed_query_leaks_through_no_channel(
     assert SECRET not in capsys.readouterr().err
 
 
+def test_a_non_utc_now_is_normalized_everywhere_it_is_recorded(config: AppConfig) -> None:
+    """One instant, spelled independently of the timezone the caller spelled it in.
+
+    ``now`` is converted once in preflight, so the run's columns, the documents'
+    ``retrieved_at_utc`` and the ``startPublishedDate`` sent to Exa all agree --
+    rather than the first two being converted by the schema and the third
+    carrying the caller's offset into ``provider_config``.
+    """
+    offset_now = datetime(2026, 7, 27, 17, 0, tzinfo=timezone(timedelta(hours=5)))
+    assert offset_now == NOW  # the same instant, differently spelled
+
+    handler = _Exchange(_json_ok(_body(_result())))
+    result = _retrieve(handler, config, now=offset_now)
+
+    cutoff = NOW - timedelta(days=config.retrieval.freshness_days_default)
+    assert handler.requests[0]["payload"]["startPublishedDate"] == cutoff.isoformat()
+    assert result.run.provider_config is not None
+    assert result.run.provider_config["start_published_date"] == cutoff.isoformat()
+    assert result.run.started_at_utc == NOW
+    assert result.run.freshness_cutoff_utc == cutoff
+    assert all(d.retrieved_at_utc == NOW for d in result.documents)
+
+
 def test_a_bare_string_of_reasons_is_refused(config: AppConfig) -> None:
     """fallback_reasons is a Sequence too; a bare str iterates to characters."""
     handler = _Exchange()
     with pytest.raises(ExaFallbackError):
-        _retrieve(handler, config, reasons="primary_provider_failed")  # type: ignore[arg-type]
+        _retrieve(handler, config, reasons="primary_provider_failed")
     assert handler.requests == []
+
+
+@pytest.mark.parametrize("reasons", [None, 42, object(), _RaisingIterable()])
+def test_a_malformed_reason_container_is_refused_before_any_call(
+    config: AppConfig, reasons: Any
+) -> None:
+    """The one caller argument round 4's container hardening missed (round 5, finding 6).
+
+    ``fallback_reasons=None`` raised a raw ``TypeError: 'NoneType' object is not
+    iterable`` -- a sibling of the shapes ``queries`` and ``include_domains``
+    already refused as this module's own error.
+    """
+    handler = _Exchange()
+    with pytest.raises(ExaFallbackError):
+        _retrieve(handler, config, reasons=reasons)
+    assert handler.requests == [], "refusal must happen before any billable call"
 
 
 def test_fallback_engagement_is_logged_without_provider_text(
@@ -808,6 +955,17 @@ def test_official_reason_alone_does_not_make_a_document_official(config: AppConf
         # Unresolvable as a host at all.
         ("-",),
         ("..",),
+        # Single labels: accepted by round 4, and `_matches_official_domain`'s
+        # subdomain rule then labelled every host beneath them `official`
+        # (round 5, finding 5). The dotted spellings must go the same way, or
+        # the terminal-dot normalization becomes a way around this rule.
+        ("com",),
+        ("gov",),
+        ("localhost",),
+        ("gov.",),
+        ("com.",),
+        ("bls.gov..",),
+        ("bls.gov", "com"),
     ],
 )
 def test_malformed_domain_allowlist_is_refused_before_any_call(
@@ -840,6 +998,40 @@ def test_an_allowlist_entry_is_case_folded(config: AppConfig) -> None:
     result = _retrieve(handler, config, include_domains=("BLS.GOV",))
     assert handler.requests[0]["payload"]["includeDomains"] == ["bls.gov"]
     assert all(d.source_type == "official" for d in result.documents)
+
+
+@pytest.mark.parametrize(
+    ("entry", "result_url"),
+    [
+        # canonicalize_url preserves a terminal DNS root dot, so the two valid
+        # spellings of one host never met -- in either direction (round 5,
+        # finding 4). Under-attribution: the run asked for official sources, Exa
+        # honoured it, and the ledger recorded `web`.
+        ("bls.gov", "https://bls.gov./report"),
+        ("bls.gov.", "https://bls.gov/report"),
+        ("bls.gov.", "https://bls.gov./report"),
+        ("bls.gov", "https://data.bls.gov./report"),
+        ("bls.gov.", "https://data.bls.gov/report"),
+    ],
+)
+def test_a_terminal_root_dot_is_the_same_host(
+    config: AppConfig, entry: str, result_url: str
+) -> None:
+    handler = _Exchange(_json_ok(_body(_result(url=result_url))))
+    result = _retrieve(handler, config, include_domains=(entry,))
+    assert result.documents, "the result must survive to be labelled at all"
+    assert all(d.source_type == "official" for d in result.documents)
+    # The dotless form is what is sent and stored, whichever way it was written.
+    assert handler.requests[0]["payload"]["includeDomains"] == ["bls.gov"]
+    assert result.run.provider_config is not None
+    assert result.run.provider_config["include_domains"] == ["bls.gov"]
+
+
+def test_the_root_dot_does_not_make_a_suffix_coincidence_a_match(config: AppConfig) -> None:
+    """Stripping the dot must not widen what counts as a subdomain."""
+    handler = _Exchange(_json_ok(_body(_result(url="https://notbls.gov./page"))))
+    result = _retrieve(handler, config, include_domains=("bls.gov",))
+    assert all(d.source_type == "web" for d in result.documents)
 
 
 # --- the run record ---------------------------------------------------------

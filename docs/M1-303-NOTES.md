@@ -312,11 +312,167 @@ code** (verified by stashing `src/whiskeyjack_bot/research/exa.py` and re-runnin
     while fixing only one of the two forms (a U-label needs IDNA, not `str.lower`).
 - Deliberately **not** done: rejecting single-label entries such as `"gov"`, which would promote
   every `.gov` host. Beyond the finding, and inventing allowlist policy on a round-4 review is how
-  a review reaches round six.
+  a review reaches round six. **Reversed in round 5 — see finding 5 below.** The judgement was
+  wrong in one specific way: this was never allowlist *policy*, it was a false attribution the
+  module already had the machinery to refuse.
 
 Two non-blocking observations were also acted on — the `max_cost_usd` path below, and the
 "body is recorded first either way" claim in the failure-handling note, which was wrong for two of
 the three failure shapes and has been corrected.
+
+## Round 5 — GPT cross-model review findings (PR #16)
+
+Six blocking findings. **All six were reproduced by execution before any of them was fixed**, and
+each reproduction was re-run afterwards to confirm it now refuses. One is worse than the review
+said. None was spurious.
+
+Round 4's own summary claimed the caller-mistake surface was closed; findings 3 and 6 are
+counterexamples to that claim, in the same shape as round 4's counterexamples to round 3's. The
+pattern worth naming: **hardening applied argument-by-argument leaves the argument nobody listed.**
+Round 4 routed `queries` and `include_domains` through `_string_list` and did not route
+`fallback_reasons`; round 4 moved `question_id`/`retrieval_run_id`/`now` into preflight and
+converted `now` to UTC at the *end*. Both gaps are the same omission.
+
+**1. Redirects handed the API key to another host.** `retrieve_web` accepts any `httpx.Client`, and
+a client built with `follow_redirects=True` — an ordinary, unremarkable setting — turned a `307
+Location: https://other-provider.example/search` into a second request carrying `x-api-key`
+verbatim. httpx strips `Authorization` when a redirect leaves the origin; it forwards every other
+header, and this API's credential is a custom one. The run still recorded `provider="exa"`. That is
+the silent provider switch `_require_exa_client` exists to prevent, reached from a third side —
+and unlike the other two it also discloses the credential. `follow_redirects=False` is now pinned
+**at the call site**, not left to the client's default, because the client is the caller's. A
+redirect is refused explicitly rather than left to `raise_for_status` (which does treat 3xx as an
+error in the pinned httpx) so that a redirect carrying a JSON body can never parse as a real answer
+from a host that never sent one. `build_exa_client` states the default too.
+
+Cost note: with a following client this was not one extra call but up to twenty-one — httpx chases
+a same-origin redirect to `max_redirects` before giving up, every hop billable. The regression test
+asserts `len(handler.requests) == 1`, which is the assertion that fails on the pre-fix code.
+
+**2. The structural `base_url` check did not establish `/search`.** Round 4 compared `(scheme, host,
+port, path.rstrip("/"), userinfo)`. That reads as stricter than a string comparison but is looser:
+it never looks at the query or the fragment, and `rstrip("/")` collapses repeated slashes. Verified
+counterexamples — three named by the review, one found while reproducing:
+
+| `base_url` (or client kwarg) | merged request URL | round 4 |
+|---|---|---|
+| `https://api.exa.ai?x=1` | `https://api.exa.ai/?x=1/search` | accepted |
+| `https://api.exa.ai//` | `https://api.exa.ai//search` | accepted |
+| `https://api.exa.ai#f` | `https://api.exa.ai/search#f` | accepted |
+| `params={"k": "v"}` | `https://api.exa.ai/search?k=v` | accepted |
+
+The last one is the one the review missed, and it is the reason the fix is not "also check query and
+fragment": `base_url` is not the only thing httpx merges into a request URL, so decomposing
+`base_url` is the wrong object to inspect at all. `_require_exa_client` now asks httpx to
+**build the actual request** — the same merge `.post()` performs — and requires
+`request.url == httpx.URL("https://api.exa.ai/search")`. One equality covers scheme, host, port,
+path, query, fragment and userinfo, and it cannot drift from what is sent, because it *is* what
+would be sent. The two legitimate spellings (`https://api.exa.ai`, `https://api.exa.ai/`) still
+pass; every round-4 rejection still fails.
+
+These are wrong-endpoint bugs, not provider switches — all four still address `api.exa.ai`. Recorded
+as such rather than inflated: the review's own wording ("does not guarantee `/search`") is the
+accurate one.
+
+**3. An upper-bound `now` billed a call and then raised raw.** `now = datetime(9999, 12, 31, 23, 59,
+59, tzinfo=timezone(-timedelta(hours=14)))` passed every preflight — it is aware, and the freshness
+*subtraction* moves away from the boundary, so round 4's `OverflowError` guard never fired. One POST
+was made and paid for. Then `validate_run` converted it to UTC, which overflows, and raised
+`builtins.OverflowError: date value out of range`: a raw exception from a sibling module, after the
+money, discarding the record of the spend. Round 4 fixed the low end of exactly this and did not
+look at the high end.
+
+`_require_run_metadata` is now **validate-and-return**, like `_validated_domains`: it converts `now`
+to UTC once, in preflight, translates the failure to `ExaFallbackError`, and returns the normalized
+value that the run, the documents and `startPublishedDate` all then use. The `utcoffset()` gate
+stays ahead of the conversion and is not redundant with it — `astimezone` on a *naive* datetime
+silently assumes local time and succeeds, so it cannot be the thing that rejects one.
+
+**Behaviour change to note:** for a caller passing a non-UTC `now`, `startPublishedDate` and
+`provider_config["start_published_date"]` now carry the UTC spelling of the same instant. This is an
+improvement rather than a cost — `provider_config` now agrees with the run's own already-UTC
+`freshness_cutoff_utc` column, and the persisted record no longer depends on which timezone a caller
+happened to spell the same moment in.
+
+**4. A terminal DNS root dot under-attributed official sources.** `canonicalize_url` preserves it, so
+`bls.gov.` and `bls.gov` — two valid spellings of one host — canonicalized to two different strings
+that never matched. Both directions verified: a `bls.gov` allowlist against a result at
+`https://bls.gov./report`, and a `bls.gov.` allowlist against `https://bls.gov/report`, each
+labelled `web`. The run asked for official sources, Exa honoured it, and the ledger recorded the
+weaker claim.
+
+One root dot is now normalized on both sides, and **deliberately in two places**: `_validated_domains`
+strips it as part of the canonicalization it already does, while `_matches_official_domain` strips it
+from the **result host only** and never from `domains`. That asymmetry preserves the rule round 4
+established — the allowlist is ours and arrives validated, so normalizing it at the comparison would
+mask an un-normalized allowlist reaching the function; the result host is provider-derived and must
+be normalized on arrival.
+
+**Fixed in `exa.py`, not in `canonicalize_url` — owner decision.** The root cause is upstream: two
+reports of one page differing only by the root dot are also two distinct dedup keys today. But
+`canonical_url` *is* document identity, so changing it moves the key of every already-stored
+document, in a module owned by already-merged M1-305, on a branch scoped to M1-303. **M1-310** is
+filed for that question. Recorded plainly: this fix corrects the attribution, and leaves the dedup
+consequence open behind a backlog row.
+
+**5. A single-label allowlist manufactured false official attribution.** `include_domains=("com",)`
+was accepted, and the subdomain rule then labelled `https://attacker.com/report` **official**.
+Round 4 declined this as allowlist policy beyond the finding. That was wrong, and the reversal is
+recorded rather than quietly made: it is not policy, it is a false attribution claim, in the one
+place this project says it will not make one — an instrument whose product is attribution cannot
+ship a spelling of "official" that means "any host on the public internet". Entries now require at
+least two labels, checked *after* the root dot is stripped so `gov.` cannot get in around `gov`.
+
+**Known residual, stated rather than half-fixed:** a *multi-label* public suffix — `co.uk`,
+`com.au` — still over-attributes everything beneath it. Closing that needs a public-suffix list,
+i.e. a new dependency, which serializes against every other track through `uv.lock` and is a
+wave-level decision, not a review fix. The review agrees the broader policy can stay separate. The
+two-label rule is the part available for nothing, and it is taken.
+
+**6. A malformed reason container escaped as a raw exception.** `fallback_reasons=None` raised
+`TypeError: 'NoneType' object is not iterable`; a container whose `__iter__` raises escaped as
+whatever it threw. `_canonical_reasons` now goes through the same `_string_list` that round 4 built
+for `queries` and `include_domains` — the one caller argument that hardening never reached. The
+container refusal gets its own constant (`_BAD_REASONS`), separate from the vocabulary message,
+because the two say different things: one is about the shape of the argument and says nothing about
+what was in it.
+
+### Non-blocking observations — both acted on, neither defended
+
+- **`IntEnum` was accepted where the notes claimed "exact `int`".** `isinstance(question_id, int)`
+  admits any `int` subclass. Harmless in practice (`%d` and pydantic both handle it), but the
+  documented claim was false, and the cheapest way to make a claim true is to make it true:
+  `type(question_id) is not int`, the exact-type gate M1-203 already established. The `bool` check
+  is now subsumed by it.
+- **The provider-binding claim was too broad.** A caller-supplied `transport` or `event_hooks` can
+  still send the bytes elsewhere — a request hook may rewrite `request.url` after it is built. The
+  claim is narrowed, in the module docstring and in `_require_exa_client`, to exactly what is
+  enforced: **the request URL this module builds is Exa's search endpoint.** The transport remains a
+  trusted boundary, for the round-2 reason (every test injects a `MockTransport`), and that is now
+  stated as a limit rather than implied away.
+- The raw-response persistence boundary staying with M1-306 was affirmed; no change.
+
+### Test discipline
+
+35 new cases. Each was run against the pre-fix `exa.py` (stashed) and **23 unit cases and 4 of 5 new
+properties fail there**. The exceptions are recorded rather than presented as regression coverage:
+
+- `test_the_root_dot_does_not_widen_a_suffix_coincidence` and its unit twin pass pre-fix by
+  construction — they guard the fix against *over*-widening `notbls.gov` into a match, which is a
+  different failure than the one being fixed.
+- `base_url="https://api.exa.ai/search"` and `include_domains=("bls.gov..",)` were already rejected
+  by round 4; they are in the tables so the rewrite is shown not to have loosened anything.
+- The `follow_redirects=False` half of the redirect test passes pre-fix, because the pinned httpx
+  already errors on a 3xx. It pins the explicit `is_redirect` branch against a future httpx that
+  does not.
+
+One test written during this round was **deleted for proving nothing**: a first version asserted
+that a redirect body is not recorded, using a client with httpx's default `follow_redirects=False`
+— which passes on the broken code. Catching it required the round-4 habit of running every new test
+against the pre-fix module, and it is the reason the surviving redirect test asserts the *request
+count* rather than only the outcome. The same run also corrected a code comment claiming "3xx is not
+an error status to httpx", which is false for the pinned version and would have left the
+`is_redirect` branch dead and mis-explained.
 
 ## Notes for downstream items
 

@@ -230,22 +230,32 @@ def test_reason_normalization_is_permutation_invariant(reasons: list[FallbackRea
     assert _canonical_reasons(forward) == forward
 
 
-@given(st.lists(st.text(max_size=8), max_size=4))
+@given(st.lists(st.text(max_size=8).filter(lambda s: s.strip()), max_size=4))
 def test_unknown_reasons_raise_without_echoing_the_value(reasons: list[str]) -> None:
+    """Non-blank entries only: a blank one is now refused by the *container* check.
+
+    That refusal carries a different constant message, whose words a drawn value
+    could coincidentally be a substring of -- the same exclusion the vocabulary
+    message already needs below. Blank and non-string entries are covered by
+    ``test_a_malformed_reason_container_raises_only_the_module_error`` instead.
+    """
     if all(reason in REASONS for reason in reasons):
         return
     with pytest.raises(ExaFallbackError) as excinfo:
         _canonical_reasons(reasons)
-    message = str(excinfo.value)
-    # The message always names the module's own fixed vocabulary (deliberate --
-    # "the vocabulary itself is ours to name"), so a caller-supplied fragment
-    # that happens to be a substring of one of those constant words (e.g. "pro"
-    # inside "primary_provider_failed") appears regardless of the input; that is
-    # not an echo of caller data, so it is excluded from the leak check.
-    vocabulary_text = ", ".join(REASONS)
-    for reason in reasons:
-        if reason not in REASONS and len(reason) > 2 and reason not in vocabulary_text:
-            assert reason not in message
+    # Stated as "the message is a constant", not as "the value is absent from
+    # the message". A substring check cannot state this property: the message
+    # names the module's own vocabulary *and* its own prose, so a drawn value
+    # like "pro" (inside "primary_provider_failed") or "rea" (inside "fallback
+    # reason is not in the vocabulary") is a substring of it without anything
+    # having been echoed -- and every exclusion carved out for those weakens the
+    # assertion further. Comparing against the message a fixed unknown reason
+    # produces says the thing that actually matters, with no exclusions at all:
+    # the message is a function of nothing the caller passed.
+    with pytest.raises(ExaFallbackError) as control:
+        _canonical_reasons(["not-a-reason"])
+    assert str(excinfo.value) == str(control.value)
+    assert repr(excinfo.value) == repr(control.value)
 
 
 def test_a_planted_secret_in_a_reason_never_reaches_the_message() -> None:
@@ -390,6 +400,12 @@ _UNVERIFIABLE_FILTERS = (
     "user@bls.gov",
     " bls.gov",
 )
+
+# One label names no site, and `_matches_official_domain`'s subdomain rule would
+# make every host beneath it `official` (round 5, finding 5). The dotted
+# spellings are here because the root-dot normalization must not become a way
+# around the rule.
+_SINGLE_LABELS = ("com", "gov", "org", "localhost", "рф", "com.", "gov.")
 
 # What a bare host cannot contain, stated here rather than imported from the
 # module under test: a post-condition asserted against the implementation's own
@@ -536,3 +552,110 @@ def test_domain_match_does_not_match_on_a_bare_suffix() -> None:
     """``notbls.gov`` must not match ``bls.gov``: string-suffix, not subdomain, coincidence."""
     canonical = canonicalize_url("https://notbls.gov/page")
     assert _matches_official_domain(canonical, ("bls.gov",)) is False
+
+
+# --- domain label edge cases (PR #16 round-5 findings 4 and 5) --------------
+
+
+@given(
+    st.sampled_from(_BASE_DOMAINS + _IDN_DOMAINS),
+    st.booleans(),
+    st.booleans(),
+    st.none() | _DOMAIN_LABEL,
+)
+def test_the_two_spellings_of_a_host_select_each_other(
+    domain: str, dotted_entry: bool, dotted_result: bool, subdomain: str | None
+) -> None:
+    """One DNS host, written with and without its root dot, must match either way.
+
+    The two spellings are drawn **independently**, which is the whole of round 5's
+    finding 4. ``test_a_hosts_as_written_form_matches_a_result_on_that_host``
+    takes both sides from one URL, so they always carry the same spelling as each
+    other and the property holds on the pre-fix code -- which compared
+    ``bls.gov.`` against ``bls.gov`` and answered ``web``.
+    """
+    entry = f"{domain}." if dotted_entry else domain
+    host = domain if subdomain is None else f"{subdomain}.{domain}"
+    result_host = f"{host}." if dotted_result else host
+
+    validated = _validated_domains((entry,))
+    canonical = canonicalize_url(f"https://{result_host}/path")
+    assert _matches_official_domain(canonical, validated) is True
+    # The stored filter is the dotless form however the caller spelled it, so two
+    # runs written differently persist the same `provider_config`.
+    assert all(not d.endswith(".") for d in validated)
+    assert validated == _validated_domains((domain,))
+
+
+@given(st.sampled_from(_BASE_DOMAINS), st.booleans())
+def test_the_root_dot_does_not_widen_a_suffix_coincidence(domain: str, dotted: bool) -> None:
+    """Normalizing the dot must not turn a string-suffix coincidence into a match."""
+    host = f"not{domain}." if dotted else f"not{domain}"
+    canonical = canonicalize_url(f"https://{host}/path")
+    assert _matches_official_domain(canonical, _validated_domains((domain,))) is False
+
+
+@given(
+    st.one_of(
+        st.lists(HOSTILE_TEXT, max_size=3),
+        st.lists(st.sampled_from(_BASE_DOMAINS + _IDN_DOMAINS + _SINGLE_LABELS), max_size=4),
+    )
+)
+def test_no_validated_entry_is_a_single_label(domains: list[str]) -> None:
+    """A one-label entry made every host beneath it ``official`` (round 5, finding 5).
+
+    Stated as a post-condition on the output rather than as "these inputs raise":
+    a rule about which entries survive validation is the thing that has to hold,
+    and it holds for entries no sampled list thought to include.
+    """
+    try:
+        validated = _validated_domains(domains)
+    except ExaFallbackError:
+        return
+    for domain in validated:
+        assert "." in domain, "a single label would promote every host beneath it"
+        assert not domain.startswith(".") and not domain.endswith(".")
+
+
+@given(st.sampled_from(_SINGLE_LABELS))
+def test_a_single_label_entry_is_refused(entry: str) -> None:
+    with pytest.raises(ExaFallbackError):
+        _validated_domains((entry,))
+
+
+# --- the reason container (PR #16 round-5 finding 6) ------------------------
+
+
+class _RaisingIterable:
+    """A container whose ``__iter__`` raises, which ``list()`` propagates unchanged."""
+
+    def __iter__(self) -> Any:
+        raise RuntimeError("deliberately broken __iter__")
+
+
+@given(
+    st.one_of(
+        st.none(),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        HOSTILE_TEXT,
+        st.binary(max_size=4),
+        st.lists(st.one_of(st.none(), st.integers(), HOSTILE_TEXT), max_size=3),
+        st.dictionaries(st.text(max_size=2), st.text(max_size=2), max_size=2),
+        st.just(_RaisingIterable()),
+    )
+)
+def test_a_malformed_reason_container_raises_only_the_module_error(reasons: Any) -> None:
+    """``fallback_reasons=None`` raised a raw ``TypeError`` (round 5, finding 6).
+
+    The container was the one caller argument round 4's ``_string_list``
+    hardening never reached, so this fuzzes the *shape* of the argument rather
+    than its contents -- the existing vocabulary property only ever passed lists
+    of strings, which is exactly why it could not find this.
+    """
+    try:
+        result = _canonical_reasons(reasons)
+    except ExaFallbackError:
+        return
+    # Whatever survives has to be the canonical persisted form.
+    assert result == tuple(r for r in REASONS if r in set(result))
