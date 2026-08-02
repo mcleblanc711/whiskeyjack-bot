@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -181,7 +182,14 @@ def test_unreadable_allowlist_is_reported_as_filesystem_problem(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """M1-308 round-3 P2 regression: a file that exists but can't be read (permission,
-    race) is a filesystem problem, not a config-content one."""
+    race) is a filesystem problem, not a config-content one.
+
+    The interception point is ``os.open``, not ``Path.read_bytes``: the round-6 FIFO guard
+    replaced the latter, and this test went on passing a patch nothing called until it
+    started failing outright. ``intercepted`` is asserted below so a future move of the read
+    makes this test fail loudly rather than pass vacuously -- a simulated failure that
+    simulates nothing proves nothing.
+    """
     set_all_env(monkeypatch)
     monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
     unreadable = tmp_path / "unreadable_accounts.yaml"
@@ -189,14 +197,17 @@ def test_unreadable_allowlist_is_reported_as_filesystem_problem(
         (REPO_ROOT / "config" / "x_accounts.yaml").read_text(encoding="utf-8"), encoding="utf-8"
     )
 
-    original_read_bytes = Path.read_bytes
+    original_open = os.open
+    intercepted = False
 
-    def _raise_for_target(self: Path) -> bytes:
-        if self == unreadable:
+    def _raise_for_target(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal intercepted
+        if Path(path) == unreadable:
+            intercepted = True
             raise PermissionError(13, "Permission denied")
-        return original_read_bytes(self)
+        return original_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", _raise_for_target)
+    monkeypatch.setattr(os, "open", _raise_for_target)
 
     data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     data["retrieval"]["social"]["enabled"] = True
@@ -206,6 +217,7 @@ def test_unreadable_allowlist_is_reported_as_filesystem_problem(
     social.write_text(yaml.safe_dump(data), encoding="utf-8")
 
     report = verify_environment(social)
+    assert intercepted, "the loader never opened the allowlist; this test proved nothing"
     assert report.exit_code == EXIT_ENV_MISSING
     assert any("allowlist" in p for p in report.filesystem_problems)
     assert report.config_problems == []
@@ -358,7 +370,20 @@ def test_second_entry_point_also_rejects_a_non_regular_allowlist_path(
 # against the last reported symptom. Overlap with the named regression tests above is
 # deliberate: those carry the *why*, this carries the completeness.
 
-_PATH_KINDS = ("absent", "valid", "invalid", "directory", "dangling_symlink", "unsearchable_parent")
+# "fifo" and "character_device" joined the list in round 6: the round-5 move from
+# Path.is_file() to an lstat/ENOENT absence test was right about absence, but is_file() had
+# also been filtering out special files as a side effect, and nothing replaced that -- so a
+# FIFO here blocked the loader forever instead of being reported.
+_PATH_KINDS = (
+    "absent",
+    "valid",
+    "invalid",
+    "directory",
+    "dangling_symlink",
+    "unsearchable_parent",
+    "fifo",
+    "character_device",
+)
 
 # (enabled, path kind) -> outcome. "enabled" buys exactly one thing: permission for the
 # file to be absent. It never excuses a directory, a dangling symlink, an unreachable file
@@ -373,6 +398,8 @@ _TRUTH_TABLE = [
         ("directory", "filesystem"),
         ("dangling_symlink", "filesystem"),
         ("unsearchable_parent", "filesystem"),
+        ("fifo", "filesystem"),
+        ("character_device", "filesystem"),
     )
 ]
 
@@ -407,6 +434,20 @@ def _allowlist_at(tmp_path: Path, kind: str) -> Iterator[Path]:
         target.symlink_to(tmp_path / "no-such-target.yaml")
         yield target
         return
+    if kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("POSIX special files are not available on this platform")
+        target = tmp_path / "accounts_fifo.yaml"
+        os.mkfifo(target)
+        yield target
+        return
+    if kind == "character_device":
+        if not Path("/dev/zero").exists():
+            pytest.skip("no /dev/zero on this platform")
+        target = tmp_path / "accounts_dev.yaml"
+        target.symlink_to("/dev/zero")
+        yield target
+        return
     assert kind == "unsearchable_parent", kind
     if os.geteuid() == 0:
         pytest.skip("root ignores the directory permission bits this case relies on")
@@ -429,6 +470,7 @@ def test_allowlist_truth_table_at_verify_env(
     tmp_path: Path,
     config_file: Path,
     monkeypatch: pytest.MonkeyPatch,
+    deadline: None,
 ) -> None:
     set_all_env(monkeypatch)
     monkeypatch.setenv("XAI_API_KEY", "fake-xai-key-value")
@@ -472,6 +514,7 @@ def test_allowlist_truth_table_at_the_cli_boundary(
     tmp_path: Path,
     config_file: Path,
     monkeypatch: pytest.MonkeyPatch,
+    deadline: None,
 ) -> None:
     """cli._load_verified_config is where the round-3 and round-4 regressions actually
     landed -- verify-env was fine both times. It discards the loaded allowlist, so the

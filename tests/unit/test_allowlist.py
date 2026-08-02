@@ -3,6 +3,7 @@ unknown reliability tags at load time, and domain matching selects the right sub
 
 from __future__ import annotations
 
+import os
 import traceback
 from pathlib import Path
 from typing import Any
@@ -206,6 +207,98 @@ def test_missing_file_error_suppresses_its_cause(tmp_path: Path) -> None:
     with pytest.raises(AllowlistError) as excinfo:
         load_allowlist(tmp_path / "no-such-file.yaml")
     assert excinfo.value.__cause__ is None
+
+
+# --- non-regular targets (round-6 review finding) ---
+#
+# A FIFO at the allowlist path used to block load_allowlist forever: opening a pipe for
+# reading waits for a writer. Everything below runs under the `deadline` fixture, because
+# a regression here hangs rather than fails.
+
+pytestmark_unix = pytest.mark.skipif(
+    not hasattr(os, "mkfifo"), reason="POSIX special files are not available on this platform"
+)
+
+
+@pytestmark_unix
+def test_fifo_is_rejected_rather_than_read(tmp_path: Path, deadline: None) -> None:
+    """The load must *return* -- on the pre-fix code this call never came back."""
+    path = tmp_path / "accounts.yaml"
+    os.mkfifo(path)
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert "not a regular file" in str(excinfo.value)
+
+
+@pytestmark_unix
+def test_fifo_is_classified_as_filesystem_error(tmp_path: Path, deadline: None) -> None:
+    """Not a content error: there is no content here to have failed validation."""
+    path = tmp_path / "accounts.yaml"
+    os.mkfifo(path)
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert excinfo.value.is_filesystem_error is True
+
+
+@pytestmark_unix
+def test_fifo_error_suppresses_its_cause(tmp_path: Path, deadline: None) -> None:
+    path = tmp_path / "accounts.yaml"
+    os.mkfifo(path)
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.skipif(not Path("/dev/zero").exists(), reason="no /dev/zero on this platform")
+def test_character_device_is_rejected_rather_than_read(tmp_path: Path, deadline: None) -> None:
+    """The other half of the hazard: /dev/zero reads forever without ever blocking, so a
+    size check or a timeout would not catch it -- only the file-type check does."""
+    path = tmp_path / "accounts.yaml"
+    path.symlink_to("/dev/zero")
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert excinfo.value.is_filesystem_error is True
+    assert "not a regular file" in str(excinfo.value)
+
+
+@pytestmark_unix
+def test_non_regular_message_names_only_the_path(tmp_path: Path, deadline: None) -> None:
+    """The path is this project's one carve-out; what the object *is* stays unsaid."""
+    path = tmp_path / "accounts.yaml"
+    os.mkfifo(path)
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    rendered = str(excinfo.value)
+    for leaked in ("fifo", "FIFO", "pipe", "S_ISREG", "st_mode"):
+        assert leaked not in rendered
+
+
+def test_symlink_to_a_regular_file_still_loads(tmp_path: Path, deadline: None) -> None:
+    """The guard rejects non-regular *targets*, not indirection: a config file reached
+    through a symlink is ordinary, and breaking it would be a regression of its own."""
+    real = tmp_path / "real_accounts.yaml"
+    real.write_text(ALLOWLIST_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    link = tmp_path / "linked_accounts.yaml"
+    link.symlink_to(real)
+    assert load_allowlist(link).entries == load_allowlist(real).entries
+
+
+def test_a_large_regular_file_is_read_in_full(tmp_path: Path, deadline: None) -> None:
+    """The read loop replaced read_bytes(); a file past one 64KiB chunk proves it does not
+    stop at the first short read. Keyed on entry count, which a truncated read changes."""
+    data: Any = yaml.safe_load(ALLOWLIST_PATH.read_text(encoding="utf-8"))
+    entries = data["accounts"]
+    padded = [
+        dict(entry, notes=f"padding {index} " + "x" * 4096)
+        for index, entry in enumerate(entries)
+        for _ in range(4)
+    ]
+    for index, entry in enumerate(padded):
+        entry["username"] = f"pad{index}"
+    path = tmp_path / "big.yaml"
+    path.write_text(yaml.safe_dump({"accounts": padded}), encoding="utf-8")
+    assert path.stat().st_size > 65536
+    assert len(load_allowlist(path).entries) == len(padded)
 
 
 def test_duplicate_username_is_classified_as_content_error(tmp_path: Path) -> None:

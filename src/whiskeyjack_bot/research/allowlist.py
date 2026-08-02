@@ -37,15 +37,19 @@ key **is** that key, so a part of ``loc`` survives only if the schema authored i
 field name, or an index under a list-valued field. An ``int`` is not self-evidently an index;
 see :func:`_sanitize`.
 
-:class:`AllowlistError` also carries ``is_filesystem_error``, set only when the file could not
-be read at all. Everything else raised here -- bad UTF-8, malformed YAML, a schema violation --
-is the file's *content* failing to validate, which ``env_verify.py`` and ``cli.py`` route to
-config-invalid rather than environment-missing (see ``env_verify.load_and_verify_account_allowlist``).
+:class:`AllowlistError` also carries ``is_filesystem_error``, set only when there was no file
+here to validate -- it could not be read, or the path names something that is not a regular
+file (a directory, a FIFO, a device). Everything else raised here -- bad UTF-8, malformed
+YAML, a schema violation -- is the file's *content* failing to validate, which
+``env_verify.py`` and ``cli.py`` route to config-invalid rather than environment-missing
+(see ``env_verify.load_and_verify_account_allowlist``).
 """
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, get_origin
@@ -131,8 +135,10 @@ class AllowlistError(Exception):
     ``is_filesystem_error`` distinguishes "the file could not be read" (a filesystem/
     environment concern -- retrying later or fixing permissions can resolve it) from every
     other case here, which is the file's *content* failing to validate (a config concern,
-    per this item's acceptance criterion). Only the ``read_bytes()`` failure in
-    :func:`load_allowlist` sets it; decode, parse and schema failures are content failures.
+    per this item's acceptance criterion). It is set by the two failures in
+    :func:`load_allowlist` that mean "there is no file here to validate" -- the open/read
+    failure and the rejection of a non-regular target -- and by nothing else; decode, parse
+    and schema failures are content failures.
     """
 
     def __init__(self, problems: list[str], *, is_filesystem_error: bool = False):
@@ -210,11 +216,34 @@ class AccountAllowlist:
         return tuple(entry for entry in self.entries if domain in entry.domains)
 
 
-def load_allowlist(path: Path | str) -> AccountAllowlist:
-    """Load and validate an account allowlist YAML file; raises AllowlistError on failure."""
-    path = Path(path)
+def _read_regular_file(path: Path) -> bytes:
+    """Read ``path`` in full, refusing anything that is not a regular file (round-6 review).
+
+    ``Path.read_bytes()`` is not safe on an operator-supplied path. Opening a FIFO for
+    reading blocks until some writer appears, so a FIFO at
+    ``retrieval.social.account_allowlist_path`` hung ``verify-env`` and every command behind
+    ``cli._load_verified_config`` instead of reporting a problem -- reproduced, the process
+    was still blocked after five seconds. Devices are the same class of hazard. Until round 5
+    this was masked by a ``Path.is_file()`` guard in ``env_verify``, which filtered out
+    special files as a side effect of answering a different question; replacing that guard
+    with a correct absence test (``lstat``/ENOENT) correctly stopped treating a directory as
+    "absent" and, in the same stroke, let FIFOs through to the reader. The check belongs
+    here, in the only function that reads, so both entry points and any later caller are
+    covered once.
+
+    ``O_NONBLOCK`` is load-bearing, not decoration: it is what makes the *open* return on a
+    FIFO with no writer. Without it the hang simply moves from the read to the open, so
+    "open, then fstat" is not on its own a fix (checked both ways -- bare ``O_RDONLY`` still
+    hangs). It has no effect on reads from a regular file, which is the only case that gets
+    past the check below.
+
+    ``fstat`` on the descriptor rather than ``stat`` on the path: the type is then decided
+    for the exact object being read, so the answer cannot be invalidated by a swap between
+    the check and the read.
+    """
     try:
-        raw_bytes = path.read_bytes()
+        # O_CLOEXEC so the descriptor cannot leak through a concurrent subprocess spawn.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as exc:
         # from None: OSError's cause chain must not ride along into a formatted
         # traceback (same rule prompt.py's identical read-failure translation follows);
@@ -223,6 +252,37 @@ def load_allowlist(path: Path | str) -> AccountAllowlist:
             [f"cannot read account allowlist {path}: {exc.strerror or exc}"],
             is_filesystem_error=True,
         ) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            # What it is instead is not named: "a FIFO" is a fact about the operator's
+            # filesystem, and the path is the only thing this project renders. It is a
+            # filesystem error for the same reason a missing file is -- there is no
+            # content here to validate, and fixing it means changing the filesystem.
+            raise AllowlistError(
+                [f"account allowlist {path} is not a regular file"],
+                is_filesystem_error=True,
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError as exc:
+        raise AllowlistError(
+            [f"cannot read account allowlist {path}: {exc.strerror or exc}"],
+            is_filesystem_error=True,
+        ) from None
+    finally:
+        # os.close, not os.fdopen: fdopen would take ownership of the descriptor and this
+        # close would then be a double close on the regular-file path.
+        os.close(fd)
+
+
+def load_allowlist(path: Path | str) -> AccountAllowlist:
+    """Load and validate an account allowlist YAML file; raises AllowlistError on failure."""
+    path = Path(path)
+    raw_bytes = _read_regular_file(path)
     try:
         raw_text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
