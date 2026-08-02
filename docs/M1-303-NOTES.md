@@ -474,6 +474,44 @@ count* rather than only the outcome. The same run also corrected a code comment 
 an error status to httpx", which is false for the pinned version and would have left the
 `is_redirect` branch dead and mis-explained.
 
+## Round 6 — GPT cross-model review (PR #16) — APPROVE
+
+Reviewed commit `44eae0cc1233e095cf8eef14ca3abc402d971488`, which is the request's `HEAD`. **No
+blocking findings.** All six round-5 blockers confirmed CLOSED, each against the remediated code
+rather than the review's own description of it: the redirect test's following client made exactly
+one request and never reached the redirected host; `_require_exa_client` refuses wrong paths,
+queries, fragments, ports, credentials, repeated slashes and client-level `params`; boundary
+timestamps make zero provider calls; `notbls.gov.` remains a non-match while `bls.gov.` matches;
+`com`/`gov`/`localhost` and their dotted spellings are refused while `bls.gov` is accepted;
+`fallback_reasons=None`, scalars, bare strings and raising iterables all arrive as
+`ExaFallbackError` before any call.
+
+This is the first round of this item that ran under the bounded review contract (`--round 6
+--previous-reviewed 748d7ac`), and it is the first that did not open with a blank-slate audit.
+Rounds 1–5 produced 19 blocking findings across five requests; round 6 produced none, on a request
+that led with the remediation delta instead of the whole branch. Recorded because the contract's
+cost — writing the delta and the falsifiable claims — is only worth paying if it shortens the loop,
+and here it ended it.
+
+### Non-blocking observations — filed, not implemented on this branch
+
+- **A public-suffix allowlist entry can still fake official attribution if it is multi-label.**
+  `include_domains=("co.uk",)` is accepted where `("com",)` is refused. This is the residual round 5
+  chose to **state rather than half-fix**, and the reviewer reached the same boundary independently
+  rather than proposing a partial suffix list. Now filed as **M1-311** with the reviewer's own
+  acceptance criterion, so it lives in the backlog instead of in a notes paragraph.
+- **`decide_fallback`'s docstring still claims all three arguments are exact-type gated**, while
+  `primary_documents` uses `isinstance(..., int)` and admits `IntEnum`. Round 5 fixed exactly this
+  claim for `question_id` and did not carry it to the sibling argument — the same
+  argument-by-argument omission named at the head of the round-5 section, now in the notes rather
+  than the code. No attribution, billing or security impact: every caller is internal and supplies
+  an exact `int`. Left for the owner to take as a one-line docstring narrowing or a `type(...) is
+  int` gate, deliberately **not** folded into the approved commit, because a post-approval code edit
+  merges something no reviewer has seen.
+- M1-309 (AskNews caller preflight) and M1-310 (terminal root dot in `canonicalize_url`) were both
+  re-confirmed as unchanged on the diff base — pre-existing conditions that cannot block this branch.
+  Both rows already exist; neither needed reopening.
+
 ## Notes for downstream items
 
 - **M1-306** owns persistence and replay: `raw_responses` are in memory only, and
