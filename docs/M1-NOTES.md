@@ -527,6 +527,52 @@ review has been finding one per round: never raises, strict weak ordering, permu
 replay-stability across the persisted JSON form, and no value leak. The M1-305 tiebreak's five
 rounds map onto four properties in one file. It found a new defect on its first run — see below.
 
+`scripts/review-request.py` now also gives that loop an explicit exit policy. Round 1 is the broad
+implementation review; round 2 is a remediation review focused on the preceding findings and
+regressions introduced by their fixes. From round 3 onward, the stopping rule is active: another
+blocker must quote the violated acceptance criterion or standing convention, identify a reachable
+product path or public module boundary using accepted input/state, reproduce the wrong result
+against the current commit, state its impact, and propose an in-scope fix. Otherwise it is a
+non-blocking backlog candidate and cannot withhold approval. Remediation rounds require
+`--previous-reviewed <commit>` and put that exact commit-to-HEAD delta before the full branch diff,
+so a stale response cannot silently restart work against an older tree and each round is not a new
+blank-slate audit.
+
+**Three disqualifying tests, carried by every round.** The stopping rule bounds how *severe* a
+finding must be; it does nothing about findings that were never this branch's to answer. Those get
+a mechanical test each, checkable before merit is argued, and each one is here because it was paid
+for:
+
+- **Outside the trust boundary.** `CLAUDE.md` now states it: trusted is `config.yaml`, every
+  filesystem path in it, the local filesystem, the operator's shell, and anything reachable only
+  by monkeypatching internals; untrusted is provider JSON, Metaculus payloads, LLM output, values
+  read back out of the ledger, and config *values* that fail validation. It extends the M1-401
+  path carve-out with the same argument — an operator-supplied path is configuration, not content,
+  and an operator who can plant a FIFO can edit the config. It binds the author as well as the
+  reviewer, which is the half that matters: the hardening gets written before anyone reviews it.
+  M1-308's round-6 `verify-env` hang is the case that named the rule. It stays fixed — the
+  boundary is not retroactive, and reverting written, passing, gate-green code to prove a point
+  costs more than it saves.
+- **Already on the diff base.** M1-303's round 4 reported holes equally present in merged AskNews
+  code. They were right, and they became M1-309 — after the branch had paid 791 lines of churn for
+  findings that were never about this branch.
+- **Stale.** Three separate rounds (M1-308 r6, M1-603 r4, M1-303) restated findings already closed
+  on a newer tree. `--previous-reviewed` fixes the request side; the response side is now a
+  contract term — the reviewed commit hash is demanded *before* the verdict, so a void round is
+  caught before its findings are written.
+
+None of the three is a dismissal: each says "propose the backlog row", because the finding is
+usually real and only misfiled.
+
+**The author-side half.** 47 of the first 121 non-merge commits were review-round commits, but the
+spread is what matters: M1-202 and M1-401 closed in two round-commits each, M1-305 took ten, and
+the cheap two are not the easy two. The difference is that M1-202's notes (§ M1-202 above) were
+written as `### Decision — X, and why`, `### Deviation`, `### Rejected — X, and why not`,
+`### Deferred (do not read the absence as an omission)`, `### Standing risk — not verifiable
+offline` — before round 1, so round 1 had nothing left to discover. `review-request.py` now emits
+those five headings into the request instead of one paragraph of advice, each with its own TODO:
+an unfilled heading is visible in the sent request, and advice is not.
+
 **3 — `GPT_REVIEW_*` files.** Gitignored and blocked by the tracked-artifact check;
 `scripts/review-request.py <ITEM>` generates the request on stdout from the backlog row, its `D##`
 decisions and the branch diff, leaving *deliberate choices* and *risk areas* as explicit TODOs.
