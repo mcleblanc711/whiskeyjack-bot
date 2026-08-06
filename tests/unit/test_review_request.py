@@ -1,10 +1,16 @@
 """The review request generator's honesty guards (scripts/review-request.py).
 
-The generator runs the four gates against the *working tree* and builds its diff from
-committed ``HEAD``. Those are the same code only while the tree is clean: with an
-uncommitted fix in place, the request truthfully reported four passes for a change the
-reviewer was never shown, and an untracked test file changed what pytest collected
-without appearing in the diff at all (cross-model review, round 2).
+The generator runs the four gates against the *working tree* and builds its diffs from a
+``HEAD`` it pins to an immutable hash. Those are the same code only while the tree is
+clean *for the whole gate run*: with an uncommitted fix in place, the request truthfully
+reported four passes for a change the reviewer was never shown, and an untracked test
+file changed what pytest collected without appearing in the diff at all (cross-model
+review, round 2).
+
+The pinning is the same failure one level up. A request that never stated its own commit
+could be answered against a different tree with nothing in the document contradicting it
+(M1-308 round 6), so ``HEAD`` and the diff base are resolved once, printed, and used to
+build every range and every check.
 
 So the tests here are about what the generator refuses to say. It is workflow tooling
 outside the package, so it is loaded by path rather than imported.
@@ -183,6 +189,13 @@ def test_every_round_carries_the_three_disqualifying_tests() -> None:
         assert "backlog" in policy.casefold(), round_number
 
 
+# Distinct 40-character hashes, so an assertion that HEAD and the base are pinned
+# *separately* cannot pass on a generator that resolves one and reuses it for both.
+TEST_HEAD = "b" * 40
+TEST_BASE = "c" * 40
+TEST_REVIEWED = "a" * 40
+
+
 def _render(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *argv: str) -> str:
     """Assemble a real request with git stubbed out, and return the emitted document.
 
@@ -191,8 +204,22 @@ def _render(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     """
 
     def fake_run(*args: str) -> str:
-        if args[:2] == ("git", "rev-parse"):
+        # Matched exactly rather than by prefix: the generator now asks `rev-parse` two
+        # different questions (the branch name, and each revision's commit hash), and a
+        # prefix match would answer both with the branch name -- which is what a pinned
+        # hash must never be.
+        if args == ("git", "rev-parse", "--abbrev-ref", "HEAD"):
             return "chore/under-test\n"
+        if args == ("git", "rev-parse", "--verify", "HEAD^{commit}"):
+            return TEST_HEAD + "\n"
+        if args == ("git", "rev-parse", "--verify", "origin/master^{commit}"):
+            return TEST_BASE + "\n"
+        if args == ("git", "rev-parse", "--verify", "reviewed-sha^{commit}"):
+            return TEST_REVIEWED + "\n"
+        if args[:3] == ("git", "merge-base", "--is-ancestor"):
+            return ""
+        if args[:3] == ("git", "diff", "--name-only"):
+            return "src/whiskeyjack_bot/research/exa.py\n"
         if args[:2] == ("git", "diff"):
             return " src/whiskeyjack_bot/research/exa.py | 1 +\n"
         return ""
@@ -221,6 +248,107 @@ def test_the_contracts_cross_references_point_the_right_way(
     # fails on a document that is right.
     assert "trust boundary above" not in body[:conventions].casefold()
     assert "trust boundary above" in body[conventions:].casefold()
+
+
+def test_the_request_pins_head_and_the_diff_base_to_full_hashes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A request that never states its own commit cannot be answered falsifiably.
+
+    Demanding the reviewer's hash (``_output_format``) only closes one end: until the
+    request printed its own, a response naming a different commit contradicted nothing in
+    the document. M1-308's round 6 was spent exactly there, on a request whose embedded
+    diff was demonstrably post-fix.
+    """
+    body = _render(monkeypatch, capsys)
+    assert f"**Request HEAD:** `{TEST_HEAD}`" in body
+    assert f"**Pinned diff base:** `{TEST_BASE}`" in body
+    assert f"git diff {TEST_BASE}...{TEST_HEAD}" in body
+    # The branch name is not a pin. It used to be the only identity the request carried.
+    assert "diffed against `origin/master`" not in body
+
+
+def test_the_embedded_diffs_survive_the_pinning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pinning names the range; it does not replace the code.
+
+    The reviewer is a pasted-context model with no filesystem, so replacing the diff with
+    `git diff <range>` would leave it reviewing a diffstat. Asserted because the pinning
+    makes that substitution look free.
+    """
+    body = _render(monkeypatch, capsys, "--round", "2", "--previous-reviewed", "reviewed-sha")
+    assert f"# Remediation diff (`git diff {TEST_REVIEWED}..{TEST_HEAD}`)" in body
+    assert f"# Full branch diff for context only (`git diff {TEST_BASE}...{TEST_HEAD}`)" in body
+
+
+def test_the_remediation_section_names_the_pinned_head_not_the_word_head(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ "Review the current HEAD" is exactly the instruction a stale round satisfies."""
+    body = _render(monkeypatch, capsys, "--round", "2", "--previous-reviewed", "reviewed-sha")
+    section = body[body.index("## Previous review and remediation delta") :]
+    assert f"The preceding review examined commit `{TEST_REVIEWED}`" in section
+    assert f"Review request HEAD\n`{TEST_HEAD}`" in section
+
+
+def test_the_ancestry_check_uses_the_pinned_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolving HEAD twice is how a request names one revision and validates another."""
+    seen: list[tuple[str, ...]] = []
+
+    def fake_run(*args: str) -> str:
+        seen.append(args)
+        if args == ("git", "rev-parse", "--verify", "reviewed-sha^{commit}"):
+            return TEST_REVIEWED + "\n"
+        return ""
+
+    monkeypatch.setattr(review_request, "_run", fake_run)
+    assert (
+        review_request._reviewed_revision(2, "reviewed-sha", head_revision=TEST_HEAD)
+        == TEST_REVIEWED
+    )
+    assert ("git", "merge-base", "--is-ancestor", TEST_REVIEWED, TEST_HEAD) in seen
+    assert ("git", "merge-base", "--is-ancestor", TEST_REVIEWED, "HEAD") not in seen
+
+
+def test_a_head_change_during_the_gates_voids_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gates take minutes; the window they run in is the one that matters.
+
+    A commit landing mid-pytest would otherwise attach a green result to a revision the
+    gates never saw, under the hash the request pins.
+    """
+    heads = iter((TEST_HEAD, "d" * 40))
+
+    def fake_resolve(revision: str, *, label: str) -> str:
+        del label
+        return next(heads) if revision == "HEAD" else TEST_BASE
+
+    monkeypatch.setattr(review_request, "_resolve_commit", fake_resolve)
+    monkeypatch.setattr(review_request, "_require_clean_tree", lambda: None)
+    monkeypatch.setattr(review_request, "_verify_gates", lambda: "all pass")
+
+    with pytest.raises(SystemExit) as excinfo:
+        review_request.main(["M1-305"])
+    assert "HEAD changed while the gates were running" in str(excinfo.value)
+
+
+def test_the_clean_tree_check_runs_after_the_gates_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Before-only leaves the whole gate window unguarded."""
+    calls = 0
+
+    def counting_clean_tree() -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(review_request, "_resolve_commit", lambda revision, *, label: TEST_HEAD)
+    monkeypatch.setattr(review_request, "_require_clean_tree", counting_clean_tree)
+    monkeypatch.setattr(review_request, "_verify_gates", lambda: "all pass")
+    monkeypatch.setattr(review_request, "_run", lambda *args: "")
+
+    review_request.main(["M1-305"])
+    assert calls == 2
 
 
 def test_the_reviewed_commit_is_demanded_before_the_verdict() -> None:
@@ -276,9 +404,12 @@ def test_previous_review_commit_must_be_an_ancestor(
 
     def fake_run(*args: str) -> str:
         calls.append(args)
-        if args[:3] == ("git", "rev-parse", "--verify"):
+        # Exact matches: both revisions are now resolved through the same
+        # `rev-parse --verify <rev>^{commit}` shape, so a prefix match would answer the
+        # reviewed commit and HEAD with the same hash and trip the "no delta" guard.
+        if args == ("git", "rev-parse", "--verify", "reviewed-sha^{commit}"):
             return "a" * 40 + "\n"
-        if args == ("git", "rev-parse", "HEAD"):
+        if args == ("git", "rev-parse", "--verify", "HEAD^{commit}"):
             return "b" * 40 + "\n"
         raise SystemExit("not an ancestor")
 
@@ -287,7 +418,7 @@ def test_previous_review_commit_must_be_an_ancestor(
         review_request._reviewed_revision(3, "reviewed-sha")
 
     assert "must be an ancestor" in str(excinfo.value)
-    assert calls[-1] == ("git", "merge-base", "--is-ancestor", "a" * 40, "HEAD")
+    assert calls[-1] == ("git", "merge-base", "--is-ancestor", "a" * 40, "b" * 40)
 
 
 def test_previous_review_commit_resolves_to_the_exact_ancestor(
@@ -296,11 +427,11 @@ def test_previous_review_commit_resolves_to_the_exact_ancestor(
     reviewed = "a" * 40
 
     def fake_run(*args: str) -> str:
-        if args[:3] == ("git", "rev-parse", "--verify"):
+        if args == ("git", "rev-parse", "--verify", "reviewed-sha^{commit}"):
             return reviewed + "\n"
-        if args == ("git", "rev-parse", "HEAD"):
+        if args == ("git", "rev-parse", "--verify", "HEAD^{commit}"):
             return "b" * 40 + "\n"
-        assert args == ("git", "merge-base", "--is-ancestor", reviewed, "HEAD")
+        assert args == ("git", "merge-base", "--is-ancestor", reviewed, "b" * 40)
         return ""
 
     monkeypatch.setattr(review_request, "_run", fake_run)
