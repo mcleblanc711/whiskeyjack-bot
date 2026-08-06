@@ -1798,3 +1798,198 @@ times`.
 diff base, so per the review contract it is a backlog row, not a fix in this branch: **M0-007**,
 filed with the reproduction and acceptance criteria. Widening this branch into the primary config
 loader would hand a round-8 reviewer a second file to audit for a defect that predates the item.
+
+## M1-310 — The terminal DNS root dot in the canonical URL
+
+Acceptance: *either `canonicalize_url` normalizes one terminal root dot and the identity change is
+recorded, or the dot is documented as identity-bearing with a rationale; dedup collapses the two
+spellings of one host iff that decision says it should.*
+
+The criterion offers two answers and asks for the reasoning either way. This note is that
+reasoning; the code implements the first.
+
+### What the criterion is actually guarding against
+
+`canonicalize_url` derives the `canonical_url` that the ledger keys dedup on —
+`UNIQUE (retrieval_run_id, canonical_url, content_sha256)` (`001_initial.sql:73`). It preserved a
+terminal root dot, so `https://bls.gov./x` and `https://bls.gov/x` — two valid spellings of one
+DNS host, both accepted by the schema gate — were two dedup keys for one page.
+
+PR #16's round-5 cross-model review found it through its *attribution* symptom rather than its
+dedup one: an Exa result at `https://bls.gov./report`, returned under a `bls.gov` allowlist, was
+labelled `source_type: web`, because the two spellings never compared equal in either direction.
+That branch fixed the symptom locally (`exa._without_root_dot`) and explicitly declined to touch
+canonical form, filing this item. The underlying duplicate-identity defect was untouched until now.
+
+### Decision — one terminal root dot is normalized away (D32)
+
+`canonicalize_url` strips exactly one trailing dot from the host, so the two spellings produce one
+`canonical_url` and collapse to one dedup key. Four things decide it.
+
+**1. The dedup key contains the content hash, so this cannot collapse two different pages.** The
+one real argument for treating the dot as identity is that it is genuinely observable on the wire:
+`Host:`, TLS SNI and cookie scope all differ between the two spellings, so a virtual-hosting stack
+*can* serve different bodies at `bls.gov.` and `bls.gov`. That argument does not survive the shape
+of the key. Two documents collapse only when `(retrieval_run_id, canonical_url, content_sha256)`
+matches — same run, and **byte-identical content after the pinned normalization**. If the two
+spellings really served different pages, the digests differ and both rows survive. What collapses
+is one page fetched twice under two spellings, which is exactly the collapse dedup exists for.
+
+**2. Attribution is not lost.** `original_url` holds the URL exactly as the provider returned it
+(`model.py:288`, `002_research_document_fields.sql:41`), and both are stored. Canonicalization has
+never been an attribution loss and this does not make it one: the as-retrieved spelling is still
+in the ledger, and both columns are immutable after insert (`003_lifecycle_events.sql:989`).
+
+**3. Nothing is stored yet, so the identity change is free now and expensive later.** No ledger
+holds research documents; there has been no production run. This is the same class of change as
+`hashing.py`'s pinned normalization rule, whose docstring requires any change to ship as a new
+versioned function *because previously stored digests keep their old values*. That constraint is
+about committed data, and there is none. **M1-306 is the deadline, not a complication**: its
+acceptance is *"replay produces zero provider calls and the same research packet hash"*, and that
+packet is built from documents keyed on `canonical_url`. Settling the dot after M1-306 lands means
+changing an identity its hash has already been computed over — the same restatement problem, just
+arrived at a milestone later. (Nothing in the M1-306 branch depends on this change today; it picks
+it up on its next daily `master` merge.)
+
+**4. The blast radius is one adapter.** `canonicalize_url` has exactly one production caller today
+— Exa, at `exa.py:912` (allowlist entries) and `exa.py:999` (each result). AskNews still sets
+`canonical_url = url` unmodified (`asknews.py:177`); that gap is M1-309 and is untouched here.
+
+### Decision — the strip lives in `_canonical_host`, before the IP-literal branch
+
+Placed as the first step of `_canonical_host`, ahead of the `ipaddress`/`idna` split, so
+`https://127.0.0.1./a` collapses to `https://127.0.0.1/a` on the same rule as
+`https://bls.gov./x`. Putting it after the split would have made the dot a domain-name special
+case and left the dotted IPv4 spelling as a second, undocumented identity — one rule, applied
+where the host is decided, is the reason this module has a single `_canonical_host` at all.
+
+IPv6 cannot reach it: `urlsplit` hands `::1` over unbracketed, and `::1.` fails `_require_http_url`
+before canonicalization runs.
+
+### Decision — exactly one dot, and only after the gate has run
+
+Only one trailing dot can ever reach the stripper, and this was verified by execution rather than
+assumed: `https://bls.gov../x`, `https://.bls.gov/x`, `https://./x` and `https://..../x` are all
+already refused by `_require_http_url`, because `idna` rejects an empty label
+(`idna.IDNAError: Empty Label`). So there is no loop, no "strip while endswith" and no question of
+what `bls.gov..` should mean — it means nothing and is refused, exactly as before.
+
+The strip therefore runs **after** the syntactic gate, never before it, and the accepted-input set
+is unchanged by construction: canonicalization still accepts precisely what `_require_http_url`
+accepts. A property asserts that rather than leaving it as a claim.
+
+The `host != "."` guard in front of the strip is not defending against a reachable input — the gate
+refuses `"."` — it keeps `_canonical_host` total on its own terms instead of on a promise made by
+its caller, in the same spirit as the `parts.hostname or ""` beside it.
+
+### Delivered
+
+- `src/whiskeyjack_bot/research/canonical.py` — `_ROOT_DOT`-aware `_canonical_host`; module and
+  function docstrings state the rule and cite D32.
+- `src/whiskeyjack_bot/research/exa.py` — `_without_root_dot` and both call sites **removed**; the
+  two docstrings that asserted "`canonicalize_url` preserves a terminal DNS root dot … see M1-310"
+  now record what M1-310 decided.
+- `docs/backlog/decisions.csv` — **D32**, and the M1-310 backlog row references it.
+- `tests/property/test_canonical_properties.py`, `tests/property/strategies.py`,
+  `tests/unit/test_dedup_freshness.py`.
+
+### Decision — M1-303's local workaround is retired, not layered
+
+`exa._without_root_dot` existed only because canonicalization did not do this. Keeping it would
+leave two normalization rules for one question, in two modules, able to drift — the precise failure
+`canonical.py`'s "the gate is *reused*, not re-implemented" paragraph was written against, and the
+reason the round-5 fix also routed allowlist entries through `canonicalize_url` instead of
+lowercasing them locally. Worse, its docstrings assert as fact something this branch makes false;
+a stale rationale beside dead code is how a later reader re-derives a decision that was already
+made.
+
+**The round-5 tests it was written for are kept byte-for-byte unchanged** —
+`test_a_terminal_root_dot_is_the_same_host` (5 parametrized pairs),
+`test_the_root_dot_does_not_make_a_suffix_coincidence_a_match`,
+`test_the_two_spellings_of_a_host_select_each_other` and
+`test_the_root_dot_does_not_widen_a_suffix_coincidence`. Them passing against a deleted helper is
+the evidence that the canonical rule subsumes the workaround; rewriting them alongside the code
+would have destroyed that evidence.
+
+`_validated_domains`' single-label refusal is unaffected: `gov.` canonicalizes to `gov`, and
+`"." not in host` refuses it for the same reason it refuses `gov`.
+
+### Rejected — documenting the dot as identity-bearing, and why not
+
+The criterion's other branch. It fails on consequences rather than on principle: every consumer
+that compares hosts would have to re-derive the strip locally — Exa's attribution already had to,
+M1-306's replay hash would have to reason about it, and any future allowlist or citation view
+would too. That is a rule maintained in *n* places by convention, which is what this module exists
+to avoid. And it preserves a distinction with no consumer: nothing in the pipeline fetches
+`canonical_url` (it is a dedup key and an attribution string; adapters fetch through their
+provider), so the Host-header difference that makes the dot meaningful on the wire is never
+exercised by anything we do.
+
+### Rejected — a versioned `canonicalize_url_v2` alongside the current one
+
+`hashing.py`'s pattern, and the right one *when digests are already committed to*. Here it would
+buy nothing: there is no stored `canonical_url` to protect, so the branch would ship two live
+canonicalizers, a choice at every call site, and a permanent question about which one a given row
+was written under — the cost of the pattern with none of its benefit.
+
+### Rejected — normalizing the dot at the comparison instead of in canonical form
+
+`_matches_official_domain` could keep folding the dot at compare time (which is what it did). That
+leaves the *stored* identity duplicated, which is the actual defect: two ledger rows for one page
+under one run is a dedup failure whether or not any comparison later treats them as equal.
+
+### Deferred (do not read the absence as an omission)
+
+- **AskNews does not canonicalize at all.** `asknews.py:177` writes the raw URL into
+  `canonical_url`, so no AskNews document is affected by this change in either direction. That is
+  **M1-309**, filed off PR #16; folding it in here would widen an identity decision into an adapter
+  rewrite.
+- **Multi-label public suffixes** (`co.uk`, `com.au`) still over-attribute under Exa's subdomain
+  rule. Stated in `exa.py` and unchanged: closing it needs a public-suffix list, a dependency, and
+  `uv.lock` serializes tracks.
+- **No schema, migration or dependency change.** Nothing about the column changes; only the value
+  written into it, and nothing has been written yet.
+- **Other canonicalization questions stay open on purpose** — case in the path, `index.html`,
+  trailing slashes, `www.`, sorted query parameters. Each is a separate identity decision with its
+  own risk of collapsing two real resources; this item was scoped to the dot and the stricter
+  reading of a scoped criterion is to answer it and stop.
+
+### Standing risk — not verifiable offline
+
+A host that genuinely serves different content at `bls.gov.` and `bls.gov` cannot be discovered
+without live traffic. The exposure is bounded by fact 1 above: such a host produces different
+digests and two surviving rows, so the risk is not a wrong collapse but the reverse — two rows that
+look like duplicates in a listing and are not. `original_url` distinguishes them, and is stored
+precisely so that this is answerable after the fact.
+
+Whether providers emit the dotted spelling often enough to matter is likewise unmeasurable here.
+Round 5 saw it in a review scenario, not in captured traffic. If it turns out never to occur, this
+change is redundant rather than wrong; if it occurs once, it would have been a duplicate ledger row
+and a mislabelled source.
+
+### On the property tests, and the check that they discriminate
+
+Four new properties, each run against the pre-fix `canonical.py` first and confirmed **failing**
+there — the M1-303 lesson, where 3 of 10 new properties passed on the broken code and proved
+nothing:
+
+| property | pre-fix result |
+|---|---|
+| the canonical host never ends in a dot | **fails** (`https://bls.gov./x`) |
+| the two spellings of one host canonicalize identically | **fails** |
+| two hosts canonicalize equal **iff** they are the same host | **fails** — see below |
+| the accepted-input set is exactly `_require_http_url`'s | passes both ways — kept as the regression pin on "the strip runs after the gate" |
+
+The third one was written expecting it to pass both ways, as the guard on the *other* direction
+(normalizing must not turn a suffix coincidence like `notbls.gov` into a match). Run against the
+pre-fix code it failed, because its **iff** form also covers the same-host case: `bls.gov.` and
+`bls.gov` are one host, so the pre-fix canonicalizer answered "distinct" to a pair the property
+says must be equal. Stated here because the difference between "I expected this to discriminate"
+and "it does" is exactly what the pre-fix run is for, and the table was wrong until that run.
+
+The fourth is kept knowing it passes both ways: it pins where the strip runs (after the gate, so
+the accepted-input set cannot move) rather than what the strip does.
+
+The paired-spelling strategy draws the two spellings **independently**, for the reason
+`test_the_two_spellings_of_a_host_select_each_other` records — a pair derived from one string
+carries one spelling on both sides and holds on the pre-fix code.
