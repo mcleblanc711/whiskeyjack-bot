@@ -13,9 +13,11 @@ non-merge commits were review-round commits, and the two items that closed cheap
 (M1-202, M1-401, two round commits each) differ from the ten-round ones only in how much
 of the reasoning was written down before round 1. Round 1 is the broad implementation
 review, round 2 verifies its remediation, and from round 3 the stopping rule is active.
-Three tests disqualify an observation from blocking regardless of merit: it falls outside
-the declared trust boundary, it applies unchanged to the diff base, or it was reproduced
-against a commit that is not this request's HEAD.
+Three scope tests bound an observation before its severity is argued: it must sit inside the
+declared threat model, be introduced or materially amplified by this branch, and be
+reproduced against this request's pinned HEAD. The middle one is deliberately not a flat
+pre-existing-code exemption -- a branch that depends on a latent defect, or widens its
+reach, owns it.
 
 The request pins its own ``HEAD`` and diff base to immutable commit hashes, prints both,
 and builds every range from them. Without that the request never stated the commit it
@@ -100,15 +102,17 @@ DIRTY_TREE_NOTE: Final = """\
 > below is not necessarily the code that was run."""
 
 STANDING_CONVENTIONS: Final = """\
-- **Trust boundary.** *Trusted*: `config.yaml`, every filesystem path in it, the local
-  filesystem, the operator's shell, and anything reachable only by monkeypatching module
-  internals. *Untrusted*: provider JSON (AskNews, Exa), Metaculus API payloads, LLM output,
-  any value read back out of the ledger, and config *values* that fail validation. A
-  reproduction that requires a hostile local filesystem -- a FIFO or device at a configured
-  path, a directory swapped in mid-read, a permission flipped between check and use -- does
-  not clear the blocking bar; propose it as a backlog row instead. This is the same
-  reasoning as the settled M1-401 path carve-out: an operator-supplied path is
-  configuration, not content, and an operator who can plant a FIFO can edit the config.
+- **Threat and operational boundary.** The operator and their machine are non-malicious;
+  do not invent an attacker who can edit `config.yaml`, replace configured paths with
+  devices, or monkeypatch the installed program. Provider JSON (AskNews, Exa), Metaculus
+  API payloads, LLM output, values read back out of the ledger, and config values that fail
+  validation are untrusted. Ordinary local I/O failures -- missing or unreadable files,
+  short reads, permission errors and races that can occur without a malicious operator --
+  remain reachable reliability conditions. Monkeypatching is only a test technique: it may
+  reproduce one of those reachable conditions, but cannot make an otherwise unreachable
+  condition blocking. Deliberately hostile local state is a backlog candidate, not a branch
+  blocker. Operator-supplied paths remain renderable configuration under the settled M1-401
+  carve-out.
 - **Error hygiene.** Every module owns a sanitized exception (`ConfigError`,
   `SnapshotError`, `LedgerError`, `NormalizationError`, `ResearchError`). A message
   never echoes stored, file or field *values*, and sanitizing raises use `from None`
@@ -152,28 +156,33 @@ be valuable, but value alone does not make it a release blocker."""
 
 # Appended to every round's policy rather than written into each. These three are not
 # judgment calls about severity -- they are mechanical facts about a finding, checkable
-# before its merit is argued, and each is here because it cost real rounds: the trust
-# boundary because a FIFO planted at a configured path was reported as a blocker; the
-# diff-base test because M1-303's round 4 reported holes that were equally present in
+# before its merit is argued, and each is here because it cost real rounds: the threat
+# model because a FIFO planted at a configured path was reported as a blocker; the
+# causality test because M1-303's round 4 reported holes that were equally present in
 # already-merged AskNews code (they became M1-309, after the branch paid 791 lines of
-# churn); the staleness test because three separate rounds restated findings that were
+# churn); the revision test because three separate rounds restated findings that were
 # already closed on a newer tree.
-DISQUALIFYING_TESTS: Final = """\
+#
+# "Scope" rather than "disqualifying": the causality test is not a flat pre-existing-code
+# exemption. A branch that depends on a latent defect, or widens its reach, owns it -- and
+# monkeypatching can validly simulate an ordinary reachable failure.
+BLOCKING_SCOPE_TESTS: Final = """\
 
-Three tests disqualify an observation from blocking regardless of its merit. Check them
-before arguing severity:
+Check three scope tests before arguing severity:
 
-- **Outside the trust boundary.** A reproduction that requires a hostile local filesystem,
-  monkeypatched module internals, or any other input listed as trusted under **Trust
-  boundary** in the standing conventions below is not a blocker here.
-- **Already on the diff base.** If the same finding applies unchanged to code that is
-  already merged, it is a pre-existing condition, not a defect this branch introduced.
-  Propose the backlog row; do not withhold approval for it.
-- **Stale.** State the commit hash you actually examined. If it is not this request's
-  `HEAD`, say so and stop: the round is void and will be regenerated. Do not restate
-  findings against an older tree.
+- **Threat model.** A reproduction that requires a malicious operator or deliberately
+  hostile local machine is not a blocker here. Ordinary local I/O failures remain in scope.
+  Monkeypatching is a test technique, not a trust classification: say which reachable
+  condition it simulates.
+- **Branch causality.** If the same finding applies to code already on the pinned diff base,
+  and this branch neither depends on it nor materially increases its reachability or impact,
+  it is a pre-existing condition. Propose the backlog row; do not withhold approval. If the
+  branch does amplify it, state the before/after exposure as part of the reproduction.
+- **Reviewed revision.** State the commit hash you actually examined. If it is not this
+  request's pinned `HEAD`, say so and stop: the round is void and will be regenerated.
 
-Each of the three is a *backlog candidate*, not a dismissal. Say what you found."""
+A non-blocking classification is not a dismissal. Preserve useful observations as backlog
+candidates with a one-sentence acceptance criterion."""
 
 REMEDIATION_REVIEW_POLICY: Final = """\
 This is the **remediation review**. Your primary job is to verify the preceding review's
@@ -244,7 +253,7 @@ def _review_policy(round_number: int) -> str:
     must clear the explicit stopping-rule bar rather than merely identify more possible
     hardening.
 
-    ``DISQUALIFYING_TESTS`` is appended to all three rather than written into each. Every
+    ``BLOCKING_SCOPE_TESTS`` is appended to all three rather than written into each. Every
     round it was ever omitted from is a round where it was needed: a pre-existing condition
     or a stale reproduction is as reportable in the first review as in the fifth, and a rule
     the reviewer only sees from round 3 has already let rounds 1 and 2 spend on it.
@@ -255,7 +264,7 @@ def _review_policy(round_number: int) -> str:
         policy = REMEDIATION_REVIEW_POLICY
     else:
         policy = STOPPING_RULE_POLICY
-    return policy + "\n" + DISQUALIFYING_TESTS
+    return policy + "\n" + BLOCKING_SCOPE_TESTS
 
 
 def _output_format(round_number: int) -> str:
@@ -275,8 +284,8 @@ Reply with:
    standing convention, reachable path, deterministic reproduction against the reviewed
    commit, observed and required outcomes, impact, and minimal in-scope fix. No
    speculative hardening: if the required evidence is absent, it is not blocking. State
-   for each that it is inside the trust boundary above and does not apply unchanged to
-   the diff base.
+   for each that it is within the threat model and is introduced or materially amplified
+   by this branch. If monkeypatching is used, name the reachable condition it simulates.
 5. **Non-blocking observations / backlog candidates** — clearly separated. For useful
    out-of-scope hardening, propose a backlog title and one-sentence acceptance criterion.
 6. For each risk area listed above, one line on whether it is actually safe and why."""
