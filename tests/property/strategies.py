@@ -127,6 +127,15 @@ URL_CANDIDATES = st.one_of(
             "https://example.org",
             "http://example.org:80/",
             "https://[2001:db8::1]:8443/x",
+            # Terminal DNS root dots (M1-310). Present here so the *existing*
+            # properties -- idempotence, revalidation, own-error-only, no-leak --
+            # cover the spelling the canonicalizer now rewrites, not only the
+            # new properties written for it.
+            "https://bls.gov./x",
+            "https://127.0.0.1./a",
+            "https://xn--bcher-kva.de./a",
+            "https://bücher.de./a",
+            "https://a..b/x",  # refused: an empty label, not a root dot
             # Not URLs at all, or URLs this validator refuses:
             "",
             "not a url",
@@ -144,6 +153,46 @@ URL_CANDIDATES = st.one_of(
     ),
     st.text(max_size=20),
 )
+
+
+# Hosts that are valid with or without a terminal root dot, for M1-310. Deliberately
+# mixed: a bare domain, a subdomain, an IPv4 literal (the dot is stripped before the
+# IP/domain split, so it has to hold there too) and both spellings of one IDN.
+ROOT_DOT_HOSTS = st.sampled_from(
+    [
+        "bls.gov",
+        "data.bls.gov",
+        "example.org",
+        "127.0.0.1",
+        "xn--bcher-kva.de",
+        "bücher.de",
+    ]
+)
+
+# The same pool minus the U-label, whose A-label is already in it: these are hosts
+# that must stay *distinct* after canonicalization, and `bücher.de` is not distinct
+# from `xn--bcher-kva.de` -- it is the same host, which is the point of folding it.
+# `notbls.gov` is the suffix coincidence: dropping the dot must not make it a match.
+DISTINCT_HOSTS = st.sampled_from(
+    ["bls.gov", "data.bls.gov", "notbls.gov", "example.org", "127.0.0.1", "xn--bcher-kva.de"]
+)
+
+
+@st.composite
+def host_spellings(draw: st.DrawFn) -> tuple[str, str]:
+    """One host, returned as two URLs whose root-dot spelling is drawn independently.
+
+    The independence is the entire property. A pair derived from one string carries
+    the same spelling on both sides and so holds on the pre-fix code -- the mistake
+    ``test_the_two_spellings_of_a_host_select_each_other`` records having made in
+    M1-303's round 5, and the reason three of that item's ten new properties proved
+    nothing.
+    """
+    host = draw(ROOT_DOT_HOSTS)
+    path = draw(st.sampled_from(["/", "/report", "/a/b?q=1"]))
+    left = f"{host}." if draw(st.booleans()) else host
+    right = f"{host}." if draw(st.booleans()) else host
+    return f"https://{left}{path}", f"https://{right}{path}"
 
 
 @st.composite

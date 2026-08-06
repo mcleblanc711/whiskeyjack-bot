@@ -64,6 +64,16 @@ def _document(**overrides: object) -> ResearchDocument:
             "https://example.org/a?a=1&utm_source=x&b=2&fbclid=y&c=3",
             "https://example.org/a?a=1&b=2&c=3",
         ),
+        # One terminal DNS root dot goes (M1-310, D32): two spellings of one host
+        # were two dedup keys for one page, and never matched for attribution.
+        ("https://bls.gov./x", "https://bls.gov/x"),
+        ("https://BLS.GOV./x", "https://bls.gov/x"),
+        ("https://data.bls.gov./x", "https://data.bls.gov/x"),
+        # The dot is removed before the port and the IP/domain split, so it
+        # composes with both rather than being a domain-name special case.
+        ("https://bls.gov.:443/x", "https://bls.gov/x"),
+        ("https://127.0.0.1./a", "https://127.0.0.1/a"),
+        ("https://BÜCHER.DE./a", "https://xn--bcher-kva.de/a"),
         # IDN host folds to its A-label; IPv6 compresses and re-brackets.
         ("https://MÜNCHEN.DE/a", "https://xn--mnchen-3ya.de/a"),
         ("https://[2001:0db8:0000:0000:0000:0000:0000:0001]:443/a", "https://[2001:db8::1]/a"),
@@ -84,6 +94,11 @@ def test_canonicalize_url_normalizes_expected_forms(url: str, expected: str) -> 
         "https://[2001:db8::1]:443/a",
         "https://8.8.8.8:8080/a",
         "http://example.org:80/",
+        # Both spellings of one host: the dotted one must also reach a fixed point,
+        # or the canonical form would depend on how many times it was canonicalized.
+        "https://bls.gov./x",
+        "https://bls.gov/x",
+        "https://127.0.0.1./a",
     ],
 )
 def test_canonical_output_revalidates_and_is_idempotent(url: str) -> None:
@@ -128,6 +143,12 @@ def test_canonicalize_accepts_what_the_schema_accepts(url: str) -> None:
         "ftp://example.org/a",  # scheme we never retrieve over
         "not a url",
         "/relative/path",
+        # M1-310 removes *one* terminal root dot and nothing else: an empty label
+        # is still refused, by the shared gate, before canonicalization can run.
+        # These are why the strip is one slice and not a loop.
+        "https://bls.gov../x",
+        "https://.bls.gov/x",
+        "https://./x",
     ],
 )
 def test_canonicalize_rejects_what_the_schema_rejects(url: str) -> None:
@@ -249,6 +270,55 @@ def test_identical_artifacts_collapse() -> None:
     result = deduplicate([a, b])
     assert len(result.documents) == 1
     assert result.collapsed_count == 1
+
+
+def test_the_two_spellings_of_one_host_collapse_to_one_document() -> None:
+    """M1-310's acceptance criterion, at the level it is written about: dedup.
+
+    Two reports of one page, one of them carrying the terminal DNS root dot. Under
+    the pre-M1-310 canonical form these were two keys and both rows survived --
+    a duplicate ledger row for one artifact inside one run.
+    """
+    body = _hash("payrolls rose")
+    dotted = _document(
+        original_url="https://bls.gov./report",
+        canonical_url=canonicalize_url("https://bls.gov./report"),
+        content_sha256=body,
+    )
+    plain = _document(
+        original_url="https://bls.gov/report",
+        canonical_url=canonicalize_url("https://bls.gov/report"),
+        content_sha256=body,
+    )
+    result = deduplicate([dotted, plain])
+    assert len(result.documents) == 1
+    assert result.collapsed_count == 1
+    # The survivor keeps its own as-retrieved spelling: canonicalization decides
+    # identity, never attribution, and original_url is what the reader checks.
+    assert result.documents[0].original_url == "https://bls.gov./report"
+
+
+def test_two_spellings_serving_different_content_are_still_two_documents() -> None:
+    """The bound on the decision above, and the answer to its main objection.
+
+    ``bls.gov.`` and ``bls.gov`` differ on the wire (Host header, SNI, cookie
+    scope), so a virtual-hosting stack *can* serve different pages at them. That
+    does not produce a wrong collapse: the key carries ``content_sha256``, so two
+    different bodies remain two rows however the host was spelled.
+    """
+    dotted = _document(
+        original_url="https://bls.gov./report",
+        canonical_url=canonicalize_url("https://bls.gov./report"),
+        content_sha256=_hash("the dotted vhost's page"),
+    )
+    plain = _document(
+        original_url="https://bls.gov/report",
+        canonical_url=canonicalize_url("https://bls.gov/report"),
+        content_sha256=_hash("a different page"),
+    )
+    result = deduplicate([dotted, plain])
+    assert result.collapsed_count == 0
+    assert len(result.documents) == 2
 
 
 def test_distinct_artifacts_are_not_collapsed_and_keep_order() -> None:

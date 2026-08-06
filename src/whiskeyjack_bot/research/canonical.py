@@ -20,6 +20,14 @@ lossy step -- dropping a documented tracking-parameter allowlist -- exists solel
 because dedup keys on ``canonical_url`` and two reports differing only by a
 ``utm_*`` tag must collapse.
 
+A **terminal DNS root dot is removed** from the host (D32, backlog M1-310). It is
+not a second lossy step in that sense: ``bls.gov.`` and ``bls.gov`` are two
+spellings of one host under the DNS standards, so removing it discards a spelling
+rather than an identity -- and ``original_url`` keeps that spelling regardless.
+The same dedup argument as ``utm_*`` applies, plus one the tracking tags do not
+have: the duplicate identity was also reaching *attribution*, where two spellings
+of one official domain failed to match each other (M1-303, review round 5).
+
 The gate is *reused*, not re-implemented: ``canonicalize_url`` runs
 ``model._require_http_url`` before normalizing, so there is one definition of
 "is this a URL at all", and a second hand-rolled copy cannot drift from it.
@@ -116,7 +124,24 @@ def _canonical_host(host: str) -> str:
     reassemble into an authority) and everything else to ``idna`` (IDNA 2008
     A-label, lowercased). ``uts46=True`` folds case/width so a mixed-case IDN host
     canonicalizes; a host that already passed the stricter gate cannot fail here.
+
+    **One terminal DNS root dot is stripped first** (D32, backlog M1-310).
+    ``bls.gov.`` and ``bls.gov`` are two spellings of one host, and preserving the
+    dot made them two dedup keys for one page -- and, in M1-303, two hosts that
+    never matched each other for official-source attribution. Stripped ahead of
+    the IP/domain split rather than inside the ``idna`` branch, so the dotted IPv4
+    spelling (``127.0.0.1.``) collapses on the same rule instead of becoming a
+    second, undocumented identity. IPv6 cannot carry one: ``urlsplit`` hands
+    ``::1`` over unbracketed and ``::1.`` never passes the gate.
+
+    Exactly one dot, never a loop: ``bls.gov..``, ``.bls.gov`` and ``.`` are
+    already refused upstream (``idna`` rejects an empty label), so a second dot is
+    not a spelling this function has to have an opinion about. The ``"."`` guard
+    is not defending a reachable input -- it keeps the function total on its own
+    terms rather than on a promise made by its caller.
     """
+    if host != "." and host.endswith("."):
+        host = host[:-1]
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -162,10 +187,16 @@ def canonicalize_url(url: str) -> str:
 
     Reuses ``model._require_http_url`` as the syntactic gate, then normalizes the
     parts that vary cosmetically between reports of one resource: it lowercases
-    the scheme, canonicalizes the host (IDN -> A-label, IPv6 compressed), drops
-    the default port, drops userinfo and the fragment, uppercases percent-octet
-    hex, and strips tracking parameters. Query order and every non-tracking
-    parameter are preserved. The result validates as an ``HttpUrlString``.
+    the scheme, canonicalizes the host (IDN -> A-label, IPv6 compressed, one
+    terminal DNS root dot removed -- D32), drops the default port, drops userinfo
+    and the fragment, uppercases percent-octet hex, and strips tracking
+    parameters. Query order and every non-tracking parameter are preserved. The
+    result validates as an ``HttpUrlString``.
+
+    The gate runs **first and unconditionally**, so this function accepts exactly
+    what ``_require_http_url`` accepts: no normalization step can rescue a string
+    that is not a URL, and the root-dot strip in particular cannot turn a refused
+    host into an accepted one (``tests/property`` asserts it).
     """
     try:
         _require_http_url(url)
