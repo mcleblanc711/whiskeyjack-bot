@@ -150,30 +150,38 @@ def test_post_remediation_output_requires_approval_without_a_qualified_blocker()
     assert "backlog title" in output
 
 
-def test_the_trust_boundary_names_both_sides() -> None:
+def test_the_boundary_names_both_what_is_out_of_scope_and_what_stays_in() -> None:
     """A boundary stated as one list is not a boundary.
 
-    The rule has to be checkable without the reviewer inferring the complement: naming only
-    what is trusted leaves "is provider JSON trusted?" open, and naming only what is not
-    leaves the FIFO-at-a-configured-path case exactly where it was.
+    The rule has to be checkable without the reviewer inferring the complement. Naming only
+    the untrusted inputs leaves "is a FIFO at a configured path a blocker?" open; naming only
+    the excluded attacker is worse, because it reads as licence to wave through *any* local
+    failure. The second assertion is the one that would have caught the wrong reading: an
+    ordinary unreadable file is not a hostile filesystem, and M1-308's round-6 FIFO hang was
+    a real defect found in self-review.
     """
     # Leading newline so the first bullet splits like the rest of them.
     bullets = ("\n" + review_request.STANDING_CONVENTIONS).split("\n- ")
-    boundary = next((entry for entry in bullets if entry.startswith("**Trust boundary.**")), None)
-    assert boundary is not None, "STANDING_CONVENTIONS has no trust-boundary bullet"
+    boundary = next(
+        (entry for entry in bullets if entry.startswith("**Threat and operational boundary.**")),
+        None,
+    )
+    assert boundary is not None, "STANDING_CONVENTIONS has no threat-boundary bullet"
 
     # Scoped to the one bullet: asserting these against the whole block would pass on a
     # boundary that named only one side, since the other terms appear in later conventions.
-    trusted, _, untrusted = boundary.partition("*Untrusted*")
-    assert untrusted, "the untrusted side is missing"
-    for trusted_item in ("config.yaml", "filesystem", "operator's shell", "monkeypatching"):
-        assert trusted_item in trusted, trusted_item
-    for untrusted_item in ("provider JSON", "Metaculus API", "LLM output", "ledger"):
-        assert untrusted_item in untrusted, untrusted_item
-    assert "backlog row" in untrusted
+    for excluded in ("non-malicious", "hostile local state", "backlog candidate"):
+        assert excluded in boundary, excluded
+    # Case-insensitive: the untrusted list opens a sentence, so "Provider JSON" is
+    # capitalized here and lower-case wherever it is cited.
+    for untrusted_item in ("provider json", "metaculus", "llm output", "ledger"):
+        assert untrusted_item in boundary.casefold(), untrusted_item
+    # The clause that distinguishes this from "anything local is trusted".
+    assert "reachable reliability conditions" in boundary
+    assert "Monkeypatching is only a test technique" in boundary
 
 
-def test_every_round_carries_the_three_disqualifying_tests() -> None:
+def test_every_round_carries_the_three_scope_tests() -> None:
     """These are mechanical, so they belong in round 1 as much as in round 5.
 
     Withholding them until the stopping rule engages is what let rounds 1 and 2 spend on a
@@ -181,12 +189,27 @@ def test_every_round_carries_the_three_disqualifying_tests() -> None:
     """
     for round_number in (1, 2, 3, 9):
         policy = review_request._review_policy(round_number)
-        assert "trust boundary" in policy.casefold(), round_number
-        assert "already merged" in policy.casefold(), round_number
-        assert "Stale" in policy, round_number
+        assert "threat model" in policy.casefold(), round_number
+        assert "pre-existing condition" in policy.casefold(), round_number
+        assert "Reviewed revision" in policy, round_number
         # A dismissal loses the finding; a backlog row keeps it. The distinction is the
         # whole reason these are safe to apply -- assert the request still asks for it.
         assert "backlog" in policy.casefold(), round_number
+
+
+def test_branch_causality_is_not_a_flat_pre_existing_code_exemption() -> None:
+    """The amplification clause is the point of the rewrite, so pin it.
+
+    A flat "already on the diff base means non-blocking" would have excused M1-308's round-7
+    finding: the same unguarded `yaml.safe_load` sat in `config.py` (filed as M0-007) *and*
+    in the branch's own new `allowlist.py`. The test asserts the escape hatch is conditional,
+    not that the words appear somewhere in the document.
+    """
+    for round_number in (1, 2, 3, 9):
+        policy = review_request._review_policy(round_number)
+        causality = policy[policy.index("**Branch causality.**") :].split("\n- ")[0]
+        assert "neither depends on it nor materially increases" in causality, round_number
+        assert "state the before/after exposure" in causality, round_number
 
 
 # Distinct 40-character hashes, so an assertion that HEAD and the base are pinned
@@ -234,20 +257,22 @@ def test_the_contracts_cross_references_point_the_right_way(
 ) -> None:
     """A cross-reference has to match the order the document is actually assembled in.
 
-    The disqualifier cites the trust boundary, which lives in the standing conventions --
-    emitted *after* the review-round contract, not before it. The first draft said "above".
+    The scope tests render in the review-round contract, the boundary they are about renders
+    later in the standing conventions, and the output format renders last. An earlier draft
+    said "the trust boundary above" from the contract -- pointing at a section the reviewer
+    had not read yet. The scope tests are now self-contained, so the fix is asserted as the
+    absence of any backward reference from the contract rather than as different wording.
     """
     body = _render(monkeypatch, capsys)
-    contract = body.index("Three tests disqualify")
-    conventions = body.index("**Trust boundary.**")
+    contract = body.index("Check three scope tests")
+    conventions = body.index("**Threat and operational boundary.**")
     output_format = body.index("## Output format")
     assert contract < conventions < output_format
 
-    # Scoped to what precedes the definition. "the trust boundary above" is correct under
-    # ## Output format, which renders after the conventions -- a blanket ban on the phrase
-    # fails on a document that is right.
-    assert "trust boundary above" not in body[:conventions].casefold()
-    assert "trust boundary above" in body[conventions:].casefold()
+    # Scoped to what precedes the definition: a reference to the boundary "above" is correct
+    # under ## Output format, which renders after the conventions, so a blanket ban on the
+    # phrase would fail on a document that is right.
+    assert "boundary above" not in body[:conventions].casefold()
 
 
 def test_the_request_pins_head_and_the_diff_base_to_full_hashes(
