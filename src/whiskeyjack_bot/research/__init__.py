@@ -2,7 +2,8 @@
 
 Adapters (M1-302 AskNews, M1-303 Exa, M1-304 structured router, M1-307 X agent)
 import from here so every provider produces one comparable evidence record.
-Deduplication, freshness-tagging and URL canonicalization are M1-305.
+Deduplication, freshness-tagging and URL canonicalization are M1-305; the
+fallback policy that decides when the Exa adapter runs is M1-303.
 """
 
 from whiskeyjack_bot.research.asknews import (
@@ -12,6 +13,15 @@ from whiskeyjack_bot.research.asknews import (
 )
 from whiskeyjack_bot.research.canonical import CanonicalizationError, canonicalize_url
 from whiskeyjack_bot.research.dedup import DedupResult, dedup_key, deduplicate
+from whiskeyjack_bot.research.exa import (
+    ExaFallbackError,
+    ExaRetrieval,
+    FallbackDecision,
+    FallbackReason,
+    build_exa_client,
+    decide_fallback,
+    retrieve_web,
+)
 from whiskeyjack_bot.research.freshness import (
     FreshnessReason,
     FreshnessState,
@@ -37,6 +47,10 @@ __all__ = [
     "AskNewsRetrieval",
     "CanonicalizationError",
     "DedupResult",
+    "ExaFallbackError",
+    "ExaRetrieval",
+    "FallbackDecision",
+    "FallbackReason",
     "FreshnessReason",
     "FreshnessState",
     "FreshnessVerdict",
@@ -50,13 +64,16 @@ __all__ = [
     "assess_document",
     "assess_freshness",
     "build_asknews_client",
+    "build_exa_client",
     "canonicalize_url",
     "content_sha256",
+    "decide_fallback",
     "dedup_key",
     "deduplicate",
     "freshness_cutoff",
     "normalize_content",
     "retrieve_news",
+    "retrieve_web",
     "validate_document",
     "validate_run",
 ]
