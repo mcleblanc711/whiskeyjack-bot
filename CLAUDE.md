@@ -82,25 +82,24 @@ outlier is worse than either consistent policy.
 - If spec and observed package behaviour conflict, **stop and ask** — do not silently adapt.
 - If an acceptance criterion is ambiguous, implement the **stricter reading** and note it.
 
-### Trust boundary
+### Threat and operational boundary
 
-The stricter-reading rule above says how to resolve an ambiguous *criterion*. It does not
-license hardening against an arbitrary threat, and without a stated boundary that distinction
-is argued fresh every review round.
+The stricter-reading rule above resolves an ambiguous *criterion*; it does not license
+hardening against an arbitrary attacker. The operator and their machine are non-malicious.
+Do not invent an attacker who can edit `config.yaml`, deliberately replace configured paths
+with devices, or monkeypatch the installed program.
 
-**Trusted** — `config.yaml` and every filesystem path in it, the local filesystem, the
-operator's shell, and anything reachable only by monkeypatching module internals.
-**Untrusted** — provider JSON (AskNews, Exa), Metaculus API payloads, LLM output, any value
-read back out of the ledger, and config *values* that fail validation.
+Provider JSON (AskNews, Exa), Metaculus API payloads, LLM output, values read back out of the
+ledger, and config values that fail validation are untrusted. Ordinary local I/O failures —
+missing or unreadable files, short reads, permission failures and races that can happen without
+a malicious operator — remain reachable reliability conditions. Monkeypatching is a test
+technique, not a trust classification: it may validly simulate a reachable failure, but cannot
+make an otherwise unreachable condition blocking.
 
-A defect whose reproduction requires a hostile local filesystem — a FIFO or device at a
-configured path, a directory swapped in mid-read, a permission flipped between check and use —
-is a **backlog row, not a blocker**, for the author writing the code and for the reviewer
-reading it. This is the same reasoning that settled the M1-401 path carve-out: an
-operator-supplied path is configuration, not content, and an operator who can plant a FIFO can
-edit the config. This is a floor, not a ceiling — nothing here weakens the ledger, the approval
-boundary, replayability, secret hygiene, or the rule that every malformed shape arrives as the
-module's own error type. Those hold against trusted input too.
+Deliberately hostile local state is a **backlog candidate, not a blocker**. Operator-supplied
+paths remain renderable configuration under the settled M1-401 carve-out. This boundary does
+not weaken the ledger, approval binding, replayability, secret hygiene, submission safety,
+paid-call controls, or the rule that malformed shapes arrive as the module's own error type.
 
 ## Workflow
 
@@ -137,18 +136,24 @@ module's own error type. Those hold against trusted input too.
   is how a review request could open with a falsehood. It also **requires a clean working tree**:
   the gates run against the tree while the diff comes from `HEAD`, so with uncommitted work it
   would report a pass for code the reviewer is never shown. `--no-verify` skips both and says so in
-  the output. `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
+  the output. Each request **pins its own `HEAD` and diff base to full commit hashes** and builds
+  every range from them, so a round that answers against a different tree contradicts the document
+  (PR #19). The diffs stay **embedded** and that is deliberate: the reviewer is a pasted-context
+  model with no filesystem, and round 7 demonstrably read file bodies out of the embedded diff, so
+  an inspection command it cannot run is not a substitute for the code.
+  `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
   Do **not** run `gh pr merge --delete-branch`: it fails while the branch is checked out in a
   sibling worktree. Merge, then `finish-item.sh`.
 - **The review has a stopping rule; pass `--round` so the request carries it.** Round 1 is the
   broad implementation review, round 2 verifies the remediation of round 1's findings, and from
   round 3 approval is required unless a finding clears an explicit five-item bar. Rounds 2+
   **require `--previous-reviewed <commit>`** — the exact commit the preceding review names — and
-  the request then leads with that commit-to-`HEAD` delta so the next round is not another
-  blank-slate audit. Three things disqualify a finding from blocking regardless of merit: it
-  falls outside the trust boundary above, it applies unchanged to the diff base (a pre-existing
-  condition — file the backlog row), or it was reproduced against a commit that is not the
-  request's `HEAD`.
+  the request then leads with that pinned commit-to-`HEAD` delta so the next round is not
+  another blank-slate audit. Three scope checks apply before severity: the finding must be inside the
+  threat model above, introduced or materially amplified by this branch, and reproduced against
+  the exact request HEAD. A pre-existing condition is non-blocking only when the branch neither
+  depends on it nor increases its reachability or impact. A monkeypatch is valid evidence only
+  when it simulates a reachable condition.
 - **A pasted review may be stale.** Before writing any fix code, diff the commit the review
   names against `HEAD` and reproduce each finding by execution. This has cost three full rounds
   (M1-308 r6, M1-603 r4, M1-303) — each time a review restated findings that were already closed
