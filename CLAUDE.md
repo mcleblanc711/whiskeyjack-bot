@@ -14,9 +14,12 @@ approval boundary, or replayability, do not take it.**
 3. `docs/backlog/backlog.csv` — issue-level acceptance criteria, and the single source for
    backlog state. `docs/backlog/decisions.csv` — the `D##` decisions referenced throughout the code.
 4. `docs/M0-REVIEW.md`, `docs/M1-NOTES.md` — running record of what shipped and what deviated.
-5. `docs/TRACKS.md` — who currently holds the dependency-adding item and the next free migration
+5. `docs/LESSONS.md` — what the *process* has cost, with the measurements. Read it **at every
+   milestone stop point and before starting a parallel wave**; 57% of this project's non-merge
+   commits are review-round commits, and that file is where the mechanism is written down.
+6. `docs/TRACKS.md` — who currently holds the dependency-adding item and the next free migration
    number. Read it before starting a worktree; claim yours there.
-6. `config.example.yaml` — the configuration contract.
+7. `config.example.yaml` — the configuration contract.
 
 ## Toolchain
 
@@ -114,8 +117,18 @@ module's own error type. Those hold against trusted input too.
   merged, and `--deps` **exits** on a live claim rather than warning. No override flag: if the
   holding branch is abandoned, delete it or drop its row. `scripts/tracks.py claims` lists what is
   live.
+- **A workflow change is a track, and it lands between waves.** Nine workflow-layer commits have
+  reached master; **six landed while PRs #15 and #16 were open**, and because master merges into
+  every active branch daily, each one entered both branches mid-review-cycle. M1-308 spent three
+  consecutive rounds of one review under three different request formats, and M1-603's round-5
+  request was generated, discarded and regenerated for the same reason. Every one of those changes
+  was individually correct; the cost was the timing. Claim the slot in `docs/TRACKS.md` and land it
+  at a wave boundary. If it must land mid-wave, **say so in the next review request** — the reviewer
+  is stateless and will otherwise read a format change as a substantive one. See `docs/LESSONS.md`.
 - **Merge `master` into every active branch daily**: `scripts/sync-worktrees.sh --merge` from the
   main checkout. Reaching a merge 20 commits behind is how one branch pays for all of them at once.
+  After any master merge, **name the real surface** in the request: M1-308's remediation diffstat
+  was ~11,495 insertions of which almost none was the branch, the rest already approved on #16/#17.
 - Branch → PR → **GPT cross-model review** → address findings → merge → `scripts/finish-item.sh
   <ITEM>`. Generate the request with `scripts/review-request.py <ITEM>`; it emits everything
   mechanical and leaves *deliberate choices* and *risk areas* as TODOs for you to write, which is
