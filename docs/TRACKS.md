@@ -33,13 +33,13 @@ to the registry, and neither is a habit you can form by reflex.
 | Claim | Held by | Notes |
 | --- | --- | --- |
 | Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. Claimed by M1-303 on 2026-07-27 and **released unused**: the Exa adapter calls the HTTP API through `httpx`, already a declared dependency, rather than adding `exa-py` (which would pull in `openai`, `requests` and `python-dotenv` for one POST). Releasing a claim you did not spend is part of holding it. |
-| Next free migration number | *free* | `001_initial.sql`, `002_research_document_fields.sql` and `003_lifecycle_events.sql` are taken; `003` landed with M1-603 and is now immutable on master. Next free is `004`. CI enforces uniqueness and immutability (`.github/scripts/check-migrations.sh`), but only *after* you push. |
+| Next free migration number | **004 — M1-606** (claimed 2026-08-06); next free is `005` | `001_initial.sql`, `002_research_document_fields.sql` and `003_lifecycle_events.sql` are taken; `003` landed with M1-603 and is now immutable on master. **M1-606 holds `004`** for the attempt-scoped pre-forecast failure schema. CI enforces uniqueness and immutability (`.github/scripts/check-migrations.sh`), but only *after* you push — so this row is the only thing standing between a parallel track and a `004_*.sql` collision that git merges cleanly and only breaks at runtime. |
 
 ## Worktrees
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-308 | feat/m1-308-x-account-allowlist | whiskeyjack-m1-308 | no | none | 2026-07-27 |
+| M1-606 | feat/m1-606-pre-forecast-failure-events | whiskeyjack-m1-606 | no | 004 | 2026-08-06 |
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per
