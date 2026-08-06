@@ -17,12 +17,24 @@ Three tests disqualify an observation from blocking regardless of merit: it fall
 the declared trust boundary, it applies unchanged to the diff base, or it was reproduced
 against a commit that is not this request's HEAD.
 
+The request pins its own ``HEAD`` and diff base to immutable commit hashes, prints both,
+and builds every range from them. Without that the request never stated the commit it
+described, so a review could answer it against a different tree and nothing in the
+document contradicted them -- M1-308's round 6 was spent that way, on a request whose
+embedded diff was demonstrably post-fix. Naming the reviewed commit (``--previous-reviewed``)
+fixes only the *other* end of that; both ends have to be pinned for the round to be
+falsifiable. The diffs stay embedded: the reviewer is a pasted-context model with no
+filesystem, so an inspection command it cannot run is not a substitute for the code.
+
 Running it also runs the four toolchain gates and refuses to emit anything if one
 fails, so the request cannot claim a green branch that is not green. It requires a clean
 working tree first, because the gates run against the tree while the diff is built from
 ``HEAD``: with uncommitted work those are different code, and the request would report a
-pass the reviewer cannot see. ``--no-verify`` skips both and says so in the output rather
-than going quiet.
+pass the reviewer cannot see. That check is repeated *after* the gates, together with a
+re-resolution of ``HEAD``, because the window that matters is the one the gates ran in --
+a commit or a checkout during a three-minute pytest run would otherwise attach a green
+result to a revision it never described. ``--no-verify`` skips both and says so in the
+output rather than going quiet.
 
     scripts/review-request.py M1-303 > GPT_REVIEW_REQUEST_M1-303.md   # gitignored
     scripts/review-request.py M1-303 --round 2 --previous-reviewed 42a57ed \
@@ -383,13 +395,32 @@ def _positive_round(value: str) -> int:
     return round_number
 
 
-def _reviewed_revision(round_number: int, requested: str | None) -> str | None:
+def _resolve_commit(revision: str, *, label: str) -> str:
+    """Resolve a revision to the immutable commit hash printed in the request.
+
+    Full hash, never the abbreviation or the symbolic name: the request is read by
+    someone who can only compare strings, and ``HEAD`` describes a different commit
+    tomorrow.
+    """
+    try:
+        return _run("git", "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+    except SystemExit:
+        raise SystemExit(f"FAIL: {label} {revision!r} does not resolve to a commit.") from None
+
+
+def _reviewed_revision(
+    round_number: int, requested: str | None, *, head_revision: str | None = None
+) -> str | None:
     """Resolve and validate the commit reviewed before a remediation round.
 
     Naming the prior commit prevents the stale-review failure mode: without it, a pasted
     response can critique an older tree while the author unknowingly applies the same fix
     again. It also gives the next reviewer a mechanically generated remediation delta
     instead of inviting another full audit from scratch.
+
+    ``head_revision`` is the caller's already-pinned hash rather than a fresh ``HEAD``
+    lookup, so the ancestry check and the printed range describe the same commit. Resolving
+    ``HEAD`` twice is how a request could name one revision and validate against another.
     """
     if round_number == 1:
         if requested is not None:
@@ -401,20 +432,15 @@ def _reviewed_revision(round_number: int, requested: str | None) -> str | None:
             "Use the exact commit named in the preceding review."
         )
 
-    try:
-        reviewed = _run("git", "rev-parse", "--verify", f"{requested}^{{commit}}").strip()
-    except SystemExit:
-        raise SystemExit(
-            f"FAIL: --previous-reviewed {requested!r} does not resolve to a commit."
-        ) from None
-    head = _run("git", "rev-parse", "HEAD").strip()
+    reviewed = _resolve_commit(requested, label="--previous-reviewed")
+    head = head_revision or _resolve_commit("HEAD", label="HEAD")
     if reviewed == head:
         raise SystemExit(
             "FAIL: --previous-reviewed resolves to HEAD, so there is no remediation "
             "delta to review."
         )
     try:
-        _run("git", "merge-base", "--is-ancestor", reviewed, "HEAD")
+        _run("git", "merge-base", "--is-ancestor", reviewed, head)
     except SystemExit:
         raise SystemExit(
             "FAIL: --previous-reviewed must be an ancestor of HEAD; the named review "
@@ -453,7 +479,11 @@ def main(argv: list[str] | None = None) -> int:
             "Add the row before requesting a review."
         )
 
-    reviewed_revision = _reviewed_revision(args.round, args.previous_reviewed)
+    head_revision = _resolve_commit("HEAD", label="HEAD")
+    base_revision = _resolve_commit(args.base, label="diff base")
+    reviewed_revision = _reviewed_revision(
+        args.round, args.previous_reviewed, head_revision=head_revision
+    )
 
     # Before anything reaches stdout: a failed gate must leave no partial request
     # behind for a shell redirect to capture.
@@ -462,14 +492,27 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _require_clean_tree()
         gate_status = _verify_gates()
+        # Both checks again, after the gates rather than only before them. pytest runs for
+        # minutes; a commit, a checkout or a stray write in that window would attach a green
+        # result to a revision the gates never saw, and the pinned hash below would name it.
+        _require_clean_tree()
+        if _resolve_commit("HEAD", label="HEAD") != head_revision:
+            raise SystemExit(
+                "FAIL: HEAD changed while the gates were running, so their result does not "
+                "describe one immutable revision. Re-run the request."
+            )
 
     branch = _run("git", "rev-parse", "--abbrev-ref", "HEAD").strip()
-    diffstat = _run("git", "diff", "--stat", f"{args.base}...HEAD").rstrip()
-    names = _run("git", "diff", "--name-only", f"{args.base}...HEAD").split()
-    diff = _run("git", "diff", f"{args.base}...HEAD")
-    if not diff.strip():
+    # Every range is built from the pinned hashes, not from `args.base` and `HEAD`: a
+    # symbolic range resolved twice can name two different commits, which is the whole
+    # failure this pinning exists to close.
+    branch_range = f"{base_revision}...{head_revision}"
+    diffstat = _run("git", "diff", "--stat", branch_range).rstrip()
+    names = _run("git", "diff", "--name-only", branch_range).split()
+    diff = _run("git", "diff", branch_range)
+    if not names:
         print(
-            f"WARNING: {args.base}...HEAD is empty — is {branch} pushed and based on {args.base}?",
+            f"WARNING: {branch_range} is empty — is {branch} pushed and based on {args.base}?",
             file=sys.stderr,
         )
 
@@ -479,14 +522,16 @@ def main(argv: list[str] | None = None) -> int:
 
     remediation: list[str] = []
     remediation_diff = ""
+    remediation_range = ""
     if reviewed_revision is not None:
-        remediation_diffstat = _run("git", "diff", "--stat", f"{reviewed_revision}..HEAD").rstrip()
-        remediation_diff = _run("git", "diff", f"{reviewed_revision}..HEAD")
+        remediation_range = f"{reviewed_revision}..{head_revision}"
+        remediation_diffstat = _run("git", "diff", "--stat", remediation_range).rstrip()
+        remediation_diff = _run("git", "diff", remediation_range)
         remediation = [
             "## Previous review and remediation delta",
             "",
-            f"The preceding review examined commit `{reviewed_revision}`. Review the current",
-            "`HEAD` against that exact baseline before considering any new finding.",
+            f"The preceding review examined commit `{reviewed_revision}`. Review request HEAD",
+            f"`{head_revision}` against that exact baseline before considering any new finding.",
             "",
             "<!-- TODO(author): list every preceding blocker and its disposition: fixed,",
             "     disputed with evidence, or intentionally moved to a named backlog item. -->",
@@ -510,8 +555,16 @@ def main(argv: list[str] | None = None) -> int:
         "",
         PROJECT_CONTEXT,
         "",
-        f"This is **{item_id}** ({row['Epic']}) on branch `{branch}`, diffed against "
-        f"`{args.base}`.",
+        f"This is **{item_id}** ({row['Epic']}) on branch `{branch}`.",
+        "",
+        f"- **Request HEAD:** `{head_revision}`",
+        f"- **Pinned diff base:** `{base_revision}` (resolved from `{args.base}`)",
+        f"- **Branch inspection:** `git diff {branch_range}`",
+        "",
+        "Every diff in this request was generated from those two hashes. **State the commit",
+        "you examined before your verdict.** If it is not the request HEAD above, the round is",
+        "void and will be regenerated -- say so and stop rather than reporting against another",
+        "tree.",
         "",
         "## Toolchain gate status",
         "",
@@ -575,16 +628,19 @@ def main(argv: list[str] | None = None) -> int:
         "",
     ]
 
+    # The diffs stay embedded, and the heading now names the pinned range rather than a
+    # symbolic one. The reviewer is a pasted-context model with no filesystem: an
+    # inspection command it cannot run would leave it reviewing a diffstat.
     if reviewed_revision is not None:
         out += [
-            f"# Remediation diff (`git diff {reviewed_revision}..HEAD`)",
+            f"# Remediation diff (`git diff {remediation_range}`)",
             "",
             remediation_diff.rstrip("\n"),
             "",
         ]
 
     out += [
-        f"# Full branch diff for context only (`git diff {args.base}...HEAD`)",
+        f"# Full branch diff for context only (`git diff {branch_range}`)",
         "",
         diff.rstrip("\n"),
         "",

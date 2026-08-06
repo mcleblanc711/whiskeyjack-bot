@@ -779,6 +779,47 @@ shape (any rule whose last token before `*` is an interpreter), asserts `git pus
 only `live_claims()` has, so the parameter made a half-test look like the whole liveness test.
 Dropped, and its docstring now says why existence is decided elsewhere.
 
+### Workflow hardening — the request pins its own HEAD
+
+The review-round contract closed the *response* end of the staleness problem: the reviewer is
+asked for the commit hash they examined, before the verdict. It left the *request* end open, and
+that half is the one that had already cost a round. Until now the request never stated the commit
+it described — it said only "on branch `feat/…`, diffed against `origin/master`", both of which
+name different commits on different days. So when M1-308's round 6 answered against a tree that
+predated the head its own request embedded, nothing in the document contradicted it; the round was
+reconstructed by hand afterwards, from commit timestamps.
+
+`scripts/review-request.py` now resolves `HEAD` and the diff base to full commit hashes once, up
+front, prints both, and builds **every** range from them — the branch diff, the remediation diff
+and the ancestry check that validates `--previous-reviewed`. Resolving a symbolic revision twice
+is the defect in miniature: two lookups of `HEAD` can name two commits, and the request would then
+validate against one and print the other.
+
+Two smaller holes closed with it:
+
+- **The clean-tree check ran only *before* the gates.** `pytest` takes minutes here. A commit or a
+  stray write inside that window would attach four green gates to a revision they never described,
+  under the hash the request now pins. Both the clean-tree check and the `HEAD` resolution are
+  repeated after the gates, and a mismatch is a hard failure with a "re-run the request" message
+  rather than a footnote.
+- **`_reviewed_revision` re-resolved `HEAD` itself**, so the ancestry check and the printed range
+  were two independent lookups. It now takes the caller's already-pinned hash.
+
+**Deliberately not taken from the same working branch: dropping the embedded diffs.** The draft
+this was split out of replaced the remediation and branch diffs with `git diff <range>` commands,
+on the reasoning that "the reviewer is already running in the worktree" — worth ~150 KB a request.
+That reasoning does not hold for this project's reviewer, which receives pasted context and has no
+filesystem, and the evidence is in the reviews themselves: M1-308's round 7 cited
+`research/allowlist.py:297` and `tests/property/test_allowlist_properties.py:3`, neither of which
+it could have read from a diffstat. An inspection command the reviewer cannot run is not a
+substitute for the code. `test_the_embedded_diffs_survive_the_pinning` pins that, because pinning
+the ranges is exactly what makes the substitution look free.
+
+The rest of that draft — a rewrite of the trust boundary in `CLAUDE.md` and of the three
+disqualifying tests — is a policy change rather than tooling, and is held back for its own
+decision. Landing it alongside a mechanical fix would have moved the bar mid-item, while M1-308
+was still open on findings judged against the current wording.
+
 ## M1-603 — Recording lifecycle events atomically
 
 The acceptance criterion is "injected failures cannot leave an approved/submitted state without
