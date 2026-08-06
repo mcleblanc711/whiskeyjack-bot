@@ -2,7 +2,9 @@
 
 Checks, in order: the config file parses and validates (which already rejects
 every invalid live-submit combination, M0-005), required data directories
-exist or can be created, referenced files exist, and every required credential
+exist or can be created, referenced files exist, the X account allowlist is
+structurally valid (M1-308, unconditionally -- see
+``load_and_verify_account_allowlist``), and every required credential
 environment variable is present. Reports environment variable *names* only —
 a value is never read further than a presence/emptiness check and never
 echoed.
@@ -19,6 +21,7 @@ from pathlib import Path
 
 from whiskeyjack_bot.config import AppConfig, ConfigError, load_config
 from whiskeyjack_bot.prompt import PromptError, load_prompt
+from whiskeyjack_bot.research.allowlist import AccountAllowlist, AllowlistError, load_allowlist
 
 EXIT_OK = 0
 EXIT_CONFIG_INVALID = 2
@@ -73,16 +76,108 @@ def _verify_directories(config: AppConfig, report: VerificationReport) -> None:
 
 
 def _verify_referenced_files(config: AppConfig, report: VerificationReport) -> None:
+    """Existence-check referenced files that nothing else opens (M0-004).
+
+    The account allowlist is deliberately *not* here: ``_verify_account_allowlist``
+    reaches its absence too (M1-308 round 4), and reporting it in both places gave
+    ``verify-env`` two lines for one missing file.
+    """
     references = {"forecast.prompt_path": config.forecast.prompt_path}
-    if config.retrieval.social.enabled:
-        references["retrieval.social.account_allowlist_path"] = (
-            config.retrieval.social.account_allowlist_path
-        )
     for label, path in references.items():
         if path.is_file():
             report.checks_passed.append(f"{label} exists: {path}")
         else:
             report.filesystem_problems.append(f"{label} does not exist: {path}")
+
+
+def _nothing_exists_at(path: Path) -> bool:
+    """True only for ENOENT -- nothing at that path at all.
+
+    ``Path.is_file()`` cannot answer this: it returns False for a directory, a dangling
+    symlink and a stat failure exactly as it does for a missing file, so every one of
+    those read as "the optional file is absent" (round-5 review finding 2). ``lstat``,
+    not ``stat``: a dangling symlink *is* an object at the configured path, so it is
+    reported rather than skipped. Every non-ENOENT failure -- an unsearchable parent, a
+    path component that is not a directory -- falls through to ``load_allowlist``, whose
+    ``OSError`` branch reports it with an accurate ``strerror``.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def load_and_verify_account_allowlist(config: AppConfig) -> AccountAllowlist | None:
+    """Load+validate the account allowlist unconditionally (M1-308 round 3).
+
+    Runs regardless of ``retrieval.social.enabled``: the committed default file must
+    always be structurally valid, and a malformed one is a config problem the moment it
+    can be read, not only when the feature happens to be turned on. This is the shared
+    boundary every config-consuming command goes through --
+    ``cli._load_verified_config`` calls it too, not just ``verify-env`` -- so an
+    enabled-but-malformed allowlist can no longer reach a command that never runs
+    ``verify_environment()``.
+
+    The full truth table, at **both** entry points (the hole moved between rounds 3, 4 and
+    5 because only part of it was ever enumerated):
+
+    ==========  ==========================  ==================================
+    enabled     what is at the path         result
+    ==========  ==========================  ==================================
+    true        nothing (ENOENT)            AllowlistError, filesystem
+    true        a valid file                loaded
+    true        an invalid file             AllowlistError, content
+    true        anything else / stat fails  AllowlistError, filesystem
+    false       nothing (ENOENT)            ``None`` -- the one skip
+    false       a valid file                loaded
+    false       an invalid file             AllowlistError, content
+    false       anything else / stat fails  AllowlistError, filesystem
+    ==========  ==========================  ==================================
+
+    So ``enabled`` buys exactly one thing: permission for the file to be *absent*. It
+    never excuses a directory, a dangling symlink, an unreadable file or malformed
+    content. An absent allowlist while ``enabled`` is true is a hard startup failure
+    (round 4) -- it used to skip here too, on the theory that absence belonged to
+    ``_verify_referenced_files``, but that function only runs inside
+    ``verify_environment()``, so ``questions fetch`` started clean with an enabled social
+    config and no allowlist at all.
+
+    Every raise is delegated to ``load_allowlist`` rather than built here: its ``OSError``
+    branch already yields a sanitized, ``from None``-chained, ``is_filesystem_error=True``
+    error whose ``strerror`` names the actual condition.
+    """
+    social = config.retrieval.social
+    path = social.account_allowlist_path
+    if not social.enabled and _nothing_exists_at(path):
+        return None
+    return load_allowlist(path)
+
+
+def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> None:
+    """Report the account allowlist's structural validity (M1-308).
+
+    A readable-but-invalid allowlist (duplicate username, unknown reliability tag, ...)
+    is a config-content problem, not a filesystem one -- unlike a missing/unreadable
+    file, it can never be fixed by waiting for the filesystem to change -- so it goes to
+    config_problems. An unreadable file (permission, race) is still a filesystem
+    problem; the two are told apart by AllowlistError.is_filesystem_error, not by which
+    function raised it.
+    """
+    try:
+        allowlist = load_and_verify_account_allowlist(config)
+    except AllowlistError as exc:
+        # AllowlistError is already sanitized; it never echoes entry content.
+        bucket = report.filesystem_problems if exc.is_filesystem_error else report.config_problems
+        bucket.append(str(exc))
+        return
+    if allowlist is None:
+        return
+    report.checks_passed.append(
+        f"retrieval.social.account_allowlist_path loads clean: {len(allowlist.entries)} accounts"
+    )
 
 
 def _verify_prompt_version(config: AppConfig, report: VerificationReport) -> None:
@@ -125,6 +220,7 @@ def verify_environment(config_path: Path | str) -> VerificationReport:
     report.checks_passed.append(f"config valid: {config_path}")
     _verify_directories(config, report)
     _verify_referenced_files(config, report)
+    _verify_account_allowlist(config, report)
     _verify_prompt_version(config, report)
     _verify_env_vars(config, report)
     return report

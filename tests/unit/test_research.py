@@ -13,11 +13,11 @@ from pathlib import Path
 import pytest
 
 from whiskeyjack_bot.ledger import LEDGER_SCHEMA_VERSION, connect, initialize_ledger
-from whiskeyjack_bot.research import (
+from whiskeyjack_bot.research.hashing import content_sha256
+from whiskeyjack_bot.research.model import (
     ResearchDocument,
     ResearchRun,
     ResearchSchemaError,
-    content_sha256,
     validate_document,
     validate_run,
 )

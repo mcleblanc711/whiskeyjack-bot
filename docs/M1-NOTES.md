@@ -1496,3 +1496,305 @@ here so it is not rediscovered as a surprise.
 - **Operators** cannot upgrade a ledger holding a non-draft forecast record. Nothing has written
   one — M1-602 is the record writer and is unstarted — so the population is expected to be empty;
   if it is not, the ledger predates the guarantee and a fresh one is the honest answer.
+
+## M1-308 — Account allowlist loader
+
+New `research/allowlist.py`: `AllowlistEntry`/`_AllowlistFile` (pydantic, `extra="forbid"`),
+`AllowlistError`, `AccountAllowlist` (`@dataclass(frozen=True)`) with `lookup_by_username` and
+`match_domain`, and `load_allowlist(path)` mirroring `config.load_config`'s read/parse/validate
+flow (same YAML-error handling, same path-is-the-carve-out rendering). `reliability_tag` reuses
+`research.model.ReliabilityTag` rather than restating it, per that Literal's own comment.
+Username uniqueness is case-insensitive and its violation message names only account indices,
+never the colliding username.
+
+Wired into `env_verify.py` as `_verify_account_allowlist`, run in `verify_environment()` right
+after `_verify_referenced_files` — gated on the file already existing (skip so a missing file
+reports one problem, not two, matching `_verify_prompt_version`'s convention). This is the
+"at startup, not at retrieval time" surface the acceptance criteria asks for; no `config.py`
+change was needed since `SocialRetrievalConfig.account_allowlist_path` already existed.
+
+**Round-2/3 cross-model review fixes.** The first cut gated this check on
+`retrieval.social.enabled` — with the committed default (`false`), a malformed allowlist was
+never checked, and `questions fetch` (the only other config-consuming command) called
+`load_config()` directly and never ran `verify_environment()` at all, so even an *enabled*
+malformed allowlist reached nothing that validated it. Fixed by extracting
+`load_and_verify_account_allowlist(config)`, unconditional on `enabled`, and adding
+`cli._load_verified_config()` as the boundary every config-consuming command must call instead
+of raw `load_config()`. Separately, `AllowlistError` gained `is_filesystem_error` (set only on
+the `read_bytes()` failure) so an unreadable file classifies as a filesystem/`EXIT_ENV_MISSING`
+problem rather than a config/`EXIT_CONFIG_INVALID` one, and that same read-failure raise switched
+from `from exc` to `from None` (matching `prompt.py`'s identical translation) so a raw `OSError`
+no longer rides along as `__cause__`.
+
+**Round-4 cross-model review fix.** Round 3 closed the hole for *malformed* allowlists and left it
+open for *absent* ones: `load_and_verify_account_allowlist` returned `None` whenever
+`path.is_file()` was false, regardless of `enabled`, and `cli._load_verified_config` discarded that
+return — so `retrieval.social.enabled: true` plus a nonexistent `account_allowlist_path` started
+`questions fetch` clean and exited 0, deferring the failure to retrieval. The docstring justified
+the skip by delegating absence to `_verify_referenced_files`, which was the false part: that
+function only runs inside `verify_environment()`, which `questions fetch` never calls. Now the
+helper skips in exactly one case — disabled *and* absent — and otherwise calls `load_allowlist`,
+which is deliberately left to raise rather than building a second error here: its `OSError` branch
+is already sanitized, `from None`-chained and `is_filesystem_error=True`, and its `strerror` stays
+accurate across every case `is_file()` collapses into one answer (absent, a directory, a dangling
+symlink, unreadable) — an explicit "does not exist" raise would mislabel three of those four.
+`_verify_referenced_files` gave the allowlist up in the same change, or `verify-env` would print
+two lines for one missing file; `tests/unit/test_env_verify.py::test_enabled_social_with_missing_
+allowlist_is_a_filesystem_problem` asserts `len(filesystem_problems) == 1` to hold that.
+
+Left alone deliberately, and stated in the round-4 review response: `_load_verified_config`
+discards the loaded `AccountAllowlist`, so M1-307 will re-parse — worth wiring where a consumer
+exists, not speculatively here; `_load_verified_config` remains enforced by convention rather than
+by a type, adequate at two commands; and `account_allowlist_path` stays CWD-relative
+(`load_config` never rebases it onto the config file's directory), which this fix makes *loud*
+when enabled instead of a silent skip, but re-resolving it is a config-contract change.
+
+**Deliberate scope boundary (owner-confirmed):** `domains` stays free-form `list[str]`, validated
+only for non-emptiness (list and per-element). The 19-tag taxonomy documented in
+`config/x_accounts.yaml`'s header comment is *not* enforced as a closed set in code — the
+acceptance criteria only ask for "non-empty domains", and a code-level taxonomy constant would be
+a second source of truth that could drift from the comment. Only `reliability_tag` gets closed-set
+enforcement (via the existing `ReliabilityTag` Literal).
+
+Verified `match_domain` against the real, committed `config/x_accounts.yaml` for both example
+domains in the acceptance criteria: `econ_data` → `{BLS_gov, BEA_News, stlouisfed, StatCan_eng,
+ONS, EU_Eurostat, IMFNews, EIAgov, Reuters}` (9 accounts), `space_launch` → `{NASA, SpaceX, esa,
+RocketLab, ulalaunch}` (5 accounts).
+
+Property suite (`tests/property/test_allowlist_properties.py`) fuzzes the validation layer
+directly on parsed dicts rather than through file I/O (already covered by the unit tests) —
+same split `test_canonical_properties.py`/`test_dedup_properties.py` use. The "no value leak"
+property is covered deterministically instead of by the fuzzer: every raise in this module is
+either a pydantic error rendered with `include_input=False` or one of the module's own
+constant-shaped, index-only messages, so leak-freedom doesn't depend on which value was
+generated — `tests/unit/test_allowlist.py::test_no_field_leaks_a_planted_secret_through_any_message`
+plants a fixed secret across every field and shape instead. `AllowlistEntry` is not hashable
+(plain `_StrictModel`, not frozen), so the subset property in `test_match_domain_result_is_a_
+subset_and_deterministic` checks identity membership rather than using `set()`.
+
+**Round-5 cross-model review fixes.** Two P2 findings, both reproduced before anything changed.
+
+*1 — `verify-env` was importing the whole provider stack.* `env_verify.py` imports
+`research.allowlist`, and importing any submodule executes the package `__init__.py`, which
+re-exported from `research.asknews` → `metaculus.client` → `forecasting_tools`. Measured in a
+fresh process: `import whiskeyjack_bot.env_verify` took **7.0s** and printed a Metaculus-token
+warning, a model-cost warning and a Streamlit cache warning into the output of the one command
+whose entire job is to report cleanly on the environment. Fixed by reducing
+`research/__init__.py` to a one-line docstring — which is what CLAUDE.md's conventions already
+prescribe ("Subpackages get a one-line-docstring `__init__.py`"); `research/` was the only
+subpackage that deviated, and the deviation *was* the coupling. Nothing in `src/` imported from
+the package (every internal import was already submodule-level); the five test files that did now
+import from the owning submodule. Import is now **0.204s** with no output. The lazy-`__getattr__`
+alternative was rejected: it keeps a re-export surface no `src/` module uses, at the price of an
+importlib indirection, an `-> Any` escape hatch under `mypy --strict`, and a name→module table to
+keep in step with `__all__`. `research.asknews` itself is as costly as before, correctly — the
+AskNews adapter needs that stack; `verify-env` never did.
+
+Guarded by `tests/unit/test_env_verify.py::test_startup_module_does_not_import_provider_sdks`,
+which must run **in a subprocess**: inside pytest the SDKs are already in `sys.modules` from the
+adapter suites, so an in-process assertion would pass for the wrong reason. A companion test
+imports `research.asknews` through the same probe and asserts it *does* report both SDKs — a
+negative test with a misspelled module name or a marker that never prints is a test of nothing.
+
+*2 — Surrounding whitespace defeated username validation, uniqueness and lookup.* `" BLS_gov "`
+passed the non-blank check, stored padded, counted as **distinct** from `"BLS_gov"` for the
+case-insensitive uniqueness check, and was then unreachable through
+`lookup_by_username("BLS_gov")`. That fails *open*: M1-307 finds no match and applies the
+`unverified_social` default to an account the operator believed was tagged `official_primary`.
+Fixed by validating `username` against the actual X handle rule — `[A-Za-z0-9_]{1,15}` via
+`re.fullmatch` (never a `$` anchor: `$` also matches before a trailing newline, so `"BLS_gov\n"`
+would pass — the same greedy-anchor trap M1-401 hit). Owner decision to take the charset over a
+whitespace-only check: `username` is not free text but the key both accessors and the uniqueness
+check use, and one predicate closes the whole class — padding, interior spaces, a leading `@`, a
+zero-width character — instead of the one reported instance. Verified to accept all 46 committed
+entries unchanged. `domains` has the identical hazard (`match_domain` compares exactly, so
+`" econ_data "` matches nothing) and gets the whitespace half only, since it stays free-form.
+
+Neither accessor normalizes its argument: validation is strict at load, and stripping at query
+time would be a second contract `lookup_by_username` and `match_domain` would each have to keep
+in step with.
+
+The property suite gained the invariant whose absence let this through — and getting it right
+took three attempts worth recording, since the first two would have shipped as false assurance:
+
+- Stated as a round trip (`lookup_by_username(entry.username)`), it **passes on the broken code**:
+  looking an entry up by the exact bytes it was stored with succeeds even for `" BLS_gov "`. The
+  property has to be stated against the key *a caller actually has* — the normalized form.
+- The existing `_entry_payload` fuzzes hostile text into every field and adds a forbidden extra
+  key half the time, so only **1 in ~300** of its allowlists validates. Any property of the form
+  "an accepted allowlist guarantees X" was therefore asserting nothing. Added
+  `_plausible_payload`, weighted 7:1 toward valid values per field, because validity compounds
+  across twelve values in a three-entry file.
+- The companion uniqueness property (no two accepted entries collide once normalized) still
+  passed against the pre-fix validator at 800 examples, because it needs two entries whose
+  usernames differ *only* by padding and independent 15-character draws never collide. Usernames
+  for that strategy now come from an eight-handle pool.
+
+Both properties were then re-run against the pre-fix validator and **fail** there, which is the
+only evidence that either is worth having. The same check is why `_mostly` uses a named picker
+rather than an inline lambda: hypothesis prints the strategy's callable in every counterexample.
+
+*Cross-track note:* M1-303 (PR #16) added Exa names to the re-export block this change deletes.
+It merged first, and master's `origin/master` merge into this branch conflicted here exactly as
+expected; resolved by dropping the added block and keeping the one-line docstring. No test import
+needed repointing after all — M1-303's `tests/unit/test_exa.py` already does
+`from whiskeyjack_bot.research import exa`, a *submodule* import, which resolves through the
+package regardless of what `__init__.py` re-exports. A grep of the merged tree confirms it is the
+only `from whiskeyjack_bot.research import ...` left in `src/`, `tests/` or `scripts/`.
+
+**Round-6 cross-model review fixes.** (This file numbers *fix* rounds; the commit messages number
+the *review* round that raised the findings, so this section is `close round-5 review findings` in
+the log. The two sequences have been one apart since the round-2/3 section and are left that way
+rather than renumbering shipped history.) Two blocking findings, both reproduced first.
+
+*1 — `_sanitize` leaked integer YAML keys.* It rendered every `int` in a pydantic `loc` tuple as
+if it were a list index. But under `extra="forbid"` the location of an unexpected key **is** that
+key, and pydantic's `invalid_key` error puts it in `loc` — so an unquoted numeric key, which YAML
+parses as an `int`, came straight back out: `987654321: Keys should be strings`, and
+`accounts.0.424242: ...` for the nested case. A digits-only value is exactly the shape of an
+account id or a numeric token, so this is the leak rule's own failure mode, not a technicality.
+Fixed by making the discrimination positional: an `int` renders only when the preceding `loc` part
+names a list-valued field, tracked in `_SEQUENCE_FIELDS` — derived from each model's `model_fields`
+annotations (`get_origin(...) is list`) rather than hardcoded as `{"accounts", "domains"}`, so a
+field added later cannot silently start rendering, and a later `list[str] | None` (origin
+`UnionType`) drops out and over-redacts, which is the fail-safe direction. Withholding *every* int
+would also close the finding and was rejected: `accounts.<withheld>.username` cannot be acted on
+against a 46-entry file, and an index under a list field is schema-authored, not file content.
+String parts need no positional test — a part that is not a declared field name is withheld
+outright, which already covered unknown *string* keys.
+
+*2 — the startup skip was `Path.is_file()`, which answers False for far more than absence.* The
+contract is "skip only when social is disabled *and* the file is absent", but `is_file()` returns
+False for a directory, a dangling symlink and any stat failure exactly as it does for a missing
+file — so with the committed default (`enabled: false`), an `account_allowlist_path` pointing at a
+directory, at a broken symlink, or inside an unsearchable parent started clean at both entry
+points. Fixed with `_nothing_exists_at()`: `os.lstat`, and only `FileNotFoundError` counts as
+absence. `lstat` not `stat` on purpose — a dangling symlink *is* an object at the configured path,
+and following it would relabel an operator's broken link as "optional file not present". Every
+other condition falls through to `load_allowlist`, whose `OSError` branch already yields a
+sanitized, `from None`-chained, `is_filesystem_error=True` error carrying the real `strerror`.
+
+The docstring now carries the full eight-row truth table, and — because this hole has moved in
+three consecutive rounds (round 3: enabled-and-malformed; round 4: enabled-and-absent; round 5:
+disabled-and-not-a-regular-file), each round having tested only the case it had just been shown —
+the table is now enumerated mechanically in `tests/unit/test_env_verify.py` at **both** entry
+points (`verify_environment` and `cli._load_verified_config`), with "anything else" expanded into
+the three shapes that reach it. `enabled` buys exactly one thing: permission for the file to be
+*absent*. The named regression tests are kept alongside it; they carry the *why*, the table carries
+the completeness.
+
+Two test-rigor defects found while checking those fixes, both in the same class as the round-5
+property lessons above:
+
+- The new non-string-key property was written as `try: ... except AllowlistError:` with no
+  assertion on the non-raising path, so any draw that validated would have passed while proving
+  nothing. Now `pytest.raises`; every key shape it draws (int, float, bool, `None`, date) is in
+  fact rejected as `invalid_key`, so a passing validation is a schema regression, not a case to
+  skip.
+- `test_disabled_social_with_missing_allowlist_is_not_a_problem` asserted the skip is silent with
+  `"allowlist" not in report.render()` — but every path line in the render contains `tmp_path`,
+  which pytest names after the test, and this one passes only because pytest truncates the name to
+  30 characters *before* reaching "allowlist". Copying the assertion into a shorter-named test
+  failed immediately. All of these now key on the check's own wording (`loads clean`, and the
+  loader's `invalid account allowlist` prefix) rather than on a word that a temp path can supply.
+
+Every test added this round was re-run against the pre-fix `src/` and **fails** there — including
+all three disabled/non-regular rows of the new table at both entry points. The `enabled` rows pass
+pre-fix, correctly: the guard short-circuited on `enabled`, so that half of the table was already
+right.
+
+Non-blocking, and answered rather than changed: deleting the `research/__init__.py` re-exports does
+break a hypothetical external `from whiskeyjack_bot.research import ResearchDocument`. Nothing in
+`src/` or `tests/` imports from the package, the package is not published, and a
+one-line-docstring `__init__.py` is what CLAUDE.md's conventions prescribe — a compatibility shim
+would reinstate the import coupling the finding was about. The PR description was also stale
+(still describing the check as gated on `retrieval.social.enabled`, which round 3 made false) and
+has been rewritten.
+
+No migration, no new dependency, no `docs/TRACKS.md` change (already claimed with `none`/`no`),
+no wiring into M1-307 (doesn't exist yet on this branch).
+
+**Round-6 review — answered with a rebuttal, no source change.** The review restated the round-5
+findings against a tree that predates the head its own request embedded; both were already closed.
+Recorded here because it is why the fix-round and review-round numbers stop tracking each other
+from this point, and because it is the case that put "diff the commit a pasted review names against
+`HEAD` and reproduce by execution before writing any fix code" into CLAUDE.md.
+
+### Round-7 review — one blocking finding, reproduced and widened
+
+Reviewed commit `7deeb2c`, which *was* `HEAD`; both prior findings closed. The finding: PyYAML
+constructor failures escape `load_allowlist` as a raw `ValueError`, against the project rule that
+every malformed shape arrives as the module's own error type. Reproduced end-to-end before writing
+anything — `whiskeyjack-bot verify-env` exits with an unhandled traceback through
+`allowlist.py:297` under the committed default `retrieval.social.enabled: false`.
+
+Reproducing it also widened it. Only PyYAML's scanner, parser and composer raise `YAMLError`; the
+*constructor* stage raises whatever Python raised at it, so the escape is a class, not one shape.
+All six of these come from a one-line edit to an otherwise-valid allowlist:
+
+| content | escapes as | leaks the value |
+| --- | --- | --- |
+| `display_name: 2026-02-30` | `ValueError('day is out of range for month')` | no |
+| `display_name: 2026-01-01 12:60:00` | `ValueError('minute must be in 0..59')` | no |
+| `notes: !!bool maybe` | `KeyError('maybe')` | **yes** |
+| `notes: !!int abc` | `ValueError("invalid literal for int()…: 'abc'")` | **yes** |
+| `notes: !!timestamp bogus` | `AttributeError` | no |
+| `domains: [[[…2000 deep…]]]` | `RecursionError` | no |
+
+`AttributeError`/`KeyError`/`ValueError` is exactly the trio CLAUDE.md names, and two of the six
+put file content in the message — so this is a secret-hygiene leak channel as well as a raw-type
+escape, which the finding as written did not reach.
+
+**Decision — the catch is "not a `YAMLError`", not a list of types.** The review's minimal fix
+(catch `ValueError`) closes three of the six; `!!bool <junk>` and `!!timestamp <junk>` — the
+leaking one and the `AttributeError` one — survive it. An enumerated tuple is not better in kind:
+the enumeration belongs to PyYAML, and a shape missing from it escapes raw, which is how this
+reached a review in the first place. What is actually known at that line is the contract — nothing
+but a parsed document may leave `yaml.safe_load` — so `except Exception` around **only** that call
+is the accurate statement of it. Same reasoning as the username charset predicate two sections up:
+close the class, not the reported instance.
+
+**Rejected — a custom `SafeLoader` with the implicit timestamp resolver removed, and why not.** It
+would make `display_name: 2026-02-30` a plain string instead of an error, which is arguably nicer
+for a curated file. It also changes *what the file accepts*, silently diverges from `config.py`'s
+loader, and leaves every explicit-tag shape untouched. Translating the failure is the smaller
+contract change and the one the acceptance criteria imply.
+
+**Rejected — catching at the caller.** `env_verify`/`cli` already handle `AllowlistError`; adding a
+second handler there would have to be repeated at every future entry point and would put the
+sanitizing decision outside the module that owns the error type.
+
+Tests, and which of them actually discriminate:
+
+- Six parametrized cases through `load_allowlist`, plus the leak check on the two tagged shapes.
+  All seven **fail against the pre-fix loader**; that is the evidence.
+- `test_each_constructor_case_still_escapes_pyyaml_untranslated` passes both ways *by design* — it
+  asserts against PyYAML, not against us, so that if a future release turns one of these into a
+  `YAMLError` the case stops silently testing a branch that was already there. The round-6
+  permission test had gone vacuous exactly that way.
+- `test_a_valid_implicit_timestamp_is_still_a_schema_error` also passes both ways by design:
+  `2026-02-28` constructs into a `datetime.date` and must still reach pydantic, so the new branch
+  is a translation and not a mask.
+- The property suite gained its **first deliberate exception** to the after-the-parse split its
+  header describes. That split assumed the parse either succeeds or raises `YAMLError`, and the
+  assumption *was* the finding — the defect lives in the transition into a dict, which cannot be
+  fuzzed from one. Two properties now drive `load_allowlist` over generated YAML text (only
+  `AllowlistError` escapes, and a drawn scalar never reaches the message); both fail pre-fix. The
+  file is written through a **module-scoped** `tmp_path_factory` fixture: `@given` with the
+  function-scoped `tmp_path` is a hypothesis health-check failure.
+
+**The round-7 request overstated its own test coverage**, and the review caught it: it claimed a
+mid-read `OSError` and descriptor cleanup were exercised, and nothing in `tests/` patched
+`os.read`. Now real — `test_mid_read_failure_is_a_filesystem_error_and_closes_the_descriptor_once`
+wraps `os.open`/`os.read`/`os.close` keyed on the one descriptor the load opens (wholesale patching
+breaks pytest's own capture), and asserts `intercepted` alongside the outcome. Mutation-checked
+rather than assumed: deleting the `finally: os.close(fd)` makes it fail with `descriptor closed 0
+times`.
+
+### Deferred (do not read the absence as an omission)
+
+`config.py:363` has the identical hole — `load_config` catches only `YAMLError`, and
+`KeyError('<value>')` out of the primary config file is the worse leak of the two. It is on the
+diff base, so per the review contract it is a backlog row, not a fix in this branch: **M0-007**,
+filed with the reproduction and acceptance criteria. Widening this branch into the primary config
+loader would hand a round-8 reviewer a second file to audit for a defect that predates the item.

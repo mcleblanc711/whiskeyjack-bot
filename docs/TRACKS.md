@@ -39,7 +39,6 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-303 | feat/m1-303-exa-fallback | whiskeyjack-m1-303 | no | none | 2026-07-27 |
 | M1-308 | feat/m1-308-x-account-allowlist | whiskeyjack-m1-308 | no | none | 2026-07-27 |
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row

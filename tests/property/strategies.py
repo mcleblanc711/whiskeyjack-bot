@@ -23,7 +23,7 @@ from typing import Any
 
 from hypothesis import strategies as st
 
-from whiskeyjack_bot.research import ResearchDocument, validate_document
+from whiskeyjack_bot.research.model import ResearchDocument, validate_document
 
 # Text that has actually broken this code before:
 #   - lone surrogates, which arrive intact from provider JSON (json.loads('"\\ud800"'))

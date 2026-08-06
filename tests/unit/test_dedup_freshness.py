@@ -10,17 +10,15 @@ from datetime import datetime, timezone
 
 import pytest
 
-from whiskeyjack_bot.research import (
-    CanonicalizationError,
-    ResearchDocument,
+from whiskeyjack_bot.research.canonical import CanonicalizationError, canonicalize_url
+from whiskeyjack_bot.research.dedup import deduplicate
+from whiskeyjack_bot.research.freshness import (
     assess_document,
     assess_freshness,
-    canonicalize_url,
-    content_sha256,
-    deduplicate,
     freshness_cutoff,
-    validate_document,
 )
+from whiskeyjack_bot.research.hashing import content_sha256
+from whiskeyjack_bot.research.model import ResearchDocument, validate_document
 
 TS = "2026-07-17T00:00:00+00:00"
 SHA = "a" * 64
@@ -135,7 +133,7 @@ def test_canonicalize_accepts_what_the_schema_accepts(url: str) -> None:
 def test_canonicalize_rejects_what_the_schema_rejects(url: str) -> None:
     # Agreement direction 2: everything the schema refuses, canonicalize refuses
     # too -- and as CanonicalizationError, so callers handle one type.
-    from whiskeyjack_bot.research import ResearchSchemaError
+    from whiskeyjack_bot.research.model import ResearchSchemaError
 
     with pytest.raises(ResearchSchemaError):
         validate_document(_document(original_url=url))

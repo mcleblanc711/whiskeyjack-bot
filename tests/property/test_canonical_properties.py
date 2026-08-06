@@ -14,9 +14,8 @@ import pytest
 from hypothesis import given
 from strategies import ENCODABLE_TEXT, SURROGATE_TEXT, URL_CANDIDATES
 
-from whiskeyjack_bot.research import CanonicalizationError, canonicalize_url, content_sha256
-from whiskeyjack_bot.research.canonical import _BAD_URL
-from whiskeyjack_bot.research.hashing import normalize_content
+from whiskeyjack_bot.research.canonical import _BAD_URL, CanonicalizationError, canonicalize_url
+from whiskeyjack_bot.research.hashing import content_sha256, normalize_content
 from whiskeyjack_bot.research.model import validate_document
 
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
