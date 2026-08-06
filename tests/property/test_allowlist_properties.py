@@ -5,15 +5,28 @@ a dict, so this suite skips file I/O (already covered by tests/unit/test_allowli
 and fuzzes the validation/matching layer directly -- the same split
 test_canonical_properties.py and test_dedup_properties.py use for their pure functions.
 
-The "no value leak" property is covered deterministically in
+**One deliberate exception to that split** (round-7 review): the last two properties drive
+``load_allowlist`` over generated YAML *text*. Starting after the parse assumed the parse
+either succeeds or raises a ``YAMLError``, and that assumption was the round-7 finding --
+PyYAML's construction stage raises whatever Python raised at it, so an out-of-range date or
+an ``!!bool`` with an unparseable scalar escaped as ValueError/KeyError/AttributeError. That
+step cannot be fuzzed from a parsed dict: the defect lives in the transition into one.
+
+Leak-freedom for *validated* content is covered deterministically in
 tests/unit/test_allowlist.py::test_no_field_leaks_a_planted_secret_through_any_message
-(every field, several shapes) rather than re-derived here: every raise in this module is
-either a pydantic error rendered with include_input=False, or one of this module's own
-constant-shaped, index-only messages, so leak-freedom does not depend on which value was
-generated -- fuzzing it again would test the same invariant less precisely.
+(every field, several shapes) rather than re-derived here: every raise from the validation
+layer is either a pydantic error rendered with include_input=False, or one of this module's
+own constant-shaped, index-only messages, so leak-freedom does not depend on which value was
+generated -- fuzzing it again would test the same invariant less precisely. The parse step is
+the exception, and for the same reason as above: PyYAML's own constructor messages quote the
+scalar (``KeyError(<value>)``, ``invalid literal for int(): '<value>'``), so there leak-freedom
+depends entirely on the translation, and the last property fuzzes it.
 """
 
 from __future__ import annotations
+
+import traceback
+from pathlib import Path
 
 import pytest
 from hypothesis import given, strategies as st
@@ -26,6 +39,7 @@ from whiskeyjack_bot.research.allowlist import (
     AllowlistError,
     _AllowlistFile,
     _sanitize,
+    load_allowlist,
 )
 
 _MAYBE_VALID_RELIABILITY = st.one_of(RELIABILITY_TAGS, HOSTILE_TEXT)
@@ -297,6 +311,113 @@ def _accounts() -> st.SearchStrategy[AllowlistEntry]:
 def test_match_domain_never_raises(entries: list[AllowlistEntry], domain: str) -> None:
     allowlist = AccountAllowlist(entries=tuple(entries))
     allowlist.match_domain(domain)
+
+
+# --- the parse step itself (round-7 review finding) ---
+
+# The tags whose constructors run Python conversions on the scalar. "" (untagged) is in the
+# pool so the implicit resolvers -- the timestamp one especially -- get their turn.
+_YAML_TAGS = st.sampled_from(
+    ["", "", "!!str ", "!!bool ", "!!int ", "!!float ", "!!timestamp ", "!!binary "]
+)
+
+# Scalars that keep the surrounding document *syntactically* valid, so the draw reaches the
+# constructor instead of dying in the parser -- a syntax error is caught by a branch that
+# already existed and would leave this property proving nothing new. The sampled shapes are
+# the ones with known constructor behaviour; the generated text supplies everything else.
+_SCALARS = st.one_of(
+    st.sampled_from(
+        [
+            "2026-02-30",
+            "2026-01-01 12:60:00",
+            "2026-02-28",
+            "2001-12-14 21:59:43.10 -25:30",
+            "true",
+            "maybe",
+            "42",
+            "abc",
+            "0.5",
+            ".inf",
+            "190:20:30",
+            "~",
+        ]
+    ),
+    st.text(
+        alphabet=st.characters(
+            min_codepoint=32, max_codepoint=126, exclude_characters="#:\"'{}[]&*!|>%@`,-?\\"
+        ),
+        min_size=1,
+        max_size=12,
+    ),
+)
+
+
+@pytest.fixture(scope="module")
+def source_file(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One reused path, rewritten per example.
+
+    Module-scoped on purpose: hypothesis's function_scoped_fixture health check rejects
+    ``tmp_path`` under ``@given``, and a fresh directory per example would leave thousands
+    behind.
+    """
+    return tmp_path_factory.mktemp("allowlist_source") / "accounts.yaml"
+
+
+def _document(tag: str, scalar: str) -> str:
+    """One otherwise-valid entry whose ``notes`` is written as raw YAML text.
+
+    ``notes`` rather than a required field: it accepts any string, so an untagged ordinary
+    scalar is *accepted* and the property covers the success path as well as the failures.
+    """
+    return (
+        "accounts:\n"
+        "  -\n"
+        "    username: blsgov\n"
+        "    display_name: Bureau\n"
+        "    reliability_tag: official_primary\n"
+        "    domains: [econ_data]\n"
+        f"    notes: {tag}{scalar}\n"
+    )
+
+
+@given(_YAML_TAGS, _SCALARS)
+def test_load_allowlist_raises_only_its_own_error_type(
+    source_file: Path, tag: str, scalar: str
+) -> None:
+    """The invariant the round-7 finding violated.
+
+    Checked against the pre-fix loader: it fails there within a handful of examples (the
+    ``!!bool``/``!!int`` draws alone), which is the evidence it is not vacuous. The
+    classification is asserted in the same body because it is the same claim seen from the
+    caller's side: the file is present and regular, so nothing raised past this point is a
+    filesystem problem, and ``cli`` routes it to EXIT_CONFIG_INVALID on that flag alone.
+    """
+    source_file.write_text(_document(tag, scalar), encoding="utf-8")
+    try:
+        load_allowlist(source_file)
+    except AllowlistError as exc:
+        assert exc.is_filesystem_error is False
+
+
+@given(_YAML_TAGS, st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=6, max_size=12))
+def test_a_tagged_scalar_never_reaches_the_message(
+    source_file: Path, tag: str, scalar: str
+) -> None:
+    """The leak half of the same finding, which "does it raise" cannot see.
+
+    ``!!bool <x>`` raises ``KeyError(<x>)`` and ``!!int <x>`` raises a ValueError quoting
+    ``<x>``, so on the pre-fix loader the drawn scalar reached the terminal in the raw
+    traceback. The draw is a distinctive lowercase token that cannot occur in the path or in
+    any of this module's constant-shaped messages, so its absence is a real assertion rather
+    than an accident of what was generated.
+    """
+    marker = f"zzq{scalar}"
+    source_file.write_text(_document(tag, marker), encoding="utf-8")
+    try:
+        load_allowlist(source_file)
+    except AllowlistError as exc:
+        rendered = str(exc) + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        assert marker not in rendered
 
 
 @given(st.lists(_accounts(), max_size=8), st.sampled_from(["econ_data", "space_launch", "science"]))

@@ -1672,3 +1672,88 @@ has been rewritten.
 
 No migration, no new dependency, no `docs/TRACKS.md` change (already claimed with `none`/`no`),
 no wiring into M1-307 (doesn't exist yet on this branch).
+
+**Round-6 review — answered with a rebuttal, no source change.** The review restated the round-5
+findings against a tree that predates the head its own request embedded; both were already closed.
+Recorded here because it is why the fix-round and review-round numbers stop tracking each other
+from this point, and because it is the case that put "diff the commit a pasted review names against
+`HEAD` and reproduce by execution before writing any fix code" into CLAUDE.md.
+
+### Round-7 review — one blocking finding, reproduced and widened
+
+Reviewed commit `7deeb2c`, which *was* `HEAD`; both prior findings closed. The finding: PyYAML
+constructor failures escape `load_allowlist` as a raw `ValueError`, against the project rule that
+every malformed shape arrives as the module's own error type. Reproduced end-to-end before writing
+anything — `whiskeyjack-bot verify-env` exits with an unhandled traceback through
+`allowlist.py:297` under the committed default `retrieval.social.enabled: false`.
+
+Reproducing it also widened it. Only PyYAML's scanner, parser and composer raise `YAMLError`; the
+*constructor* stage raises whatever Python raised at it, so the escape is a class, not one shape.
+All six of these come from a one-line edit to an otherwise-valid allowlist:
+
+| content | escapes as | leaks the value |
+| --- | --- | --- |
+| `display_name: 2026-02-30` | `ValueError('day is out of range for month')` | no |
+| `display_name: 2026-01-01 12:60:00` | `ValueError('minute must be in 0..59')` | no |
+| `notes: !!bool maybe` | `KeyError('maybe')` | **yes** |
+| `notes: !!int abc` | `ValueError("invalid literal for int()…: 'abc'")` | **yes** |
+| `notes: !!timestamp bogus` | `AttributeError` | no |
+| `domains: [[[…2000 deep…]]]` | `RecursionError` | no |
+
+`AttributeError`/`KeyError`/`ValueError` is exactly the trio CLAUDE.md names, and two of the six
+put file content in the message — so this is a secret-hygiene leak channel as well as a raw-type
+escape, which the finding as written did not reach.
+
+**Decision — the catch is "not a `YAMLError`", not a list of types.** The review's minimal fix
+(catch `ValueError`) closes three of the six; `!!bool <junk>` and `!!timestamp <junk>` — the
+leaking one and the `AttributeError` one — survive it. An enumerated tuple is not better in kind:
+the enumeration belongs to PyYAML, and a shape missing from it escapes raw, which is how this
+reached a review in the first place. What is actually known at that line is the contract — nothing
+but a parsed document may leave `yaml.safe_load` — so `except Exception` around **only** that call
+is the accurate statement of it. Same reasoning as the username charset predicate two sections up:
+close the class, not the reported instance.
+
+**Rejected — a custom `SafeLoader` with the implicit timestamp resolver removed, and why not.** It
+would make `display_name: 2026-02-30` a plain string instead of an error, which is arguably nicer
+for a curated file. It also changes *what the file accepts*, silently diverges from `config.py`'s
+loader, and leaves every explicit-tag shape untouched. Translating the failure is the smaller
+contract change and the one the acceptance criteria imply.
+
+**Rejected — catching at the caller.** `env_verify`/`cli` already handle `AllowlistError`; adding a
+second handler there would have to be repeated at every future entry point and would put the
+sanitizing decision outside the module that owns the error type.
+
+Tests, and which of them actually discriminate:
+
+- Six parametrized cases through `load_allowlist`, plus the leak check on the two tagged shapes.
+  All seven **fail against the pre-fix loader**; that is the evidence.
+- `test_each_constructor_case_still_escapes_pyyaml_untranslated` passes both ways *by design* — it
+  asserts against PyYAML, not against us, so that if a future release turns one of these into a
+  `YAMLError` the case stops silently testing a branch that was already there. The round-6
+  permission test had gone vacuous exactly that way.
+- `test_a_valid_implicit_timestamp_is_still_a_schema_error` also passes both ways by design:
+  `2026-02-28` constructs into a `datetime.date` and must still reach pydantic, so the new branch
+  is a translation and not a mask.
+- The property suite gained its **first deliberate exception** to the after-the-parse split its
+  header describes. That split assumed the parse either succeeds or raises `YAMLError`, and the
+  assumption *was* the finding — the defect lives in the transition into a dict, which cannot be
+  fuzzed from one. Two properties now drive `load_allowlist` over generated YAML text (only
+  `AllowlistError` escapes, and a drawn scalar never reaches the message); both fail pre-fix. The
+  file is written through a **module-scoped** `tmp_path_factory` fixture: `@given` with the
+  function-scoped `tmp_path` is a hypothesis health-check failure.
+
+**The round-7 request overstated its own test coverage**, and the review caught it: it claimed a
+mid-read `OSError` and descriptor cleanup were exercised, and nothing in `tests/` patched
+`os.read`. Now real — `test_mid_read_failure_is_a_filesystem_error_and_closes_the_descriptor_once`
+wraps `os.open`/`os.read`/`os.close` keyed on the one descriptor the load opens (wholesale patching
+breaks pytest's own capture), and asserts `intercepted` alongside the outcome. Mutation-checked
+rather than assumed: deleting the `finally: os.close(fd)` makes it fail with `descriptor closed 0
+times`.
+
+### Deferred (do not read the absence as an omission)
+
+`config.py:363` has the identical hole — `load_config` catches only `YAMLError`, and
+`KeyError('<value>')` out of the primary config file is the worse leak of the two. It is on the
+diff base, so per the review contract it is a backlog row, not a fix in this branch: **M0-007**,
+filed with the reproduction and acceptance criteria. Widening this branch into the primary config
+loader would hand a round-8 reviewer a second file to audit for a defect that predates the item.

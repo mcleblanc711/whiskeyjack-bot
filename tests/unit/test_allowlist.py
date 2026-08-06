@@ -181,6 +181,91 @@ def test_malformed_yaml_rejected(tmp_path: Path) -> None:
         load_allowlist(path)
 
 
+# --- YAML that parses but cannot be *constructed* (round-7 review finding) ---
+#
+# The test above exercises a scanner/parser error, which is the only kind that arrives as a
+# YAMLError. PyYAML's construction stage raises whatever Python raised at it, so all six
+# shapes below escaped load_allowlist raw -- as ValueError, KeyError, AttributeError and
+# RecursionError -- and took `whiskeyjack-bot verify-env` down with an unhandled traceback
+# under the committed default `retrieval.social.enabled: false`.
+
+
+def _raw_source(**fields: str) -> str:
+    """One otherwise-valid entry, written as YAML *text* so tags and scalars survive.
+
+    ``_write`` cannot be used here: it round-trips through ``yaml.safe_dump``, which quotes
+    and escapes exactly the shapes these cases depend on.
+    """
+    entry = {
+        "username": "SomeOrg",
+        "display_name": "Some Organization",
+        "reliability_tag": "official_primary",
+        "domains": "[econ_data]",
+    }
+    entry.update(fields)
+    return "accounts:\n  -\n" + "".join(f"    {key}: {value}\n" for key, value in entry.items())
+
+
+CONSTRUCTOR_FAILURES = {
+    "implicit date, day out of range": _raw_source(display_name="2026-02-30"),
+    "implicit timestamp, minute out of range": _raw_source(display_name="2026-01-01 12:60:00"),
+    "explicit !!bool with an unparseable scalar": _raw_source(notes="!!bool maybe"),
+    "explicit !!int with an unparseable scalar": _raw_source(notes="!!int abc"),
+    "explicit !!timestamp with an unparseable scalar": _raw_source(notes="!!timestamp bogus"),
+    "flow nesting deeper than the recursion limit": _raw_source(
+        domains="[" * 2000 + "]" * 2000,
+    ),
+}
+
+
+@pytest.mark.parametrize("source", CONSTRUCTOR_FAILURES.values(), ids=CONSTRUCTOR_FAILURES)
+def test_yaml_constructor_failure_arrives_as_an_allowlist_error(
+    tmp_path: Path, source: str
+) -> None:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    assert "not valid YAML" in str(excinfo.value)
+    # A content error, not a filesystem one: cli routes it to EXIT_CONFIG_INVALID.
+    assert excinfo.value.is_filesystem_error is False
+    # from None -- the raw exception must not reprint the value through a traceback.
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize("source", CONSTRUCTOR_FAILURES.values(), ids=CONSTRUCTOR_FAILURES)
+def test_each_constructor_case_still_escapes_pyyaml_untranslated(source: str) -> None:
+    """Guard against the suite above going vacuous.
+
+    Each case earns its place only while ``yaml.safe_load`` really does raise something
+    outside its own hierarchy for it. If a future PyYAML turns one of these into a
+    ``YAMLError`` -- or accepts it -- that case stops testing the new branch and starts
+    testing one of the two that were already there, silently. (The round-6 permission test
+    had become a test of nothing this way.)
+    """
+    with pytest.raises(Exception) as raw:  # noqa: B017 -- the point is that it is untyped
+        yaml.safe_load(source)
+    assert not isinstance(raw.value, yaml.YAMLError)
+
+
+def test_a_valid_implicit_timestamp_is_still_a_schema_error(tmp_path: Path) -> None:
+    """The new branch translates construction failures; it must not mask valid ones.
+
+    ``2026-02-28`` constructs cleanly into a ``datetime.date``, so it has to reach pydantic
+    and be rejected there as not-a-string -- with a schema message, not the YAML one.
+    """
+    path = tmp_path / "accounts.yaml"
+    path.write_text(_raw_source(display_name="2026-02-28"), encoding="utf-8")
+
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+    rendered = str(excinfo.value)
+    assert "not valid YAML" not in rendered
+    assert "accounts.0.display_name" in rendered
+    assert excinfo.value.is_filesystem_error is False
+
+
 def test_non_mapping_top_level_rejected(tmp_path: Path) -> None:
     path = tmp_path / "list.yaml"
     path.write_text(yaml.safe_dump(["not", "a", "mapping"]), encoding="utf-8")
@@ -301,6 +386,64 @@ def test_a_large_regular_file_is_read_in_full(tmp_path: Path, deadline: None) ->
     assert len(load_allowlist(path).entries) == len(padded)
 
 
+def test_mid_read_failure_is_a_filesystem_error_and_closes_the_descriptor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read loop's own failure path, and the ``finally`` that pairs with ``os.open``.
+
+    A failure *after* the open is not reachable from a test fixture -- an I/O error on a
+    regular file, a truncation mid-read -- so it is simulated. Every wrapper is keyed on the
+    one descriptor this load opens, because patching ``os.read``/``os.close`` wholesale would
+    break pytest's own output capture. ``intercepted`` is asserted for the same reason
+    test_env_verify's permission test asserts it: a simulated failure that simulates nothing
+    proves nothing, and this suite has shipped one of those before.
+
+    The close count is the point. ``_read_regular_file`` closes in a ``finally``, so the
+    error path must not close twice (which could later be a close of an unrelated,
+    since-reused fd) nor leak the descriptor.
+    """
+    path = tmp_path / "accounts.yaml"
+    path.write_text(ALLOWLIST_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+
+    original_open, original_read, original_close = os.open, os.read, os.close
+    target_fd: int | None = None
+    intercepted = False
+    closes = 0
+
+    def _tracking_open(target: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal target_fd
+        fd = original_open(target, flags, *args, **kwargs)
+        if Path(target) == path:
+            target_fd = fd
+        return fd
+
+    def _failing_read(fd: int, length: int) -> bytes:
+        nonlocal intercepted
+        if fd == target_fd:
+            intercepted = True
+            raise OSError(5, "Input/output error")
+        return original_read(fd, length)
+
+    def _counting_close(fd: int) -> None:
+        nonlocal closes
+        if fd == target_fd:
+            closes += 1
+        original_close(fd)
+
+    monkeypatch.setattr(os, "open", _tracking_open)
+    monkeypatch.setattr(os, "read", _failing_read)
+    monkeypatch.setattr(os, "close", _counting_close)
+
+    with pytest.raises(AllowlistError) as excinfo:
+        load_allowlist(path)
+
+    assert intercepted, "os.read was never reached -- this test no longer simulates anything"
+    assert closes == 1, f"descriptor closed {closes} times"
+    assert excinfo.value.is_filesystem_error is True
+    assert excinfo.value.__cause__ is None
+    assert "Input/output error" in str(excinfo.value)
+
+
 def test_duplicate_username_is_classified_as_content_error(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
@@ -374,6 +517,27 @@ def test_no_field_leaks_a_planted_secret_through_any_message(tmp_path: Path) -> 
         with pytest.raises(AllowlistError) as excinfo:
             load_allowlist(path)
         assert not _leaks(excinfo.value), f"{name} leaked the numeric key"
+
+
+def test_a_yaml_constructor_failure_does_not_echo_the_offending_value(tmp_path: Path) -> None:
+    """Two of the six constructor failures put the scalar in their own message.
+
+    ``!!bool <x>`` raises ``KeyError(<x>)`` and ``!!int <x>`` raises
+    ``ValueError("invalid literal for int() with base 10: '<x>'")``, so a secret pasted into
+    the file reached the terminal in the raw traceback -- this is a leak channel, not only a
+    raw-type escape. Both messages *and* the rendered traceback are checked, because
+    ``from None`` is what keeps the second one clean.
+    """
+    for name, tagged in (
+        ("bool-tag.yaml", f"!!bool {SECRET}"),
+        ("int-tag.yaml", f"!!int {SECRET}"),
+        ("bool-tag-int.yaml", f"!!bool {SECRET_INT}"),
+    ):
+        path = tmp_path / name
+        path.write_text(_raw_source(notes=tagged), encoding="utf-8")
+        with pytest.raises(AllowlistError) as excinfo:
+            load_allowlist(path)
+        assert not _leaks(excinfo.value), f"{name} leaked the tagged scalar"
 
 
 # --- error-location hygiene (round-5 review finding 1) ---

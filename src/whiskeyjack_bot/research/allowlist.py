@@ -40,9 +40,13 @@ see :func:`_sanitize`.
 :class:`AllowlistError` also carries ``is_filesystem_error``, set only when there was no file
 here to validate -- it could not be read, or the path names something that is not a regular
 file (a directory, a FIFO, a device). Everything else raised here -- bad UTF-8, malformed
-YAML, a schema violation -- is the file's *content* failing to validate, which
-``env_verify.py`` and ``cli.py`` route to config-invalid rather than environment-missing
-(see ``env_verify.load_and_verify_account_allowlist``).
+YAML, a YAML document that parses but cannot be *constructed*, a schema violation -- is the
+file's *content* failing to validate, which ``env_verify.py`` and ``cli.py`` route to
+config-invalid rather than environment-missing (see
+``env_verify.load_and_verify_account_allowlist``). The construction case is the one that is
+not obvious: PyYAML raises YAMLError from its scanner, parser and composer, but a constructor
+that cannot build a value raises whatever Python raised at it, so a bad date or a bad
+explicit tag arrives as a raw ValueError/KeyError/AttributeError. See :func:`load_allowlist`.
 """
 
 from __future__ import annotations
@@ -307,6 +311,30 @@ def load_allowlist(path: Path | str) -> AccountAllowlist:
             ]
         ) from None
     except yaml.YAMLError:
+        raise AllowlistError(
+            [
+                f"account allowlist {path} is not valid YAML "
+                "(parser detail withheld: it can echo file contents)"
+            ]
+        ) from None
+    except Exception:
+        # PyYAML's *construction* stage sits outside its own error hierarchy: only the
+        # scanner, parser and composer raise YAMLError. Reproduced on the pinned version,
+        # every one of these from a one-line allowlist -- ``2026-02-30`` raises
+        # ValueError("day is out of range for month"), ``!!int abc`` raises
+        # ValueError("... 'abc'"), ``!!bool maybe`` raises KeyError('maybe'),
+        # ``!!timestamp bogus`` raises AttributeError, and a deeply nested flow sequence
+        # raises RecursionError. Two of those carry the offending value in their message,
+        # so the detail is withheld for the same reason the MarkedYAMLError branch withholds
+        # its source snippet, and ``from None`` keeps the raw exception from reprinting it
+        # through a rendered traceback.
+        #
+        # Deliberately not an enumerated tuple of types: the enumeration belongs to PyYAML,
+        # and any shape missing from the list escapes raw -- which is exactly how this
+        # reached a review. What is *known* here is the contract: nothing but a parsed
+        # document may leave this call, so anything else is the file's content failing to
+        # construct. Only ``yaml.safe_load`` is inside the ``try``, so this cannot swallow
+        # a failure from any other statement.
         raise AllowlistError(
             [
                 f"account allowlist {path} is not valid YAML "
