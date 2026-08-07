@@ -1199,6 +1199,14 @@ _EVENT_COLUMNS = (
     "resolution_event_id, score_event_id, occurred_at_utc, created_at_utc"
 )
 
+# Spelled out rather than `SELECT *` for the reason _EVENT_COLUMNS is: the row mapper
+# indexes positionally, so the order here is part of the contract and a later ALTER TABLE
+# must not be able to silently reorder it. Matches PreForecastFailure's field order.
+_PRE_FORECAST_FAILURE_COLUMNS = (
+    "event_id, attempt_id, event_seq, question_id, tournament_id, event_type, "
+    "detail_code, retrieval_run_id, occurred_at_utc, created_at_utc"
+)
+
 
 def _append_event(
     conn: sqlite3.Connection,
@@ -1274,6 +1282,25 @@ def _require_stored_record(conn: sqlite3.Connection, record_id: str) -> None:
     row = _fetch_one(conn, "SELECT 1 FROM forecast_records WHERE record_id = ?", (record_id,))
     if row is None:
         raise LifecycleError("record_id does not name a stored forecast record")
+
+
+def _require_no_prior_success(conn: sqlite3.Connection, attempt_id: str) -> None:
+    """Fail readably when an attempt has already produced a forecast record (M1-606).
+
+    The writer-side twin of ``pipeline_failure_events_validate_on_insert``'s
+    prior-success probe. The trigger is the enforcement -- it holds against a raw INSERT
+    that never reaches this module -- and this is what turns the same refusal into a
+    :class:`LifecycleError` with an actionable message instead of the opaque
+    ``the ledger rejected this write`` :func:`_insert` is obliged to raise. Both must
+    hold; neither is redundant, for the reason 003 gives about its own paired probes.
+
+    Success and failure are both terminal for one ``attempt_id``: an attempt that
+    produced a forecast version cannot afterwards be recorded as having failed, or the
+    ledger would show a campaign that both succeeded and did not.
+    """
+    row = _fetch_one(conn, "SELECT 1 FROM forecast_records WHERE attempt_id = ?", (attempt_id,))
+    if row is not None:
+        raise LifecycleError("attempt_id has already produced a stored forecast record")
 
 
 def _require_hash_binds(conn: sqlite3.Connection, record_id: str, digest: str) -> None:
@@ -1354,6 +1381,34 @@ def _next_seq(conn: sqlite3.Connection, record_id: str) -> int:
     return row[0] + 1
 
 
+def _next_pipeline_failure_seq(conn: sqlite3.Connection, attempt_id: str) -> int:
+    """:func:`_next_seq` for ``pipeline_failure_events``, scoped to an attempt (M1-606).
+
+    Separate from :func:`_next_seq` rather than parameterized over table and key column:
+    the two sequences count different things over different identity spaces, and a shared
+    helper taking a table name would put an f-stringed identifier into SQL for no gain.
+
+    Racing writers are not a correctness concern here for the reason they are not one for
+    :func:`_next_seq`: ``UNIQUE (attempt_id, event_seq)`` is what actually decides, and a
+    loser gets a refused write rather than a duplicated sequence number.
+    """
+    row = _fetch_one(
+        conn,
+        "SELECT max(event_seq) FROM pipeline_failure_events WHERE attempt_id = ?",
+        (attempt_id,),
+    )
+    if row is None or row[0] is None:
+        return 1
+    if type(row[0]) is not int:
+        # See _next_seq: affinity is not a type, and the offending value is stored
+        # content that this message must not name.
+        raise LifecycleError(
+            "the stored pipeline failure sequence is malformed "
+            "(detail withheld: it can echo stored values)"
+        )
+    return row[0] + 1
+
+
 def _event_from_row(row: sqlite3.Row) -> LifecycleEvent:
     """Build the value object from a stored row, gating every vocabulary field."""
     return LifecycleEvent(
@@ -1381,6 +1436,35 @@ def _event_from_row(row: sqlite3.Row) -> LifecycleEvent:
         score_event_id=None if row[11] is None else _stored_int(row[11], "score_event_id"),
         occurred_at_utc=_stored_text(row[12], "occurred_at_utc"),
         created_at_utc=_stored_text(row[13], "created_at_utc"),
+    )
+
+
+def _pre_forecast_failure_from_row(row: sqlite3.Row) -> PreForecastFailure:
+    """Build the value object from a stored row, gating every vocabulary field (M1-606).
+
+    Every field is re-validated on the way out even though the schema's own ``CHECK``
+    constraints accepted it on the way in. That is not belt-and-braces: values read back
+    out of the ledger are untrusted per CLAUDE.md's threat boundary, the database file is
+    ordinary local state, and a row written by something other than this module is
+    exactly the case the ``typeof()``-style guards elsewhere in this file exist for. A
+    row that cannot be gated arrives as a :class:`LifecycleError` naming only the field.
+    """
+    return PreForecastFailure(
+        event_id=_stored_int(row[0], "event_id"),
+        attempt_id=_stored_text(row[1], "attempt_id"),
+        event_seq=_stored_int(row[2], "event_seq"),
+        question_id=_stored_int(row[3], "question_id"),
+        tournament_id=_stored_text(row[4], "tournament_id"),
+        event_type=cast(
+            PreForecastEventType, _require_member(row[5], _PRE_FORECAST_EVENT_TYPES, "event_type")
+        ),
+        detail_code=cast(
+            PreForecastFailureCode,
+            _require_member(row[6], _PRE_FORECAST_FAILURE_CODES, "detail_code"),
+        ),
+        retrieval_run_id=(None if row[7] is None else _stored_text(row[7], "retrieval_run_id")),
+        occurred_at_utc=_stored_text(row[8], "occurred_at_utc"),
+        created_at_utc=_stored_text(row[9], "created_at_utc"),
     )
 
 
