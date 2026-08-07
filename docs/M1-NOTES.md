@@ -1497,6 +1497,266 @@ here so it is not rediscovered as a surprise.
   one — M1-602 is the record writer and is unstarted — so the population is expected to be empty;
   if it is not, the ledger predates the guarantee and a fresh one is the honest answer.
 
+## M1-606 — Recording pre-forecast pipeline failures
+
+The acceptance criterion is two-part: "a research or generation failure with no forecast record
+still produces a queryable ledger event", and "the failed attempt is linked to the forecast version
+that later succeeds for the same question". M1-603 shipped `lifecycle_events` scoped to a
+`forecast_records` row and explicitly could not cover this — 001 requires a non-null
+`final_prediction_json`, `record_json` and `retrieval_run_id`, so no `forecast_records` row exists
+until generation has already succeeded, and a research or generation failure happens before that.
+003's header names this item and this migration by number: `forecast_record_id` is nullable in the
+DDL specifically so this item would not have to rebuild an append-only table to get here. This item
+settles the two things 003 left open.
+
+**What shipped.** `004_pipeline_failure_events.sql`: a new `pipeline_failure_events` table scoped to
+a caller-minted `attempt_id`, with a validating `BEFORE INSERT` trigger and the append-only
+`_block_update`/`_block_delete` pair; `forecast_records.attempt_id` plus a partial `UNIQUE` index and
+an extended `forecast_records_require_draft_on_insert`. In `lifecycle.py`:
+`record_pre_forecast_failure`, `read_pipeline_failure_events`, the `PreForecastFailure` value object,
+the `PreForecastEventType`/`PreForecastFailureCode` literals, and `_require_identifier`.
+`LEDGER_SCHEMA_VERSION` 3 → 4. Tests: the 004 truth table driven at both entry points in
+`tests/unit/test_lifecycle.py` (raw SQL for the schema, the writer for the writer) and four invariants
+in `tests/property/test_lifecycle_properties.py`.
+
+### Decision — a new attempt-scoped table, not a widened `lifecycle_events`
+
+**Owner decision, per the task brief.** `lifecycle_events.event_type` is a closed `CHECK` and does
+not include `research_failed`/`generation_failed` — the first draft of 003 carried them and they
+were removed in round 1 as structurally unreachable (no record to attach to). SQLite cannot widen a
+`CHECK` in place; the only route is `CREATE TABLE ... AS SELECT` plus a rename, which means dropping
+and recreating every trigger on the table — including the append-only `_block_update`/`_block_delete`
+pair, which is "precisely the operation the ledger exists to make impossible" (003's own words,
+about itself). So a pre-forecast failure needs a table whose *own* `CHECK` can name these two event
+types without touching `lifecycle_events` at all.
+
+New table `pipeline_failure_events`, scoped to a caller-minted `attempt_id` (TEXT) rather than a
+`forecast_record_id`. An attempt is the end-to-end campaign to produce one forecast version for one
+question — it may fail research, fail again, and eventually either succeed (decision 2) or be
+abandoned — so more than one failure can share an `attempt_id`, and `UNIQUE (attempt_id, event_seq)`
+with a contiguous-next-value trigger probe is `lifecycle_events`' own `UNIQUE (forecast_record_id,
+event_seq)` pattern, reused rather than reinvented. `question_id`/`tournament_id` are stored directly
+on the row (not inferred through a FK) for the same reason `resolution_events` (001) carries its own
+`question_id` alongside a nullable `forecast_record_id`: the thing this event is about may have no
+forecast record to join through, ever.
+
+`event_type` is `CHECK (event_type IN ('research_failed', 'generation_failed'))` — a full return of
+the two vocabulary members 003 removed, just on a table where they are reachable. `detail_code` is a
+`FailureCode` subset (see below). `retrieval_run_id` is a nullable `REFERENCES research_runs`:
+required by trigger for `generation_failed` (generation only runs after research has completed, so
+there is always a run to cite) and optional for `research_failed` (a failure can occur before any
+`research_runs` row exists, e.g. the provider call never got made).
+
+Append-only from creation, like everything else `lifecycle_events`-adjacent: unconditional
+`_block_update`/`_block_delete` triggers, same shape as 003's. `PRAGMA recursive_triggers` (already
+`ON` in `ledger.py` since 003) is what stops `INSERT OR REPLACE` bypassing them here too — 003 found
+this the hard way in its own round 1; this migration inherits the connection-level setting rather
+than needing anything new, but the header says so explicitly rather than leaving it to be
+rediscovered.
+
+The rejected alternative: widen `lifecycle_events.forecast_record_id`'s trigger-enforced
+requirement to accept an attempt-only row with `forecast_record_id NULL`, and give `event_type` a
+second closed set depending on which of `forecast_record_id`/`attempt_id` is present. That still
+needs the `CHECK` widened (the vocabulary has to grow either way) and it makes one table cover two
+unrelated identity spaces, which is the same polymorphic-FK problem 003 rejected for its own detail
+columns ("a polymorphic pair cannot be a real foreign key"). A second table is the narrower change
+and never puts `lifecycle_events` at risk.
+
+### Decision — `attempt_id` links a failure to the forecast version that follows it
+
+**Owner decision, per the task brief.** Acceptance criterion 2 has no natural home: `forecast_records`
+is UPDATE-blocked (003, D25), so nothing can annotate an existing successful row with the failures
+that preceded it after the fact, and nothing can annotate a failure row with a success that has not
+happened yet. The link has to be established once, at the moment the successful row is written, by
+both sides already agreeing on a shared value.
+
+`forecast_records` gets `attempt_id TEXT`, added `NULLable` with a `BEFORE INSERT` trigger requiring
+it of every new row — the exact pattern 003 used for `forecast_sha256` (`ALTER TABLE ... ADD COLUMN`
+cannot add `NOT NULL` without a default, and no default is honest for an identifier nobody minted for
+a pre-existing row). Concretely: an orchestrator mints `attempt_id` once, before the first research
+call, for the whole campaign toward one forecast version; every `pipeline_failure_events` row logged
+while pursuing that version cites the same `attempt_id`; if the campaign eventually succeeds, the
+`forecast_records` row it produces is stamped with that same `attempt_id` at `INSERT` time. "The
+forecast version that later succeeds" a given failure is then a plain equality join
+(`pipeline_failure_events.attempt_id = forecast_records.attempt_id`), not an inferred one over
+question/tournament and timestamps — which matters, because a question can have several independent
+retry campaigns and several successful versions over its lifetime, and an inferred join has no
+principled way to pair the right failure with the right success.
+
+Two triggers close the loop from both directions: `pipeline_failure_events` refuses a new row whose
+`attempt_id` already has a `forecast_records` row (an attempt that already succeeded cannot also
+fail — terminal both ways), and refuses a row whose `attempt_id` was previously used for a *different*
+`question_id`/`tournament_id` (identity stability — the same reasoning 003 applies to
+`resolution_events` citing the wrong question). `forecast_records`' new trigger clause mirrors the
+second check from its own side. A partial `UNIQUE INDEX (attempt_id) WHERE attempt_id IS NOT NULL`
+on `forecast_records` enforces that one attempt succeeds at most once.
+
+### Rejected — an append-only link table instead of the column, and why not
+
+An `attempt_forecast_links` table written once, after the fact, by whoever creates the successful
+`forecast_records` row. Rejected because it adds a second place to look for the same fact
+`forecast_records.attempt_id` already states directly, with no offsetting benefit — the link table
+would still have to be written atomically with the `forecast_records` INSERT (same transaction, same
+ordering constraint), so it does not relax anything decision 2 needs, and it is one more append-only
+table whose own integrity (what stops two link rows citing the same successful record, or a link row
+citing a nonexistent attempt) has to be independently reasoned about. A column with a `UNIQUE`
+partial index says the same thing with one fewer table.
+
+### Decision — M1-606 imposes the mandatory `attempt_id`, not M1-602
+
+**Owner decision, 2026-08-06, taken explicitly because this is the one place this item reaches
+outside its own surface.** 004 extends 003's `forecast_records_require_draft_on_insert` so that
+*every* `forecast_records` INSERT must carry a non-blank `attempt_id`. That is a writer contract for
+a table M1-602 owns, and M1-602 is `Not Started`. The question is whether M1-606 should be setting
+it. It should, on three grounds:
+
+- **An optional link is unrepairable, not deferrable.** `forecast_records` is UPDATE-blocked (003,
+  D25). A row admitted without an `attempt_id` can never be given one afterwards, so every failure
+  recorded against that campaign is orphaned permanently. The cost of being wrong is asymmetric:
+  requiring it too early costs M1-602 one column in an INSERT it has not written yet; requiring it
+  too late costs a hole in the ledger that no later migration can close.
+- **The precedent is exact and already settled.** 003 added a required `forecast_sha256` to
+  `forecast_records` through this same trigger, before M1-602 existed, for the same reason (approval
+  binds to a hash; a record with none is unapprovable). M1-602 picks up an already-required column
+  either way; this makes it two rather than one.
+- **The affected population is empty.** No production code writes `forecast_records` today — only
+  tests, via raw SQL. The `NULLable`-column carve-out is a formality for a population of zero, not a
+  live migration.
+
+CLAUDE.md's stricter-reading rule covers the residual ambiguity in acceptance criterion 2: "the
+failed attempt is linked to the forecast version that later succeeds" reads either as "there is a
+column for the link" or as "the link exists for every success". The second is stricter and is what
+shipped.
+
+**What M1-602 inherits, stated so it is not discovered:** its `forecast_records` writer must mint or
+accept an `attempt_id` and pass it at INSERT time, non-blank; it cannot add one later. The
+`pipeline_failure_events` side is already written and needs nothing from it.
+
+### Rejected — deferring the requirement to M1-602, and why not
+
+Keep 004's column, its partial `UNIQUE` index and its identity-stability clause, but drop only the
+`attempt_id is required` clause, leaving M1-602 to add it in a later migration when it writes the
+real writer. This is the narrower change and it was seriously considered: it keeps each item inside
+its own table.
+
+Rejected because the window is not free. Between 004 landing and M1-602 landing, any
+`forecast_records` row written — by a test fixture, an operator's manual insert, an M1-604 export
+fixture — is admitted with a NULL `attempt_id` and is then permanently unjoinable, on a table whose
+whole point is that it cannot be corrected. The item's own acceptance criterion would be satisfied
+only in the sense that a column exists. Deferring an enforcement onto an append-only table is not
+the same kind of deferral as deferring a feature.
+
+### Decision — `detail_code` is `FailureCode` minus the two refetch codes
+
+`pipeline_failure_events.detail_code` reuses `lifecycle.FailureCode`'s vocabulary rather than
+inventing a parallel one, minus `refetch_mismatch`/`refetch_missing` — both describe what a refetch
+saw of an *already-posted* forecast (M2-704's contract in `submission_verifications`), which cannot
+occur before generation has even succeeded once. A new `Literal`, `PreForecastFailureCode`, spells the
+ten remaining members out explicitly rather than deriving them, the same style `PipelineFailureEvent`
+already uses for `record_failure`'s one-member vocabulary — a spelled-out list is what keeps a future
+`FailureCode` addition from silently becoming reachable here before anyone decides it should be.
+
+### Deviation — 004's blank-identifier test is 003's pinned character set, not `trim()`
+
+The first draft of this migration wrote `trim(NEW.attempt_id) = ''`, and self-review before round 1
+found it accepts `'\t\n'`. **That is M1-603's round-5 defect, reproduced in a new migration by
+copying the idiom from before its fix.** SQLite's one-argument `trim()` strips U+0020 and nothing
+else, so tabs, newlines and NBSP pass straight through it. 004 now spells out the same 29 codepoints
+003 pinned — the set where Python's `str.isspace()` is true — at every place that defines "blank"
+for an `attempt_id`.
+
+Three things came out of chasing it, and all three are in the shipped code:
+
+- **`pipeline_failure_events.attempt_id`, `tournament_id` and `question_id` had no shape guard at
+  all.** The first draft guarded only the `forecast_records` end. The failure table accepted `''`,
+  `'  '` and a BLOB `attempt_id` — and a blob is worse than blank, because
+  `_pre_forecast_failure_from_row`'s `_stored_text` refuses it on the way out: an append-only row
+  that can never be read back. Both ends of a join key have to agree on what a valid key is, or a
+  failure can be recorded under a value no `forecast_records` row is permitted to claim.
+- **`typeof()` on an affinity column catches less than it looks like it does.** `'1'` bound to
+  `event_seq` (INTEGER affinity) reaches the trigger already converted to integer 1 and is accepted
+  — correctly, since what lands is a genuine integer. What the clause actually catches is what
+  affinity *cannot* convert: `'x'`, `1.5`, a blob. Same on the TEXT side: `42` becomes `'42'`, and
+  the clause earns its place by rejecting blobs. The tests assert the **stored type** for the
+  coerced cases, because a test that fed `'1'` expecting a refusal would have passed against a
+  trigger with no `typeof()` clause at all — green for the wrong reason.
+- **The writer had the same gap.** `_require_text` refuses `''` but `'\n\t'` is truthy and reached
+  storage through it. New `_require_identifier` adds the `str.strip()` blank test, and a test
+  asserts the writer's definition and both triggers' agree over every codepoint Python calls
+  whitespace — the drift guard 003 wrote for the same reason.
+
+**`_require_identifier` is scoped to this item's writer rather than folded into `_require_text`.**
+The older identifier columns (`record_id`, `submission_attempt_id`, `idempotency_key`) have never
+had a blank guard, so widening the shared validator would change what already-shipped, already-
+reviewed writers accept — a behaviour change to merged code, smuggled in under a new item. That is a
+**backlog candidate, not a fix here**, and the same call M1-308 made when it found `config.py`'s
+copy of its YAML hole (filed as M0-007). Filed as **M1-607**.
+
+### Deviation — every guard was mutation-checked, and three tests failed the check
+
+A trigger test that stays green with its trigger removed is testing nothing, and M1-303 shipped
+three properties out of ten that passed against the pre-fix code. So each of 004's 16 `RAISE(ABORT)`
+clauses, both append-only block triggers and the partial `UNIQUE` index was removed one at a time
+with the suite re-run against each — **18/18 are load-bearing for at least one test** — and eight
+deliberate breakages were injected into `lifecycle.py` the same way. What the exercise actually
+found is the point of recording it:
+
+- **`test_one_attempt_succeeds_at_most_once` passed with the index deleted.** Both its records used
+  question 100, which collides with 001's `UNIQUE (question_id, tournament_id, forecast_version)`,
+  and `match="UNIQUE constraint failed"` cannot tell two unique constraints apart. Now uses a
+  different `question_id` and matches `forecast_records.attempt_id`.
+- **The only-`LifecycleError` property caught neither of the two writer holes its docstring claimed.**
+  `_insert`/`_fetch_*` wrap `sqlite3.Error` *and* `OverflowError`, so a validator hole just moves the
+  refusal from the writer to the database without changing the exception type. The invariant holds;
+  the property simply cannot see it. `test_a_refused_write_is_refused_with_a_field_level_message` is
+  the property that can — for inputs the writer is contracted to judge itself, the refusal must not
+  be `_insert`'s opaque fallback and must name the field. That is M1-303's round-4 lesson (refuse
+  caller mistakes before reaching the expensive layer) written as a property. It catches 7 of the 8
+  injected breakages between it and its siblings; the eighth, dropping the writer's prior-success
+  probe, is caught by `test_the_writer_refuses_an_attempt_that_already_succeeded` in the unit suite.
+- **Two mutation results were unsound and had to be re-run.** Deleting the single statement from a
+  block trigger leaves `BEGIN END;` — a syntax error, so the migration fails to apply and every test
+  goes red for the wrong reason. Removing the whole `CREATE TRIGGER` is the sound mutation. A green
+  mutation result is only evidence if the mutant still runs.
+- **The first version of the field-level property was wrong about its own strategy**, drawing
+  `question_id=42` — a valid question id — from a bogus-value set shared across fields. Hostile
+  inputs have to be relative to the field they target or the test is testing the strategy.
+
+Every docstring that names a breakage now names one that was **observed** failing, not one that
+seemed likely. Two docstrings state, explicitly, a breakage the test does *not* catch and which
+sibling does.
+
+**A note for whoever runs this next.** The sweep first appeared to hang: every test builds a SQLite
+ledger under `tmp_path`, and on ext4 the journal commits dominate — 3m55s of wall clock for 6s of
+CPU, with pytest sitting in `D` state in `jbd2_log_wait_commit`. `--basetemp=/dev/shm/...` puts the
+same databases on tmpfs and the same run takes 2.8s. That is an 85x difference on identical tests,
+and it is what makes mutation testing practical here at all.
+
+### Deferred (do not read the absence as an omission)
+
+- **The `lifecycle_events` ∪ `pipeline_failure_events` merged read/export view → M1-604.** This item
+  ships `read_pipeline_failure_events(conn, attempt_id)`, a direct per-attempt reader, the same
+  granularity `read_history()` offers for `lifecycle_events`. Joining the two into one chronological
+  view of "everything that happened toward this question" is M1-604's `show`/export seam to build.
+- **No orchestrator wiring.** Nothing yet mints an `attempt_id` or calls `record_pre_forecast_failure`
+  in production code — M1-306 (research retrieval), M1-602 (the `forecast_records` writer) and T-903
+  (the dry-run acceptance test that would exercise the whole path) are all `Not Started`. This item
+  ships the ledger primitive and its schema contract only, tested directly against hand-built rows,
+  the same posture 003 shipped in before M1-602 existed to call it.
+- **Calendar/format validity of `occurred_at_utc`/`created_at_utc`.** Rendered by the same
+  `_require_utc`/`_utc_text` this module already uses for `lifecycle_events`; 003's M1-NOTES entry on
+  this (non-blocking, round 5) applies unchanged and is not re-litigated here.
+
+### Standing risk — not verifiable offline
+
+The `attempt_id`-sharing contract (decision 2) is an interface promise to code that does not exist
+yet: nothing today constructs the "mint once, reuse across retries, stamp on success" sequence
+end-to-end, so its only exercise is this item's own tests inserting hand-built rows in the shape a
+real orchestrator would produce. That is the same position 003 was in before M1-602, and the same
+answer applies — the schema and its triggers are the enforcement regardless of who calls them, and
+`tests/unit/test_lifecycle.py` drives the truth table directly rather than through a caller that does
+not exist.
+
 ## M1-308 — Account allowlist loader
 
 New `research/allowlist.py`: `AllowlistEntry`/`_AllowlistFile` (pydantic, `extra="forbid"`),
