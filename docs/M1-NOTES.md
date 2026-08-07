@@ -1497,6 +1497,141 @@ here so it is not rediscovered as a surprise.
   one — M1-602 is the record writer and is unstarted — so the population is expected to be empty;
   if it is not, the ledger predates the guarantee and a fresh one is the honest answer.
 
+## M1-606 — Recording pre-forecast pipeline failures
+
+The acceptance criterion is two-part: "a research or generation failure with no forecast record
+still produces a queryable ledger event", and "the failed attempt is linked to the forecast version
+that later succeeds for the same question". M1-603 shipped `lifecycle_events` scoped to a
+`forecast_records` row and explicitly could not cover this — 001 requires a non-null
+`final_prediction_json`, `record_json` and `retrieval_run_id`, so no `forecast_records` row exists
+until generation has already succeeded, and a research or generation failure happens before that.
+003's header names this item and this migration by number: `forecast_record_id` is nullable in the
+DDL specifically so this item would not have to rebuild an append-only table to get here. This item
+settles the two things 003 left open.
+
+### Decision — a new attempt-scoped table, not a widened `lifecycle_events`
+
+**Owner decision, per the task brief.** `lifecycle_events.event_type` is a closed `CHECK` and does
+not include `research_failed`/`generation_failed` — the first draft of 003 carried them and they
+were removed in round 1 as structurally unreachable (no record to attach to). SQLite cannot widen a
+`CHECK` in place; the only route is `CREATE TABLE ... AS SELECT` plus a rename, which means dropping
+and recreating every trigger on the table — including the append-only `_block_update`/`_block_delete`
+pair, which is "precisely the operation the ledger exists to make impossible" (003's own words,
+about itself). So a pre-forecast failure needs a table whose *own* `CHECK` can name these two event
+types without touching `lifecycle_events` at all.
+
+New table `pipeline_failure_events`, scoped to a caller-minted `attempt_id` (TEXT) rather than a
+`forecast_record_id`. An attempt is the end-to-end campaign to produce one forecast version for one
+question — it may fail research, fail again, and eventually either succeed (decision 2) or be
+abandoned — so more than one failure can share an `attempt_id`, and `UNIQUE (attempt_id, event_seq)`
+with a contiguous-next-value trigger probe is `lifecycle_events`' own `UNIQUE (forecast_record_id,
+event_seq)` pattern, reused rather than reinvented. `question_id`/`tournament_id` are stored directly
+on the row (not inferred through a FK) for the same reason `resolution_events` (001) carries its own
+`question_id` alongside a nullable `forecast_record_id`: the thing this event is about may have no
+forecast record to join through, ever.
+
+`event_type` is `CHECK (event_type IN ('research_failed', 'generation_failed'))` — a full return of
+the two vocabulary members 003 removed, just on a table where they are reachable. `detail_code` is a
+`FailureCode` subset (see below). `retrieval_run_id` is a nullable `REFERENCES research_runs`:
+required by trigger for `generation_failed` (generation only runs after research has completed, so
+there is always a run to cite) and optional for `research_failed` (a failure can occur before any
+`research_runs` row exists, e.g. the provider call never got made).
+
+Append-only from creation, like everything else `lifecycle_events`-adjacent: unconditional
+`_block_update`/`_block_delete` triggers, same shape as 003's. `PRAGMA recursive_triggers` (already
+`ON` in `ledger.py` since 003) is what stops `INSERT OR REPLACE` bypassing them here too — 003 found
+this the hard way in its own round 1; this migration inherits the connection-level setting rather
+than needing anything new, but the header says so explicitly rather than leaving it to be
+rediscovered.
+
+The rejected alternative: widen `lifecycle_events.forecast_record_id`'s trigger-enforced
+requirement to accept an attempt-only row with `forecast_record_id NULL`, and give `event_type` a
+second closed set depending on which of `forecast_record_id`/`attempt_id` is present. That still
+needs the `CHECK` widened (the vocabulary has to grow either way) and it makes one table cover two
+unrelated identity spaces, which is the same polymorphic-FK problem 003 rejected for its own detail
+columns ("a polymorphic pair cannot be a real foreign key"). A second table is the narrower change
+and never puts `lifecycle_events` at risk.
+
+### Decision — `attempt_id` links a failure to the forecast version that follows it
+
+**Owner decision, per the task brief.** Acceptance criterion 2 has no natural home: `forecast_records`
+is UPDATE-blocked (003, D25), so nothing can annotate an existing successful row with the failures
+that preceded it after the fact, and nothing can annotate a failure row with a success that has not
+happened yet. The link has to be established once, at the moment the successful row is written, by
+both sides already agreeing on a shared value.
+
+`forecast_records` gets `attempt_id TEXT`, added `NULLable` with a `BEFORE INSERT` trigger requiring
+it of every new row — the exact pattern 003 used for `forecast_sha256` (`ALTER TABLE ... ADD COLUMN`
+cannot add `NOT NULL` without a default, and no default is honest for an identifier nobody minted for
+a pre-existing row). Concretely: an orchestrator mints `attempt_id` once, before the first research
+call, for the whole campaign toward one forecast version; every `pipeline_failure_events` row logged
+while pursuing that version cites the same `attempt_id`; if the campaign eventually succeeds, the
+`forecast_records` row it produces is stamped with that same `attempt_id` at `INSERT` time. "The
+forecast version that later succeeds" a given failure is then a plain equality join
+(`pipeline_failure_events.attempt_id = forecast_records.attempt_id`), not an inferred one over
+question/tournament and timestamps — which matters, because a question can have several independent
+retry campaigns and several successful versions over its lifetime, and an inferred join has no
+principled way to pair the right failure with the right success.
+
+Two triggers close the loop from both directions: `pipeline_failure_events` refuses a new row whose
+`attempt_id` already has a `forecast_records` row (an attempt that already succeeded cannot also
+fail — terminal both ways), and refuses a row whose `attempt_id` was previously used for a *different*
+`question_id`/`tournament_id` (identity stability — the same reasoning 003 applies to
+`resolution_events` citing the wrong question). `forecast_records`' new trigger clause mirrors the
+second check from its own side. A partial `UNIQUE INDEX (attempt_id) WHERE attempt_id IS NOT NULL`
+on `forecast_records` enforces that one attempt succeeds at most once.
+
+This reaches into M1-602's column set before M1-602 exists, the same way 003 reached into it for
+`forecast_sha256`. That is deliberately cheap here: **M1-602 is `Not Started`** — grep confirms no
+production code writes `forecast_records` today, only tests via raw SQL — so the nullable carve-out
+this decision needs is a formality, not a live population to migrate. M1-602 picks up an
+already-required column the same way it already has to pick up `forecast_sha256`.
+
+The rejected alternative: an append-only link table (`attempt_forecast_links` or similar) written
+once, after the fact, by whoever creates the successful `forecast_records` row. It was rejected
+because it adds a second place to look for the same fact `forecast_records.attempt_id` already states
+directly, with no offsetting benefit — the link table would still have to be written atomically with
+the `forecast_records` INSERT (same transaction, same ordering constraint), so it does not relax
+anything decision 2 needs, and it is one more append-only table whose own integrity (what stops two
+link rows citing the same successful record, or a link row citing a nonexistent attempt) has to be
+independently reasoned about. A column with a `UNIQUE` partial index says the same thing with one
+fewer table.
+
+### Decision — `detail_code` is `FailureCode` minus the two refetch codes
+
+`pipeline_failure_events.detail_code` reuses `lifecycle.FailureCode`'s vocabulary rather than
+inventing a parallel one, minus `refetch_mismatch`/`refetch_missing` — both describe what a refetch
+saw of an *already-posted* forecast (M2-704's contract in `submission_verifications`), which cannot
+occur before generation has even succeeded once. A new `Literal`, `PreForecastFailureCode`, spells the
+ten remaining members out explicitly rather than deriving them, the same style `PipelineFailureEvent`
+already uses for `record_failure`'s one-member vocabulary — a spelled-out list is what keeps a future
+`FailureCode` addition from silently becoming reachable here before anyone decides it should be.
+
+### Deferred (do not read the absence as an omission)
+
+- **The `lifecycle_events` ∪ `pipeline_failure_events` merged read/export view → M1-604.** This item
+  ships `read_pipeline_failure_events(conn, attempt_id)`, a direct per-attempt reader, the same
+  granularity `read_history()` offers for `lifecycle_events`. Joining the two into one chronological
+  view of "everything that happened toward this question" is M1-604's `show`/export seam to build.
+- **No orchestrator wiring.** Nothing yet mints an `attempt_id` or calls `record_pre_forecast_failure`
+  in production code — M1-306 (research retrieval), M1-602 (the `forecast_records` writer) and T-903
+  (the dry-run acceptance test that would exercise the whole path) are all `Not Started`. This item
+  ships the ledger primitive and its schema contract only, tested directly against hand-built rows,
+  the same posture 003 shipped in before M1-602 existed to call it.
+- **Calendar/format validity of `occurred_at_utc`/`created_at_utc`.** Rendered by the same
+  `_require_utc`/`_utc_text` this module already uses for `lifecycle_events`; 003's M1-NOTES entry on
+  this (non-blocking, round 5) applies unchanged and is not re-litigated here.
+
+### Standing risk — not verifiable offline
+
+The `attempt_id`-sharing contract (decision 2) is an interface promise to code that does not exist
+yet: nothing today constructs the "mint once, reuse across retries, stamp on success" sequence
+end-to-end, so its only exercise is this item's own tests inserting hand-built rows in the shape a
+real orchestrator would produce. That is the same position 003 was in before M1-602, and the same
+answer applies — the schema and its triggers are the enforcement regardless of who calls them, and
+`tests/unit/test_lifecycle.py` drives the truth table directly rather than through a caller that does
+not exist.
+
 ## M1-308 — Account allowlist loader
 
 New `research/allowlist.py`: `AllowlistEntry`/`_AllowlistFile` (pydantic, `extra="forbid"`),
