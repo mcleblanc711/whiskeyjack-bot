@@ -26,6 +26,7 @@ LEDGER_TABLES = {
     "resolution_events",
     "score_events",
     "lifecycle_events",
+    "pipeline_failure_events",
     "schema_migrations",
 }
 
@@ -59,19 +60,33 @@ def _seed_forecast(
     status: str = "draft",
     run_id: str = "run-1",
     forecast_sha256: str | None = FORECAST_SHA,
+    attempt_id: str | None = None,
 ) -> None:
     # forecast_sha256 is supplied for the same reason _seed_run supplies question_id:
     # migration 003's triggers require it of every new row, and a record with no content
-    # hash is exactly the unapprovable row that requirement exists to stop.
+    # hash is exactly the unapprovable row that requirement exists to stop. attempt_id is
+    # migration 004's equivalent, and defaults per record_id because 004 also indexes it
+    # UNIQUE where not null -- a shared default would fire that index in tests aimed at a
+    # different constraint.
     conn.execute(
         "INSERT INTO forecast_records ("
         "record_id, question_id, tournament_id, forecast_version, question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
-        "forecast_sha256) "
+        "forecast_sha256, attempt_id) "
         "VALUES (?, ?, 'minibench', ?, 'binary', ?, 'anthropic', 'claude', 'v1', 'abc', ?, "
-        "?, '{}', '{}', ?, ?)",
-        (record_id, question_id, version, status, run_id, TS, TS, forecast_sha256),
+        "?, '{}', '{}', ?, ?, ?)",
+        (
+            record_id,
+            question_id,
+            version,
+            status,
+            run_id,
+            TS,
+            TS,
+            forecast_sha256,
+            attempt_id or f"att-{record_id}",
+        ),
     )
 
 

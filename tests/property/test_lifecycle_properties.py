@@ -748,15 +748,18 @@ def _new_record(conn: sqlite3.Connection, *, validated: bool = True) -> str:
     """
     serial = next(_SERIAL)
     record_id = f"rec-{serial}"
+    # attempt_id comes off the same serial as record_id: migration 004 requires it and
+    # indexes it UNIQUE where not null, and one database serves the whole session here, so
+    # every record in a run needs its own.
     conn.execute(
         "INSERT INTO forecast_records ("
         "record_id, question_id, tournament_id, forecast_version, question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
-        "forecast_sha256) "
+        "forecast_sha256, attempt_id) "
         "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
-        "'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?)",
-        (record_id, serial, TS, TS, SHA),
+        "'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
+        (record_id, serial, TS, TS, SHA, f"att-{serial}"),
     )
     if validated:
         record_validation(conn, record_id=record_id, occurred_at=WHEN)

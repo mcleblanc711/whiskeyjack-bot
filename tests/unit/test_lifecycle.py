@@ -118,15 +118,23 @@ def _seed_draft(
     record_id: str = "rec-1",
     question_id: int = 100,
     forecast_sha256: str | None = SHA,
+    attempt_id: str | None = None,
 ) -> str:
+    # attempt_id defaults to one derived from record_id rather than a constant: migration
+    # 004 requires it of every new row and indexes it UNIQUE (where not null), so a shared
+    # default would make a second seeded record fail on the attempt_id index instead of
+    # whatever the test meant to exercise. Callers that are *about* the attempt_id -- two
+    # records claiming one attempt, a failure and a success sharing one -- pass it
+    # explicitly.
     conn.execute(
         "INSERT INTO forecast_records ("
         "record_id, question_id, tournament_id, forecast_version, question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
-        "generated_at_utc, final_prediction_json, record_json, created_at_utc, forecast_sha256) "
+        "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+        "forecast_sha256, attempt_id) "
         "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
-        "'run-1', ?, '{}', '{}', ?, ?)",
-        (record_id, question_id, TS, TS, forecast_sha256),
+        "'run-1', ?, '{}', '{}', ?, ?, ?)",
+        (record_id, question_id, TS, TS, forecast_sha256, attempt_id or f"att-{record_id}"),
     )
     return record_id
 
@@ -245,15 +253,20 @@ def test_a_new_record_cannot_be_created_in_a_later_state(
     # This is the acceptance criterion at its sharpest. Without the draft-only trigger a
     # writer could INSERT a row already claiming `approved`, satisfy every other
     # constraint in the schema, and produce an approved state with no approval event.
+    #
+    # attempt_id is supplied even though it is irrelevant to the state under test:
+    # migration 004's extended trigger requires it, so omitting it would raise
+    # IntegrityError for *that* reason and leave this test green while proving nothing
+    # about the draft-only rule it is named for.
     with pytest.raises(sqlite3.IntegrityError):
         ledger.execute(
             "INSERT INTO forecast_records ("
             "record_id, question_id, tournament_id, forecast_version, question_type, status, "
             "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
             "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
-            "forecast_sha256) "
+            "forecast_sha256, attempt_id) "
             "VALUES ('rec-x', 100, 'minibench', 1, 'binary', ?, 'anthropic', 'claude', 'v1', "
-            "'abc', 'run-1', ?, '{}', '{}', ?, ?)",
+            "'abc', 'run-1', ?, '{}', '{}', ?, ?, 'att-rec-x')",
             (status, TS, TS, SHA),
         )
 
