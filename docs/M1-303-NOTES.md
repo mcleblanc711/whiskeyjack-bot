@@ -415,6 +415,12 @@ document, in a module owned by already-merged M1-305, on a branch scoped to M1-3
 filed for that question. Recorded plainly: this fix corrects the attribution, and leaves the dedup
 consequence open behind a backlog row.
 
+**Superseded by M1-310 (D32).** That item answered the question this one deferred: the strip now
+lives in `canonicalize_url`, so the two-places arrangement above is one rule in one function, and
+`exa._without_root_dot` and both of its call sites are gone. The round-5 tests here are unchanged
+and still pass, which is what proves the canonical rule subsumes the local workaround. Left as
+written otherwise — this is the record of what M1-303 shipped, not of what is true today.
+
 **5. A single-label allowlist manufactured false official attribution.** `include_domains=("com",)`
 was accepted, and the subdomain rule then labelled `https://attacker.com/report` **official**.
 Round 4 declined this as allowlist policy beyond the finding. That was wrong, and the reversal is

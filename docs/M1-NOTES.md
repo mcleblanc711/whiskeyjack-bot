@@ -1852,7 +1852,7 @@ arrived at a milestone later. (Nothing in the M1-306 branch depends on this chan
 it up on its next daily `master` merge.)
 
 **4. The blast radius is one adapter.** `canonicalize_url` has exactly one production caller today
-— Exa, at `exa.py:912` (allowlist entries) and `exa.py:999` (each result). AskNews still sets
+— Exa, at `exa.py:913` (allowlist entries) and `exa.py:988` (each result). AskNews still sets
 `canonical_url = url` unmodified (`asknews.py:177`); that gap is M1-309 and is untouched here.
 
 ### Decision — the strip lives in `_canonical_host`, before the IP-literal branch

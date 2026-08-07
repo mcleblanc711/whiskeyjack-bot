@@ -1003,10 +1003,13 @@ def test_an_allowlist_entry_is_case_folded(config: AppConfig) -> None:
 @pytest.mark.parametrize(
     ("entry", "result_url"),
     [
-        # canonicalize_url preserves a terminal DNS root dot, so the two valid
-        # spellings of one host never met -- in either direction (round 5,
+        # canonicalize_url *used to* preserve a terminal DNS root dot, so the two
+        # valid spellings of one host never met -- in either direction (round 5,
         # finding 4). Under-attribution: the run asked for official sources, Exa
-        # honoured it, and the ledger recorded `web`.
+        # honoured it, and the ledger recorded `web`. M1-310 (D32) moved the strip
+        # into canonicalize_url and deleted this module's local `_without_root_dot`;
+        # these pairs are kept unchanged, because them still passing is the evidence
+        # that the canonical rule subsumes the workaround.
         ("bls.gov", "https://bls.gov./report"),
         ("bls.gov.", "https://bls.gov/report"),
         ("bls.gov.", "https://bls.gov./report"),
