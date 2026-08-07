@@ -74,6 +74,21 @@ def _document(**overrides: object) -> ResearchDocument:
         ("https://bls.gov.:443/x", "https://bls.gov/x"),
         ("https://127.0.0.1./a", "https://127.0.0.1/a"),
         ("https://BÜCHER.DE./a", "https://xn--bcher-kva.de/a"),
+        # The same dot in the three separators UTS-46 folds onto `.` (review round
+        # 1, finding 1). These are the regression pins: an ASCII-only strip ran
+        # *before* IDNA created the dot, so each of these produced `bls.gov.` --
+        # a non-fixed-point canonical form and a second identity for one page.
+        ("https://bls.gov。/x", "https://bls.gov/x"),  # U+3002
+        ("https://bls.gov．/x", "https://bls.gov/x"),  # U+FF0E
+        ("https://bls.gov｡/x", "https://bls.gov/x"),  # U+FF61
+        ("https://BLS.GOV。/x", "https://bls.gov/x"),
+        ("https://data.bls.gov。/x", "https://data.bls.gov/x"),
+        ("https://bls.gov。:443/x", "https://bls.gov/x"),
+        ("https://127.0.0.1。/a", "https://127.0.0.1/a"),
+        ("https://BÜCHER.DE。/a", "https://xn--bcher-kva.de/a"),
+        # Interior separators fold too -- that is UTS-46's doing, not this
+        # module's, and it is why the mapping is delegated rather than re-tabled.
+        ("https://bls。gov。/x", "https://bls.gov/x"),
         # IDN host folds to its A-label; IPv6 compresses and re-brackets.
         ("https://MÜNCHEN.DE/a", "https://xn--mnchen-3ya.de/a"),
         ("https://[2001:0db8:0000:0000:0000:0000:0000:0001]:443/a", "https://[2001:db8::1]/a"),
@@ -99,6 +114,13 @@ def test_canonicalize_url_normalizes_expected_forms(url: str, expected: str) -> 
         "https://bls.gov./x",
         "https://bls.gov/x",
         "https://127.0.0.1./a",
+        # Every separator spelling, because this is the property that broke: the
+        # Unicode ones canonicalized to `https://bls.gov./x`, which canonicalized
+        # again to something else. One canonicalization must settle it.
+        "https://bls.gov。/x",
+        "https://bls.gov．/x",
+        "https://bls.gov｡/x",
+        "https://127.0.0.1。/a",
     ],
 )
 def test_canonical_output_revalidates_and_is_idempotent(url: str) -> None:
@@ -149,6 +171,18 @@ def test_canonicalize_accepts_what_the_schema_accepts(url: str) -> None:
         "https://bls.gov../x",
         "https://.bls.gov/x",
         "https://./x",
+        # Same, in and across the folded separators. These are what makes "exactly
+        # one, never a loop" a statement about every spelling rather than only the
+        # ASCII one: a double separator is an empty label whichever way it is
+        # written, so the strip never has a second dot left to consider.
+        # Unlike the cases added above, these **pass both pre- and post-fix** --
+        # the shared gate refuses them either way. Kept as the bound on the widened
+        # fold: it must not start accepting an empty label in a new spelling.
+        "https://bls.gov。。/x",
+        "https://bls.gov。./x",
+        "https://bls.gov.。/x",
+        "https://。bls.gov/x",
+        "https://。/x",
     ],
 )
 def test_canonicalize_rejects_what_the_schema_rejects(url: str) -> None:
@@ -272,17 +306,24 @@ def test_identical_artifacts_collapse() -> None:
     assert result.collapsed_count == 1
 
 
-def test_the_two_spellings_of_one_host_collapse_to_one_document() -> None:
+@pytest.mark.parametrize("separator", [".", "。", "．", "｡"])
+def test_the_two_spellings_of_one_host_collapse_to_one_document(separator: str) -> None:
     """M1-310's acceptance criterion, at the level it is written about: dedup.
 
     Two reports of one page, one of them carrying the terminal DNS root dot. Under
     the pre-M1-310 canonical form these were two keys and both rows survived --
     a duplicate ledger row for one artifact inside one run.
+
+    Parametrized over the separators UTS-46 folds (review round 1, finding 1): the
+    ASCII case passed while the other three still produced two survivors, which is
+    the whole shape of that defect -- a rule that was right about one spelling of
+    the thing it was written about.
     """
     body = _hash("payrolls rose")
+    dotted_url = f"https://bls.gov{separator}/report"
     dotted = _document(
-        original_url="https://bls.gov./report",
-        canonical_url=canonicalize_url("https://bls.gov./report"),
+        original_url=dotted_url,
+        canonical_url=canonicalize_url(dotted_url),
         content_sha256=body,
     )
     plain = _document(
@@ -293,9 +334,23 @@ def test_the_two_spellings_of_one_host_collapse_to_one_document() -> None:
     result = deduplicate([dotted, plain])
     assert len(result.documents) == 1
     assert result.collapsed_count == 1
-    # The survivor keeps its own as-retrieved spelling: canonicalization decides
-    # identity, never attribution, and original_url is what the reader checks.
-    assert result.documents[0].original_url == "https://bls.gov./report"
+    # The survivor is one of the two documents exactly as retrieved, carrying its
+    # own original_url next to the shared canonical form: canonicalization decides
+    # identity, never attribution, so original_url is never rewritten to what
+    # canonicalization produced.
+    #
+    # *Which* of the two survives is `_sort_key`'s business, not this rule's, and
+    # it is genuinely separator-dependent -- the tiebreak orders the persisted
+    # JSON, where `ensure_ascii=True` renders U+3002 as a backslash-u escape,
+    # so `/` (U+002F) sorts ahead of that backslash (U+005C) while a bare
+    # `.` (U+002E) sorts ahead of `/`. Pinning the dotted document as the winner
+    # would assert that unrelated order here, and would be wrong for three of
+    # these four separators.
+    survivor = result.documents[0]
+    assert (survivor.original_url, survivor.canonical_url) in {
+        (dotted_url, "https://bls.gov/report"),
+        ("https://bls.gov/report", "https://bls.gov/report"),
+    }
 
 
 def test_two_spellings_serving_different_content_are_still_two_documents() -> None:

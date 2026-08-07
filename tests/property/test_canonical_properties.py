@@ -13,10 +13,10 @@ from urllib.parse import urlsplit
 
 import pytest
 from hypothesis import given
-from hypothesis import strategies as st
 from strategies import (
     DISTINCT_HOSTS,
     ENCODABLE_TEXT,
+    ROOT_DOT_SUFFIXES,
     SURROGATE_TEXT,
     URL_CANDIDATES,
     host_spellings,
@@ -98,6 +98,14 @@ def test_rejection_never_echoes_the_input(url: str) -> None:
 # there; the last passes both ways and is kept for the reason its docstring gives.
 # Saying which is which is how a reader knows the suite was checked rather than
 # assumed -- M1-303 shipped three properties that passed on the broken code.
+#
+# Re-run against the *round-1* code (which stripped ASCII `.` before IDNA encoding
+# rather than mapping UTS-46 separators first) all four fail, on the counterexample
+# `suffix_left='' / suffix_right='。'`. That run is the point of the separator
+# dimension in ROOT_DOT_SUFFIXES: these properties were already asserting the right
+# statements over an input space that could not reach the defect, which is the
+# M1-303 lesson one level up -- a property that discriminates perfectly still proves
+# nothing if the generator cannot produce the failing case.
 
 
 @given(URL_CANDIDATES)
@@ -123,9 +131,9 @@ def test_the_two_spellings_of_a_host_canonicalize_identically(pair: tuple[str, s
     assert canonical_left == canonical_right
 
 
-@given(DISTINCT_HOSTS, DISTINCT_HOSTS, st.booleans(), st.booleans())
+@given(DISTINCT_HOSTS, DISTINCT_HOSTS, ROOT_DOT_SUFFIXES, ROOT_DOT_SUFFIXES)
 def test_distinct_hosts_stay_distinct(
-    left: str, right: str, dotted_left: bool, dotted_right: bool
+    left: str, right: str, suffix_left: str, suffix_right: str
 ) -> None:
     """Fails pre-fix, though it was written for the *other* direction.
 
@@ -137,9 +145,12 @@ def test_distinct_hosts_stay_distinct(
     It fails there anyway, because the **iff** also covers the same-host case:
     ``bls.gov.`` and ``bls.gov`` are one host, and the pre-fix canonicalizer called
     them two. Both halves are one statement about identity, so they are asserted as
-    one -- and the failing run is what proved the first half was not vacuous."""
-    spelled_left = f"{left}." if dotted_left else left
-    spelled_right = f"{right}." if dotted_right else right
+    one -- and the failing run is what proved the first half was not vacuous.
+
+    The separators are drawn from every spelling UTS-46 folds, not a boolean: with
+    an ASCII-only pool this still passed after review round 1's defect was found."""
+    spelled_left = f"{left}{suffix_left}"
+    spelled_right = f"{right}{suffix_right}"
     canonical_left = canonicalize_url(f"https://{spelled_left}/report")
     canonical_right = canonicalize_url(f"https://{spelled_right}/report")
     assert (canonical_left == canonical_right) == (left == right)

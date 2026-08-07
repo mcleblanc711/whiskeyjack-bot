@@ -1015,6 +1015,21 @@ def test_an_allowlist_entry_is_case_folded(config: AppConfig) -> None:
         ("bls.gov.", "https://bls.gov./report"),
         ("bls.gov", "https://data.bls.gov./report"),
         ("bls.gov.", "https://data.bls.gov/report"),
+        # The separators UTS-46 folds onto `.` (M1-310, review round 1, finding 1).
+        # This is the regression itself, not a generalization of it: deleting the
+        # local `_without_root_dot` was safe for the ASCII pairs above and *not*
+        # safe for these, because the old helper ran after IDNA encoding and so
+        # caught the dot these spellings turn into. Each of these was recorded as
+        # `web` -- an official source demoted to ordinary web evidence.
+        ("bls.gov", "https://bls.gov。/report"),
+        ("bls.gov", "https://bls.gov．/report"),
+        ("bls.gov", "https://bls.gov｡/report"),
+        ("bls.gov", "https://data.bls.gov。/report"),
+        # And the allowlist side, which reaches the same rule through the same
+        # function -- one definition of the host, whichever side wrote it.
+        ("bls.gov。", "https://bls.gov/report"),
+        ("bls.gov。", "https://bls.gov。/report"),
+        ("bls.gov．", "https://bls.gov./report"),
     ],
 )
 def test_a_terminal_root_dot_is_the_same_host(
@@ -1030,9 +1045,17 @@ def test_a_terminal_root_dot_is_the_same_host(
     assert result.run.provider_config["include_domains"] == ["bls.gov"]
 
 
-def test_the_root_dot_does_not_make_a_suffix_coincidence_a_match(config: AppConfig) -> None:
-    """Stripping the dot must not widen what counts as a subdomain."""
-    handler = _Exchange(_json_ok(_body(_result(url="https://notbls.gov./page"))))
+@pytest.mark.parametrize("suffix", [".", "。", "．", "｡"])
+def test_the_root_dot_does_not_make_a_suffix_coincidence_a_match(
+    config: AppConfig, suffix: str
+) -> None:
+    """Stripping the dot must not widen what counts as a subdomain.
+
+    Parametrized over every separator alongside the widened strip: a fix that
+    folds more spellings has to stay bounded in the direction that would fake an
+    official attribution, not only in the direction that lost one.
+    """
+    handler = _Exchange(_json_ok(_body(_result(url=f"https://notbls.gov{suffix}/page"))))
     result = _retrieve(handler, config, include_domains=("bls.gov",))
     assert all(d.source_type == "web" for d in result.documents)
 

@@ -1823,8 +1823,10 @@ canonical form, filing this item. The underlying duplicate-identity defect was u
 
 ### Decision — one terminal root dot is normalized away (D32)
 
-`canonicalize_url` strips exactly one trailing dot from the host, so the two spellings produce one
-`canonical_url` and collapse to one dedup key. Four things decide it.
+`canonicalize_url` strips exactly one trailing root dot from the host — **in any of the four
+spellings UTS-46 maps onto `.`** (ASCII `.`, U+3002 `。`, U+FF0E `．`, U+FF61 `｡`; the non-ASCII
+three were missed in the first implementation and added in review round 1, below) — so the
+spellings produce one `canonical_url` and collapse to one dedup key. Four things decide it.
 
 **1. The dedup key contains the content hash, so this cannot collapse two different pages.** The
 one real argument for treating the dot as identity is that it is genuinely observable on the wire:
@@ -1855,16 +1857,37 @@ it up on its next daily `master` merge.)
 — Exa, at `exa.py:913` (allowlist entries) and `exa.py:988` (each result). AskNews still sets
 `canonical_url = url` unmodified (`asknews.py:177`); that gap is M1-309 and is untouched here.
 
-### Decision — the strip lives in `_canonical_host`, before the IP-literal branch
+### Decision — UTS-46 mapping first, then the strip, then the IP-literal branch
 
-Placed as the first step of `_canonical_host`, ahead of the `ipaddress`/`idna` split, so
-`https://127.0.0.1./a` collapses to `https://127.0.0.1/a` on the same rule as
-`https://bls.gov./x`. Putting it after the split would have made the dot a domain-name special
-case and left the dotted IPv4 spelling as a second, undocumented identity — one rule, applied
-where the host is decided, is the reason this module has a single `_canonical_host` at all.
+`_canonical_host` runs `idna.uts46_remap(host, std3_rules=False)`, then strips one trailing ASCII
+dot, then splits `ipaddress`/`idna`. The order is the whole correctness argument and each step is
+where it is for a stated reason:
 
-IPv6 cannot reach it: `urlsplit` hands `::1` over unbracketed, and `::1.` fails `_require_http_url`
-before canonicalization runs.
+**The mapping is first because the separator is not only ASCII.** UTS-46 folds U+3002, U+FF0E and
+U+FF61 onto `.`, and `idna.encode(uts46=True)` applies that mapping *itself*. The first
+implementation stripped ASCII and then encoded, so for `https://bls.gov。/report` the strip ran
+before the separator existed and IDNA then *created* a terminal dot that nothing removed. Review
+round 1 found it; see that section below.
+
+**The strip is before the IP/domain split** so `https://127.0.0.1./a` collapses to
+`https://127.0.0.1/a` on the same rule as `https://bls.gov./x`. Putting it after the split would
+have made the dot a domain-name special case and left the dotted IPv4 spelling as a second,
+undocumented identity — one rule, applied where the host is decided, is the reason this module has
+a single `_canonical_host` at all. The mapping running ahead of it is what makes
+`https://127.0.0.1。/a` reach `ipaddress` as an IP literal at all rather than falling through to
+the domain branch as `127.0.0.1.`.
+
+**The separator table stays inside `idna`.** The alternative — a local `("." , "。", "．", "｡")`
+tuple matched before the split — was rejected: it is exactly the speculative host transform this
+module's header records losing to three times, and it puts a copy of a Unicode mapping in a module
+whose stated rule is *delegate host classification to the authority*. `std3_rules=False` is passed
+explicitly because it is `uts46_remap`'s non-default while being what `idna.encode` applies
+internally; the two calls disagreeing about which codepoints survive is the only way this
+decomposition can go wrong, so it is pinned rather than defaulted.
+
+`uts46_remap` is verified not to disturb the IP path: `::1`, `2001:db8::1`, `::ffff:192.168.0.1`
+and `127.0.0.1` all pass through unchanged. IPv6 cannot carry a root dot anyway — `urlsplit` hands
+`::1` over unbracketed, and `::1.` fails `_require_http_url` before canonicalization runs.
 
 ### Decision — exactly one dot, and only after the gate has run
 
@@ -1873,6 +1896,11 @@ assumed: `https://bls.gov../x`, `https://.bls.gov/x`, `https://./x` and `https:/
 already refused by `_require_http_url`, because `idna` rejects an empty label
 (`idna.IDNAError: Empty Label`). So there is no loop, no "strip while endswith" and no question of
 what `bls.gov..` should mean — it means nothing and is refused, exactly as before.
+
+Re-verified across the folded separators in round 1, since a widened fold could have widened the
+accepted set: `https://bls.gov。。/x`, `https://bls.gov。./x`, `https://bls.gov.。/x`,
+`https://。bls.gov/x` and `https://。/x` are all refused too, and as `CanonicalizationError`. A
+double separator is an empty label whichever way it is spelled.
 
 The strip therefore runs **after** the syntactic gate, never before it, and the accepted-input set
 is unchanged by construction: canonicalization still accepts precisely what `_require_http_url`
@@ -1884,8 +1912,9 @@ its caller, in the same spirit as the `parts.hostname or ""` beside it.
 
 ### Delivered
 
-- `src/whiskeyjack_bot/research/canonical.py` — `_ROOT_DOT`-aware `_canonical_host`; module and
-  function docstrings state the rule and cite D32.
+- `src/whiskeyjack_bot/research/canonical.py` — `_canonical_host` maps UTS-46 separators via
+  `idna.uts46_remap`, then strips one terminal root dot; module and function docstrings state the
+  rule and cite D32.
 - `src/whiskeyjack_bot/research/exa.py` — `_without_root_dot` and both call sites **removed**; the
   two docstrings that asserted "`canonicalize_url` preserves a terminal DNS root dot … see M1-310"
   now record what M1-310 decided.
@@ -1903,13 +1932,21 @@ lowercasing them locally. Worse, its docstrings assert as fact something this br
 a stale rationale beside dead code is how a later reader re-derives a decision that was already
 made.
 
-**The round-5 tests it was written for are kept byte-for-byte unchanged** —
-`test_a_terminal_root_dot_is_the_same_host` (5 parametrized pairs),
+**The round-5 tests it was written for keep all their original cases unchanged** —
+`test_a_terminal_root_dot_is_the_same_host` (its 5 parametrized pairs),
 `test_the_root_dot_does_not_make_a_suffix_coincidence_a_match`,
 `test_the_two_spellings_of_a_host_select_each_other` and
-`test_the_root_dot_does_not_widen_a_suffix_coincidence`. Them passing against a deleted helper is
-the evidence that the canonical rule subsumes the workaround; rewriting them alongside the code
-would have destroyed that evidence.
+`test_the_root_dot_does_not_widen_a_suffix_coincidence`. Those cases passing against a deleted
+helper is the evidence that the canonical rule subsumes the workaround; rewriting them alongside
+the code would have destroyed that evidence.
+
+Round 1 **added** cases to two of them rather than editing any — the Unicode separator pairs to
+`test_a_terminal_root_dot_is_the_same_host`, and a separator parametrization to
+`test_the_root_dot_does_not_make_a_suffix_coincidence_a_match`. That is the honest bookkeeping: the
+original assertions still stand as written and still pass, and the additions are what the deleted
+helper had also been covering and the first fix did not. See the round-1 section below — the
+"subsumes the workaround" claim was true of the ASCII pairs and false of these, which is precisely
+why deleting the helper was a regression rather than a cleanup.
 
 `_validated_domains`' single-label refusal is unaffected: `gov.` canonicalizes to `gov`, and
 `"." not in host` refuses it for the same reason it refuses `gov`.
@@ -1993,3 +2030,63 @@ the accepted-input set cannot move) rather than what the strip does.
 The paired-spelling strategy draws the two spellings **independently**, for the reason
 `test_the_two_spellings_of_a_host_select_each_other` records — a pair derived from one string
 carries one spelling on both sides and holds on the pre-fix code.
+
+### Review round 1 — the separator was not only ASCII
+
+Cross-model review of `d3bcdc5` returned one blocking finding, and it was correct. Reproduced by
+execution against that exact HEAD before any fix code was written:
+
+```
+canonicalize_url("https://bls.gov。/report")  ->  "https://bls.gov./report"
+canonicalize_url("https://bls.gov./report")  ->  "https://bls.gov/report"
+```
+
+`_canonical_host` removed ASCII `.` *before* IDNA encoding, but UTS-46 maps U+3002, U+FF0E and
+U+FF61 onto `.` during that encoding. So the strip ran before the separator existed, and the
+encoder then produced the very character the strip was there to remove. Three consequences, all
+verified rather than argued:
+
+1. **Canonicalization was not a fixed point.** `f(f(x)) != f(x)` for every non-ASCII separator —
+   the one property a canonicalizer exists to have, and the one this module's docstring claims.
+2. **One page kept two ledger identities**, which is the defect this whole item was filed to close.
+3. **An official source was recorded as `web`.** This is the part that made it a *regression* and
+   not a pre-existing gap, and it is worth stating precisely because the branch causality decides
+   whether a finding is blocking at all. At the merge base, `exa._without_root_dot` ran **after**
+   `canonicalize_url`, so it caught the ASCII dot that IDNA had just produced from `。`. Measured
+   at both trees with a `bls.gov` allowlist and a result at `https://bls.gov。/report`:
+
+   | tree | `source_type` |
+   |---|---|
+   | base `e6e83a7` | `official` |
+   | this branch at `d3bcdc5` | `web` |
+
+   Deleting the workaround was justified by a canonicalization rule that did not in fact cover
+   everything the workaround covered. The "retire, don't layer" decision above is still right; it
+   was applied one spelling too early.
+
+**Fix.** `idna.uts46_remap(host, std3_rules=False)` runs first, so the strip sees one settled
+spelling — see the ordering decision above for why the separator table is delegated rather than
+re-tabled locally. The review proposed the local tuple instead; it would close the same
+counterexample, and it was declined for the reason recorded there.
+
+**Why the existing tests missed it.** Not because the properties were weak — they were asserting
+the right statements over an input space that could not express the counterexample.
+`ROOT_DOT_SUFFIXES` now draws from all four spellings and `URL_CANDIDATES` carries the Unicode
+forms, so `host_spellings` can straddle the ASCII/Unicode boundary and
+`test_distinct_hosts_stay_distinct` draws separators rather than a boolean. Re-run against the
+round-1 code, all four properties fail, on exactly the counterexample
+(`suffix_left=''`, `suffix_right='。'`); every new unit case fails there too, except the
+double-separator rejection cases, which pass both ways and are kept as the bound on the widened
+fold. **This is the M1-303 lesson landing one level up: a property can discriminate perfectly and
+still prove nothing if the generator cannot reach the defect.**
+
+**One test assertion was corrected, not weakened.** Parametrizing
+`test_the_two_spellings_of_one_host_collapse_to_one_document` over the separators failed on its
+final assertion — that the *dotted* document is the survivor. That assertion was pinning
+`_sort_key`'s tiebreak, not M1-310's rule, and it is separator-dependent for a legitimate reason:
+the tiebreak orders the persisted JSON, where `ensure_ascii=True` renders U+3002 as a
+backslash-`u` escape, so `/` (U+002F) sorts ahead of `\` (U+005C) while a bare `.` (U+002E) sorts
+ahead of `/`. The plain document therefore wins three of the four cases. The assertion now pins
+what this rule actually claims — the survivor is one of the two documents exactly as retrieved,
+with its own `original_url` beside the shared canonical form — and the tiebreak keeps its own
+tests. No source change followed from it.

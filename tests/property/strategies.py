@@ -135,7 +135,17 @@ URL_CANDIDATES = st.one_of(
             "https://127.0.0.1./a",
             "https://xn--bcher-kva.de./a",
             "https://bücher.de./a",
+            # The same dot in its three non-ASCII spellings (review round 1,
+            # finding 1). UTS-46 maps these onto `.`, so they were accepted by the
+            # gate, survived an ASCII-only strip, and *became* a terminal dot
+            # during IDNA encoding -- after the only code that removed one had run.
+            "https://bls.gov。/x",
+            "https://bls.gov．/x",
+            "https://bls.gov｡/x",
+            "https://127.0.0.1。/a",
+            "https://bücher.de。/a",
             "https://a..b/x",  # refused: an empty label, not a root dot
+            "https://a。。b/x",  # refused for the same reason, in the other spelling
             # Not URLs at all, or URLs this validator refuses:
             "",
             "not a url",
@@ -178,6 +188,15 @@ DISTINCT_HOSTS = st.sampled_from(
 )
 
 
+# Every spelling of "one terminal DNS root dot, or none". The three non-ASCII
+# entries are the separators UTS-46 maps onto `.` (U+3002, U+FF0E, U+FF61); the
+# gate accepts all three, so all three are spellings of one host and belong in any
+# pool that claims to enumerate them. Generating only "" and "." is what let review
+# round 1, finding 1 through: the properties below were already asserting the right
+# statements, over an input space that could not express the counterexample.
+ROOT_DOT_SUFFIXES = st.sampled_from(["", ".", "。", "．", "｡"])
+
+
 @st.composite
 def host_spellings(draw: st.DrawFn) -> tuple[str, str]:
     """One host, returned as two URLs whose root-dot spelling is drawn independently.
@@ -186,12 +205,14 @@ def host_spellings(draw: st.DrawFn) -> tuple[str, str]:
     the same spelling on both sides and so holds on the pre-fix code -- the mistake
     ``test_the_two_spellings_of_a_host_select_each_other`` records having made in
     M1-303's round 5, and the reason three of that item's ten new properties proved
-    nothing.
+    nothing. The *separator* is drawn independently for the same reason, one round
+    later: with both sides restricted to ASCII the pair could never straddle the
+    ASCII/Unicode boundary, which is exactly where the surviving defect was.
     """
     host = draw(ROOT_DOT_HOSTS)
     path = draw(st.sampled_from(["/", "/report", "/a/b?q=1"]))
-    left = f"{host}." if draw(st.booleans()) else host
-    right = f"{host}." if draw(st.booleans()) else host
+    left = f"{host}{draw(ROOT_DOT_SUFFIXES)}"
+    right = f"{host}{draw(ROOT_DOT_SUFFIXES)}"
     return f"https://{left}{path}", f"https://{right}{path}"
 
 
