@@ -935,3 +935,411 @@ def _insert_event(
             TS,
         ),
     )
+
+
+# --------------------------------------------------------------------------------------
+# M1-606: the pre-forecast failure writer, over the same four invariants.
+#
+# Written before round 1 and re-run against deliberately broken code, per CLAUDE.md. That
+# second half is not ceremony: M1-303 shipped ten new properties of which three passed
+# against the pre-fix implementation, so a property nobody has seen fail is evidence of
+# nothing. What each of these was checked against is named in its docstring.
+# --------------------------------------------------------------------------------------
+
+
+PRE_FORECAST_EVENT_TYPES: tuple[str, ...] = get_args(lifecycle.PreForecastEventType)
+PRE_FORECAST_FAILURE_CODES: tuple[str, ...] = get_args(lifecycle.PreForecastFailureCode)
+
+_ATTEMPT_SERIAL = itertools.count(1)
+
+
+def _fresh_attempt() -> str:
+    """An attempt_id no earlier example has used.
+
+    One database serves the whole session, and 004 makes an attempt_id's question,
+    tournament and sequence sticky for the life of the table. Reusing one across examples
+    would make each draw depend on its predecessors, so a shrink would report the wrong
+    input.
+    """
+    return f"prop-att-{next(_ATTEMPT_SERIAL)}"
+
+
+@given(
+    attempt_id=ANYTHING,
+    question_id=ANYTHING,
+    tournament_id=ANYTHING,
+    event_type=st.sampled_from(PRE_FORECAST_EVENT_TYPES) | ANYTHING,
+    detail_code=st.sampled_from(PRE_FORECAST_FAILURE_CODES) | ANYTHING,
+    occurred_at=st.just(WHEN) | ANYTHING,
+    retrieval_run_id=st.none() | st.just("run-1") | ANYTHING,
+)
+@settings(max_examples=80, deadline=None)
+def test_the_pre_forecast_writer_raises_only_lifecycle_error(
+    attempt_id: object,
+    question_id: object,
+    tournament_id: object,
+    event_type: object,
+    detail_code: object,
+    occurred_at: object,
+    retrieval_run_id: object,
+) -> None:
+    """Invariant 1, over every parameter at once.
+
+    Each argument is fuzzed independently rather than one-at-a-time-around-a-good-record,
+    because the interesting failures are combinations: a valid `event_type` with a hostile
+    `occurred_at`, an out-of-range `question_id` that only raises while *binding*
+    (OverflowError, which is not a `sqlite3.Error`), a blob `attempt_id` that the schema
+    accepts and the reader cannot decode.
+
+    **What this property does not discriminate, measured rather than assumed.** It was
+    mutation-checked against five deliberate breakages and caught none of the two it was
+    first documented as catching: with `_require_int` returning its argument unchecked,
+    and with `_require_identifier` weakened back to `_require_text`, the bad value still
+    arrives as a `LifecycleError` -- because `_insert` and `_fetch_*` wrap
+    `sqlite3.Error` *and* `OverflowError`, so a validator hole simply moves the refusal
+    from the writer to the database without changing its type. That is the invariant
+    holding, not the test being weak, and it is exactly why it is not the only property
+    here: `test_a_refused_write_is_refused_with_a_field_level_message` below is the one
+    that notices, and the docstring is written from what was observed rather than from
+    what seemed likely.
+    """
+    conn = _CONNECTION
+    assert conn is not None
+    try:
+        lifecycle.record_pre_forecast_failure(
+            conn,
+            attempt_id=attempt_id,  # type: ignore[arg-type]
+            question_id=question_id,  # type: ignore[arg-type]
+            tournament_id=tournament_id,  # type: ignore[arg-type]
+            event_type=event_type,  # type: ignore[arg-type]
+            detail_code=detail_code,  # type: ignore[arg-type]
+            occurred_at=occurred_at,  # type: ignore[arg-type]
+            retrieval_run_id=retrieval_run_id,  # type: ignore[arg-type]
+        )
+    except LifecycleError:
+        pass
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+    # A writer that leaves its transaction open strands every later example on this
+    # connection, so this is asserted rather than only tidied up above.
+    assert not conn.in_transaction
+
+
+# Bogus *per field*, not one shared list. The first version shared one, and hypothesis
+# immediately drew `question_id=42` -- a perfectly good question id -- and failed on a
+# value the writer is right to accept. A hostile-input set that is not relative to the
+# field it targets tests the strategy, not the code.
+_TEXT_BOGUS: list[object] = [None, "", "   ", "\t\n", "\u00a0", 42, 1.5, b"x", object()]
+_BOGUS_FOR_FIELD: dict[str, list[object]] = {
+    "attempt_id": [*_TEXT_BOGUS, "a" * 201],
+    "tournament_id": [*_TEXT_BOGUS, "t" * 201],
+    "question_id": [None, "", "   ", "100", 1.5, b"1", object()],
+    "event_type": [*_TEXT_BOGUS, "approved", "RESEARCH_FAILED", "submission_failed"],
+    "detail_code": [*_TEXT_BOGUS, "refetch_mismatch", "refetch_missing", "nope"],
+}
+
+
+@st.composite
+def _a_bogus_field(draw: st.DrawFn) -> tuple[str, object]:
+    field = draw(st.sampled_from(sorted(_BOGUS_FOR_FIELD)))
+    return field, draw(st.sampled_from(_BOGUS_FOR_FIELD[field]))
+
+
+@given(case=_a_bogus_field())
+@settings(max_examples=80, deadline=None)
+def test_a_refused_write_is_refused_with_a_field_level_message(
+    case: tuple[str, object],
+) -> None:
+    """A caller mistake is refused *by the writer*, naming the field -- not by the database.
+
+    This is the property that discriminates, and it exists because the only-LifecycleError
+    invariant above provably does not. `_insert` wraps every `sqlite3.Error` into one
+    opaque message -- "the ledger rejected this write (detail withheld: a database message
+    can echo stored values)" -- which is correct for it to do and useless to a caller. So
+    a validator hole is invisible to a test that only checks the exception *type*: the bad
+    value reaches the trigger, the trigger refuses it, and the caller gets a
+    `LifecycleError` that says nothing about which field was wrong.
+
+    The claim here is therefore stronger: for inputs the writer is contracted to judge for
+    itself, the refusal must arrive before any statement runs and must name the field.
+    That is the M1-303 round-4 lesson as a property -- refuse caller mistakes *before*
+    reaching the expensive layer, as this module's own error, with something actionable in
+    it.
+
+    Confirmed to fail against broken code, both mutations the invariant above missed:
+    `_require_int` returning its argument unchecked, and `_require_identifier` weakened
+    back to `_require_text`.
+    """
+    field, value = case
+    conn = _CONNECTION
+    assert conn is not None
+    kwargs: dict[str, object] = {
+        "attempt_id": _fresh_attempt(),
+        "question_id": 100,
+        "tournament_id": "minibench",
+        "event_type": "research_failed",
+        "detail_code": "provider_error",
+        "occurred_at": WHEN,
+    }
+    kwargs[field] = value
+    before = conn.execute("SELECT count(*) FROM pipeline_failure_events").fetchone()[0]
+    try:
+        lifecycle.record_pre_forecast_failure(conn, **kwargs)  # type: ignore[arg-type]
+    except LifecycleError as error:
+        assert "the ledger rejected this write" not in str(error), (
+            f"{field} was refused by the database, not by the writer: {error}"
+        )
+        assert field in str(error), f"the refusal does not name {field}: {error}"
+    else:  # pragma: no cover - reached only if a bogus value is accepted
+        raise AssertionError(f"a bogus {field} was accepted")
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+    assert conn.execute("SELECT count(*) FROM pipeline_failure_events").fetchone()[0] == before
+
+
+@given(attempt_id=ANYTHING)
+@settings(max_examples=60, deadline=None)
+def test_the_pre_forecast_reader_raises_only_lifecycle_error(attempt_id: object) -> None:
+    conn = _CONNECTION
+    assert conn is not None
+    try:
+        result = lifecycle.read_pipeline_failure_events(conn, attempt_id)  # type: ignore[arg-type]
+    except LifecycleError:
+        return
+    # An accepted identifier must produce a well-formed answer, not merely not raise.
+    assert isinstance(result, tuple)
+    assert all(isinstance(event, lifecycle.PreForecastFailure) for event in result)
+
+
+# --------------------------------------------------------------------------------------
+# Invariant 2: a total order wherever ordering is claimed.
+# --------------------------------------------------------------------------------------
+
+
+@given(
+    codes=st.lists(st.sampled_from(PRE_FORECAST_FAILURE_CODES), min_size=1, max_size=6),
+    other_codes=st.lists(st.sampled_from(PRE_FORECAST_FAILURE_CODES), min_size=1, max_size=4),
+)
+@settings(max_examples=40, deadline=None)
+def test_each_attempts_failures_are_contiguous_from_one_and_read_back_in_order(
+    codes: list[str], other_codes: list[str]
+) -> None:
+    """Invariant 2: `event_seq` is `1..n` per attempt, and interleaving cannot disturb it.
+
+    Two attempts are written *interleaved* rather than one after the other, which is the
+    part that discriminates. A `_next_pipeline_failure_seq` that took `max(event_seq)`
+    over the whole table -- the obvious wrong implementation, and the one a
+    copy-of-`_next_seq` becomes if the WHERE clause is dropped -- passes a
+    one-attempt-at-a-time test and fails here on the second attempt's first event.
+
+    Contiguity from 1 is what makes a *missing* failure detectable at all: a gap is
+    unforgeable on an append-only table, so `[1, 3]` is evidence, not noise.
+
+    Confirmed to fail against two broken trees: `_next_pipeline_failure_seq` with its
+    `WHERE attempt_id = ?` removed, and `_PRE_FORECAST_FAILURE_COLUMNS` with `event_seq`
+    and `question_id` transposed. The second is worth naming because it is the one a
+    reordered `SELECT` produces and the *replay* property does **not** catch it: the
+    writer and the reader index the same wrong column, so their two objects agree with
+    each other perfectly. Only a test that knows what the sequence should *be* sees it.
+    """
+    conn = _CONNECTION
+    assert conn is not None
+    first, second = _fresh_attempt(), _fresh_attempt()
+
+    def write(attempt_id: str, code: str) -> lifecycle.PreForecastFailure:
+        return lifecycle.record_pre_forecast_failure(
+            conn,
+            attempt_id=attempt_id,
+            question_id=100,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code=code,  # type: ignore[arg-type]
+            occurred_at=WHEN,
+        )
+
+    written: dict[str, list[lifecycle.PreForecastFailure]] = {first: [], second: []}
+    for index in range(max(len(codes), len(other_codes))):
+        if index < len(codes):
+            written[first].append(write(first, codes[index]))
+        if index < len(other_codes):
+            written[second].append(write(second, other_codes[index]))
+
+    for attempt_id, events in written.items():
+        stored = lifecycle.read_pipeline_failure_events(conn, attempt_id)
+        assert stored == tuple(events)
+        assert [event.event_seq for event in stored] == list(range(1, len(events) + 1))
+        # A total order, not merely a sorted list: event_id and event_seq agree, so the
+        # append order the ledger records and the order the reader returns cannot diverge.
+        assert [event.event_id for event in stored] == sorted(e.event_id for e in stored)
+
+
+# --------------------------------------------------------------------------------------
+# Invariant 3: replay-stability across the persisted form.
+# --------------------------------------------------------------------------------------
+
+
+@given(
+    attempt_id=HOSTILE_TEXT,
+    tournament_id=HOSTILE_TEXT,
+    run_id=st.none() | HOSTILE_TEXT,
+    occurred=HOSTILE_TEXT,
+    question_id=st.integers(min_value=-(2**40), max_value=2**40),
+    event_type=st.sampled_from(PRE_FORECAST_EVENT_TYPES),
+    detail_code=st.sampled_from(PRE_FORECAST_FAILURE_CODES),
+)
+@settings(max_examples=60, deadline=None)
+def test_pre_forecast_failures_survive_the_persisted_json_form_unchanged(
+    attempt_id: str,
+    tournament_id: str,
+    run_id: str | None,
+    occurred: str,
+    question_id: int,
+    event_type: str,
+    detail_code: str,
+) -> None:
+    """Invariant 3, on the value object rather than on the database round trip.
+
+    The claim is idempotence of the *encoding*, for the reason
+    `test_events_survive_the_persisted_json_form_unchanged` sets out at length: a
+    surrogate pair and its astral scalar are distinct Python strings that
+    `ensure_ascii=True` then `json.loads` collapses into one, so asserting the object
+    survives unchanged would be stricter than storage can honour and would make a
+    replayed run disagree with the live one.
+
+    Not `model_dump_json()` and not `repr`: the first raises on the lone surrogates that
+    arrive from provider JSON, the second preserves distinctions JSON drops.
+    """
+    event = lifecycle.PreForecastFailure(
+        event_id=1,
+        attempt_id=attempt_id,
+        event_seq=1,
+        question_id=question_id,
+        tournament_id=tournament_id,
+        event_type=event_type,  # type: ignore[arg-type]
+        detail_code=detail_code,  # type: ignore[arg-type]
+        retrieval_run_id=run_id,
+        occurred_at_utc=occurred,
+        created_at_utc=TS,
+    )
+    encoded = json.dumps(asdict(event), ensure_ascii=True, sort_keys=True)
+    assert json.dumps(json.loads(encoded), ensure_ascii=True, sort_keys=True) == encoded
+    # The encoding is total: every field is JSON-native, so no input to this dataclass
+    # makes the persisted form unrepresentable.
+    assert set(json.loads(encoded)) == set(asdict(event))
+
+
+@given(
+    attempt_id=st.text(
+        st.characters(exclude_categories=["Cc", "Cs"], exclude_characters="\x00"),
+        min_size=1,
+        max_size=24,
+    ).filter(lambda text: text.strip() != ""),
+    tournament_id=st.text(
+        st.characters(exclude_categories=["Cc", "Cs"], exclude_characters="\x00"),
+        min_size=1,
+        max_size=24,
+    ).filter(lambda text: text.strip() != ""),
+)
+@settings(max_examples=40, deadline=None)
+def test_a_stored_failure_replays_identically_through_the_ledger(
+    attempt_id: str, tournament_id: str
+) -> None:
+    """The other half of invariant 3: what the writer returned is what the reader returns.
+
+    Storage is the step that can lose a distinction -- SQLite normalises nothing, but the
+    text goes out as UTF-8 and comes back decoded -- so this is the round trip the value
+    object test above deliberately does not make. Restricted to identifiers the schema
+    actually accepts, because what is being checked here is fidelity, not refusal; the
+    refusal path is invariant 1's.
+
+    Confirmed to fail against broken code: `_next_pipeline_failure_seq` with its
+    `WHERE attempt_id = ?` removed, where the writer's returned `event_seq` and the one
+    the reader finds under this attempt diverge.
+
+    It does **not** catch a transposed `SELECT` column order, and the docstring says so
+    rather than claiming a coverage it was measured not to have: writer and reader read
+    the same wrong position, so the two objects agree. The contiguity property above is
+    what notices that one.
+    """
+    conn = _CONNECTION
+    assert conn is not None
+    unique = f"{_fresh_attempt()}-{attempt_id}"
+    written = lifecycle.record_pre_forecast_failure(
+        conn,
+        attempt_id=unique,
+        question_id=100,
+        tournament_id=tournament_id,
+        event_type="research_failed",
+        detail_code="provider_error",
+        occurred_at=WHEN,
+    )
+    (read_back,) = lifecycle.read_pipeline_failure_events(conn, unique)
+    assert read_back == written
+    assert json.dumps(asdict(read_back), ensure_ascii=True, sort_keys=True) == json.dumps(
+        asdict(written), ensure_ascii=True, sort_keys=True
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Invariant 4: no value leak in any message.
+# --------------------------------------------------------------------------------------
+
+
+@given(
+    text=st.sampled_from(
+        [
+            PLANTED_SECRET,
+            PLANTED_SECRET * 400,
+            f"\ud800{PLANTED_SECRET}",
+            f"{PLANTED_SECRET}\N{ZERO WIDTH SPACE}",
+            f"  {PLANTED_SECRET}  ",
+        ]
+    ),
+    field=st.sampled_from(["attempt_id", "tournament_id", "retrieval_run_id"]),
+)
+@settings(max_examples=40, deadline=None)
+def test_no_pre_forecast_value_reaches_the_message_or_traceback(text: str, field: str) -> None:
+    """Invariant 4, on the message *and* the rendered traceback.
+
+    The traceback half is what `from None` exists for and what a message-only assertion
+    misses: a chained exception reprints the value it was raised from when the traceback
+    is formatted, so a writer that sanitises its own string and re-raises normally still
+    leaks. Over-long and lone-surrogate variants are included because those take different
+    branches inside `_require_text` -- the length check and the encode probe -- and each
+    branch is its own message.
+    """
+    conn = _CONNECTION
+    assert conn is not None
+    kwargs: dict[str, object] = {
+        "attempt_id": _fresh_attempt(),
+        "question_id": 100,
+        "tournament_id": "minibench",
+        "event_type": "research_failed",
+        "detail_code": "provider_error",
+        "occurred_at": WHEN,
+    }
+    kwargs[field] = text
+    try:
+        lifecycle.record_pre_forecast_failure(conn, **kwargs)  # type: ignore[arg-type]
+    except LifecycleError as error:
+        rendered = "".join(traceback.format_exception(error))
+        assert PLANTED_SECRET not in str(error)
+        assert PLANTED_SECRET not in rendered
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+
+
+@given(attempt_id=st.sampled_from([PLANTED_SECRET, PLANTED_SECRET * 400]))
+@settings(max_examples=10, deadline=None)
+def test_no_rejected_reader_value_reaches_the_message_or_traceback(attempt_id: str) -> None:
+    conn = _CONNECTION
+    assert conn is not None
+    try:
+        lifecycle.read_pipeline_failure_events(conn, attempt_id)
+    except LifecycleError as error:
+        rendered = "".join(traceback.format_exception(error))
+        assert PLANTED_SECRET not in str(error)
+        assert PLANTED_SECRET not in rendered

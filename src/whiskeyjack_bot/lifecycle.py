@@ -444,6 +444,33 @@ def _require_optional_text(value: object, field: str, *, max_length: int) -> str
     return None if value is None else _require_text(value, field, max_length=max_length)
 
 
+def _require_identifier(value: object, field: str) -> str:
+    """Return ``value`` as a non-blank identifier, or raise (M1-606).
+
+    :func:`_require_text` already refuses ``''``, but ``'\\n\\t'`` is truthy and reaches
+    storage through it. That is tolerable for prose columns and not for an identifier:
+    ``attempt_id`` is the join key linking a failed campaign to the forecast version that
+    later succeeds, and ``004_pipeline_failure_events.sql`` refuses a blank one on *both*
+    tables. A writer that accepted what the schema refuses would fail at the statement
+    with an opaque message; a writer that accepted what the schema accepts on one table
+    and not the other would mint an attempt_id no ``forecast_records`` row could ever
+    claim, leaving an append-only failure permanently unjoinable.
+
+    The blank test is ``str.strip()``, which is the definition the migration's character
+    set was written from -- M1-603's round 5 was exactly these two definitions disagreeing
+    (SQLite's one-argument ``trim()`` strips U+0020 alone), and a test asserts they still
+    agree over every codepoint Python calls whitespace.
+
+    Scoped to this item's writer rather than folded into :func:`_require_text`: the older
+    identifier columns have never had this guard, and widening a shared validator would
+    change what already-shipped writers accept. Noted in ``docs/M1-NOTES.md`` instead.
+    """
+    text = _require_text(value, field, max_length=_MAX_IDENTIFIER)
+    if not text.strip():
+        raise LifecycleError(f"{field} must not be blank")
+    return text
+
+
 def _require_sha256(value: object, field: str) -> str:
     """Return ``value`` as a 64-character lowercase hex digest, or raise.
 
@@ -1128,9 +1155,9 @@ def record_pre_forecast_failure(
     ``attempt_id`` already claimed by a successful record cannot also record a failure,
     and that an ``attempt_id``'s question/tournament cannot change once used.
     """
-    identifier = _require_text(attempt_id, "attempt_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(attempt_id, "attempt_id")
     qid = _require_int(question_id, "question_id")
-    tid = _require_text(tournament_id, "tournament_id", max_length=_MAX_IDENTIFIER)
+    tid = _require_identifier(tournament_id, "tournament_id")
     _require_member(event_type, _PRE_FORECAST_EVENT_TYPES, "event_type")
     _require_member(detail_code, _PRE_FORECAST_FAILURE_CODES, "detail_code")
     occurred = _require_utc(occurred_at, "occurred_at")
@@ -1183,7 +1210,7 @@ def read_pipeline_failure_events(
     an empty tuple is the honest answer whether the attempt never failed or never
     existed at all.
     """
-    identifier = _require_text(attempt_id, "attempt_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(attempt_id, "attempt_id")
     rows = _fetch_all(
         conn,
         f"SELECT {_PRE_FORECAST_FAILURE_COLUMNS} FROM pipeline_failure_events "

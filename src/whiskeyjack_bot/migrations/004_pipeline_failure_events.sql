@@ -83,9 +83,46 @@ BEFORE INSERT ON pipeline_failure_events
 FOR EACH ROW
 BEGIN
     -- typeof() because INTEGER is affinity, not a type: 003 documents the same trap for
-    -- lifecycle_events.event_seq.
+    -- lifecycle_events.event_seq. What this actually catches is the values affinity
+    -- *cannot* losslessly convert -- 'x', 1.5, a blob. A '1' arrives here already
+    -- converted to integer 1 and is accepted, correctly: what lands in the row is a
+    -- genuine integer.
     SELECT RAISE(ABORT, 'pipeline_failure_events: event_seq must be a positive integer')
     WHERE typeof(NEW.event_seq) <> 'integer' OR NEW.event_seq < 1;
+
+    SELECT RAISE(ABORT, 'pipeline_failure_events: question_id must be an integer')
+    WHERE typeof(NEW.question_id) <> 'integer';
+
+    -- attempt_id is the join key acceptance criterion 2 rests on, so it gets the same
+    -- shape guard forecast_records.attempt_id gets below, and for a sharper reason than
+    -- tidiness: if the two tables disagreed about what a valid attempt_id is, a failure
+    -- could be recorded under a value no forecast_records row is ever allowed to claim,
+    -- and the link would be silently unjoinable on an append-only table.
+    --
+    -- The whitespace set is 003's, written out rather than inherited. One-argument
+    -- trim() strips U+0020 alone, so a '\n\t' identifier passes it -- that is round 5 of
+    -- M1-603, and the first draft of this migration reproduced it by copying the idiom
+    -- from before that fix. These are the 29 codepoints where Python's str.isspace() is
+    -- true; tests/unit/test_lifecycle.py asserts the two definitions still agree over
+    -- the whole set, so a future Unicode change surfaces as a failed test rather than a
+    -- silently reopened hole. typeof() is checked too: TEXT affinity converts a number
+    -- to text but leaves a blob a blob, and a blob identifier is a row this schema's own
+    -- reader cannot read back.
+    SELECT RAISE(ABORT, 'pipeline_failure_events: attempt_id must be non-blank text')
+    WHERE NEW.attempt_id IS NULL
+       OR typeof(NEW.attempt_id) <> 'text'
+       OR trim(NEW.attempt_id,
+               char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
+                    8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                    8232, 8233, 8239, 8287, 12288)) = '';
+
+    SELECT RAISE(ABORT, 'pipeline_failure_events: tournament_id must be non-blank text')
+    WHERE NEW.tournament_id IS NULL
+       OR typeof(NEW.tournament_id) <> 'text'
+       OR trim(NEW.tournament_id,
+               char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
+                    8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                    8232, 8233, 8239, 8287, 12288)) = '';
 
     SELECT RAISE(ABORT, 'pipeline_failure_events: event_seq must be the next sequence number for this attempt_id')
     WHERE NEW.event_seq <> COALESCE(
@@ -188,8 +225,18 @@ BEGIN
        OR length(NEW.forecast_sha256) <> 64
        OR NEW.forecast_sha256 GLOB '*[^0-9a-f]*';
 
+    -- The same non-blank test pipeline_failure_events applies to its own attempt_id, and
+    -- it must stay the same: the two tables are the two ends of one join key. See that
+    -- trigger for why the whitespace set is spelled out instead of using one-argument
+    -- trim() -- a '\n\t' attempt_id passed the first draft of this clause, which is
+    -- M1-603's round-5 defect reproduced by copying the idiom from before its fix.
     SELECT RAISE(ABORT, 'forecast_records: attempt_id is required')
-    WHERE NEW.attempt_id IS NULL OR typeof(NEW.attempt_id) <> 'text' OR trim(NEW.attempt_id) = '';
+    WHERE NEW.attempt_id IS NULL
+       OR typeof(NEW.attempt_id) <> 'text'
+       OR trim(NEW.attempt_id,
+               char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
+                    8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                    8232, 8233, 8239, 8287, 12288)) = '';
 
     -- The other half of pipeline_failure_events_validate_on_insert's identity-stability
     -- probe: a successful record cannot claim an attempt_id that pipeline_failure_events

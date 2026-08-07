@@ -37,12 +37,17 @@ from whiskeyjack_bot.lifecycle import (
     LifecycleEvent,
     LifecycleEventType,
     LifecycleStatus,
+    PreForecastEventType,
+    PreForecastFailure,
+    PreForecastFailureCode,
     SubmissionAttempt,
     SubmissionVerification,
     current_status,
     read_history,
+    read_pipeline_failure_events,
     record_approval,
     record_failure,
+    record_pre_forecast_failure,
     record_submission_attempt,
     record_submission_verification,
     record_validation,
@@ -78,9 +83,12 @@ PLANTED_SECRET = "privateFAKE123456"
 STATUSES: tuple[str, ...] = get_args(LifecycleStatus)
 EVENT_TYPES: tuple[str, ...] = get_args(LifecycleEventType)
 
-# Tables migration 003 closes to UPDATE and DELETE alike, with a row of each already
-# present so a FOR EACH ROW trigger has something to fire on -- `DELETE FROM t` against
-# an empty table succeeds, and would read as a passing test of a trigger that never ran.
+# Tables migrations 003 and 004 close to UPDATE and DELETE alike, with a row of each
+# already present so a FOR EACH ROW trigger has something to fire on -- `DELETE FROM t`
+# against an empty table succeeds, and would read as a passing test of a trigger that
+# never ran. `pipeline_failure_events` (004) is in the same list rather than in a probe
+# of its own: its block pair is the same shape as 003's, so what it needs is the same
+# coverage, not a second one written from scratch.
 APPEND_ONLY_TABLES = (
     "forecast_records",
     "lifecycle_events",
@@ -89,6 +97,7 @@ APPEND_ONLY_TABLES = (
     "submission_verifications",
     "resolution_events",
     "score_events",
+    "pipeline_failure_events",
 )
 
 # One existing, nullable column per table, so the UPDATE probe below is a well-formed
@@ -101,6 +110,7 @@ UPDATABLE_COLUMN = {
     "submission_verifications": "refetched_forecast_snapshot",
     "resolution_events": "outcome",
     "score_events": "comparison_baseline",
+    "pipeline_failure_events": "retrieval_run_id",
 }
 
 
@@ -137,6 +147,49 @@ def _seed_draft(
         (record_id, question_id, TS, TS, forecast_sha256, attempt_id or f"att-{record_id}"),
     )
     return record_id
+
+
+# The attempt a failure is recorded under by default. Deliberately not `_seed_draft`'s
+# `att-rec-1`: 004 refuses a failure whose attempt_id already produced a forecast record,
+# so a fixture that shared one would fail on that probe in every test that seeds both.
+FAILED_ATTEMPT = "att-failed"
+
+
+def _seed_failure(
+    conn: sqlite3.Connection,
+    *,
+    attempt_id: str = FAILED_ATTEMPT,
+    event_seq: object = 1,
+    question_id: object = 100,
+    tournament_id: object = "minibench",
+    event_type: str = "research_failed",
+    detail_code: str = "provider_unavailable",
+    retrieval_run_id: str | None = None,
+    occurred_at: object = TS,
+) -> None:
+    """Write a `pipeline_failure_events` row directly, bypassing the writer's validation.
+
+    Every field is a parameter and several are typed `object`: what these tests are for
+    is the schema's own guards, and a helper that could only produce well-formed values
+    could not reach them. `_seed_run`/`_insert_attempt` take the same shape for the same
+    reason.
+    """
+    conn.execute(
+        "INSERT INTO pipeline_failure_events (attempt_id, event_seq, question_id, "
+        "tournament_id, event_type, detail_code, retrieval_run_id, occurred_at_utc, "
+        "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            attempt_id,
+            event_seq,
+            question_id,
+            tournament_id,
+            event_type,
+            detail_code,
+            retrieval_run_id,
+            occurred_at,
+            TS,
+        ),
+    )
 
 
 @pytest.fixture
@@ -304,6 +357,10 @@ def test_ledger_rows_can_be_neither_updated_nor_deleted(
     conn = ledger
     record_id = _seed_draft(conn)
     _walk_to(conn, record_id, "scored")
+    # A walk populates the seven 003 tables but never pipeline_failure_events -- nothing
+    # in a successful lifecycle writes one. Without this the count assertion below would
+    # be the only thing standing between an empty table and a DELETE that "passes".
+    _seed_failure(conn)
     assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] > 0
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(f"DELETE FROM {table}")
@@ -463,15 +520,17 @@ def test_replace_cannot_overwrite_a_row_through_its_primary_key(
     the readback; this is the statement-level half of that guarantee. (GPT review round
     1, finding 1, reproduced against all three tables it named.)
 
-    Asserted as "refused, and nothing was erased" rather than on the message: for five
-    of the six tables the append-only delete trigger is what fires, but on
-    ``lifecycle_events`` the state-machine trigger gets there first, and which guard
-    catches it matters less than that the stored rows survive. The two named scenarios
-    below pin the specific guards.
+    Asserted as "refused, and nothing was erased" rather than on the message: for most
+    of these tables the append-only delete trigger is what fires, but on
+    ``lifecycle_events`` the state-machine trigger gets there first and on
+    ``pipeline_failure_events`` the sequence probe does, and which guard catches it
+    matters less than that the stored rows survive. The two named scenarios below pin
+    the specific guards.
     """
     conn = ledger
     record_id = _seed_draft(conn)
     _walk_to(conn, record_id, "scored")
+    _seed_failure(conn)  # see the sibling test: a walk writes no failure row
     before = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
     assert before
     with pytest.raises(sqlite3.IntegrityError):
@@ -639,6 +698,7 @@ def test_update_or_replace_is_refused_before_it_can_delete(
     conn = ledger
     record_id = _seed_draft(conn)
     _walk_to(conn, record_id, "scored")
+    _seed_failure(conn)  # a walk writes no failure row; see the DELETE probe above
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(f"UPDATE OR REPLACE {table} SET {UPDATABLE_COLUMN[table]} = ?", ("changed",))
 
@@ -2935,3 +2995,665 @@ def test_a_submission_verification_subclass_is_refused(
             occurred_at=WHEN,
         )
     assert _counts(conn)["submission_verifications"] == 0
+
+
+# --------------------------------------------------------------------------------------
+# M1-606: pre-forecast pipeline failures, attempt-scoped.
+#
+# Same split as the rest of this file. That a failure *cannot* be recorded in a shape the
+# ledger would later have to reason around is a property of migration 004's triggers, so
+# it is tested with raw SQL bypassing `lifecycle` entirely -- a writer-level suite cannot
+# find a schema hole at all, which is M1-603's round-5 lesson. That the writer refuses the
+# same shapes as its own error type, before billing a statement, is tested through the
+# writer. Both entry points, because the truth table has to hold at both.
+# --------------------------------------------------------------------------------------
+
+
+PRE_FORECAST_EVENT_TYPES: tuple[str, ...] = get_args(PreForecastEventType)
+PRE_FORECAST_FAILURE_CODES: tuple[str, ...] = get_args(PreForecastFailureCode)
+
+
+def _failures(conn: sqlite3.Connection, attempt_id: str = FAILED_ATTEMPT) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM pipeline_failure_events WHERE attempt_id = ? ORDER BY event_seq",
+        (attempt_id,),
+    ).fetchall()
+
+
+def test_a_failure_is_recordable_with_no_forecast_record_in_existence(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Acceptance criterion 1, at its sharpest and with nothing else in the database.
+
+    The whole reason this table exists: 001 requires `final_prediction_json`,
+    `record_json` and `retrieval_run_id` on `forecast_records`, so a research failure has
+    no record to hang a `lifecycle_events` row from and never will. The assertion is that
+    the event is *queryable*, not merely accepted -- an insert nobody can read back is not
+    a ledger entry.
+    """
+    assert ledger.execute("SELECT count(*) FROM forecast_records").fetchone()[0] == 0
+    event = record_pre_forecast_failure(
+        ledger,
+        attempt_id="att-orphan",
+        question_id=100,
+        tournament_id="minibench",
+        event_type="research_failed",
+        detail_code="provider_unavailable",
+        occurred_at=WHEN,
+    )
+    assert event.event_seq == 1
+    assert read_pipeline_failure_events(ledger, "att-orphan") == (event,)
+
+
+# ---- The schema is the enforcement: raw SQL, no writers involved. ---------------------
+
+
+@pytest.mark.parametrize("bad_seq", ["x", 1.5, b"1", 0, -1])
+def test_a_failure_event_seq_must_be_a_positive_integer(
+    ledger: sqlite3.Connection, bad_seq: object
+) -> None:
+    with pytest.raises(sqlite3.IntegrityError, match="positive integer"):
+        _seed_failure(ledger, event_seq=bad_seq)
+
+
+@pytest.mark.parametrize("coerced", ["1", 1.0, "01"])
+def test_an_affinity_coerced_event_seq_is_stored_as_a_real_integer(
+    ledger: sqlite3.Connection, coerced: object
+) -> None:
+    """`typeof()` is checked because INTEGER is affinity, and affinity is why it passes.
+
+    This is the counterpart the truth table needs and the one it is easy to get wrong. A
+    `'1'` bound to an INTEGER-affinity column is converted *before* the BEFORE INSERT
+    trigger sees `NEW.event_seq`, so it reaches the trigger already `typeof() = 'integer'`
+    and is accepted -- correctly, because what lands in the row is a genuine integer 1.
+
+    Asserting only "accepted" would prove nothing, so the assertion is on the *stored*
+    type. And a test that fed `'1'` expecting a refusal would have passed against a
+    trigger with no `typeof()` clause at all, for the wrong reason: the values that
+    actually reach that clause are the ones affinity cannot losslessly convert, which is
+    the sibling test above.
+    """
+    _seed_failure(ledger, event_seq=coerced)
+    stored = ledger.execute(
+        "SELECT event_seq, typeof(event_seq) FROM pipeline_failure_events"
+    ).fetchone()
+    assert (stored[0], stored[1]) == (1, "integer")
+
+
+def test_a_failure_event_seq_must_be_the_next_one_for_its_attempt(
+    ledger: sqlite3.Connection,
+) -> None:
+    _seed_failure(ledger, event_seq=1)
+    with pytest.raises(sqlite3.IntegrityError, match="next sequence number"):
+        _seed_failure(ledger, event_seq=3)
+    with pytest.raises(sqlite3.IntegrityError, match="next sequence number"):
+        _seed_failure(ledger, event_seq=1)
+    _seed_failure(ledger, event_seq=2)
+    assert [row["event_seq"] for row in _failures(ledger)] == [1, 2]
+
+
+def test_failure_sequences_are_independent_across_attempts(ledger: sqlite3.Connection) -> None:
+    # Two campaigns run against the same question without either one's history renumbering
+    # the other -- the same guarantee `lifecycle_events` gives per forecast record.
+    _seed_failure(ledger, attempt_id="att-a", event_seq=1)
+    _seed_failure(ledger, attempt_id="att-b", event_seq=1)
+    _seed_failure(ledger, attempt_id="att-a", event_seq=2)
+    assert [row["event_seq"] for row in _failures(ledger, "att-a")] == [1, 2]
+    assert [row["event_seq"] for row in _failures(ledger, "att-b")] == [1]
+
+
+def test_an_attempt_that_already_succeeded_cannot_also_fail(ledger: sqlite3.Connection) -> None:
+    # Success and failure are both terminal for one attempt_id. Without this an
+    # immutable ledger could show a campaign that both produced a forecast version and
+    # did not, with no way to say which happened.
+    _seed_draft(ledger, record_id="rec-won", attempt_id="att-won")
+    with pytest.raises(sqlite3.IntegrityError, match="already produced a successful"):
+        _seed_failure(ledger, attempt_id="att-won")
+
+
+@pytest.mark.parametrize(("question_id", "tournament_id"), [(101, "minibench"), (100, "other-cup")])
+def test_an_attempt_id_cannot_change_the_question_it_names(
+    ledger: sqlite3.Connection, question_id: int, tournament_id: str
+) -> None:
+    # An attempt_id names one campaign toward one forecast version for one question. If a
+    # second event could move it, the link acceptance criterion 2 rests on would join a
+    # failure to a success that was never about the same thing.
+    _seed_failure(ledger, event_seq=1)
+    with pytest.raises(sqlite3.IntegrityError, match="different question or tournament"):
+        _seed_failure(ledger, event_seq=2, question_id=question_id, tournament_id=tournament_id)
+
+
+def test_a_forecast_record_cannot_claim_an_attempt_id_from_another_question(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The identity-stability probe from the `forecast_records` side.
+
+    Only reachable from raw SQL today -- nothing in `src/` inserts a `forecast_records`
+    row -- but it is the half that makes the link trustworthy in the direction the join
+    is actually read: failures first, success later.
+    """
+    _seed_failure(ledger, attempt_id="att-shared", question_id=100)
+    with pytest.raises(sqlite3.IntegrityError, match="different question or tournament"):
+        _seed_draft(ledger, record_id="rec-wrong", question_id=101, attempt_id="att-shared")
+    _seed_draft(ledger, record_id="rec-right", question_id=100, attempt_id="att-shared")
+    assert (
+        ledger.execute(
+            "SELECT record_id FROM forecast_records WHERE attempt_id = ?", ("att-shared",)
+        ).fetchone()["record_id"]
+        == "rec-right"
+    )
+
+
+def test_a_generation_failure_must_cite_the_research_run_it_followed(
+    ledger: sqlite3.Connection,
+) -> None:
+    # Generation only runs once research has completed, so there is always a run to cite;
+    # a generation failure with none is a claim nobody can audit. Research failures are
+    # the opposite case -- the provider call may never have been made.
+    with pytest.raises(sqlite3.IntegrityError, match="requires retrieval_run_id"):
+        _seed_failure(ledger, attempt_id="att-gen", event_type="generation_failed")
+    _seed_failure(ledger, attempt_id="att-res", event_type="research_failed")
+    assert _failures(ledger, "att-res")[0]["retrieval_run_id"] is None
+
+
+def test_a_cited_research_run_must_exist(ledger: sqlite3.Connection) -> None:
+    # BEFORE INSERT runs ahead of the foreign-key check, so this arrives with the
+    # schema's own message rather than a generic `FOREIGN KEY constraint failed`.
+    with pytest.raises(sqlite3.IntegrityError, match="does not name a stored research run"):
+        _seed_failure(ledger, retrieval_run_id="run-nope")
+
+
+def test_a_cited_research_run_must_be_for_this_question(ledger: sqlite3.Connection) -> None:
+    # `run-1` is the fixture's run for question 100. A failure about a different question
+    # citing it would attribute one question's evidence to another's failure.
+    with pytest.raises(sqlite3.IntegrityError, match="linked research run is for another"):
+        _seed_failure(ledger, question_id=101, retrieval_run_id="run-1")
+    _seed_failure(ledger, question_id=100, retrieval_run_id="run-1")
+    assert _failures(ledger)[0]["retrieval_run_id"] == "run-1"
+
+
+@pytest.mark.parametrize("event_type", ["approved", "submitted", "", "RESEARCH_FAILED"])
+def test_the_failure_event_vocabulary_is_closed(
+    ledger: sqlite3.Connection, event_type: str
+) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        _seed_failure(ledger, event_type=event_type)
+
+
+@pytest.mark.parametrize("detail_code", ["refetch_mismatch", "refetch_missing", "", "nope"])
+def test_the_refetch_codes_are_not_reachable_before_a_forecast_exists(
+    ledger: sqlite3.Connection, detail_code: str
+) -> None:
+    # Both refetch codes describe what a refetch saw of an already-posted forecast, which
+    # cannot have happened before generation has even succeeded once. Named explicitly
+    # rather than left to "some value outside the set", because these two are the members
+    # of `FailureCode` this table deliberately does not carry.
+    assert detail_code not in PRE_FORECAST_FAILURE_CODES
+    with pytest.raises(sqlite3.IntegrityError):
+        _seed_failure(ledger, detail_code=detail_code)
+
+
+def test_every_pre_forecast_code_the_module_declares_is_storable(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The other direction, so the closed-vocabulary tests cannot both pass vacuously.
+
+    A CHECK narrower than the `Literal` would make a legal `detail_code` unwritable, and
+    every test above would still be green. Enumerated from `get_args` rather than
+    restated, so adding a member to one side without the other fails here.
+    """
+    for index, code in enumerate(PRE_FORECAST_FAILURE_CODES):
+        _seed_failure(ledger, attempt_id=f"att-code-{index}", detail_code=code)
+    for index, event_type in enumerate(PRE_FORECAST_EVENT_TYPES):
+        _seed_failure(
+            ledger,
+            attempt_id=f"att-type-{index}",
+            event_type=event_type,
+            retrieval_run_id="run-1",
+        )
+    assert ledger.execute("SELECT count(*) FROM pipeline_failure_events").fetchone()[0] == len(
+        PRE_FORECAST_FAILURE_CODES
+    ) + len(PRE_FORECAST_EVENT_TYPES)
+
+
+def _insert_record_raw(conn: sqlite3.Connection, attempt_id: object) -> None:
+    """A `forecast_records` INSERT that passes `attempt_id` through untouched.
+
+    `_seed_draft`'s `attempt_id or f"att-{record_id}"` default substitutes a good value
+    for every falsy one, so it cannot be used to test what the column refuses -- it would
+    turn `None`, `''` and `'   '` into three more runs of the happy path.
+    """
+    conn.execute(
+        "INSERT INTO forecast_records ("
+        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+        "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+        "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+        "forecast_sha256, attempt_id) "
+        "VALUES ('rec-raw', 100, 'minibench', 1, 'binary', 'draft', 'anthropic', "
+        "'claude', 'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
+        (TS, TS, SHA, attempt_id),
+    )
+
+
+@pytest.mark.parametrize("bad_attempt", [None, "", "   ", "\t\n", " ", b"x"])
+def test_a_new_record_must_carry_a_non_blank_attempt_id(
+    ledger: sqlite3.Connection, bad_attempt: object
+) -> None:
+    """004's extension of `forecast_records_require_draft_on_insert`.
+
+    `forecast_records` is UPDATE-blocked, so a row admitted without a usable attempt_id
+    could never be given one: an optional link is a permanently unjoinable row, not a
+    deferrable detail. See `docs/M1-NOTES.md`'s M1-606 section.
+
+    `'\\t\\n'` and `'\\u00a0'` are here because the first draft of this clause used
+    one-argument `trim()`, which strips U+0020 and nothing else, and accepted both. That
+    is M1-603's round-5 defect reproduced in a new migration by copying the idiom from
+    before its fix -- and it is why the sibling test below asserts the whole set rather
+    than these two samples.
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_id"):
+        _insert_record_raw(ledger, bad_attempt)
+
+
+@pytest.mark.parametrize("coerced", [42, 1.5])
+def test_an_affinity_coerced_attempt_id_is_stored_as_real_text(
+    ledger: sqlite3.Connection, coerced: object
+) -> None:
+    # The TEXT-affinity counterpart of the event_seq case: a number bound to a TEXT column
+    # arrives at the trigger already converted, so `typeof() <> 'text'` cannot refuse it
+    # and what lands is a genuine, non-blank text identifier. A blob is what that clause
+    # actually catches -- affinity leaves it a blob, and `_stored_text` could not read it
+    # back. Asserted on the stored type, because "accepted" alone would prove nothing.
+    _insert_record_raw(ledger, coerced)
+    stored = ledger.execute(
+        "SELECT attempt_id, typeof(attempt_id) FROM forecast_records WHERE record_id = 'rec-raw'"
+    ).fetchone()
+    assert (stored["attempt_id"], stored[1]) == (str(coerced), "text")
+
+
+def test_both_attempt_id_columns_agree_with_the_writer_on_what_blank_means(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The whole whitespace set, at all three places that define "blank" for an attempt_id.
+
+    003's round 5 was not a missing trigger -- it was two layers each holding a definition
+    of blank that nobody had compared, and a space is blank under both, which is exactly
+    why hand-picked parameters missed it for five rounds. So this asserts the equivalence
+    directly over every codepoint Python calls whitespace, against the character set the
+    two triggers pin and the `str.strip()` the writer uses.
+
+    It is also a drift guard: `str.strip()` follows the Unicode data of whatever Python is
+    running, while the triggers' literal freezes when 004 lands on master. A future
+    whitespace codepoint fails here loudly instead of reopening the hole in silence.
+    """
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: an empty list would make the loop assert nothing at all.
+    assert len(whitespace) == 29
+    for cp in whitespace:
+        blank = chr(cp) * 3
+        with pytest.raises(sqlite3.IntegrityError, match="attempt_id"):
+            _insert_record_raw(ledger, blank)
+        with pytest.raises(sqlite3.IntegrityError, match="attempt_id must be non-blank"):
+            _seed_failure(ledger, attempt_id=blank)
+        with pytest.raises(LifecycleError, match="attempt_id must not be blank"):
+            record_pre_forecast_failure(
+                ledger,
+                attempt_id=blank,
+                question_id=100,
+                tournament_id="minibench",
+                event_type="research_failed",
+                detail_code="provider_error",
+                occurred_at=WHEN,
+            )
+
+    # The other direction, so the pinned set cannot quietly grow into rejecting a real
+    # identifier: U+200B is not whitespace to Python, and an attempt_id built from it is a
+    # value this ledger stores rather than a blank one.
+    _seed_failure(ledger, attempt_id="​")
+    assert _failures(ledger, "​")
+
+
+@pytest.mark.parametrize("bad_attempt", [None, "", "   ", "\t\n", b"x"])
+def test_a_failure_must_carry_a_non_blank_attempt_id(
+    ledger: sqlite3.Connection, bad_attempt: object
+) -> None:
+    # The same guard on the other end of the join key. Without it a failure could be
+    # recorded under a value no forecast_records row is permitted to claim, so the link
+    # acceptance criterion 2 rests on would be unjoinable by construction -- on a table
+    # that can never be corrected.
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_id must be non-blank"):
+        _seed_failure(ledger, attempt_id=bad_attempt)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad_tournament", [None, "", "  ", "\t\n", b"x"])
+def test_a_failure_must_carry_a_non_blank_tournament_id(
+    ledger: sqlite3.Connection, bad_tournament: object
+) -> None:
+    # tournament_id is stored on the row rather than joined through, for the reason 001
+    # gives on resolution_events -- so nothing else in the schema can vouch for it.
+    with pytest.raises(sqlite3.IntegrityError, match="tournament_id must be non-blank"):
+        _seed_failure(ledger, tournament_id=bad_tournament)
+
+
+@pytest.mark.parametrize("bad_question", ["x", 1.5, None, b"1"])
+def test_a_failure_question_id_must_be_an_integer(
+    ledger: sqlite3.Connection, bad_question: object
+) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        _seed_failure(ledger, question_id=bad_question)
+
+
+def test_one_attempt_succeeds_at_most_once(ledger: sqlite3.Connection) -> None:
+    """The partial UNIQUE index on `forecast_records.attempt_id`.
+
+    Two forecast versions claiming one campaign would make "the forecast version that
+    later succeeds" ambiguous for every failure recorded under it.
+
+    The second record takes a **different** `question_id`, and the assertion names the
+    constraint. Both matter: the first draft of this test reused question 100, which
+    collides with 001's `UNIQUE (question_id, tournament_id, forecast_version)` — so it
+    passed with 004's index deleted, on a refusal from an unrelated constraint that
+    `match="UNIQUE constraint failed"` could not tell apart. Mutation-checked after the
+    fix; it now fails when the index is removed.
+    """
+    _seed_draft(ledger, record_id="rec-1", question_id=100, attempt_id="att-once")
+    with pytest.raises(sqlite3.IntegrityError, match=r"forecast_records\.attempt_id"):
+        _seed_draft(ledger, record_id="rec-2", question_id=101, attempt_id="att-once")
+
+
+def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path) -> None:
+    """The nullable carve-out, and the reason the partial index is partial.
+
+    `ADD COLUMN` cannot add NOT NULL without a default, and no default is honest for an
+    identifier nobody minted. So pre-004 rows keep NULL -- and because `WHERE attempt_id
+    IS NOT NULL` excludes them, *several* such rows coexist under a UNIQUE index. A plain
+    UNIQUE index would have made this migration undeployable against any ledger holding
+    two forecast records; that it is deployable is what this asserts.
+
+    Unreachable through the writers by construction (they are the thing that requires an
+    attempt_id), which is why it is driven from a genuine older-schema database rather
+    than by relaxing anything.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v2_ledger(db)
+    conn = connect(db)
+    try:
+        # A second pre-004 record, so what the index tolerates is more than one NULL.
+        conn.execute(
+            "INSERT INTO forecast_records ("
+            "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+            "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+            "generated_at_utc, final_prediction_json, record_json, created_at_utc) "
+            "VALUES ('rec-legacy-2', 102, 'minibench', 1, 'binary', 'draft', 'anthropic', "
+            "'claude', 'v1', 'abc', 'run-1', ?, '{}', '{}', ?)",
+            (TS, TS),
+        )
+    finally:
+        conn.close()
+
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 4
+
+    conn = connect(db)
+    try:
+        stored = conn.execute(
+            "SELECT record_id, attempt_id FROM forecast_records ORDER BY record_id"
+        ).fetchall()
+        assert [(row["record_id"], row["attempt_id"]) for row in stored] == [
+            (LEGACY_RECORD, None),
+            ("rec-legacy-2", None),
+        ]
+    finally:
+        conn.close()
+
+
+def test_migration_004_is_applied_and_recorded(ledger: sqlite3.Connection) -> None:
+    # The migration is immutable once on master; this is what would notice an edit to a
+    # file the ledger has already applied somewhere.
+    recorded = ledger.execute("SELECT checksum FROM schema_migrations WHERE version = 4").fetchone()
+    assert recorded["checksum"] == _checksum_of("004_pipeline_failure_events.sql")
+
+
+# ---- The writer: same refusals, as this module's own error type. ----------------------
+
+
+def test_the_writer_returns_the_row_the_ledger_stored(ledger: sqlite3.Connection) -> None:
+    # Read back after insert rather than assembled from the arguments, so what a caller
+    # gets is what the ledger holds -- including anything its constraints coerced.
+    event = record_pre_forecast_failure(
+        ledger,
+        attempt_id="att-1",
+        question_id=100,
+        tournament_id="minibench",
+        event_type="generation_failed",
+        detail_code="schema_invalid",
+        occurred_at=WHEN,
+        retrieval_run_id="run-1",
+    )
+    stored = ledger.execute(
+        "SELECT * FROM pipeline_failure_events WHERE event_id = ?", (event.event_id,)
+    ).fetchone()
+    assert asdict(event) == dict(stored)
+    assert isinstance(event, PreForecastFailure)
+
+
+def test_the_writer_numbers_an_attempts_failures_from_one(ledger: sqlite3.Connection) -> None:
+    seqs = [
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id="att-1",
+            question_id=100,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code="timeout",
+            occurred_at=WHEN,
+        ).event_seq
+        for _ in range(3)
+    ]
+    assert seqs == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempt_id", None),
+        ("attempt_id", ""),
+        ("attempt_id", 42),
+        ("attempt_id", "a" * 201),
+        ("question_id", "100"),
+        ("question_id", None),
+        ("question_id", 1.5),
+        ("tournament_id", None),
+        ("tournament_id", 7),
+        ("event_type", "approved"),
+        ("event_type", None),
+        ("detail_code", "refetch_mismatch"),
+        ("detail_code", None),
+        ("occurred_at", WHEN.replace(tzinfo=None)),
+        ("occurred_at", "2026-07-27"),
+        ("occurred_at", None),
+        ("retrieval_run_id", 7),
+        ("retrieval_run_id", "r" * 201),
+    ],
+)
+def test_the_writer_refuses_a_malformed_field_as_a_lifecycle_error(
+    ledger: sqlite3.Connection, field: str, value: object
+) -> None:
+    """Every malformed shape arrives as this module's own error type, and writes nothing.
+
+    `sqlite3.IntegrityError` leaking out of here would be a review finding twice over:
+    callers only handle `LifecycleError`, and a database message is a channel that can
+    echo the value that caused it.
+    """
+    kwargs: dict[str, object] = {
+        "attempt_id": "att-1",
+        "question_id": 100,
+        "tournament_id": "minibench",
+        "event_type": "research_failed",
+        "detail_code": "provider_error",
+        "occurred_at": WHEN,
+    }
+    kwargs[field] = value
+    with pytest.raises(LifecycleError):
+        record_pre_forecast_failure(ledger, **kwargs)  # type: ignore[arg-type]
+    assert ledger.execute("SELECT count(*) FROM pipeline_failure_events").fetchone()[0] == 0
+
+
+def test_the_writer_requires_a_run_for_a_generation_failure_before_any_statement(
+    ledger: sqlite3.Connection,
+) -> None:
+    # The trigger enforces this too. What the writer adds is that it is refused as a
+    # readable LifecycleError rather than the opaque "the ledger rejected this write"
+    # `_insert` is obliged to raise, and refused before a statement runs at all.
+    with pytest.raises(LifecycleError, match="retrieval_run_id is required"):
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id="att-1",
+            question_id=100,
+            tournament_id="minibench",
+            event_type="generation_failed",
+            detail_code="schema_invalid",
+            occurred_at=WHEN,
+        )
+    assert ledger.execute("SELECT count(*) FROM pipeline_failure_events").fetchone()[0] == 0
+
+
+def test_the_writer_refuses_an_attempt_that_already_succeeded(ledger: sqlite3.Connection) -> None:
+    _seed_draft(ledger, record_id="rec-won", attempt_id="att-won")
+    with pytest.raises(LifecycleError, match="already produced a stored forecast record"):
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id="att-won",
+            question_id=100,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code="timeout",
+            occurred_at=WHEN,
+        )
+    assert ledger.execute("SELECT count(*) FROM pipeline_failure_events").fetchone()[0] == 0
+
+
+def test_a_refused_second_failure_leaves_the_first_one_intact(ledger: sqlite3.Connection) -> None:
+    """Atomicity, driven by a real trigger refusal rather than an injected exception.
+
+    The identity-stability trigger is the one guard the writer does *not* pre-check, so
+    this is the reachable path where `_insert` raises mid-transaction. Nothing is mocked:
+    what must hold is that the rollback leaves the attempt's existing history untouched
+    and its sequence unadvanced.
+    """
+    first = record_pre_forecast_failure(
+        ledger,
+        attempt_id="att-1",
+        question_id=100,
+        tournament_id="minibench",
+        event_type="research_failed",
+        detail_code="no_evidence",
+        occurred_at=WHEN,
+    )
+    with pytest.raises(LifecycleError):
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id="att-1",
+            question_id=101,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code="no_evidence",
+            occurred_at=WHEN,
+        )
+    assert read_pipeline_failure_events(ledger, "att-1") == (first,)
+    later = record_pre_forecast_failure(
+        ledger,
+        attempt_id="att-1",
+        question_id=100,
+        tournament_id="minibench",
+        event_type="research_failed",
+        detail_code="timeout",
+        occurred_at=WHEN,
+    )
+    assert later.event_seq == 2
+
+
+def test_the_reader_returns_an_attempts_failures_in_append_order(
+    ledger: sqlite3.Connection,
+) -> None:
+    written = [
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id="att-1",
+            question_id=100,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code=code,
+            occurred_at=WHEN,
+        )
+        for code in ("provider_error", "no_evidence", "timeout")
+    ]
+    record_pre_forecast_failure(
+        ledger,
+        attempt_id="att-other",
+        question_id=100,
+        tournament_id="minibench",
+        event_type="research_failed",
+        detail_code="stale_evidence",
+        occurred_at=WHEN,
+    )
+    assert read_pipeline_failure_events(ledger, "att-1") == tuple(written)
+
+
+def test_the_reader_answers_an_unknown_attempt_with_no_events(ledger: sqlite3.Connection) -> None:
+    """Deliberately not the `read_history` behaviour, and the asymmetry is the point.
+
+    `read_history` raises on an unknown record because a `forecast_records` row is an
+    identity that either exists or does not. An attempt_id has no such row: nothing
+    creates one before the first event cites it, so "this attempt never failed" and "no
+    such attempt" are the same observable state and `()` is the only honest answer.
+    """
+    assert read_pipeline_failure_events(ledger, "att-never-existed") == ()
+
+
+@pytest.mark.parametrize("attempt_id", [None, "", 42, "a" * 201])
+def test_the_reader_refuses_a_malformed_attempt_id(
+    ledger: sqlite3.Connection, attempt_id: object
+) -> None:
+    with pytest.raises(LifecycleError):
+        read_pipeline_failure_events(ledger, attempt_id)  # type: ignore[arg-type]
+
+
+def test_a_stored_row_outside_the_vocabulary_is_refused_on_the_way_out(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Values read back out of the ledger are untrusted (CLAUDE.md's threat boundary).
+
+    The row is planted with `PRAGMA ignore_check_constraints` -- not to model an attacker,
+    but because the reachable case is a ledger file some other program or an older build
+    wrote, and that is the only way to produce one from inside this suite. The CHECK is
+    what stops this module writing such a row; the mapper's re-gating is what stops a
+    caller receiving a `PreForecastFailure` whose `detail_code` is outside its own type.
+    """
+    ledger.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        _seed_failure(ledger, detail_code="refetch_mismatch")
+    finally:
+        ledger.execute("PRAGMA ignore_check_constraints = OFF")
+
+    with pytest.raises(LifecycleError, match="detail_code"):
+        read_pipeline_failure_events(ledger, FAILED_ATTEMPT)
+
+
+def test_no_rejected_value_reaches_a_pre_forecast_failure_message(
+    ledger: sqlite3.Connection,
+) -> None:
+    # The leak channel is the message *and* the rendered traceback: a chained exception
+    # reprints the value it was raised from, which is why the writers raise `from None`.
+    with pytest.raises(LifecycleError) as caught:
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id=PLANTED_SECRET * 40,
+            question_id=100,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code="provider_error",
+            occurred_at=WHEN,
+        )
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert PLANTED_SECRET not in str(caught.value)
+    assert PLANTED_SECRET not in rendered
