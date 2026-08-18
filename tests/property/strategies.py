@@ -23,7 +23,12 @@ from typing import Any
 
 from hypothesis import strategies as st
 
-from whiskeyjack_bot.research.model import ResearchDocument, validate_document
+from whiskeyjack_bot.research.model import (
+    ResearchDocument,
+    ResearchRun,
+    validate_document,
+    validate_run,
+)
 
 # Text that has actually broken this code before:
 #   - lone surrogates, which arrive intact from provider JSON (json.loads('"\\ud800"'))
@@ -264,3 +269,89 @@ def persisted(document: ResearchDocument) -> str:
 def round_trip(document: ResearchDocument) -> ResearchDocument:
     """Store and reload a document the way replay does."""
     return validate_document(json.loads(persisted(document)))
+
+
+# --- Research runs (M1-306) -------------------------------------------------
+#
+# The packet hash covers the run as well as its documents, so the run needs the
+# same hostile-input treatment the documents already get: queries and provider
+# configs are provider- and caller-supplied text that reaches the same JSON
+# rendering, and the counters added by 004 have to keep NULL distinct from 0.
+
+# Deliberately small, so two runs in one packet can collide on the fields the
+# packet's own validation is supposed to refuse.
+QUESTION_IDS = st.sampled_from([1, 42])
+
+# Non-negative and nullable: None is "unmeasured", 0 is "nothing was discarded",
+# and 004 keeps them apart on purpose.
+COUNTS = st.none() | st.integers(min_value=0, max_value=5)
+
+# JSON that survives the round trip into a TEXT column. Non-finite floats are
+# excluded because the schema refuses them (they render as null), which is the
+# invariant `_reject_non_finite` exists to hold.
+PROVIDER_CONFIG_VALUES = st.recursive(
+    st.none()
+    | st.booleans()
+    | st.integers(min_value=-1000, max_value=1000)
+    | st.floats(allow_nan=False, allow_infinity=False, width=32)
+    | HOSTILE_TEXT,
+    lambda children: (
+        st.lists(children, max_size=3) | st.dictionaries(HOSTILE_TEXT, children, max_size=3)
+    ),
+    max_leaves=6,
+)
+
+
+@st.composite
+def research_runs(draw: st.DrawFn) -> ResearchRun:
+    """A schema-valid ResearchRun over the hostile input classes above."""
+    # Drawn together rather than generated and filtered: the schema requires an
+    # agent_model and a posts_dropped_no_url from the agent provider, and a run that
+    # cannot be built is not a run worth fuzzing.
+    provider = draw(st.sampled_from(["asknews", "exa", "structured", "xai_x_search"]))
+    if provider == "xai_x_search":
+        agent_model: str | None = draw(st.sampled_from(["grok-3", "grok-4-fast"]))
+        posts_dropped: int | None = draw(st.integers(min_value=0, max_value=5))
+    else:
+        agent_model = draw(st.none() | st.sampled_from(["grok-3"]))
+        posts_dropped = draw(COUNTS)
+
+    started = draw(TIMESTAMPS)
+    payload: dict[str, Any] = {
+        "retrieval_run_id": draw(RUN_IDS),
+        "question_id": draw(QUESTION_IDS),
+        "provider": provider,
+        "provider_config": draw(
+            st.none() | st.dictionaries(HOSTILE_TEXT, PROVIDER_CONFIG_VALUES, max_size=3)
+        ),
+        "queries": draw(st.lists(HOSTILE_TEXT, max_size=3)),
+        "started_at_utc": started,
+        # None or the start itself: the schema refuses a completion before the start,
+        # and drawing an independent instant would mostly generate refusals.
+        "completed_at_utc": draw(st.none() | st.just(started)),
+        "freshness_cutoff_utc": draw(st.none() | TIMESTAMPS),
+        # Excluded from the packet hash, and generated *because* it is: the property
+        # that says so can only discriminate if the value actually varies.
+        "raw_response_path": draw(st.none() | st.sampled_from(["research/1/a.json", "x.json"])),
+        "error_summary": draw(st.none() | HOSTILE_TEXT),
+        "cost_usd": draw(
+            st.none() | st.floats(min_value=0, max_value=100, allow_nan=False, allow_infinity=False)
+        ),
+        "agent_model": agent_model,
+        "posts_dropped_no_url": posts_dropped,
+        "documents_dropped": draw(COUNTS),
+        "duplicates_collapsed": draw(COUNTS),
+    }
+    return validate_run(payload)
+
+
+def persisted_run(run: ResearchRun) -> str:
+    """The run exactly as the ledger stores it. See :func:`persisted`."""
+    return json.dumps(
+        run.model_dump(mode="json"), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+
+
+def round_trip_run(run: ResearchRun) -> ResearchRun:
+    """Store and reload a run the way replay does."""
+    return validate_run(json.loads(persisted_run(run)))

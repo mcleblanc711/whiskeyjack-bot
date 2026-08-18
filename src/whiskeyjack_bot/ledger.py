@@ -6,7 +6,9 @@ attempts, resolutions and scores. This module owns database connections and
 migration application only. The database-level append-only enforcement
 (UPDATE/DELETE-blocking triggers) and the lifecycle state machine shipped with
 M1-603 -- see ``003_lifecycle_events.sql`` and :mod:`whiskeyjack_bot.lifecycle`;
-forecast versioning and its writer are M1-602's.
+forecast versioning and its writer are M1-602's. ``004_research_run_counters.sql``
+(M1-306) adds the two discarded-evidence counters a research run had nowhere to
+record; its writers live in :mod:`whiskeyjack_bot.research.store`.
 
 Migrations live inside the package (:mod:`whiskeyjack_bot.migrations`) rather
 than at the repository root shown in the handoff's proposed tree, so they ship
@@ -26,7 +28,7 @@ from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
-LEDGER_SCHEMA_VERSION = 3
+LEDGER_SCHEMA_VERSION = 4
 
 _MIGRATIONS_PACKAGE = "whiskeyjack_bot.migrations"
 _MIGRATION_NAME_RE = re.compile(r"^(\d+)_.*\.sql$")

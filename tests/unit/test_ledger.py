@@ -393,3 +393,55 @@ def test_statement_splitter_ignores_trailing_comments() -> None:
 def test_statement_splitter_rejects_unterminated_statement() -> None:
     with pytest.raises(LedgerError):
         _statements("CREATE TABLE t (a TEXT)")  # no terminating semicolon
+
+
+def test_migration_004_adds_the_discarded_evidence_counters(tmp_path: Path) -> None:
+    """M1-306: the counts of retrieved evidence that never became a document row.
+
+    Both are NULLable on purpose, and the two states are different claims: NULL is
+    *unmeasured* (a run opened before its calls, or a row predating 004), 0 is the
+    auditable claim that nothing was discarded. A NOT NULL DEFAULT 0 would collapse
+    them into the second, manufacturing a measurement -- the same reasoning that
+    stopped 002 defaulting `provenance` to 'direct_api'.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(research_runs)")}
+        assert {"documents_dropped", "duplicates_collapsed"} <= columns
+
+        _seed_run(conn, "run-null")
+        stored = conn.execute(
+            "SELECT documents_dropped, duplicates_collapsed FROM research_runs "
+            "WHERE retrieval_run_id = 'run-null'"
+        ).fetchone()
+        assert tuple(stored) == (None, None)
+    finally:
+        conn.close()
+
+
+def test_migration_004_counters_reject_a_non_integer_or_negative_count(
+    tmp_path: Path,
+) -> None:
+    """`INTEGER` in SQLite is affinity, not a type.
+
+    A REAL that cannot be losslessly converted stays REAL and a non-numeric string
+    stays TEXT, so without the `typeof()` half of the CHECK both 1.5 and 'garbage'
+    satisfy `>= 0` -- 'garbage' passing only because SQLite orders TEXT above every
+    number. 002 spells this out for `posts_dropped_no_url`; 004 inherits it.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        for value in (-1, 1.5, "garbage"):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+                    "started_at_utc, created_at_utc, documents_dropped) "
+                    "VALUES (?, 'asknews', 100, ?, ?, ?)",
+                    (f"run-{value}", TS, TS, value),
+                )
+    finally:
+        conn.close()

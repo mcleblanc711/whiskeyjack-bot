@@ -167,6 +167,27 @@ third instance of the same vacuity class in this slice, so it is closed at the h
 Acceptance: *unpacked fixtures produce one unique internal question per subquestion and no
 duplicate IDs.*
 
+### Delivered
+
+- `src/whiskeyjack_bot/research/packet.py` — `ResearchPacket`, `build_packet`,
+  `packet_sha256`, `canonical_packet_json`, `PacketError`, `PACKET_SCHEMA_VERSION`.
+- `src/whiskeyjack_bot/research/store.py` — `open_run` / `complete_run` /
+  `persist_retrieval`, `with_retrieval_counts`, `load_run` / `load_documents` /
+  `load_packet`, `replay_research`, `StoreError`.
+- `src/whiskeyjack_bot/research/artifacts.py` — `write_raw_responses`,
+  `read_raw_responses`, `artifact_relative_path`, `ArtifactError`,
+  `ARTIFACT_SCHEMA_VERSION`.
+- `src/whiskeyjack_bot/migrations/004_research_run_counters.sql` —
+  `documents_dropped` and `duplicates_collapsed` on `research_runs`;
+  `LEDGER_SCHEMA_VERSION` 3 → 4.
+- `src/whiskeyjack_bot/research/model.py` — the two counter fields on `ResearchRun`.
+- `tests/unit/test_research_{packet,store,artifacts}.py` (46 tests),
+  `tests/property/test_packet_properties.py` (8 properties),
+  `tests/property/strategies.py` (`research_runs`, `persisted_run`, `round_trip_run`),
+  two migration-004 cases in `tests/unit/test_ledger.py`.
+
+Nothing here is reachable from the CLI, and nothing calls a provider.
+
 ### What the criterion is actually guarding against
 
 Group questions arrive as a single *post* carrying a `group_of_questions` block.
@@ -283,6 +304,45 @@ compares.
   fixtures and for any future path that reads raw post JSON.
 - The comprehensive valid/invalid **golden fixture set is Codex's T-901**; this slice ships
   only the group fixture its own acceptance needs.
+
+### Found while building, before any review
+
+Two defects, both caught by the checks CLAUDE.md requires rather than by reading.
+
+**The counters skewed the packet hash.** The first cut took `documents_dropped` and
+`duplicates_collapsed` as keyword arguments to `complete_run`/`persist_retrieval`, alongside
+the run. The end-to-end smoke test then produced a stored packet hash that did not match the
+in-memory one, because the caller's `ResearchRun` carried `None` for both while the row carried
+`2` and `1`. Any value that is both hashed into the packet **and** accepted separately by the
+writer can be stored inconsistent with the object that was hashed. Fixed by reading both off
+the run — `with_retrieval_counts()` is the seam that puts them there, going through
+`validate_run` rather than `model_copy`, which skips validation and would defer a negative
+count to 004's CHECK, at write time, after the calls were paid for.
+
+`raw_response_path` is the deliberate counter-example and it is why the exclusion list is not
+arbitrary: it is *also* passed separately to the writer, and it cannot skew anything, because
+it is excluded from the hash.
+
+**A property strategy laundered away the distinction its own property tested for.**
+`test_the_hash_survives_the_persisted_round_trip` exists for the `datetime.fold` class of bug
+that cost M1-305 its round 3. The `packets()` strategy re-keyed each generated run onto the
+packet's question with `model_dump(mode="json")` → `validate_run` — which round-trips every
+timestamp through ISO-8601 and **drops `fold`**. So no packet reaching any property could
+carry the distinction, and a deliberately fold-sensitive `packet.py` passed the property that
+is named after it. `tests/property/strategies.py` generates `fold` correctly; the consumer
+threw it away.
+
+Caught only by the mutation step — the property was green both before and after the strategy
+fix, so nothing but running it against broken code could have distinguished them. Fixed with
+`model_copy`. All seven mutations now discriminate: the persisted-form rule (two variants,
+fold-sensitive and surrogate-pair-sensitive), the sorting, the exclusion list, a constant
+digest, `ensure_ascii`, and the constructor's validation.
+
+The generalizable form is written up as `docs/LESSONS.md` lesson 9, with the measurement:
+**a strategy that normalizes its generated inputs before handing them to a property can be the
+thing that makes the property vacuous**, and the mutation has to express the defect the property
+is *named for* — two other mutations of the same function were caught, which is exactly what made
+the suite look discriminating when it was not.
 
 ### Standing risk — not verifiable offline
 
@@ -2121,3 +2181,239 @@ everything that *isn't* already a bare IP literal; this adds an earlier exit, no
 (`tests/unit/test_dedup_freshness.py`) pin the three inputs above as fixed points that stay
 pairwise distinct. Re-run against the round-2 code (fix reverted), both fail on exactly the
 reviewer's counterexample.
+
+## M1-306 — Persisting replayable retrieval runs
+
+**Acceptance criterion:** *replay produces zero provider calls and the same research packet
+hash.* One of those two nouns did not exist. `content_sha256`'s docstring promises "the
+research-packet hash that replay reproduces", `CLAUDE_CODE_PROMPT.md` § B requires M1-307 to
+reproduce it, and the handoff's canonical record lists "retrieval run and normalized source
+references" — but nothing in the repository defined a research packet or hashed one. **M1-306
+defines it**, and most of what follows is that definition and its consequences.
+
+Scope was settled with the owner before any code: this item is **persistence and replay only**.
+The cross-provider orchestration that `docs/M1-303-NOTES.md` assigns here — `decide_fallback()`
+then `retrieve_web()` — is a follow-up row, not this branch.
+
+### What the criterion is actually guarding against
+
+Not "can we write rows". The failure it exists to prevent is a forecast whose evidence cannot
+be re-derived: a stored forecast that says it saw twelve articles, where nothing can now
+establish *which* twelve, gathered under which queries, at what cost. The packet hash is the
+one value that makes that claim falsifiable — if the ledger's rows still hash to what the
+forecast recorded, the evidence is the evidence. If a normalization change, a re-persist, or a
+different machine moves that hash, the instrument has quietly lied.
+
+That framing is what decides every question below, and in particular the two that look like
+implementation detail and are not: *what the hash is computed over* (§ persisted form) and
+*what replay reads* (§ the ledger, not the artifacts).
+
+### Decision — the packet is derived, not stored
+
+A `ResearchPacket` is a frozen value object over rows that already exist: one `question_id`,
+its `research_runs`, and their deduplicated `research_documents`. There is **no
+`research_packets` table and no packet row**.
+
+The alternative — persist the packet and its hash — was rejected because it creates a second
+source of truth for something wholly derivable, and the two can disagree. A stored hash that
+no longer matches the rows it summarizes is worse than no stored hash: it is an attribution
+claim the evidence contradicts, and the ledger's whole purpose is that those cannot diverge.
+Derived means the hash is *recomputed* from the rows every time it is asked for, so a
+mismatch is unrepresentable rather than merely unlikely.
+
+M1-602 will store the packet hash on `forecast_records.record_json`, and that is a different
+thing: a forecast records the packet it *saw*, and comparing that stamp against a recomputed
+hash is exactly the audit this design makes possible. The stamp lives with the forecast; the
+truth lives in the evidence rows.
+
+It also costs nothing in migration budget — see the counters decision for what 004 is actually
+spent on.
+
+### Decision — the hash keys on the persisted form, not the in-memory objects
+
+`packet_sha256` digests `model_dump(mode="json")` → `json.dumps(..., ensure_ascii=True,
+sort_keys=True, separators=(",", ":"))` → UTF-8 → SHA-256.
+
+This is M1-305's lesson applied verbatim, and it is the one place on this branch where the
+wrong choice is invisible until replay (`research/dedup.py:_sort_key`, `docs/M1-305-NOTES.md`
+rounds 2-4, five review rounds on one function):
+
+- **Never `model_dump_json()`** — it raises on a lone surrogate, which is reachable from
+  provider JSON through any schema-valid text field.
+- **Never `repr` or a plain `model_dump()`** — the in-memory form carries distinctions JSON
+  drops, notably `datetime.fold` and the astral-scalar/surrogate-pair spelling of one
+  character. A hash over those is stable in memory and *changes across a store→load
+  round-trip*, which is precisely the hash that would fail the acceptance criterion while
+  passing every test that never went through SQLite.
+
+`ensure_ascii=True` escapes surrogates instead of encoding them; `sort_keys` and the compact
+separators make the rendering canonical. Runs are ordered by `retrieval_run_id`, documents by
+`dedup.dedup_key` — reusing the ledger's own identity tuple rather than restating it, so the
+hash's ordering and the `UNIQUE` constraint can never drift apart.
+
+The rule is versioned (`PACKET_SCHEMA_VERSION`) and carries the same warning `hashing.py` and
+`prompt.py` carry: **changing it breaks replay for every packet already hashed**, so it changes
+as a new function alongside this one, never as an edit to it.
+
+### Decision — the hash covers how the evidence was gathered, not only what was found
+
+Owner decision, taken over the narrower reading. The digest includes each run's
+`retrieval_run_id`, `question_id`, `provider`, `provider_config`, `queries`,
+`started_at_utc`/`completed_at_utc`, `freshness_cutoff_utc`, `cost_usd`, `error_summary`,
+`agent_model`, `posts_dropped_no_url` and the two new counters — alongside every document.
+
+Hashing documents alone was the tempting option: it is stable across re-runs that happen to
+surface the same articles, which *sounds* like the property replay wants. It is the wrong
+property. Two runs that found the same twelve articles under different queries, a different
+provider, or a different freshness window are not the same research; a packet that cannot tell
+them apart cannot testify to how the evidence was found, and "the same research packet" would
+degrade into "the same reading list". A run is an event, and the packet is the record of it.
+
+The consequence is deliberate and worth stating plainly: **a fresh retrieval over identical
+evidence produces a different packet hash**, because it is a different gathering event. Replay
+reproduces the hash because it reads the *same rows*, which is what the criterion asks.
+
+### Decision — three fields are excluded from the digest, each for its own reason
+
+- **`document_id`** — a writer-minted UUID. A document's identity in this ledger is its dedup
+  key (`retrieval_run_id`, `canonical_url`, `content_sha256`), which the `UNIQUE` constraint
+  already says out loud; the UUID is an addressing convenience assigned at write time. Include
+  it and re-persisting byte-identical evidence hashes differently, which would make the digest
+  a fact about *when rows were written* rather than about the evidence.
+- **`raw_response_path` / `raw_artifact_path`** — where bytes were filed is not what was
+  retrieved. These are stored relative to `storage.artifact_root`, which is operator
+  configuration; including them would make the packet hash **machine-dependent**, so the same
+  evidence would fail to verify after a config edit or on a second checkout. An operator
+  reorganizing their artifact directory must not be able to invalidate an attribution record.
+
+`created_at_utc` needs no exclusion rule: it is writer-owned metadata that `ResearchRun` and
+`ResearchDocument` deliberately do not carry (`research/model.py:24-27`), so it never reaches
+the dump.
+
+### Decision — replay reads the ledger; raw artifacts are audit evidence, not the substrate
+
+`replay_research()` reconstructs the packet from `research_runs` and `research_documents`. It
+does **not** re-parse the stored raw provider bodies.
+
+Re-normalizing from raw responses is the option that looks more faithful and is in fact the
+dangerous one: normalization lives in the adapters, so a replayed packet would depend on
+*adapter code version*. Fix a bug in `_to_document`, and every historical forecast's evidence
+silently re-derives into something else — the ledger would rewrite its own history on a
+refactor, which is the exact failure D25 and the append-only triggers exist to prevent. The
+normalized rows are the record; the raw bodies are the evidence that those rows were derived
+from something a provider really returned.
+
+This is also what makes the zero-provider-calls property structural rather than a mock count:
+the replay path reads SQLite, and the module it lives in imports no provider SDK at all.
+
+A consequence, stated rather than hidden: **a deleted or corrupted artifact does not break
+replay.** That is correct — replay does not depend on it — but it does mean artifact loss is
+an *audit* loss that replay will not report. Recorded under standing risks.
+
+### Decision — the run row is opened before the calls and completed after
+
+`open_run()` inserts identity and `started_at_utc` with `completed_at_utc` NULL; `complete_run()`
+fills in what the run learned. Master already committed to this shape — 003's triggers pin
+identity and provenance while deliberately leaving `completed_at_utc`, `error_summary` and
+`cost_usd` writable, and `docs/M1-NOTES.md` says so under M1-603's consequences.
+
+The reason to actually use it, rather than doing a single insert at the end: a run makes up to
+`max_queries_per_question * 2` billable calls, and both adapters were already hardened so a
+mid-run provider failure returns everything paid for instead of raising it away (M1-302 round 1,
+finding 2). A single terminal insert reopens the same hole one level up — a hard crash between
+the last paid call and the write loses the record of every call. Opening the row first means
+the spend is attributable even when the process does not survive to describe it.
+
+`persist_retrieval()` composes both inside one transaction for the case where the caller
+already holds a completed run.
+
+### Decision — migration 004 holds the discarded-evidence counters
+
+Both adapters return `documents_dropped` and `duplicates_collapsed` on their in-memory result
+objects, with no column to land in; `docs/M1-301-NOTES.md` left the call here. They get columns.
+
+002 already settled the principle for exactly this shape of number, and settled it against its
+own first instinct: an off-range count is "not a bad measurement but an unfalsifiable claim
+about how much evidence was discarded". That is why `posts_dropped_no_url` took a column and a
+`typeof()` guard rather than staying model-side. `documents_dropped` is the same claim about
+the same subject, so it is stored the same way — including the `typeof()` guard, because
+`INTEGER` in SQLite is affinity rather than a type and `1.5` and `'garbage'` both satisfy a
+bare `>= 0`.
+
+**NULLable, deliberately.** Under the two-phase write the counts are not knowable at insert
+time, and rows predating 004 never had them. NULL means *unmeasured*; `0` is the auditable
+claim that nothing was discarded. Collapsing the two would manufacture a measurement, which is
+the failure 002's note names. No trigger changes are needed: 003 pins identity, and these are
+completion data.
+
+### Decision — artifacts are relative, atomic, and never overwritten
+
+`write_raw_responses()` writes a versioned envelope (shaped after `metaculus/snapshots.py`, the
+existing precedent for a replay substrate on disk) to
+`<artifact_root>/research/<question_id>/<retrieval_run_id>.json`, via a temp file and
+`os.replace`, and **refuses to overwrite an existing file**. An artifact is the record that a
+paid run happened; silently replacing one destroys evidence, and the same rule already governs
+`run-review.sh` refusing to overwrite a review response.
+
+The path stored on the run is **relative to `artifact_root`**, so a ledger stays readable after
+the artifact directory moves or is opened on another machine. Retention is the caller's flag
+(`retrieval.retain_raw_responses`, `storage.retain_raw_research`), passed explicitly — the
+module reads no config and does not guess; off means no file and `raw_response_path is None`.
+
+The envelope holds provider **response bodies only**. No request headers, no request URL: both
+carry the API key, and both adapters already discard provider exceptions unread for that reason.
+
+### Deviation — `research` imports `transaction()` from `lifecycle`
+
+`lifecycle.transaction()` is a reviewed, savepoint-aware `BEGIN IMMEDIATE` helper, and the
+writers here need exactly it: a run row and its documents must never be observable one without
+the other. So `research/store.py` imports it, which points the retrieval epic at the lifecycle
+module.
+
+Both alternatives are worse. Duplicating the helper puts a second transaction implementation in
+the tree, and the savepoint/nesting behaviour it encodes took M1-603 a review round to get
+right. Relocating it to `ledger.py` — arguably its real home — is a refactor of merged, approved
+code carried on a review branch, which is the shape of change `docs/LESSONS.md` measures the
+cost of. **Stated, not half-fixed**: if the relocation is wanted, it is its own row.
+
+### Rejected — options weighed and not taken
+
+- **A `research_packets` table.** A second source of truth for a derivable value; see the first
+  decision.
+- **Hashing the document set alone.** Cheaper and stable across re-runs, but the packet then
+  cannot testify to the queries, provider or freshness window that produced it.
+- **Re-normalizing from raw responses on replay.** Makes replay depend on adapter code version,
+  so a normalization fix rewrites history.
+- **Touching the two merged adapters.** `AskNewsRetrieval`/`ExaRetrieval` keep their shape; the
+  caller hands the counters to `complete_run()`. Editing merged, approved modules to save one
+  argument is not a trade this branch makes.
+- **A `replay` CLI subcommand.** The handoff spells it `replay --record-id ID`, and
+  `forecast_records` does not exist yet (M1-602). Adding a `--run-id` variant now would ship a
+  command shape the handoff does not specify and M1-602 would rewrite.
+
+### Deferred (do not read the absence as an omission)
+
+- **Cross-provider orchestration** — `decide_fallback()` → `retrieve_web()` → cross-run dedup,
+  assigned here by `docs/M1-303-NOTES.md`. Owner decision to split; it is a paid-call policy
+  surface and does not belong in a persistence review.
+- **The `replay --record-id` CLI** — M1-602 owns the key.
+- **Budget enforcement.** `run_limits.max_cost_usd` still has no consumer. This branch preserves
+  the invariant M1-303 round 3 established — **`cost_usd is None` means unknown, never free** —
+  by round-tripping NULL as `None` and never summing it as zero. Enforcing a cap is M1-504's.
+- **M1-309's shared caller preflight.** Unchanged here.
+
+### Standing risk — not verifiable offline
+
+- **Artifacts can drift from the ledger.** Replay survives a missing artifact by design (it
+  reads rows), which means artifact loss is an audit loss replay will not report.
+- **AskNews summary-derived `content_sha256` is not byte-stable across re-retrieval**
+  (`docs/M1-301-NOTES.md`): the summary is LLM-generated. This does not affect replay — replay
+  re-reads stored rows and issues zero calls — but it does mean a *fresh* run over the same
+  article can produce a different document identity, and therefore a different packet hash.
+- **The packet hash is anchored to `canonicalize_url` as of D32.** M1-310 changed document
+  identity by stripping a terminal root dot; a further canonicalization change is a
+  packet-hash change and must be treated as one.
+- **`content_sha256` still raises on a lone surrogate** — open owner decision, xfail in
+  `tests/property/test_canonical_properties.py`. It is upstream of the packet hash: a document
+  that cannot be hashed never becomes a row, so this is a reachability limit on what can be
+  persisted, not a defect introduced here.

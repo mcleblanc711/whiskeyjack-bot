@@ -19,6 +19,10 @@ migration and are added by ``002_research_document_fields.sql``:
   rewrite ``canonical_url`` for dedup; without this field the as-retrieved URL
   would be unrecoverable, which is an attribution loss.
 
+Two more arrive with ``004_research_run_counters.sql`` (M1-306):
+``documents_dropped`` and ``duplicates_collapsed``, the counts of retrieved
+evidence that never became a document row.
+
 The mirroring is not field-for-field, and the two departures are deliberate:
 
 - ``created_at_utc`` (NOT NULL in both tables) is **writer-owned metadata**, not
@@ -377,6 +381,17 @@ class ResearchRun(_StrictModel):
     # Citation-hygiene counter: agent-reported posts dropped for lacking a
     # resolvable status URL (M1-307). None for providers where it has no meaning.
     posts_dropped_no_url: int | None = Field(default=None, ge=0)
+
+    # Accountability counters for evidence that never became a row, added with
+    # ``004_research_run_counters.sql`` (M1-306). Both adapters already produce
+    # them on their own result objects; these are where they land.
+    #
+    # ``None`` is *unmeasured*, ``0`` is the auditable claim that nothing was
+    # discarded -- the distinction 002 drew for ``posts_dropped_no_url`` and the
+    # reason neither column defaults to zero. A run row is opened before its
+    # billable calls, so at insert time neither count exists yet.
+    documents_dropped: int | None = Field(default=None, ge=0)
+    duplicates_collapsed: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _completion_not_before_start(self) -> ResearchRun:
