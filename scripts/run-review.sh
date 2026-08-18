@@ -15,6 +15,10 @@
 # cost this project has spent the most rounds on. So: plain `codex exec`, pointed at the
 # request, told to follow it exactly.
 #
+# Note on the sandbox: --sandbox read-only is requested, and on a host where bubblewrap can
+# create a user namespace it is enforced. This machine is not such a host (see the preflight
+# below), so treat it as advisory. Nothing in this workflow relies on it.
+#
 # It does not live inside review-request.py. That script has one job -- emit a request it
 # has verified -- and it is unit-tested on the assumption that it never acts outward.
 # Every run of *this* script spends a paid API call, so it stays a separate command and
@@ -112,7 +116,21 @@ code should defend against.
 Begin your response by stating the exact commit hash you examined.
 PROMPT
 
-echo "==> running the reviewer (read-only sandbox, no session files persisted)"
+# --sandbox read-only asks codex to confine the reviewer to reads. On this machine it
+# cannot: bubblewrap needs an unprivileged user namespace, and Ubuntu's
+# kernel.apparmor_restrict_unprivileged_userns=1 refuses to create one, so codex prints a
+# warning and proceeds unconfined. Say so rather than let the flag imply a guarantee it is
+# not providing -- a check whose failure mode is a silent pass is decoration
+# (docs/LESSONS.md, lesson 7). Nothing here depends on the confinement: the reviewer is
+# asked to read and answer, and the operator is not an attacker under this project's
+# threat boundary. It is the claim that has to be accurate, not the sandbox.
+if command -v unshare >/dev/null 2>&1 && ! unshare --user --map-root-user true 2>/dev/null; then
+  echo "    note: unprivileged user namespaces are blocked on this host, so codex's"
+  echo "          --sandbox read-only is ADVISORY here, not enforced. The bubblewrap"
+  echo "          warning codex prints below is expected and is not an error."
+fi
+
+echo "==> running the reviewer (read-only requested, no session files persisted)"
 codex exec \
   -C "$repo_root" \
   --sandbox read-only \

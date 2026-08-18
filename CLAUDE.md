@@ -169,6 +169,10 @@ paid-call controls, or the rule that malformed shapes arrive as the module's own
 - **Run the round with `scripts/run-review.sh <ITEM> --round N [--previous-reviewed <sha>]`.** It
   generates the request (same gates, same refusals) and hands it to the local reviewer with
   `codex exec --sandbox read-only`, writing the answer to `GPT_REVIEW_RESPONSE_<ITEM>_r<N>.md`.
+  The sandbox flag is **advisory on this machine** — bubblewrap needs an unprivileged user
+  namespace and `kernel.apparmor_restrict_unprivileged_userns=1` refuses one, so codex warns and
+  runs unconfined. The script says so at the point of use rather than letting the flag imply a
+  guarantee. Nothing in the workflow depends on the confinement.
   It uses plain `codex exec` pointed at the request, **not `codex exec review`** — that subcommand
   builds its own diff and its own framing, which discards the contract the request spent PRs
   #18/#19/#20 building and turns the round into the unbounded hardening exercise the contract
