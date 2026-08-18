@@ -461,6 +461,16 @@ def _require_identifier(value: object, field: str) -> str:
     (SQLite's one-argument ``trim()`` strips U+0020 alone), and a test asserts they still
     agree over every codepoint Python calls whitespace.
 
+    **U+0000 is refused outright** (M1-606 review round 2, finding B1). SQLite's own
+    ``length()`` stops counting at an embedded NUL rather than counting the full Python
+    string, so ``004_pipeline_failure_events.sql``'s ``length(...) > 200`` guard cannot see
+    past one: a 202-character ``attempt_id`` with a NUL at position 2 reads as
+    ``length() == 1`` to the trigger and passes, while this function's own ``len()`` sees
+    202 and refuses it on read-back. Refusing the character here (and in both migration
+    triggers, via ``instr(..., char(0)) > 0``) closes the mismatch by removing the one
+    input the two counting functions disagree about, rather than trying to make SQLite
+    count matching Python's definition of length.
+
     Scoped to this item's writer rather than folded into :func:`_require_text`: the older
     identifier columns have never had this guard, and widening a shared validator would
     change what already-shipped writers accept. Noted in ``docs/M1-NOTES.md`` instead.
@@ -468,6 +478,8 @@ def _require_identifier(value: object, field: str) -> str:
     text = _require_text(value, field, max_length=_MAX_IDENTIFIER)
     if not text.strip():
         raise LifecycleError(f"{field} must not be blank")
+    if "\x00" in text:
+        raise LifecycleError(f"{field} must not contain a NUL character")
     return text
 
 

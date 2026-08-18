@@ -114,10 +114,18 @@ BEGIN
     -- insert an attempt_id the Python writer would have refused, and that row -- being
     -- append-only -- would be permanently unreadable through read_pipeline_failure_events,
     -- which rejects anything over the same limit.
-    SELECT RAISE(ABORT, 'pipeline_failure_events: attempt_id must be non-blank text of at most 200 characters')
+    --
+    -- The NUL check is round 2 of the same finding: SQLite's length() stops counting at
+    -- an embedded NUL rather than counting the full string, so a 202-character attempt_id
+    -- with a NUL early in it reads as length() == 1 to the guard above and passes, while
+    -- _require_identifier's Python len() sees 202 and refuses it on read-back -- the exact
+    -- unreadable-row failure the 200-character guard exists to close, reopened through the
+    -- one input the two counting functions disagree about.
+    SELECT RAISE(ABORT, 'pipeline_failure_events: attempt_id must be non-blank text of at most 200 characters and no NUL')
     WHERE NEW.attempt_id IS NULL
        OR typeof(NEW.attempt_id) <> 'text'
        OR length(NEW.attempt_id) > 200
+       OR instr(NEW.attempt_id, char(0)) > 0
        OR trim(NEW.attempt_id,
                char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
                     8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
@@ -239,10 +247,13 @@ BEGIN
     -- M1-603's round-5 defect reproduced by copying the idiom from before its fix. The
     -- 200-character ceiling is the same borrowed reasoning (M1-606 review round 1,
     -- finding B1): the two tables must keep disagreeing about nothing, length included.
-    SELECT RAISE(ABORT, 'forecast_records: attempt_id is required and must be at most 200 characters')
+    -- The NUL check is round 2 of the same finding -- see the sibling trigger's comment
+    -- for why length() alone cannot catch it.
+    SELECT RAISE(ABORT, 'forecast_records: attempt_id is required and must be at most 200 characters and no NUL')
     WHERE NEW.attempt_id IS NULL
        OR typeof(NEW.attempt_id) <> 'text'
        OR length(NEW.attempt_id) > 200
+       OR instr(NEW.attempt_id, char(0)) > 0
        OR trim(NEW.attempt_id,
                char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
                     8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,

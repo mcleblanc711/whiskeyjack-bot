@@ -1777,6 +1777,39 @@ asserts the 200-character row round-trips through `read_pipeline_failure_events`
 the finding named, not just the insert. Re-run against the round-1 code (fix reverted), both fail on
 exactly the reviewer's counterexample.
 
+### Review round 2 — `length()` does not count what Python counts
+
+Cross-model review of `1b533c1` (round-1's fix) returned one blocking finding: B1 reopened through a
+different vector. Reproduced by execution against that exact HEAD before any fix code was written:
+
+```
+attempt_id = "a\x00" + "b" * 200                     # 202 characters in Python
+sqlite length(attempt_id)                            -> 1
+INSERT via raw SQL                                    -> succeeds (length() guard sees 1, not 202)
+read_pipeline_failure_events(conn, attempt_id)        -> LifecycleError:
+    attempt_id is longer than the 200-character limit
+```
+
+SQLite's `length()` on TEXT stops counting at an embedded NUL rather than counting the full stored
+string, so the round-1 `length(NEW.attempt_id) > 200` guard cannot see past one: a 202-character
+identifier with a NUL at position 2 reads as `length() == 1` and passes, while `_require_identifier`'s
+Python `len()` sees the true 202 on read-back and refuses it — the exact unreadable-append-only-row
+failure round 1 closed, reopened through the one input the two counting functions disagree about
+rather than through a bigger number.
+
+**Fix.** Rather than chasing SQLite's counting semantics to match Python's, U+0000 is refused
+outright wherever an `attempt_id` is validated: `_require_identifier` now raises on any NUL, and both
+migration triggers gained `OR instr(NEW.attempt_id, char(0)) > 0` — `instr()` finds the NUL directly
+(verified by execution: `instr()` returns 2 for the counterexample above while `length()` still
+returns 1), so it does not depend on a length count either. Removing the one input class the two
+layers disagree about closes the mismatch structurally instead of adding a second special case.
+
+**Tests.** `test_a_record_attempt_id_with_an_embedded_nul_is_refused` and
+`test_a_failure_attempt_id_with_an_embedded_nul_is_refused` (`tests/unit/test_lifecycle.py`) pin the
+reviewer's counterexample refused at the raw-SQL boundary on both tables, and the second also asserts
+`record_pre_forecast_failure` refuses a short NUL-bearing identifier through the writer. Re-run against
+the round-2 code (fix reverted), both fail exactly as the reviewer's reproduction predicts.
+
 ### Standing risk — not verifiable offline
 
 The `attempt_id`-sharing contract (decision 2) is an interface promise to code that does not exist

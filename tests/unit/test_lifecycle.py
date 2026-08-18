@@ -3270,6 +3270,21 @@ def test_a_record_attempt_id_over_200_characters_is_refused(
     _insert_record_raw(ledger, "y" * 200)
 
 
+def test_a_record_attempt_id_with_an_embedded_nul_is_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """M1-606 review round 1, finding B1, round 2.
+
+    SQLite's `length()` stops counting at an embedded NUL rather than counting the full
+    string, so a 202-character attempt_id with a NUL early in it read as `length() == 1`
+    to the round-1 guard and passed -- reopening the exact unreadable-row failure that
+    guard exists to close. `instr(..., char(0)) > 0` finds the NUL directly instead of
+    relying on a length count that disagrees with Python's.
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_id"):
+        _insert_record_raw(ledger, "a\x00" + "b" * 200)
+
+
 @pytest.mark.parametrize("coerced", [42, 1.5])
 def test_an_affinity_coerced_attempt_id_is_stored_as_real_text(
     ledger: sqlite3.Connection, coerced: object
@@ -3357,6 +3372,30 @@ def test_a_failure_attempt_id_over_200_characters_is_refused(
 
     _seed_failure(ledger, attempt_id="y" * 200)
     assert len(read_pipeline_failure_events(ledger, "y" * 200)) == 1
+
+
+def test_a_failure_attempt_id_with_an_embedded_nul_is_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """M1-606 review round 1, finding B1, round 2 -- the other end of the join key.
+
+    Same SQLite `length()`-vs-NUL mismatch as the sibling test, on this table's own
+    guard. The writer's `_require_identifier` refuses U+0000 outright too, at whatever
+    length it appears -- the raw-SQL boundary and the writer must not disagree about
+    what a valid attempt_id is, the same reasoning the blank and length guards rest on.
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_id"):
+        _seed_failure(ledger, attempt_id="a\x00" + "b" * 200)
+    with pytest.raises(LifecycleError, match="attempt_id"):
+        record_pre_forecast_failure(
+            ledger,
+            attempt_id="a\x00b",
+            question_id=100,
+            tournament_id="minibench",
+            event_type="research_failed",
+            detail_code="provider_error",
+            occurred_at=WHEN,
+        )
 
 
 @pytest.mark.parametrize("bad_tournament", [None, "", "  ", "\t\n", b"x"])
