@@ -159,7 +159,24 @@ def _canonical_host(host: str) -> str:
     separator is not a spelling this function has to have an opinion about. The
     ``"."`` guard is not defending a reachable input -- it keeps the function
     total on its own terms rather than on a promise made by its caller.
+
+    **An IP literal is classified before UTS-46 runs** (cross-model review round
+    2, finding 1). An IPv6 zone ID (``fe80::1%eth0``) is opaque per RFC 4007
+    s11.2 -- it is not a DNS label -- but running it through ``uts46_remap``
+    first case-folds it and strips a trailing dot from it as if it were one,
+    turning two distinct scoped addresses (``%eth0`` and ``%ETH0``, or one with
+    a trailing dot) into one. ``ipaddress`` is tried first and, on success,
+    returned immediately with no further transform. A dotted IPv4 literal with a
+    trailing separator (``127.0.0.1.``) is not an IP literal on this first
+    attempt -- ``ipaddress`` rejects the trailing dot -- so it still falls
+    through to the mapping/strip path below and is re-classified afterwards.
     """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        pass  # Not an IP literal as given; try again after DNS-only normalization.
+    else:
+        return f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
     try:
         host = idna.uts46_remap(host, std3_rules=False)
     except idna.IDNAError:

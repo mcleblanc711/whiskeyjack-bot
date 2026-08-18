@@ -134,6 +134,32 @@ def test_canonical_output_revalidates_and_is_idempotent(url: str) -> None:
 @pytest.mark.parametrize(
     "url",
     [
+        # An IPv6 zone ID is opaque (RFC 4007 s11.2), not a DNS label -- unlike
+        # the root dot, UTS-46 must never touch it (cross-model review round 2,
+        # finding 1). Each is a fixed point: case and a trailing dot are part of
+        # the zone ID's own bytes, not DNS spellings of one host.
+        "https://[fe80::1%25ETH0]/report",
+        "https://[fe80::1%25eth0]/report",
+        "https://[fe80::1%25eth0.]/report",
+    ],
+)
+def test_ipv6_zone_id_is_a_fixed_point(url: str) -> None:
+    assert canonicalize_url(url) == url
+
+
+def test_ipv6_zone_id_spellings_stay_distinct() -> None:
+    # The regression this pins: UTS-46 case-folded the zone ID and stripped its
+    # trailing dot as if it were a DNS root dot, collapsing three distinct scoped
+    # addresses into one canonical form.
+    upper = canonicalize_url("https://[fe80::1%25ETH0]/report")
+    lower = canonicalize_url("https://[fe80::1%25eth0]/report")
+    dotted = canonicalize_url("https://[fe80::1%25eth0.]/report")
+    assert len({upper, lower, dotted}) == 3
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         # Standards-valid international hostnames model.py accepts: canonicalize
         # must accept them too (policy consolidation, not a second, stricter gate).
         "https://نامه‌ای.ir/a",

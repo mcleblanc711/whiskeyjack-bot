@@ -2090,3 +2090,34 @@ ahead of `/`. The plain document therefore wins three of the four cases. The ass
 what this rule actually claims — the survivor is one of the two documents exactly as retrieved,
 with its own `original_url` beside the shared canonical form — and the tiebreak keeps its own
 tests. No source change followed from it.
+
+### Review round 2 — an IPv6 zone ID is not a DNS label
+
+Cross-model review of `d32a4bc` (round-1 fixes plus a `master` merge) returned one blocking
+finding, and it was correct. Reproduced by execution against that exact HEAD before any fix code
+was written:
+
+```
+canonicalize_url("https://[fe80::1%25ETH0]/report")   -> "https://[fe80::1%25eth0]/report"
+canonicalize_url("https://[fe80::1%25eth0.]/report")  -> "https://[fe80::1%25eth0]/report"
+canonicalize_url("https://[fe80::1%25eth0]/report")   -> "https://[fe80::1%25eth0]/report"
+```
+
+`_canonical_host` ran `idna.uts46_remap` before attempting `ipaddress` classification at all, so a
+scoped IPv6 literal was folded as if its zone ID were a DNS label: case-folded (`ETH0` -> `eth0`)
+and dot-stripped (`eth0.` -> `eth0`). A zone ID is opaque per RFC 4007 s11.2 — its string form is
+implementation-dependent, not a DNS spelling — so three distinct scoped addresses collapsed to one
+canonical form, and dedup would have discarded two of the three attribution records.
+
+**Fix.** `ipaddress.ip_address(host)` is attempted *before* `uts46_remap` runs, and returned
+immediately on success — an IPv6 literal (zone ID included, verbatim) or a non-dotted IPv4 literal
+never reaches the DNS-mapping path at all. On failure it falls through to the existing
+mapping/strip/re-classify path unchanged, so `https://127.0.0.1./a` (not a valid IP literal on the
+first attempt, because of the trailing dot) still collapses to `https://127.0.0.1/a` exactly as
+before. The ordering decision above — mapping, then strip, then IP/domain split — still governs
+everything that *isn't* already a bare IP literal; this adds an earlier exit, not a new branch.
+
+**Tests.** `test_ipv6_zone_id_is_a_fixed_point` and `test_ipv6_zone_id_spellings_stay_distinct`
+(`tests/unit/test_dedup_freshness.py`) pin the three inputs above as fixed points that stay
+pairwise distinct. Re-run against the round-2 code (fix reverted), both fail on exactly the
+reviewer's counterexample.
