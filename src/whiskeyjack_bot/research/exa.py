@@ -878,13 +878,14 @@ def _validated_domains(include_domains: Sequence[str]) -> list[str]:
 
     Two further rules, both from cross-model review round 5.
 
-    **One terminal DNS root dot is normalized away** (finding 4).
-    ``canonicalize_url`` preserves it, so ``bls.gov.`` and ``bls.gov`` -- two
-    valid spellings of one DNS host -- canonicalized to two different strings and
-    never matched each other in either direction. Stripped here rather than in
-    ``canonicalize_url`` deliberately: that function's output *is* document
-    identity, and changing it would move the dedup key of every already-stored
-    document. See M1-310, filed for that question.
+    **One terminal DNS root dot is normalized away** (finding 4), now by
+    ``canonicalize_url`` itself. ``bls.gov.`` and ``bls.gov`` -- two valid
+    spellings of one DNS host -- canonicalized to two different strings and never
+    matched each other in either direction. Round 5 stripped the dot locally here,
+    deliberately leaving canonical form alone on a review branch and filing the
+    identity question as M1-310; **M1-310 settled it in the canonicalizer** (D32),
+    so the local strip is gone and both sides of every comparison below get the
+    rule from the one function that owns it.
 
     **Single-label entries are refused** (finding 5). ``include_domains=("com",)``
     was accepted, and :func:`_matches_official_domain`'s subdomain rule then
@@ -914,23 +915,12 @@ def _validated_domains(include_domains: Sequence[str]) -> list[str]:
             raise ExaFallbackError(_BAD_DOMAIN) from None
         if host is None:
             raise ExaFallbackError(_BAD_DOMAIN)
-        host = _without_root_dot(host)
-        # After the dot is gone, so `gov.` is refused for the same reason `gov` is.
+        # Canonicalization has already removed the root dot (M1-310), so `gov.` is
+        # refused here for the same reason `gov` is, on the same one-label test.
         if "." not in host:
             raise ExaFallbackError(_BAD_DOMAIN)
         canonical.append(host)
     return canonical
-
-
-def _without_root_dot(host: str) -> str:
-    """Return ``host`` without a single terminal DNS root dot.
-
-    ``bls.gov.`` and ``bls.gov`` name the same host; ``canonicalize_url`` keeps
-    whichever the provider or the caller wrote (cross-model review round 5,
-    finding 4). Exactly one dot is removed, so ``bls.gov..`` -- which is not a
-    valid spelling of anything -- still fails the checks it should.
-    """
-    return host[:-1] if host.endswith(".") else host
 
 
 def _matches_official_domain(canonical_url: str, domains: Sequence[str]) -> bool:
@@ -950,20 +940,19 @@ def _matches_official_domain(canonical_url: str, domains: Sequence[str]) -> bool
     allowlist reaching this function, and only one of the two forms would be
     fixed by it (a U-label entry needs IDNA, not ``str.lower``).
 
-    The **result** host is the one exception, and the asymmetry is the point:
-    ``domains`` is ours and arrives validated, while the URL is provider-derived
-    and ``canonicalize_url`` preserves a terminal DNS root dot. So
-    ``https://bls.gov./report`` was labelled ``web`` against a ``bls.gov``
-    allowlist (cross-model review round 5, finding 4). One root dot is stripped
-    from the result host on arrival; ``domains`` had its stripped in
-    :func:`_validated_domains`, where the rest of its normalization happens.
+    The terminal DNS root dot used to need handling here as well: the URL is
+    provider-derived, ``canonicalize_url`` preserved whichever spelling arrived,
+    and ``https://bls.gov./report`` was therefore labelled ``web`` against a
+    ``bls.gov`` allowlist (cross-model review round 5, finding 4). **M1-310 moved
+    that rule into ``canonicalize_url``** (D32), so both sides now arrive without
+    the dot and the local strip that round 5 added has been removed rather than
+    kept as a second copy of one rule.
 
     Total: any string pair is a valid question with a ``bool`` answer.
     """
     host = urlsplit(canonical_url).hostname
     if host is None:
         return False
-    host = _without_root_dot(host)
     return any(host == domain or host.endswith(f".{domain}") for domain in domains)
 
 

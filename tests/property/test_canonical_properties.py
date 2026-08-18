@@ -9,14 +9,22 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from urllib.parse import urlsplit
 
 import pytest
 from hypothesis import given
-from strategies import ENCODABLE_TEXT, SURROGATE_TEXT, URL_CANDIDATES
+from strategies import (
+    DISTINCT_HOSTS,
+    ENCODABLE_TEXT,
+    ROOT_DOT_SUFFIXES,
+    SURROGATE_TEXT,
+    URL_CANDIDATES,
+    host_spellings,
+)
 
 from whiskeyjack_bot.research.canonical import _BAD_URL, CanonicalizationError, canonicalize_url
 from whiskeyjack_bot.research.hashing import content_sha256, normalize_content
-from whiskeyjack_bot.research.model import validate_document
+from whiskeyjack_bot.research.model import _require_http_url, validate_document
 
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 
@@ -82,6 +90,89 @@ def test_rejection_never_echoes_the_input(url: str) -> None:
         canonicalize_url(url)
     except CanonicalizationError as error:
         assert str(error) == _BAD_URL
+
+
+# --- the terminal DNS root dot (M1-310, D32) --------------------------------
+#
+# Each of the four was run against the pre-M1-310 canonical.py first. Three fail
+# there; the last passes both ways and is kept for the reason its docstring gives.
+# Saying which is which is how a reader knows the suite was checked rather than
+# assumed -- M1-303 shipped three properties that passed on the broken code.
+#
+# Re-run against the *round-1* code (which stripped ASCII `.` before IDNA encoding
+# rather than mapping UTS-46 separators first) all four fail, on the counterexample
+# `suffix_left='' / suffix_right='。'`. That run is the point of the separator
+# dimension in ROOT_DOT_SUFFIXES: these properties were already asserting the right
+# statements over an input space that could not reach the defect, which is the
+# M1-303 lesson one level up -- a property that discriminates perfectly still proves
+# nothing if the generator cannot produce the failing case.
+
+
+@given(URL_CANDIDATES)
+def test_the_canonical_host_never_ends_in_a_root_dot(url: str) -> None:
+    """Fails pre-fix. The canonical host is one spelling, so it is one dedup key."""
+    canonical = _canonicalize(url)
+    if canonical is None:
+        return
+    host = urlsplit(canonical).hostname
+    assert host is not None
+    assert not host.endswith(".")
+
+
+@given(host_spellings())
+def test_the_two_spellings_of_a_host_canonicalize_identically(pair: tuple[str, str]) -> None:
+    """Fails pre-fix. The dotted and dotless spellings of one DNS host are one page,
+    and the strategy draws the two spellings independently so the pair can actually
+    disagree -- a pair derived from a single string holds on the broken code."""
+    left, right = pair
+    canonical_left = _canonicalize(left)
+    canonical_right = _canonicalize(right)
+    assert canonical_left is not None and canonical_right is not None
+    assert canonical_left == canonical_right
+
+
+@given(DISTINCT_HOSTS, DISTINCT_HOSTS, ROOT_DOT_SUFFIXES, ROOT_DOT_SUFFIXES)
+def test_distinct_hosts_stay_distinct(
+    left: str, right: str, suffix_left: str, suffix_right: str
+) -> None:
+    """Fails pre-fix, though it was written for the *other* direction.
+
+    The direction it was written for: normalizing must not merge two hosts that
+    differ by more than the dot. ``notbls.gov`` is in the pool precisely because a
+    sloppier rule is how a suffix coincidence becomes a false ``official``
+    attribution, and that half does hold on the pre-fix code.
+
+    It fails there anyway, because the **iff** also covers the same-host case:
+    ``bls.gov.`` and ``bls.gov`` are one host, and the pre-fix canonicalizer called
+    them two. Both halves are one statement about identity, so they are asserted as
+    one -- and the failing run is what proved the first half was not vacuous.
+
+    The separators are drawn from every spelling UTS-46 folds, not a boolean: with
+    an ASCII-only pool this still passed after review round 1's defect was found."""
+    spelled_left = f"{left}{suffix_left}"
+    spelled_right = f"{right}{suffix_right}"
+    canonical_left = canonicalize_url(f"https://{spelled_left}/report")
+    canonical_right = canonicalize_url(f"https://{spelled_right}/report")
+    assert (canonical_left == canonical_right) == (left == right)
+
+
+@given(URL_CANDIDATES)
+def test_canonicalization_accepts_exactly_what_the_gate_accepts(url: str) -> None:
+    """Passes both ways, kept: the regression pin on *where* the strip runs.
+
+    The gate runs first and unconditionally, so no normalization step can rescue a
+    string that is not a URL. Written as an iff rather than one direction, because
+    the failure this guards against is bidirectional: a strip performed before
+    ``_require_http_url`` would make ``https://a../x`` acceptable, and a strip that
+    could raise would refuse something the schema accepts (``_canonical_host``'s
+    docstring claims it cannot -- this is that claim under a fuzzer)."""
+    try:
+        _require_http_url(url)
+    except ValueError:
+        gate_accepts = False
+    else:
+        gate_accepts = True
+    assert (_canonicalize(url) is not None) == gate_accepts
 
 
 @given(ENCODABLE_TEXT)
