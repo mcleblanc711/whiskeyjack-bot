@@ -25,8 +25,10 @@ described, so a review could answer it against a different tree and nothing in t
 document contradicted them -- M1-308's round 6 was spent that way, on a request whose
 embedded diff was demonstrably post-fix. Naming the reviewed commit (``--previous-reviewed``)
 fixes only the *other* end of that; both ends have to be pinned for the round to be
-falsifiable. The diffs stay embedded: the reviewer is a pasted-context model with no
-filesystem, so an inspection command it cannot run is not a substitute for the code.
+falsifiable. The diffs stay embedded: round 7 demonstrably read file bodies out of the
+embedded diff. The reviewer runs locally (``scripts/run-review.sh``) and can read the
+repo, so that is not about capability -- a reviewer handed the code reads it, and a
+reviewer told where to find the code may not.
 
 Running it also runs the four toolchain gates and refuses to emit anything if one
 fails, so the request cannot claim a green branch that is not green. It requires a clean
@@ -51,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
@@ -82,12 +85,23 @@ offline-first (tests run with sockets disabled)."""
 # checked, so running it on a red branch produced a review request that opened with a
 # falsehood (cross-model review, round 1). A generator may not assert what it has not
 # verified: either it runs them, or it says it did not.
+# Ordered cheapest first. All four still run and every failure is reported -- a review
+# request wants the whole picture in one pass -- but a formatting slip should surface in
+# under a second rather than behind the suite. Measured: 0.5s + 0.1s + 1.0s, then ~85s.
 GATES: Final = (
-    ("pytest", ("uv", "run", "pytest", "-q")),
     ("ruff check", ("uv", "run", "ruff", "check", ".")),
     ("ruff format --check", ("uv", "run", "ruff", "format", "--check", ".")),
     ("mypy --strict src", ("uv", "run", "mypy", "--strict", "src")),
+    ("pytest", ("uv", "run", "pytest", "-q")),
 )
+
+# The hypothesis profile the gate run is pinned to, overriding whatever is exported in the
+# author's shell. tests/property/conftest.py also registers `fast` (25 draws) for the inner
+# loop, and a gate run that inherited it would report a green suite at an eighth of the
+# search the reviewer is being told about. `dev` rather than `ci` because the request is
+# generated locally and a randomized search is where new counterexamples come from; the
+# profile that actually ran is printed in the request either way, so the claim is checkable.
+GATE_HYPOTHESIS_PROFILE: Final = "dev"
 
 NOT_VERIFIED: Final = """\
 > **NOT VERIFIED.** This request was generated with `--no-verify`; the toolchain gates
@@ -312,10 +326,22 @@ def _verify_gates() -> str:
     lines: list[str] = []
     failures: list[str] = []
 
+    # Pinned, not inherited. The author's shell may export HYPOTHESIS_PROFILE=fast for the
+    # inner loop, and a gate run that picked it up would report a green suite at 25 draws
+    # while the request told the reviewer the properties had been fuzzed. A generator may
+    # not assert what it has not verified (docs/LESSONS.md, lesson 7).
+    gate_env = {**os.environ, "HYPOTHESIS_PROFILE": GATE_HYPOTHESIS_PROFILE}
+
     for label, command in GATES:
         print(f"  running {label} ...", file=sys.stderr, flush=True)
         result = subprocess.run(
-            command, cwd=REPO_ROOT, capture_output=True, text=True, check=False, encoding="utf-8"
+            command,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            env=gate_env,
         )
         if result.returncode == 0:
             lines.append(f"- `{label}` — **pass**")
@@ -333,6 +359,10 @@ def _verify_gates() -> str:
             "will say plainly that the gates were not run."
         )
 
+    lines.append(
+        f"- hypothesis profile for the `pytest` gate: **`{GATE_HYPOTHESIS_PROFILE}`** "
+        "(pinned by the generator, not inherited from the shell)"
+    )
     return "\n".join(lines)
 
 
@@ -638,8 +668,9 @@ def main(argv: list[str] | None = None) -> int:
     ]
 
     # The diffs stay embedded, and the heading now names the pinned range rather than a
-    # symbolic one. The reviewer is a pasted-context model with no filesystem: an
-    # inspection command it cannot run would leave it reviewing a diffstat.
+    # symbolic one. Not because the reviewer cannot read the repo -- it runs locally and
+    # can -- but because round 7 read file bodies out of this diff, and a command it has
+    # to choose to run would leave it reviewing a diffstat.
     if reviewed_revision is not None:
         out += [
             f"# Remediation diff (`git diff {remediation_range}`)",
