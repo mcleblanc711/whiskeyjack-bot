@@ -127,6 +127,25 @@ URL_CANDIDATES = st.one_of(
             "https://example.org",
             "http://example.org:80/",
             "https://[2001:db8::1]:8443/x",
+            # Terminal DNS root dots (M1-310). Present here so the *existing*
+            # properties -- idempotence, revalidation, own-error-only, no-leak --
+            # cover the spelling the canonicalizer now rewrites, not only the
+            # new properties written for it.
+            "https://bls.gov./x",
+            "https://127.0.0.1./a",
+            "https://xn--bcher-kva.de./a",
+            "https://bücher.de./a",
+            # The same dot in its three non-ASCII spellings (review round 1,
+            # finding 1). UTS-46 maps these onto `.`, so they were accepted by the
+            # gate, survived an ASCII-only strip, and *became* a terminal dot
+            # during IDNA encoding -- after the only code that removed one had run.
+            "https://bls.gov。/x",
+            "https://bls.gov．/x",
+            "https://bls.gov｡/x",
+            "https://127.0.0.1。/a",
+            "https://bücher.de。/a",
+            "https://a..b/x",  # refused: an empty label, not a root dot
+            "https://a。。b/x",  # refused for the same reason, in the other spelling
             # Not URLs at all, or URLs this validator refuses:
             "",
             "not a url",
@@ -144,6 +163,57 @@ URL_CANDIDATES = st.one_of(
     ),
     st.text(max_size=20),
 )
+
+
+# Hosts that are valid with or without a terminal root dot, for M1-310. Deliberately
+# mixed: a bare domain, a subdomain, an IPv4 literal (the dot is stripped before the
+# IP/domain split, so it has to hold there too) and both spellings of one IDN.
+ROOT_DOT_HOSTS = st.sampled_from(
+    [
+        "bls.gov",
+        "data.bls.gov",
+        "example.org",
+        "127.0.0.1",
+        "xn--bcher-kva.de",
+        "bücher.de",
+    ]
+)
+
+# The same pool minus the U-label, whose A-label is already in it: these are hosts
+# that must stay *distinct* after canonicalization, and `bücher.de` is not distinct
+# from `xn--bcher-kva.de` -- it is the same host, which is the point of folding it.
+# `notbls.gov` is the suffix coincidence: dropping the dot must not make it a match.
+DISTINCT_HOSTS = st.sampled_from(
+    ["bls.gov", "data.bls.gov", "notbls.gov", "example.org", "127.0.0.1", "xn--bcher-kva.de"]
+)
+
+
+# Every spelling of "one terminal DNS root dot, or none". The three non-ASCII
+# entries are the separators UTS-46 maps onto `.` (U+3002, U+FF0E, U+FF61); the
+# gate accepts all three, so all three are spellings of one host and belong in any
+# pool that claims to enumerate them. Generating only "" and "." is what let review
+# round 1, finding 1 through: the properties below were already asserting the right
+# statements, over an input space that could not express the counterexample.
+ROOT_DOT_SUFFIXES = st.sampled_from(["", ".", "。", "．", "｡"])
+
+
+@st.composite
+def host_spellings(draw: st.DrawFn) -> tuple[str, str]:
+    """One host, returned as two URLs whose root-dot spelling is drawn independently.
+
+    The independence is the entire property. A pair derived from one string carries
+    the same spelling on both sides and so holds on the pre-fix code -- the mistake
+    ``test_the_two_spellings_of_a_host_select_each_other`` records having made in
+    M1-303's round 5, and the reason three of that item's ten new properties proved
+    nothing. The *separator* is drawn independently for the same reason, one round
+    later: with both sides restricted to ASCII the pair could never straddle the
+    ASCII/Unicode boundary, which is exactly where the surviving defect was.
+    """
+    host = draw(ROOT_DOT_HOSTS)
+    path = draw(st.sampled_from(["/", "/report", "/a/b?q=1"]))
+    left = f"{host}{draw(ROOT_DOT_SUFFIXES)}"
+    right = f"{host}{draw(ROOT_DOT_SUFFIXES)}"
+    return f"https://{left}{path}", f"https://{right}{path}"
 
 
 @st.composite

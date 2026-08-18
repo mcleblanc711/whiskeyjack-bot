@@ -415,6 +415,20 @@ document, in a module owned by already-merged M1-305, on a branch scoped to M1-3
 filed for that question. Recorded plainly: this fix corrects the attribution, and leaves the dedup
 consequence open behind a backlog row.
 
+**Superseded by M1-310 (D32).** That item answered the question this one deferred: the strip now
+lives in `canonicalize_url`, so the two-places arrangement above is one rule in one function, and
+`exa._without_root_dot` and both of its call sites are gone. The round-5 tests here keep all their
+original cases and still pass.
+
+Worth recording for whoever reads this helper's deletion later: **it was covering more than the
+first version of M1-310 replaced.** `_without_root_dot` ran *after* `canonicalize_url`, so it also
+caught the ASCII dot that IDNA encoding produces from the UTS-46 separators (U+3002, U+FF0E,
+U+FF61) — which M1-310's first implementation, stripping ASCII *before* encoding, did not. Its
+review round 1 caught the resulting `official` → `web` regression and moved the UTS-46 mapping
+ahead of the strip. Position was doing load-bearing work here that neither this note nor M1-310's
+first draft had noticed. Left as written otherwise — this is the record of what M1-303 shipped,
+not of what is true today.
+
 **5. A single-label allowlist manufactured false official attribution.** `include_domains=("com",)`
 was accepted, and the subdomain rule then labelled `https://attacker.com/report` **official**.
 Round 4 declined this as allowlist policy beyond the finding. That was wrong, and the reversal is
