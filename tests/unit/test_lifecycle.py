@@ -3255,6 +3255,21 @@ def test_a_new_record_must_carry_a_non_blank_attempt_id(
         _insert_record_raw(ledger, bad_attempt)
 
 
+def test_a_record_attempt_id_over_200_characters_is_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """M1-606 review round 1, finding B1, the other end of the join key.
+
+    Without this ceiling the two tables could disagree about what a valid attempt_id is
+    by length rather than blankness -- the same failure mode
+    `test_both_attempt_id_columns_agree_with_the_writer_on_what_blank_means` guards for
+    blank. 200 is still accepted.
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_id"):
+        _insert_record_raw(ledger, "x" * 201)
+    _insert_record_raw(ledger, "y" * 200)
+
+
 @pytest.mark.parametrize("coerced", [42, 1.5])
 def test_an_affinity_coerced_attempt_id_is_stored_as_real_text(
     ledger: sqlite3.Connection, coerced: object
@@ -3323,6 +3338,25 @@ def test_a_failure_must_carry_a_non_blank_attempt_id(
     # that can never be corrected.
     with pytest.raises(sqlite3.IntegrityError, match="attempt_id must be non-blank"):
         _seed_failure(ledger, attempt_id=bad_attempt)  # type: ignore[arg-type]
+
+
+def test_a_failure_attempt_id_over_200_characters_is_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """M1-606 review round 1, finding B1.
+
+    Raw SQL accepted any nonblank attempt_id, with no ceiling matching
+    `lifecycle._require_identifier`'s 200-character limit. So a >200-character attempt_id
+    could be written directly -- bypassing the writer -- and the row, being append-only,
+    would be permanently unreadable through `read_pipeline_failure_events`, which refuses
+    anything over that same limit. 200 is still accepted, and the row it produces is
+    readable back through the public reader, closing the loop the finding named.
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_id"):
+        _seed_failure(ledger, attempt_id="x" * 201)
+
+    _seed_failure(ledger, attempt_id="y" * 200)
+    assert len(read_pipeline_failure_events(ledger, "y" * 200)) == 1
 
 
 @pytest.mark.parametrize("bad_tournament", [None, "", "  ", "\t\n", b"x"])

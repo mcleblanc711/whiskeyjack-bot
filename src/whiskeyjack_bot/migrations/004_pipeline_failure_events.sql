@@ -108,9 +108,16 @@ BEGIN
     -- silently reopened hole. typeof() is checked too: TEXT affinity converts a number
     -- to text but leaves a blob a blob, and a blob identifier is a row this schema's own
     -- reader cannot read back.
-    SELECT RAISE(ABORT, 'pipeline_failure_events: attempt_id must be non-blank text')
+    --
+    -- The 200-character ceiling mirrors lifecycle.py's _require_identifier /
+    -- _MAX_IDENTIFIER (M1-606 review round 1, finding B1): without it, raw SQL could
+    -- insert an attempt_id the Python writer would have refused, and that row -- being
+    -- append-only -- would be permanently unreadable through read_pipeline_failure_events,
+    -- which rejects anything over the same limit.
+    SELECT RAISE(ABORT, 'pipeline_failure_events: attempt_id must be non-blank text of at most 200 characters')
     WHERE NEW.attempt_id IS NULL
        OR typeof(NEW.attempt_id) <> 'text'
+       OR length(NEW.attempt_id) > 200
        OR trim(NEW.attempt_id,
                char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
                     8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
@@ -229,10 +236,13 @@ BEGIN
     -- it must stay the same: the two tables are the two ends of one join key. See that
     -- trigger for why the whitespace set is spelled out instead of using one-argument
     -- trim() -- a '\n\t' attempt_id passed the first draft of this clause, which is
-    -- M1-603's round-5 defect reproduced by copying the idiom from before its fix.
-    SELECT RAISE(ABORT, 'forecast_records: attempt_id is required')
+    -- M1-603's round-5 defect reproduced by copying the idiom from before its fix. The
+    -- 200-character ceiling is the same borrowed reasoning (M1-606 review round 1,
+    -- finding B1): the two tables must keep disagreeing about nothing, length included.
+    SELECT RAISE(ABORT, 'forecast_records: attempt_id is required and must be at most 200 characters')
     WHERE NEW.attempt_id IS NULL
        OR typeof(NEW.attempt_id) <> 'text'
+       OR length(NEW.attempt_id) > 200
        OR trim(NEW.attempt_id,
                char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192,
                     8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,

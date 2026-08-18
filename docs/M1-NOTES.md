@@ -1747,6 +1747,36 @@ and it is what makes mutation testing practical here at all.
   `_require_utc`/`_utc_text` this module already uses for `lifecycle_events`; 003's M1-NOTES entry on
   this (non-blocking, round 5) applies unchanged and is not re-litigated here.
 
+### Review round 1 — the schema had no ceiling matching the reader's
+
+Cross-model review of `1ef9661` returned one blocking finding, and it was correct. Reproduced by
+execution against that exact HEAD before any fix code was written:
+
+```
+INSERT a pipeline_failure_events row with a 201-character attempt_id via raw SQL -> succeeds
+read_pipeline_failure_events(conn, that attempt_id)                              -> LifecycleError:
+    attempt_id is longer than the 200-character limit
+```
+
+Both new `BEFORE INSERT` triggers guarded blankness and type but not length, while
+`_require_identifier` (the writer's own gate, and the reader's) refuses anything over
+`_MAX_IDENTIFIER = 200`. So raw SQL — an intended schema-enforcement boundary in this branch, the
+same one the whole 004 truth table is driven against — could admit a row the public reader could
+never retrieve, on a table that is append-only by construction: unlike a validation gap on a mutable
+table, there is no later UPDATE that repairs it.
+
+**Fix.** Both triggers (`pipeline_failure_events_validate_on_insert`'s `attempt_id` clause and
+`forecast_records_require_draft_on_insert`'s) gained `OR length(NEW.attempt_id) > 200`, matching the
+writer's ceiling exactly — the same "the two tables must not disagree" reasoning the blank-identifier
+guard was already built on, extended from blankness to length.
+
+**Tests.** `test_a_failure_attempt_id_over_200_characters_is_refused` and
+`test_a_record_attempt_id_over_200_characters_is_refused`
+(`tests/unit/test_lifecycle.py`) pin 201 refused and 200 accepted at both ends, and the first also
+asserts the 200-character row round-trips through `read_pipeline_failure_events` — closing the loop
+the finding named, not just the insert. Re-run against the round-1 code (fix reverted), both fail on
+exactly the reviewer's counterexample.
+
 ### Standing risk — not verifiable offline
 
 The `attempt_id`-sharing contract (decision 2) is an interface promise to code that does not exist
