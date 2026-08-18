@@ -174,19 +174,21 @@ def test_tmp_path_really_lands_on_tmpfs(
 
     Every test above exercises the decision with a stand-in root, so all of them would
     still pass if the hook were never wired into the real session. This is the one that
-    fails when it is not -- which is why the two skips below enumerate the *deliberate*
-    overrides only. An unset temp root on a machine that has a usable tmpfs is the hook
-    not running, and that must fail rather than skip: a skip here is exactly the "test
-    that proves nothing" this suite has shipped before (docs/LESSONS.md, lesson 5).
-    """
-    if request.config.option.basetemp is not None:
-        pytest.skip("--basetemp was given for this run")
-    root = conftest._tmpfs_temproot()
-    if root is None:
-        pytest.skip("no tmpfs on this platform")
-    configured = os.environ.get("PYTEST_DEBUG_TEMPROOT")
-    if configured is not None and configured != str(root):
-        pytest.skip(f"temp root deliberately overridden for this run: {configured!r}")
+    fails when it is not.
 
-    assert configured == str(root), "the temp-root hook did not run"
+    It keys off ``config.whiskeyjack_temproot_source`` rather than off the environment,
+    because the environment cannot tell the two cases apart. A shell exporting
+    ``PYTEST_DEBUG_TEMPROOT=/dev/shm`` -- which is what .claude/settings.local.json does
+    on this project -- puts the temp root on tmpfs whether the hook runs or not, so an
+    env-based assertion here passes against a hook whose body has been deleted. Observed,
+    not theorized: it silently swallowed a mutation on 2026-08-17. When the hook did not
+    make the choice this skips and says which branch did, instead of quietly agreeing.
+    """
+    source = getattr(request.config, "whiskeyjack_temproot_source", None)
+    assert source is not None, "pytest_configure did not run at all"
+    if source != "hook":
+        pytest.skip(f"temp root not chosen by the hook for this run: {source}")
+
+    root = conftest._tmpfs_temproot()
+    assert os.environ.get("PYTEST_DEBUG_TEMPROOT") == str(root)
     assert str(tmp_path).startswith(str(root) + os.sep)

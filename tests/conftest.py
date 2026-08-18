@@ -71,14 +71,26 @@ def pytest_configure(config: pytest.Config) -> None:
     An explicit ``--basetemp``, an already-set ``PYTEST_DEBUG_TEMPROOT``, a platform with
     no ``/dev/shm`` (macOS, Windows) and a tmpfs below the free-space floor all keep
     pytest's own default.
+
+    Which of those happened is recorded on the config as
+    ``whiskeyjack_temproot_source``. That exists for one test: without it, a shell that
+    already exports ``PYTEST_DEBUG_TEMPROOT=/dev/shm`` makes the end-to-end check pass
+    whether this hook runs or not -- the temp root is on tmpfs either way. A test that
+    cannot tell the two apart is testing nothing (docs/LESSONS.md, lesson 5), and the
+    project's own .claude/settings.local.json shim is exactly the shell that triggers it.
     """
     if config.option.basetemp is not None:
+        config.whiskeyjack_temproot_source = "basetemp"  # type: ignore[attr-defined]
         return
     if os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+        config.whiskeyjack_temproot_source = "preset"  # type: ignore[attr-defined]
         return
     root = _tmpfs_temproot()
-    if root is not None:
-        os.environ["PYTEST_DEBUG_TEMPROOT"] = str(root)
+    if root is None:
+        config.whiskeyjack_temproot_source = "unavailable"  # type: ignore[attr-defined]
+        return
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(root)
+    config.whiskeyjack_temproot_source = "hook"  # type: ignore[attr-defined]
 
 
 @pytest.fixture
