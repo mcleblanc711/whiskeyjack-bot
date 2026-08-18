@@ -33,6 +33,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Claim | Held by | Notes |
 | --- | --- | --- |
 | Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. Claimed by M1-303 on 2026-07-27 and **released unused**: the Exa adapter calls the HTTP API through `httpx`, already a declared dependency, rather than adding `exa-py` (which would pull in `openai`, `requests` and `python-dotenv` for one POST). Releasing a claim you did not spend is part of holding it. |
+| Workflow / test-infrastructure change | **test/tmpfs-temp-root** | Lesson 1: a workflow change is a track and takes a slot. This one moves pytest's temp root to tmpfs (`tests/conftest.py`): full suite 497.7s → 81.3s, `test_lifecycle.py` 96.5s → 3.2s. It is landing **mid-wave**, deliberately — it touches no file any live branch touches (checked: none of M1-306/310/606 modify `tests/conftest.py` or `pyproject.toml`), and holding it would make every remaining round of this wave pay 8 minutes a gate run. **Say so in the next review request on each live branch:** it changes where temp files land, nothing about what is asserted. |
 | Next free migration number | *free* | `001_initial.sql`, `002_research_document_fields.sql` and `003_lifecycle_events.sql` are taken; `003` landed with M1-603 and is now immutable on master. Next free is `004`. CI enforces uniqueness and immutability (`.github/scripts/check-migrations.sh`), but only *after* you push. |
 
 ## Worktrees
@@ -40,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-308 | feat/m1-308-x-account-allowlist | whiskeyjack-m1-308 | no | none | 2026-07-27 |
+| workflow | test/tmpfs-temp-root | whiskeyjack-tmpfs-temp-root | no | none | 2026-08-17 |
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per
