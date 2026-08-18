@@ -112,6 +112,43 @@ PYTEST_DEBUG_TEMPROOT=/dev/shm uv run pytest -q      # now the default, via pyte
 tell is the ratio between the projection and the measurement: a 6× miss on "cache the expensive
 object" means the expense was not in the object.
 
+### The root cause, and why CI never showed it
+
+```bash
+cat /sys/block/sda/queue/rotational   # 1
+cat /sys/block/sda/device/model       # TOSHIBA DT01ACA2
+python3 - <<'PY'
+import os, time, tempfile
+for label, d in (("project dir", "/home/cleblanc/projects"), ("/dev/shm", "/dev/shm")):
+    fd, path = tempfile.mkstemp(dir=d); t = time.perf_counter()
+    for _ in range(50): os.write(fd, b"x" * 4096); os.fsync(fd)
+    print(f"{label:12} {(time.perf_counter()-t)/50*1000:7.3f} ms per fsync")
+    os.close(fd); os.unlink(path)
+PY
+```
+
+| | ms per fsync |
+| --- | ---: |
+| project directory (`/dev/sda2`, ext4) | **49.638** |
+| `/dev/shm` (tmpfs) | **0.013** |
+
+**The development machine's only drive is a 7200 RPM hard disk.** 49.6 ms is one platter
+rotation plus a seek — the physical price of durability here, roughly 50–500× what an SSD
+charges. That single number explains the whole 497.7s, and it is why the fix is a filesystem
+and not a fixture.
+
+**And CI would have told you there was no problem.** `quality-gate` has run in 92–118s
+throughout, before and after this change, because GitHub's runners are SSD-backed:
+
+```bash
+gh run list --workflow=ci.yml --limit 12 --json headBranch,startedAt,updatedAt
+```
+
+So the honest scope of this lesson is *local development*, and the transferable part is the
+trap, not the tmpfs: **a profile is only valid in the environment the work happens in.** The
+suite was 5× slower where it was being written than where it was being checked, and the number
+that was easy to look up was the one that said nothing was wrong.
+
 `PYTEST_DEBUG_TEMPROOT` rather than `--basetemp` matters and is not a detail — pytest still
 creates its own per-run numbered directory underneath, so parallel worktrees keep separate roots.
 `--basetemp` names one shared path and wipes it on entry, which two concurrent worktrees would do
