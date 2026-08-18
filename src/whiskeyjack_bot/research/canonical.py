@@ -20,6 +20,18 @@ lossy step -- dropping a documented tracking-parameter allowlist -- exists solel
 because dedup keys on ``canonical_url`` and two reports differing only by a
 ``utm_*`` tag must collapse.
 
+A **terminal DNS root dot is removed** from the host (D32, backlog M1-310), in
+**any of its four IDNA-equivalent spellings** -- ASCII ``.`` plus the U+3002,
+U+FF0E and U+FF61 separators that UTS-46 maps onto it. It is not a second lossy
+step in that sense: ``bls.gov.``, ``bls.gov。`` and ``bls.gov`` are spellings of
+one host under the DNS standards, so removing it discards a spelling rather than
+an identity -- and ``original_url`` keeps that spelling regardless. The same dedup
+argument as ``utm_*`` applies, plus one the tracking tags do not have: the
+duplicate identity was also reaching *attribution*, where two spellings of one
+official domain failed to match each other (M1-303, review round 5). Recognizing
+only the ASCII spelling reproduced that same attribution failure through the
+Unicode separators (M1-310, review round 1) -- see ``_canonical_host``.
+
 The gate is *reused*, not re-implemented: ``canonicalize_url`` runs
 ``model._require_http_url`` before normalizing, so there is one definition of
 "is this a URL at all", and a second hand-rolled copy cannot drift from it.
@@ -116,7 +128,61 @@ def _canonical_host(host: str) -> str:
     reassemble into an authority) and everything else to ``idna`` (IDNA 2008
     A-label, lowercased). ``uts46=True`` folds case/width so a mixed-case IDN host
     canonicalizes; a host that already passed the stricter gate cannot fail here.
+
+    **One terminal DNS root dot is stripped** (D32, backlog M1-310).
+    ``bls.gov.`` and ``bls.gov`` are two spellings of one host, and preserving the
+    dot made them two dedup keys for one page -- and, in M1-303, two hosts that
+    never matched each other for official-source attribution. Stripped ahead of
+    the IP/domain split rather than inside the ``idna`` branch, so the dotted IPv4
+    spelling (``127.0.0.1.``) collapses on the same rule instead of becoming a
+    second, undocumented identity. IPv6 cannot carry one: ``urlsplit`` hands
+    ``::1`` over unbracketed and ``::1.`` never passes the gate.
+
+    **The separator is not only ASCII ``.``** (cross-model review round 1,
+    finding 1). UTS-46 maps U+3002, U+FF0E and U+FF61 onto ``.`` as well, so
+    ``bls.gov。`` is a fourth spelling of the same host. Stripping ASCII first and
+    encoding afterwards got this exactly backwards: ``idna.encode(uts46=True)``
+    applies that mapping *itself*, so the strip ran before the separator existed
+    and ``https://bls.gov。/report`` canonicalized to ``https://bls.gov./report``
+    -- not a fixed point, a second ledger identity, and ``web`` where the base
+    branch said ``official``. So the mapping runs **first**, via ``idna``'s own
+    ``uts46_remap``, and the strip then sees one settled spelling. The separator
+    table stays inside ``idna`` deliberately: a hand-rolled copy here is the
+    speculative host transform this module's header records losing to three times.
+    ``std3_rules=False`` is passed explicitly because it is ``uts46_remap``'s
+    non-default but exactly what ``idna.encode`` applies internally -- the two
+    calls must not disagree about which codepoints survive.
+
+    Exactly one dot, never a loop: every double-separator spelling
+    (``bls.gov..``, ``bls.gov。。``, ``bls.gov。.``), ``.bls.gov`` and ``.`` are
+    already refused upstream (``idna`` rejects an empty label), so a second
+    separator is not a spelling this function has to have an opinion about. The
+    ``"."`` guard is not defending a reachable input -- it keeps the function
+    total on its own terms rather than on a promise made by its caller.
+
+    **An IP literal is classified before UTS-46 runs** (cross-model review round
+    2, finding 1). An IPv6 zone ID (``fe80::1%eth0``) is opaque per RFC 4007
+    s11.2 -- it is not a DNS label -- but running it through ``uts46_remap``
+    first case-folds it and strips a trailing dot from it as if it were one,
+    turning two distinct scoped addresses (``%eth0`` and ``%ETH0``, or one with
+    a trailing dot) into one. ``ipaddress`` is tried first and, on success,
+    returned immediately with no further transform. A dotted IPv4 literal with a
+    trailing separator (``127.0.0.1.``) is not an IP literal on this first
+    attempt -- ``ipaddress`` rejects the trailing dot -- so it still falls
+    through to the mapping/strip path below and is re-classified afterwards.
     """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        pass  # Not an IP literal as given; try again after DNS-only normalization.
+    else:
+        return f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
+    try:
+        host = idna.uts46_remap(host, std3_rules=False)
+    except idna.IDNAError:
+        raise CanonicalizationError(_BAD_URL) from None
+    if host != "." and host.endswith("."):
+        host = host[:-1]
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -162,10 +228,16 @@ def canonicalize_url(url: str) -> str:
 
     Reuses ``model._require_http_url`` as the syntactic gate, then normalizes the
     parts that vary cosmetically between reports of one resource: it lowercases
-    the scheme, canonicalizes the host (IDN -> A-label, IPv6 compressed), drops
-    the default port, drops userinfo and the fragment, uppercases percent-octet
-    hex, and strips tracking parameters. Query order and every non-tracking
-    parameter are preserved. The result validates as an ``HttpUrlString``.
+    the scheme, canonicalizes the host (IDN -> A-label, IPv6 compressed, one
+    terminal DNS root dot removed -- D32), drops the default port, drops userinfo
+    and the fragment, uppercases percent-octet hex, and strips tracking
+    parameters. Query order and every non-tracking parameter are preserved. The
+    result validates as an ``HttpUrlString``.
+
+    The gate runs **first and unconditionally**, so this function accepts exactly
+    what ``_require_http_url`` accepts: no normalization step can rescue a string
+    that is not a URL, and the root-dot strip in particular cannot turn a refused
+    host into an accepted one (``tests/property`` asserts it).
     """
     try:
         _require_http_url(url)
