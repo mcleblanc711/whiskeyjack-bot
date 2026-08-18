@@ -541,7 +541,7 @@ def test_url_validation_does_not_rewrite_the_url() -> None:
 
 def test_migration_002_makes_the_document_storable(tmp_path: Path) -> None:
     db = tmp_path / "ledger.sqlite3"
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 3
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 4
 
     doc = validate_document(_document(document_id="doc-1"))
     run = validate_run(_run())
