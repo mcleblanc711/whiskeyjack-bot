@@ -37,6 +37,102 @@ The spread is 1 to 7 on comparably sized items. The lessons below are mostly abo
 
 ---
 
+## The second headline number — and the two instincts it corrects
+
+Measured 2026-08-06 and re-measured 2026-08-17, on the perception that "the tests have
+dramatically slowed down progress." The instinct was right that something had. It took two
+tries to find what, and **both wrong turns are the reusable part.**
+
+```bash
+/usr/bin/time -f "%e" uv run pytest -q                 # 497.7s
+/usr/bin/time -f "%e" uv run pytest -q tests/unit      # 374.3s
+/usr/bin/time -f "%e" uv run pytest -q tests/property  #  77.4s
+uv run pytest -q tests/unit --durations=0 \
+  | awk '/^[0-9.]+s (call|setup|teardown)/ {gsub("s","",$1); t[$2]+=$1} \
+         END {for (k in t) printf "%s %.1fs\n", k, t[k]}'
+```
+
+| | before | after |
+| --- | ---: | ---: |
+| Full suite | **497.7s** | **81.3s** |
+| `tests/unit` | 374.3s | 28.2s |
+| `tests/property` | 77.4s | 46.0s |
+| unit `setup` | **202.3s** | **5.3s** |
+| unit `teardown` | 44.7s | — |
+| unit `call` — the actual assertions | 74.7s | 13.8s |
+| `tests/unit/test_lifecycle.py` alone | 96.5s (149.7s on M1-606) | 3.2s |
+| ruff + ruff format + mypy, all three | — | 1.6s |
+
+### Wrong turn 1 — believing a suite is slow because of what it tests
+
+`call` was 20% of unit time on one run and 22% on a second. **Two thirds of unit-test time was
+fixture construction, not testing**, and test authorship was not where the time went either:
+
+```bash
+git log --no-merges --format='%H' | while read c; do
+  git show --format='' --name-only "$c" | grep -v '^$' \
+    | awk '{if($0~/^tests\//)t++; if($0~/^src\//)s++} END{print (t&&!s)?"tests-only":(t&&s)?"both":(s)?"src-only":"other"}'
+done | sort | uniq -c
+```
+
+Of 132 non-merge commits: **14 touched tests without touching `src/`, 61 touched both together,
+and exactly 1 touched `src/` without tests.** Tests ride along with the code they cover; they are
+not a separate tax paid in separate commits. **Rule: before believing a suite is slow because of
+what it tests, split `setup` from `call`.** And quote the ratio, not the seconds — absolute times
+move with page-cache warmth.
+
+### Wrong turn 2 — fixing a uniform cost at each call site instead of below them
+
+The profile above named the expensive object, and the proposed fix followed from it directly:
+
+```
+connect() + replay migrations 001→003 : 429 ms     ← done ~483 times per run
+copy of an already-migrated .sqlite3  :   1.1 ms
+```
+
+So: build the migrated ledger once, copy it per test. Converting the lifecycle `ledger` fixture to
+a session-scoped template returned **122.3s → 92.7s, about 30s** against a projection of ~195s — a
+6× miss — because the fixture was never the only path to a database. The raw-SQL schema tests, the
+v2 backfill and the 003-refusal test each build their own, correctly. Closing the gap needed ~45
+more `initialize_ledger` call sites converted across four files, and it was blocked behind
+migration 004.
+
+**The 429 ms was never about migrations.** `ledger.connect()` opens WAL with
+`synchronous = NORMAL` — real fsyncs — and the suite was buying disk durability for databases
+discarded seconds later. That cost sits *below* every path to a database, including every one a
+cached template cannot reach. Moving pytest's temp root to tmpfs took the full suite **497.7s →
+81.3s** and `test_lifecycle.py` **96.5s → 3.2s**, for ~30 lines in `tests/conftest.py`, no test
+edits, no dependency, and no migration dependency:
+
+```bash
+PYTEST_DEBUG_TEMPROOT=/dev/shm uv run pytest -q      # now the default, via pytest_configure
+```
+
+**Rule: when a cost is uniform across many call sites, fix it below them, not at each one.** The
+tell is the ratio between the projection and the measurement: a 6× miss on "cache the expensive
+object" means the expense was not in the object.
+
+`PYTEST_DEBUG_TEMPROOT` rather than `--basetemp` matters and is not a detail — pytest still
+creates its own per-run numbered directory underneath, so parallel worktrees keep separate roots.
+`--basetemp` names one shared path and wipes it on entry, which two concurrent worktrees would do
+to each other mid-run. An explicit `--basetemp`, a preset `PYTEST_DEBUG_TEMPROOT`, a platform with
+no `/dev/shm`, or a tmpfs below the free-space floor all fall back to pytest's default: the
+failure mode of the whole mechanism is "slow", never "wrong". Verified both ways — 4.1s with the
+hook, 118s with `PYTEST_DEBUG_TEMPROOT=/tmp`, 122s with `--basetemp`, green in all three.
+
+**The session-scoped template patch is superseded, not deferred** — it needs no backlog row (see
+checklist item 4). What survives from it is lesson 5's constraint, which still binds anything that
+replaces a slow fixture: prove the replacement can fail.
+
+### What this cost, and what it buys back
+
+The inner loop lesson 5 mandates — write test → prove it fails pre-fix → fix → re-run → run the
+full suite — was **~13 minutes per test** on M1-606, and one test genuinely took 45 minutes. It is
+now **~1.5 minutes**. A review round costs at least two full gate runs, so a round drops from ~17
+minutes of waiting to ~3. None of the checks were removed to get there.
+
+---
+
 ## 1. The review protocol changed underneath the reviews it was governing
 
 This is the most expensive structural lesson so far, and the least obvious.
@@ -162,8 +258,11 @@ bureaucracy.
 
 Run this at the end of each milestone, before asking for owner go-ahead:
 
-1. **Re-measure the headline number.** If the review-commit share has not fallen, the changes
-   made in response to this file did not work.
+1. **Re-measure both headline numbers.** If the review-commit share has not fallen, the changes
+   made in response to this file did not work. Re-time the suite the same way (`/usr/bin/time -f
+   "%e" uv run pytest -q`, then the `--durations=0` phase split): a suite that has crept back
+   past ~3 minutes has grown a new uniform cost, and the ratio between `setup` and `call` says
+   whether it is below the tests or in them.
 2. **List every workflow-layer change that landed mid-wave** (`git log -- scripts/ .github/
    CLAUDE.md` bounded to the milestone) and check each against lesson 1: could it have waited
    for the wave boundary?
