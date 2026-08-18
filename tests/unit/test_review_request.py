@@ -31,10 +31,19 @@ SCRIPT = REPO_ROOT / "scripts" / "review-request.py"
 
 
 def _load() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("review_request", SCRIPT)
-    assert spec is not None and spec.loader is not None
+    # Compiled from source every time, deliberately: importlib's normal path loading
+    # consults __pycache__, and its validation is the source's *size* plus its mtime at
+    # one-second granularity. A mutation check that edits this script, runs the tests and
+    # restores the original within the same second -- reordering a tuple, swapping `<` for
+    # `<=` -- leaves both fields unchanged, so the mutant's bytecode is served to every
+    # later run. That turns a surviving mutation into a silent pass, which is exactly the
+    # "test that proves nothing" this suite is meant to catch. Observed 2026-08-17.
+    spec = importlib.util.spec_from_loader("review_request", loader=None)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module.__file__ = str(SCRIPT)
+    source = SCRIPT.read_text(encoding="utf-8")
+    exec(compile(source, str(SCRIPT), "exec"), module.__dict__)
     return module
 
 
@@ -116,12 +125,74 @@ def test_no_verify_banner_carries_the_dirty_caveat() -> None:
 def test_the_gates_are_the_four_documented_ones() -> None:
     """CLAUDE.md names these four; a request claiming a gate it never ran is the defect
     this section of the script exists to prevent."""
-    assert [label for label, _ in review_request.GATES] == [
+    assert {label for label, _ in review_request.GATES} == {
         "pytest",
         "ruff check",
         "ruff format --check",
         "mypy --strict src",
-    ]
+    }
+
+
+def test_the_gates_run_cheapest_first() -> None:
+    """All four still run and every failure is reported -- the ordering is only about how
+    soon you hear. pytest is ~85s; the other three together are ~1.6s, so a formatting slip
+    behind the suite is a minute and a half of nothing."""
+    labels = [label for label, _ in review_request.GATES]
+
+    assert labels[-1] == "pytest"
+
+
+def _record_gate_runs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Stub the gate subprocesses and record the environment each was handed."""
+    envs: list[dict[str, str]] = []
+
+    def _run(_command: tuple[str, ...], **kwargs: Any) -> SimpleNamespace:
+        envs.append(dict(kwargs["env"]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_request.subprocess, "run", _run)
+    return envs
+
+
+def test_the_gate_run_pins_the_hypothesis_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exported `fast` in the author's shell must not reach the gate.
+
+    tests/property/conftest.py registers `fast` at 25 draws for the inner loop. A gate run
+    that inherited it would report a green suite at an eighth of the search the request
+    tells the reviewer was performed -- the generator asserting what it has not verified
+    (docs/LESSONS.md, lesson 7).
+    """
+    monkeypatch.setenv("HYPOTHESIS_PROFILE", "fast")
+    envs = _record_gate_runs(monkeypatch)
+
+    review_request._verify_gates()
+
+    assert envs, "no gate was run"
+    assert {env["HYPOTHESIS_PROFILE"] for env in envs} == {review_request.GATE_HYPOTHESIS_PROFILE}
+    assert review_request.GATE_HYPOTHESIS_PROFILE != "fast"
+
+
+def test_the_gate_run_keeps_the_rest_of_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinning one variable must not amount to running the gates in a bare environment --
+    uv, the venv and the PATH all live there."""
+    monkeypatch.setenv("WHISKEYJACK_TEST_MARKER", "kept")
+    envs = _record_gate_runs(monkeypatch)
+
+    review_request._verify_gates()
+
+    assert all(env.get("WHISKEYJACK_TEST_MARKER") == "kept" for env in envs)
+
+
+def test_the_gate_status_names_the_profile_that_ran(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pinned profile the reviewer cannot see is a claim they cannot check."""
+    _record_gate_runs(monkeypatch)
+
+    status = review_request._verify_gates()
+
+    assert f"`{review_request.GATE_HYPOTHESIS_PROFILE}`" in status
+    assert "hypothesis profile" in status
 
 
 @pytest.mark.parametrize(

@@ -29,10 +29,19 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not 
 
 
 def _load() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("tracks", SCRIPT)
-    assert spec is not None and spec.loader is not None
+    # Compiled from source every time, deliberately: importlib's normal path loading
+    # consults __pycache__, and its validation is the source's *size* plus its mtime at
+    # one-second granularity. A mutation check that edits this script, runs the tests and
+    # restores the original within the same second -- reordering a tuple, swapping `<` for
+    # `<=` -- leaves both fields unchanged, so the mutant's bytecode is served to every
+    # later run. That turns a surviving mutation into a silent pass, which is exactly the
+    # "test that proves nothing" this suite is meant to catch. Observed 2026-08-17.
+    spec = importlib.util.spec_from_loader("tracks", loader=None)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module.__file__ = str(SCRIPT)
+    source = SCRIPT.read_text(encoding="utf-8")
+    exec(compile(source, str(SCRIPT), "exec"), module.__dict__)
     return module
 
 
