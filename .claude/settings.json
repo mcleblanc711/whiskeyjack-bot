@@ -14,7 +14,8 @@
     "once per merge. git push, gh pr create and gh pr merge are absent for the same reason.",
     "Nothing here can stop a cooperating agent from reaching the network, but the operator",
     "is now actually the boundary on outward actions rather than nominally one. Add exact",
-    "commands as they come up; never widen a prefix back out to a directory or interpreter."
+    "commands as they come up; never widen a prefix back out to a directory or interpreter.",
+    "scripts/run-review.sh is deliberately absent for the same reason as finish-item.sh: every run spends a paid reviewer call, so it prompts each time. gate.sh is listed by exact name, with no arguments, because it takes none."
   ],
   "permissions": {
     "allow": [
@@ -31,6 +32,8 @@
       "Bash(python3 scripts/tracks.py *)",
       "Bash(scripts/review-request.py *)",
       "Bash(scripts/tracks.py *)",
+      "Bash(scripts/gate.sh)",
+      "Bash(bash scripts/gate.sh)",
       "Bash(scripts/start-item.sh *)",
       "Bash(bash scripts/start-item.sh *)",
       "Bash(scripts/sync-worktrees.sh*)",

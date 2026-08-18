@@ -252,6 +252,41 @@ bureaucracy.
 
 **Rule: fail closed. A check whose unknown case is "pass" is decoration.**
 
+## 8. A mutation check can be answered by stale bytecode
+
+The verification technique this file leans on hardest — mutate the source, confirm the test
+fails, restore, confirm it passes — has a failure mode that returns a **false green**.
+
+`scripts/*.py` and `tests/conftest.py` are loaded in tests by path, through
+`importlib.util.spec_from_file_location`. That consults `__pycache__`, and its cache validation
+is the source file's **size** plus its mtime at **one-second granularity**. A mutation that
+preserves the byte count — reordering a tuple, swapping `<` for `<=` — and is restored within
+the same second leaves both fields unchanged, so Python serves the *mutant's* bytecode to every
+later run.
+
+Observed 2026-08-17 while reordering the `GATES` tuple in `review-request.py`. The mutation was
+caught, correctly. Then the restored source kept reporting the mutant's ordering, and the next
+green run was green about code that was no longer there.
+
+The direction that matters is the other one: had the mutation been introduced *and* the cache
+been warm from the pre-mutation source, the check would have reported "mutation survived" — or
+worse, "test still passes", which reads as "the test is fine".
+
+**Rule: a loader used for mutation checking must compile from source.**
+
+```python
+spec = importlib.util.spec_from_loader(name, loader=None)
+module = importlib.util.module_from_spec(spec)
+module.__file__ = str(path)
+exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+```
+
+All four path-loading test modules use that form now (`test_tracks.py`, `test_check_backlog.py`,
+`test_review_request.py`, `test_conftest_temproot.py`). The general shape is the one lesson 5 is
+already about: **a verification step has to be verified too.** Re-run a mutation check whose
+result surprises you with `find . -name __pycache__ -prune -exec rm -rf {} +` first, and if the
+answer changes, the earlier answer was the cache talking.
+
 ---
 
 ## Milestone stop-point checklist

@@ -23,7 +23,15 @@ approval boundary, or replayability, do not take it.**
 
 ## Toolchain
 
-Python 3.11, `src/` layout, `uv`. The full gate — run all four before calling anything done:
+Python 3.11, `src/` layout, `uv`. The full gate — **`scripts/gate.sh`** runs all four, cheapest
+first, stopping at the first failure. It pins the same hypothesis profile `review-request.py`
+pins, so a green `gate.sh` means the same thing as a green gate section in a review request:
+
+```bash
+scripts/gate.sh            # ~85s total; ruff 0.5s, ruff format 0.1s, mypy 1.0s, pytest ~85s
+```
+
+The four it runs, if you want them individually:
 
 ```bash
 uv run pytest              # offline; sockets are blocked
@@ -31,6 +39,22 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy --strict src
 ```
+
+**The inner loop is not the full gate.** For the "prove it fails pre-fix" step, run the one node:
+
+```bash
+uv run pytest tests/unit/test_lifecycle.py -k blank_identifier -x   # sub-second
+HYPOTHESIS_PROFILE=fast uv run pytest tests/property/test_dedup_properties.py   # 19.7s -> 2.9s
+```
+
+`fast` is 25 draws — enough to watch a property fail and then pass, nowhere near enough to trust
+one, and never a gate. `review-request.py` and `gate.sh` both override it. Run the full gate once,
+at the end of the change, not at each iteration.
+
+`tests/conftest.py` puts pytest's temp root on tmpfs where the platform has one, which took the
+suite from 497.7s to 81.3s: `ledger.connect()` opens WAL with real fsyncs and the suite builds
+several hundred ledgers per run. Every way out of that hook falls back to pytest's default, so its
+failure mode is "slow", never "wrong". See `docs/LESSONS.md`.
 
 CI (`quality-gate`, required on master) runs these plus a gitleaks full-history scan, a
 tracked-artifact hygiene check, a backlog lint, a migration hygiene check, a workbook build,
@@ -138,9 +162,18 @@ paid-call controls, or the rule that malformed shapes arrive as the module's own
   would report a pass for code the reviewer is never shown. `--no-verify` skips both and says so in
   the output. Each request **pins its own `HEAD` and diff base to full commit hashes** and builds
   every range from them, so a round that answers against a different tree contradicts the document
-  (PR #19). The diffs stay **embedded** and that is deliberate: the reviewer is a pasted-context
-  model with no filesystem, and round 7 demonstrably read file bodies out of the embedded diff, so
-  an inspection command it cannot run is not a substitute for the code.
+  (PR #19). The diffs stay **embedded** and that is deliberate: round 7 demonstrably read file
+  bodies out of the embedded diff. The reviewer runs locally and *can* read the repo, so this is
+  no longer about capability — it is that a reviewer handed the code reads it, and a reviewer told
+  where to find the code may not. Do not trim the diffs back out.
+- **Run the round with `scripts/run-review.sh <ITEM> --round N [--previous-reviewed <sha>]`.** It
+  generates the request (same gates, same refusals) and hands it to the local reviewer with
+  `codex exec --sandbox read-only`, writing the answer to `GPT_REVIEW_RESPONSE_<ITEM>_r<N>.md`.
+  It uses plain `codex exec` pointed at the request, **not `codex exec review`** — that subcommand
+  builds its own diff and its own framing, which discards the contract the request spent PRs
+  #18/#19/#20 building and turns the round into the unbounded hardening exercise the contract
+  exists to prevent. `--dry-run` writes the request and spends nothing. It refuses to overwrite an
+  existing response, because a response is the record that a round happened.
   `GPT_REVIEW_*` files are gitignored scaffolding — never commit them.
   Do **not** run `gh pr merge --delete-branch`: it fails while the branch is checked out in a
   sibling worktree. Merge, then `finish-item.sh`.
