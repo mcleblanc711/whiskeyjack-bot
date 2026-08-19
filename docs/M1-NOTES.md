@@ -2947,3 +2947,42 @@ cost of. **Stated, not half-fixed**: if the relocation is wanted, it is its own 
   `tests/property/test_canonical_properties.py`. It is upstream of the packet hash: a document
   that cannot be hashed never becomes a row, so this is a reachability limit on what can be
   persisted, not a defect introduced here.
+
+## M0-007 — Sanitizing PyYAML constructor errors in `load_config`
+
+`config.load_config` caught only `yaml.MarkedYAMLError`/`yaml.YAMLError` around
+`yaml.safe_load`. PyYAML's construction stage (as opposed to its scanner/parser/composer) raises
+whatever Python raised at it, so it is not a `YAMLError` at all — the same hole M1-308 round 7
+found and closed in `research/allowlist.py`, filed here because it predated that branch's diff
+base. Reproduced the same six shapes against `config.py` before writing anything: an out-of-range
+implicit date/timestamp (`ValueError`), `!!bool`/`!!int` with an unparseable scalar (`KeyError`/
+`ValueError`, both leaking the value), `!!timestamp` with an unparseable scalar (`AttributeError`),
+and flow nesting past the recursion limit (`RecursionError`).
+
+### Decision — copy the reviewed fix verbatim, not a variant
+
+Added `except Exception:` immediately after the existing `except yaml.YAMLError:` clause, scoped
+to only the `yaml.safe_load(raw_text)` call, raising the same sanitized `ConfigError` message the
+two existing branches already use, `from None`. Deliberately not an enumerated tuple of exception
+types — GPT r7 rejected that shape for `allowlist.py` on the grounds that the enumeration belongs
+to PyYAML and any type missing from a hand-written list would escape raw; the same reasoning
+applies here unchanged.
+
+### Rejected — adding `is_filesystem_error` to `ConfigError`
+
+`AllowlistError` carries an `is_filesystem_error` flag that `cli.py` uses to route between
+`EXIT_ENV_MISSING` and `EXIT_CONFIG_INVALID`; `ConfigError` has no equivalent, so every
+`load_config` failure — including an unreadable file — maps to `EXIT_CONFIG_INVALID`. Out of
+scope for this item's acceptance criterion, which is about sanitizing the constructor-error leak,
+not exit-code routing; changing exit code semantics for existing `ConfigError` callers on a
+sanitization branch would be a second, unrelated change. Left as a possible future backlog row.
+
+### Verification
+
+Six-case parametrized suite mirrors `test_allowlist.py`'s `CONSTRUCTOR_FAILURES` table, plus the
+same meta-guard (`yaml.safe_load` on each source must still raise something that is *not* a
+`yaml.YAMLError`, so the suite cannot silently go vacuous against a future PyYAML) and a negative
+control (a value that constructs cleanly must still reach pydantic and fail as a schema error, not
+get misclassified as "not valid YAML"). Confirmed all six new tests fail against the pre-fix tree
+(raw `ValueError`/`KeyError`/`AttributeError`/`RecursionError` escaping `load_config`) and pass
+post-fix.
