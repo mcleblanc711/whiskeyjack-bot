@@ -40,23 +40,47 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-402 | feat/m1-402-structured-model-call | whiskeyjack-m1-402 | no | none | 2026-08-18 |
-| M2-701 | feat/m2-701-approval-commands | whiskeyjack-m2-701 | no | none | 2026-08-18 |
-| M0-007 | feat/m0-007-sanitize-yaml-constructor-errors | whiskeyjack-m0-007 | no | none | 2026-08-18 |
+*(none — the next wave's rows land on their own branches, see below)*
 
-The three rows above are one wave, claimed together before any worktree existed rather
-than each on its own branch. That is a deliberate departure from the usual flow and it is
-worth saying why: the Worktrees table is the one part of this file that three concurrent
-branches reliably conflict on (it was the only conflict PRs #24 and #25 produced), and
-claiming a wave up front also closes the one blind spot the section above names — the
-window between `start-item.sh` and pushing the row. It only works when the whole wave is
-known at once. A track started later still claims on its own branch.
+## Planned next wave
 
-M0-007 is the head of a **queue**, not a single item: `M0-007 → M1-309 → M1-311 → M1-312
-→ M1-313 → M1-607`, one branch and one worktree each, run in series in one terminal. Only
-the head is claimed here because only the head has a worktree; the next is claimed when
-the previous merges. **M1-607 is the one that needs migration `006`** — claimed below now,
-because it is knowable now, even though its branch will not exist for days.
+Not claims. A claim is a row in the table above, on the branch that holds it, and
+`scripts/tracks.py` **rejects** a row naming a branch that does not exist on origin — which
+is how the first draft of this section was caught. Writing the wave down here instead is
+free of that, because nothing parses this prose.
+
+Worth recording why the attempt was made and why it failed, since the reasoning was not
+silly. The Worktrees table is the one part of this file concurrent branches reliably
+collide on — it was the only conflict PRs #24 and #25 produced between them — so claiming
+a whole known wave in one commit would both avoid a three-way collision and close the
+blind spot the section above names, the window between `start-item.sh` and pushing the
+row. The validator refuses it anyway, and it is right to: a row whose branch does not
+exist cannot be distinguished from a stale row whose branch was deleted, and the whole
+registry rests on being able to tell those apart. **The three-line collision is the
+cheaper problem.** Take it.
+
+Three lanes, run concurrently:
+
+| Lane | Items, in order | Notes |
+| --- | --- | --- |
+| 1 — critical path | `M1-402 → M1-403 → M1-501 → M1-602` | Strictly serial, and nothing shortens it. Protect this lane: merge master into it just after a review round closes, never mid-round. |
+| 2 — M2 path | `M2-701 → M2-702 → M2-703` | Independent of lane 1 until `M2-702`, which needs `M1-602` from it. `lifecycle.py` already documents the seam it plugs into. |
+| 3 — debt queue | `M0-007 → M1-313 → M1-607 → M1-312 → M1-309 → M1-311` | Six small items, one branch and one worktree each, in series in one terminal. |
+
+**M1-607 needs migration `006`** — claimed in the standing table above now, because it is
+knowable now even though its branch will not exist for days. That is exactly the shape
+that produced the `004` collision between M1-606 and M1-306: both were told the number was
+free, because each claim lived on its holder's branch.
+
+The lane-3 order is not the numeric one, and the two departures are the point:
+
+- **M1-607 is third, not last.** It puts the non-blank identifier guard on
+  `forecast_records.record_id`, and `M1-602` — fourth on the M1-402 lane — is the item that
+  starts writing that column. The guard should be on master before the writer is, not after.
+- **M1-311 is last, because it is the only one whose shape is unknown.** Rejecting multi-label
+  public suffixes (`co.uk`, `com.au`) needs either a real public-suffix list, which is a **new
+  dependency and therefore the dep slot**, or an explicit restriction narrow enough to defend
+  without one. Sequenced last so that open question stalls one item instead of five.
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per
