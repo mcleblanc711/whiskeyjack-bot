@@ -40,7 +40,8 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-*(none — the next wave's rows land on their own branches, see below)*
+| M0-007 | feat/m0-007-sanitize-yaml-constructor-errors | whiskeyjack-m0-007 | no | none | 2026-08-19 |
+*(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
 
