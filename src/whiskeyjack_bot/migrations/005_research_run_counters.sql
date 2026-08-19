@@ -1,5 +1,14 @@
 -- M1-306: the discarded-evidence counters a research run has nowhere to record.
 --
+-- Numbered 005, not 004. This was written as 004 while `docs/TRACKS.md` said 004 was
+-- the next free number; M1-606 held that claim on its own unmerged branch and landed
+-- `004_pipeline_failure_events.sql` on master first. The migration claim in TRACKS.md
+-- is advisory -- nothing reads that column -- so the enforcement is
+-- `.github/scripts/check-migrations.sh` plus master's up-to-date-branch requirement,
+-- and this is that check working: the collision surfaced at the daily master merge,
+-- before either migration could be applied twice under one number. Renumbering is
+-- safe precisely because 004 here was never on master and so was never immutable.
+--
 -- Both retrieval adapters already count two things and can persist neither. AskNews
 -- (M1-302) and Exa (M1-303) return `documents_dropped` (results that could not be
 -- normalized into a usable document) and `duplicates_collapsed` (repeats of one article

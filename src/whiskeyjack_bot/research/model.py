@@ -19,7 +19,7 @@ migration and are added by ``002_research_document_fields.sql``:
   rewrite ``canonical_url`` for dedup; without this field the as-retrieved URL
   would be unrecoverable, which is an attribution loss.
 
-Two more arrive with ``004_research_run_counters.sql`` (M1-306):
+Two more arrive with ``005_research_run_counters.sql`` (M1-306):
 ``documents_dropped`` and ``duplicates_collapsed``, the counts of retrieved
 evidence that never became a document row.
 
@@ -397,7 +397,7 @@ class ResearchRun(_StrictModel):
     posts_dropped_no_url: int | None = Field(default=None, ge=0)
 
     # Accountability counters for evidence that never became a row, added with
-    # ``004_research_run_counters.sql`` (M1-306). Both adapters already produce
+    # ``005_research_run_counters.sql`` (M1-306). Both adapters already produce
     # them on their own result objects; these are where they land.
     #
     # ``None`` is *unmeasured*, ``0`` is the auditable claim that nothing was
