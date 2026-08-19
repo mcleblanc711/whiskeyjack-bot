@@ -33,14 +33,54 @@ to the registry, and neither is a habit you can form by reflex.
 | Claim | Held by | Notes |
 | --- | --- | --- |
 | Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. Claimed by M1-303 on 2026-07-27 and **released unused**: the Exa adapter calls the HTTP API through `httpx`, already a declared dependency, rather than adding `exa-py` (which would pull in `openai`, `requests` and `python-dotenv` for one POST). Releasing a claim you did not spend is part of holding it. |
-| Workflow / test-infrastructure change | *free* | Lesson 1: a workflow change is a track and takes a slot. Held 2026-08-17 by `test/tmpfs-temp-root` (PR #24) and `chore/review-loop` (PR #25), **both merged and released the same day**. #24 moved pytest's temp root to tmpfs (`tests/conftest.py`): full suite 497.7s → 81.3s, `test_lifecycle.py` 96.5s → 3.2s, because the dev machine's only drive is a 7200rpm platter at 49.6ms/fsync. #25 added `scripts/gate.sh`, `scripts/run-review.sh` and the `fast` hypothesis profile. They landed **mid-wave** by deliberate exception, having been checked against every live branch first — the only conflict was this table. **Say so in the next review request:** the conftest change moves where temp files land, nothing about what is asserted. |
-| Next free migration number | *free*; next is `006` | `001`-`003` are immutable on master. `004_pipeline_failure_events.sql` landed with **M1-606** and `005_research_run_counters.sql` with **M1-306**, and the pair is worth reading as a case study: both branches were told `004` was free, because a claim lives on its holder's branch and this **migration** column is advisory — `scripts/tracks.py` checks the *dependency* claim and nothing reads this one. M1-606 merged first; M1-306 renumbered to `005` at its daily master merge, which is the designed outcome: `.github/scripts/check-migrations.sh` plus master's up-to-date-branch requirement is the enforcement, and it caught this before either number could be applied twice. Renumbering was safe only because M1-306's `004` had never reached master. |
+| Workflow / test-infrastructure change | *free* — **and should stay free until this wave closes** | Three concurrent lanes means every workflow change lands in three open review cycles at once, which is lesson 1 at triple cost. If one is genuinely needed mid-wave, claim the slot here and **say so in the next review request on every open lane** — the reviewer is stateless and reads a format change as a substantive one. Lesson 1: a workflow change is a track and takes a slot. Held 2026-08-17 by `test/tmpfs-temp-root` (PR #24) and `chore/review-loop` (PR #25), **both merged and released the same day**. #24 moved pytest's temp root to tmpfs (`tests/conftest.py`): full suite 497.7s → 81.3s, `test_lifecycle.py` 96.5s → 3.2s, because the dev machine's only drive is a 7200rpm platter at 49.6ms/fsync. #25 added `scripts/gate.sh`, `scripts/run-review.sh` and the `fast` hypothesis profile. They landed **mid-wave** by deliberate exception, having been checked against every live branch first — the only conflict was this table. **Say so in the next review request:** the conftest change moves where temp files land, nothing about what is asserted. |
+| Next free migration number | `006` held by **M1-607** (queued behind M0-007/309/311/312/313); next free is `007` | `001`-`005` are immutable on master. `004_pipeline_failure_events.sql` landed with **M1-606** and `005_research_run_counters.sql` with **M1-306**, and the pair is worth reading as a case study: both branches were told `004` was free, because a claim lives on its holder's branch and this **migration** column is advisory — `scripts/tracks.py` checks the *dependency* claim and nothing reads this one. M1-606 merged first; M1-306 renumbered to `005` at its daily master merge, which is the designed outcome: `.github/scripts/check-migrations.sh` plus master's up-to-date-branch requirement is the enforcement, and it caught this before either number could be applied twice. Renumbering was safe only because M1-306's `004` had never reached master. |
 
 ## Worktrees
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-306 | feat/m1-306-replayable-retrieval-runs | whiskeyjack-m1-306 | no | 005 | 2026-08-06 |
+*(none — the next wave's rows land on their own branches, see below)*
+
+## Planned next wave
+
+Not claims. A claim is a row in the table above, on the branch that holds it, and
+`scripts/tracks.py` **rejects** a row naming a branch that does not exist on origin — which
+is how the first draft of this section was caught. Writing the wave down here instead is
+free of that, because nothing parses this prose.
+
+Worth recording why the attempt was made and why it failed, since the reasoning was not
+silly. The Worktrees table is the one part of this file concurrent branches reliably
+collide on — it was the only conflict PRs #24 and #25 produced between them — so claiming
+a whole known wave in one commit would both avoid a three-way collision and close the
+blind spot the section above names, the window between `start-item.sh` and pushing the
+row. The validator refuses it anyway, and it is right to: a row whose branch does not
+exist cannot be distinguished from a stale row whose branch was deleted, and the whole
+registry rests on being able to tell those apart. **The three-line collision is the
+cheaper problem.** Take it.
+
+Three lanes, run concurrently:
+
+| Lane | Items, in order | Notes |
+| --- | --- | --- |
+| 1 — critical path | `M1-402 → M1-403 → M1-501 → M1-602` | Strictly serial, and nothing shortens it. Protect this lane: merge master into it just after a review round closes, never mid-round. |
+| 2 — M2 path | `M2-701 → M2-702 → M2-703` | Independent of lane 1 until `M2-702`, which needs `M1-602` from it. `lifecycle.py` already documents the seam it plugs into. |
+| 3 — debt queue | `M0-007 → M1-313 → M1-607 → M1-312 → M1-309 → M1-311` | Six small items, one branch and one worktree each, in series in one terminal. |
+
+**M1-607 needs migration `006`** — claimed in the standing table above now, because it is
+knowable now even though its branch will not exist for days. That is exactly the shape
+that produced the `004` collision between M1-606 and M1-306: both were told the number was
+free, because each claim lived on its holder's branch.
+
+The lane-3 order is not the numeric one, and the two departures are the point:
+
+- **M1-607 is third, not last.** It puts the non-blank identifier guard on
+  `forecast_records.record_id`, and `M1-602` — fourth on the M1-402 lane — is the item that
+  starts writing that column. The guard should be on master before the writer is, not after.
+- **M1-311 is last, because it is the only one whose shape is unknown.** Rejecting multi-label
+  public suffixes (`co.uk`, `com.au`) needs either a real public-suffix list, which is a **new
+  dependency and therefore the dep slot**, or an explicit restriction narrow enough to defend
+  without one. Sequenced last so that open question stalls one item instead of five.
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per
