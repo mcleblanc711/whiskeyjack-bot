@@ -15,7 +15,19 @@ from typing import TYPE_CHECKING
 from whiskeyjack_bot import __version__
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from whiskeyjack_bot.config import AppConfig
+    from whiskeyjack_bot.lifecycle import ApprovalDecision
+
+# A command that refused to act: an unusable ledger, an unknown record, an illegal
+# transition, or a hash the operator supplied that the record does not store (M2-701).
+#
+# Defined here rather than beside EXIT_CONFIG_INVALID / EXIT_ENV_MISSING, which live in
+# env_verify.py. Those two are that module's report vocabulary and predate any other
+# command; an approval refusal is not an environment verdict, and moving the existing pair
+# into a shared home is a change to every caller of them, which is not this item's.
+EXIT_REFUSED = 4
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,7 +84,48 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="write the fetched questions to this snapshot file",
     )
+
+    _add_approval_parser(
+        subparsers,
+        "approve",
+        "record an approval of a validated forecast, bound to its exact content hash",
+    )
+    _add_approval_parser(
+        subparsers,
+        "reject",
+        "record a rejection; the record stays validated and may be approved later",
+    )
     return parser
+
+
+def _add_approval_parser(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser], name: str, help_text: str
+) -> None:
+    """Register `approve` or `reject`; the two take identical arguments (M2-701).
+
+    ``--actor`` is **required and has no default**. An approval is an attribution claim
+    about a person, and inferring one from the OS login would write ``getpass.getuser()``
+    into the one table that exists to be trusted -- permanently, since it is append-only.
+
+    ``--forecast-sha256`` is optional and is verified when supplied: it is the hash the
+    operator actually reviewed, and a mismatch refuses the command without writing
+    anything. The hash the decision binds to is printed either way, so a review and the
+    approval that follows it can be tied together.
+    """
+    command = subparsers.add_parser(name, help=help_text)
+    command.add_argument("--config", default="config.yaml", type=Path)
+    command.add_argument("--record-id", required=True, help="the forecast record to decide on")
+    command.add_argument(
+        "--actor", required=True, help="who is making this decision; recorded verbatim"
+    )
+    command.add_argument("--note", help="optional free-text note, stored with the decision")
+    command.add_argument(
+        "--forecast-sha256",
+        help=(
+            "the content hash you reviewed; the command refuses and writes nothing if the "
+            "record does not store this exact hash"
+        ),
+    )
 
 
 def _run_verify_env(config_path: Path) -> int:
@@ -160,6 +213,107 @@ def _run_questions_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
+    """Record one approval decision against a stored forecast record (M2-701).
+
+    Prints what is being decided on -- identity, derived status and the content hash --
+    *before* writing, because an approval that binds to a hash the operator never saw is
+    an attribution claim with nothing behind it.
+
+    Nothing here contacts Metaculus. Approval and submission are separate commands (D23),
+    and the gateway is M2-703/M2-704.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.approval import ApprovalError, approve, read_forecast_summary, reject
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            summary = read_forecast_summary(connection, args.record_id)
+        except ApprovalError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"record:    {summary.record_id}")
+        print(
+            f"question:  {summary.question_id}  tournament: {summary.tournament_id}  "
+            f"version: {summary.forecast_version}  type: {summary.question_type}"
+        )
+        print(f"status:    {summary.status}")
+        print(f"hash:      {summary.forecast_sha256 or '(none stored)'}")
+
+        writer = approve if decision == "approved" else reject
+        try:
+            recorded = writer(
+                connection,
+                record_id=args.record_id,
+                actor=args.actor,
+                occurred_at=datetime.now(tz=timezone.utc),
+                note=args.note,
+                expected_sha256=args.forecast_sha256,
+            )
+        except ApprovalError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(
+            f"{recorded.decision} {recorded.forecast_record_id} "
+            f"(approval event {recorded.event_id}, lifecycle seq {recorded.event_seq})"
+        )
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
+    """Open an existing ledger, or print why not and return ``None`` (M2-701).
+
+    **The file must already exist.** ``initialize_ledger`` would happily create one, and a
+    mistyped ``--config`` would then mint an empty database and report "no such record"
+    against it -- a true statement about the wrong ledger.
+
+    Given that it exists, it is opened through ``initialize_ledger`` rather than
+    ``connect`` alone: that is the only public path that re-verifies every applied
+    migration's checksum and refuses a database written by a newer build, and it is a
+    no-op on a current ledger. The alternative -- a read-only schema-version probe --
+    needs ``ledger._current_version``, which is private to that module.
+    """
+    from whiskeyjack_bot.ledger import LedgerError, connect, initialize_ledger
+
+    try:
+        exists = path.is_file()
+    except OSError:
+        # from None is not needed (nothing is re-raised), but the message must not carry
+        # the OSError's text; the path itself is operator-supplied configuration and is
+        # rendered under the settled M1-401 carve-out.
+        print(f"cannot read the ledger database at {path}")
+        return None
+    if not exists:
+        print(f"no ledger database at {path}; nothing has been recorded there yet")
+        return None
+    try:
+        initialize_ledger(path)
+        return connect(path)
+    except LedgerError as exc:
+        print(exc)
+        return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -173,6 +327,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.parse_args(["questions", "--help"])
             return 2
         return _run_questions_fetch(args)
+    if args.command == "approve":
+        return _run_approval(args, "approved")
+    if args.command == "reject":
+        return _run_approval(args, "rejected")
     raise AssertionError(f"unhandled command: {args.command}")
 
 
