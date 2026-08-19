@@ -47,17 +47,41 @@ class LedgerError(Exception):
     """
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     """Open the ledger with WAL, foreign keys, recursive triggers and explicit
     transactions.
+
+    ``create=False`` opens an **existing** database only, through SQLite's
+    ``file:...?mode=rw`` URI, and fails rather than creating one. ``sqlite3.connect``
+    creates a database for any path it is given, so a caller that has already checked the
+    file exists still races the check: between the check and the open the file can be
+    removed or rotated, and what comes back is then a brand-new empty ledger that answers
+    questions about content it never held. Checking again cannot close that -- only an
+    open that *cannot* create can (M2-701 review round 1, finding 1; reproduced).
+
+    Ordinary local I/O races are reachable reliability conditions under CLAUDE.md's
+    threat boundary, so this is not a defence against a hostile operator; it is the
+    difference between a wrong answer and an error.
+
+    The default stays ``True`` so that every existing caller -- and
+    :func:`initialize_ledger`'s ordinary create-or-upgrade path -- is unchanged.
 
     Purely local file I/O: no network access on any path through here.
     """
     try:
-        conn = sqlite3.connect(path)
-    except sqlite3.Error:
+        target: str | Path = path
+        if not create:
+            # as_uri() percent-encodes, and requires an absolute path; resolve() supplies
+            # one (non-strict, so a missing file resolves rather than raising here -- the
+            # refusal belongs to the open, which is the operation that is racing).
+            target = f"{path.resolve().as_uri()}?mode=rw"
+        conn = sqlite3.connect(target, uri=not create)
+    except (sqlite3.Error, OSError, ValueError):
         # from None: the underlying error can name the file; wrap it and keep
-        # the cause chain from reprinting anything about the target.
+        # the cause chain from reprinting anything about the target. OSError and
+        # ValueError join sqlite3.Error because the create=False branch above can raise
+        # them: resolve() an OSError, and as_uri() a ValueError on a path that resolve()
+        # could not make absolute.
         raise LedgerError(f"cannot open ledger database at {path}") from None
     try:
         conn.row_factory = sqlite3.Row
@@ -102,21 +126,28 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def initialize_ledger(path: Path) -> int:
+def initialize_ledger(path: Path, *, create: bool = True) -> int:
     """Create or upgrade the ledger schema; return the applied schema version.
 
     Idempotent: migrations already recorded in ``schema_migrations`` are
     skipped (after a checksum re-check), so re-running is a no-op that does not
     error. Fails safely on schema drift, duplicate migration numbers, or a
     database written by a newer build.
+
+    ``create=False`` verifies and upgrades an **existing** ledger and refuses to bring one
+    into being: neither the parent directory nor the database file is created. That is
+    what lets a command whose whole point is to act on an already-recorded ledger use this
+    for its checksum and version verification without also being the thing that mints an
+    empty one. See :func:`connect`.
     """
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        # from None: the OSError can name parent paths; wrap it with a constant
-        # message so nothing about the target filesystem is reprinted.
-        raise LedgerError(f"cannot create ledger directory for {path}") from None
-    conn = connect(path)
+    if create:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # from None: the OSError can name parent paths; wrap it with a constant
+            # message so nothing about the target filesystem is reprinted.
+            raise LedgerError(f"cannot create ledger directory for {path}") from None
+    conn = connect(path, create=create)
     try:
         migrations = _load_migrations()
         applied = _applied_migrations(conn)

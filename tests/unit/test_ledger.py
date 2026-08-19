@@ -460,3 +460,89 @@ def test_migration_005_counters_reject_a_non_integer_or_negative_count(
                 )
     finally:
         conn.close()
+
+
+def test_create_false_refuses_an_absent_database_and_creates_nothing(tmp_path: Path) -> None:
+    """`create=False` is the only thing that closes a check-then-open race (M2-701 r1).
+
+    A caller that has already checked the file exists still races its own answer:
+    `sqlite3.connect` brings a database into being for any path it is handed, so a
+    deletion or rotation between the check and the open yields a brand-new empty ledger
+    that then answers questions about content it never held. Re-checking cannot close
+    that window; an open that *cannot* create can.
+    """
+    db = tmp_path / "gone" / "ledger.db"
+    with pytest.raises(LedgerError):
+        connect(db, create=False)
+    assert not db.exists()
+    assert not db.parent.exists()
+
+    with pytest.raises(LedgerError):
+        initialize_ledger(db, create=False)
+    # initialize_ledger's create path makes the parent directory; the existing-only path
+    # must not, or a mistyped --config would leave a directory tree behind it.
+    assert not db.exists()
+    assert not db.parent.exists()
+
+
+def test_create_false_refuses_a_database_removed_after_it_was_seen(tmp_path: Path) -> None:
+    """The race itself, run forwards: a ledger that existed, and then did not.
+
+    This is the shape the CLI hits -- `_open_existing_ledger` checks, and the file is
+    gone by the time either open runs. Both opens must refuse, and neither may leave a
+    replacement behind for the next command to read as the real ledger.
+    """
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+    for opener in (lambda: initialize_ledger(db, create=False), lambda: connect(db, create=False)):
+        db.unlink()
+        with pytest.raises(LedgerError):
+            opener()
+        assert not db.exists()
+        initialize_ledger(db)
+
+
+def test_create_false_opens_an_existing_ledger_unchanged(tmp_path: Path) -> None:
+    """Refusing to create is the only difference: verification and pragmas are intact."""
+    db = tmp_path / "ledger.db"
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+    # The verification half of initialize_ledger -- checksums, version, drift -- still
+    # runs, and is still a no-op on a current ledger.
+    assert initialize_ledger(db, create=False) == LEDGER_SCHEMA_VERSION
+    conn = connect(db, create=False)
+    try:
+        assert _table_names(conn) == LEDGER_TABLES
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_create_defaults_to_true_so_every_existing_caller_is_unchanged(tmp_path: Path) -> None:
+    """The seam is opt-in. The pipeline's own writers still create on first run."""
+    db = tmp_path / "fresh" / "ledger.db"
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+    assert db.is_file()
+    conn = connect(tmp_path / "fresh" / "second.db")
+    try:
+        assert (tmp_path / "fresh" / "second.db").is_file()
+    finally:
+        conn.close()
+
+
+def test_create_false_refuses_without_leaking_the_reason(tmp_path: Path) -> None:
+    """Same hygiene as every other ledger raise: the path, and nothing else.
+
+    SQLite's own message for a `mode=rw` miss is "unable to open database file", and the
+    URI it was handed is percent-encoded -- neither may reach the operator through the
+    message or a rendered traceback.
+    """
+    db = tmp_path / "secret-value-in-name" / "ledger.db"
+    with pytest.raises(LedgerError) as excinfo:
+        connect(db, create=False)
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert str(excinfo.value) == f"cannot open ledger database at {db}"
+    assert "unable to open" not in rendered
+    assert "mode=rw" not in rendered
+    assert "file://" not in rendered

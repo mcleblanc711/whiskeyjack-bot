@@ -157,6 +157,21 @@ checksum and refuses a database written by a newer build, and it is a no-op on a
 ledger. The alternative — a read-only schema-version probe — needs `ledger._current_version`,
 which is private to that module.
 
+**The existence check is not what carries the guarantee** (review round 1, finding 1,
+reproduced). It answers a *question* — is this a mistyped `--config`, or a ledger that
+vanished? — and the two need different messages. But `sqlite3.connect` brings a database
+into being for any path it is handed, so a caller that has already checked still races its
+own answer: an ordinary deletion or rotation between the check and the open used to yield a
+brand-new empty ledger, and the command then reported "record_id does not name a stored
+forecast record" against it. That is this decision's own failure mode reached from the other
+side, and the pre-fix code printed exactly that line. Re-checking cannot close the window;
+only an open that *cannot* create can, so `ledger.connect()` and `initialize_ledger()` grew a
+`create` keyword (`file:…?mode=rw`, default `True` so no existing caller moves) and
+`_open_existing_ledger` passes `create=False` to both — the second call is its own window.
+Ordinary local I/O races are reachable reliability conditions under CLAUDE.md's threat
+boundary; this is not a defence against a hostile operator, it is the difference between a
+wrong answer and an error.
+
 ### Deviation — `EXIT_REFUSED` lives in `cli.py`, not beside the other exit codes
 
 `EXIT_OK` / `EXIT_CONFIG_INVALID` / `EXIT_ENV_MISSING` live in `env_verify.py`, where they
@@ -200,6 +215,13 @@ carries its own small set — around forty lines — and each raises this module
   `approval_events.note` has always been. The length cap (`lifecycle._MAX_NOTE`, 4000) is
   the only bound this item adds.
 - **Relocating the shared exit codes.** See the deviation above.
+- **Pinning the shared identifier bound → M1-608.** `approval._MAX_IDENTIFIER` restates
+  `lifecycle._MAX_IDENTIFIER`; both are 200 and behaviour agrees at this revision, but nothing
+  holds them together, so a change to either would quietly let the two entry points accept
+  different `record_id` sets. Filed rather than fixed for the same reason the private
+  validators were not imported: the fix is a shared public contract, and inventing one inside
+  this diff would put a new seam into already-reviewed code. Raised as a non-blocking
+  observation in round 1.
 - **`lifecycle.py`'s "a approved event is not a legal transition" article slip.** The
   message predates this branch (M1-603) and this item is the first thing that shows it to
   an operator, which is an argument for fixing it and not a good enough one: it would put

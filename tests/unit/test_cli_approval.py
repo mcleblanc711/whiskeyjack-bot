@@ -211,6 +211,47 @@ def test_a_missing_ledger_is_refused_rather_than_created(
     assert not path.exists()
 
 
+def test_a_ledger_that_disappears_after_the_check_is_refused_not_recreated(
+    seeded: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The check-then-open race, made deterministic (review round 1, finding 1).
+
+    `_open_existing_ledger` checks that the file exists and then opens it. Both opens
+    used to be creation-capable, so an ordinary deletion or rotation in between -- a
+    backup, a rotation, an operator clearing a path -- minted a fresh empty ledger and
+    the command reported "does not name a stored forecast record" against it. That is
+    the same wrong-ledger answer the existence check exists to prevent, reached from the
+    other side, and it is worse than an error because it looks like an answer.
+
+    The monkeypatch only makes the timing deterministic; the simulated condition is an
+    ordinary file disappearance, which CLAUDE.md's threat boundary keeps in scope.
+    """
+    path = _ledger_path(seeded)
+    real_is_file = Path.is_file
+
+    def vanishing_is_file(self: Path) -> bool:
+        result = real_is_file(self)
+        if self == path and result:
+            # The window: the check has already answered truthfully.
+            for sidecar in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+                sidecar.unlink(missing_ok=True)
+        return result
+
+    monkeypatch.setattr(Path, "is_file", vanishing_is_file)
+
+    code = main(["approve", "--config", str(seeded), "--record-id", RECORD_ID, "--actor", "chris"])
+
+    assert code == EXIT_REFUSED
+    # Nothing was created to stand in for what vanished -- not the database, and not
+    # the parent directory the create path would have made.
+    assert not path.exists()
+    out = capsys.readouterr().out
+    assert "cannot open ledger database at" in out
+    # The assertion the finding turns on: on the pre-fix code the command got a live
+    # connection to a brand-new empty ledger and printed this instead.
+    assert "does not name a stored forecast record" not in out
+
+
 def test_an_invalid_config_is_told_apart_from_a_refusal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
