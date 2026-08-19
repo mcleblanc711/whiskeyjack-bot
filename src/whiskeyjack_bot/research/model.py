@@ -19,6 +19,10 @@ migration and are added by ``002_research_document_fields.sql``:
   rewrite ``canonical_url`` for dedup; without this field the as-retrieved URL
   would be unrecoverable, which is an attribution loss.
 
+Two more arrive with ``005_research_run_counters.sql`` (M1-306):
+``documents_dropped`` and ``duplicates_collapsed``, the counts of retrieved
+evidence that never became a document row.
+
 The mirroring is not field-for-field, and the two departures are deliberate:
 
 - ``created_at_utc`` (NOT NULL in both tables) is **writer-owned metadata**, not
@@ -216,17 +220,31 @@ HttpUrlString = Annotated[str, Field(min_length=1), AfterValidator(_require_http
 
 
 def _require_finite(value: float) -> float:
-    """Reject a non-finite number on a field that is stored as JSON or REAL.
+    """Reject a non-finite number, and canonicalize negative zero.
 
     ``ge=0`` happened to catch ``-inf`` and ``NaN`` (both comparisons are false),
     which made ``+inf`` look covered when it was not: it validated, then
     ``model_dump_json()`` rendered it as ``null``. A cost that reads as "unknown"
     once persisted is worse than one that reads as absurd, so the check is
     explicit rather than a side effect of the bound (review round 4).
+
+    ``value + 0.0`` maps ``-0.0`` to ``0.0`` and is the identity on everything
+    else (adding zero is exact in IEEE-754). It is here because **SQLite does the
+    same mapping and this module did not**: ``-0.0`` satisfies ``ge=0``, renders
+    as ``-0.0`` in ``model_dump(mode="json")``, and comes back out of a REAL
+    column as ``0.0``. That made a schema-valid run hash differently before and
+    after persistence -- an ordinary accepted input that falsified M1-306's
+    "replay produces the same research packet hash" (M1-306 review round 1,
+    finding 1). Canonicalizing at validation makes both sides agree, which is the
+    only fix that keeps the two spellings of "no cost" from being two costs.
+
+    Deliberately a normalization rather than a rejection: ``-0.0`` and ``0.0`` are
+    the same amount of money, and refusing one would turn a provider's sign
+    convention into a validation failure.
     """
     if not isfinite(value):
         raise ValueError("must be a finite number: NaN and Infinity cannot be persisted")
-    return value
+    return value + 0.0
 
 
 # A number that survives the round trip into storage. See _require_finite.
@@ -377,6 +395,17 @@ class ResearchRun(_StrictModel):
     # Citation-hygiene counter: agent-reported posts dropped for lacking a
     # resolvable status URL (M1-307). None for providers where it has no meaning.
     posts_dropped_no_url: int | None = Field(default=None, ge=0)
+
+    # Accountability counters for evidence that never became a row, added with
+    # ``005_research_run_counters.sql`` (M1-306). Both adapters already produce
+    # them on their own result objects; these are where they land.
+    #
+    # ``None`` is *unmeasured*, ``0`` is the auditable claim that nothing was
+    # discarded -- the distinction 002 drew for ``posts_dropped_no_url`` and the
+    # reason neither column defaults to zero. A run row is opened before its
+    # billable calls, so at insert time neither count exists yet.
+    documents_dropped: int | None = Field(default=None, ge=0)
+    duplicates_collapsed: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _completion_not_before_start(self) -> ResearchRun:

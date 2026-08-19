@@ -8,7 +8,9 @@ migration application only. The database-level append-only enforcement
 M1-603 -- see ``003_lifecycle_events.sql`` and :mod:`whiskeyjack_bot.lifecycle`;
 forecast versioning and its writer are M1-602's. Pre-forecast (research/generation)
 failure events shipped with M1-606 -- see ``004_pipeline_failure_events.sql`` and the
-same module.
+same module. ``005_research_run_counters.sql`` (M1-306) adds the two
+discarded-evidence counters a research run had nowhere to record; its writers live in
+:mod:`whiskeyjack_bot.research.store`.
 
 Migrations live inside the package (:mod:`whiskeyjack_bot.migrations`) rather
 than at the repository root shown in the handoff's proposed tree, so they ship
@@ -28,7 +30,7 @@ from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
-LEDGER_SCHEMA_VERSION = 4
+LEDGER_SCHEMA_VERSION = 5
 
 _MIGRATIONS_PACKAGE = "whiskeyjack_bot.migrations"
 _MIGRATION_NAME_RE = re.compile(r"^(\d+)_.*\.sql$")

@@ -131,13 +131,19 @@ if command -v unshare >/dev/null 2>&1 && ! unshare --user --map-root-user true 2
 fi
 
 echo "==> running the reviewer (read-only requested, no session files persisted)"
+# stdin is redirected from /dev/null deliberately. Run from a terminal, codex exec
+# behaves; run it where stdin is a pipe or a socket -- any non-interactive harness,
+# CI, or a backgrounded shell -- and it blocks before doing any work. Observed
+# 2026-08-18 on M1-306 round 1: 57 minutes elapsed, 00:00:00 of CPU time, no output,
+# no response file. It is indistinguishable from a slow API call until you look at
+# CPU time, which is the tell: a reviewer that is really working accumulates some.
 codex exec \
   -C "$repo_root" \
   --sandbox read-only \
   --ephemeral \
   "${model[@]}" \
   -o "$response" \
-  "$prompt"
+  "$prompt" < /dev/null
 
 echo
 echo "==> round $round for $item_id"

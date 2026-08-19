@@ -3464,7 +3464,12 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     finally:
         conn.close()
 
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 4
+    # 5, not 4: M1-306's 005_research_run_counters.sql lands alongside 004 on this
+    # branch. What this line pins is unchanged -- that LEDGER_SCHEMA_VERSION tracks
+    # the migrations actually on disk, and that upgrading a v2 ledger runs all of
+    # them. The literal is kept rather than dropped, since a constant compared only
+    # against itself pins nothing.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 5
 
     conn = connect(db)
     try:

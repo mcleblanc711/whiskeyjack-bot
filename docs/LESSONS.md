@@ -324,6 +324,97 @@ already about: **a verification step has to be verified too.** Re-run a mutation
 result surprises you with `find . -name __pycache__ -prune -exec rm -rf {} +` first, and if the
 answer changes, the earlier answer was the cache talking.
 
+## 9. A strategy that normalizes its own inputs can be what makes a property vacuous
+
+Lesson 5 says run every new property against the pre-fix code. M1-306 is the case that shows
+*why the mutation has to be aimed at the named defect*, not merely at the function.
+
+`test_the_hash_survives_the_persisted_round_trip` exists for one bug class: the `datetime.fold`
+distinction that cost M1-305 its round 3. `tests/property/strategies.py` generates `fold`
+correctly — that was fixed by an earlier review, and the file's docstring says so. The
+**consumer** threw it away. The `packets()` strategy re-keyed each generated run onto the
+packet's question with:
+
+```python
+payload = run.model_dump(mode="json")   # ISO-8601 has nowhere to put fold
+payload["question_id"] = question_id
+unique.append(validate_run(payload))    # ...so it is gone before the property runs
+```
+
+So no packet reaching any property could carry the distinction, and a deliberately
+fold-sensitive `packet.py` **passed** the property named after it. Two other mutations of the
+same function were caught, which is what makes this dangerous: the suite looked discriminating.
+
+The measurement that separates the two states is the only one that could:
+
+| mutation | old strategy | fixed strategy |
+| --- | --- | --- |
+| hash the in-memory form (crashes) | fails | fails |
+| hash a surrogate-pair-sensitive extra | fails | fails |
+| hash a **fold**-sensitive extra | **passes** | fails |
+
+The property was green before and after the strategy fix. Nothing but running it against
+deliberately broken code could tell the two apart.
+
+**Rule: the mutation must express the defect the property is named for.** A property that
+survives three mutations has been shown to discriminate on three things, not on the thing it
+claims. And when a property covers a distinction the schema *drops on serialization*, check the
+path from the generator to the assertion for a `model_dump` → re-validate round trip — that is
+the normalization, and it is invisible because it looks like ordinary fixture plumbing.
+
+### The same shape one level up: a simulated boundary tests the simulation
+
+M1-306's round-1 review found that a schema-valid `cost_usd = -0.0` hashed one way in memory
+and another after persistence, because SQLite maps `-0.0` to `0.0` on a REAL column. No
+property could see it: `round_trip_run` modelled storage as `json.dumps` → `json.loads`, and
+**JSON is the half of storage that behaves** — it preserves the sign. The defect lived in the
+half being simulated away.
+
+Replacing it with a property that persists into a real ledger found an *eighth* defect the
+review had not reported, on the first run: a **surrogate pair** in a `provider_config` key is
+not UTF-8 encodable, `json.loads` silently **recombines** it into the astral scalar, and
+pydantic's `model_dump(mode="json")` renders the original as six `U+FFFD` — so in-memory and
+stored hashed differently. Again invisible to a JSON-simulated round trip, and again the
+recombination *succeeded* rather than failing, which is what made it silent.
+
+**Rule: for a persistence invariant, at least one property must cross the real boundary.**
+Simulate the boundary for speed everywhere else, but a claim of the form "what is stored
+replays to what was hashed" has to be tested against the thing that does the storing. The
+cheap version of this is one property with a module-scoped ledger and a per-example row id —
+about a second of runtime for the class of defect that is otherwise unreachable.
+
+Corollary, from the same item: a value that is both hashed into a record **and** accepted as a
+separate argument by the writer can be stored inconsistent with the object that was hashed.
+M1-306's `documents_dropped` was passed alongside the run and defaulted to `None` on it, so the
+stored packet and the in-memory packet hashed differently. Found by an end-to-end smoke test,
+not by any unit test, because every unit test built both sides the same way. **Give a hashed
+field exactly one source.**
+
+## 10. A hung tool looks exactly like a slow one, except in CPU time
+
+`scripts/run-review.sh` invoked from a non-interactive shell hung for **57 minutes** with
+**`00:00:00` of CPU time** and no output. The cause was `codex exec` reading stdin: from a
+terminal it behaves, but where stdin is a pipe or a socket — any harness, CI job, or
+backgrounded shell — it blocks before doing any work. Fixed with `< /dev/null` on the
+invocation.
+
+The reusable part is the diagnosis, not the fix. "Still running" and "wedged" are the same
+observation from the outside, and the instinct is to wait longer, because the request really
+was large. What separated them in about five seconds:
+
+```bash
+ps -o pid,etime,time -p <pid>       # ELAPSED 56:03, TIME 00:00:00
+```
+
+A process that is genuinely working accumulates CPU time — even one that is mostly waiting on
+a network response has to parse its input and stream its output. Near-zero CPU against a large
+elapsed time means it never started. Two supporting checks, in order of cost: whether its log
+files are still being written, and `ls -l /proc/<pid>/fd/0` to see what stdin actually is.
+
+**Rule: before waiting longer on a slow tool, check that it has spent any CPU at all.** And
+when you background a tool that normally runs interactively, redirect stdin from `/dev/null`
+rather than inheriting whatever the harness handed you.
+
 ---
 
 ## Milestone stop-point checklist
