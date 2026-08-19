@@ -327,7 +327,7 @@ def _load_json(value: object, field: str, *, expect: type | tuple[type, ...]) ->
 def _require_count(value: object, field: str) -> int | None:
     """Gate a discarded-evidence counter.
 
-    ``None`` is *unmeasured* and ``0`` is the claim that nothing was discarded; 004
+    ``None`` is *unmeasured* and ``0`` is the claim that nothing was discarded; 005
     keeps them distinct on purpose, so this must not coerce one into the other.
     ``type() is int`` rather than ``isinstance``: ``bool`` subclasses ``int``, and
     ``True`` would otherwise be stored as the count 1.
@@ -623,12 +623,12 @@ def with_retrieval_counts(
 
     Both adapters report ``documents_dropped`` and ``duplicates_collapsed`` on their
     own result object (``AskNewsRetrieval``/``ExaRetrieval``) rather than on the run,
-    because until 004 there was no column for either. This is the seam that moves
+    because until 005 there was no column for either. This is the seam that moves
     them onto the run, which is where the writer and the packet hash both read them.
 
     It exists so callers do not reach for ``model_copy(update=...)``, which **skips
     validation** -- a negative count would sail past the model and be caught only by
-    004's CHECK, at write time, after the calls were paid for. Re-validating here
+    005's CHECK, at write time, after the calls were paid for. Re-validating here
     means a bad count is refused as this module's own error, before any I/O.
     """
     validated = _require_run(run)

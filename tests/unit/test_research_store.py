@@ -268,7 +268,7 @@ def test_a_document_from_another_run_is_refused(ledger: sqlite3.Connection) -> N
 
 
 def test_an_unmeasured_count_stays_distinct_from_zero(ledger: sqlite3.Connection) -> None:
-    """004 keeps NULL and 0 apart on purpose; the round trip must too."""
+    """005 keeps NULL and 0 apart on purpose; the round trip must too."""
     persist_retrieval(
         ledger, with_retrieval_counts(_run(), documents_dropped=0, duplicates_collapsed=0), []
     )
@@ -284,7 +284,7 @@ def test_an_unmeasured_count_stays_distinct_from_zero(ledger: sqlite3.Connection
 
 
 def test_with_retrieval_counts_refuses_a_negative_count() -> None:
-    """Before any I/O, as this module's error -- not at 004's CHECK after the spend."""
+    """Before any I/O, as this module's error -- not at 005's CHECK after the spend."""
     with pytest.raises(StoreError, match="non-negative"):
         with_retrieval_counts(_run(), documents_dropped=-1, duplicates_collapsed=0)
 

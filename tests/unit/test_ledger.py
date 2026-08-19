@@ -410,11 +410,11 @@ def test_statement_splitter_rejects_unterminated_statement() -> None:
         _statements("CREATE TABLE t (a TEXT)")  # no terminating semicolon
 
 
-def test_migration_004_adds_the_discarded_evidence_counters(tmp_path: Path) -> None:
+def test_migration_005_adds_the_discarded_evidence_counters(tmp_path: Path) -> None:
     """M1-306: the counts of retrieved evidence that never became a document row.
 
     Both are NULLable on purpose, and the two states are different claims: NULL is
-    *unmeasured* (a run opened before its calls, or a row predating 004), 0 is the
+    *unmeasured* (a run opened before its calls, or a row predating 005), 0 is the
     auditable claim that nothing was discarded. A NOT NULL DEFAULT 0 would collapse
     them into the second, manufacturing a measurement -- the same reasoning that
     stopped 002 defaulting `provenance` to 'direct_api'.
@@ -436,7 +436,7 @@ def test_migration_004_adds_the_discarded_evidence_counters(tmp_path: Path) -> N
         conn.close()
 
 
-def test_migration_004_counters_reject_a_non_integer_or_negative_count(
+def test_migration_005_counters_reject_a_non_integer_or_negative_count(
     tmp_path: Path,
 ) -> None:
     """`INTEGER` in SQLite is affinity, not a type.
@@ -444,7 +444,7 @@ def test_migration_004_counters_reject_a_non_integer_or_negative_count(
     A REAL that cannot be losslessly converted stays REAL and a non-numeric string
     stays TEXT, so without the `typeof()` half of the CHECK both 1.5 and 'garbage'
     satisfy `>= 0` -- 'garbage' passing only because SQLite orders TEXT above every
-    number. 002 spells this out for `posts_dropped_no_url`; 004 inherits it.
+    number. 002 spells this out for `posts_dropped_no_url`; 005 inherits it.
     """
     db = tmp_path / "ledger.sqlite3"
     initialize_ledger(db)

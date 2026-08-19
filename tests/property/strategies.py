@@ -286,14 +286,14 @@ def round_trip(document: ResearchDocument) -> ResearchDocument:
 # The packet hash covers the run as well as its documents, so the run needs the
 # same hostile-input treatment the documents already get: queries and provider
 # configs are provider- and caller-supplied text that reaches the same JSON
-# rendering, and the counters added by 004 have to keep NULL distinct from 0.
+# rendering, and the counters added by 005 have to keep NULL distinct from 0.
 
 # Deliberately small, so two runs in one packet can collide on the fields the
 # packet's own validation is supposed to refuse.
 QUESTION_IDS = st.sampled_from([1, 42])
 
 # Non-negative and nullable: None is "unmeasured", 0 is "nothing was discarded",
-# and 004 keeps them apart on purpose.
+# and 005 keeps them apart on purpose.
 COUNTS = st.none() | st.integers(min_value=0, max_value=5)
 
 

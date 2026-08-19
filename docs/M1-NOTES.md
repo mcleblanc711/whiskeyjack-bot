@@ -191,7 +191,7 @@ duplicate IDs.*
 - `tests/unit/test_research_{packet,store,artifacts}.py` (46 tests),
   `tests/property/test_packet_properties.py` (8 properties),
   `tests/property/strategies.py` (`research_runs`, `persisted_run`, `round_trip_run`),
-  two migration-004 cases in `tests/unit/test_ledger.py`.
+  two migration-005 cases in `tests/unit/test_ledger.py`.
 
 Nothing here is reachable from the CLI, and nothing calls a provider.
 
@@ -528,6 +528,28 @@ simulated storage with JSON, and this — the *test* has held the wrong notion o
 the code held the right one. The recurring shape is worth naming: **wherever identity is
 persisted-equivalence, every helper around the assertion has to use that equality too**, and
 in-memory `==` is the easy default that silently means something stricter.
+
+### Round 4 review (GPT) — APPROVE
+
+Reviewed commit `df17907`. Round 3's finding confirmed **CLOSED**; rounds 1-2's nine remain
+closed and untouched. No blocking findings, no new backlog candidates. All four risk areas the
+request raised — the migration renumber, the storability boundaries, the raw-SQL property, and
+M1-606's merged content — came back safe, including the one I was least sure of: that TEXT
+columns need no read-side storability re-check, because a value that reached one was encodable
+by construction.
+
+One non-blocking observation, acted on: several comments and two test names still called the
+counter migration `004` after the renumber. Executable references and version pins were already
+correct, so it was nomenclature only — but a comment naming the wrong migration is the drift
+this project spends rounds on, so they now read `005`. (Three `004` references remain and are
+correct: they are M1-606's, and one M1-603-era note that predates both.)
+
+**Four rounds.** For the record against `docs/LESSONS.md`'s table: 7 blocking findings, then 2,
+then 1, then approve. Every one of the ten was reproduced by execution before any fix was
+written and none was rebutted — but the more useful number is that **three further defects were
+found by this branch's own tests rather than by any review**, each one from closing a process
+gap a review had named rather than from the finding itself. The reviews were worth more for
+what they pointed at than for what they caught.
 
 ### Standing risk — not verifiable offline
 
