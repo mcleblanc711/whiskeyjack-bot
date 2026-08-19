@@ -252,3 +252,78 @@ def test_yaml_and_missing_file_errors_are_config_errors(tmp_path: Path) -> None:
     bad.write_text("just a string", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(bad)
+
+
+# --- YAML that parses but cannot be *constructed* (M0-007, M1-308 round-7 finding) ---
+#
+# The tests above exercise scanner/parser errors, which are the only kind that arrive as a
+# YAMLError. PyYAML's construction stage raises whatever Python raised at it, so all six
+# shapes below escaped load_config raw -- as ValueError, KeyError, AttributeError and
+# RecursionError. Two of them carry the offending value in their message, so an operator's
+# pasted secret would reach the terminal via an unhandled traceback.
+
+
+def _raw_source(**fields: str) -> str:
+    """A one-line config document, written as YAML *text* so tags and scalars survive.
+
+    ``write_config`` cannot be used here: it round-trips through ``yaml.safe_dump``, which
+    quotes and escapes exactly the shapes these cases depend on. The document never reaches
+    schema validation -- construction fails inside ``yaml.safe_load`` regardless of which
+    top-level key holds the bad value -- so a single-key document is enough.
+    """
+    entry = {"environment": "development"}
+    entry.update(fields)
+    return "".join(f"{key}: {value}\n" for key, value in entry.items())
+
+
+CONSTRUCTOR_FAILURES = {
+    "implicit date, day out of range": _raw_source(environment="2026-02-30"),
+    "implicit timestamp, minute out of range": _raw_source(environment="2026-01-01 12:60:00"),
+    "explicit !!bool with an unparseable scalar": _raw_source(environment="!!bool maybe"),
+    "explicit !!int with an unparseable scalar": _raw_source(environment="!!int abc"),
+    "explicit !!timestamp with an unparseable scalar": _raw_source(environment="!!timestamp bogus"),
+    "flow nesting deeper than the recursion limit": _raw_source(
+        environment="[" * 2000 + "]" * 2000,
+    ),
+}
+
+
+@pytest.mark.parametrize("source", CONSTRUCTOR_FAILURES.values(), ids=CONSTRUCTOR_FAILURES)
+def test_yaml_constructor_failure_arrives_as_a_config_error(tmp_path: Path, source: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "not valid YAML" in str(excinfo.value)
+    # from None -- the raw exception must not reprint the value through a traceback.
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize("source", CONSTRUCTOR_FAILURES.values(), ids=CONSTRUCTOR_FAILURES)
+def test_each_constructor_case_still_escapes_pyyaml_untranslated(source: str) -> None:
+    """Guard against the suite above going vacuous.
+
+    Each case earns its place only while ``yaml.safe_load`` really does raise something
+    outside its own hierarchy for it. If a future PyYAML turns one of these into a
+    ``YAMLError`` -- or accepts it -- that case stops testing the new branch and starts
+    testing one of the two that were already there, silently.
+    """
+    with pytest.raises(Exception) as raw:  # noqa: B017 -- the point is that it is untyped
+        yaml.safe_load(source)
+    assert not isinstance(raw.value, yaml.YAMLError)
+
+
+def test_a_valid_implicit_date_is_still_a_schema_error(tmp_path: Path) -> None:
+    """The new branch translates construction failures; it must not mask valid ones.
+
+    ``2026-02-28`` constructs cleanly into a ``datetime.date``, so it has to reach
+    pydantic and be rejected there as a schema mismatch -- with a schema message, not
+    the YAML one.
+    """
+    path = tmp_path / "config.yaml"
+    path.write_text(_raw_source(environment="2026-02-28"), encoding="utf-8")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "not valid YAML" not in str(excinfo.value)
