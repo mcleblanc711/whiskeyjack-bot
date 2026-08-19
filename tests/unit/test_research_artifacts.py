@@ -168,3 +168,84 @@ def test_the_envelope_carries_bodies_only_and_no_request_material(
 def test_a_naive_timestamp_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ArtifactError, match="timezone-aware"):
         _write(tmp_path, written_at_utc=datetime(2026, 8, 18, 12, 0))
+
+
+# --- round-1 review regressions ----------------------------------------------
+
+
+def test_the_reader_refuses_a_non_finite_constant_the_writer_cannot_emit(
+    tmp_path: Path,
+) -> None:
+    """Finding 7. `json.loads` accepts `NaN`/`Infinity` by default.
+
+    So the reader was accepting bodies the writer refuses to produce, and returned
+    them as Python floats as though they had round-tripped. A reader that admits
+    more than its writer can emit is not reading the format it documents.
+    """
+    relative = artifact_relative_path(question_id=42, retrieval_run_id="run-1")
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        path.write_text(
+            '{"artifact_schema_version": "1.0.0", "retrieval_run_id": "run-1", '
+            '"question_id": 42, "provider": "asknews", '
+            '"written_at_utc": "2026-08-18T12:00:00+00:00", '
+            f'"raw_responses": [{{"score": {constant}}}]}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(ArtifactError, match="non-finite JSON constant"):
+            read_raw_responses(tmp_path, relative)
+
+
+def test_the_reader_requires_the_envelopes_provenance_fields(tmp_path: Path) -> None:
+    """Finding 7. A version-and-bodies envelope was accepted as a valid artifact.
+
+    With no run id, question, provider or timestamp it is an unattributable blob,
+    not a retrieval record — and the whole point of keeping the bytes is saying
+    which paid run they came from.
+    """
+    relative = artifact_relative_path(question_id=42, retrieval_run_id="run-1")
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    complete = {
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "retrieval_run_id": "run-1",
+        "question_id": 42,
+        "provider": "asknews",
+        "written_at_utc": "2026-08-18T12:00:00+00:00",
+        "raw_responses": [],
+    }
+    # The complete envelope reads, so the assertions below are about the missing
+    # field and not about some unrelated strictness.
+    path.write_text(json.dumps(complete), encoding="utf-8")
+    assert read_raw_responses(tmp_path, relative) == ()
+
+    for field in ("retrieval_run_id", "question_id", "provider", "written_at_utc"):
+        partial = {k: v for k, v in complete.items() if k != field}
+        path.write_text(json.dumps(partial), encoding="utf-8")
+        with pytest.raises(ArtifactError, match="missing or malformed"):
+            read_raw_responses(tmp_path, relative)
+
+
+def test_the_reader_refuses_a_malformed_written_at(tmp_path: Path) -> None:
+    """Finding 7. `fromisoformat` quotes the offending string, so it is wrapped."""
+    relative = artifact_relative_path(question_id=42, retrieval_run_id="run-1")
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    for stamp, expected in ((PLANTED, "not an ISO-8601"), ("2026-08-18T12:00:00", "no offset")):
+        path.write_text(
+            json.dumps(
+                {
+                    "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                    "retrieval_run_id": "run-1",
+                    "question_id": 42,
+                    "provider": "asknews",
+                    "written_at_utc": stamp,
+                    "raw_responses": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ArtifactError, match=expected) as caught:
+            read_raw_responses(tmp_path, relative)
+        assert PLANTED not in f"{caught.value}{caught.value!r}{caught.value.args}"

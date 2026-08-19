@@ -123,10 +123,16 @@ def write_raw_responses(
     default's meaning and not a failure.
 
     Raises :class:`ArtifactError` rather than swallowing a write failure. Callers on
-    the paid path must not let that lose the run: write the artifact first and
-    persist the ledger row with ``raw_response_path=None`` if it failed, which is
-    what :func:`whiskeyjack_bot.research.store.persist_retrieval` does. A run that
+    the paid path must not let that lose the run: write the artifact first, and if it
+    fails, persist the ledger row anyway with ``raw_response_path=None``. A run that
     cost money and produced no artifact is still a run that must be recorded.
+
+    **No function here or in the store performs that composition** -- the caller
+    does. An earlier version of this docstring claimed
+    ``store.persist_retrieval`` did, which was simply false (round 1, non-blocking
+    observation): it takes an already-computed path and has no opinion about how the
+    artifact write went. Filed as a follow-up rather than built here, because the
+    composed API belongs with the orchestrator this item deliberately does not ship.
     """
     run_id = _require_safe_run_id(retrieval_run_id)
     question = _require_int(question_id, "question_id")
@@ -220,12 +226,39 @@ def _write_new_file(destination: Path, payload: bytes) -> None:
                 pass
 
 
+def _reject_json_constant(token: str) -> object:
+    """Refuse ``NaN``/``Infinity``/``-Infinity`` while parsing an artifact.
+
+    ``json.loads`` accepts all three by default, so the reader was accepting bodies
+    the writer refuses to produce -- an envelope holding ``NaN`` came back as a
+    Python float and would have flowed on as though it had round-tripped (round 1,
+    finding 7). A reader that admits more than its writer can emit is not reading
+    the format it documents.
+    """
+    raise ArtifactError(
+        "retrieval artifact contains a non-finite JSON constant, which this format does not permit"
+    )
+
+
+def _require_envelope_text(envelope: dict[str, Any], key: str, path: Path) -> str:
+    value = envelope.get(key)
+    if type(value) is not str or not value:
+        raise ArtifactError(f"retrieval artifact {key} is missing or malformed: {path}")
+    return value
+
+
 def read_raw_responses(artifact_root: Path, relative_path: str) -> tuple[dict[str, Any], ...]:
     """Read back one run's raw provider bodies, for audit.
 
     Not on the replay path -- replay reads the ledger. A missing or corrupt artifact
     therefore costs an audit trail, not a replay, which is stated as a standing risk
     in ``docs/M1-NOTES.md`` rather than left to be discovered.
+
+    Every required envelope field is validated, not just the schema version. The
+    first cut checked the version and the bodies and returned; an envelope carrying
+    neither run id, question, provider nor timestamp was accepted as a valid
+    artifact, which makes it an unattributable blob rather than a retrieval record
+    (round 1, finding 7).
     """
     if type(relative_path) is not str or not relative_path:
         raise ArtifactError("relative_path must be a non-empty string")
@@ -235,7 +268,9 @@ def read_raw_responses(artifact_root: Path, relative_path: str) -> tuple[dict[st
     except OSError:
         raise ArtifactError(f"cannot read retrieval artifact {path}") from None
     try:
-        envelope = json.loads(raw.decode("utf-8"))
+        envelope = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except ArtifactError:
+        raise
     except (UnicodeDecodeError, ValueError):
         # from None: a JSONDecodeError quotes the surrounding document text.
         raise ArtifactError(f"retrieval artifact is not valid JSON: {path}") from None
@@ -249,6 +284,22 @@ def read_raw_responses(artifact_root: Path, relative_path: str) -> tuple[dict[st
             f"retrieval artifact schema version is not {ARTIFACT_SCHEMA_VERSION} "
             f"(found value withheld): {path}"
         )
+    # Provenance, not decoration: these are what say which run and which question the
+    # bodies below belong to. An artifact that cannot answer that is not evidence.
+    _require_safe_run_id(_require_envelope_text(envelope, "retrieval_run_id", path))
+    _require_envelope_text(envelope, "provider", path)
+    written_at = _require_envelope_text(envelope, "written_at_utc", path)
+    try:
+        parsed = datetime.fromisoformat(written_at)
+    except ValueError:
+        # from None: fromisoformat quotes the offending string.
+        raise ArtifactError(
+            f"retrieval artifact written_at_utc is not an ISO-8601 timestamp: {path}"
+        ) from None
+    if parsed.tzinfo is None:
+        raise ArtifactError(f"retrieval artifact written_at_utc has no offset: {path}")
+    if type(envelope.get("question_id")) is not int:
+        raise ArtifactError(f"retrieval artifact question_id is missing or malformed: {path}")
     bodies = envelope.get("raw_responses")
     if not isinstance(bodies, list) or any(not isinstance(body, dict) for body in bodies):
         raise ArtifactError(f"retrieval artifact raw_responses is malformed: {path}")

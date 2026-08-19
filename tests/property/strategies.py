@@ -222,8 +222,18 @@ def host_spellings(draw: st.DrawFn) -> tuple[str, str]:
 
 
 @st.composite
-def research_documents(draw: st.DrawFn) -> ResearchDocument:
-    """A schema-valid ResearchDocument over the hostile input classes above."""
+def research_documents(
+    draw: st.DrawFn, text: st.SearchStrategy[str] = HOSTILE_TEXT
+) -> ResearchDocument:
+    """A schema-valid ResearchDocument over the hostile input classes above.
+
+    ``text`` is a parameter so a property that is only claimed over storable input
+    can pass ``ENCODABLE_TEXT`` instead of filtering. Filtering was the first cut and
+    hypothesis rejected it as a failed health check: lone surrogates are common
+    enough in ``HOSTILE_TEXT`` that most packets were discarded. Narrowing the
+    *generator* keeps the surrogate gap visible as its own test rather than hiding
+    it inside an ``assume``.
+    """
     # Social documents are constrained by the schema (llm_reported plus a tag), so
     # the trio is drawn together rather than generated and filtered.
     source_type = draw(st.sampled_from(["news", "web", "official", "structured", "social"]))
@@ -242,11 +252,11 @@ def research_documents(draw: st.DrawFn) -> ResearchDocument:
         "source_type": source_type,
         "provenance": provenance,
         "content_sha256": draw(DIGESTS),
-        "title": draw(st.none() | HOSTILE_TEXT),
-        "snippet": draw(st.none() | HOSTILE_TEXT),
-        "summary": draw(st.none() | HOSTILE_TEXT),
-        "publisher": draw(st.none() | HOSTILE_TEXT),
-        "author": draw(st.none() | HOSTILE_TEXT),
+        "title": draw(st.none() | text),
+        "snippet": draw(st.none() | text),
+        "summary": draw(st.none() | text),
+        "publisher": draw(st.none() | text),
+        "author": draw(st.none() | text),
         "reliability_tag": reliability_tag,
     }
     return validate_document(payload)
@@ -286,25 +296,35 @@ QUESTION_IDS = st.sampled_from([1, 42])
 # and 004 keeps them apart on purpose.
 COUNTS = st.none() | st.integers(min_value=0, max_value=5)
 
+
 # JSON that survives the round trip into a TEXT column. Non-finite floats are
 # excluded because the schema refuses them (they render as null), which is the
 # invariant `_reject_non_finite` exists to hold.
-PROVIDER_CONFIG_VALUES = st.recursive(
-    st.none()
-    | st.booleans()
-    | st.integers(min_value=-1000, max_value=1000)
-    | st.floats(allow_nan=False, allow_infinity=False, width=32)
-    | HOSTILE_TEXT,
-    lambda children: (
-        st.lists(children, max_size=3) | st.dictionaries(HOSTILE_TEXT, children, max_size=3)
-    ),
-    max_leaves=6,
-)
+def provider_config_values(
+    text: st.SearchStrategy[str] = HOSTILE_TEXT,
+) -> st.SearchStrategy[object]:
+    """Nested JSON a provider config may hold, over the given text class."""
+    return st.recursive(
+        st.none()
+        | st.booleans()
+        | st.integers(min_value=-1000, max_value=1000)
+        | st.floats(allow_nan=False, allow_infinity=False, width=32)
+        | text,
+        lambda children: (
+            st.lists(children, max_size=3) | st.dictionaries(text, children, max_size=3)
+        ),
+        max_leaves=6,
+    )
+
+
+PROVIDER_CONFIG_VALUES = provider_config_values()
 
 
 @st.composite
-def research_runs(draw: st.DrawFn) -> ResearchRun:
-    """A schema-valid ResearchRun over the hostile input classes above."""
+def research_runs(draw: st.DrawFn, text: st.SearchStrategy[str] = HOSTILE_TEXT) -> ResearchRun:
+    """A schema-valid ResearchRun over the hostile input classes above.
+
+    ``text`` is a parameter for the reason :func:`research_documents` gives."""
     # Drawn together rather than generated and filtered: the schema requires an
     # agent_model and a posts_dropped_no_url from the agent provider, and a run that
     # cannot be built is not a run worth fuzzing.
@@ -322,9 +342,9 @@ def research_runs(draw: st.DrawFn) -> ResearchRun:
         "question_id": draw(QUESTION_IDS),
         "provider": provider,
         "provider_config": draw(
-            st.none() | st.dictionaries(HOSTILE_TEXT, PROVIDER_CONFIG_VALUES, max_size=3)
+            st.none() | st.dictionaries(text, provider_config_values(text), max_size=3)
         ),
-        "queries": draw(st.lists(HOSTILE_TEXT, max_size=3)),
+        "queries": draw(st.lists(text, max_size=3)),
         "started_at_utc": started,
         # None or the start itself: the schema refuses a completion before the start,
         # and drawing an independent instant would mostly generate refusals.
@@ -333,9 +353,16 @@ def research_runs(draw: st.DrawFn) -> ResearchRun:
         # Excluded from the packet hash, and generated *because* it is: the property
         # that says so can only discriminate if the value actually varies.
         "raw_response_path": draw(st.none() | st.sampled_from(["research/1/a.json", "x.json"])),
-        "error_summary": draw(st.none() | HOSTILE_TEXT),
+        "error_summary": draw(st.none() | text),
+        # -0.0 is drawn explicitly. `st.floats(min_value=0, ...)` never produces it,
+        # which is why the suite missed that SQLite maps -0.0 to 0.0 on a REAL column
+        # while the model preserved the sign -- an ordinary accepted cost that hashed
+        # differently before and after persistence (M1-306 review round 1, finding 1).
+        # A bound that starts at zero silently excludes one of zero's two spellings.
         "cost_usd": draw(
-            st.none() | st.floats(min_value=0, max_value=100, allow_nan=False, allow_infinity=False)
+            st.none()
+            | st.sampled_from([0.0, -0.0])
+            | st.floats(min_value=0, max_value=100, allow_nan=False, allow_infinity=False)
         ),
         "agent_model": agent_model,
         "posts_dropped_no_url": posts_dropped,

@@ -220,17 +220,31 @@ HttpUrlString = Annotated[str, Field(min_length=1), AfterValidator(_require_http
 
 
 def _require_finite(value: float) -> float:
-    """Reject a non-finite number on a field that is stored as JSON or REAL.
+    """Reject a non-finite number, and canonicalize negative zero.
 
     ``ge=0`` happened to catch ``-inf`` and ``NaN`` (both comparisons are false),
     which made ``+inf`` look covered when it was not: it validated, then
     ``model_dump_json()`` rendered it as ``null``. A cost that reads as "unknown"
     once persisted is worse than one that reads as absurd, so the check is
     explicit rather than a side effect of the bound (review round 4).
+
+    ``value + 0.0`` maps ``-0.0`` to ``0.0`` and is the identity on everything
+    else (adding zero is exact in IEEE-754). It is here because **SQLite does the
+    same mapping and this module did not**: ``-0.0`` satisfies ``ge=0``, renders
+    as ``-0.0`` in ``model_dump(mode="json")``, and comes back out of a REAL
+    column as ``0.0``. That made a schema-valid run hash differently before and
+    after persistence -- an ordinary accepted input that falsified M1-306's
+    "replay produces the same research packet hash" (M1-306 review round 1,
+    finding 1). Canonicalizing at validation makes both sides agree, which is the
+    only fix that keeps the two spellings of "no cost" from being two costs.
+
+    Deliberately a normalization rather than a rejection: ``-0.0`` and ``0.0`` are
+    the same amount of money, and refusing one would turn a provider's sign
+    convention into a validation failure.
     """
     if not isfinite(value):
         raise ValueError("must be a finite number: NaN and Infinity cannot be persisted")
-    return value
+    return value + 0.0
 
 
 # A number that survives the round trip into storage. See _require_finite.

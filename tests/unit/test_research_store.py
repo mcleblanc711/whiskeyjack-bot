@@ -25,7 +25,9 @@ from whiskeyjack_bot.research.model import (
 from whiskeyjack_bot.research.packet import build_packet, packet_sha256
 from whiskeyjack_bot.research.store import (
     StoreError,
+    _read_snapshot,
     complete_run,
+    list_retrieval_run_ids,
     load_documents,
     load_packet,
     load_run,
@@ -116,7 +118,12 @@ def test_replay_reproduces_the_packet_hash_with_zero_provider_calls(
     persist_retrieval(ledger, run, documents, raw_response_path="research/42/run-1.json")
 
     config = _config(tmp_path, replay_saved_research=True)
-    replayed = replay_research(ledger, config, question_id=QUESTION)
+    replayed = replay_research(
+        ledger,
+        config,
+        question_id=QUESTION,
+        retrieval_run_ids=list_retrieval_run_ids(ledger, question_id=QUESTION),
+    )
     assert packet_sha256(replayed) == before
 
 
@@ -207,7 +214,7 @@ def test_open_run_refuses_a_run_that_already_completed(ledger: sqlite3.Connectio
 
 
 def test_complete_run_refuses_a_run_that_was_never_opened(ledger: sqlite3.Connection) -> None:
-    with pytest.raises(StoreError, match="call open_run first"):
+    with pytest.raises(StoreError, match="no open run matches this one"):
         complete_run(ledger, _run(), [])
 
 
@@ -300,7 +307,9 @@ def test_replay_refuses_while_the_config_flag_is_off(
 ) -> None:
     persist_retrieval(ledger, _run(), [_document(0)])
     with pytest.raises(StoreError, match="replay_saved_research is disabled"):
-        replay_research(ledger, _config(tmp_path), question_id=QUESTION)
+        replay_research(
+            ledger, _config(tmp_path), question_id=QUESTION, retrieval_run_ids=("run-1",)
+        )
 
 
 def test_replay_refuses_an_empty_packet_rather_than_returning_one(
@@ -313,7 +322,7 @@ def test_replay_refuses_an_empty_packet_rather_than_returning_one(
     """
     config = _config(tmp_path, replay_saved_research=True)
     with pytest.raises(StoreError, match="refusing to replay an empty packet"):
-        replay_research(ledger, config, question_id=QUESTION)
+        replay_research(ledger, config, question_id=QUESTION, retrieval_run_ids=())
 
 
 def test_a_question_with_several_runs_replays_all_of_them(
@@ -326,7 +335,10 @@ def test_a_question_with_several_runs_replays_all_of_them(
         [_document(1, retrieval_run_id="run-2")],
     )
     packet = replay_research(
-        ledger, _config(tmp_path, replay_saved_research=True), question_id=QUESTION
+        ledger,
+        _config(tmp_path, replay_saved_research=True),
+        question_id=QUESTION,
+        retrieval_run_ids=list_retrieval_run_ids(ledger, question_id=QUESTION),
     )
     assert {run.provider for run in packet.runs} == {"asknews", "exa"}
     assert len(packet.documents) == 2
@@ -408,7 +420,241 @@ def test_malformed_arguments_arrive_as_store_errors(ledger: sqlite3.Connection) 
         lambda: persist_retrieval(ledger, _run(), ["not a document"]),  # type: ignore[list-item]
         lambda: load_run(ledger, 7),  # type: ignore[arg-type]
         lambda: load_documents(ledger, ""),
-        lambda: load_packet(ledger, question_id="42"),  # type: ignore[arg-type]
+        lambda: load_packet(ledger, question_id="42", retrieval_run_ids=()),  # type: ignore[arg-type]
+        lambda: load_packet(ledger, question_id=1, retrieval_run_ids="run-1"),
+        lambda: load_packet(ledger, question_id=1, retrieval_run_ids=("a", "a")),
     ):
         with pytest.raises(StoreError):
             call()
+
+
+# --- round-1 review regressions ----------------------------------------------
+#
+# One per blocking finding, each reproduced by execution against 837f333 before any
+# fix was written and confirmed to fail there.
+
+
+def test_a_negative_zero_cost_replays_to_the_same_hash(ledger: sqlite3.Connection) -> None:
+    """Finding 1. ``-0.0`` satisfies `ge=0`, renders as `-0.0`, returns as `0.0`.
+
+    An ordinary accepted input that falsified the acceptance criterion: the packet
+    hashed one way in memory and another after a round trip through a REAL column.
+    The fix canonicalizes at model validation so both sides agree; the assertion is
+    the SQLite round trip, not the model, because the model was never the half that
+    disagreed.
+    """
+    run = _run(cost_usd=-0.0)
+    before = packet_sha256(build_packet(QUESTION, [run], []))
+    persist_retrieval(ledger, run, [])
+    after = load_packet(
+        ledger,
+        question_id=QUESTION,
+        retrieval_run_ids=list_retrieval_run_ids(ledger, question_id=QUESTION),
+    )
+    assert packet_sha256(after) == before
+
+
+def test_a_named_packet_is_unchanged_by_a_later_unrelated_run(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Finding 2. A packet keyed on "every row sharing a question" has no identity.
+
+    Persisting a second run silently changed what the *first* packet was, and the
+    earlier one became unreplayable. Naming the runs makes a stored hash a claim that
+    can still be checked a year later.
+    """
+    persist_retrieval(ledger, _run(), [_document(0)])
+    named = list_retrieval_run_ids(ledger, question_id=QUESTION)
+    before = packet_sha256(load_packet(ledger, question_id=QUESTION, retrieval_run_ids=named))
+
+    persist_retrieval(
+        ledger,
+        _run(retrieval_run_id="run-2", provider="exa"),
+        [_document(1, retrieval_run_id="run-2")],
+    )
+    after = packet_sha256(load_packet(ledger, question_id=QUESTION, retrieval_run_ids=named))
+    assert after == before
+
+
+def test_an_open_run_is_not_replayable(ledger: sqlite3.Connection, tmp_path: Path) -> None:
+    """Finding 2, second half. An open run is a spend record, not evidence.
+
+    It has no documents yet and its own columns are still to be written, so replaying
+    it reproduces a hash the finished run will not match.
+    """
+    open_run(ledger, _run(completed_at_utc=None))
+    assert list_retrieval_run_ids(ledger, question_id=QUESTION) == ()
+    config = _config(tmp_path, replay_saved_research=True)
+    with pytest.raises(StoreError, match="has not completed"):
+        replay_research(ledger, config, question_id=QUESTION, retrieval_run_ids=("run-1",))
+
+
+def test_a_packet_is_read_from_one_snapshot(tmp_path: Path) -> None:
+    """Finding 3. Three unsynchronized reads produced a state the ledger never held.
+
+    A concurrent ``complete_run`` landing between the run read and the document read
+    returned an *unfinished* run together with the documents it only has once
+    finished. Two real connections and a real commit; no mocking, because the race is
+    ordinary and reachable.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    reader, writer = connect(db), connect(db)
+    try:
+        opened = _run(completed_at_utc=None)
+        open_run(reader, opened)
+        finished = _run(cost_usd=0.5)
+        with _read_snapshot(reader):
+            runs = [load_run(reader, "run-1")]
+            complete_run(writer, finished, [_document(0)])
+            documents = list(load_documents(reader, "run-1"))
+        # Either both halves are the before-state or both are the after-state; the
+        # torn combination (unfinished run + its completed-run documents) is what
+        # this forbids.
+        assert (runs[0].completed_at_utc is None) == (documents == [])
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_completing_a_run_twice_is_refused(ledger: sqlite3.Connection) -> None:
+    """Finding 4. The second completion rewrote a stored run's queries and cost.
+
+    That moved an already-computed packet hash on a table whose whole point is that
+    evidence is not re-identified after the fact.
+    """
+    open_run(ledger, _run(completed_at_utc=None))
+    complete_run(ledger, _run(queries=["first"], cost_usd=1.0), [])
+    with pytest.raises(StoreError, match="no open run matches this one"):
+        complete_run(ledger, _run(queries=["second"], cost_usd=2.0), [])
+    assert load_run(ledger, "run-1").queries == ["first"]
+
+
+def test_completing_with_a_mismatched_identity_is_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Finding 4. A caller id mix-up silently fused two runs.
+
+    Completing `run-1` with a model carrying a different question, provider and start
+    time kept the opened identity and took the other model's payload — a row that
+    describes neither retrieval.
+    """
+    open_run(ledger, _run(completed_at_utc=None))
+    other = _run(
+        question_id=99,
+        provider="exa",
+        started_at_utc=datetime(2026, 8, 18, 13, 0, tzinfo=timezone.utc),
+        completed_at_utc=datetime(2026, 8, 18, 13, 0, tzinfo=timezone.utc),
+        queries=["third"],
+    )
+    with pytest.raises(StoreError, match="no open run matches this one"):
+        complete_run(ledger, other, [])
+    stored = load_run(ledger, "run-1")
+    assert stored.question_id == QUESTION
+    assert stored.completed_at_utc is None
+
+
+def test_an_integer_too_wide_for_sqlite_is_refused(ledger: sqlite3.Connection) -> None:
+    """Finding 5. `question_id` is schema-valid at any Python width.
+
+    Binding one wider than 64 bits raised a raw `OverflowError` out of a module that
+    contracts to raise only its own type.
+    """
+    with pytest.raises(StoreError, match="outside the range SQLite can store"):
+        persist_retrieval(ledger, _run(question_id=2**63), [])
+
+
+def test_an_undecodable_stored_column_is_refused_without_echoing_it(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Finding 5, and the leak in it.
+
+    Decoding happens at **fetch**, so ending the protection at `conn.execute` left a
+    raw `sqlite3.OperationalError` escaping — and its message quotes the stored
+    bytes, so it printed the planted value verbatim. Written around the writers on
+    purpose: this is ordinary foreign-tool-written or corrupted state.
+    """
+    persist_retrieval(ledger, _run(), [])
+    ledger.execute(
+        "UPDATE research_runs SET error_summary = CAST(? AS TEXT) WHERE retrieval_run_id = ?",
+        (PLANTED.encode() + b"\xff\xfe", "run-1"),
+    )
+    with pytest.raises(StoreError) as caught:
+        load_run(ledger, "run-1")
+    assert PLANTED not in f"{caught.value}{caught.value!r}{caught.value.args}"
+
+
+def test_a_malformed_queries_column_is_refused_not_rewritten(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Finding 6. `_load_json(...) or []` turned four malformed shapes into `[]`.
+
+    A corrupt row was silently rewritten into a schema-valid run with no queries,
+    which then hashed as a perfectly good packet. Reading is not the place to repair
+    the ledger. Only SQL NULL may take the legacy default, and that case is asserted
+    too so the fix is not a blanket refusal.
+
+    The fix is two halves — dropping ``or []`` and adding ``_load_json(expect=...)``
+    — and **each masks the other**, measured by reverting them one at a time: with
+    only ``or []`` restored the shape gate refuses first, and with only the gate
+    removed pydantic refuses the non-list. Reverting both together is what returns
+    ``[]`` for all four inputs. Recorded because either half read on its own looks
+    like dead defence and is not.
+    """
+    persist_retrieval(ledger, _run(queries=["real"]), [])
+    for malformed in ("false", "0", '""', "{}", "[1]"):
+        ledger.execute(
+            "UPDATE research_runs SET queries_json = ? WHERE retrieval_run_id = ?",
+            (malformed, "run-1"),
+        )
+        with pytest.raises(StoreError):
+            load_run(ledger, "run-1")
+    ledger.execute(
+        "UPDATE research_runs SET queries_json = NULL WHERE retrieval_run_id = ?", ("run-1",)
+    )
+    assert load_run(ledger, "run-1").queries == []
+
+
+def test_a_blob_in_a_text_column_is_refused_not_coerced(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Finding 6. A BLOB in a TEXT-affinity column came back as `bytes`.
+
+    Pydantic then coerced it into a `str`, so corrupt state was returned as valid
+    evidence rather than refused.
+    """
+    persist_retrieval(ledger, _run(), [])
+    ledger.execute(
+        "UPDATE research_runs SET error_summary = ? WHERE retrieval_run_id = ?",
+        (b"\x01\x02\x03", "run-1"),
+    )
+    with pytest.raises(StoreError, match="not text"):
+        load_run(ledger, "run-1")
+
+
+def test_a_surrogate_pair_in_a_json_column_is_refused(ledger: sqlite3.Connection) -> None:
+    """Found by the SQLite round-trip property, not by the review.
+
+    ``queries`` and ``provider_config`` are stored as JSON with ``ensure_ascii=True``,
+    and this module previously claimed that made them immune to the surrogate problem
+    guarded on the TEXT columns. True of *lone* surrogates, false of **pairs**, which
+    is the more dangerous half:
+
+    - ``chr(0xD800) + chr(0xDC00)`` is two Python code points and is not UTF-8
+      encodable;
+    - ``json.dumps(ensure_ascii=True)`` writes it and ``json.loads`` **recombines it**
+      into the single scalar ``U+10000``, so what comes back is a different string;
+    - pydantic's ``model_dump(mode="json")`` renders the original as six ``U+FFFD``.
+
+    So the in-memory packet hashed over replacement characters and the stored packet
+    over the clean scalar. Refused rather than normalized, for the reason
+    ``_require_storable_text`` gives.
+    """
+    pair = chr(0xD800) + chr(0xDC00)
+    with pytest.raises(StoreError, match="lone surrogate"):
+        persist_retrieval(ledger, _run(queries=[pair]), [])
+    with pytest.raises(StoreError, match="lone surrogate"):
+        persist_retrieval(ledger, _run(provider_config={pair: 1}), [])
+    with pytest.raises(StoreError, match="lone surrogate"):
+        persist_retrieval(ledger, _run(provider_config={"k": [{"nested": pair}]}), [])
+    assert ledger.execute("SELECT count(*) FROM research_runs").fetchone()[0] == 0

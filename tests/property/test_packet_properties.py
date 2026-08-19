@@ -26,11 +26,17 @@ against broken code, which is the reason that step is written down rather than a
 
 from __future__ import annotations
 
+import itertools
 import json
+import sqlite3
+from collections.abc import Iterator
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
+
+from whiskeyjack_bot.ledger import connect, initialize_ledger
+from whiskeyjack_bot.research.store import load_packet, persist_retrieval
 
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun, validate_run
 from whiskeyjack_bot.research.packet import (
@@ -41,6 +47,7 @@ from whiskeyjack_bot.research.packet import (
     packet_sha256,
 )
 from strategies import (
+    ENCODABLE_TEXT,
     HOSTILE_TEXT,
     research_documents,
     research_runs,
@@ -55,7 +62,7 @@ PLANTED = "privateFAKE123456"
 
 
 @st.composite
-def packets(draw: st.DrawFn) -> ResearchPacket:
+def packets(draw: st.DrawFn, text: st.SearchStrategy[str] = HOSTILE_TEXT) -> ResearchPacket:
     """A schema-valid packet: one question, its runs, and documents that belong to them.
 
     Built by *construction* rather than by generating freely and filtering, because a
@@ -64,7 +71,7 @@ def packets(draw: st.DrawFn) -> ResearchPacket:
     spend its draws on rejections.
     """
     question_id = draw(st.sampled_from([1, 42]))
-    runs = draw(st.lists(research_runs(), min_size=1, max_size=3))
+    runs = draw(st.lists(research_runs(text=text), min_size=1, max_size=3))
     # Re-key the drawn runs onto this packet's question and onto distinct ids, which
     # is what the constructor requires and what the generator cannot know.
     #
@@ -82,7 +89,7 @@ def packets(draw: st.DrawFn) -> ResearchPacket:
         for index, run in enumerate(runs)
     ]
 
-    documents = draw(st.lists(research_documents(), max_size=4))
+    documents = draw(st.lists(research_documents(text=text), max_size=4))
     attached: list[ResearchDocument] = []
     seen: set[tuple[str, str, str]] = set()
     for document in documents:
@@ -254,3 +261,149 @@ def test_no_message_echoes_a_planted_secret(run: ResearchRun, document: Research
     # a rendering, so the planted value must not survive into anything a caller prints.
     digest = packet_sha256(build_packet(1, [planted_run], []))
     assert PLANTED not in digest
+
+
+# --- the round trip that goes through SQLite ---------------------------------
+
+
+@pytest.fixture(scope="module")
+def sqlite_ledger(tmp_path_factory: pytest.TempPathFactory) -> Iterator[sqlite3.Connection]:
+    """One ledger for the whole property, not one per example.
+
+    ``@given`` with a function-scoped ``tmp_path`` is a hypothesis health-check
+    failure, and building a schema per example would dominate the runtime. Each
+    example writes its own run id instead.
+    """
+    db = tmp_path_factory.mktemp("packet-properties") / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _is_storable(value: str | None) -> bool:
+    """True if SQLite can hold this text; see store._require_storable_text."""
+    if value is None:
+        return True
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _json_text(value: object) -> list[str | None]:
+    """Every string inside a provider config, keys included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str | None] = []
+        for key, nested in value.items():
+            out.append(key)
+            out.extend(_json_text(nested))
+        return out
+    if isinstance(value, list):
+        return [s for item in value for s in _json_text(item)]
+    return []
+
+
+def _text_of(packet: ResearchPacket) -> list[str | None]:
+    """Every caller-supplied text value the writer binds into a TEXT column."""
+    values: list[str | None] = []
+    for run in packet.runs:
+        values.extend([run.retrieval_run_id, run.error_summary, run.agent_model])
+        # The JSON columns are checked too: a surrogate *pair* is not UTF-8
+        # encodable and json round-trips it into a different string, so the store
+        # refuses it (see store._require_storable_json).
+        values.extend(run.queries)
+        values.extend(_json_text(run.provider_config))
+    for document in packet.documents:
+        values.extend(
+            [
+                document.title,
+                document.publisher,
+                document.author,
+                document.snippet,
+                document.summary,
+                document.raw_artifact_path,
+                document.original_url,
+                document.canonical_url,
+            ]
+        )
+    return values
+
+
+# Monotonic, not drawn: a drawn nonce repeats across examples and collides on
+# research_runs' primary key, which fails the test for a reason that has nothing to
+# do with what it asserts.
+_RUN_SEQUENCE = itertools.count()
+
+
+@given(packets(text=ENCODABLE_TEXT))
+@settings(max_examples=60, deadline=None)
+def test_the_hash_survives_a_real_sqlite_round_trip(
+    sqlite_ledger: sqlite3.Connection, packet: ResearchPacket
+) -> None:
+    """The persisted-form round trip, through the actual ledger rather than JSON.
+
+    ``round_trip_run``/``round_trip`` simulate storage with ``json.dumps`` ->
+    ``json.loads``, which is the right model of *most* of what storage does and was
+    wrong about the case that mattered: JSON preserves the sign of ``-0.0`` and a
+    SQLite REAL column does not, so a schema-valid cost hashed differently before and
+    after persistence and no property could see it (round 1, finding 1). A simulated
+    boundary tests the simulation.
+
+    Re-keyed onto a per-example run id so one ledger serves the whole property; the
+    ids are not part of what is being asserted, since both sides carry the same ones.
+
+    Scoped to packets the ledger accepts, which is the claim being made: *every
+    schema-valid run that persists successfully replays to its original hash.* The
+    shared strategies deliberately generate lone surrogates and surrogate pairs, and
+    the store deliberately refuses both -- neither is UTF-8 encodable, and escaping
+    or recombining them would store something other than what the caller supplied.
+    Those are a refusal to assert about, not a hash failure, and
+    ``test_research_store.py`` asserts the refusal directly.
+
+    Drawn from ``ENCODABLE_TEXT`` rather than filtered with ``assume``: filtering was
+    the first cut and hypothesis rejected it as a failed health check, because
+    surrogates are common enough in ``HOSTILE_TEXT`` that most packets were
+    discarded. The assertion below is not redundant with the draw -- it is what would
+    fail loudly if ``ENCODABLE_TEXT`` ever stopped excluding them, rather than the
+    property quietly asserting nothing.
+    """
+    assert all(_is_storable(value) for value in _text_of(packet))
+    runs, documents = [], []
+    for index, run in enumerate(packet.runs):
+        run_id = f"p{next(_RUN_SEQUENCE)}-{index}"
+        runs.append(
+            run.model_copy(
+                update={"retrieval_run_id": run_id, "completed_at_utc": run.started_at_utc}
+            )
+        )
+        for document in packet.documents:
+            if document.retrieval_run_id == run.retrieval_run_id:
+                documents.append(document.model_copy(update={"retrieval_run_id": run_id}))
+
+    question_id = packet.question_id
+    before = packet_sha256(build_packet(question_id, runs, documents))
+    for run in runs:
+        persist_retrieval(
+            sqlite_ledger,
+            run,
+            [d for d in documents if d.retrieval_run_id == run.retrieval_run_id],
+        )
+    stored = load_packet(
+        sqlite_ledger,
+        question_id=question_id,
+        retrieval_run_ids=[run.retrieval_run_id for run in runs],
+    )
+    if packet_sha256(stored) != before:
+        import difflib
+
+        a = canonical_packet_json(build_packet(question_id, runs, documents))
+        b = canonical_packet_json(stored)
+        raise AssertionError(
+            "\n".join(difflib.unified_diff(a.split(","), b.split(","), lineterm="", n=1))
+        )

@@ -362,6 +362,27 @@ claims. And when a property covers a distinction the schema *drops on serializat
 path from the generator to the assertion for a `model_dump` → re-validate round trip — that is
 the normalization, and it is invisible because it looks like ordinary fixture plumbing.
 
+### The same shape one level up: a simulated boundary tests the simulation
+
+M1-306's round-1 review found that a schema-valid `cost_usd = -0.0` hashed one way in memory
+and another after persistence, because SQLite maps `-0.0` to `0.0` on a REAL column. No
+property could see it: `round_trip_run` modelled storage as `json.dumps` → `json.loads`, and
+**JSON is the half of storage that behaves** — it preserves the sign. The defect lived in the
+half being simulated away.
+
+Replacing it with a property that persists into a real ledger found an *eighth* defect the
+review had not reported, on the first run: a **surrogate pair** in a `provider_config` key is
+not UTF-8 encodable, `json.loads` silently **recombines** it into the astral scalar, and
+pydantic's `model_dump(mode="json")` renders the original as six `U+FFFD` — so in-memory and
+stored hashed differently. Again invisible to a JSON-simulated round trip, and again the
+recombination *succeeded* rather than failing, which is what made it silent.
+
+**Rule: for a persistence invariant, at least one property must cross the real boundary.**
+Simulate the boundary for speed everywhere else, but a claim of the form "what is stored
+replays to what was hashed" has to be tested against the thing that does the storing. The
+cheap version of this is one property with a module-scoped ledger and a per-example row id —
+about a second of runtime for the class of defect that is otherwise unreachable.
+
 Corollary, from the same item: a value that is both hashed into a record **and** accepted as a
 separate argument by the writer can be stored inconsistent with the object that was hashed.
 M1-306's `documents_dropped` was passed alongside the run and defaulted to `None` on it, so the

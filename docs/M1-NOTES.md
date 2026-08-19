@@ -344,6 +344,86 @@ thing that makes the property vacuous**, and the mutation has to express the def
 is *named for* — two other mutations of the same function were caught, which is exactly what made
 the suite look discriminating when it was not.
 
+### Round 1 review (GPT) — seven blocking findings, all reproduced
+
+Reviewed commit `837f333`, which was HEAD, so nothing was stale. **Every finding was
+reproduced by execution before any fix was written**, per the standing rule. All seven were
+real; none was rebutted.
+
+1. **`cost_usd = -0.0` changed the packet hash.** `-0.0` satisfies `ge=0`, renders as `-0.0`
+   in the persisted form, and comes back out of a REAL column as `0.0`. An ordinary accepted
+   input that falsified the acceptance criterion. Fixed by canonicalizing in
+   `_require_finite` (`value + 0.0`), so both sides agree — a normalization rather than a
+   rejection, because the two spellings are the same amount of money.
+2. **Question-wide replay had no stable packet identity.** `load_packet(question_id=...)`
+   meant "every row currently sharing this question", so persisting a second run silently
+   changed what the *first* packet was and made the earlier one unaddressable. An open run
+   was replayable too. Fixed by making the run set explicit: `list_retrieval_run_ids()` for
+   discovery, `load_packet(..., retrieval_run_ids=...)` for assembly, and `replay_research`
+   refusing an incomplete run. **This is the finding that mattered most** — the deliberate
+   rule that a fresh retrieval hashes differently is only coherent if the earlier packet
+   stays replayable, and it did not.
+3. **Packet assembly was not one snapshot.** Three unsynchronized reads, so a concurrent
+   `complete_run` between them returned an unfinished run together with the documents it only
+   has once finished — a state the ledger never held. Fixed with `_read_snapshot`, a deferred
+   `BEGIN` (not `BEGIN IMMEDIATE`: a reader takes no write lock, and WAL fixes the view at the
+   first statement).
+4. **`complete_run` was neither bound to the opened run nor once-only.** Completing twice
+   rewrote a stored run's queries and cost; completing with a model carrying a different
+   question, provider and start time kept the opened identity and took the other payload.
+   Fixed in the `WHERE` clause — `completed_at_utc IS NULL` plus the identity columns — rather
+   than a preceding `SELECT`, because a read-then-write is a race even inside `BEGIN IMMEDIATE`
+   and only one statement makes `rowcount` mean what it says.
+5. **The store did not own every SQLite failure, and one leaked.** A schema-valid
+   `question_id = 2**63` raised raw `OverflowError`; a lone-surrogate run id raised raw
+   `UnicodeEncodeError`; and fetching a column holding invalid UTF-8 raised
+   `sqlite3.OperationalError` **whose message printed the planted value verbatim** — decoding
+   happens at *fetch*, and the protection stopped at `conn.execute`. Fixed with `_fetch_one`/
+   `_fetch_all`, an integer range check, and the rule that only `IntegrityError` keeps its
+   text (that text is schema-authored; `OperationalError`'s is not).
+6. **Malformed stored values were coerced into valid evidence.** `_load_json(...) or []` turned
+   stored `false`, `0`, `""` and `{}` into `[]`, and a BLOB in a TEXT column came back as
+   `bytes` for pydantic to coerce into a `str`. Reading is not the place to repair the ledger.
+   Fixed with `expect=` on `_load_json` and `_stored_text`/`_stored_int`/`_stored_real` gates.
+7. **The artifact reader accepted envelopes the writer cannot produce** — `NaN` bodies
+   (`json.loads` accepts the constant) and envelopes with no run id, question, provider or
+   timestamp, i.e. an unattributable blob. Fixed with `parse_constant` and full envelope
+   validation.
+
+Both non-blocking observations were acted on: the two backlog candidates are filed as
+**M1-312** (compose artifact and ledger persistence) and **M1-313** (deep-freeze the packet),
+and the `artifacts.py` docstring that claimed `persist_retrieval` already performed the
+artifact-failure fallback was simply false and now says who actually owns it.
+
+### The eighth defect — found by the property the review asked for
+
+The review's finding 1 came with a process note: `round_trip_run` simulates storage with
+`json.dumps` → `json.loads` rather than SQLite, and the float strategy never generated `-0.0`.
+Both were true. Closing them meant adding `test_the_hash_survives_a_real_sqlite_round_trip`,
+which persists a generated packet into a real ledger and re-hashes it — **and that property
+immediately found a defect nobody had reported.**
+
+A **surrogate pair** in a `provider_config` key or a query:
+
+- `chr(0xD800) + chr(0xDC00)` is two Python code points and is **not** UTF-8 encodable;
+- `json.dumps(..., ensure_ascii=True)` writes it and `json.loads` **recombines it** into the
+  single scalar `U+10000` — so what comes back out of the ledger is a *different Python
+  string*;
+- and pydantic's `model_dump(mode="json")` renders the original pair as six `U+FFFD`.
+
+So the in-memory packet hashed over replacement characters while the stored packet hashed over
+the clean scalar. The module had explicitly claimed the JSON columns were immune because
+`ensure_ascii` escapes surrogates — true of *lone* surrogates, false of pairs, and the pair is
+the more dangerous case because it round-trips **successfully into something else** rather than
+failing. Fixed with `_require_storable_json`, refusing rather than normalizing, on the same
+reasoning `_require_storable_text` gives.
+
+The generalizable point, and the reason this is written down rather than just fixed: **a
+simulated boundary tests the simulation.** JSON was the half of storage that behaves; the
+defect lived in the half being simulated away. That is the same shape as lesson 9 — a test
+harness that normalizes what it is supposed to be probing — one level up, at the boundary
+rather than at the strategy.
+
 ### Standing risk — not verifiable offline
 
 Whether real MiniBench group subquestion titles are already self-describing cannot be checked

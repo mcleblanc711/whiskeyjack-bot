@@ -25,7 +25,11 @@ from whiskeyjack_bot.research.packet import (
     canonical_packet_json,
     packet_sha256,
 )
-from whiskeyjack_bot.research.store import load_packet, persist_retrieval
+from whiskeyjack_bot.research.store import (
+    list_retrieval_run_ids,
+    load_packet,
+    persist_retrieval,
+)
 
 WHEN = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
 QUESTION = 42
@@ -81,9 +85,12 @@ def test_the_hash_is_computable_from_the_ledger_alone(ledger: sqlite3.Connection
     """
     run, documents = _run(), [_document(0), _document(1)]
     persist_retrieval(ledger, run, documents)
-    assert packet_sha256(load_packet(ledger, question_id=QUESTION)) == packet_sha256(
-        build_packet(QUESTION, [run], documents)
+    stored = load_packet(
+        ledger,
+        question_id=QUESTION,
+        retrieval_run_ids=list_retrieval_run_ids(ledger, question_id=QUESTION),
     )
+    assert packet_sha256(stored) == packet_sha256(build_packet(QUESTION, [run], documents))
 
 
 def test_a_different_provider_config_is_a_different_packet() -> None:
@@ -135,17 +142,19 @@ def test_a_reminted_document_id_does_not_move_the_hash(ledger: sqlite3.Connectio
     """
     run, documents = _run(), [_document(0)]
     persist_retrieval(ledger, run, documents)
-    first = load_packet(ledger, question_id=QUESTION)
+    first = load_packet(ledger, question_id=QUESTION, retrieval_run_ids=("run-1",))
 
-    second_run = _run(retrieval_run_id="run-2")
-    persist_retrieval(ledger, second_run, [_document(0, retrieval_run_id="run-2")])
+    persist_retrieval(
+        ledger, _run(retrieval_run_id="run-2"), [_document(0, retrieval_run_id="run-2")]
+    )
     stored_ids = {row[0] for row in ledger.execute("SELECT document_id FROM research_documents")}
     assert len(stored_ids) == 2  # two distinct UUIDs for the same article
 
-    # The two runs differ only in their id, so the packets are genuinely different;
-    # what this pins is that hashing one run's evidence does not depend on the uuid.
-    reloaded = load_packet(ledger, question_id=QUESTION)
-    assert packet_sha256(reloaded) != packet_sha256(first)
+    # Naming run-1 again returns the same packet it did before run-2 existed, and it
+    # still equals the pre-persist hash: neither the freshly minted uuid nor the
+    # unrelated second run moves it.
+    again = load_packet(ledger, question_id=QUESTION, retrieval_run_ids=("run-1",))
+    assert packet_sha256(again) == packet_sha256(first)
     assert packet_sha256(first) == packet_sha256(build_packet(QUESTION, [run], documents))
 
 

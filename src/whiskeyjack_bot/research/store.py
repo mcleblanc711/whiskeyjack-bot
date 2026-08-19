@@ -221,6 +221,49 @@ def _require_storable_text(value: object, field: str) -> None:
         ) from None
 
 
+def _require_storable_json(value: object, field: str) -> None:
+    """Refuse text inside a JSON column that cannot survive the round trip.
+
+    ``queries`` and ``provider_config`` are stored as JSON with
+    ``ensure_ascii=True``, and an earlier version of this module claimed that made
+    them immune to the surrogate problem that ``_require_storable_text`` guards the
+    TEXT columns against. That was true of *lone* surrogates and false of
+    **surrogate pairs**, which is the more dangerous half:
+
+    - ``"\ud800\udc00"`` is two Python code points and is **not** UTF-8 encodable;
+    - ``json.dumps(..., ensure_ascii=True)`` writes it as ``"\ud800\udc00"`` and
+      ``json.loads`` **recombines it** into the single scalar ``U+10000`` -- so what
+      comes back out of the ledger is a *different Python string* than what went in;
+    - and pydantic's ``model_dump(mode="json")`` renders the original pair as six
+      ``U+FFFD`` replacement characters, so the in-memory packet hashes over garbage
+      while the stored packet hashes over the clean scalar.
+
+    The two therefore hash differently, which falsifies the acceptance criterion for
+    an input the schema accepts. Found by the SQLite round-trip property added in
+    response to review round 1 -- the JSON-simulated round trip could not see it,
+    because JSON is precisely the half that behaves.
+
+    Refusing rather than normalizing, for the reason ``_require_storable_text``
+    gives: rewriting the value would store something other than what the caller
+    supplied. One check covers both spellings, since neither encodes to UTF-8.
+    """
+    if isinstance(value, str):
+        _require_storable_text(value, field)
+    elif isinstance(value, dict):
+        for key, nested in value.items():
+            _require_storable_text(key, f"{field} key")
+            _require_storable_json(nested, field)
+    elif isinstance(value, list):
+        for item in value:
+            _require_storable_json(item, field)
+
+
+def _checked_json(value: object, field: str) -> object:
+    """``_require_storable_json`` as an expression, so the check cannot be skipped."""
+    _require_storable_json(value, field)
+    return value
+
+
 def _canonical_json(value: object, field: str) -> str:
     """Serialize a run's JSON-column value in a form that round-trips exactly.
 
@@ -239,18 +282,34 @@ def _canonical_json(value: object, field: str) -> str:
         ) from None
 
 
-def _load_json(value: object, field: str) -> Any:
+def _load_json(value: object, field: str, *, expect: type | tuple[type, ...]) -> Any:
+    """Parse a stored JSON column and require the shape the writer put there.
+
+    ``expect`` is not decoration. Round 1, finding 6: the reader spelled the query
+    list as ``_load_json(...) or []``, so a stored ``false``, ``0``, ``""`` or
+    ``{}`` all became ``[]`` -- a malformed row silently *rewritten* into a
+    schema-valid run with no queries, which then hashed as a perfectly good packet.
+    Only SQL NULL may take the legacy default; every other shape is a refusal.
+    """
     if value is None:
         return None
     if type(value) is not str:
         raise StoreError(f"stored {field} is not text (detail withheld: it can echo a value)")
     try:
-        return json.loads(value)
+        parsed = json.loads(value)
     except ValueError:
         # from None: a JSONDecodeError quotes the surrounding document text.
         raise StoreError(
             f"stored {field} is not valid JSON (detail withheld: it can echo a stored value)"
         ) from None
+    if not isinstance(parsed, expect) or isinstance(parsed, bool):
+        # bool is excluded explicitly: it subclasses int, so `expect=int` would
+        # otherwise accept `true`.
+        raise StoreError(
+            f"stored {field} does not hold the shape the writer stores there "
+            "(detail withheld: it can echo a stored value)"
+        )
+    return parsed
 
 
 def _require_count(value: object, field: str) -> int | None:
@@ -297,14 +356,19 @@ def _run_parameters(
     _require_storable_text(raw_response_path, "raw_response_path")
     return {
         "retrieval_run_id": run.retrieval_run_id,
-        "question_id": run.question_id,
+        # Range-checked here rather than left to the binding: the models bound these
+        # below zero but not above, so a schema-valid width wider than SQLite's
+        # signed 64-bit integer is ordinary accepted input (round 1, finding 5).
+        "question_id": _require_bindable_int(run.question_id, "question_id"),
         "provider": run.provider,
         "provider_config_json": (
             None
             if run.provider_config is None
-            else _canonical_json(run.provider_config, "provider_config")
+            else _canonical_json(
+                _checked_json(run.provider_config, "provider_config"), "provider_config"
+            )
         ),
-        "queries_json": _canonical_json(list(run.queries), "queries"),
+        "queries_json": _canonical_json(_checked_json(list(run.queries), "queries"), "queries"),
         "started_at_utc": _utc_text(run.started_at_utc),
         "completed_at_utc": _optional_utc_text(run.completed_at_utc) if completed else None,
         "freshness_cutoff_utc": _optional_utc_text(run.freshness_cutoff_utc),
@@ -312,9 +376,16 @@ def _run_parameters(
         "error_summary": run.error_summary,
         "cost_usd": run.cost_usd,
         "agent_model": run.agent_model,
-        "posts_dropped_no_url": run.posts_dropped_no_url,
-        "documents_dropped": _require_count(run.documents_dropped, "documents_dropped"),
-        "duplicates_collapsed": _require_count(run.duplicates_collapsed, "duplicates_collapsed"),
+        "posts_dropped_no_url": _optional_bindable_int(
+            run.posts_dropped_no_url, "posts_dropped_no_url"
+        ),
+        "documents_dropped": _optional_bindable_int(
+            _require_count(run.documents_dropped, "documents_dropped"), "documents_dropped"
+        ),
+        "duplicates_collapsed": _optional_bindable_int(
+            _require_count(run.duplicates_collapsed, "duplicates_collapsed"),
+            "duplicates_collapsed",
+        ),
         "created_at_utc": created_at_utc,
     }
 
@@ -353,16 +424,129 @@ def _execute(conn: sqlite3.Connection, sql: str, parameters: Sequence[object]) -
     Their ``RAISE(ABORT, ...)`` messages name fields and never interpolate a row
     value, but they arrive as ``sqlite3.IntegrityError``, and a caller of this module
     handles ``StoreError``.
+
+    **Only ``IntegrityError`` keeps the underlying text.** That distinction is the fix
+    for review round 1, finding 5: an integrity failure's message is schema-authored
+    (constraint names and our own ``RAISE`` strings), but an ``OperationalError`` can
+    quote *data* -- fetching a column holding invalid UTF-8 produces
+    ``Could not decode to UTF-8 column 'error_summary' with text '...'``, which
+    printed a planted value verbatim. Every other shape now gets a constant message.
+
+    ``sqlite3.Error`` is also not the whole class. Binding a Python ``int`` wider than
+    64 bits raises ``OverflowError`` and binding a lone surrogate raises
+    ``UnicodeEncodeError`` -- both from ``conn.execute``, neither a ``sqlite3.Error``,
+    and the second quotes the character. This is M1-308's round-7 lesson in a different
+    library: when a dependency can fail, it fails as a *class*, so enumerate the
+    siblings rather than the one type you predicted.
     """
     try:
         return conn.execute(sql, tuple(parameters))
-    except sqlite3.Error as exc:
+    except sqlite3.IntegrityError as exc:
         # The trigger and constraint text is schema-authored -- it names columns and
         # rules, never row content -- so it is the one part of the underlying error
         # worth keeping, and it is what makes a refusal actionable. from None still,
         # so the exception object itself (which can carry parameter values in a
         # rendered traceback) does not reach a reporter through the cause chain.
         raise StoreError(f"ledger refused a research write: {exc}") from None
+    except (sqlite3.Error, OverflowError, UnicodeEncodeError, UnicodeDecodeError, ValueError):
+        raise StoreError(
+            "the ledger could not execute a research statement "
+            "(detail withheld: it can echo a stored or bound value)"
+        ) from None
+
+
+def _fetch_one(
+    conn: sqlite3.Connection, sql: str, parameters: Sequence[object]
+) -> sqlite3.Row | None:
+    """Run a query and take one row, owning the failures ``_execute`` cannot see.
+
+    Decoding happens at **fetch**, not at execute: a TEXT column holding invalid
+    UTF-8 -- ordinary foreign-tool-written or corrupted state, which CLAUDE.md
+    classifies as untrusted -- raises ``sqlite3.OperationalError`` here, quoting the
+    stored bytes. Ending the protection at ``conn.execute`` left that outside the
+    module's error type *and* outside its no-echo rule (round 1, finding 5).
+    """
+    cursor = _execute(conn, sql, parameters)
+    try:
+        row = cursor.fetchone()
+    except (sqlite3.Error, UnicodeDecodeError, ValueError):
+        raise StoreError(
+            "the ledger returned a row that could not be read "
+            "(detail withheld: it can echo a stored value)"
+        ) from None
+    return None if row is None else row
+
+
+def _fetch_all(
+    conn: sqlite3.Connection, sql: str, parameters: Sequence[object]
+) -> list[sqlite3.Row]:
+    """Run a query and take every row. See :func:`_fetch_one`."""
+    cursor = _execute(conn, sql, parameters)
+    try:
+        return list(cursor.fetchall())
+    except (sqlite3.Error, UnicodeDecodeError, ValueError):
+        raise StoreError(
+            "the ledger returned a row that could not be read "
+            "(detail withheld: it can echo a stored value)"
+        ) from None
+
+
+# SQLite stores integers as signed 64-bit. A wider Python int is not a number it can
+# hold, and `conn.execute` reports that as a raw OverflowError.
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+def _require_bindable_int(value: int, field: str) -> int:
+    """Refuse an integer SQLite cannot store, as this module's error type.
+
+    ``question_id`` and the counters are schema-valid at any Python width -- the
+    models bound them below, not above -- so this is reachable from ordinary
+    accepted input rather than from hostile state (round 1, finding 5).
+    """
+    if not _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
+        # The bound is this module's own literal; the offending value is not named.
+        raise StoreError(
+            f"{field} is outside the range SQLite can store as an integer "
+            "(offending input withheld)"
+        )
+    return value
+
+
+def _optional_bindable_int(value: int | None, field: str) -> int | None:
+    return None if value is None else _require_bindable_int(value, field)
+
+
+def _stored_text(value: object, field: str) -> str | None:
+    """Gate a value read out of a TEXT column, without coercing it.
+
+    Round 1, finding 6: a BLOB in a TEXT-affinity column comes back as ``bytes``,
+    and pydantic would coerce it into a ``str`` -- so a corrupt row would be
+    *rewritten* into valid-looking evidence rather than refused. Reading is not the
+    place to repair the ledger.
+    """
+    if value is None or type(value) is str:
+        return value if value is None else str(value)
+    raise StoreError(f"stored {field} is not text (detail withheld: it can echo a value)")
+
+
+def _stored_int(value: object, field: str) -> int | None:
+    if value is None or type(value) is int:
+        return None if value is None else int(value)
+    raise StoreError(f"stored {field} is not an integer (detail withheld: it can echo a value)")
+
+
+def _stored_real(value: object, field: str) -> float | None:
+    """Gate a REAL column. ``int`` is accepted because SQLite may return one for a
+    whole number written to a REAL column; everything else is refused rather than
+    coerced."""
+    if value is None:
+        return None
+    if type(value) is float:
+        return value
+    if type(value) is int:
+        return float(value)
+    raise StoreError(f"stored {field} is not a number (detail withheld: it can echo a value)")
 
 
 def _insert_run(conn: sqlite3.Connection, parameters: dict[str, object]) -> None:
@@ -498,16 +682,41 @@ def complete_run(
         created_at_utc="",  # unused on the UPDATE path; the stored value is fixed.
     )
     assignments = ", ".join(f"{column} = ?" for column in _COMPLETION_COLUMNS)
+    # The guard is in the WHERE clause, not in a preceding SELECT. `completed_at_utc
+    # IS NULL` makes completion a **once-only transition**, and matching the identity
+    # columns makes it apply to *the run that was opened* rather than to whatever row
+    # happens to share the id. Both were missing (round 1, finding 4): completing
+    # twice rewrote a stored run's queries and cost and moved its already-computed
+    # packet hash, and completing with a model carrying a different question and
+    # provider silently combined the opened identity with the other model's payload.
+    #
+    # Enforced in SQL rather than by a read-then-write, because a read-then-write is
+    # a race even inside BEGIN IMMEDIATE's serialization -- the condition and the
+    # write have to be the same statement for `rowcount` to mean what it says.
+    guard = "retrieval_run_id = ? AND completed_at_utc IS NULL AND question_id = ? "
+    guard += "AND provider = ? AND started_at_utc = ?"
     with _atomic(conn):
-        if not _run_exists(conn, validated.retrieval_run_id):
-            raise StoreError("no open run with that retrieval_run_id; call open_run first")
         cursor = _execute(
             conn,
-            f"UPDATE research_runs SET {assignments} WHERE retrieval_run_id = ?",
-            [parameters[column] for column in _COMPLETION_COLUMNS] + [validated.retrieval_run_id],
+            f"UPDATE research_runs SET {assignments} WHERE {guard}",
+            [parameters[column] for column in _COMPLETION_COLUMNS]
+            + [
+                validated.retrieval_run_id,
+                _require_bindable_int(validated.question_id, "question_id"),
+                validated.provider,
+                _utc_text(validated.started_at_utc),
+            ],
         )
         if cursor.rowcount != 1:
-            raise StoreError("completing the run did not update exactly one row")
+            # One message for all three causes, and deliberately so: distinguishing
+            # them means reporting which stored column disagreed, and a stored value
+            # is exactly what this module does not echo. The causes are named as
+            # possibilities, which is actionable without printing anything.
+            raise StoreError(
+                "no open run matches this one: it was never opened, it has already "
+                "been completed, or its identity (question_id, provider, "
+                "started_at_utc) differs from the row that was opened"
+            )
         return _insert_documents(conn, prepared)
 
 
@@ -559,15 +768,6 @@ def _prepare_documents(
     return deduplicate(candidates).documents
 
 
-def _run_exists(conn: sqlite3.Connection, retrieval_run_id: str) -> bool:
-    row = _execute(
-        conn,
-        "SELECT 1 FROM research_runs WHERE retrieval_run_id = ?",
-        (retrieval_run_id,),
-    ).fetchone()
-    return row is not None
-
-
 def load_run(conn: sqlite3.Connection, retrieval_run_id: str) -> ResearchRun:
     """Read one stored run back as a validated model.
 
@@ -577,12 +777,15 @@ def load_run(conn: sqlite3.Connection, retrieval_run_id: str) -> ResearchRun:
     """
     if type(retrieval_run_id) is not str or not retrieval_run_id:
         raise StoreError("retrieval_run_id must be a non-empty string")
+    # Before binding: a lone surrogate cannot be encoded as a SQL parameter, and the
+    # UnicodeEncodeError that raises quotes the character (round 1, finding 5).
+    _require_storable_text(retrieval_run_id, "retrieval_run_id")
     columns = ", ".join(_RUN_COLUMNS)
-    row = _execute(
+    row = _fetch_one(
         conn,
         f"SELECT {columns} FROM research_runs WHERE retrieval_run_id = ?",
         (retrieval_run_id,),
-    ).fetchone()
+    )
     if row is None:
         raise StoreError("no research run with that retrieval_run_id")
     return _run_from_row(dict(zip(_RUN_COLUMNS, tuple(row), strict=True)))
@@ -592,8 +795,9 @@ def load_documents(conn: sqlite3.Connection, retrieval_run_id: str) -> tuple[Res
     """Read one run's documents back as validated models, in a stable order."""
     if type(retrieval_run_id) is not str or not retrieval_run_id:
         raise StoreError("retrieval_run_id must be a non-empty string")
+    _require_storable_text(retrieval_run_id, "retrieval_run_id")
     columns = ", ".join(_DOCUMENT_COLUMNS)
-    rows = _execute(
+    rows = _fetch_all(
         conn,
         # Ordered by the ledger's own dedup key rather than by document_id: the key
         # is stable across a re-persist and the minted uuid is not, so a reader gets
@@ -601,29 +805,42 @@ def load_documents(conn: sqlite3.Connection, retrieval_run_id: str) -> tuple[Res
         f"SELECT {columns} FROM research_documents WHERE retrieval_run_id = ? "
         "ORDER BY canonical_url, content_sha256",
         (retrieval_run_id,),
-    ).fetchall()
+    )
     return tuple(
         _document_from_row(dict(zip(_DOCUMENT_COLUMNS, tuple(row), strict=True))) for row in rows
     )
 
 
 def _run_from_row(row: dict[str, Any]) -> ResearchRun:
+    """Rebuild a run from stored columns, type-checking each one first.
+
+    Every column is gated by the ``_stored_*`` helpers before it reaches pydantic.
+    Handing raw values to ``validate_run`` let coercion repair malformed state --
+    a BLOB in a TEXT column arrived as ``bytes`` and came back out a ``str`` --
+    which turns "the ledger is corrupt" into "here is some evidence" (round 1,
+    finding 6). Values read out of the ledger are untrusted, and validating on the
+    way out is also what makes the packet hash computable from the database alone.
+    """
+    queries = _load_json(row["queries_json"], "queries_json", expect=list)
     payload = {
-        "retrieval_run_id": row["retrieval_run_id"],
-        "question_id": row["question_id"],
-        "provider": row["provider"],
-        "provider_config": _load_json(row["provider_config_json"], "provider_config_json"),
-        "queries": _load_json(row["queries_json"], "queries_json") or [],
+        "retrieval_run_id": _stored_text(row["retrieval_run_id"], "retrieval_run_id"),
+        "question_id": _stored_int(row["question_id"], "question_id"),
+        "provider": _stored_text(row["provider"], "provider"),
+        "provider_config": _load_json(
+            row["provider_config_json"], "provider_config_json", expect=dict
+        ),
+        # Only SQL NULL means "no queries recorded"; see _load_json.
+        "queries": [] if queries is None else queries,
         "started_at_utc": _parse_utc(row["started_at_utc"], "started_at_utc"),
         "completed_at_utc": _parse_utc(row["completed_at_utc"], "completed_at_utc"),
         "freshness_cutoff_utc": _parse_utc(row["freshness_cutoff_utc"], "freshness_cutoff_utc"),
-        "raw_response_path": row["raw_response_path"],
-        "error_summary": row["error_summary"],
-        "cost_usd": row["cost_usd"],
-        "agent_model": row["agent_model"],
-        "posts_dropped_no_url": row["posts_dropped_no_url"],
-        "documents_dropped": row["documents_dropped"],
-        "duplicates_collapsed": row["duplicates_collapsed"],
+        "raw_response_path": _stored_text(row["raw_response_path"], "raw_response_path"),
+        "error_summary": _stored_text(row["error_summary"], "error_summary"),
+        "cost_usd": _stored_real(row["cost_usd"], "cost_usd"),
+        "agent_model": _stored_text(row["agent_model"], "agent_model"),
+        "posts_dropped_no_url": _stored_int(row["posts_dropped_no_url"], "posts_dropped_no_url"),
+        "documents_dropped": _stored_int(row["documents_dropped"], "documents_dropped"),
+        "duplicates_collapsed": _stored_int(row["duplicates_collapsed"], "duplicates_collapsed"),
     }
     try:
         return validate_run(payload)
@@ -636,24 +853,26 @@ def _run_from_row(row: dict[str, Any]) -> ResearchRun:
 
 
 def _document_from_row(row: dict[str, Any]) -> ResearchDocument:
+    """Rebuild a document from stored columns, type-checking each one. See
+    :func:`_run_from_row`."""
     payload = {
-        "document_id": row["document_id"],
-        "retrieval_run_id": row["retrieval_run_id"],
-        "original_url": row["original_url"],
-        "canonical_url": row["canonical_url"],
-        "title": row["title"],
-        "publisher": row["publisher"],
-        "author": row["author"],
+        "document_id": _stored_text(row["document_id"], "document_id"),
+        "retrieval_run_id": _stored_text(row["retrieval_run_id"], "retrieval_run_id"),
+        "original_url": _stored_text(row["original_url"], "original_url"),
+        "canonical_url": _stored_text(row["canonical_url"], "canonical_url"),
+        "title": _stored_text(row["title"], "title"),
+        "publisher": _stored_text(row["publisher"], "publisher"),
+        "author": _stored_text(row["author"], "author"),
         "published_at_utc": _parse_utc(row["published_at_utc"], "published_at_utc"),
         "updated_at_utc": _parse_utc(row["updated_at_utc"], "updated_at_utc"),
         "retrieved_at_utc": _parse_utc(row["retrieved_at_utc"], "retrieved_at_utc"),
-        "source_type": row["source_type"],
-        "provenance": row["provenance"],
-        "content_sha256": row["content_sha256"],
-        "snippet": row["snippet"],
-        "summary": row["summary"],
-        "raw_artifact_path": row["raw_artifact_path"],
-        "reliability_tag": row["reliability_tag"],
+        "source_type": _stored_text(row["source_type"], "source_type"),
+        "provenance": _stored_text(row["provenance"], "provenance"),
+        "content_sha256": _stored_text(row["content_sha256"], "content_sha256"),
+        "snippet": _stored_text(row["snippet"], "snippet"),
+        "summary": _stored_text(row["summary"], "summary"),
+        "raw_artifact_path": _stored_text(row["raw_artifact_path"], "raw_artifact_path"),
+        "reliability_tag": _stored_text(row["reliability_tag"], "reliability_tag"),
     }
     try:
         return validate_document(payload)
@@ -661,48 +880,147 @@ def _document_from_row(row: dict[str, Any]) -> ResearchDocument:
         raise StoreError(f"stored research document does not validate: {exc}") from None
 
 
-def load_packet(conn: sqlite3.Connection, *, question_id: int) -> ResearchPacket:
-    """Assemble one question's stored evidence into a :class:`ResearchPacket`.
+@contextmanager
+def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """Hold one consistent read view across a multi-statement read.
 
-    Zero provider calls by construction: this reads SQLite and nothing else.
+    Assembling a packet takes three queries -- the run ids, each run, then each
+    run's documents. Issued outside a transaction they are three independent reads,
+    and an ordinary concurrent ``complete_run`` landing between them produced a
+    packet holding an *unfinished* run together with the documents that run only has
+    once it is finished: a state that never existed in the ledger, hashing to
+    something neither the before nor the after committed state matches (round 1,
+    finding 3).
+
+    A deferred ``BEGIN`` is deliberate where the writers use ``BEGIN IMMEDIATE``:
+    this takes no write lock, and under WAL the read view is fixed at the first
+    statement inside it, which is exactly the snapshot semantics wanted. Nesting is a
+    no-op so a caller who already holds a transaction keeps their own view.
+    """
+    if not isinstance(conn, sqlite3.Connection):
+        raise StoreError("conn must be a sqlite3.Connection opened with ledger.connect()")
+    if conn.isolation_level is not None:
+        raise StoreError(
+            "the ledger connection must be in explicit-transaction mode; "
+            "open it with whiskeyjack_bot.ledger.connect()"
+        )
+    if conn.in_transaction:
+        yield
+        return
+    try:
+        conn.execute("BEGIN")
+    except sqlite3.Error:
+        raise StoreError("the ledger could not open a read transaction") from None
+    try:
+        yield
+    finally:
+        try:
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            # A read transaction has nothing to lose by failing to close cleanly, but
+            # leaving one open would strand every later statement on the connection.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+
+
+def list_retrieval_run_ids(
+    conn: sqlite3.Connection, *, question_id: int, completed_only: bool = True
+) -> tuple[str, ...]:
+    """The runs stored for one question, oldest first.
+
+    Discovery is separated from packet assembly on purpose. A packet built from
+    "every row currently sharing a question" has no stable identity: persisting a
+    second run changes what the *first* packet was, and the earlier one becomes
+    unaddressable (round 1, finding 2). So this answers "what is there now", and
+    :func:`load_packet` takes the answer -- or a recorded subset -- explicitly.
+    A caller that stores the ids it used can reproduce that packet forever.
+
+    ``completed_only`` defaults to true because an open run is a spend record, not
+    evidence: it has no documents yet and its own columns are still to be written.
     """
     if type(question_id) is not int:
         raise StoreError("question_id must be an int")
-    rows = _execute(
+    _require_bindable_int(question_id, "question_id")
+    clause = " AND completed_at_utc IS NOT NULL" if completed_only else ""
+    rows = _fetch_all(
         conn,
         # Ordered by the run's start, then its id, so the sequence is stable and
         # reads as the retrieval timeline. Packet identity does not depend on it --
         # packet_sha256 sorts -- but a caller presenting evidence should not have to.
-        "SELECT retrieval_run_id FROM research_runs WHERE question_id = ? "
+        f"SELECT retrieval_run_id FROM research_runs WHERE question_id = ?{clause} "
         "ORDER BY started_at_utc, retrieval_run_id",
         (question_id,),
-    ).fetchall()
-    run_ids = [str(row[0]) for row in rows]
-    runs = [load_run(conn, run_id) for run_id in run_ids]
-    documents = [document for run_id in run_ids for document in load_documents(conn, run_id)]
+    )
+    return tuple(_require_stored_run_id(row[0]) for row in rows)
+
+
+def _require_stored_run_id(value: object) -> str:
+    text = _stored_text(value, "retrieval_run_id")
+    if text is None:
+        raise StoreError("stored retrieval_run_id is NULL")
+    return text
+
+
+def load_packet(
+    conn: sqlite3.Connection, *, question_id: int, retrieval_run_ids: Sequence[str]
+) -> ResearchPacket:
+    """Assemble a packet from an explicitly named set of runs.
+
+    Zero provider calls by construction: this reads SQLite and nothing else.
+
+    ``retrieval_run_ids`` is required rather than defaulted to "whatever this
+    question has now", because the packet hash is an attribution claim and a claim
+    whose subject changes when unrelated evidence is added later cannot be checked.
+    Use :func:`list_retrieval_run_ids` to discover them; record what you used.
+
+    Every read happens inside one snapshot, so the packet is a state the ledger
+    actually held.
+    """
+    if type(question_id) is not int:
+        raise StoreError("question_id must be an int")
+    if isinstance(retrieval_run_ids, (str, bytes)) or not isinstance(retrieval_run_ids, Sequence):
+        # A bare str satisfies Sequence and would be read one character per run id.
+        raise StoreError("retrieval_run_ids must be a sequence of run ids")
+    requested = list(retrieval_run_ids)
+    if len(set(requested)) != len(requested):
+        raise StoreError("retrieval_run_ids must not repeat a run id")
+    with _read_snapshot(conn):
+        runs = [load_run(conn, run_id) for run_id in requested]
+        for run in runs:
+            if run.question_id != question_id:
+                # No ids in the message; a question id is row content.
+                raise StoreError("a named run belongs to a different question")
+        documents = [document for run_id in requested for document in load_documents(conn, run_id)]
     return build_packet(question_id, runs, documents)
 
 
 def replay_research(
-    conn: sqlite3.Connection, config: AppConfig, *, question_id: int
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    *,
+    question_id: int,
+    retrieval_run_ids: Sequence[str],
 ) -> ResearchPacket:
-    """Return a question's stored research packet instead of retrieving it again.
+    """Return a stored research packet instead of retrieving it again.
 
     The item's acceptance criterion in one function: **zero provider calls, and the
     same packet hash**. The first is structural -- this module imports no provider
     SDK and no HTTP client, so there is no call to make. The second follows from
-    reading the same rows the packet was hashed from.
+    reading the same rows, named explicitly, inside one snapshot.
 
-    Two refusals, both deliberate:
+    Three refusals, all deliberate:
 
     - ``retrieval.replay_saved_research`` must be enabled. Replay is not a fallback a
       caller drifts into; the committed default is ``false``, and honouring it here
       is what keeps "we replayed" from being something that happened by accident.
-    - **A question with no stored run raises rather than returning an empty packet.**
-      An empty packet is indistinguishable from a question researched and found
-      nothing, so returning one would let a caller forecast as though research had
-      happened. A forecast built on silently-absent evidence is the precise failure
-      this ledger exists to make impossible.
+    - **An empty run set raises rather than returning an empty packet.** An empty
+      packet is indistinguishable from a question researched and found nothing, so
+      returning one would let a caller forecast as though research had happened.
+    - **An incomplete run raises.** A run row opened before its billable calls is a
+      spend record, and completing it later changes what the packet is. Replaying one
+      would reproduce a hash that the finished run will not match (round 1, finding 2).
     """
     if type(question_id) is not int:
         raise StoreError("question_id must be an int")
@@ -714,10 +1032,15 @@ def replay_research(
         raise StoreError(
             "retrieval.replay_saved_research is disabled; refusing to replay saved research"
         )
-    packet = load_packet(conn, question_id=question_id)
+    packet = load_packet(conn, question_id=question_id, retrieval_run_ids=retrieval_run_ids)
     if not packet.runs:
         raise StoreError(
-            "no stored research run for that question; refusing to replay an empty "
-            "packet (it cannot be told apart from research that found nothing)"
+            "no runs named for that question; refusing to replay an empty packet "
+            "(it cannot be told apart from research that found nothing)"
+        )
+    if any(run.completed_at_utc is None for run in packet.runs):
+        raise StoreError(
+            "a named run has not completed; refusing to replay a packet whose "
+            "contents will change when the run finishes"
         )
     return packet
