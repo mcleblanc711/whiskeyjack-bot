@@ -249,3 +249,37 @@ def test_the_reader_refuses_a_malformed_written_at(tmp_path: Path) -> None:
         with pytest.raises(ArtifactError, match=expected) as caught:
             read_raw_responses(tmp_path, relative)
         assert PLANTED not in f"{caught.value}{caught.value!r}{caught.value.args}"
+
+
+def test_the_reader_refuses_a_blank_provider_the_writer_would_reject(
+    tmp_path: Path,
+) -> None:
+    """Round 2, finding 1. The reader must admit exactly what the writer can emit.
+
+    A whitespace-only `provider` is refused by `write_raw_responses` and was accepted
+    by the reader, so an effectively unattributed artifact was reported as valid
+    audit evidence. Both halves are asserted here, because the defect was the gap
+    between them rather than either rule on its own.
+    """
+    with pytest.raises(ArtifactError, match="non-blank string"):
+        _write(tmp_path, provider="   ")
+
+    relative = artifact_relative_path(question_id=42, retrieval_run_id="run-1")
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    for blank in ("   ", "\t", "\n"):
+        path.write_text(
+            json.dumps(
+                {
+                    "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                    "retrieval_run_id": "run-1",
+                    "question_id": 42,
+                    "provider": blank,
+                    "written_at_utc": "2026-08-18T12:00:00+00:00",
+                    "raw_responses": [{"ok": True}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ArtifactError, match="missing or malformed"):
+            read_raw_responses(tmp_path, relative)

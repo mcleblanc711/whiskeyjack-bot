@@ -241,8 +241,17 @@ def _reject_json_constant(token: str) -> object:
 
 
 def _require_envelope_text(envelope: dict[str, Any], key: str, path: Path) -> str:
+    """Require a non-blank string, matching the rule the writer applies.
+
+    ``not value.strip()`` rather than ``not value``: the writer refuses a
+    whitespace-only ``provider``, and a reader that accepts one accepts an envelope
+    the writer cannot emit -- an effectively unattributed artifact reported as valid
+    audit evidence (review round 2, finding 1). The reader's job is to admit exactly
+    what the writer can produce, which means sharing the rule rather than
+    approximating it.
+    """
     value = envelope.get(key)
-    if type(value) is not str or not value:
+    if type(value) is not str or not value.strip():
         raise ArtifactError(f"retrieval artifact {key} is missing or malformed: {path}")
     return value
 

@@ -424,6 +424,41 @@ defect lived in the half being simulated away. That is the same shape as lesson 
 harness that normalizes what it is supposed to be probing — one level up, at the boundary
 rather than at the strategy.
 
+### Round 2 review (GPT) — six of seven closed, two new findings, both reproduced
+
+Reviewed commit `c7c6052`, which was HEAD. Findings 1-6 confirmed **CLOSED**. Finding 7 was
+confirmed only in part, and two new blocking findings landed — both narrow, both introduced by
+the round-1 remediation itself, and both reproduced by execution before any fix.
+
+1. **The artifact reader still accepted malformed provenance.** Round 1's fix validated that
+   `provider` was a non-empty string; the *writer* refuses a **whitespace-only** one. So
+   `"provider": "   "` was still accepted by the reader — an effectively unattributed artifact
+   reported as valid audit evidence. Fixed by applying the writer's exact rule
+   (`not value.strip()`).
+
+   The instructive part is why the first fix missed it: I validated the envelope against a
+   rule I wrote at the reader, rather than against the rule the writer already enforced. **A
+   reader's job is to admit exactly what the writer can emit**, so the two must share the rule
+   and not merely resemble each other. The regression asserts both halves for that reason.
+
+2. **The new run-selection inputs were not fully validated**, in two ways:
+   - `load_packet(retrieval_run_ids=[[]])` raised a raw `TypeError: unhashable type` from
+     `set(requested)`. The duplicate check assumed a shape nothing had checked. Fixed by
+     validating each id *before* the set operation — ordering is the whole fix.
+   - `list_retrieval_run_ids(completed_only=None)` took the `False` branch by truthiness and
+     returned an **open** run, i.e. a spend record surfaced from a call that reads as asking
+     for finished evidence. Fixed with `type(completed_only) is not bool`.
+
+Both are the same shape as findings the project has taken before: a public boundary added in a
+hurry inherits the module's error contract only if someone applies it. Worth noting plainly —
+**the remediation for finding 2 introduced two of its own defects**, which is the argument for
+round 2 existing at all rather than merging on a round-1 fix.
+
+The review's risk-area answers closed the six questions the round-2 request raised, including
+the two I most expected to be wrong: arbitrary run subsets are correct semantics (the blocker
+was input validation, not subset meaning), and the `IntegrityError`/`OperationalError` text
+split is drawn in the right place under the fixed schema.
+
 ### Standing risk — not verifiable offline
 
 Whether real MiniBench group subquestion titles are already self-describing cannot be checked

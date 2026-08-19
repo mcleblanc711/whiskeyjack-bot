@@ -658,3 +658,36 @@ def test_a_surrogate_pair_in_a_json_column_is_refused(ledger: sqlite3.Connection
     with pytest.raises(StoreError, match="lone surrogate"):
         persist_retrieval(ledger, _run(provider_config={"k": [{"nested": pair}]}), [])
     assert ledger.execute("SELECT count(*) FROM research_runs").fetchone()[0] == 0
+
+
+def test_an_unhashable_run_id_is_refused_as_a_store_error(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Round 2, finding 2. `set(requested)` raised a raw `TypeError` on an
+    unhashable element, escaping a module contracted to raise only its own type.
+
+    The ordering is the fix: validate each id's shape, *then* do the set operation
+    that assumes the shape.
+    """
+    for malformed in ([[]], [{}], [None], [""], [42]):
+        with pytest.raises(StoreError, match="non-empty string"):
+            load_packet(ledger, question_id=QUESTION, retrieval_run_ids=malformed)  # type: ignore[arg-type]
+
+
+def test_a_non_boolean_completed_only_is_refused(ledger: sqlite3.Connection) -> None:
+    """Round 2, finding 2. A non-boolean took the `False` branch by truthiness.
+
+    That surfaced open runs — spend records, not evidence — from a call that reads as
+    asking for finished ones. The `True` and `False` behaviours are both asserted so
+    the fix is a type gate rather than a change of meaning.
+    """
+    open_run(ledger, _run(completed_at_utc=None))
+    assert list_retrieval_run_ids(ledger, question_id=QUESTION) == ()
+    assert list_retrieval_run_ids(ledger, question_id=QUESTION, completed_only=False) == ("run-1",)
+    for malformed in (None, 0, 1, "", "yes"):
+        with pytest.raises(StoreError, match="completed_only must be a bool"):
+            list_retrieval_run_ids(
+                ledger,
+                question_id=QUESTION,
+                completed_only=malformed,  # type: ignore[arg-type]
+            )

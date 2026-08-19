@@ -943,6 +943,13 @@ def list_retrieval_run_ids(
     if type(question_id) is not int:
         raise StoreError("question_id must be an int")
     _require_bindable_int(question_id, "question_id")
+    # An explicit bool test, not truthiness. A non-boolean silently selected the
+    # `completed_only=False` branch and surfaced open runs -- spend records, not
+    # evidence -- from a call that read as asking for finished ones (round 2,
+    # finding 2). A flag that changes what evidence is returned is not a place for
+    # a permissive cast.
+    if type(completed_only) is not bool:
+        raise StoreError("completed_only must be a bool")
     clause = " AND completed_at_utc IS NOT NULL" if completed_only else ""
     rows = _fetch_all(
         conn,
@@ -984,6 +991,14 @@ def load_packet(
         # A bare str satisfies Sequence and would be read one character per run id.
         raise StoreError("retrieval_run_ids must be a sequence of run ids")
     requested = list(retrieval_run_ids)
+    # Validate each id *before* the duplicate check: `set(requested)` raises a raw
+    # `TypeError: unhashable type` on an unhashable element, which escaped a module
+    # contracted to raise only its own type (round 2, finding 2). Shape first, then
+    # the set operation that assumes the shape.
+    for run_id in requested:
+        if type(run_id) is not str or not run_id:
+            raise StoreError("every entry in retrieval_run_ids must be a non-empty string")
+        _require_storable_text(run_id, "retrieval_run_id")
     if len(set(requested)) != len(requested):
         raise StoreError("retrieval_run_ids must not repeat a run id")
     with _read_snapshot(conn):
