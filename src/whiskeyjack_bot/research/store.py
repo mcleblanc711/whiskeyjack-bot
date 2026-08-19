@@ -309,6 +309,18 @@ def _load_json(value: object, field: str, *, expect: type | tuple[type, ...]) ->
             f"stored {field} does not hold the shape the writer stores there "
             "(detail withheld: it can echo a stored value)"
         )
+    # The same storability rule the writer applies, on the way back out. Without it
+    # the reader admitted what its own writer refuses: `queries_json = '["\ud800"]'`
+    # is schema-accepted, pure-ASCII JSON that any foreign tool could write, and
+    # `json.loads` hands back a lone surrogate. `persist_retrieval` rejects that
+    # value; `load_run` certified it as valid replay provenance (review round 3).
+    #
+    # The shape check above was not enough because the defect is not in the JSON
+    # shape -- a one-element list of strings is exactly the right shape. It is in
+    # what the string *is*. Reachable without a malicious operator: values read out
+    # of the ledger are untrusted, and a corrupt or foreign-tool-written row is the
+    # ordinary case the boundary exists for.
+    _require_storable_json(parsed, f"stored {field}")
     return parsed
 
 

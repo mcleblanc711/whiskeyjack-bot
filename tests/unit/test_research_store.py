@@ -691,3 +691,42 @@ def test_a_non_boolean_completed_only_is_refused(ledger: sqlite3.Connection) -> 
                 question_id=QUESTION,
                 completed_only=malformed,  # type: ignore[arg-type]
             )
+
+
+def test_a_stored_surrogate_in_a_json_column_is_refused_on_read(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Round 3. The reader admitted what its own writer refuses.
+
+    `queries_json = '["\\ud800"]'` is schema-accepted, **pure-ASCII** JSON that any
+    foreign tool could write, and `json.loads` hands back a lone surrogate. The
+    writer rejects that value; the reader certified it as valid replay provenance.
+
+    The shape gate could not catch it, and that is the point: a one-element list of
+    strings is exactly the right *shape*. The defect is in what the string is. So
+    the reader now applies the writer's storability rule too — the same
+    "a reader must admit exactly what its writer can emit" contract that round 2
+    settled for the artifact envelope.
+    """
+    persist_retrieval(ledger, _run(queries=["real"]), [])
+    for column, malformed in (
+        ("queries_json", '["\\ud800"]'),
+        ("provider_config_json", '{"k": "\\ud800"}'),
+        ("provider_config_json", '{"\\ud800": 1}'),
+        ("provider_config_json", '{"k": [{"nested": "\\udfff"}]}'),
+    ):
+        ledger.execute(
+            f"UPDATE research_runs SET {column} = ? WHERE retrieval_run_id = ?",
+            (malformed, "run-1"),
+        )
+        with pytest.raises(StoreError, match="lone surrogate"):
+            load_run(ledger, "run-1")
+        with pytest.raises(StoreError, match="lone surrogate"):
+            load_packet(ledger, question_id=QUESTION, retrieval_run_ids=("run-1",))
+        # Restore, so each iteration starts from a row the reader accepts and the
+        # loop cannot pass on a stale failure.
+        ledger.execute(
+            f"UPDATE research_runs SET {column} = ? WHERE retrieval_run_id = ?",
+            ('["real"]' if column == "queries_json" else None, "run-1"),
+        )
+    assert load_run(ledger, "run-1").queries == ["real"]

@@ -459,6 +459,69 @@ the two I most expected to be wrong: arbitrary run subsets are correct semantics
 was input validation, not subset meaning), and the `IntegrityError`/`OperationalError` text
 split is drawn in the right place under the fixed schema.
 
+### Round 3 review (GPT) — nine prior findings closed, one new, reproduced
+
+Reviewed commit `8e7870f`. **All nine prior findings confirmed CLOSED.** One new blocking
+finding, and it is the sharpest of the whole item because it is the rule I had just written
+into the round-3 request, applied to a place I had not applied it.
+
+**The reader admitted what its own writer refuses.** Round 1's finding 6 taught the reader not
+to *coerce* stored values, and the eighth defect taught the *writer* to refuse text that cannot
+survive the round trip (`_require_storable_json`). Nobody applied that second rule on the way
+back out. So:
+
+```sql
+UPDATE research_runs SET queries_json = '["\ud800"]' WHERE retrieval_run_id = 'run-1';
+```
+
+`load_run` returned `queries == ["\ud800"]` and `load_packet` built a packet from it, while
+`persist_retrieval` refuses that exact value. The source-of-truth reader certified as valid
+replay provenance a query its own writer declares unpersistable.
+
+Two details make it worth recording rather than just fixing:
+
+- **The shape gate could not have caught it.** A one-element list of strings is exactly the
+  right shape; the defect is in what the string *is*. Shape validation and value validation are
+  different checks and the first does not imply the second.
+- **The stored bytes are pure ASCII.** `'["\ud800"]'` contains no non-UTF-8 byte on disk — the
+  surrogate only exists after `json.loads`. So no check on the column's bytes, and no
+  `sqlite3` decoding error, could ever have found it. It is only visible one layer up.
+
+Fixed by calling `_require_storable_json` from `_load_json` after the shape check.
+
+**The property this round added is the general form**, and it took two attempts, which is the
+instructive part. The first cut asserted "if the writer refused this text, the reader must
+refuse it too" — and failed on its second example, correctly. A surrogate **pair** is refused by
+the writer, but `json.loads` recombines it into an astral scalar, and that scalar is an
+ordinary value the writer would happily store; the reader returning it is right. The invariant
+is not about the text that was encoded. It is about **what the reader returns**: everything the
+reader hands back must be something the writer would accept, and must survive being written
+back. Restated that way it passes, and it fails when the fix is reverted.
+
+That distinction — between "the input was refused" and "the output is unwritable" — is the
+whole content of the finding, and the first property would have enshrined the wrong one.
+
+### A third demonstration of the same lesson, from the gate rather than a review
+
+`test_a_changed_query_moves_the_hash` — written at round 1, green through two review rounds —
+failed on the round-3 gate run at the full 200-example profile. It passes at 25, which is
+precisely what `CLAUDE.md` says `fast` is for and not for.
+
+The counterexample: the packet held `"\U0001f600"` and the drawn "changed" query was
+`"\ud83d\ude00"`, its UTF-16 surrogate-pair spelling. Two distinct Python strings that
+`ensure_ascii` renders identically, so the digest correctly did **not** move. The property's
+skip-guard compared the two in memory and therefore called it a change when the ledger cannot.
+
+No source defect: the hash is right and the test was asking it to distinguish two spellings of
+one stored value, which is the M1-305 round-4 bug requested back. Fixed by comparing the
+persisted rendering in the guard.
+
+Three times now on this item — the strategy that laundered `fold`, the round trip that
+simulated storage with JSON, and this — the *test* has held the wrong notion of equality while
+the code held the right one. The recurring shape is worth naming: **wherever identity is
+persisted-equivalence, every helper around the assertion has to use that equality too**, and
+in-memory `==` is the easy default that silently means something stricter.
+
 ### Standing risk — not verifiable offline
 
 Whether real MiniBench group subquestion titles are already self-describing cannot be checked

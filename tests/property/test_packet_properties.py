@@ -36,7 +36,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from whiskeyjack_bot.ledger import connect, initialize_ledger
-from whiskeyjack_bot.research.store import load_packet, persist_retrieval
+from whiskeyjack_bot.research.store import (
+    StoreError,
+    load_packet,
+    load_run,
+    persist_retrieval,
+)
 
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun, validate_run
 from whiskeyjack_bot.research.packet import (
@@ -194,7 +199,15 @@ def test_a_changed_query_moves_the_hash(packet: ResearchPacket, query: str) -> N
     queries are not the same research.
     """
     payload = packet.runs[0].model_dump(mode="json")
-    if payload["queries"] == [query]:
+    # Equality in the **persisted form**, not in memory. This guard originally compared
+    # the Python strings and the property failed at the full 200-example profile (it
+    # passed at 25, which is exactly what `fast` is warned about): the packet held the
+    # astral scalar "\U0001f600" and the drawn query was its surrogate-pair spelling
+    # "\ud83d\ude00". Those are two distinct Python strings that `ensure_ascii` renders
+    # identically, so the digest correctly does not move -- the hash keys on persisted
+    # equivalence, and a test that asks it to distinguish them is asking for the M1-305
+    # round-4 bug back.
+    if _persisted(payload["queries"]) == _persisted([query]):
         return  # Not a change; nothing is claimed about hashing equal inputs differently.
     payload["queries"] = [query]
     changed = [validate_run(payload), *packet.runs[1:]]
@@ -281,6 +294,11 @@ def sqlite_ledger(tmp_path_factory: pytest.TempPathFactory) -> Iterator[sqlite3.
         yield conn
     finally:
         conn.close()
+
+
+def _persisted(value: object) -> str:
+    """The canonical rendering the packet digest keys on. See `packet.canonical_packet_json`."""
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
 def _is_storable(value: str | None) -> bool:
@@ -407,3 +425,72 @@ def test_the_hash_survives_a_real_sqlite_round_trip(
         raise AssertionError(
             "\n".join(difflib.unified_diff(a.split(","), b.split(","), lineterm="", n=1))
         )
+
+
+@given(HOSTILE_TEXT)
+@settings(max_examples=100, deadline=None)
+def test_everything_the_reader_returns_is_something_the_writer_could_write(
+    sqlite_ledger: sqlite3.Connection, text: str
+) -> None:
+    """Whatever comes out of the ledger must be a value the writer would accept.
+
+    The contract round 2 settled for the artifact envelope and round 3 found broken
+    for the JSON columns, stated as a property instead of one example at a time:
+    `queries_json = '["\\ud800"]'` is schema-accepted, **pure ASCII** on disk, and
+    `json.loads` hands back a lone surrogate the writer refuses.
+
+    The stored value is written **around** the writer, straight into the column,
+    because that is the state the reader exists to be safe against: a schema-valid
+    row from a foreign tool or from corruption. Going through the writer would only
+    produce rows the writer already accepts, which was never the case in doubt.
+
+    The invariant is deliberately about **what the reader returns**, not about the
+    text that was encoded. The first cut asserted "if the writer refused this text,
+    the reader must refuse it too" and was wrong on its second example: a surrogate
+    *pair* is refused by the writer, but `json.loads` recombines it into an astral
+    scalar, and that scalar is a perfectly ordinary value the writer would happily
+    store. The reader returning it is correct. What must never happen is the reader
+    returning something unwritable.
+    """
+    run_id = f"rw{next(_RUN_SEQUENCE)}"
+    persist_retrieval(
+        sqlite_ledger,
+        validate_run(
+            {
+                "retrieval_run_id": run_id,
+                "question_id": 7,
+                "provider": "asknews",
+                "started_at_utc": "2026-08-18T12:00:00+00:00",
+                "completed_at_utc": "2026-08-18T12:00:00+00:00",
+            }
+        ),
+        [],
+    )
+    sqlite_ledger.execute(
+        "UPDATE research_runs SET queries_json = ? WHERE retrieval_run_id = ?",
+        (json.dumps([text], ensure_ascii=True), run_id),
+    )
+
+    try:
+        queries = load_run(sqlite_ledger, run_id).queries
+    except StoreError:
+        return  # A refusal is always an acceptable answer.
+    for query in queries:
+        assert _is_storable(query), "the reader returned a value its own writer refuses"
+    # And what it returns must survive being written back: read-then-write is the
+    # replay path, so a value that cannot make the return trip is not replayable.
+    persist_retrieval(
+        sqlite_ledger,
+        validate_run(
+            {
+                "retrieval_run_id": f"{run_id}-rt",
+                "question_id": 7,
+                "provider": "asknews",
+                "started_at_utc": "2026-08-18T12:00:00+00:00",
+                "completed_at_utc": "2026-08-18T12:00:00+00:00",
+                "queries": queries,
+            }
+        ),
+        [],
+    )
+    assert load_run(sqlite_ledger, f"{run_id}-rt").queries == queries
