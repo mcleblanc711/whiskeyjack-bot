@@ -390,6 +390,31 @@ stored packet and the in-memory packet hashed differently. Found by an end-to-en
 not by any unit test, because every unit test built both sides the same way. **Give a hashed
 field exactly one source.**
 
+## 10. A hung tool looks exactly like a slow one, except in CPU time
+
+`scripts/run-review.sh` invoked from a non-interactive shell hung for **57 minutes** with
+**`00:00:00` of CPU time** and no output. The cause was `codex exec` reading stdin: from a
+terminal it behaves, but where stdin is a pipe or a socket — any harness, CI job, or
+backgrounded shell — it blocks before doing any work. Fixed with `< /dev/null` on the
+invocation.
+
+The reusable part is the diagnosis, not the fix. "Still running" and "wedged" are the same
+observation from the outside, and the instinct is to wait longer, because the request really
+was large. What separated them in about five seconds:
+
+```bash
+ps -o pid,etime,time -p <pid>       # ELAPSED 56:03, TIME 00:00:00
+```
+
+A process that is genuinely working accumulates CPU time — even one that is mostly waiting on
+a network response has to parse its input and stream its output. Near-zero CPU against a large
+elapsed time means it never started. Two supporting checks, in order of cost: whether its log
+files are still being written, and `ls -l /proc/<pid>/fd/0` to see what stdin actually is.
+
+**Rule: before waiting longer on a slow tool, check that it has spent any CPU at all.** And
+when you background a tool that normally runs interactively, redirect stdin from `/dev/null`
+rather than inheriting whatever the harness handed you.
+
 ---
 
 ## Milestone stop-point checklist
