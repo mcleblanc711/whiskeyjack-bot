@@ -251,6 +251,41 @@ def _require_finite(value: float) -> float:
 FiniteFloat = Annotated[float, AfterValidator(_require_finite)]
 
 
+# Every rejection from _require_identifier_text uses this one constant string, for the
+# reason _BAD_URL exists: pydantic's ValidationError interpolates the offending input, so
+# a message built from the value would leak provider text through any renderer that shows
+# the error. See _require_identifier_text.
+_BAD_IDENTIFIER = "must be a non-blank identifier containing no NUL character"
+
+
+def _require_identifier_text(value: str) -> str:
+    """Reject a blank or NUL-bearing identifier (M1-607).
+
+    ``Field(min_length=1)`` refuses ``''`` but ``'\\n\\t'`` is length 2, so a
+    whitespace-only ``retrieval_run_id`` validated happily and reached the ledger, where
+    ``006_non_blank_identifiers.sql`` now refuses it. Catching it at the model rather than
+    only at ``store.py`` is what covers the AskNews adapter, which builds
+    ``ResearchDocument`` objects directly and has no preflight of its own -- see the
+    "Rejected" note in ``docs/M1-NOTES.md`` for why that adapter is not modified here.
+
+    ``str.strip()`` is the definition ``006``'s pinned character set was written from, and
+    a test asserts the two still agree over every codepoint Python calls whitespace.
+
+    No length ceiling: nothing reading a run back imposes one, so a ceiling here would
+    refuse input the shipped writer accepts. The NUL check stands on its own -- it is the
+    one input where SQLite's ``length()``/``trim()`` and Python's ``len()``/``strip()``
+    disagree about the same string.
+    """
+    if not value.strip() or "\x00" in value:
+        raise ValueError(_BAD_IDENTIFIER)
+    return value
+
+
+# A run identifier that the ledger's own guard will also accept. See
+# _require_identifier_text.
+IdentifierString = Annotated[str, Field(min_length=1), AfterValidator(_require_identifier_text)]
+
+
 def _reject_non_finite(value: JsonValue) -> JsonValue:
     """Reject NaN and +/-Inf anywhere inside a provider config.
 
@@ -301,7 +336,7 @@ class ResearchDocument(_StrictModel):
     # forecast_records.record_id: adapters construct documents before the ledger
     # transaction that assigns identity.
     document_id: str | None = None
-    retrieval_run_id: str = Field(min_length=1)
+    retrieval_run_id: IdentifierString
 
     # As returned by the provider; never rewritten. M1-305 derives canonical_url
     # from it, and until then adapters may set the two to the same value.
@@ -364,7 +399,7 @@ class ResearchDocument(_StrictModel):
 class ResearchRun(_StrictModel):
     """One provider invocation for one question, and how it went."""
 
-    retrieval_run_id: str = Field(min_length=1)
+    retrieval_run_id: IdentifierString
     # Integer reference only. Deliberately not the M1-201 CanonicalQuestion: the
     # run needs the question's identity, not its content, and importing the model
     # would couple the retrieval epic to the normalization epic for nothing.

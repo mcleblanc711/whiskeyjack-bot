@@ -445,7 +445,7 @@ def _require_optional_text(value: object, field: str, *, max_length: int) -> str
 
 
 def _require_identifier(value: object, field: str) -> str:
-    """Return ``value`` as a non-blank identifier, or raise (M1-606).
+    """Return ``value`` as a non-blank identifier, or raise (M1-606, widened by M1-607).
 
     :func:`_require_text` already refuses ``''``, but ``'\\n\\t'`` is truthy and reaches
     storage through it. That is tolerable for prose columns and not for an identifier:
@@ -471,9 +471,19 @@ def _require_identifier(value: object, field: str) -> str:
     input the two counting functions disagree about, rather than trying to make SQLite
     count matching Python's definition of length.
 
-    Scoped to this item's writer rather than folded into :func:`_require_text`: the older
-    identifier columns have never had this guard, and widening a shared validator would
-    change what already-shipped writers accept. Noted in ``docs/M1-NOTES.md`` instead.
+    **Now every identifier column's validator, not just this item's (M1-607).** M1-606
+    deliberately scoped this function to its own writer, because widening it would have
+    changed what already-shipped, already-reviewed writers accept -- a behaviour change to
+    merged code smuggled in under a different item -- and filed the widening as its own
+    reviewed change instead. ``006_non_blank_identifiers.sql`` is the schema half of it:
+    ``record_id``, ``tournament_id``, ``attempt_id``, ``idempotency_key`` and
+    ``retrieval_run_id`` now carry the same clause on both layers.
+
+    It stays separate from :func:`_require_text` rather than replacing it, because the two
+    kinds of column differ in what blankness *means*. Blank prose -- an ``actor`` note, an
+    ``error_message``, a ``response_body`` -- is a thin record; blank identity is an
+    unjoinable one. So ``actor`` and the body columns keep :func:`_require_text`, and that
+    distinction is the reason both functions exist.
     """
     text = _require_text(value, field, max_length=_MAX_IDENTIFIER)
     if not text.strip():
@@ -749,7 +759,7 @@ def current_status(conn: sqlite3.Connection, record_id: str) -> LifecycleStatus:
     pinned to ``draft`` by the migration; it is never the answer to "where is this
     record now" once any event exists.
     """
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     row = _fetch_one(
         conn,
         "SELECT to_status FROM lifecycle_events WHERE forecast_record_id = ? "
@@ -778,7 +788,7 @@ def read_history(conn: sqlite3.Connection, record_id: str) -> tuple[LifecycleEve
     a caller that cannot tell "this record has no events yet" from "there is no such
     record" would report the first while looking at the second.
     """
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     _require_stored_record(conn, identifier)
     rows = _fetch_all(
         conn,
@@ -808,7 +818,7 @@ def unresolved_uncertainties(conn: sqlite3.Connection, record_id: str) -> tuple[
     that resolved one carried the record to ``submitted`` or ``failed``, and no submission
     is legal from either -- so once the record has moved, nothing here is outstanding.
     """
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     if current_status(conn, identifier) != "approved":
         return ()
     rows = _fetch_all(
@@ -890,7 +900,7 @@ def record_approval(
     does not move the record, and the last valid record stays intact.
     """
     _require_member(decision, _APPROVAL_DECISIONS, "decision")
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     actor_text = _require_text(actor, "actor", max_length=_MAX_ACTOR)
     digest = _require_sha256(forecast_sha256, "forecast_sha256")
     note_text = _require_optional_text(note, "note", max_length=_MAX_NOTE)
@@ -961,10 +971,10 @@ def record_submission_attempt(
     # (GPT review round 1, finding 3.)
     if type(attempt) is not SubmissionAttempt:
         raise LifecycleError("attempt must be a SubmissionAttempt")
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     occurred = _require_utc(occurred_at, "occurred_at")
 
-    attempt_id = _require_text(attempt.attempt_id, "attempt.attempt_id", max_length=_MAX_IDENTIFIER)
+    attempt_id = _require_identifier(attempt.attempt_id, "attempt.attempt_id")
     success = _require_bool(attempt.success, "attempt.success")
     verified = _require_bool(attempt.verified_by_refetch, "attempt.verified_by_refetch")
 
@@ -994,9 +1004,7 @@ def record_submission_attempt(
     values = (
         attempt_id,
         identifier,
-        _require_text(
-            attempt.idempotency_key, "attempt.idempotency_key", max_length=_MAX_IDENTIFIER
-        ),
+        _require_identifier(attempt.idempotency_key, "attempt.idempotency_key"),
         _utc_text(requested),
         _utc_text(completed),
         _require_sha256(attempt.request_payload_sha256, "attempt.request_payload_sha256"),
@@ -1080,13 +1088,11 @@ def record_submission_verification(
     # turn every attribute read below into a call into caller-supplied code.
     if type(verification) is not SubmissionVerification:
         raise LifecycleError("verification must be a SubmissionVerification")
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     occurred = _require_utc(occurred_at, "occurred_at")
 
-    attempt_id = _require_text(
-        verification.submission_attempt_id,
-        "verification.submission_attempt_id",
-        max_length=_MAX_IDENTIFIER,
+    attempt_id = _require_identifier(
+        verification.submission_attempt_id, "verification.submission_attempt_id"
     )
     outcome = _require_member(verification.outcome, _VERIFICATION_OUTCOMES, "verification.outcome")
     observed = _require_utc(verification.observed_at_utc, "verification.observed_at_utc")
@@ -1271,7 +1277,7 @@ def _append_event(
     returned is then what the ledger holds, including the values its own constraints
     accepted.
     """
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     _require_member(event_type, _EVENT_TYPES, "event_type")
 
     with transaction(conn):
