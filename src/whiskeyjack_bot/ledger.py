@@ -47,17 +47,41 @@ class LedgerError(Exception):
     """
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     """Open the ledger with WAL, foreign keys, recursive triggers and explicit
     transactions.
+
+    ``create=False`` opens an **existing** database only, through SQLite's
+    ``file:...?mode=rw`` URI, and fails rather than creating one. ``sqlite3.connect``
+    creates a database for any path it is given, so a caller that has already checked the
+    file exists still races the check: between the check and the open the file can be
+    removed or rotated, and what comes back is then a brand-new empty ledger that answers
+    questions about content it never held. Checking again cannot close that -- only an
+    open that *cannot* create can (M2-701 review round 1, finding 1; reproduced).
+
+    Ordinary local I/O races are reachable reliability conditions under CLAUDE.md's
+    threat boundary, so this is not a defence against a hostile operator; it is the
+    difference between a wrong answer and an error.
+
+    The default stays ``True`` so that every existing caller -- and
+    :func:`initialize_ledger`'s ordinary create-or-upgrade path -- is unchanged.
 
     Purely local file I/O: no network access on any path through here.
     """
     try:
-        conn = sqlite3.connect(path)
-    except sqlite3.Error:
+        target: str | Path = path
+        if not create:
+            # as_uri() percent-encodes, and requires an absolute path; resolve() supplies
+            # one (non-strict, so a missing file resolves rather than raising here -- the
+            # refusal belongs to the open, which is the operation that is racing).
+            target = f"{path.resolve().as_uri()}?mode=rw"
+        conn = sqlite3.connect(target, uri=not create)
+    except (sqlite3.Error, OSError, ValueError):
         # from None: the underlying error can name the file; wrap it and keep
-        # the cause chain from reprinting anything about the target.
+        # the cause chain from reprinting anything about the target. OSError and
+        # ValueError join sqlite3.Error because the create=False branch above can raise
+        # them: resolve() an OSError, and as_uri() a ValueError on a path that resolve()
+        # could not make absolute.
         raise LedgerError(f"cannot open ledger database at {path}") from None
     try:
         conn.row_factory = sqlite3.Row
@@ -109,6 +133,10 @@ def initialize_ledger(path: Path) -> int:
     skipped (after a checksum re-check), so re-running is a no-op that does not
     error. Fails safely on schema drift, duplicate migration numbers, or a
     database written by a newer build.
+
+    Opens, migrates and closes. A caller that then *uses* the ledger wants
+    :func:`open_verified_ledger` instead -- see its docstring for why reopening the
+    pathname is not the same thing.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,17 +146,59 @@ def initialize_ledger(path: Path) -> int:
         raise LedgerError(f"cannot create ledger directory for {path}") from None
     conn = connect(path)
     try:
-        migrations = _load_migrations()
-        applied = _applied_migrations(conn)
-        _reject_newer_database(applied, migrations)
-        for version, sql, checksum in migrations:
-            if version in applied:
-                _verify_checksum(version, applied[version], checksum)
-                continue
-            _apply_migration(conn, version, sql, checksum)
-        return _current_version(conn)
+        return _migrate(conn)
     finally:
         conn.close()
+
+
+def open_verified_ledger(path: Path) -> sqlite3.Connection:
+    """Open an **existing** ledger, verify its schema, and return *that* connection.
+
+    For a command that acts on a ledger someone else recorded. Two properties, and the
+    second is the reason this is a function rather than two calls:
+
+    - It never creates. ``sqlite3.connect`` brings a database into being for any path it
+      is handed, so a caller who checks the file exists first still races the check: the
+      file can be removed between the two, and what comes back is a brand-new empty
+      ledger that answers questions about content it never held. Checking again cannot
+      close that; ``create=False`` can.
+    - **It verifies and returns the same open connection.** Verifying through one
+      connection and then reopening the pathname is a second, worse window: both files
+      exist, so refusing to create catches nothing, and an ordinary atomic rotation --
+      a backup, a restore, a log-style rename -- in between means the schema that was
+      checked and the database that is written are different files. On the approval path
+      that lands an immutable decision in a ledger the command never read (M2-701 review
+      round 2, finding 1; reproduced: the command exited 0, printed the *replacement's*
+      hash, and left the verified ledger with no approval). Holding one connection makes
+      the rotation harmless: the open descriptor still refers to the database that was
+      verified, which is the ledger the operator was shown.
+
+    The caller owns the returned connection and must close it.
+    """
+    conn = connect(path, create=False)
+    try:
+        _migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> int:
+    """Apply every pending migration on an open connection; return the schema version.
+
+    Takes a connection rather than a path so that verification and use cannot end up on
+    two different databases. See :func:`open_verified_ledger`.
+    """
+    migrations = _load_migrations()
+    applied = _applied_migrations(conn)
+    _reject_newer_database(applied, migrations)
+    for version, sql, checksum in migrations:
+        if version in applied:
+            _verify_checksum(version, applied[version], checksum)
+            continue
+        _apply_migration(conn, version, sql, checksum)
+    return _current_version(conn)
 
 
 def _applied_migrations(conn: sqlite3.Connection) -> dict[int, str]:
