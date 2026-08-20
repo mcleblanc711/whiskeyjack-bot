@@ -12,6 +12,7 @@ the shape verified against https://api.exa.ai/openapi.json on 2026-07-27.
 import copy
 import json
 import logging
+import sys
 import traceback
 import warnings
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -535,6 +536,14 @@ def test_a_bare_string_allowlist_is_refused_before_any_call(config: AppConfig) -
         ("retrieval_run_id", ""),
         ("retrieval_run_id", 42),
         ("retrieval_run_id", None),
+        # M1-607: `not retrieval_run_id` refused '' but every one of these is truthy, so
+        # they passed this preflight, paid for every call in the run, and only then failed
+        # at the ledger -- the exact shape of round 4's finding 4, which is the reason this
+        # gate exists. `'\xa0'` and `'\t\n'` are also what one-argument trim() misses.
+        ("retrieval_run_id", "   "),
+        ("retrieval_run_id", "\t\n"),
+        ("retrieval_run_id", "\xa0"),
+        ("retrieval_run_id", "a\x00b"),
         ("now", datetime(2026, 7, 27, 12, 0)),
         ("now", "2026-07-27T12:00:00Z"),
         # Aware, but the freshness bound underflows datetime's range.
@@ -556,6 +565,29 @@ def test_malformed_run_metadata_is_refused_before_any_call(
     with pytest.raises(ExaFallbackError):
         _retrieve(handler, config, **{field: value})
     assert handler.requests == [], "refusal must happen before any billable call"
+
+
+def test_the_exa_preflight_agrees_with_the_ledger_on_what_a_blank_run_id_is(
+    config: AppConfig,
+) -> None:
+    """The whole whitespace set, and no billable call for any of it (M1-607).
+
+    This preflight is the only layer that can refuse a bad run id *before the money*: the
+    model and the store both see it after the calls are made. So its definition of blank
+    has to be the ledger's, over the whole set rather than the handful of parameters
+    above -- three hand-picked ones are what let round 5 of M1-603 through.
+
+    Drift guard as well: `str.strip()` follows the running Python's Unicode data, while
+    `006_non_blank_identifiers.sql`'s literal froze when it landed on master.
+    """
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: an empty list would make the loop assert nothing at all.
+    assert len(whitespace) == 29
+    for cp in whitespace:
+        handler = _Exchange()
+        with pytest.raises(ExaFallbackError, match="non-blank string"):
+            _retrieve(handler, config, retrieval_run_id=chr(cp) * 3)
+        assert handler.requests == [], "refusal must happen before any billable call"
 
 
 def test_a_malformed_question_id_leaks_through_no_channel(

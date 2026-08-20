@@ -19,6 +19,7 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.research.model import (
     ResearchDocument,
     ResearchRun,
+    ResearchSchemaError,
     validate_document,
     validate_run,
 )
@@ -40,6 +41,7 @@ from whiskeyjack_bot.research.store import (
 WHEN = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
 LATER = datetime(2026, 8, 18, 12, 5, tzinfo=timezone.utc)
 QUESTION = 42
+TS_TEXT = "2026-08-18T12:00:00.000000+00:00"
 
 # Low-entropy on purpose: a realistic-looking key would trip the repository's
 # gitleaks full-history scan on every unrelated PR (docs/LESSONS.md).
@@ -669,8 +671,10 @@ def test_an_unhashable_run_id_is_refused_as_a_store_error(
     The ordering is the fix: validate each id's shape, *then* do the set operation
     that assumes the shape.
     """
-    for malformed in ([[]], [{}], [None], [""], [42]):
-        with pytest.raises(StoreError, match="non-empty string"):
+    # "\n\t" and "a\x00b" are M1-607's additions: both are truthy, so the `not run_id`
+    # test this list was written against accepted them and the id reached the query.
+    for malformed in ([[]], [{}], [None], [""], [42], ["\n\t"], ["a\x00b"]):
+        with pytest.raises(StoreError, match="non-blank string|NUL character"):
             load_packet(ledger, question_id=QUESTION, retrieval_run_ids=malformed)  # type: ignore[arg-type]
 
 
@@ -730,3 +734,135 @@ def test_a_stored_surrogate_in_a_json_column_is_refused_on_read(
             ('["real"]' if column == "queries_json" else None, "run-1"),
         )
     assert load_run(ledger, "run-1").queries == ["real"]
+
+
+# --- M1-607: a blank retrieval_run_id, at each of the three layers that can see one ---
+
+
+BLANK_RUN_IDS = ["", " ", "   ", "\t\n", "\xa0"]
+
+
+@pytest.mark.parametrize("blank", BLANK_RUN_IDS)
+def test_the_model_refuses_a_blank_run_id_without_echoing_it(blank: str) -> None:
+    """`Field(min_length=1)` refuses `''`, but `'\\t\\n'` is length 2 (M1-607).
+
+    So a whitespace-only `retrieval_run_id` validated happily and reached the ledger,
+    where `006_non_blank_identifiers.sql` now refuses it. Catching it here rather than
+    only in `store.py` is what covers the AskNews adapter, which builds these models
+    directly and has no preflight of its own.
+
+    The message is a constant for the reason `_BAD_URL` is: pydantic's `ValidationError`
+    interpolates the offending input, so a message built from the value would leak
+    provider text through any renderer that shows the error.
+    """
+    with pytest.raises(ResearchSchemaError) as caught:
+        _run(retrieval_run_id=blank)
+    # `''` is refused one layer up by `Field(min_length=1)`, with pydantic's own message;
+    # everything else reaches the validator this item added. Both are sanitized, which is
+    # what the second assertion is really about.
+    assert ("non-blank identifier" in str(caught.value)) or blank == ""
+    assert repr(blank) not in str(caught.value)
+
+    # The document model carries the same column and so must carry the same rule: a
+    # document whose run id is blank cites a run that cannot exist.
+    with pytest.raises(ResearchSchemaError):
+        _document(0, retrieval_run_id=blank)
+
+
+@pytest.mark.parametrize("blank", BLANK_RUN_IDS)
+def test_the_readers_refuse_a_blank_run_id_by_name(ledger: sqlite3.Connection, blank: str) -> None:
+    # A blank id can now match no stored row by construction, so reporting "no research
+    # run with that retrieval_run_id" would describe a caller mistake as a missing row.
+    for reader in (load_run, load_documents):
+        with pytest.raises(StoreError, match="retrieval_run_id must be a non-blank string"):
+            reader(ledger, blank)  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t\n", "\xa0"])
+def test_the_writer_refuses_a_blank_run_id_even_when_the_model_is_bypassed(
+    ledger: sqlite3.Connection, blank: str
+) -> None:
+    """The store's own guard, reached past the model that would normally catch this.
+
+    `model_construct` skips validation, which is the only way to hand `open_run` a run the
+    model would have refused -- and that is exactly the point of asserting it. Without
+    this, `store._require_identifier` would be unreachable behind the model validator and
+    the test suite could not tell a load-bearing guard from dead code.
+
+    It also is not hypothetical: the model is one import away from any caller, and a
+    future writer constructing a `ResearchRun` some other way inherits the schema's
+    refusal with no message naming the field unless this layer holds too.
+    """
+    # `completed_at_utc=None` because `open_run` refuses a completed run before it looks
+    # at anything else, and this test is about the clause after that one.
+    base = _run(completed_at_utc=None)
+    run = ResearchRun.model_construct(**{**base.__dict__, "retrieval_run_id": blank})
+    with pytest.raises(StoreError, match="retrieval_run_id must be a non-blank string"):
+        open_run(ledger, run)
+    assert list_retrieval_run_ids(ledger, question_id=QUESTION) == ()
+
+
+def test_every_layer_agrees_with_the_schema_on_what_a_blank_run_id_is(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The whole whitespace set, at the model, the store and the trigger.
+
+    003's round 5 was two layers each holding a definition of blank that nobody had
+    compared, and a space is blank under both -- which is why hand-picked parameters
+    missed it for five rounds. This asserts the equivalence directly over every codepoint
+    Python calls whitespace, against the character set `006` pins.
+
+    It is also a drift guard: `str.strip()` follows the Unicode data of whatever Python is
+    running, while the migration's literal froze when 006 landed on master.
+    """
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: an empty list would make the loop assert nothing at all.
+    assert len(whitespace) == 29
+    for cp in whitespace:
+        blank = chr(cp) * 3
+        with pytest.raises(ResearchSchemaError):
+            _run(retrieval_run_id=blank)
+        with pytest.raises(StoreError, match="non-blank string"):
+            load_run(ledger, blank)
+        with pytest.raises(sqlite3.IntegrityError, match="retrieval_run_id"):
+            ledger.execute(
+                "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+                "started_at_utc, created_at_utc) VALUES (?, 'asknews', ?, ?, ?)",
+                (blank, QUESTION, "2026-08-18T12:00:00.000000+00:00", TS_TEXT),
+            )
+
+    # The other direction, so the pinned set cannot grow into rejecting real identifiers:
+    # U+200B is not whitespace to Python, and a run id built from it is a value the ledger
+    # stores. It validates, it persists, and it reads back as itself.
+    zero_width = "​"
+    open_run(ledger, _run(retrieval_run_id=zero_width, completed_at_utc=None))
+    assert load_run(ledger, zero_width).retrieval_run_id == zero_width
+
+
+def test_a_run_id_longer_than_200_characters_round_trips(ledger: sqlite3.Connection) -> None:
+    """The deliberate asymmetry in 006, pinned from the writer's side.
+
+    The four `lifecycle`/`approval` identifier columns take a 200-character ceiling because
+    their readers do -- a longer value would be a row that can never be read back. Nothing
+    here caps `retrieval_run_id` on the way out, so that defect does not exist on this
+    column, and adding a ceiling would refuse input the shipped M1-306 writer accepts.
+
+    Asserted rather than left as a comment, because a comment does not fail when someone
+    makes the five columns "uniform".
+    """
+    long_id = "y" * 201
+    open_run(ledger, _run(retrieval_run_id=long_id, completed_at_utc=None))
+    assert load_run(ledger, long_id).retrieval_run_id == long_id
+
+
+@pytest.mark.parametrize("layer", ["model", "reader"])
+def test_a_run_id_with_an_embedded_nul_is_refused(ledger: sqlite3.Connection, layer: str) -> None:
+    # Independent of any ceiling: a NUL is the one input where SQLite's length()/trim()
+    # and Python's len()/strip() disagree about the same string, so a NUL-bearing
+    # identifier is one the schema and the writer cannot both reason about.
+    if layer == "model":
+        with pytest.raises(ResearchSchemaError):
+            _run(retrieval_run_id="a\x00b")
+    else:
+        with pytest.raises(StoreError, match="NUL character"):
+            load_run(ledger, "a\x00b")

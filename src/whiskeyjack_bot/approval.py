@@ -172,7 +172,7 @@ def read_forecast_summary(conn: sqlite3.Connection, record_id: str) -> ForecastS
     seam, and a caller that cannot tell "nothing recorded yet" from "no such record"
     would report the first while looking at the second.
     """
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     row = _fetch_one(
         conn,
         f"SELECT {_SUMMARY_COLUMNS} FROM forecast_records WHERE record_id = ?",
@@ -211,7 +211,7 @@ def approval_history(conn: sqlite3.Connection, record_id: str) -> tuple[Approval
 
     An unknown ``record_id`` raises, for :func:`read_forecast_summary`'s reason.
     """
-    identifier = _require_text(record_id, "record_id", max_length=_MAX_IDENTIFIER)
+    identifier = _require_identifier(record_id, "record_id")
     _require_stored_record(conn, identifier)
     rows = _fetch_all(
         conn,
@@ -424,6 +424,34 @@ def _require_text(value: object, field: str, *, max_length: int) -> str:
             "(detail withheld: it can echo the value)"
         ) from None
     return value
+
+
+def _require_identifier(value: object, field: str) -> str:
+    """Return ``value`` as a non-blank identifier, or raise (M1-607).
+
+    :func:`_require_text` refuses ``''``, but ``'\\n\\t'`` is truthy and reaches storage
+    through it -- tolerable for prose, not for the value every other table in the ledger
+    points at. ``006_non_blank_identifiers.sql`` refuses a blank or blob ``record_id`` at
+    the schema, so without this a caller would get an opaque constraint failure from the
+    statement instead of a message naming the field.
+
+    Duplicated from ``lifecycle._require_identifier`` rather than imported, for the reason
+    :func:`_require_text` above is duplicated: each module owns its own sanitized
+    exception, and a shared helper would have to raise one module's error inside the
+    other. The two definitions of "blank" are both ``str.strip()``, and a test asserts they
+    and the migration's pinned character set still agree over every codepoint Python calls
+    whitespace.
+
+    The NUL check is 004's finding B1: SQLite's ``length()`` stops counting at an embedded
+    NUL, so the schema's ``length(...) > 200`` guard cannot see past one while this
+    function's ``len()`` can -- a record the reader refuses and the schema accepted.
+    """
+    text = _require_text(value, field, max_length=_MAX_IDENTIFIER)
+    if not text.strip():
+        raise ApprovalError(f"{field} must not be blank")
+    if "\x00" in text:
+        raise ApprovalError(f"{field} must not contain a NUL character")
+    return text
 
 
 def _require_sha256(value: object) -> str:
