@@ -52,10 +52,10 @@ UNIQUE constraint after the caller has already decided to post.
 **Two derivation seams, not one.** :func:`submission_key_for_record` will mint a key for
 any stored record including a ``draft``, because that is what a dry run needs -- a dry run
 is how an operator sees what *would* be submitted before deciding whether to approve it
-(M2-703). :func:`submission_key_for_approved_record` refuses unless
-``approval.effective_approval`` reports an approval in force, and every path leading to a
-real post goes through it. They are two functions rather than one function with a flag,
-for the reason M1-402 settled: a bound any caller can lift is not a bound.
+(M2-703). :func:`submission_key_for_approved_record` refuses unless the record both holds
+an approval **and** is still at ``approved``, and every path leading to a real post goes
+through it. They are two functions rather than one function with a flag, for the reason
+M1-402 settled: a bound any caller can lift is not a bound.
 
 **What this module does not do.** It does not build the request payload -- M1-502/M1-503
 own that, and ``request_payload_sha256`` is an *input* here, exactly as the backlog says
@@ -85,6 +85,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from whiskeyjack_bot.approval import ApprovalError, effective_approval
+from whiskeyjack_bot.lifecycle import LifecycleError, current_status
 
 # Bumping this changes every key, which is the point: a rule change must be visible as a
 # different key rather than silently reinterpreting stored ones. It is part of the hashed
@@ -306,25 +307,50 @@ def submission_key_for_approved_record(
     approved command" is the reason the two are separate functions rather than one
     function with a flag: a bound any caller can lift is not a bound.
 
-    **What this does and does not establish.** It establishes that *this forecast* is
-    approved, from ``approval.effective_approval`` -- derived from the lifecycle event, so
-    an ``approval_events`` row nothing acted on does not count. It does **not** establish
-    that ``request_payload_sha256`` is the payload that approval meant: an approval binds
-    to ``forecast_sha256``, and one approved forecast covers every payload built from it.
-    Closing that needs the forecast->payload mapping, which lives in M1-502/M1-503 and
-    does not exist yet; **M2-707** is the filed item and M2-704 is where the check lands.
-    See ``docs/M2-NOTES.md`` and decision D33.
+    **Two checks, and the second is not redundant.** ``approval.effective_approval``
+    answers "was this forecast approved", derived from the lifecycle event so an
+    ``approval_events`` row nothing acted on does not count. It does **not** answer "is it
+    approved *now*": an approval event is append-only history, and a record carries it
+    forever, so a record that has since reached terminal ``failed`` or ``submitted`` still
+    reports one. ``lifecycle.current_status`` is the second check, and without it this
+    function would mint a key for a record ``record_submission_attempt`` can no longer
+    append an event for -- a live post the ledger cannot record, which is the product's
+    primary failure mode (cross-model review round 2, reproduced).
+
+    ``approved`` is the only status this admits, and that is exactly the set
+    ``lifecycle._LEGAL_TRANSITIONS`` allows ``submitted``/``submission_failed``/
+    ``submission_uncertain`` to leave from. An *uncertain* attempt leaves the record at
+    ``approved`` and so still passes -- deliberately, per M1-603: whether to make a second
+    request while one is unresolved is decided by ``lifecycle.unresolved_uncertainties``,
+    not by refusing to derive a key.
+
+    **What it still does not establish** is that ``request_payload_sha256`` is the payload
+    that approval meant: an approval binds to ``forecast_sha256``, and one approved
+    forecast covers every payload built from it. Closing that needs the forecast->payload
+    mapping, which lives in M1-502/M1-503 and does not exist yet; **M2-707** is the filed
+    item and M2-704 is where the check lands. See ``docs/M2-NOTES.md`` and decision D33.
     """
     payload_sha = _require_sha256(request_payload_sha256, "request_payload_sha256")
     identifier = _require_text(record_id, "record_id")
     try:
         approval = effective_approval(conn, identifier)
+        status = current_status(conn, identifier)
     except ApprovalError as exc:
         raise _wrap_approval(exc) from None
+    except LifecycleError as exc:
+        raise _wrap_lifecycle(exc) from None
     if approval is None:
         raise SubmissionError(
             "this forecast record holds no approval in force, so no submission key may be "
             "derived for it; approve the record first"
+        )
+    if status != "approved":
+        # The status is one of `lifecycle.LifecycleStatus`, a closed vocabulary this
+        # package defines, so naming it is safe -- and it is what makes the refusal
+        # actionable. It is not a stored value in the sense the hygiene rule guards.
+        raise SubmissionError(
+            f"this forecast record was approved but is no longer awaiting submission "
+            f"(it is {status}), so no submission key may be derived for it"
         )
     return submission_key_for_record(conn, identifier, request_payload_sha256=payload_sha)
 
@@ -381,6 +407,11 @@ def require_key_unused(conn: sqlite3.Connection, idempotency_key: str) -> None:
             "this idempotency key has already been used by a recorded submission attempt; "
             "a second attempt under it would claim a second live post"
         )
+
+
+def _wrap_lifecycle(exc: LifecycleError) -> SubmissionError:
+    """Re-raise the lifecycle layer as this module's own type; see :func:`_wrap_approval`."""
+    return SubmissionError(str(exc) or "the ledger refused to report this record's status")
 
 
 def _wrap_approval(exc: ApprovalError) -> SubmissionError:

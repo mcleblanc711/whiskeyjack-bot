@@ -25,6 +25,7 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     SubmissionAttempt,
+    current_status,
     record_submission_attempt,
     record_validation,
 )
@@ -731,3 +732,145 @@ def test_the_documented_gap_is_real_and_is_asserted(
     approval = effective_approval(conn, record_id)
     assert approval is not None
     assert approval.forecast_sha256 == SHA
+
+
+# --- the gate is about the status now, not only the history --------------------------
+
+
+def _attempt(key: str, *, attempt_id: str, success: bool, verified: bool) -> SubmissionAttempt:
+    return SubmissionAttempt(
+        attempt_id=attempt_id,
+        idempotency_key=key,
+        requested_at_utc=OCCURRED,
+        completed_at_utc=OCCURRED,
+        request_payload_sha256=PAYLOAD_SHA,
+        success=success,
+        verified_by_refetch=verified,
+    )
+
+
+@pytest.mark.parametrize(
+    ("success", "verified", "detail_code", "expected_status"),
+    [
+        (False, False, "http_error", "failed"),
+        (True, True, None, "submitted"),
+    ],
+)
+def test_the_gated_seam_refuses_a_record_that_left_approved(
+    approved: tuple[sqlite3.Connection, str],
+    success: bool,
+    verified: bool,
+    detail_code: str | None,
+    expected_status: str,
+) -> None:
+    """An approval event is append-only history; a record carries it forever.
+
+    So `effective_approval()` still reports one after the record has reached terminal
+    `failed` or `submitted`, and a gate resting on it alone would mint a key for a record
+    `record_submission_attempt` can no longer append an event for -- a live post the ledger
+    cannot record. Reproduced by execution at cross-model review round 2.
+    """
+    conn, record_id = approved
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt("k-1", attempt_id="att-1", success=success, verified=verified),
+        occurred_at=OCCURRED,
+        detail_code=detail_code,  # type: ignore[arg-type]
+    )
+    assert current_status(conn, record_id) == expected_status
+    # The history still says approved -- which is why the second check is not redundant.
+    assert effective_approval(conn, record_id) is not None
+    with pytest.raises(
+        SubmissionError, match=f"no longer awaiting submission \\(it is {expected_status}\\)"
+    ):
+        submission_key_for_approved_record(
+            conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA
+        )
+
+
+def test_an_unresolved_uncertain_attempt_still_passes_the_gate(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """`submission_uncertain` leaves the record at `approved`, deliberately (M1-603).
+
+    Whether to make a second request while one is unresolved is decided by
+    `lifecycle.unresolved_uncertainties`, not by refusing to derive a key -- and an
+    uncertain attempt must not be terminal, or a later confirming refetch has nowhere to
+    land. So this must keep passing; a fix that made it fail would have overshot.
+    """
+    conn, record_id = approved
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt("k-1", attempt_id="att-1", success=True, verified=False),
+        occurred_at=OCCURRED,
+        detail_code="timeout",
+    )
+    assert current_status(conn, record_id) == "approved"
+    assert KEY_RE.match(
+        submission_key_for_approved_record(
+            conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA
+        )
+    )
+
+
+def test_the_ungated_seam_still_serves_a_terminal_record(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The status check belongs to the gated seam only: reading back the key a *past*
+    attempt used must keep working for a `failed` or `submitted` record, or the ledger
+    could not explain its own history."""
+    conn, record_id = approved
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt("k-1", attempt_id="att-1", success=False, verified=False),
+        occurred_at=OCCURRED,
+        detail_code="http_error",
+    )
+    assert current_status(conn, record_id) == "failed"
+    assert KEY_RE.match(
+        submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    )
+
+
+def test_the_status_refusal_names_only_the_closed_vocabulary(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The message names the status, which is a `LifecycleStatus` this package defines --
+    not a stored value. Nothing else about the record appears."""
+    conn, record_id = approved
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt("k-1", attempt_id="att-1", success=False, verified=False),
+        occurred_at=OCCURRED,
+        detail_code="http_error",
+    )
+    with pytest.raises(SubmissionError) as excinfo:
+        submission_key_for_approved_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    message = str(excinfo.value)
+    assert "failed" in message
+    assert record_id not in message
+    assert SHA not in message
+    assert PAYLOAD_SHA not in message
+
+
+def test_every_status_reachable_from_approved_is_accounted_for() -> None:
+    """Enumerated from the state machine, not from a hand-written list.
+
+    M1-308's lesson: a guard tested against the cases the author thought of moves when the
+    truth table does. `_LEGAL_TRANSITIONS` is read here to *generate* the cases, never as
+    the expected value of an assertion -- the assertion is about what the gate accepts.
+    """
+    from whiskeyjack_bot.lifecycle import _LEGAL_TRANSITIONS
+
+    reachable = {
+        to_status
+        for _event, from_status, to_status in _LEGAL_TRANSITIONS
+        if from_status == "approved"
+    }
+    # The gate admits exactly one of them. If a future migration adds a transition out of
+    # `approved`, this fails until someone decides which side of the gate it belongs on.
+    assert reachable == {"approved", "submitted", "failed"}

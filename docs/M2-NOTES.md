@@ -434,6 +434,48 @@ is where the check lands. The gap is asserted as a test
 change closes it, that test fails and this note has to be updated, which is the point of
 pinning a known limitation instead of only describing one.
 
+### Round 2 — an approval event is history, not a current state
+
+Round 2 closed all three round-1 findings and blocked on a defect in the gate round 1 had
+just produced. **Reproduced by execution before any fix was written**, as the workflow
+requires:
+
+```text
+status                     = failed
+effective_approval is None = False
+GATE OPENED, key           = wjsub-1-1ca7c9a3…
+```
+
+`approval_events` is append-only, so a record carries its approval **forever**.
+`effective_approval()` answers "was this forecast approved", and M2-701's contract is right
+that it does — but it is not the same question as "is it approved *now*". A record that has
+since reached terminal `failed` or `submitted` still reports one, so the gate minted a key
+for a record `record_submission_attempt()` can no longer append an event for. A future
+M2-704 gateway trusting the advertised gate would have posted and only then discovered the
+attempt was unrecordable: **a live post the ledger cannot record**, which is this project's
+primary failure mode.
+
+The fix is the second check, in `submission_key_for_approved_record()` rather than in
+`effective_approval()`. The reviewer offered both; changing `effective_approval()` would
+alter M2-701's merged public contract and its tests for a caller that does not exist yet,
+and M2-701's reader is genuinely a reader of *history*. The gate is the thing that needs a
+current-state question, so the question is asked there.
+
+`approved` is the only status admitted, and an **uncertain** attempt still passes because it
+leaves the record at `approved` — deliberately, per M1-603: whether to make a second request
+while one is unresolved is `lifecycle.unresolved_uncertainties`' decision, and an uncertain
+attempt must not be terminal or a later confirming refetch has nowhere to land. A fix that
+refused it would have overshot, so that case has its own test.
+
+The ungated seam still serves a terminal record: reading back the key a *past* attempt used
+must keep working, or the ledger could not explain its own history.
+
+`test_every_status_reachable_from_approved_is_accounted_for` enumerates the destinations out
+of `approved` from `lifecycle._LEGAL_TRANSITIONS` rather than from a hand-written list —
+M1-308's lesson that a guard tested against the cases the author thought of moves when the
+truth table does. The private constant is read to *generate* the cases, never as the expected
+value of an assertion.
+
 ### Round 1 — the other two findings
 
 **Non-blocking, fixed:** `test_the_same_key_cannot_create_two_attempts` used
