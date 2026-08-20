@@ -282,3 +282,244 @@ decision sequences through the real database: a migration that widened the graph
 would fail it. That is the intended outcome — a loud failure rather than a silently wrong
 reader — and it is a real maintenance obligation, recorded here so it is not rediscovered
 as a surprise.
+
+## M2-702 — Idempotency keys
+
+`submission_attempts.idempotency_key` has been `TEXT NOT NULL UNIQUE` since migration
+`001`, and `lifecycle.record_submission_attempt()` has written it since M1-603 — but
+nothing in the tree *minted* one, so every caller would have had to invent a key. An
+invented key defeats the column it goes in: the UNIQUE constraint stops a duplicate key
+from claiming a second live post, it cannot stop two differently-spelled keys for one
+forecast from claiming two. This item is the derivation, and the reader that lets a
+gateway ask the question before it decides to post.
+
+Delivered:
+
+- `src/whiskeyjack_bot/submission.py` — `SubmissionError`, `KEY_SCHEMA_VERSION`,
+  `canonical_key_json()`, `submission_key()`, `submission_key_for_record()`, the
+  `AttemptSummary` value object, `attempt_for_key()` and `require_key_unused()`.
+- `tests/unit/test_submission.py` (67), `tests/property/test_submission_properties.py`
+  (36). Suite: 1758 passed, 1 xfailed; four gates green.
+
+No migration, no dependency, no CLI, no network call on any path. `submission.enabled:
+false` and `dry_run: true` remain the committed defaults — the gateways are M2-703 and
+M2-704, and nothing here is reachable from a submission path that does not yet exist.
+
+### Decision — the key material is exactly the four declared inputs
+
+The backlog says "derive keys from tournament, question, forecast version and payload
+hash", and that is what is hashed, alongside `key_schema_version` which pins the rule.
+Two obvious candidates are excluded, each for its own reason:
+
+- **`record_id`** — a writer-minted UUID. Including it would make the key a fact about
+  when a row was written rather than about what is being submitted, so a replay would mint
+  a *second* key for identical work and claim a second live post. That is precisely the
+  failure the key exists to prevent, so the field that would cause it cannot be in it.
+- **`forecast_sha256`** — functionally determined by the triple already present, because
+  `001` declares `UNIQUE (question_id, tournament_id, forecast_version)` and a stored
+  version is immutable (D25). It would add no discrimination and a second value that has
+  to agree. The hash binding lives in `approval.py`, where an operator can act on it.
+
+The acceptance criterion's two halves fall out of this. *"Changed payload requires a new
+key"* is direct: `request_payload_sha256` is in the material. *"Changed forecast requires
+a new key"* is structural: a changed forecast is a new record at a new `forecast_version`
+(M1-602/D25), and the version is in the material.
+
+### Decision — a visible scheme tag on the digest
+
+Every other hash in this package is a bare 64-hex digest (`content_sha256`,
+`packet_sha256`, `forecast_sha256`). This one is `wjsub-1-` + digest, and the departure is
+deliberate: `idempotency_key` is an **append-only** column whose values must still be
+interpretable after the rule is versioned, and a bare digest tells a later reader nothing
+about which rule produced it. The version is *also* inside the hashed payload, so the two
+cannot silently disagree — `_assert_prefix_matches_version()` fails at import if they do,
+the way `packet._assert_fields_exist()` guards its exclusion list, and for the same reason
+it runs at import rather than only in a test.
+
+Key length is 72 characters, well inside the writer's 200-character identifier bound. The
+unit test asserts that by putting a minted key through `lifecycle.record_submission_attempt`
+rather than by importing `lifecycle._MAX_IDENTIFIER`: a private constant imported to assert
+against tests the constant, not the writer that enforces it (M1-303).
+
+### Decision — the reader ships with the derivation
+
+`require_key_unused()` is what M2-703/M2-704 call before deciding to post. `001`'s UNIQUE
+constraint remains the enforcement and callers must still let it decide — but it fires as
+a `sqlite3.IntegrityError` at the write, which is after a gateway has made its decision
+and, on the live path, possibly its call. The guard says the same thing beforehand, as
+this module's own error, naming no value.
+
+It is a **read**, so it is not a race-free claim, and the docstring says so. That division
+is the honest one and it is the same one M1-603 settled for `unresolved_uncertainties`:
+whether to make a request is decided before it is made, and the writer that is handed a
+finished receipt cannot refuse it without producing a live post with no ledger row.
+
+Mirrors M2-701's owner decision to ship `effective_approval()` alongside the writer, for
+the same reason: "structurally true" demonstrated by the absence of a row is a weak thing
+to hand a reviewer and a weaker thing for M2-704 to depend on.
+
+### Deviation — M1-602 is `Not Started`, and this did not wait for it
+
+The backlog names M1-602 (*persist immutable forecast versions*) as the dependency. That
+dependency is on the **writer**, not on the columns: `tournament_id`, `question_id` and
+`forecast_version` shipped in `001_initial.sql` along with the UNIQUE constraint over the
+triple, and `approval.read_forecast_summary()` (M2-701, merged) already reads exactly
+those three columns from exactly that table. `submission_key_for_record()` reads them the
+same way. Tests seed records directly, as `tests/unit/test_approval.py` does and for the
+same stated reason.
+
+Nothing here anticipates M1-602's shape. When the record writer lands, this module needs
+no change.
+
+### Rejected — a human-readable structured key, and a bare digest
+
+A key like `wjsub-1/minibench/38402/v2/3f9c2ae1b0d4` reads at a glance in a database dump,
+and that is its whole case. Against it: `tournament_id` is free-form operator
+configuration, so it needs escaping and a length budget inside a 200-character column, and
+a *truncated* hash weakens the one claim the key makes — that the same payload gives the
+same key and a different payload does not. Neither cost buys anything an operator cannot
+get from `submission_key_for_record()`.
+
+A bare 64-hex digest was the consistent choice and was rejected for the append-only reason
+above.
+
+### Rejected — normalizing an uppercase digest
+
+`_require_sha256` refuses `"D"*64` rather than lowercasing it. Accepting both spellings
+would mean two callers could mint the same key from what they believe are different
+inputs, or — worse — that a stored key could not be traced back to which spelling built
+it. An uppercase digest arriving from a caller is a bug in the caller, and this is where
+it is cheapest to see.
+
+### Deferred (do not read the absence as an omission)
+
+- **No CLI.** There is nothing to submit yet; the operator command is M2-703's.
+- **No payload builder.** `request_payload_sha256` is an *input*, exactly as the backlog
+  wording says. M1-502/M1-503 own producing the binary/multiple-choice/numeric submission
+  payload, and both are `Not Started`.
+- **No `submission.enabled`/`dry_run` handling.** This module is not on a submission path.
+
+### Owner decision (D33) — an approval binds to the forecast hash, not to a payload
+
+**Round 1 blocked on this**, and it was the standing risk this item declared up front.
+The criterion reads *"changed payload requires a new approval/key"*. The **key** half is
+direct. The **approval** half cannot be satisfied here: an approval binds to
+`forecast_sha256`, so one approved forecast covers every payload built from it, and a
+payload that changed *without the forecast changing* gets a new key while keeping its old
+approval in force.
+
+The reviewer was right that noting it is not enough — CLAUDE.md's stricter-reading rule
+says implement the stricter reading *and* note it — and right that the alternative is an
+explicit owner decision. Both were taken:
+
+**The strengthening that is in scope shipped.** `submission_key_for_approved_record()`
+refuses to derive a key for a record with no approval in force, read through
+`approval.effective_approval()` — so an `approval_events` row that no lifecycle event
+cites does not open the gate either. `submission_key_for_record()` stays ungated and
+serves a `draft`, because that is exactly what M2-703's dry run needs: seeing what *would*
+be submitted is how an operator decides whether to approve it. **Two functions rather than
+one function with a flag**, for the reason M1-402 settled — a bound any caller can lift is
+not a bound.
+
+**The rest is D33, and it is a sequencing fact rather than a preference.** Binding an
+approval to a payload requires the forecast→payload mapping, which is M1-502/M1-503 and
+does not exist. An operator asked to approve a payload hash today would be approving a
+value nothing in the tree can compute, and the approval command that took it would be
+`M2-701`'s, already merged. Doing it now would mean a migration, a changed approval
+command, and an operator ceremony over a value that has no producer.
+
+**M2-707** carries the payload binding (dependency `M2-702; M1-502; M1-503`), and M2-704
+is where the check lands. The gap is asserted as a test
+(`test_the_documented_gap_is_real_and_is_asserted`) rather than left as prose: if a later
+change closes it, that test fails and this note has to be updated, which is the point of
+pinning a known limitation instead of only describing one.
+
+### Round 2 — an approval event is history, not a current state
+
+Round 2 closed all three round-1 findings and blocked on a defect in the gate round 1 had
+just produced. **Reproduced by execution before any fix was written**, as the workflow
+requires:
+
+```text
+status                     = failed
+effective_approval is None = False
+GATE OPENED, key           = wjsub-1-1ca7c9a3…
+```
+
+`approval_events` is append-only, so a record carries its approval **forever**.
+`effective_approval()` answers "was this forecast approved", and M2-701's contract is right
+that it does — but it is not the same question as "is it approved *now*". A record that has
+since reached terminal `failed` or `submitted` still reports one, so the gate minted a key
+for a record `record_submission_attempt()` can no longer append an event for. A future
+M2-704 gateway trusting the advertised gate would have posted and only then discovered the
+attempt was unrecordable: **a live post the ledger cannot record**, which is this project's
+primary failure mode.
+
+The fix is the second check, in `submission_key_for_approved_record()` rather than in
+`effective_approval()`. The reviewer offered both; changing `effective_approval()` would
+alter M2-701's merged public contract and its tests for a caller that does not exist yet,
+and M2-701's reader is genuinely a reader of *history*. The gate is the thing that needs a
+current-state question, so the question is asked there.
+
+`approved` is the only status admitted, and an **uncertain** attempt still passes because it
+leaves the record at `approved` — deliberately, per M1-603: whether to make a second request
+while one is unresolved is `lifecycle.unresolved_uncertainties`' decision, and an uncertain
+attempt must not be terminal or a later confirming refetch has nowhere to land. A fix that
+refused it would have overshot, so that case has its own test.
+
+The ungated seam still serves a terminal record: reading back the key a *past* attempt used
+must keep working, or the ledger could not explain its own history.
+
+`test_every_status_reachable_from_approved_is_accounted_for` enumerates the destinations out
+of `approved` from `lifecycle._LEGAL_TRANSITIONS` rather than from a hand-written list —
+M1-308's lesson that a guard tested against the cases the author thought of moves when the
+truth table does. The private constant is read to *generate* the cases, never as the expected
+value of an assertion.
+
+### Round 1 — the other two findings
+
+**Non-blocking, fixed:** `test_the_same_key_cannot_create_two_attempts` used
+`pytest.raises(Exception)`, which would have passed for an unrelated failure. Narrowed to
+`LifecycleError`, to its sanitized text, and with an assertion that the key is not echoed.
+
+**Backlog candidate, filed as M2-708:** `require_key_unused()` is a read, so two concurrent
+commands can both see one key as unused, and `001`'s UNIQUE constraint only refuses the
+second row *after* its post has been made. Nothing is reachable today — no gateway exists
+— and the module's docstring already disclaims race safety, which the reviewer confirmed.
+
+The six risk areas the request asked to be pressure-tested all came back **safe**:
+canonical-material injectivity, store/load replay stability, the `require_key_unused` race
+claim as documented, own-error-only, no value in messages or tracebacks, and the boolean
+integer dispatch.
+
+### Standing risk — two stored-value gates are not reachable through this schema
+
+`_stored_flag` and `_stored_text` re-gate values read back out of the ledger, per
+CLAUDE.md's threat boundary. For `submission_attempts` specifically, neither can fire from
+a row this schema accepted: `success`/`verified_by_refetch` carry `CHECK (… IN (0, 1))`,
+and TEXT affinity coerces an integer written to `attempt_id`. Both facts are asserted
+rather than assumed (`test_the_schema_is_what_refuses_a_flag_outside_zero_and_one`,
+`test_text_affinity_is_why_the_stored_text_gate_is_defense_in_depth`), and the gates are
+kept as defense in depth for a row this package did not write. `_stored_int` on
+`forecast_records.question_id` **is** reachable — INTEGER affinity leaves non-numeric text
+as TEXT and no trigger types that column — and has its own test.
+
+### On the property pass
+
+Seven deliberate mutations were run against the suite before the first review, each
+confirmed to fail the property it is meant to fail: a delimiter-free field concatenation,
+the payload hash dropped from the material, the tournament collapsed to a constant, a
+nonce added to the material, a refusal that echoes its value, the lone-surrogate probe
+removed, and the stored version altered on the way out.
+
+The first of those is the lesson worth writing down. The injectivity property **passed**
+against the concatenation on its first draft, because the smear pools were large enough
+that the colliding pair was never drawn — M1-303's "collision properties need colliding
+draws", reproduced exactly. The fix was to shrink the pool to six tuples containing three
+pairs that collide under `tournament_id + question_id + forecast_version`, and to assert
+those three pairs directly as well, so the claim does not depend on the search at all.
+
+A second near-miss is worth recording because it would have produced a false claim rather
+than a weak test: two of the first mutation attempts were silent no-ops, because `ruff
+format` had rewrapped the lines the patch matched against. A mutation that does not apply
+looks exactly like a property that does not catch it. Assert that the patch applied.
