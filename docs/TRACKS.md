@@ -42,6 +42,7 @@ to the registry, and neither is a habit you can form by reflex.
 | --- | --- | --- | --- | --- | --- |
 | M1-402 | feat/m1-402-structured-model-call | whiskeyjack-m1-402 | no | none | 2026-08-19 |
 | M1-313 | feat/m1-313-freeze-research-packet | whiskeyjack-m1-313 | no | none | 2026-08-20 |
+| M1-607 | feat/m1-607-blank-identifier-guard | whiskeyjack-m1-607 | no | 006 | 2026-08-20 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
