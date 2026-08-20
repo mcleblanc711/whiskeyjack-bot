@@ -3188,3 +3188,19 @@ and includes embedded NULs. The unit suite asserts the same agreement over the 2
 codepoints; the property covers the rest of the input space, because the failure mode is not "the
 set is wrong" but "two layers hold two definitions and nobody compared them", which can differ
 anywhere.
+
+### Review outcome — approved in round 1
+
+Cross-model review round 1 (reviewed commit `07b3297`) returned **APPROVE with no blocking
+findings**, the second single-round approval in the project after M1-202. The one non-blocking
+observation was the `PRAGMA foreign_keys` residual this item had already declared as a standing
+risk, and the reviewer's own note records why it is not a defect on the branch: the PRAGMA is
+recognized on the supported SQLite runtime and set outside a transaction, so there is no
+deterministic failure to reproduce. Filed as **M1-609** rather than fixed here, for the reason the
+Deferred section gives — reading it back changes `ledger.connect`'s contract.
+
+Worth recording alongside `docs/LESSONS.md`'s count of review-round commits: the difference between
+this and M1-305's ten rounds was not the code. It was writing the five headings above, the risk
+areas and the mutation-check result *before* round 1 instead of discovering them through it. The
+deviation most likely to be read as an oversight — `retrieval_run_id` having no length ceiling —
+was stated first and came back marked "Safe" rather than as a finding.
