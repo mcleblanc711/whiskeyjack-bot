@@ -8,6 +8,11 @@ any configured credential environment variable with ``<redacted:VAR_NAME>``,
 including in records emitted by third-party loggers (the forecasting-tools SDK
 logs freely). Redaction is not configurable off (the config schema locks
 ``redact_secrets: true``).
+
+Redaction covers *credentials*. :class:`PayloadDebugFilter` covers the other thing a
+third-party logger can emit — **content**: the pinned ``forecasting-tools`` logs the
+whole prompt and the whole raw model response at DEBUG, and ``logging.level: DEBUG``
+is accepted configuration. See its docstring (M1-402 review round 1, finding 2).
 """
 
 from __future__ import annotations
@@ -24,6 +29,15 @@ from whiskeyjack_bot.config import AppConfig
 # a 1-3 character string would mangle unrelated log text far more often than
 # it would protect a real credential.
 _MIN_SECRET_LENGTH = 4
+
+# Third-party loggers that see a model call's payloads. ``forecasting_tools`` logs
+# ``f"Invoking model with prompt: {prompt}"`` and ``f"Model responded with: {response}"``
+# at DEBUG (``ai_models/general_llm.py``), and litellm sits under it holding the same
+# messages. ``httpx``/``httpcore`` are deliberately absent: their DEBUG records carry
+# request lines and headers rather than bodies, and any credential in them is already
+# handled by the redaction above -- listing them would suppress genuinely useful
+# transport diagnostics for no content gain.
+_PAYLOAD_LOGGER_PREFIXES = ("forecasting_tools", "litellm", "LiteLLM")
 
 
 def _redact_text(text: str, env_var_names: list[str]) -> str:
@@ -62,6 +76,40 @@ class SecretRedactionFilter(logging.Filter):
             record.msg = redacted
             record.args = None
         return True
+
+
+class PayloadDebugFilter(logging.Filter):
+    """Drop sub-INFO records from libraries that log the model call's payloads.
+
+    ``logging.level: DEBUG`` is accepted configuration, and at DEBUG the pinned
+    ``forecasting-tools`` writes the full reasoning packet and the full *unvalidated*
+    model response through this project's own handlers into
+    ``logging.file``. That breaches two hard constraints at once: a message never
+    echoes field values, and hidden chain-of-thought is never persisted -- an
+    unvalidated response is exactly where deliberation the prompt forbids would
+    appear, and it is logged before any schema check can reject it. Reproduced by
+    execution in M1-402 review round 1, finding 2.
+
+    **The whole sub-INFO range is dropped, not the two known messages.** Matching
+    their text would be a check whose unknown case is "pass": the library rewords a
+    log line, or adds a third, and the leak reopens silently with nothing to notice it
+    (``docs/LESSONS.md`` #7, and the "close the class, not the reported instance"
+    rule from M1-308 round 7). Nothing in that range is worth the exposure -- INFO and
+    above from the same libraries still reach the log, so real diagnostics survive.
+
+    It is a **handler** filter rather than a level set on those loggers, because a
+    library may raise its own level at any time (litellm does exactly that when its
+    verbose flag is set) and would silently undo a ``setLevel``. A filter on the
+    handlers this project installs cannot be undone by the library, and those handlers
+    are the ones that persist. A library writing to a handler of its own making is
+    outside this module's reach and is recorded as a standing risk rather than
+    claimed.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.INFO:
+            return True
+        return not record.name.startswith(_PAYLOAD_LOGGER_PREFIXES)
 
 
 class JsonFormatter(logging.Formatter):
@@ -109,6 +157,7 @@ def configure_logging(config: AppConfig) -> None:
 
     secret_names = config.secret_env_var_names()
     redaction = SecretRedactionFilter(secret_names)
+    payload_debug = PayloadDebugFilter()
     formatter = JsonFormatter(secret_names)
 
     stream_handler = logging.StreamHandler()
@@ -119,5 +168,6 @@ def configure_logging(config: AppConfig) -> None:
     for handler in (stream_handler, file_handler):
         handler.setFormatter(formatter)
         handler.addFilter(redaction)
+        handler.addFilter(payload_debug)
         setattr(handler, "_whiskeyjack", True)  # noqa: B010 - marker for idempotent re-setup
         root.addHandler(handler)

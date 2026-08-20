@@ -31,14 +31,22 @@ retries on any exception, including a timeout *after* generation, which re-bills
 retried -- "a request that reached the server is never re-sent and so cannot be billed
 twice". A layer that cannot make that distinction is switched off rather than trusted.
 
-**``model.allowed_tries`` is the total number of model invocations for one forecast**
-(owner decision). ``repairs_allowed = allowed_tries - 1``, so the committed default of
-2 is one call plus at most one repair -- exactly the criterion -- and 1 means no
-repair at all. Stated rather than left to be discovered: the criterion's "at most one"
-therefore holds *at the committed default*, not for every configuration. An operator
-who sets 5 gets four repairs. Refusing a value ``ModelConfig`` itself accepts, or
-silently clamping it, would be the worse failure: a config field whose unknown case is
-handled quietly is the shape ``docs/LESSONS.md`` #7 is about.
+**``model.allowed_tries`` is the total number of model invocations for one forecast**,
+bounded at ``config.MAX_MODEL_INVOCATIONS``. ``repairs_allowed = allowed_tries - 1``,
+so the committed default of 2 is one call plus at most one repair -- exactly the
+criterion -- and 1 means no repair at all.
+
+The bound is **unconditional**, and the first cut of this module got that wrong: it
+honoured whatever the field held, so `allowed_tries: 5` bought four repairs and the
+criterion held only at the committed default. Review round 1 reproduced it, and it is
+worth recording why the looser reading was tempting and still wrong. A bound any
+config can lift is not a bound; the criterion exists to cap what a malformed response
+can cost, and this field's *name* is the footgun that makes the cap load-bearing --
+`GeneralLlm`'s constructor parameter of the same name means transport retries, so an
+operator reading "5" as "retry the network five times" would instead buy five billed
+model calls. The refusal lives in ``ModelConfig`` so it fails at load and at
+``verify-env``, and is repeated here so it also fails for an ``AppConfig`` assembled
+some other way. Nothing is silently clamped.
 
 **A provider failure is not repaired.** A repair repairs *output*; re-issuing a call
 that raised is the transport retry deliberately disabled above. So an exception from
@@ -86,7 +94,7 @@ from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import 
     MonetaryCostManager,
 )
 
-from whiskeyjack_bot.config import AppConfig
+from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS, AppConfig
 from whiskeyjack_bot.forecast.inputs import (
     ForecastInputError,
     ModelInput,
@@ -388,6 +396,16 @@ def generate_forecast(
         raise ForecastGenerationError("packet must be a ResearchPacket")
     if packet.question_id != question.question_id:
         raise ForecastGenerationError("packet must belong to the question being forecast")
+    if config.model.allowed_tries > MAX_MODEL_INVOCATIONS:
+        # ModelConfig already refuses this at load, so reaching here means an
+        # AppConfig assembled some other way. Repeated at the spending site for the
+        # reason research/exa.py repeats its configuration check there: a config
+        # object carries no memory of which validator built it, and this is the
+        # bound that decides how much a malformed response can cost.
+        raise ForecastGenerationError(
+            "model.allowed_tries exceeds the one-repair bound; a malformed response "
+            "may cost at most one initial call and one repair"
+        )
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(

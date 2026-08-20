@@ -24,8 +24,14 @@ from typing import Any
 
 import pytest
 import yaml
+from forecasting_tools.ai_models.general_llm import GeneralLlm
 
-from whiskeyjack_bot.config import AppConfig, validate_config_data
+from whiskeyjack_bot.config import (
+    MAX_MODEL_INVOCATIONS,
+    AppConfig,
+    ConfigError,
+    validate_config_data,
+)
 from whiskeyjack_bot.forecast.generate import (
     ForecastGeneration,
     ForecastGenerationError,
@@ -33,7 +39,11 @@ from whiskeyjack_bot.forecast.generate import (
     generate_forecast,
 )
 from whiskeyjack_bot.forecast.schema import BinaryForecastResponse
-from whiskeyjack_bot.logging_setup import SecretRedactionFilter, configure_logging
+from whiskeyjack_bot.logging_setup import (
+    PayloadDebugFilter,
+    SecretRedactionFilter,
+    configure_logging,
+)
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 from whiskeyjack_bot.prompt import LoadedPrompt, load_prompt
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
@@ -617,3 +627,190 @@ def test_the_probe_would_notice_a_regression() -> None:
     added = _added_modules("whiskeyjack_bot.forecast.generate")
     assert "forecasting_tools" in added
     assert "litellm" in added
+
+
+# --- DEBUG logging (review round 1, finding 2) -----------------------------------
+
+
+def _debug_config(config: AppConfig) -> AppConfig:
+    return config.model_copy(
+        update={"logging": config.logging.model_copy(update={"level": "DEBUG"})}
+    )
+
+
+class _Reply:
+    """Stands in for the SDK's own response object; ``invoke`` reads only ``.data``."""
+
+    def __init__(self, text: str) -> None:
+        self.data = text
+
+
+def _real_client_with_recorded_reply(monkeypatch: pytest.MonkeyPatch, reply: str) -> GeneralLlm:
+    """A genuine ``GeneralLlm`` with only its network-facing method replaced.
+
+    The point of using the real class rather than ``_Model`` is that the SDK's own
+    logging path is what leaks; a double would route around the very thing under test.
+    ``_mockable_direct_call_to_model`` is the seam the package names for this, and it
+    sits below both DEBUG lines.
+    """
+
+    async def _fake(self: Any, prompt: Any) -> _Reply:
+        return _Reply(reply)
+
+    monkeypatch.setattr(GeneralLlm, "_mockable_direct_call_to_model", _fake)
+    return GeneralLlm(
+        model=MODEL_NAME,
+        temperature=0.0,
+        timeout=5,
+        allowed_tries=1,
+        max_tokens=100,
+        api_key=FAKE_KEY,
+        pass_through_unknown_kwargs=False,
+    )
+
+
+def test_debug_logging_persists_neither_the_packet_nor_the_raw_response(
+    config: AppConfig,
+    prompt: LoadedPrompt,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``logging.level: DEBUG`` is accepted configuration, and the pinned SDK logs the
+    full prompt and the full response at DEBUG through this project's own handlers.
+
+    Two hard constraints at once: a message never echoes field values, and hidden
+    chain-of-thought is never persisted -- the raw response is logged *before* the
+    schema can reject it, so a reply carrying the deliberation the prompt forbids is
+    written to the log file whatever validation later decides.
+    """
+    packet_marker = "PACKETMARKERAAA"
+    output_marker = "OUTPUTMARKERZZZ"
+    debug = _debug_config(config)
+    configure_logging(debug)
+    client = _real_client_with_recorded_reply(
+        monkeypatch, f"deliberation the prompt forbids, {output_marker}"
+    )
+
+    question = _question(title=f"Will {packet_marker} happen?")
+    result = generate_forecast(
+        config=debug,
+        question=question,
+        packet=_packet(),
+        prompt=prompt,
+        tournament_id="minibench",
+        now=NOW,
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    log_text = debug.logging.file.read_text(encoding="utf-8")
+    assert result.failure_code == "malformed_response"
+    # The markers really were in play, so the assertions below are not vacuous.
+    assert packet_marker in result.request
+    assert any(output_marker in raw for raw in result.raw_responses)
+    for marker in (packet_marker, output_marker):
+        assert marker not in log_text
+        assert marker not in captured.err
+
+
+def test_the_payload_filter_keeps_real_diagnostics_from_the_same_libraries(
+    config: AppConfig,
+) -> None:
+    """The filter drops a whole level range, so it has to be shown not to be "drop
+    everything from these libraries" -- INFO and above must still reach the log."""
+    configure_logging(_debug_config(config))
+    logging.getLogger("forecasting_tools.ai_models.general_llm").warning("rate limit reached")
+    logging.getLogger("litellm").info("provider selected")
+    log_text = config.logging.file.read_text(encoding="utf-8")
+    assert "rate limit reached" in log_text
+    assert "provider selected" in log_text
+
+
+def test_this_projects_own_debug_records_are_untouched(config: AppConfig) -> None:
+    """The filter is scoped to libraries that see the payload, not to DEBUG at large:
+    an operator who turns DEBUG on still gets this project's own diagnostics."""
+    configure_logging(_debug_config(config))
+    logging.getLogger("whiskeyjack_bot.forecast.generate").debug("our own detail")
+    assert "our own detail" in config.logging.file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("logger_name", "level", "kept"),
+    [
+        ("forecasting_tools.ai_models.general_llm", logging.DEBUG, False),
+        ("forecasting_tools", logging.DEBUG, False),
+        ("litellm", logging.DEBUG, False),
+        ("LiteLLM", logging.DEBUG, False),
+        ("litellm.llms.custom_httpx", logging.DEBUG, False),
+        ("forecasting_tools.ai_models.general_llm", logging.INFO, True),
+        ("httpx", logging.DEBUG, True),
+        ("whiskeyjack_bot.forecast.generate", logging.DEBUG, True),
+    ],
+)
+def test_the_payload_filter_truth_table(logger_name: str, level: int, kept: bool) -> None:
+    record = logging.LogRecord(logger_name, level, __file__, 1, "payload", None, None)
+    assert PayloadDebugFilter().filter(record) is kept
+
+
+# --- the invocation bound is unconditional (review round 1, finding 1) -----------
+
+
+@pytest.mark.parametrize("value", [3, 5, 100])
+def test_a_config_above_the_bound_is_refused_at_load(value: int) -> None:
+    """The criterion is a hard upper bound, so the field that decides it is bounded
+    where it fails earliest: at config load, and therefore at verify-env, rather than
+    part-way through a forecast that has already been paid for.
+
+    The first cut of this module honoured whatever the field held, and round 1
+    reproduced `allowed_tries: 5` buying four repairs.
+    """
+    data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    data = copy.deepcopy(data)
+    data["model"]["name"] = MODEL_NAME
+    data["model"]["allowed_tries"] = value
+    with pytest.raises(ConfigError):
+        validate_config_data(data)
+
+
+def test_the_committed_default_is_inside_the_bound() -> None:
+    """A bound that refused the shipped config would be a different kind of bug."""
+    data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    assert data["model"]["allowed_tries"] <= MAX_MODEL_INVOCATIONS
+    assert MAX_MODEL_INVOCATIONS == 2
+
+
+def test_the_bound_is_refused_again_at_the_spending_site(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """ModelConfig refuses this at load, so reaching the call site means an AppConfig
+    assembled some other way. Repeated here for the reason the Exa adapter repeats its
+    configuration check at the point that spends money: a config object carries no
+    memory of which validator built it."""
+    unbounded = config.model_copy(
+        update={
+            "model": config.model.model_construct(
+                **{**config.model.model_dump(), "allowed_tries": 5}
+            )
+        }
+    )
+    assert unbounded.model.allowed_tries == 5
+    client = _Model("not json", "still not json", "and again")
+    with pytest.raises(ForecastGenerationError):
+        _generate(client, unbounded, prompt)
+    assert client.calls == [], "refusal must happen before any billable call"
+
+
+def test_no_configuration_can_buy_a_second_repair(config: AppConfig, prompt: LoadedPrompt) -> None:
+    """The criterion, stated as a property of every accepted configuration rather than
+    of the committed default: across the whole accepted range, a model that never
+    returns usable JSON can never cost more than two calls."""
+    for value in range(1, MAX_MODEL_INVOCATIONS + 1):
+        bounded = config.model_copy(
+            update={"model": config.model.model_copy(update={"allowed_tries": value})}
+        )
+        client = _Model("no", "no", "no", "no", "no")
+        result = _generate(client, bounded, prompt)
+        assert result.invocations == value
+        assert len(client.calls) == value
+        assert result.invocations <= MAX_MODEL_INVOCATIONS
+        assert sum(1 for c in client.calls if any(m["role"] == "assistant" for m in c)) <= 1

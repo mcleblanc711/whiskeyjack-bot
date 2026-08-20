@@ -176,11 +176,11 @@ exception, including a timeout *after* generation, which re-bills; `research/tra
 settled that only connection failures may be retried — "a request that reached the server is never
 re-sent and so cannot be billed twice" — and the SDK's layer cannot make that distinction.
 
-**Stated rather than left to be found: the criterion's "at most one" holds at the committed
-default, not for every configuration.** An operator who sets `allowed_tries: 5` gets four repairs.
-The stricter alternative — refusing a value `ModelConfig` itself accepts — was weighed and declined
-with the owner: an unread or silently clamped config field is the worse failure, and it is the
-shape `docs/LESSONS.md` #7 is about.
+**Corrected in review round 1 — see that section.** The first cut honoured whatever the field
+held, so `allowed_tries: 5` bought four repairs and the criterion held only at the committed
+default. It is now bounded at `config.MAX_MODEL_INVOCATIONS` (2), refused in `ModelConfig` so it
+fails at load and at `verify-env`, and refused again at the spending site for an `AppConfig`
+assembled some other way. Nothing is silently clamped.
 
 ### Decision — a provider failure is never repaired
 
@@ -385,16 +385,112 @@ project twice. Fixed with an exact-type gate before the lookup.
   `GeneralLlm` seam is exercised only against a recording double. What the tests establish is the
   call shape, the invocation bound and the hygiene; that the pinned SDK behaves as its source reads
   was verified by reading and executing 0.2.92 locally, not by a live call.
+- **A library's own handler is outside `configure_logging`'s reach.** `PayloadDebugFilter` sits
+  on the handlers this project installs, which is what closes the persistence path; litellm also
+  prints to stderr through a handler of its own making, and nothing here can filter that.
 - **Cost capture is best-effort.** It depends on litellm's callback reaching our
   `MonetaryCostManager` through a `ContextVar`. If it does not, `current_usage` stays `0.0` and we
   record `None` — the failure mode is "unknown", which is the safe direction, but it is not proof
   that cost was captured.
 - **`GeneralLlm` opens its own nested `MonetaryCostManager(1)` around every call**
   (`general_llm.py:271`), a $1-per-call ceiling this module neither sets nor can turn off.
-- **`general_llm.py` logs the full prompt and the full response at DEBUG.** At the committed
-  `logging.level: INFO` nothing is emitted, but an operator who raises it to DEBUG puts the whole
-  research packet and the model's output in the log file. No credential is involved; it is content,
-  and it is the pinned package's behaviour rather than this module's.
 - **Importing `GeneralLlm` runs `nest_asyncio.apply()`**, monkeypatching the global event loop for
   the process, and costs ~6.3s and a Streamlit import. Confining the import to `generate.py` is what
   keeps that off the startup path; `tests/unit/test_env_verify.py`'s probe is what keeps it there.
+
+### Review round 1 (GPT) — two blocking findings, both reproduced, both closed
+
+Reviewed commit `531526f`, which was the request's `HEAD`. Both findings were reproduced by
+execution against that exact tree before any fix code was written, per the rule that a pasted
+review may be stale — here it was not.
+
+**Finding 1 — a contract-valid config could buy more than one repair.** Reproduced exactly as
+described: `model.allowed_tries: 5` validated, and a forecaster returning malformed text every
+time produced `invocations=5`, `client_calls=5`, four repair turns.
+
+This one reversed a decision taken with the owner *before* the code was written, and the reversal
+is the interesting part. The option the reviewer asked for had been presented and declined; the
+argument for declining it was that refusing a value `ModelConfig` accepts is worse than honouring
+it. That argument is wrong, and one fact settles it: **the field's name is the footgun.**
+`GeneralLlm`'s constructor parameter of the same name means *transport* retries, so an operator
+reading `5` as "retry the network five times" buys five billed model calls instead. That is not a
+malicious operator or hostile state — it is the ordinary misreading the name invites, and it is
+exactly what an acceptance criterion phrased as a hard upper bound exists to prevent. A bound any
+config can lift is not a bound.
+
+Taken back to the owner rather than reversed unilaterally, and the fix is the *earlier* of the two
+options: `ModelConfig.allowed_tries` is now `Field(2, ge=1, le=MAX_MODEL_INVOCATIONS)`, so a wrong
+value fails at config load and at `verify-env` instead of part-way through a forecast that has
+already been paid for. The refusal is repeated in `generate_forecast`'s preflight, before any
+billable call, for the reason `research/exa.py` repeats its configuration check at the spending
+site: a config object carries no memory of which validator built it.
+`test_no_configuration_can_buy_a_second_repair` states the criterion as a property of the whole
+accepted range rather than of the default.
+
+**Finding 2 — a valid DEBUG configuration persisted the packet and the raw response.** Reproduced
+end to end: with `logging.level: DEBUG` (accepted configuration) and a real `GeneralLlm` whose
+network-facing `_mockable_direct_call_to_model` was replaced, planted markers from both the
+research packet and the model's unvalidated output were found in `logging.file`. The pinned SDK
+logs `f"Invoking model with prompt: {prompt}"` and `f"Model responded with: {response}"` at DEBUG,
+and this branch is what introduced the first caller of that path.
+
+Two hard constraints, not one: a message never echoes field values, and hidden chain-of-thought is
+never persisted. The second is the sharper of the two — the raw response is logged *before* the
+schema can reject it, so a reply carrying the deliberation the prompt forbids is written to disk
+whatever validation later decides. This had been recorded as a standing risk rather than fixed;
+the reviewer was right that a hard constraint breached by accepted configuration is not a risk to
+note, it is a defect to close.
+
+`PayloadDebugFilter` (`logging_setup.py`) drops sub-INFO records from `forecasting_tools`,
+`litellm` and `LiteLLM` on the handlers this project installs. Three choices in it are deliberate:
+
+- **The whole sub-INFO range, not the two known messages.** The reviewer's minimal fix named the
+  two records; matching their text would be a check whose unknown case is "pass" — the library
+  rewords a line or adds a third and the leak reopens with nothing to notice it. Close the class,
+  not the reported instance (M1-308 round 7, `docs/LESSONS.md` #7). INFO and above from the same
+  libraries still reach the log, and a test pins that so the filter cannot degrade into "drop
+  everything".
+- **A handler filter, not `setLevel` on those loggers.** litellm raises its own logger level when
+  its verbose flag is set and would silently undo a `setLevel`. A filter on our own handlers
+  cannot be undone by the library, and our handlers are the ones that persist.
+- **`httpx`/`httpcore` are not in the list.** Their DEBUG records carry request lines and headers
+  rather than bodies, and any credential in them is already handled by `SecretRedactionFilter`;
+  listing them would cost real transport diagnostics for no content gain.
+
+`logging_setup.py` is a merged module, and editing one on a review branch is the shape of change
+`docs/LESSONS.md` measures the cost of. It is the right place anyway: `configure_logging` replaces
+its handlers on every call, so a filter installed anywhere else would be discarded, and this is
+where the sibling concern — credential redaction — already lives.
+
+**Test discipline for the remediation**, stated precisely because the loose version of this
+sentence is the one that gets caught. Eight new test functions, seventeen cases. Running them
+against the pre-fix behaviour — the fixes' *behaviour* reverted while their symbols stayed, so the
+question is "which tests fail" and not "does the module still import" — **five cases fail**:
+`test_debug_logging_persists_neither_the_packet_nor_the_raw_response`, all three parameters of
+`test_a_config_above_the_bound_is_refused_at_load`, and
+`test_the_bound_is_refused_again_at_the_spending_site`. Those are the regressions.
+
+The other five functions **pass both ways, by design**, and are labelled as guards rather than
+presented as coverage (the M1-308 round-4 lesson about properties that prove nothing, applied
+before a reviewer has to apply it):
+
+- `test_the_payload_filter_keeps_real_diagnostics_from_the_same_libraries` and
+  `test_this_projects_own_debug_records_are_untouched` guard against the filter degrading into
+  "drop everything" — a failure the pre-fix tree cannot have, because it has no filter.
+- `test_the_payload_filter_truth_table` exercises `PayloadDebugFilter` directly, so it is a unit
+  test of new code rather than a regression against old code.
+- `test_the_committed_default_is_inside_the_bound` guards the bound against being set below what
+  `config.example.yaml` ships.
+- `test_no_configuration_can_buy_a_second_repair` iterates the whole accepted range, which
+  pre-fix was still 1..2 — the behaviour was correct there and wrong only outside it. It earns its
+  place by failing when the *bound itself* moves, which the mutation matrix confirms.
+
+What actually establishes the fixes is that matrix: **nine mutations, all nine caught** — the
+config bound removed, the bound raised to 3, the spending-site refusal removed, the refusal moved
+to after the first call, the filter never attached to the handlers, the filter narrowed to the two
+known message texts, `litellm` dropped from the prefixes, the filter widened to drop every
+sub-INFO record whatever its logger, and the filter widened to drop INFO as well.
+
+**Non-blocking observations.** The reviewer confirmed M1-204's classification as branch-independent
+and raised no further backlog candidate. Its declared risk areas agreed with the branch's own
+standing risks on cost capture, the SDK's nested $1 ceiling and the import/event-loop side effects.
