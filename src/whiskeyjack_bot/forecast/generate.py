@@ -1,4 +1,11 @@
-"""One structured call to the configured forecaster model (M1-402).
+"""One structured call to the configured forecaster model (M1-402, M1-403).
+
+**M1-403 added the config-dependent output checks to the parse step** rather than to the
+returned result. ``forecast/binary.py`` owns the rules; ``_output_problems`` dispatches to
+them on the ``question_type`` literal, and because their problems are the same sanitized
+shape the schema produces, the repair loop, the failure classification and the invocation
+accounting below are unchanged. The effect is that an out-of-bounds probability costs the
+one repair this module already budgets instead of throwing a billed call away.
 
 The acceptance criterion is short and the pinned package cannot meet it: *"valid
 response returns typed output; malformed output gets at most one bounded repair
@@ -94,7 +101,8 @@ from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import 
     MonetaryCostManager,
 )
 
-from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS, AppConfig
+from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS, AppConfig, ForecastConfig
+from whiskeyjack_bot.forecast.binary import binary_output_problems
 from whiskeyjack_bot.forecast.inputs import (
     ForecastInputError,
     ModelInput,
@@ -286,11 +294,35 @@ def _strip_fences(text: str) -> str:
     return stripped
 
 
-def _parse(text: str, model: type[ForecastResponse]) -> tuple[ForecastResponse | None, list[str]]:
+def _output_problems(forecast: ForecastResponse, forecast_config: ForecastConfig) -> list[str]:
+    """The config- and question-dependent checks ``forecast.schema`` deliberately omits.
+
+    Keyed on the ``question_type`` literal, never ``isinstance``: ``DiscreteQuestion``
+    subclasses ``NumericQuestion`` in the pinned SDK, and this project has the rule
+    because dispatching the other way silently forecasts an unsupported type as numeric.
+
+    Only ``binary`` has checks today. The multiple-choice option set is **M1-404's**
+    stated criterion and the numeric percentile levels are **M1-405's**; each adds its
+    branch here, and neither is approximated in the meantime.
+    """
+    if forecast.question_type == "binary":
+        return binary_output_problems(forecast, forecast_config)
+    return []
+
+
+def _parse(
+    text: str, model: type[ForecastResponse], forecast_config: ForecastConfig
+) -> tuple[ForecastResponse | None, list[str]]:
     """Parse and validate one response; returns the forecast or the problems.
 
     An empty problem list with a ``None`` forecast is impossible: every failure path
     supplies at least one sanitized problem string.
+
+    The configured-bounds check runs *here*, inside the attempt loop, rather than on the
+    returned result. That is what makes an out-of-bounds probability repairable at the
+    cost of the second call this module already budgets, instead of a billed call thrown
+    away -- and its problems are the same sanitized shape as the schema's, so the repair
+    turn and the failure classification below need no special case for them.
     """
     try:
         payload = json.loads(_strip_fences(text))
@@ -301,9 +333,15 @@ def _parse(text: str, model: type[ForecastResponse]) -> tuple[ForecastResponse |
     if not isinstance(payload, dict):
         return None, [_NOT_JSON]
     try:
-        return validate_forecast_response(payload, model), []
+        forecast = validate_forecast_response(payload, model)
     except ForecastSchemaError as exc:
         return None, list(exc.problems)
+    # Cannot raise: the response is provably the model this dispatch selected, and
+    # ``generate_forecast`` refuses an inverted bounds pair before anything is spent.
+    problems = _output_problems(forecast, forecast_config)
+    if problems:
+        return None, problems
+    return forecast, []
 
 
 def _classify(problems: list[str]) -> PreForecastFailureCode:
@@ -406,6 +444,15 @@ def generate_forecast(
             "model.allowed_tries exceeds the one-repair bound; a malformed response "
             "may cost at most one initial call and one repair"
         )
+    if not config.forecast.min_probability < config.forecast.max_probability:
+        # ForecastConfig refuses this at load, so reaching here means an AppConfig
+        # assembled some other way -- the same reason the bound above is repeated.
+        # Left unchecked it would fail every binary forecast through the repair loop:
+        # two billed calls per question to reject a probability no model could supply.
+        raise ForecastGenerationError(
+            "forecast.min_probability is not strictly below forecast.max_probability; "
+            "no probability could satisfy the configured bounds"
+        )
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(
@@ -453,6 +500,7 @@ def generate_forecast(
         messages=messages,
         response_model=response_model,
         allowed_tries=config.model.allowed_tries,
+        forecast_config=config.forecast,
         settings=settings,
         sources=model_input.sources,
         request=request,
@@ -492,6 +540,7 @@ def _run_attempts(
     messages: list[dict[str, str]],
     response_model: type[ForecastResponse],
     allowed_tries: int,
+    forecast_config: ForecastConfig,
     settings: ModelSettings,
     sources: tuple[SourceReference, ...],
     request: str,
@@ -523,7 +572,7 @@ def _run_attempts(
         if usage > 0.0 and isfinite(usage):
             calls_with_cost += 1
             cost_total += usage
-        forecast, problems = _parse(text, response_model)
+        forecast, problems = _parse(text, response_model, forecast_config)
         if forecast is not None:
             return _result(
                 forecast=forecast,

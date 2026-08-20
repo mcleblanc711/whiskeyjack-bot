@@ -494,3 +494,179 @@ sub-INFO record whatever its logger, and the filter widened to drop INFO as well
 **Non-blocking observations.** The reviewer confirmed M1-204's classification as branch-independent
 and raised no further backlog candidate. Its declared risk areas agreed with the branch's own
 standing risks on cost capture, the SDK's nested $1 ceiling and the import/event-loop side effects.
+
+## M1-403 — The binary output path
+
+**Acceptance criterion:** *golden output validates within configured bounds and includes base rate,
+adjustments and failure modes.* Two clauses, and they are satisfied by different things — the first
+is a property of a checker, the second a property of a fixture. Conflating them is how this row
+would have grown into M1-501's.
+
+`forecast.min_probability` and `forecast.max_probability` have shipped in `ForecastConfig` since M0
+with **no consumer anywhere in `src/`** — `grep` found only `schema.py`'s comment saying this item
+owns them. That is the same condition M1-402 found for `model.allowed_tries`, and it has the same
+consequence: this item does not *use* the fields, it **defines** them.
+
+### What the criterion is actually guarding against
+
+Not "is 0.9995 bigger than 0.999". `tests/unit/test_forecast_schema.py:213` already asserts that
+0.9995 validates against the response schema, deliberately — so before this branch, a binary
+response the model was told to keep inside 0.001–0.999 flowed through `generate_forecast`, out of
+`ForecastGeneration.forecast`, and would have reached `forecast_records.final_prediction_json` as an
+attribution claim Metaculus itself would refuse. The failure this closes is a forecast that is
+*shaped* right and cannot be posted, discovered at the submission boundary where the evidence of how
+it was produced is furthest away.
+
+### Delivered
+
+- `forecast/binary.py` — `binary_output_problems()` (the pure checker, returning sanitized problem
+  strings) and `validate_binary_output()` (the raising wrapper). Imports no provider SDK and no
+  question model.
+- `forecast/generate.py` — `_output_problems()` dispatching on the question-type literal, the check
+  threaded into `_parse`, and one new preflight refusal for a bounds pair no probability could
+  satisfy.
+- `tests/fixtures/forecasts/binary_golden.json` — the golden binary output.
+- `tests/unit/test_forecast_binary.py` (27 cases), 7 cases added to
+  `tests/unit/test_forecast_generate.py`, 5 properties added to
+  `tests/property/test_forecast_properties.py`. Suite: **1655 -> 1694 passed**, 1 xfailed
+  (the pre-existing `content_sha256` lone-surrogate xfail). Four gates green; `pytest` 160s.
+- One new backlog row, **M1-407**. No migration, no dependency, no `uv.lock` change, no
+  config-contract change, no prompt edit, and no edit to any merged module other than `generate.py`.
+
+### Decision — the bounds check runs inside the attempt loop, not on the result (owner decision)
+
+The obvious placement is a validation pass over what `generate_forecast` returned. The chosen one is
+`_parse`, alongside `validate_forecast_response`, so an out-of-bounds probability becomes a
+`(None, problems)` exactly like a schema failure and the **existing one-repair loop feeds it back to
+the model**.
+
+That is worth the coupling because of what the alternative costs. `generate.py`'s whole thesis is
+that a shape of failure has a price in billable calls; a post-hoc rejection prices "the model
+returned 0.9995" at one wasted call with no attempt to fix it, while the repair loop prices it at
+the second call M1-402 already budgets — and on the questions where the model reaches for an extreme
+probability, that is exactly the population most worth one more turn.
+
+Nothing downstream needed a special case. The problems are the same sanitized shape
+`schema._sanitize` produces, so `_repair_turn` renders them, `_classify` reads them as
+`schema_invalid` rather than `malformed_response` (the reply *was* well-formed JSON that satisfied
+the schema — a distinction the ledger keeps), and the invocation accounting is untouched.
+
+### Decision — the message names the configured bounds and withholds the model's value
+
+The one place in this module that renders a number, and the asymmetry is the decision.
+
+A probability is untrusted model output. The bounds are **operator configuration**, which is the
+category CLAUDE.md's M1-401 carve-out settled, and the argument for rendering them is stronger here
+than it was for paths: `prompts/forecaster.md:114` prints 0.001–0.999 to the model as a *literal*
+while config is free to narrow it, so a repair turn that says only "out of bounds" is one **no model
+can satisfy** — it has nothing to aim at. An error nobody can act on is its own failure mode.
+
+`repr()` rather than a fixed precision, because it is the shortest string that round-trips: a
+truncated `0.0010` would be a bound the model could aim at and still miss.
+
+The leak property is written as invariance (two different offending probabilities produce
+byte-identical text), not as substring absence, for the M1-402 reason restated: the message renders
+bounds, so `"0."` and most short digit runs are substrings of it for reasons unrelated to leaking.
+
+### Decision — the prior-presence rule is binary-specific and lives on the output path
+
+`schema.py` enforces the prompt's stated rule — a non-binary response leaves `prior_probability` and
+`model_prior` null. M1-402 weighed the converse and deferred it. The owner has settled it here,
+because enforcing one direction alone leaves **binary the single question type where the prior is
+optional**, and the prior is what a binary forecast is built from (prompt, Method step 1).
+
+It lives in `binary.py` rather than as a `@model_validator` on `BinaryForecastResponse`, which is
+the placement that matters: `test_a_binary_response_may_carry_priors` keeps pinning that the schema
+accepts both spellings, so M1-402's recorded decision is *layered over* rather than reversed — and
+the rule becomes repairable for free, which a schema-level version would not be.
+
+It does not fail a model that followed the prompt: the shared-fields example populates both. That is
+the same test M1-402 applied to `source_disagreements`.
+
+### Deviation — this module owns no exception of its own
+
+The project rule is that every module owns a sanitized exception. `binary.py` raises
+`ForecastSchemaError` instead. The condition — *this model response is not acceptable* — already
+belongs to that type, `generate._parse` already catches exactly it, and the rule's purpose is that a
+caller handles **one** error type per malformed shape. A second type for one condition works against
+the rule it would be obeying.
+
+Caller mistakes still raise rather than becoming problems: a response of another question type, a
+config of the wrong type, and an inverted bounds pair are refused, because asking the model to
+repair a dispatch bug of ours is nonsense.
+
+### Rejected — options weighed and not taken
+
+- **Clamping to the nearest bound.** `prompts/forecaster.md:46` says "do not clamp mechanically" and
+  M1-502's criterion is that "no arbitrary post-hoc renormalization is hidden". A coerced
+  probability is a number the ledger cannot attribute to the model, which is the one thing this
+  project exists to prevent. `test_nothing_is_clamped` pins it.
+- **Putting the bounds in `schema.py`.** It would contradict that module's stated scope in its own
+  docstring, invalidate the three boundary tests M1-402 wrote to make the split visible, and make
+  the schema config-dependent — the property M1-406's replay path is built on.
+- **A `BinaryForecast` value object carrying `probability_yes` plus the attribution fields.**
+  `BinaryForecastResponse` already *is* that. A second near-identical shape is a second thing to keep
+  in agreement, and M1-501 and M1-602 both consume the typed response.
+- **Emitting `final_prediction_json` here** for `forecast_records`. M1-602 owns that column and its
+  criterion is that v1 stays byte-identical; pre-deciding its canonical form on a branch whose review
+  is about the binary path is how two items end up disagreeing about one column.
+- **A one-key dispatch table** in `_output_problems`. One `if` on the literal, with the comment
+  naming M1-404 and M1-405 as the two that add branches, says the same thing without a registry that
+  currently registers one thing.
+- **Fixing the prompt/config divergence.** Filed as **M1-407**. The prompt is at v1.1.0 with its
+  digest pinned in `RELEASED_PROMPT_SHA256`, and a startup cross-check is a `verify-env` change, not
+  a binary-path one.
+
+### Deferred (do not read the absence as an omission)
+
+- **Cross-type attribution presence** — status quo, adjustments, failure modes, load-bearing facts,
+  and **resolving `source_ids` against the documents actually supplied**. All M1-501's, which owns
+  them for all three question types. `test_the_golden_output_includes_base_rate_adjustments_and_
+  failure_modes` asserts them **of the fixture**, which is what this row's second clause asks.
+- **The multiple-choice option set (M1-404) and the numeric percentile levels (M1-405).**
+  `test_a_non_binary_response_is_not_bound_checked_here` pins that boundary from the inside, the
+  idiom M1-402 established, so the split stays visible rather than inferred from an absence.
+- **The comprehensive valid/invalid golden set — Codex's T-901**, authored blind from spec.
+  One fixture ships here because this row names one; CLAUDE.md says do not pre-write Codex's tests.
+- **Budget enforcement** (M1-504) and **persistence of the raw response** (M1-406), unchanged from
+  M1-402.
+
+### Standing risk — not verifiable offline
+
+- **Nothing checks the configured bounds against the prompt's printed range.** Filed as M1-407.
+  `test_the_committed_defaults_still_match_the_range_the_prompt_prints` is a canary over the
+  committed values, not a constraint on an operator's config — it fails loudly if the defaults drift,
+  and says nothing about a config that narrows them deliberately.
+- **That Metaculus refuses a probability outside 0.001–0.999 is read from the handoff, not
+  observed.** The suite blocks sockets and no submission path is reachable until M2. What is
+  established here is that the *configured* bound is enforced before the ledger sees a forecast.
+- **A repair turn's effectiveness is unmeasured.** The tests establish that the model is shown the
+  actual bound and that a corrected reply is accepted in one further call. Whether a real model
+  corrects an extreme probability when told the bound is not something an offline suite can answer.
+
+### On the property tests, and the check that they discriminate
+
+Five properties, and **nine mutations were run against the source and every one was caught** before
+any of them was trusted (`docs/LESSONS.md` #5): an exclusive comparison at the bounds, the bounds
+returned swapped, the model's probability spliced into the message, the configured bounds dropped
+from the message, a problem reported at a location the schema never declared, only the first problem
+reported, the prior-presence rule removed, the output checks never reached from `_parse`, and the
+bound accepted rather than refused. The harness sweeps `__pycache__` and runs with
+`PYTHONDONTWRITEBYTECODE` — a same-size mutation restored inside one second is otherwise served back
+from cache.
+
+The two properties worth reading are the pair. `test_a_bounds_problem_never_varies_with_the_
+probability_that_failed` says the message is invariant in the model's value;
+`test_the_invariance_property_can_see_the_bounds_change` says it is **not** invariant in the config's.
+Either alone is satisfiable by a constant string, which would pass the leak check while making every
+repair turn unactionable — the exact half-a-defect shape M1-402 recorded from the other direction.
+
+`_resolves_through_the_schema` walks `model_fields` in the test rather than importing
+`schema._schema_field_names`: a property that asserts against the constant the implementation uses
+passes whatever that constant says (M1-303's lesson).
+
+One trap met again while writing these. `_leaks` renders the traceback, which quotes the **source
+line** that raised — so `_generate(client, _narrowed(config, 0.9, 0.1), prompt)` made the leak
+assertion fail on its own test code. The bounds are bound to names now. This is M1-308 round 5's
+`tmp_path` finding in a new costume, and it is the third time it has cost this project a debugging
+pass.

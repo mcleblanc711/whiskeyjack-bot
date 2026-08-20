@@ -29,6 +29,8 @@ from whiskeyjack_bot.forecast.inputs import (
     build_model_input,
     render_model_input,
 )
+from whiskeyjack_bot.config import ForecastConfig
+from whiskeyjack_bot.forecast.binary import binary_output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastSchemaError,
@@ -397,3 +399,152 @@ def test_a_refusal_message_is_a_constant_whatever_the_evidence_was(
     error = _refuse_with_wrong_question(packet)
     assert str(error) == BASELINE_REFUSAL
     assert not _would_reprint_a_cause(error)
+
+
+# --- 5. the configured probability bounds (M1-403) --------------------------------
+
+
+def _forecast_config(minimum: float, maximum: float) -> ForecastConfig:
+    """A ForecastConfig with the drawn bounds and everything else at its committed value."""
+    return ForecastConfig(
+        supported_question_types=["binary", "multiple_choice", "numeric"],
+        min_probability=minimum,
+        max_probability=maximum,
+        community_prediction_policy="log_after_forecast_do_not_use_as_input",
+        replay_saved_model_output=False,
+        fail_on_stale_research=False,
+        flag_on_stale_research=True,
+        prompt_path="prompts/forecaster.md",
+        prompt_version="1.1.0",
+    )
+
+
+def _binary_response(
+    probability: float, *, prior: bool = True, model_prior: bool = True
+) -> BinaryForecastResponse:
+    payload = json.loads(json.dumps(VALID_PAYLOAD))
+    payload["final_prediction"] = {"probability_yes": probability}
+    if not prior:
+        payload["base_rate"]["prior_probability"] = None
+    if not model_prior:
+        payload["model_prior"] = None
+    return validate_forecast_response(payload, BinaryForecastResponse)
+
+
+# The schema's own field names, walked from the models rather than imported from
+# ``schema._schema_field_names``: a property that asserts against the constant the
+# implementation uses passes whatever that constant says (M1-303's lesson).
+def _resolves_through_the_schema(location: str) -> bool:
+    model: Any = BinaryForecastResponse
+    for part in location.split("."):
+        fields = getattr(model, "model_fields", None)
+        if fields is None or part not in fields:
+            return False
+        annotation = fields[part].annotation
+        model = next(
+            (
+                candidate
+                for candidate in (annotation, *getattr(annotation, "__args__", ()))
+                if hasattr(candidate, "model_fields")
+            ),
+            None,
+        )
+    return True
+
+
+# 0.001 and 0.999 are the only values ForecastConfig admits at its edges, so the
+# strategy is drawn inside them and the pair is ordered rather than assumed apart.
+BOUNDS = st.lists(
+    st.floats(min_value=0.001, max_value=0.999, allow_nan=False, allow_infinity=False),
+    min_size=2,
+    max_size=2,
+    unique=True,
+).map(sorted)
+
+PROBABILITIES = st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False)
+
+
+@given(PROBABILITIES, BOUNDS, st.booleans(), st.booleans())
+def test_the_bounds_check_accepts_exactly_the_probabilities_inside_them(
+    probability: float, bounds: list[float], prior: bool, model_prior: bool
+) -> None:
+    """The discriminating post-condition, not a smoke test.
+
+    Written as an ``iff`` over the *whole* rule -- an in-bounds probability with a
+    missing prior is still refused -- because "returns a list" and "sometimes refuses"
+    are both satisfied by code that is wrong at the boundary.
+    """
+    low, high = bounds
+    forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
+    problems = binary_output_problems(forecast, _forecast_config(low, high))
+    expected = (low <= probability <= high) and prior and model_prior
+    assert (problems == []) is expected
+
+
+@given(PROBABILITIES, BOUNDS, st.booleans(), st.booleans())
+def test_the_bounds_check_never_raises_for_a_valid_response_and_a_valid_config(
+    probability: float, bounds: list[float], prior: bool, model_prior: bool
+) -> None:
+    """Every malformed shape must arrive as this project's own error type; a *well*
+    formed one must arrive as data. Nothing in this function may raise at all."""
+    low, high = bounds
+    forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
+    problems = binary_output_problems(forecast, _forecast_config(low, high))
+    assert all(isinstance(problem, str) for problem in problems)
+
+
+@given(PROBABILITIES, BOUNDS, st.booleans(), st.booleans())
+def test_every_problem_is_reported_at_a_location_the_schema_authored(
+    probability: float, bounds: list[float], prior: bool, model_prior: bool
+) -> None:
+    """A repair turn's field paths must be resolvable, and must be *ours*.
+
+    ``schema._sanitize`` withholds any location part the schema did not declare, so a
+    problem this module invents at some other path would be the one field reference in
+    a repair turn that means nothing to the reader of a stored failure.
+    """
+    low, high = bounds
+    forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
+    for problem in binary_output_problems(forecast, _forecast_config(low, high)):
+        location, separator, message = problem.partition(": ")
+        assert separator == ": "
+        assert message
+        assert _resolves_through_the_schema(location)
+
+
+@given(PROBABILITIES, PROBABILITIES, BOUNDS)
+def test_a_bounds_problem_never_varies_with_the_probability_that_failed(
+    first: float, second: float, bounds: list[float]
+) -> None:
+    """Invariance, not substring absence -- the M1-402 leak-property shape.
+
+    "The value does not appear in the message" is unwritable over probabilities: the
+    message renders the configured bounds, so ``"0."`` and most short digit runs are
+    substrings of it for reasons that have nothing to do with the model's value. Two
+    different offending values producing byte-identical text is the claim that
+    discriminates.
+    """
+    low, high = bounds
+    assume(not low <= first <= high)
+    assume(not low <= second <= high)
+    config = _forecast_config(low, high)
+    assert binary_output_problems(_binary_response(first), config) == binary_output_problems(
+        _binary_response(second), config
+    )
+
+
+@given(BOUNDS, BOUNDS)
+def test_the_invariance_property_can_see_the_bounds_change(
+    first: list[float], second: list[float]
+) -> None:
+    """The companion check: the message above is invariant in the model's value and
+    *not* invariant in the config's, which is what makes a repair turn actionable."""
+    assume(first != second)
+    outside = 0.0 if 0.0 < first[0] and 0.0 < second[0] else 1.0
+    assume(not first[0] <= outside <= first[1])
+    assume(not second[0] <= outside <= second[1])
+    forecast = _binary_response(outside)
+    left = binary_output_problems(forecast, _forecast_config(*first))
+    right = binary_output_problems(forecast, _forecast_config(*second))
+    assert left and right
+    assert left != right
