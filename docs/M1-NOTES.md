@@ -2986,3 +2986,41 @@ control (a value that constructs cleanly must still reach pydantic and fail as a
 get misclassified as "not valid YAML"). Confirmed all six new tests fail against the pre-fix tree
 (raw `ValueError`/`KeyError`/`AttributeError`/`RecursionError` escaping `load_config`) and pass
 post-fix.
+
+## M1-313 — Deep-freezing the research packet
+
+`ResearchPacket` is a frozen dataclass, but `ResearchRun`/`ResearchDocument` are plain
+(unfrozen) pydantic models with mutable list/dict fields (`queries`, `provider_config`), so a
+tuple of them is immutable only at the container level. `build_packet` stored the exact objects
+a caller handed it; a caller that retained a reference to a run or document — or to one of its
+mutable fields — could mutate it after construction and change what `packet_sha256` returns for
+an object the rest of the system treats as an immutable attribution record. No current product
+path does this (round-1 finding on PR #26, filed as a hardening item, not a live defect), but the
+acceptance criterion is that it becomes structurally impossible rather than merely unobserved.
+
+### Decision — copy at construction, not at read
+
+`ResearchPacket.__post_init__` now deep-copies every run and document via
+`model.model_copy(deep=True)` before any validation runs, then rebinds `self.runs`/
+`self.documents` to the copies via `object.__setattr__` — the same idiom `questions/events.py`
+already uses to normalize fields on a frozen dataclass from inside its own `__post_init__`.
+Validation then runs against the packet's own copies, so what is checked is what is stored.
+
+Considered and rejected: freezing only at the `build_packet` entry point rather than in
+`__post_init__`. `ResearchPacket`'s own docstring already documents that constructing the
+dataclass directly with a list (rather than a tuple) raises deliberately, so direct construction
+is a supported path, not just an implementation detail `build_packet` wraps. Freezing in
+`__post_init__` covers both.
+
+The copy failure path (`model_copy` raising) follows the same precedent `_dump`'s parser-failure
+branch set at M1-308 round 7: caught broadly, scoped to the one call, `from None`, a constant
+message that withholds detail because a third-party copy routine can echo the value it failed on.
+
+### Verification
+
+New property `test_mutating_caller_owned_inputs_does_not_move_the_hash` builds a packet from
+caller-held `run`/`document` objects, hashes it, then mutates every mutable surface the
+acceptance criterion names — the run object, the document object, `run.queries` (append),
+`run.provider_config` (add a key) — and asserts the digest is unchanged. Confirmed it fails
+against the pre-fix tree (the digest moves) and passes post-fix, per the project's mutation-check
+convention. No schema, no migration, no new dependency.
