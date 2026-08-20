@@ -29,6 +29,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from whiskeyjack_bot.prompt import BARE_VERSION_RE
 
 PLACEHOLDER_PREFIX = "REPLACE_WITH"
+
+# The most model invocations one forecast may cost: the initial call plus at most one
+# bounded repair (M1-402's acceptance criterion). Lives here because ModelConfig is
+# where the value is accepted; forecast.generate imports it rather than restating it,
+# so the schema bound and the spending-site refusal cannot drift apart.
+MAX_MODEL_INVOCATIONS = 2
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Question types the v1 pipeline supports; date/conditional are deferred (D20/D21).
@@ -87,7 +93,18 @@ class ModelConfig(_StrictModel):
     temperature: float = Field(0.0, ge=0)
     timeout_seconds: float = Field(120, gt=0)
     max_output_tokens: int = Field(6000, gt=0)
-    allowed_tries: int = Field(2, ge=1)
+    # Total model invocations for one forecast: 1 means no repair, 2 means one
+    # initial call plus at most one repair. Bounded at 2 because M1-402's acceptance
+    # criterion is a hard upper bound -- "malformed output gets at most one bounded
+    # repair attempt" -- and a bound any config can lift is not a bound. The upper
+    # limit is here rather than only at the call site so a wrong value fails at load
+    # and at verify-env, before a forecast is ever attempted (M1-402 review round 1).
+    #
+    # The name deliberately matches GeneralLlm's constructor parameter, and that is
+    # the footgun this bound closes: there the same word means *transport* retries,
+    # so an operator reading "5" as "retry the network five times" would instead buy
+    # five billed model calls.
+    allowed_tries: int = Field(2, ge=1, le=MAX_MODEL_INVOCATIONS)
 
     @field_validator("name")
     @classmethod
