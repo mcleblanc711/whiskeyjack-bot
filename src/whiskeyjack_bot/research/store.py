@@ -221,6 +221,35 @@ def _require_storable_text(value: object, field: str) -> None:
         ) from None
 
 
+def _require_identifier(value: object, field: str) -> None:
+    """Refuse a blank or NUL-bearing identifier, as this module's own error (M1-607).
+
+    ``retrieval_run_id`` is the evidence pointer: ``research_documents`` and
+    ``forecast_records`` both reference it, and it is part of M1-305's dedup key and of
+    M1-306's research packet. A blank one detaches a forecast from the evidence it was
+    made on. The existing ``not value`` tests refuse ``''`` but ``'\\n\\t'`` is truthy and
+    reached storage through them, and ``006_non_blank_identifiers.sql`` now refuses it at
+    the schema -- so without this the caller would get an opaque constraint failure from
+    the statement instead of a message naming the field.
+
+    ``str.strip()`` is the same definition the migration's pinned character set was
+    written from; a test asserts the two still agree over every codepoint Python calls
+    whitespace, so a future Unicode change fails loudly rather than reopening the hole.
+
+    **No length ceiling, unlike ``lifecycle._require_identifier``.** That 200-character
+    limit exists to stop a value being written that the reader would then refuse, leaving
+    an unreadable row; nothing in this module caps ``retrieval_run_id`` on the way out, so
+    that defect does not exist here and inventing a ceiling would refuse input the shipped
+    M1-306 writer accepts. The NUL check is independent of any ceiling: it is the one
+    input where SQLite's ``length()``/``trim()`` and Python's ``len()``/``strip()``
+    disagree about the same string.
+    """
+    if type(value) is not str or not value.strip():
+        raise StoreError(f"{field} must be a non-blank string")
+    if "\x00" in value:
+        raise StoreError(f"{field} must not contain a NUL character")
+
+
 def _require_storable_json(value: object, field: str) -> None:
     """Refuse text inside a JSON column that cannot survive the round trip.
 
@@ -362,6 +391,7 @@ def _run_parameters(
     excluded from the packet hash precisely because it is a fact about storage
     rather than about the run, so it cannot skew anything by arriving here.
     """
+    _require_identifier(run.retrieval_run_id, "retrieval_run_id")
     _require_storable_text(run.retrieval_run_id, "retrieval_run_id")
     _require_storable_text(run.error_summary, "error_summary")
     _require_storable_text(run.agent_model, "agent_model")
@@ -787,8 +817,7 @@ def load_run(conn: sqlite3.Connection, retrieval_run_id: str) -> ResearchRun:
     under CLAUDE.md's threat boundary, and validating on the way out is also what
     makes the packet hash computable from the database alone.
     """
-    if type(retrieval_run_id) is not str or not retrieval_run_id:
-        raise StoreError("retrieval_run_id must be a non-empty string")
+    _require_identifier(retrieval_run_id, "retrieval_run_id")
     # Before binding: a lone surrogate cannot be encoded as a SQL parameter, and the
     # UnicodeEncodeError that raises quotes the character (round 1, finding 5).
     _require_storable_text(retrieval_run_id, "retrieval_run_id")
@@ -805,8 +834,7 @@ def load_run(conn: sqlite3.Connection, retrieval_run_id: str) -> ResearchRun:
 
 def load_documents(conn: sqlite3.Connection, retrieval_run_id: str) -> tuple[ResearchDocument, ...]:
     """Read one run's documents back as validated models, in a stable order."""
-    if type(retrieval_run_id) is not str or not retrieval_run_id:
-        raise StoreError("retrieval_run_id must be a non-empty string")
+    _require_identifier(retrieval_run_id, "retrieval_run_id")
     _require_storable_text(retrieval_run_id, "retrieval_run_id")
     columns = ", ".join(_DOCUMENT_COLUMNS)
     rows = _fetch_all(
@@ -1008,8 +1036,7 @@ def load_packet(
     # contracted to raise only its own type (round 2, finding 2). Shape first, then
     # the set operation that assumes the shape.
     for run_id in requested:
-        if type(run_id) is not str or not run_id:
-            raise StoreError("every entry in retrieval_run_ids must be a non-empty string")
+        _require_identifier(run_id, "retrieval_run_id")
         _require_storable_text(run_id, "retrieval_run_id")
     if len(set(requested)) != len(requested):
         raise StoreError("retrieval_run_ids must not repeat a run id")

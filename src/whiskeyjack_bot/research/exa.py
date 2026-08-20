@@ -502,9 +502,19 @@ def _require_run_metadata(*, question_id: int, retrieval_run_id: str, now: datet
     """
     if type(question_id) is not int:
         raise ExaFallbackError("question_id must be an int (offending input withheld)")
-    if not isinstance(retrieval_run_id, str) or not retrieval_run_id:
+    # M1-607: `not retrieval_run_id` refuses '' but '\n\t' is truthy, so a
+    # whitespace-only run id passed this preflight, paid for every call in the
+    # run, and only then failed at the ledger -- the exact shape of round 4's
+    # finding 4, which is why this gate exists at all. `str.strip()` is the
+    # definition 006's pinned character set was written from.
+    if (
+        not isinstance(retrieval_run_id, str)
+        or not retrieval_run_id.strip()
+        or "\x00" in retrieval_run_id
+    ):
         raise ExaFallbackError(
-            "retrieval_run_id must be a non-empty string (offending input withheld)"
+            "retrieval_run_id must be a non-blank string with no NUL character "
+            "(offending input withheld)"
         )
     if not isinstance(now, datetime):
         raise ExaFallbackError("now must be a timezone-aware datetime (offending input withheld)")

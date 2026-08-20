@@ -8,6 +8,7 @@ back, and that a refused command writes nothing.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -450,3 +451,57 @@ def test_a_note_value_is_never_echoed_by_a_refusal(
             expected_sha256=OTHER_SHA,
         )
     assert "x" * 20 not in str(excinfo.value)
+
+
+# --- M1-607: a blank record_id is a caller mistake, not a missing record -------------
+
+
+@pytest.mark.parametrize("blank", ["", " ", "   ", "\t\n", "\xa0"])
+@pytest.mark.parametrize("reader", [read_forecast_summary, approval_history])
+def test_a_blank_record_id_is_refused_by_name_rather_than_reported_as_unknown(
+    ledger: sqlite3.Connection, blank: str, reader: object
+) -> None:
+    """M1-607. `_require_text` refuses `''` but `'\\t\\n'` is truthy and reached the query.
+
+    The distinction matters for what the operator is told. These readers raise "no such
+    record" for an id that names nothing, and that is the right answer for a real id that
+    was never written -- but for a whitespace-only one it describes a caller mistake as a
+    missing row, and `006_non_blank_identifiers.sql` guarantees the row it is describing
+    can never exist. So the refusal names the field instead.
+    """
+    # `''` is matched loosely because `_require_text` already refuses it one layer up,
+    # with its own message. What this asserts is the outcome both layers owe the caller:
+    # a refusal that names `record_id`, never a report that the record is missing.
+    with pytest.raises(ApprovalError, match="record_id must (not be blank|be a non-empty)"):
+        reader(ledger, blank)  # type: ignore[operator]
+
+
+def test_the_approval_readers_agree_with_the_schema_on_what_blank_means(
+    ledger: sqlite3.Connection,
+) -> None:
+    """`approval.py` holds its own copy of `_require_identifier`, so it drifts on its own.
+
+    It is duplicated rather than imported because each module owns its sanitized exception
+    type -- but a second copy of a rule is a second thing that can be wrong, so the whole
+    whitespace set is asserted here too rather than trusting the copy to match
+    `lifecycle`'s. Same drift-guard reasoning as the migration-side test: `str.strip()`
+    follows the running Python's Unicode data while 006's literal froze when it landed.
+    """
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: an empty list would make the loop assert nothing at all.
+    assert len(whitespace) == 29
+    for cp in whitespace:
+        with pytest.raises(ApprovalError, match="record_id must not be blank"):
+            read_forecast_summary(ledger, chr(cp) * 3)
+
+    # The other direction: U+200B is not whitespace to Python, so it is a real id that
+    # simply names no row -- and must be reported as such, not as a malformed argument.
+    with pytest.raises(ApprovalError, match="does not name a stored forecast record"):
+        read_forecast_summary(ledger, "​")
+
+
+def test_a_record_id_with_an_embedded_nul_is_refused(ledger: sqlite3.Connection) -> None:
+    # 004's finding B1, on this module's copy: SQLite's `length()` stops counting at a NUL
+    # while Python's `len()` does not, so the two layers must simply not accept one.
+    with pytest.raises(ApprovalError, match="NUL character"):
+        read_forecast_summary(ledger, "a\x00b")

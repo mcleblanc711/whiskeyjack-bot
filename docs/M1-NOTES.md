@@ -3024,3 +3024,167 @@ acceptance criterion names — the run object, the document object, `run.queries
 `run.provider_config` (add a key) — and asserts the digest is unchanged. Confirmed it fails
 against the pre-fix tree (the digest moves) and passes post-fix, per the project's mutation-check
 convention. No schema, no migration, no new dependency.
+
+## M1-607 — The non-blank identifier guard on the pre-004 columns
+
+Migration **006** (`006_non_blank_identifiers.sql`). No new dependency, no new table, no new
+column: three existing `BEFORE INSERT` triggers redefined, an upgrade precondition, and the
+matching writer-side guard in five modules.
+
+M1-606 built this guard for `attempt_id` and **deliberately stopped there**, because widening
+`_require_text` would have changed what already-shipped, already-reviewed writers accept — a
+behaviour change to merged code smuggled in under a different item. It filed the widening as
+its own reviewed change (this one), the same call M1-308 made when it found `config.py`'s copy
+of its YAML hole and filed M0-007. So the interesting content here is not the guard, which is
+copied verbatim from 004; it is the five decisions about *where the copy stops*.
+
+### Decision — five columns, and why `tournament_id` is one of them
+
+The backlog row names four: `forecast_records.record_id`, `submission_attempts.attempt_id` and
+`.idempotency_key`, `research_runs.retrieval_run_id`. `forecast_records.tournament_id` is the
+fifth, added on purpose.
+
+004 already guards `pipeline_failure_events.tournament_id`, and 004's identity-stability probe
+compares the two columns directly — it refuses a forecast record whose `attempt_id` was recorded
+under a *different* tournament. That probe can only be as trustworthy as the weaker of the two
+columns it joins, and 004 guarded one end. Guarding one end of a join key and not the other is
+the precise defect M1-606's own notes describe finding in its first draft. Owner agreed the
+widening before implementation.
+
+### Decision — foreign-key columns are covered transitively, and the residual is stated
+
+Every remaining identifier column is a foreign key into one of the five guarded primary keys
+(`approval_events`/`submission_attempts`/`resolution_events`/`score_events.forecast_record_id`
+into `forecast_records.record_id`; `forecast_records`/`research_documents.retrieval_run_id` into
+`research_runs.retrieval_run_id`), and `research_documents.document_id` is minted by the writer
+as `uuid4().hex`. Duplicating the clause onto each would be a second copy of a rule with nothing
+keeping the copies in agreement.
+
+**The residual, stated rather than half-fixed** (M1-303 round 5's `co.uk` lesson): that
+transitivity rests on `PRAGMA foreign_keys = ON`, which `ledger.py` sets at line 95 but — unlike
+`journal_mode` and `recursive_triggers` — **does not read back**. An unknown or ignored PRAGMA is
+a silent no-op in SQLite. So this is an assumption, not a verified property. Reading it back is a
+change to `ledger.py`'s connection contract and belongs to its own item; it is not smuggled in
+here, for the same reason M1-606 did not smuggle this one in there.
+
+### Deviation — `research_runs.retrieval_run_id` gets no 200-character ceiling
+
+The other four columns take the full 004 clause: `IS NULL`, `typeof <> 'text'`, `length > 200`,
+`instr(..., char(0)) > 0`, and the 29-codepoint `trim()`. This one takes everything except the
+ceiling, and the asymmetry is deliberate.
+
+The ceiling exists in 004 to close one specific defect (M1-606 review round 1, finding B1): raw
+SQL writing an identifier longer than the **reader** accepts, producing an append-only row that
+can never be read back. Every reader of the other four caps at `_MAX_IDENTIFIER`.
+`store.load_run` and `store.load_documents` impose no length limit at all — so that defect does
+not exist on this column, and inventing a ceiling would refuse input the shipped M1-306 writer
+accepts, which is exactly the behaviour-change-to-merged-code this item exists to avoid making by
+accident.
+
+The NUL check stays on all five, because it is justified independently of any ceiling: U+0000 is
+the one input where SQLite's `length()`/`trim()` and Python's `len()`/`strip()` disagree about the
+*same* string, so a NUL-bearing identifier is one the schema and the writer cannot both reason
+about. `test_the_run_id_column_has_no_length_ceiling_and_that_is_deliberate` and
+`test_a_run_id_longer_than_200_characters_round_trips` assert the asymmetry from both sides, so it
+cannot be quietly "tidied" into uniformity.
+
+### Decision — the upgrade refuses a ledger that already holds a violating row
+
+`BEFORE INSERT` triggers bind new rows only. Without a precondition the guarantee would quietly
+become "every row written after 006" — and these are append-only tables, so a violating legacy row
+can never be corrected. A blank or blob identifier is precisely the row that is unjoinable and
+unreadable for good, which is the condition this item exists to make impossible.
+
+Same mechanism 003 uses for its non-draft-record precondition: `RAISE()` is legal only inside a
+trigger body, so the refusal is a `CREATE TEMP TABLE` whose `CHECK` the offending row violates and
+whose **name** carries the reason. `ledger.py` wraps the failure without echoing any stored value
+and rolls back, so a refused upgrade leaves the database exactly at version 5. Each probe is the
+*same predicate* as the trigger clause it corresponds to — two definitions of "blank" that nobody
+compared is the defect this whole family descends from, and a third layer with its own wording
+would reopen it.
+
+Realistic population today is empty: `forecast_records` has no writer until M1-602, submission is
+disabled until M2, and `research_runs` ids are short caller-supplied strings.
+`test_a_clean_v5_ledger_upgrades_to_006` and
+`test_rows_written_before_006_survive_it_when_their_identifiers_are_well_formed` are the controls —
+without them a migration that refused *every* v5 ledger would satisfy all seven refusal cases while
+being undeployable.
+
+### Rejected — changing `research/asknews.py`
+
+AskNews is the one reachable path that still notices a blank `retrieval_run_id` only *after*
+billing. It was left alone anyway. Its module docstring contracts that `MissingCredentialError` is
+the only exception it raises, and `retrieve_news` contracts **never to raise on provider failure**
+so that a partly-paid-for run is still recordable. Adding a raise there is a contract change, not a
+guard application.
+
+What covers it instead is the model-level validator: `asknews.py` builds `ResearchDocument`
+objects directly, so `IdentifierString` refuses a blank run id at construction and the *ledger* is
+protected, which is this item's actual subject. The residual — that AskNews spends before it
+notices — is the same class of hole **M1-309** was already filed for ("the same holes in merged
+AskNews", M1-303's follow-up) and belongs there, with the preflight redesign that contract change
+needs.
+
+`research/exa.py` **was** changed, and the difference is the point: it already has
+`_require_run_metadata`, a preflight whose entire reason for existing is refusing caller mistakes
+before the money (M1-303 round 4, finding 4). Its test was `not retrieval_run_id`, which refuses
+`''` and passes `'\n\t'` — the hole in the exact place built to prevent it. Extending an existing
+gate is not a contract change.
+
+### Rejected — folding `_require_identifier` into `_require_text`
+
+Kept as two functions, in all of `lifecycle.py`, `approval.py` and `research/store.py`. Blank prose
+— an `actor` note, an `error_message`, a `response_body` — is a thin record; blank identity is an
+unjoinable one. Collapsing them would put the identifier rule on `refetched_forecast_snapshot` and
+`note`, which is a different change with a different justification.
+
+The three module-level copies are also deliberate rather than a shared helper: each module owns its
+sanitized exception type, and a shared helper would have to raise one module's error inside
+another. That is the same trade `_require_text` itself already makes. Because a second copy of a
+rule is a second thing that can be wrong, a property test
+(`test_the_two_module_copies_of_the_identifier_rule_agree`) asserts `lifecycle`'s and `approval`'s
+copies accept and reject exactly the same inputs.
+
+### Deferred (do not read the absence as an omission)
+
+- Reading `PRAGMA foreign_keys` back in `ledger.py` — see the residual above.
+- AskNews's pre-billing preflight — M1-309.
+- `forecast_records.parent_record_id`, and the `*_forecast_record_id` FK columns — covered
+  transitively; guarding them directly would duplicate the rule.
+
+### Standing risk — not verifiable offline
+
+The 29-codepoint set is frozen in SQL the moment 006 lands on master, while `str.strip()` follows
+the Unicode data of whatever Python is running. A future Python whose `str.isspace()` covers a new
+codepoint reopens the gap on the schema side. That cannot be prevented, only detected: four drift
+guards (in `test_lifecycle.py`, `test_approval.py`, `test_research_store.py` and `test_exa.py`)
+each recompute the set from the running interpreter and assert `len(...) == 29` before looping, so
+the change surfaces as a failed test and a migration 007 rather than as a silently reopened hole.
+
+### Verification — 18 of 18 guards are load-bearing
+
+Every new `RAISE(ABORT)` clause (5), every upgrade precondition probe (5) and every writer-side
+branch (8) was broken one at a time with the suite re-run against each. All 18 were caught by at
+least one test. Two details worth keeping:
+
+- **Trigger clauses were neutered, not deleted.** Removing the only statement from a trigger body
+  leaves `BEGIN END;` — a syntax error, so the migration fails to apply and every test fails for
+  the wrong reason, reporting a guard as load-bearing when nothing tested it. Each clause's `WHERE`
+  was replaced with `WHERE 0` instead. 004's notes record hitting exactly this.
+- **`__pycache__` was cleared between mutations.** Bytecode is validated on size plus a
+  one-second mtime, so a same-size edit reverted within the same second can be served from stale
+  bytecode and a mutation silently never runs.
+
+The value-leak property needed rewriting rather than the obvious spelling. "The value is not a
+substring of the message" is **vacuous and worse than nothing** here: a one-character whitespace
+identifier is a substring of every message containing a space, so it fails on correct code and
+would then be "fixed" into asserting less. `test_an_identifier_refusal_says_one_of_a_fixed_set_of_things`
+closes the message set instead — five constants with only the field name interpolated — which says
+the thing that matters and says it for inputs a substring check cannot speak about at all.
+
+`test_the_writer_and_the_schema_admit_exactly_the_same_identifiers` fuzzes the two-layer agreement
+on `record_id` in **both** directions, with a strategy that straddles the 200-character boundary
+and includes embedded NULs. The unit suite asserts the same agreement over the 29 whitespace
+codepoints; the property covers the rest of the input space, because the failure mode is not "the
+set is wrong" but "two layers hold two definitions and nobody compared them", which can differ
+anywhere.

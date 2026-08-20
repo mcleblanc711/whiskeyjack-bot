@@ -29,9 +29,10 @@ from typing import Any, get_args
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from strategies import HOSTILE_TEXT
+from strategies import ENCODABLE_TEXT, HOSTILE_TEXT
 
-from whiskeyjack_bot import lifecycle
+from whiskeyjack_bot import approval, lifecycle
+from whiskeyjack_bot.approval import ApprovalError
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
@@ -137,6 +138,7 @@ def test_validators_raise_only_lifecycle_error(value: object) -> None:
     validators = (
         lambda: lifecycle._require_text(value, "field", max_length=32),
         lambda: lifecycle._require_optional_text(value, "field", max_length=32),
+        lambda: lifecycle._require_identifier(value, "field"),
         lambda: lifecycle._require_sha256(value, "field"),
         lambda: lifecycle._require_bool(value, "field"),
         lambda: lifecycle._require_optional_int(value, "field"),
@@ -1343,3 +1345,154 @@ def test_no_rejected_reader_value_reaches_the_message_or_traceback(attempt_id: s
         rendered = "".join(traceback.format_exception(error))
         assert PLANTED_SECRET not in str(error)
         assert PLANTED_SECRET not in rendered
+
+
+# --------------------------------------------------------------------------------------
+# M1-607: the writer's definition of "identifier" is the schema's, over fuzzed input.
+# --------------------------------------------------------------------------------------
+#
+# The unit suite asserts this over the 29 whitespace codepoints, which is the set the
+# defect actually lived in. These fuzz the rest of the input space, because the failure
+# mode being guarded against is not "the set is wrong" -- it is "two layers hold two
+# definitions and nobody compared them", and that can differ anywhere, not only on
+# whitespace. M1-603 spent five rounds on one function for exactly this shape.
+
+IDENTIFIER_TEXT = st.one_of(
+    ENCODABLE_TEXT,
+    # Around the 200-character ceiling, where the two layers count differently.
+    st.text(st.characters(exclude_categories=["Cs"]), min_size=195, max_size=205),
+    # Control characters are deliberately *not* excluded: U+0000 is the one input where
+    # SQLite's length() and Python's len() disagree about the same string.
+    st.text(st.characters(exclude_categories=["Cs"]), max_size=8),
+    st.sampled_from(
+        ["", " ", "\t\n", "\xa0", "\x00", "a\x00b", "x" * 200, "x" * 201, "\x00" + "y" * 205]
+    ),
+)
+
+
+def _schema_accepts_record_id(conn: sqlite3.Connection, value: str) -> bool:
+    """Whether `forecast_records`' trigger admits `value` as a record_id.
+
+    Probed inside a transaction that is always rolled back: `forecast_records` is
+    append-only, so an accepted row could not be cleaned up afterwards and the next
+    example would collide on the primary key rather than testing anything.
+
+    `UnicodeEncodeError` counts as a refusal, not an error, because it is one -- sqlite3
+    encodes text parameters as UTF-8 and cannot bind a lone surrogate. The writer refuses
+    the same input through `_require_text`'s encode probe, which is the agreement being
+    asserted.
+    """
+    serial = next(_SERIAL)
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            "INSERT INTO forecast_records ("
+            "record_id, question_id, tournament_id, forecast_version, question_type, "
+            "status, model_provider, model_name, prompt_version, prompt_sha256, "
+            "retrieval_run_id, generated_at_utc, final_prediction_json, record_json, "
+            "created_at_utc, forecast_sha256, attempt_id) "
+            "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
+            "'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
+            (value, 900000 + serial, TS, TS, SHA, f"att-probe-{serial}"),
+        )
+    except (sqlite3.IntegrityError, UnicodeEncodeError, sqlite3.InterfaceError):
+        return False
+    finally:
+        conn.execute("ROLLBACK")
+    return True
+
+
+@given(value=IDENTIFIER_TEXT)
+@settings(max_examples=120, deadline=None)
+def test_the_writer_and_the_schema_admit_exactly_the_same_identifiers(value: str) -> None:
+    """The two-layer agreement, fuzzed rather than sampled.
+
+    A writer that accepted what the schema refuses fails at the statement with an opaque
+    message instead of a field-level one. A writer that refused what the schema accepts is
+    worse: raw SQL could then mint a `record_id` no reader can ever look up, on a table
+    that is append-only, so the row is unreadable for good.
+
+    Asserting equality in both directions is what makes this more than a restatement of
+    the guard. `record_id` is the column where the two definitions must match exactly --
+    the ceiling included, which is why the strategy above straddles 200.
+    """
+    with _ledger() as (conn, _):
+        try:
+            lifecycle._require_identifier(value, "record_id")
+        except LifecycleError:
+            writer_accepts = False
+        else:
+            writer_accepts = True
+
+        assert writer_accepts == _schema_accepts_record_id(conn, value)
+        assert not conn.in_transaction
+
+
+@given(value=ANYTHING)
+def test_the_two_module_copies_of_the_identifier_rule_agree(value: object) -> None:
+    """`approval.py` holds its own copy of `_require_identifier`; it must not drift.
+
+    The copy exists because each module owns its sanitized exception type, so a shared
+    helper would have to raise one module's error inside the other. That is the right
+    trade, but a second copy of a rule is a second thing that can be wrong -- and the two
+    are used against the *same column*, `forecast_records.record_id`, so a disagreement
+    means one of them contradicts the schema.
+    """
+    try:
+        lifecycle._require_identifier(value, "record_id")
+    except LifecycleError:
+        lifecycle_accepts = False
+    else:
+        lifecycle_accepts = True
+
+    try:
+        approval._require_identifier(value, "record_id")
+    except ApprovalError:
+        approval_accepts = False
+    else:
+        approval_accepts = True
+
+    assert lifecycle_accepts == approval_accepts
+
+
+# Every message `_require_identifier` and the `_require_text` beneath it can produce,
+# with only the field name interpolated. Spelled out rather than derived from the source,
+# so a new branch that built its message from the *value* fails this instead of being
+# described by it.
+def _permitted_refusals(field: str) -> frozenset[str]:
+    return frozenset(
+        {
+            f"{field} must be a non-empty string",
+            f"{field} is longer than the 200-character limit",
+            f"{field} contains characters that cannot be stored "
+            "(detail withheld: it can echo the value)",
+            f"{field} must not be blank",
+            f"{field} must not contain a NUL character",
+        }
+    )
+
+
+@given(value=ANYTHING)
+def test_an_identifier_refusal_says_one_of_a_fixed_set_of_things(value: object) -> None:
+    """Invariant 4 on the new validator, as a closed message set.
+
+    The obvious spelling -- "the value is not a substring of the message" -- is vacuous
+    here and worse than nothing: a one-character whitespace identifier is a substring of
+    every message that contains a space, so the property would fail on correct code and
+    then be "fixed" into asserting less. Closing the message set instead says the thing
+    that actually matters, and says it for inputs a substring check cannot speak about at
+    all.
+
+    The rendered traceback is checked too, because the leak channels this project has
+    actually found were indirect: a pydantic `loc` carrying an int key, logging's `%d`
+    printing its raw argument past caplog, a chained `__cause__` reprinting the input
+    through a rendered traceback. `_require_text` uses `from None` for exactly that.
+    """
+    try:
+        lifecycle._require_identifier(value, "record_id")
+    except LifecycleError as error:
+        assert str(error) in _permitted_refusals("record_id")
+        rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        # No chained cause: a re-raised UnicodeEncodeError would reprint the character.
+        assert "During handling of the above exception" not in rendered
+        assert "The above exception was the direct cause" not in rendered
