@@ -397,6 +397,28 @@ def load_config(path: Path | str) -> AppConfig:
                 "(parser detail withheld: it can echo file contents)"
             ]
         ) from None
+    except Exception:
+        # PyYAML's *construction* stage sits outside its own error hierarchy: only the
+        # scanner, parser and composer raise YAMLError. Reproduced on the pinned version,
+        # every one of these from a one-line config edit -- ``2026-02-30`` raises
+        # ValueError("day is out of range for month"), ``!!int abc`` raises
+        # ValueError("... 'abc'"), ``!!bool maybe`` raises KeyError('maybe'),
+        # ``!!timestamp bogus`` raises AttributeError, and a deeply nested flow sequence
+        # raises RecursionError. Two of those carry the offending value in their message,
+        # so the detail is withheld for the same reason the MarkedYAMLError branch withholds
+        # its source snippet, and ``from None`` keeps the raw exception from reprinting it
+        # through a rendered traceback. Same defect and fix as research/allowlist.py
+        # (M1-308 round 7); filed here as M0-007 because this hole predates that branch.
+        #
+        # Deliberately not an enumerated tuple of types: the enumeration belongs to PyYAML,
+        # and any shape missing from the list escapes raw. Only ``yaml.safe_load`` is inside
+        # the ``try``, so this cannot swallow a failure from any other statement.
+        raise ConfigError(
+            [
+                f"config file {path} is not valid YAML "
+                "(parser detail withheld: it can echo file contents)"
+            ]
+        ) from None
     if not isinstance(data, dict):
         raise ConfigError([f"config file {path} must contain a YAML mapping at the top level"])
     return validate_config_data(data)
