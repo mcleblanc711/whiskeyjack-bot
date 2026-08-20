@@ -130,6 +130,12 @@ class ResearchPacket:
     Order is not part of packet identity: :func:`packet_sha256` sorts both
     sequences. The tuples are kept in the order they were supplied so a caller can
     present evidence in retrieval order.
+
+    **Deep-frozen at construction** (M1-313): every run and document is copied via
+    ``model_copy(deep=True)`` before anything else runs, so a caller who mutates the
+    ``ResearchRun``/``ResearchDocument`` objects it passed in -- or a nested mutable
+    field on one, such as ``queries`` or ``provider_config`` -- after
+    :func:`build_packet` returns cannot change what this packet hashes to.
     """
 
     question_id: int
@@ -143,10 +149,31 @@ class ResearchPacket:
             raise PacketError("question_id must be an int")
         if not isinstance(self.runs, tuple) or not isinstance(self.documents, tuple):
             raise PacketError("runs and documents must be tuples")
-        run_ids: set[str] = set()
         for run in self.runs:
             if not isinstance(run, ResearchRun):
                 raise PacketError("every run must be a ResearchRun")
+        for document in self.documents:
+            if not isinstance(document, ResearchDocument):
+                raise PacketError("every document must be a ResearchDocument")
+
+        # Deep-copy every run and document before anything else touches them. Both
+        # models are plain (unfrozen) pydantic models with mutable list/dict fields
+        # (``ResearchRun.queries``, ``.provider_config``), so a tuple of them is
+        # immutable only at the container level -- a caller who retains a reference
+        # to a run or document handed to build_packet can still mutate it, or a
+        # nested list/dict field, after construction, changing what packet_sha256
+        # returns for an object that is supposed to be an immutable attribution
+        # record. Rebinding to independent copies via object.__setattr__ (the
+        # standard frozen-dataclass idiom for post-init normalization) severs that
+        # link: everything downstream, including validation below, reads only the
+        # packet's own copies.
+        frozen_runs = tuple(_deep_copy(run, "run") for run in self.runs)
+        frozen_documents = tuple(_deep_copy(document, "document") for document in self.documents)
+        object.__setattr__(self, "runs", frozen_runs)
+        object.__setattr__(self, "documents", frozen_documents)
+
+        run_ids: set[str] = set()
+        for run in self.runs:
             if run.question_id != self.question_id:
                 # No ids in the message: a question id is row content, and the
                 # no-echo rule is unconditional (M1-202's duplicate-id precedent).
@@ -156,8 +183,6 @@ class ResearchPacket:
             run_ids.add(run.retrieval_run_id)
         keys: set[tuple[str, str, str]] = set()
         for document in self.documents:
-            if not isinstance(document, ResearchDocument):
-                raise PacketError("every document must be a ResearchDocument")
             if document.retrieval_run_id not in run_ids:
                 raise PacketError(
                     "every document must belong to a run the packet carries: "
@@ -173,6 +198,24 @@ class ResearchPacket:
                     "documents must be deduplicated: two share the ledger's dedup key"
                 )
             keys.add(key)
+
+
+def _deep_copy(model: ResearchRun | ResearchDocument, kind: str) -> ResearchRun | ResearchDocument:
+    """Return an independent copy of ``model``, detached from the caller's reference.
+
+    ``kind`` is one of this module's own literals ("run"/"document"), not row
+    content, so naming it in the error is safe.
+    """
+    try:
+        return model.model_copy(deep=True)
+    except Exception:
+        # Deliberately broad, scoped to this one call -- same precedent as _dump's
+        # M1-308-round-7 reasoning: a third-party copy routine that can fail fails
+        # as a class of exceptions, not the one type you predicted.
+        raise PacketError(
+            f"a {kind} could not be copied into the packet "
+            "(detail withheld: it can echo row content)"
+        ) from None
 
 
 def _dump(model: ResearchRun | ResearchDocument, excluded: frozenset[str]) -> dict[str, object]:
