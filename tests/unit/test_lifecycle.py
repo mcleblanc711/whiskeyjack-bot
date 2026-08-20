@@ -12,6 +12,7 @@ already gone in.
 """
 
 import hashlib
+import itertools
 import json
 import sqlite3
 import sys
@@ -229,20 +230,39 @@ def _attempt(
     )
 
 
+# Distinguishes "the caller did not supply one" from an explicit `None`, which is itself a
+# value these tests need to push at the schema (M1-607).
+_UNSET = object()
+
+
 def _insert_attempt(
     conn: sqlite3.Connection,
     record_id: str,
     *,
-    attempt_id: str = "att-raw",
+    attempt_id: object = "att-raw",
+    key: object = _UNSET,
     requested: object = TS,
     completed: object = TS,
 ) -> None:
-    """Write a `submission_attempts` row directly, bypassing the writer's validation."""
+    """Write a `submission_attempts` row directly, bypassing the writer's validation.
+
+    `attempt_id` and `key` are typed `object` and passed through untouched, for M1-607's
+    guards on this table: `f"idem-{attempt_id}"` would substitute a well-formed key for
+    every malformed one, which is the same trap `_insert_record_raw` documents.
+    """
     conn.execute(
         "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
         "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
         "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)",
-        (attempt_id, record_id, f"idem-{attempt_id}", requested, completed, PAYLOAD_SHA, TS),
+        (
+            attempt_id,
+            record_id,
+            f"idem-{attempt_id}" if key is _UNSET else key,
+            requested,
+            completed,
+            PAYLOAD_SHA,
+            TS,
+        ),
     )
 
 
@@ -3216,12 +3236,21 @@ def test_every_pre_forecast_code_the_module_declares_is_storable(
     ) + len(PRE_FORECAST_EVENT_TYPES)
 
 
-def _insert_record_raw(conn: sqlite3.Connection, attempt_id: object) -> None:
-    """A `forecast_records` INSERT that passes `attempt_id` through untouched.
+def _insert_record_raw(
+    conn: sqlite3.Connection,
+    attempt_id: object = "att-raw",
+    *,
+    record_id: object = "rec-raw",
+    tournament_id: object = "minibench",
+) -> None:
+    """A `forecast_records` INSERT that passes its identifiers through untouched.
 
     `_seed_draft`'s `attempt_id or f"att-{record_id}"` default substitutes a good value
     for every falsy one, so it cannot be used to test what the column refuses -- it would
-    turn `None`, `''` and `'   '` into three more runs of the happy path.
+    turn `None`, `''` and `'   '` into three more runs of the happy path. `record_id` and
+    `tournament_id` are parameters for M1-607's guards on the same trigger, and typed
+    `object` for `_seed_failure`'s reason: a helper that could only produce well-formed
+    values could not reach the clauses these tests are about.
     """
     conn.execute(
         "INSERT INTO forecast_records ("
@@ -3229,9 +3258,9 @@ def _insert_record_raw(conn: sqlite3.Connection, attempt_id: object) -> None:
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES ('rec-raw', 100, 'minibench', 1, 'binary', 'draft', 'anthropic', "
+        "VALUES (?, 100, ?, 1, 'binary', 'draft', 'anthropic', "
         "'claude', 'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (TS, TS, SHA, attempt_id),
+        (record_id, tournament_id, TS, TS, SHA, attempt_id),
     )
 
 
@@ -3464,12 +3493,16 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     finally:
         conn.close()
 
-    # 5, not 4: M1-306's 005_research_run_counters.sql lands alongside 004 on this
-    # branch. What this line pins is unchanged -- that LEDGER_SCHEMA_VERSION tracks
-    # the migrations actually on disk, and that upgrading a v2 ledger runs all of
-    # them. The literal is kept rather than dropped, since a constant compared only
-    # against itself pins nothing.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 5
+    # 6, not 4: M1-306's 005_research_run_counters.sql landed alongside 004, and
+    # M1-607's 006_non_blank_identifiers.sql after them. What this line pins is
+    # unchanged -- that LEDGER_SCHEMA_VERSION tracks the migrations actually on disk,
+    # and that upgrading a v2 ledger runs all of them. The literal is kept rather than
+    # dropped, since a constant compared only against itself pins nothing.
+    #
+    # The v2 rows this seeds are non-blank in every column 006 guards, so they pass its
+    # upgrade precondition; `test_migration_006_refuses_a_ledger_holding_a_blank_
+    # identifier` is the other side of that.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 6
 
     conn = connect(db)
     try:
@@ -3735,3 +3768,420 @@ def test_no_rejected_value_reaches_a_pre_forecast_failure_message(
     rendered = "".join(traceback.format_exception(caught.value))
     assert PLANTED_SECRET not in str(caught.value)
     assert PLANTED_SECRET not in rendered
+
+
+# ======================================================================================
+# M1-607: the non-blank identifier guard, on the columns that predate 004.
+# ======================================================================================
+#
+# 004 built this guard for `attempt_id` and deliberately stopped there, because widening
+# `_require_text` would have changed what already-shipped writers accept. These are the
+# columns it left: `forecast_records.record_id` and `.tournament_id`,
+# `submission_attempts.attempt_id` and `.idempotency_key`, and
+# `research_runs.retrieval_run_id` -- whose writer-side half lives in
+# `test_research_store.py`, where its writer does.
+
+# Every column 006 guards. Driving the tests below from one list rather than writing five
+# of each by hand is the point: the defect this item closes is a guard present on one
+# column and absent on the column beside it, and hand-written per-column tests are exactly
+# the shape that misses that again.
+GUARDED_COLUMNS = [
+    "record_id",
+    "tournament_id",
+    "attempt_id",
+    "idempotency_key",
+    "retrieval_run_id",
+]
+
+# The four whose readers cap at `_MAX_IDENTIFIER`, and which therefore take the ceiling.
+# `retrieval_run_id` is deliberately absent -- see
+# `test_the_run_id_column_has_no_length_ceiling_and_that_is_deliberate`.
+CAPPED_COLUMNS = GUARDED_COLUMNS[:-1]
+
+
+@pytest.fixture
+def guarded(ledger: sqlite3.Connection) -> tuple[sqlite3.Connection, str]:
+    """A ledger with a forecast record for `submission_attempts` rows to hang off.
+
+    `question_id=101`, not the `_seed_draft` default: `_insert_record_raw` writes
+    `question_id=100` and 001's `UNIQUE (question_id, tournament_id, forecast_version)`
+    would otherwise fail the record inserts below on the wrong constraint entirely.
+    """
+    return ledger, _seed_draft(ledger, record_id="rec-owner", question_id=101)
+
+
+def _insert_for(conn: sqlite3.Connection, record_id: str, column: str) -> Callable[[object], None]:
+    """The raw insert that puts `value` into `column` and leaves every sibling well-formed.
+
+    The siblings matter as much as the target. A helper that derived `idempotency_key`
+    from `attempt_id` would push a 200-character attempt_id past the *key's* ceiling and
+    report a pass for the wrong clause, and one that reused a constant key would trip the
+    UNIQUE index instead. So the untested fields are minted fresh per call.
+    """
+    unique = next(_MINTED)
+    return {
+        "record_id": lambda value: _insert_record_raw(
+            conn, f"att-{unique}", record_id=value, tournament_id="minibench"
+        ),
+        "tournament_id": lambda value: _insert_record_raw(
+            conn, f"att-{unique}", record_id=f"rec-{unique}", tournament_id=value
+        ),
+        "attempt_id": lambda value: _insert_attempt(
+            conn, record_id, attempt_id=value, key=f"idem-{unique}"
+        ),
+        "idempotency_key": lambda value: _insert_attempt(
+            conn, record_id, attempt_id=f"att-{unique}", key=value
+        ),
+        "retrieval_run_id": lambda value: _seed_run(conn, value),  # type: ignore[arg-type]
+    }[column]
+
+
+_MINTED = itertools.count()
+
+
+# `''` and `'   '` were refused by nothing at all on these columns. `'\t\n'` and `'\xa0'`
+# are the ones that make the point, because one-argument `trim()` strips U+0020 alone and
+# passes both -- M1-603's round 5. `b'x'` is the blob case, worse than blank: `_stored_text`
+# refuses it on the way *out*, so the row is append-only and unreadable at once. `None` is
+# here even though all five columns are declared NOT NULL, because a trigger must not
+# depend on a table constraint it did not write.
+BLANK_IDENTIFIERS: list[object] = [None, "", " ", "   ", "\t\n", "\xa0", b"x"]
+
+
+@pytest.mark.parametrize("column", GUARDED_COLUMNS)
+@pytest.mark.parametrize("bad", BLANK_IDENTIFIERS)
+def test_the_schema_refuses_a_blank_or_blob_identifier(
+    guarded: tuple[sqlite3.Connection, str], column: str, bad: object
+) -> None:
+    conn, record_id = guarded
+    with pytest.raises(sqlite3.IntegrityError, match=column):
+        _insert_for(conn, record_id, column)(bad)
+
+
+@pytest.mark.parametrize("column", CAPPED_COLUMNS)
+def test_the_schema_refuses_an_identifier_over_200_characters(
+    guarded: tuple[sqlite3.Connection, str], column: str
+) -> None:
+    """The readers' ceiling, mirrored into the schema (004's finding B1, on new columns).
+
+    Every public entry point in `lifecycle.py` and `approval.py` caps an identifier at
+    `_MAX_IDENTIFIER`, so a longer one written through raw SQL would be a row that is
+    append-only and permanently unlookupable. 200 itself stays accepted: a ceiling that
+    refused the boundary would be a different rule from the one the writers apply, which
+    is the same disagreement in the other direction.
+    """
+    conn, record_id = guarded
+    with pytest.raises(sqlite3.IntegrityError, match=column):
+        _insert_for(conn, record_id, column)("x" * 201)
+    _insert_for(conn, record_id, column)("y" * 200)
+
+
+@pytest.mark.parametrize("column", CAPPED_COLUMNS)
+def test_the_schema_refuses_an_identifier_with_an_embedded_nul(
+    guarded: tuple[sqlite3.Connection, str], column: str
+) -> None:
+    """Round 2 of the same finding, on each new column.
+
+    SQLite's `length()` stops counting at an embedded NUL, so a 202-character identifier
+    with a NUL early in it reads as `length() == 1` to the ceiling above and passes, while
+    the writers' Python `len()` sees 202 and refuses it on read-back -- the unreadable row
+    the ceiling exists to close, reopened through the one input the two counting functions
+    disagree about. `instr(..., char(0))` is what removes that input.
+    """
+    conn, record_id = guarded
+    with pytest.raises(sqlite3.IntegrityError, match=column):
+        _insert_for(conn, record_id, column)("a\x00" + "b" * 200)
+
+
+def test_every_guarded_column_agrees_with_the_writers_on_what_blank_means(
+    guarded: tuple[sqlite3.Connection, str],
+) -> None:
+    """The whole whitespace set, at every layer that defines "blank" for an identifier.
+
+    003's round 5 was not a missing trigger -- it was two layers each holding a definition
+    of blank that nobody had compared, and a space is blank under both, which is exactly
+    why hand-picked parameters missed it for five rounds. So this asserts the equivalence
+    directly over every codepoint Python calls whitespace, against the character set the
+    triggers pin and the `str.strip()` the writers use.
+
+    It is also a drift guard: `str.strip()` follows the Unicode data of whatever Python is
+    running, while the triggers' literal freezes when 006 lands on master. A future
+    whitespace codepoint fails here loudly instead of reopening the hole in silence.
+    """
+    conn, record_id = guarded
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: an empty list would make the loops below assert nothing.
+    assert len(whitespace) == 29
+
+    for cp in whitespace:
+        blank = chr(cp) * 3
+        for column in GUARDED_COLUMNS:
+            with pytest.raises(sqlite3.IntegrityError, match=column):
+                _insert_for(conn, record_id, column)(blank)
+
+        # The writer half, for the identifiers this module's public entry points take.
+        # `record_id` is checked through a reader as well as a writer: both go through
+        # `_require_identifier`, and a reader that accepted a blank would look up a row
+        # the schema guarantees cannot exist and report "no such record" for what is
+        # really a caller mistake.
+        with pytest.raises(LifecycleError, match="record_id must not be blank"):
+            current_status(conn, blank)
+        with pytest.raises(LifecycleError, match="record_id must not be blank"):
+            record_validation(conn, record_id=blank, occurred_at=WHEN)
+        with pytest.raises(LifecycleError, match=r"attempt\.attempt_id must not be blank"):
+            record_submission_attempt(
+                conn, record_id=record_id, attempt=_attempt(attempt_id=blank), occurred_at=WHEN
+            )
+        with pytest.raises(LifecycleError, match=r"attempt\.idempotency_key must not be blank"):
+            record_submission_attempt(
+                conn, record_id=record_id, attempt=_attempt(key=blank), occurred_at=WHEN
+            )
+
+    # Nothing above was allowed to land. A guard that refused 28 codepoints and wrote a row
+    # for the 29th would still satisfy every `pytest.raises` in the loop.
+    assert _counts(conn)["submission_attempts"] == 0
+    assert conn.execute("SELECT count(*) FROM forecast_records").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM research_runs").fetchone()[0] == 1
+
+    # The other direction, so the pinned set cannot quietly grow into rejecting real
+    # identifiers: U+200B is not whitespace to Python, and an id built from it is a value
+    # this ledger stores rather than a blank one.
+    _seed_run(conn, "​")
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM research_runs WHERE retrieval_run_id = ?", ("​",)
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_a_numeric_identifier_is_stored_as_text_rather_than_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """What `typeof()` actually catches, asserted so the clause is not misread.
+
+    On a TEXT-affinity column `42` arrives already converted to `'42'` and is accepted --
+    correctly, since what lands is genuine text. So the clause earns its place by rejecting
+    what affinity *cannot* convert, which is a blob. This is 004's own lesson: a test that
+    fed `42` expecting a refusal would pass against a trigger with no `typeof()` clause at
+    all, green for the wrong reason.
+    """
+    _seed_run(ledger, 42)  # type: ignore[arg-type]
+    stored = ledger.execute(
+        "SELECT retrieval_run_id, typeof(retrieval_run_id) FROM research_runs "
+        "WHERE retrieval_run_id = '42'"
+    ).fetchone()
+    assert (stored[0], stored[1]) == ("42", "text")
+
+
+def test_the_run_id_column_has_no_length_ceiling_and_that_is_deliberate(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The one asymmetry in 006, pinned so it cannot be "tidied" into consistency.
+
+    The four columns above take a 200-character ceiling because their readers do: a longer
+    value would be a row that can never be read back. Nothing in `research/store.py` caps
+    `retrieval_run_id` on the way out, so that defect does not exist on this column, and
+    adding a ceiling would refuse input the shipped M1-306 writer accepts -- the
+    behaviour-change-to-merged-code this whole item exists to avoid making by accident.
+
+    Asserted rather than left as a comment, because a comment does not fail when someone
+    makes the five columns "uniform".
+    """
+    _seed_run(ledger, "y" * 201)
+    assert (
+        ledger.execute(
+            "SELECT count(*) FROM research_runs WHERE length(retrieval_run_id) = 201"
+        ).fetchone()[0]
+        == 1
+    )
+
+
+# The migrations a ledger at version 5 has applied -- everything before this item.
+_PRE_006_MIGRATIONS = [
+    "001_initial.sql",
+    "002_research_document_fields.sql",
+    "003_lifecycle_events.sql",
+    "004_pipeline_failure_events.sql",
+    "005_research_run_counters.sql",
+]
+
+
+def _seed_v5_ledger(
+    db: Path,
+    *,
+    record_id: object = "rec-legacy",
+    tournament_id: object = "minibench",
+    run_id: object = "run-1",
+    attempt_id: object = "att-legacy",
+    key: object = "idem-legacy",
+) -> None:
+    """A ledger at schema version 5: everything before 006, with one record and one attempt.
+
+    Written by applying the packaged migration files directly and recording their real
+    checksums, so this is a database a previous build genuinely produced rather than a
+    hand-built approximation -- `ledger.py` verifies those checksums on every open and
+    would refuse a fake.
+
+    Every identifier is a parameter, and typed `object`: 006's whole subject is what these
+    columns were allowed to hold before it existed, and a helper that could only write
+    well-formed values could not set up the case.
+    """
+    conn = connect(db)
+    try:
+        for name in _PRE_006_MIGRATIONS:
+            conn.executescript(files("whiskeyjack_bot.migrations").joinpath(name).read_text())
+        conn.execute(
+            "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+            "started_at_utc, created_at_utc) VALUES (?, 'asknews', 100, ?, ?)",
+            (run_id, TS, TS),
+        )
+        conn.execute(
+            "INSERT INTO forecast_records ("
+            "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+            "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+            "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+            "forecast_sha256, attempt_id) "
+            "VALUES (?, 100, ?, 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
+            "?, ?, '{}', '{}', ?, ?, 'att-record')",
+            (record_id, tournament_id, run_id, TS, TS, SHA),
+        )
+        conn.execute(
+            "INSERT INTO submission_attempts (attempt_id, forecast_record_id, "
+            "idempotency_key, requested_at_utc, completed_at_utc, request_payload_sha256, "
+            "success, verified_by_refetch, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)",
+            (attempt_id, record_id, key, TS, TS, PAYLOAD_SHA, TS),
+        )
+        for version, name in enumerate(_PRE_006_MIGRATIONS, start=1):
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at_utc, checksum) "
+                "VALUES (?, ?, ?)",
+                (version, TS, _checksum_of(name)),
+            )
+    finally:
+        conn.close()
+
+
+def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
+    # The control for the refusals below. Without it, a migration that refused *every*
+    # v5 ledger -- a malformed probe, say -- would pass all of them.
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v5_ledger(db)
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 6
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {"record_id": "\t\n"},
+        {"record_id": "x" * 201},
+        {"record_id": "a\x00b"},
+        {"tournament_id": "\xa0"},
+        {"run_id": "  "},
+        {"attempt_id": "\t\n"},
+        {"key": "\xa0"},
+    ],
+)
+def test_migration_006_refuses_a_ledger_holding_a_blank_identifier(
+    tmp_path: Path, legacy: dict[str, object]
+) -> None:
+    """A `BEFORE INSERT` trigger binds new rows only, so the upgrade checks the old ones.
+
+    Without this the guarantee would quietly become "every row written after 006" -- and
+    these are append-only tables, so a violating row can never be corrected afterwards. A
+    blank or blob identifier is precisely the row that is unjoinable and unreadable for
+    good, which is the condition this item exists to make impossible. So the upgrade
+    refuses rather than shipping a rule with a grandfathered exception, the same call 003
+    made about a non-draft record for the same reason.
+
+    The parameters are one per guarded column plus the length and NUL cases, because the
+    probe is meant to be the *same predicate* as the trigger: a probe that checked only
+    blankness would leave two of the three ways a legacy row can be unreadable.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v5_ledger(db, **legacy)  # type: ignore[arg-type]
+
+    with pytest.raises(LedgerError) as caught:
+        initialize_ledger(db)
+
+    # The refusal must not echo the offending value -- `ledger.py` wraps the failure with
+    # `from None` and a message built only from the filename-derived version number.
+    for value in legacy.values():
+        assert str(value) not in str(caught.value)
+
+    # And it is clean: the migration ran inside a transaction, so the database sits at
+    # version 5 with 006's triggers unapplied rather than half-upgraded.
+    conn = connect(db)
+    try:
+        assert conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 5
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'migration_006%'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_migration_006s_upgrade_precondition_leaves_nothing_behind(tmp_path: Path) -> None:
+    """The guard is a temp table, so it must not survive either outcome.
+
+    On the refusal path it is rolled back with the rest of the migration (asserted above).
+    On the success path it is dropped. A leftover table in either schema would be a
+    migration writing something the schema does not document -- 003 makes the same
+    assertion about its own precondition.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v5_ledger(db)
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'migration_006%'"
+            ).fetchone()[0]
+            == 0
+        )
+        # A fresh ledger takes the same path from empty, so assert it there too.
+        fresh = tmp_path / "fresh.sqlite3"
+        initialize_ledger(fresh)
+        other = connect(fresh)
+        try:
+            assert (
+                other.execute(
+                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'migration_006%'"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            other.close()
+    finally:
+        conn.close()
+
+
+def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_formed(
+    tmp_path: Path,
+) -> None:
+    """The converse of the refusal: 006 rejects violating rows, not old rows.
+
+    A migration that refused every pre-006 ledger would satisfy every test above while
+    being undeployable, which is the failure mode 002 and 003 both name when they explain
+    why their added columns stay NULLable.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v5_ledger(db)
+    assert initialize_ledger(db) == 6
+    conn = connect(db)
+    try:
+        assert current_status(conn, "rec-legacy") == "draft"
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM submission_attempts WHERE attempt_id = 'att-legacy'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
