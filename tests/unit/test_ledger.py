@@ -14,6 +14,7 @@ from whiskeyjack_bot.ledger import (
     _statements,
     connect,
     initialize_ledger,
+    open_verified_ledger,
 )
 
 LEDGER_TABLES = {
@@ -458,5 +459,152 @@ def test_migration_005_counters_reject_a_non_integer_or_negative_count(
                     "VALUES (?, 'asknews', 100, ?, ?, ?)",
                     (f"run-{value}", TS, TS, value),
                 )
+    finally:
+        conn.close()
+
+
+def test_open_verified_refuses_an_absent_database_and_creates_nothing(tmp_path: Path) -> None:
+    """`create=False` is what closes a check-then-open race (M2-701 review round 1).
+
+    A caller that has already checked the file exists still races its own answer:
+    `sqlite3.connect` brings a database into being for any path it is handed, so a
+    deletion or rotation between the check and the open yields a brand-new empty ledger
+    that then answers questions about content it never held. Re-checking cannot close
+    that window; an open that *cannot* create can.
+    """
+    db = tmp_path / "gone" / "ledger.db"
+    with pytest.raises(LedgerError):
+        connect(db, create=False)
+    assert not db.exists()
+    assert not db.parent.exists()
+
+    with pytest.raises(LedgerError):
+        open_verified_ledger(db)
+    # initialize_ledger's create path makes the parent directory; the existing-only path
+    # must not, or a mistyped --config would leave a directory tree behind it.
+    assert not db.exists()
+    assert not db.parent.exists()
+
+
+def test_open_verified_refuses_a_database_removed_after_it_was_seen(tmp_path: Path) -> None:
+    """The race run forwards: a ledger that existed, and then did not.
+
+    This is the shape the CLI hits -- `_open_existing_ledger` checks, and the file is
+    gone by the time the open runs. It must refuse, and must not leave a replacement
+    behind for the next command to read as the real ledger.
+    """
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+    db.unlink()
+    with pytest.raises(LedgerError):
+        open_verified_ledger(db)
+    assert not db.exists()
+
+
+def test_open_verified_returns_the_connection_it_verified(tmp_path: Path) -> None:
+    """The second window, and the reason this is one function (review round 2).
+
+    Verifying through one connection and reopening the pathname is worse than the first
+    race, because refusing to create catches nothing: both files exist. An atomic
+    rotation in between -- a backup, a restore, a rename -- and the schema that was
+    checked is not the database that gets written. Holding the connection makes the
+    rotation harmless: the descriptor still refers to the database that was verified.
+    """
+    db = tmp_path / "ledger.db"
+    replacement = tmp_path / "replacement.db"
+    initialize_ledger(db)
+    initialize_ledger(replacement)
+    conn = open_verified_ledger(db)
+    try:
+        conn.execute(
+            "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+            "started_at_utc, created_at_utc) VALUES ('verified', 'asknews', 100, ?, ?)",
+            (TS, TS),
+        )
+        replacement.replace(db)  # the rotation, after the connection was handed over
+        rows = conn.execute("SELECT retrieval_run_id FROM research_runs").fetchall()
+        assert [row[0] for row in rows] == ["verified"]
+    finally:
+        conn.close()
+    # The replacement was never opened by us and never written through: its own content
+    # is untouched. (Read it in isolation -- the rotation strands the verified ledger's
+    # WAL under the old pathname, and SQLite replays a foreign WAL beside a database it
+    # was not written for. See the standing risk in docs/M2-NOTES.md.)
+    isolated = tmp_path / "isolated.db"
+    isolated.write_bytes(db.read_bytes())
+    conn = sqlite3.connect(isolated)
+    try:
+        assert conn.execute("SELECT count(*) FROM research_runs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_open_verified_verifies_the_schema_and_hands_back_a_usable_connection(
+    tmp_path: Path,
+) -> None:
+    """Refusing to create is not the only difference from `connect`: it also migrates."""
+    db = tmp_path / "ledger.db"
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+    conn = open_verified_ledger(db)
+    try:
+        assert _table_names(conn) == LEDGER_TABLES
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_open_verified_closes_the_connection_when_verification_fails(tmp_path: Path) -> None:
+    """A refusal must not leak the descriptor it opened to decide on the refusal."""
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE schema_migrations SET checksum = 'drifted' WHERE version = 1")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    with pytest.raises(LedgerError):
+        open_verified_ledger(db)
+    # A leaked connection would still hold this ledger's locks; an exclusive write proves
+    # nothing is holding it open.
+    conn = connect(db)
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def test_open_verified_refuses_without_leaking_the_reason(tmp_path: Path) -> None:
+    """Same hygiene as every other ledger raise: the path, and nothing else.
+
+    SQLite's own message for a `mode=rw` miss is "unable to open database file", and the
+    URI it was handed is percent-encoded -- neither may reach the operator through the
+    message or a rendered traceback.
+    """
+    db = tmp_path / "secret-value-in-name" / "ledger.db"
+    with pytest.raises(LedgerError) as excinfo:
+        connect(db, create=False)
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert str(excinfo.value) == f"cannot open ledger database at {db}"
+    assert "unable to open" not in rendered
+    assert "mode=rw" not in rendered
+    assert "file://" not in rendered
+
+
+def test_initialize_ledger_still_creates_so_every_existing_caller_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    """The existing-only seam is a separate function; the pipeline's writers still create."""
+    db = tmp_path / "fresh" / "ledger.db"
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+    assert db.is_file()
+    second = tmp_path / "fresh" / "second.db"
+    conn = connect(second)
+    try:
+        assert second.is_file()
     finally:
         conn.close()
