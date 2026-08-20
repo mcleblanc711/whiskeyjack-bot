@@ -132,6 +132,42 @@ def test_the_hash_is_independent_of_input_order(packet: ResearchPacket, random: 
     assert packet_sha256(build_packet(packet.question_id, runs, documents)) == packet_sha256(packet)
 
 
+@given(research_runs(), research_documents())
+def test_mutating_caller_owned_inputs_does_not_move_the_hash(
+    run: ResearchRun, document: ResearchDocument
+) -> None:
+    """M1-313: the packet is a copy, not a view onto the caller's objects.
+
+    ``ResearchRun``/``ResearchDocument`` are plain (unfrozen) pydantic models with
+    mutable list/dict fields (``queries``, ``provider_config``), so a tuple of them
+    is immutable only at the container level unless ``build_packet`` detaches its
+    own copies. Every caller-owned mutable surface the acceptance criterion names is
+    exercised here: the run object itself, a document object, the run's ``queries``
+    list, and the run's ``provider_config`` dict.
+    """
+    run = run.model_copy(update={"question_id": 1, "provider_config": {"k": "v"}})
+    document = document.model_copy(update={"retrieval_run_id": run.retrieval_run_id})
+    runs = [run]
+    documents = [document]
+
+    packet = build_packet(1, runs, documents)
+    before = packet_sha256(packet)
+
+    # Mutate the caller's own lists -- already covered by build_packet's `tuple(...)`
+    # even pre-fix, kept here so the test exercises every input the criterion names.
+    runs.append(run)
+    documents.append(document)
+
+    # Mutate the caller-retained model objects and their nested mutable fields.
+    run.queries.append("a query appended after build_packet returned")
+    assert run.provider_config is not None
+    run.provider_config["injected"] = "a value added after build_packet returned"
+    run.error_summary = "mutated after construction"
+    document.title = "mutated after construction"
+
+    assert packet_sha256(packet) == before
+
+
 @given(packets())
 def test_the_hash_survives_the_persisted_round_trip(packet: ResearchPacket) -> None:
     """Store it, load it, hash it again: the same digest.
