@@ -40,7 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M2-701 | feat/m2-701-approval-commands | whiskeyjack-m2-701 | no | none | 2026-08-19 |
+| M1-313 | feat/m1-313-freeze-research-packet | whiskeyjack-m1-313 | no | none | 2026-08-20 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
