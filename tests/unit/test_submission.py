@@ -20,9 +20,10 @@ from typing import Any
 
 import pytest
 
-from whiskeyjack_bot.approval import approve
+from whiskeyjack_bot.approval import approve, effective_approval, reject
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
+    LifecycleError,
     SubmissionAttempt,
     record_submission_attempt,
     record_validation,
@@ -36,6 +37,7 @@ from whiskeyjack_bot.submission import (
     canonical_key_json,
     require_key_unused,
     submission_key,
+    submission_key_for_approved_record,
     submission_key_for_record,
 )
 
@@ -355,7 +357,10 @@ def test_the_same_key_cannot_create_two_attempts(
         occurred_at=OCCURRED,
         detail_code="timeout",
     )
-    with pytest.raises(Exception):
+    # Narrowed to the writer's own error, and to its sanitized text: `Exception` would
+    # have passed for an unrelated failure and proved nothing about the key
+    # (cross-model review round 1, non-blocking finding 1).
+    with pytest.raises(LifecycleError) as excinfo:
         record_submission_attempt(
             conn,
             record_id=record_id,
@@ -363,6 +368,8 @@ def test_the_same_key_cannot_create_two_attempts(
             occurred_at=OCCURRED,
             detail_code="timeout",
         )
+    assert "the ledger rejected this write" in str(excinfo.value)
+    assert key not in str(excinfo.value)
     rows = conn.execute(
         "SELECT count(*) FROM submission_attempts WHERE idempotency_key = ?", (key,)
     ).fetchone()[0]
@@ -612,3 +619,115 @@ def test_the_duplicate_refusal_never_echoes_the_key(
     with pytest.raises(SubmissionError) as excinfo:
         require_key_unused(conn, key)
     assert key not in str(excinfo.value)
+
+
+# --- the gated seam ------------------------------------------------------------------
+
+
+def test_the_gated_seam_agrees_with_the_ungated_one_on_an_approved_record(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    assert submission_key_for_approved_record(
+        conn, record_id, request_payload_sha256=PAYLOAD_SHA
+    ) == submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+
+
+def test_the_gated_seam_refuses_a_draft(ledger: sqlite3.Connection) -> None:
+    _seed_draft(ledger)
+    with pytest.raises(SubmissionError, match="holds no approval in force"):
+        submission_key_for_approved_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
+
+
+def test_the_gated_seam_refuses_a_validated_but_undecided_record(
+    ledger: sqlite3.Connection,
+) -> None:
+    record_id = _seed_draft(ledger)
+    record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
+    with pytest.raises(SubmissionError, match="holds no approval in force"):
+        submission_key_for_approved_record(ledger, record_id, request_payload_sha256=PAYLOAD_SHA)
+
+
+def test_the_gated_seam_refuses_a_rejected_record(ledger: sqlite3.Connection) -> None:
+    """A rejection records a decision and leaves the record `validated`; it is not an
+    approval in force, so no key may be derived for a post."""
+    record_id = _seed_draft(ledger)
+    record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
+    reject(ledger, record_id=record_id, actor="chris", occurred_at=OCCURRED)
+    with pytest.raises(SubmissionError, match="holds no approval in force"):
+        submission_key_for_approved_record(ledger, record_id, request_payload_sha256=PAYLOAD_SHA)
+
+
+def test_the_ungated_seam_still_serves_a_draft(ledger: sqlite3.Connection) -> None:
+    """The dry-run path (M2-703): an operator sees what would be submitted *before*
+    deciding whether to approve it, so the ungated seam must not require an approval."""
+    _seed_draft(ledger)
+    assert KEY_RE.match(
+        submission_key_for_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
+    )
+
+
+def test_an_approval_row_no_lifecycle_event_cites_does_not_open_the_gate(
+    ledger: sqlite3.Connection,
+) -> None:
+    """`effective_approval` derives from the lifecycle event, so a raw-SQL
+    `approval_events` row that moved nothing is not an approval -- and must not mint a
+    submission key. Proven here rather than assumed, because it is the one shape that
+    satisfies 003's hash-binding trigger while changing no state."""
+    record_id = _seed_draft(ledger)
+    record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
+    ledger.execute(
+        "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+        "created_at_utc) VALUES (?, 'approved', 'nobody', ?, ?)",
+        (record_id, SHA, TS),
+    )
+    with pytest.raises(SubmissionError, match="holds no approval in force"):
+        submission_key_for_approved_record(ledger, record_id, request_payload_sha256=PAYLOAD_SHA)
+
+
+def test_the_gated_seam_refuses_an_unknown_record(ledger: sqlite3.Connection) -> None:
+    with pytest.raises(SubmissionError, match="does not name a stored forecast record"):
+        submission_key_for_approved_record(ledger, "nope", request_payload_sha256=PAYLOAD_SHA)
+
+
+def test_the_gated_seam_validates_the_payload_hash_before_reading(
+    ledger: sqlite3.Connection,
+) -> None:
+    _seed_draft(ledger)
+    ledger.close()
+    with pytest.raises(SubmissionError, match="64 lowercase hexadecimal"):
+        submission_key_for_approved_record(ledger, "rec-1", request_payload_sha256="nope")
+
+
+def test_an_approval_layer_error_never_escapes_as_itself(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Callers handle this module's error type only; an `ApprovalError` from the layer
+    below must arrive as a `SubmissionError` with its (value-free) message preserved."""
+    from whiskeyjack_bot.approval import ApprovalError
+
+    with pytest.raises(SubmissionError) as excinfo:
+        submission_key_for_approved_record(ledger, "nope", request_payload_sha256=PAYLOAD_SHA)
+    assert not isinstance(excinfo.value, ApprovalError)
+
+
+def test_the_documented_gap_is_real_and_is_asserted(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The recorded limitation, pinned as a test rather than left as prose (D33, M2-707).
+
+    Two different payloads for one approved forecast get two different keys and are both
+    served by the gated seam, because an approval binds to `forecast_sha256` and one
+    approved forecast covers every payload built from it. If a later change closes this,
+    the test fails and the note must be updated -- which is the point of asserting a known
+    gap rather than only describing one.
+    """
+    conn, record_id = approved
+    first = submission_key_for_approved_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    second = submission_key_for_approved_record(
+        conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA
+    )
+    assert first != second
+    approval = effective_approval(conn, record_id)
+    assert approval is not None
+    assert approval.forecast_sha256 == SHA

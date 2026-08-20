@@ -43,6 +43,7 @@ from whiskeyjack_bot.submission import (
     canonical_key_json,
     require_key_unused,
     submission_key,
+    submission_key_for_approved_record,
     submission_key_for_record,
 )
 
@@ -239,7 +240,13 @@ def test_the_readers_raise_only_submission_error(value: object) -> None:
         lambda: attempt_for_key(conn, value),  # type: ignore[arg-type]
         lambda: require_key_unused(conn, value),  # type: ignore[arg-type]
         lambda: submission_key_for_record(conn, value, request_payload_sha256=DIGEST),  # type: ignore[arg-type]
+        lambda: submission_key_for_approved_record(conn, value, request_payload_sha256=DIGEST),  # type: ignore[arg-type]
         lambda: submission_key_for_record(
+            conn,
+            "rec-absent",
+            request_payload_sha256=value,  # type: ignore[arg-type]
+        ),
+        lambda: submission_key_for_approved_record(
             conn,
             "rec-absent",
             request_payload_sha256=value,  # type: ignore[arg-type]
@@ -366,6 +373,7 @@ def test_a_read_leaves_the_ledger_where_it_was(value: object) -> None:
         lambda: attempt_for_key(conn, value),  # type: ignore[arg-type]
         lambda: require_key_unused(conn, value),  # type: ignore[arg-type]
         lambda: submission_key_for_record(conn, value, request_payload_sha256=DIGEST),  # type: ignore[arg-type]
+        lambda: submission_key_for_approved_record(conn, value, request_payload_sha256=DIGEST),  # type: ignore[arg-type]
     ):
         try:
             call()
@@ -405,7 +413,13 @@ def test_a_refused_read_never_reaches_the_message_or_the_traceback(value: object
         lambda: attempt_for_key(conn, value),  # type: ignore[arg-type]
         lambda: require_key_unused(conn, value),  # type: ignore[arg-type]
         lambda: submission_key_for_record(conn, value, request_payload_sha256=DIGEST),  # type: ignore[arg-type]
+        lambda: submission_key_for_approved_record(conn, value, request_payload_sha256=DIGEST),  # type: ignore[arg-type]
         lambda: submission_key_for_record(
+            conn,
+            "rec-absent",
+            request_payload_sha256=value,  # type: ignore[arg-type]
+        ),
+        lambda: submission_key_for_approved_record(
             conn,
             "rec-absent",
             request_payload_sha256=value,  # type: ignore[arg-type]
@@ -470,3 +484,18 @@ def test_the_leaky_shapes_are_all_actually_refused(value: object, position: int)
             forecast_version=arguments[2],
             request_payload_sha256=arguments[3],
         )
+
+
+@given(tournament_id=TOURNAMENTS, digest=DIGESTS)
+def test_the_gated_seam_never_mints_a_key_for_an_unapproved_record(
+    tournament_id: str, digest: str
+) -> None:
+    """Over the whole accepted domain, not just the states the unit tests name.
+
+    Every record this fixture seeds is a `draft`, and a draft holds no approval in force,
+    so the gated seam must refuse every one of them -- whatever the tournament, question
+    or payload happens to be.
+    """
+    record_id, _ = _seed(tournament_id, 1)
+    with pytest.raises(SubmissionError, match="holds no approval in force"):
+        submission_key_for_approved_record(_conn(), record_id, request_payload_sha256=digest)

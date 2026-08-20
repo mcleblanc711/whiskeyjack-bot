@@ -399,19 +399,56 @@ it is cheapest to see.
   payload, and both are `Not Started`.
 - **No `submission.enabled`/`dry_run` handling.** This module is not on a submission path.
 
-### Standing risk — the key cannot by itself force a new *approval*
+### Owner decision (D33) — an approval binds to the forecast hash, not to a payload
 
-The acceptance criterion reads "changed payload requires a new approval/key". The **key**
-half holds here. The **approval** half does not, and cannot: approval binds to
-`forecast_sha256`, so a payload that changed *without the forecast changing* gets a new
-key while keeping its old approval in force. Nothing in this module can detect that,
-because it never sees the forecast the payload was built from.
+**Round 1 blocked on this**, and it was the standing risk this item declared up front.
+The criterion reads *"changed payload requires a new approval/key"*. The **key** half is
+direct. The **approval** half cannot be satisfied here: an approval binds to
+`forecast_sha256`, so one approved forecast covers every payload built from it, and a
+payload that changed *without the forecast changing* gets a new key while keeping its old
+approval in force.
 
-Closing it is M2-704's, and it needs two checks together: `approval.effective_approval()`
-for "is this exact forecast approved", and a payload-derives-from-the-approved-forecast
-check for "is this the payload that forecast means". Recorded here rather than filed as a
-backlog row because M2-704's acceptance criteria already require the first, and the second
-is inside its scope rather than a new item.
+The reviewer was right that noting it is not enough — CLAUDE.md's stricter-reading rule
+says implement the stricter reading *and* note it — and right that the alternative is an
+explicit owner decision. Both were taken:
+
+**The strengthening that is in scope shipped.** `submission_key_for_approved_record()`
+refuses to derive a key for a record with no approval in force, read through
+`approval.effective_approval()` — so an `approval_events` row that no lifecycle event
+cites does not open the gate either. `submission_key_for_record()` stays ungated and
+serves a `draft`, because that is exactly what M2-703's dry run needs: seeing what *would*
+be submitted is how an operator decides whether to approve it. **Two functions rather than
+one function with a flag**, for the reason M1-402 settled — a bound any caller can lift is
+not a bound.
+
+**The rest is D33, and it is a sequencing fact rather than a preference.** Binding an
+approval to a payload requires the forecast→payload mapping, which is M1-502/M1-503 and
+does not exist. An operator asked to approve a payload hash today would be approving a
+value nothing in the tree can compute, and the approval command that took it would be
+`M2-701`'s, already merged. Doing it now would mean a migration, a changed approval
+command, and an operator ceremony over a value that has no producer.
+
+**M2-707** carries the payload binding (dependency `M2-702; M1-502; M1-503`), and M2-704
+is where the check lands. The gap is asserted as a test
+(`test_the_documented_gap_is_real_and_is_asserted`) rather than left as prose: if a later
+change closes it, that test fails and this note has to be updated, which is the point of
+pinning a known limitation instead of only describing one.
+
+### Round 1 — the other two findings
+
+**Non-blocking, fixed:** `test_the_same_key_cannot_create_two_attempts` used
+`pytest.raises(Exception)`, which would have passed for an unrelated failure. Narrowed to
+`LifecycleError`, to its sanitized text, and with an assertion that the key is not echoed.
+
+**Backlog candidate, filed as M2-708:** `require_key_unused()` is a read, so two concurrent
+commands can both see one key as unused, and `001`'s UNIQUE constraint only refuses the
+second row *after* its post has been made. Nothing is reachable today — no gateway exists
+— and the module's docstring already disclaims race safety, which the reviewer confirmed.
+
+The six risk areas the request asked to be pressure-tested all came back **safe**:
+canonical-material injectivity, store/load replay stability, the `require_key_unused` race
+claim as documented, own-error-only, no value in messages or tracebacks, and the boolean
+integer dispatch.
 
 ### Standing risk — two stored-value gates are not reachable through this schema
 

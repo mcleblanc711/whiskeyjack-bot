@@ -49,12 +49,23 @@ minting an attempt -- so "same payload/key cannot create two attempts" is a type
 that names the collision, rather than a ``sqlite3.IntegrityError`` surfacing from the
 UNIQUE constraint after the caller has already decided to post.
 
-**What this module does not do.** It does not build the request payload (M1-502/M1-503
-own that; ``request_payload_sha256`` is an *input* here, exactly as the backlog says), and
-it does not check that a payload derives from an approved forecast. Approval binds to
-``forecast_sha256``, so a payload that changed without the forecast changing gets a new
-key while keeping its old approval; closing that is M2-704's job, which must consult
-``approval.effective_approval`` as well as this key. See ``docs/M2-NOTES.md``.
+**Two derivation seams, not one.** :func:`submission_key_for_record` will mint a key for
+any stored record including a ``draft``, because that is what a dry run needs -- a dry run
+is how an operator sees what *would* be submitted before deciding whether to approve it
+(M2-703). :func:`submission_key_for_approved_record` refuses unless
+``approval.effective_approval`` reports an approval in force, and every path leading to a
+real post goes through it. They are two functions rather than one function with a flag,
+for the reason M1-402 settled: a bound any caller can lift is not a bound.
+
+**What this module does not do.** It does not build the request payload -- M1-502/M1-503
+own that, and ``request_payload_sha256`` is an *input* here, exactly as the backlog says
+("derive keys from ... and payload hash"). Nor does it check that a payload *is* the one
+an approval meant. An approval binds to ``forecast_sha256``, so one approved forecast
+covers every payload built from it: a payload that changed without the forecast changing
+gets a new key and keeps the old approval. That is a **known, recorded gap**, not an
+oversight -- it cannot be closed without the forecast->payload mapping, which does not
+exist yet. **Decision D33** records the reading; **M2-707** is the filed item; M2-704 is
+where the check lands. See ``docs/M2-NOTES.md``.
 
 Error hygiene follows ``ConfigError``/``LedgerError``/``LifecycleError``/``ApprovalError``:
 a :class:`SubmissionError` never echoes a caller-supplied or stored value, sanitizing
@@ -72,6 +83,8 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from typing import cast
+
+from whiskeyjack_bot.approval import ApprovalError, effective_approval
 
 # Bumping this changes every key, which is the point: a rule change must be visible as a
 # different key rather than silently reinterpreting stored ones. It is part of the hashed
@@ -278,6 +291,44 @@ def submission_key_for_record(
     )
 
 
+def submission_key_for_approved_record(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    request_payload_sha256: str,
+) -> str:
+    """Derive the key, and refuse unless an approval is in force for this record.
+
+    The gated seam. :func:`submission_key_for_record` will mint a key for a ``draft`` --
+    which is what a dry run needs, because a dry run is how an operator sees what *would*
+    be submitted before deciding whether to approve it (M2-703). Every path that leads to
+    a real post goes through this one instead, and D23's "submission is a separate
+    approved command" is the reason the two are separate functions rather than one
+    function with a flag: a bound any caller can lift is not a bound.
+
+    **What this does and does not establish.** It establishes that *this forecast* is
+    approved, from ``approval.effective_approval`` -- derived from the lifecycle event, so
+    an ``approval_events`` row nothing acted on does not count. It does **not** establish
+    that ``request_payload_sha256`` is the payload that approval meant: an approval binds
+    to ``forecast_sha256``, and one approved forecast covers every payload built from it.
+    Closing that needs the forecast->payload mapping, which lives in M1-502/M1-503 and
+    does not exist yet; **M2-707** is the filed item and M2-704 is where the check lands.
+    See ``docs/M2-NOTES.md`` and decision D33.
+    """
+    payload_sha = _require_sha256(request_payload_sha256, "request_payload_sha256")
+    identifier = _require_text(record_id, "record_id")
+    try:
+        approval = effective_approval(conn, identifier)
+    except ApprovalError as exc:
+        raise _wrap_approval(exc) from None
+    if approval is None:
+        raise SubmissionError(
+            "this forecast record holds no approval in force, so no submission key may be "
+            "derived for it; approve the record first"
+        )
+    return submission_key_for_record(conn, identifier, request_payload_sha256=payload_sha)
+
+
 def attempt_for_key(conn: sqlite3.Connection, idempotency_key: str) -> AttemptSummary | None:
     """Return the attempt already recorded under this key, or ``None``.
 
@@ -330,6 +381,18 @@ def require_key_unused(conn: sqlite3.Connection, idempotency_key: str) -> None:
             "this idempotency key has already been used by a recorded submission attempt; "
             "a second attempt under it would claim a second live post"
         )
+
+
+def _wrap_approval(exc: ApprovalError) -> SubmissionError:
+    """Re-raise the approval layer as this module's own type, message preserved.
+
+    Deliberate rather than lazy, and the same call ``approval._wrap_lifecycle`` makes:
+    ``ApprovalError``'s own contract guarantees its text names no stored or caller-supplied
+    value, and its message is the one thing that makes a refusal actionable. Replacing it
+    with a constant would satisfy the letter of the module-own-error rule while destroying
+    what the operator needs.
+    """
+    return SubmissionError(str(exc) or "the ledger refused to report this record's approval")
 
 
 def _require_text(value: object, field: str) -> str:
