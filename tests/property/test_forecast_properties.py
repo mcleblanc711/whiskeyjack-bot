@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from math import nextafter
 from pathlib import Path
 from typing import Any
 
@@ -464,9 +465,40 @@ BOUNDS = st.lists(
 PROBABILITIES = st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False)
 
 
-@given(PROBABILITIES, BOUNDS, st.booleans(), st.booleans())
+@st.composite
+def bounds_and_probability(draw: st.DrawFn) -> tuple[float, float, float]:
+    """Drawn bounds, and a probability that lands *on* them often enough to matter.
+
+    A free draw over ``PROBABILITIES`` is what this property used first, and the
+    mutation harness caught it out: an off-by-one-ulp boundary error survived, because
+    hitting ``probability == low`` exactly is measure-zero over a continuous float
+    strategy. The single earlier catch was hypothesis's boundary heuristics being lucky,
+    which is precisely the "passes for the wrong reason" shape ``docs/LESSONS.md`` #5 is
+    about. The interesting bug lives at the boundary, so the strategy is made to go
+    there.
+    """
+    low, high = draw(BOUNDS)
+    probability = draw(
+        st.one_of(
+            st.sampled_from(
+                [
+                    low,
+                    high,
+                    nextafter(low, 0.0),
+                    nextafter(high, 1.0),
+                    nextafter(low, 1.0),
+                    nextafter(high, 0.0),
+                ]
+            ),
+            PROBABILITIES,
+        )
+    )
+    return low, high, max(0.0, min(1.0, probability))
+
+
+@given(bounds_and_probability(), st.booleans(), st.booleans())
 def test_the_bounds_check_accepts_exactly_the_probabilities_inside_them(
-    probability: float, bounds: list[float], prior: bool, model_prior: bool
+    drawn: tuple[float, float, float], prior: bool, model_prior: bool
 ) -> None:
     """The discriminating post-condition, not a smoke test.
 
@@ -474,7 +506,7 @@ def test_the_bounds_check_accepts_exactly_the_probabilities_inside_them(
     missing prior is still refused -- because "returns a list" and "sometimes refuses"
     are both satisfied by code that is wrong at the boundary.
     """
-    low, high = bounds
+    low, high, probability = drawn
     forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
     problems = binary_output_problems(forecast, _forecast_config(low, high))
     expected = (low <= probability <= high) and prior and model_prior

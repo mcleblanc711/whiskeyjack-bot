@@ -528,8 +528,9 @@ it was produced is furthest away.
 - `tests/fixtures/forecasts/binary_golden.json` — the golden binary output.
 - `tests/unit/test_forecast_binary.py` (27 cases), 7 cases added to
   `tests/unit/test_forecast_generate.py`, 5 properties added to
-  `tests/property/test_forecast_properties.py`. Suite: **1655 -> 1694 passed**, 1 xfailed
-  (the pre-existing `content_sha256` lone-surrogate xfail). Four gates green; `pytest` 160s.
+  `tests/property/test_forecast_properties.py`, plus 5 more cases from round 1. Suite:
+  **1655 -> 1699 passed**, 1 xfailed (the pre-existing `content_sha256` lone-surrogate xfail).
+  Four gates green; `pytest` 137s.
 - One new backlog row, **M1-407**. No migration, no dependency, no `uv.lock` change, no
   config-contract change, no prompt edit, and no edit to any merged module other than `generate.py`.
 
@@ -583,17 +584,29 @@ the rule becomes repairable for free, which a schema-level version would not be.
 It does not fail a model that followed the prompt: the shared-fields example populates both. That is
 the same test M1-402 applied to `source_disagreements`.
 
-### Deviation — this module owns no exception of its own
+### Decision — `BinaryOutputError` subclasses `ForecastSchemaError` (corrected in review round 1)
 
-The project rule is that every module owns a sanitized exception. `binary.py` raises
-`ForecastSchemaError` instead. The condition — *this model response is not acceptable* — already
-belongs to that type, `generate._parse` already catches exactly it, and the rule's purpose is that a
-caller handles **one** error type per malformed shape. A second type for one condition works against
-the rule it would be obeying.
+The first cut raised `ForecastSchemaError` directly and recorded it as a deliberate deviation from
+"every module owns a sanitized exception": the condition — *this model response is not acceptable* —
+already belonged to that type, `generate._parse` already caught exactly it, and a second type for
+one condition seemed to work against the rule it would be obeying.
+
+**Round 1 was right that this reads the rule too narrowly, and the reviewer's minimal fix is why.**
+Subclassing is not a compromise between the two readings, it satisfies both: a caller handling the
+forecast package's response failures still writes `except ForecastSchemaError` and still catches
+every one, `generate._parse` is unchanged, and the module nonetheless has an error boundary a caller
+can name without importing `forecast.schema`. The tension the first cut accepted was not there to
+accept. Worth recording as an author-side lesson rather than a reviewer's: a deviation that has to be
+argued for is a prompt to look for the option that removes the choice, and this one was one line.
 
 Caller mistakes still raise rather than becoming problems: a response of another question type, a
 config of the wrong type, and an inverted bounds pair are refused, because asking the model to
-repair a dispatch bug of ours is nonsense.
+repair a dispatch bug of ours is nonsense — and it would cost a billable call to do it.
+
+### Deviation — none
+
+Nothing on this branch departs from the SDK, the spec or a sibling module. (The error-type reading
+above was recorded here as a deviation before round 1; it is now a plain decision.)
 
 ### Rejected — options weighed and not taken
 
@@ -644,16 +657,49 @@ repair a dispatch bug of ours is nonsense.
   actual bound and that a corrected reply is accepted in one further call. Whether a real model
   corrects an extreme probability when told the bound is not something an offline suite can answer.
 
+### Review round 1 — one blocking finding, reproduced and closed
+
+Reviewed commit `daadc4a`, which was `HEAD`; the diff against `HEAD` was empty, so the finding was
+not stale (the check that has cost this project three rounds elsewhere). Reproduced by execution
+before any fix code: `validate_binary_output` and the three caller-shape paths all raised
+`whiskeyjack_bot.forecast.schema.ForecastSchemaError`.
+
+Closed by defining `BinaryOutputError(ForecastSchemaError)` and raising it on all four paths, plus
+`test_every_refusal_path_raises_this_modules_own_type_exactly` (exact type, not `isinstance`, so the
+parent being raised directly on one path cannot go unnoticed) and
+`test_this_modules_errors_are_its_own_type_and_still_catch_as_the_packages`. Two mutations were added
+to the harness for it. The rationale is folded into the decision above rather than left as a
+deviation.
+
+The reviewer raised no other blocker, filed no new backlog candidate, agreed M1-407 was correctly
+filed, and confirmed all four declared risk areas as safe.
+
 ### On the property tests, and the check that they discriminate
 
-Five properties, and **nine mutations were run against the source and every one was caught** before
-any of them was trusted (`docs/LESSONS.md` #5): an exclusive comparison at the bounds, the bounds
-returned swapped, the model's probability spliced into the message, the configured bounds dropped
-from the message, a problem reported at a location the schema never declared, only the first problem
-reported, the prior-presence rule removed, the output checks never reached from `_parse`, and the
-bound accepted rather than refused. The harness sweeps `__pycache__` and runs with
+Five properties, and **eleven mutations were run against the source and every one was caught**
+before any of them was trusted (`docs/LESSONS.md` #5): an exclusive comparison at the bounds, the
+bounds returned swapped, the model's probability spliced into the message, the configured bounds
+dropped from the message, a problem reported at a location the schema never declared, only the first
+problem reported, the prior-presence rule removed, the output checks never reached from `_parse`,
+the bound accepted rather than refused, the package error raised instead of this module's own, and
+the owned error no longer catching as the package's. The harness sweeps `__pycache__` and runs with
 `PYTHONDONTWRITEBYTECODE` — a same-size mutation restored inside one second is otherwise served back
 from cache.
+
+**Two of those mutations initially escaped, and both were the harness's fault rather than the
+properties'.** They are worth the paragraph because the failure mode is the one `docs/LESSONS.md` #5
+exists for, met from an angle this project had not hit before.
+
+- *The boundary property was passing for the wrong reason.* An exclusive comparison at the bounds
+  survived, because a free draw over a continuous float strategy hits `probability == low` exactly
+  with probability zero — the one earlier catch was hypothesis's boundary heuristics being lucky.
+  The interesting bug in a bounds check lives **at** the bound, so `bounds_and_probability()` now
+  draws the endpoints and their neighbouring ulps explicitly. This is a property that would have
+  read as evidence while proving nothing about the case it exists for.
+- *The harness ran the wrong profile.* It drove the properties at `fast` (25 examples), so "the
+  prior-presence rule removed" escaped on roughly one run in three by chance. A verdict rests on
+  `dev` (200 examples), so the harness now runs that. Re-measured three consecutive times at the
+  gate's own profile: eleven of eleven, every run.
 
 The two properties worth reading are the pair. `test_a_bounds_problem_never_varies_with_the_
 probability_that_failed` says the message is invariant in the model's value;

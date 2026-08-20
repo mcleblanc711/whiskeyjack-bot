@@ -40,12 +40,16 @@ turn that does not state the *actual* bound is one **no model can satisfy**, and
 error nobody can act on is its own failure mode. Nothing else in this module renders a
 value.
 
-This module owns no exception of its own, which is a deliberate departure from the
-project rule that every module does. The condition -- *this model response is not
-acceptable* -- already belongs to :class:`ForecastSchemaError`, ``generate._parse``
-already catches exactly that type, and the rule's purpose is that a caller handles
-**one** error type per malformed shape. A second type for one condition works against
-it.
+This module owns :class:`BinaryOutputError`, and it **subclasses**
+:class:`ForecastSchemaError`. The first cut raised the parent directly, reasoning that
+the condition -- *this model response is not acceptable* -- already belonged to that
+type and that a second type for one condition worked against the rule it would be
+obeying. Review round 1 was right that this reads the rule too narrowly, and the
+subclass is why: it is not a choice between the two readings. A caller handling the
+forecast package's response failures still writes ``except ForecastSchemaError`` and
+still catches every one, ``generate._parse`` is unchanged, and this module nonetheless
+has an error boundary a caller can name without importing ``forecast.schema``. The
+tension the first cut accepted was not there to accept.
 
 Imports no provider SDK and no question model: like ``forecast/schema.py``, this has to
 stay reachable from a replay path (M1-406) with the provider client not importable at
@@ -66,6 +70,21 @@ from whiskeyjack_bot.forecast.schema import (
 _PROBABILITY_LOC = "final_prediction.probability_yes"
 _PRIOR_LOC = "base_rate.prior_probability"
 _MODEL_PRIOR_LOC = "model_prior"
+
+
+class BinaryOutputError(ForecastSchemaError):
+    """A binary forecast cannot be used, or was asked for in a way this module refuses.
+
+    Subclasses :class:`ForecastSchemaError` deliberately, so the two readings of the
+    project's error rule are both satisfied rather than traded off. A caller that
+    handles the forecast package's response failures as one type keeps working
+    unchanged -- ``generate._parse`` is exactly such a caller -- while a caller that
+    wants *this* module's boundary can name it without importing ``forecast.schema``.
+
+    Carries the same sanitized ``problems`` list as its parent: a field path, a colon
+    and a value-free message. Nothing here echoes model output.
+    """
+
 
 # Said of both priors, so the two problems differ only in their location. The prompt's
 # shared-fields example populates both for a binary question, so a model that followed
@@ -94,13 +113,13 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
     to reject something no model could have supplied.
     """
     if not isinstance(forecast_config, ForecastConfig):
-        raise ForecastSchemaError(["forecast_config: must be a ForecastConfig"])
+        raise BinaryOutputError(["forecast_config: must be a ForecastConfig"])
     low = forecast_config.min_probability
     high = forecast_config.max_probability
     if not low < high:
         # The two values are operator configuration and are rendered elsewhere in this
         # module; here they buy nothing the message does not already say.
-        raise ForecastSchemaError(
+        raise BinaryOutputError(
             ["forecast_config: min_probability must be strictly below max_probability"]
         )
     return low, high
@@ -115,7 +134,7 @@ def binary_output_problems(
     schema-authored field path, a colon, and a value-free message -- safe to log, to
     store, and to send back to the model as a repair turn.
 
-    Raises :class:`ForecastSchemaError` only for a caller mistake (a response or a config
+    Raises :class:`BinaryOutputError` only for a caller mistake (a response or a config
     of the wrong type, or a config admitting no probability at all). Those are not
     problems with the model's output and must never become a repair turn.
     """
@@ -123,7 +142,7 @@ def binary_output_problems(
         # Exact category, not a duck-typed read: a response of another question type has
         # no probability_yes, and a non-response has no fields at all. Both are caller
         # mistakes, and neither is something to ask the model to fix.
-        raise ForecastSchemaError(["forecast: must be a binary forecast response"])
+        raise BinaryOutputError(["forecast: must be a binary forecast response"])
     low, high = _require_config(forecast_config)
 
     problems: list[str] = []
@@ -159,5 +178,5 @@ def validate_binary_output(
     """
     problems = binary_output_problems(forecast, forecast_config)
     if problems:
-        raise ForecastSchemaError(problems)
+        raise BinaryOutputError(problems)
     return forecast

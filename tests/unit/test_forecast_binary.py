@@ -21,7 +21,11 @@ import pytest
 import yaml
 
 from whiskeyjack_bot.config import ForecastConfig, validate_config_data
-from whiskeyjack_bot.forecast.binary import binary_output_problems, validate_binary_output
+from whiskeyjack_bot.forecast.binary import (
+    BinaryOutputError,
+    binary_output_problems,
+    validate_binary_output,
+)
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastSchemaError,
@@ -253,14 +257,14 @@ def test_nothing_is_clamped(golden: dict[str, Any]) -> None:
     returned = validate_binary_output(forecast, _committed_forecast_config())
     assert returned is forecast
     assert returned.final_prediction.probability_yes == 0.5
-    with pytest.raises(ForecastSchemaError):
+    with pytest.raises(BinaryOutputError):
         validate_binary_output(_with_probability(golden, 0.9995), _committed_forecast_config())
 
 
 def test_the_raising_entry_point_carries_the_same_problems(golden: dict[str, Any]) -> None:
     forecast = _with_probability(golden, 0.9995)
     config = _committed_forecast_config()
-    with pytest.raises(ForecastSchemaError) as caught:
+    with pytest.raises(BinaryOutputError) as caught:
         validate_binary_output(forecast, config)
     assert caught.value.problems == binary_output_problems(forecast, config)
 
@@ -303,7 +307,7 @@ def test_a_response_of_another_question_type_is_a_caller_mistake(
         "final_prediction": final_prediction,
     }
     forecast = validate_forecast_response(payload, response_type)
-    with pytest.raises(ForecastSchemaError) as caught:
+    with pytest.raises(BinaryOutputError) as caught:
         binary_output_problems(forecast, _committed_forecast_config())
     assert caught.value.problems == ["forecast: must be a binary forecast response"]
 
@@ -317,9 +321,9 @@ def test_a_config_that_admits_no_probability_is_refused(golden: dict[str, Any]) 
     anything is spent; this is the net under that.
     """
     forecast = _response(golden)
-    with pytest.raises(ForecastSchemaError):
+    with pytest.raises(BinaryOutputError):
         binary_output_problems(forecast, _bounds(0.9, 0.1))
-    with pytest.raises(ForecastSchemaError):
+    with pytest.raises(BinaryOutputError):
         binary_output_problems(forecast, _bounds(0.5, 0.5))
 
 
@@ -329,7 +333,7 @@ def test_a_config_of_the_wrong_type_arrives_as_this_projects_error(
 ) -> None:
     """Every malformed shape arrives as the module's own error type, never an
     AttributeError -- the rule this project has taken as a review finding twice."""
-    with pytest.raises(ForecastSchemaError):
+    with pytest.raises(BinaryOutputError):
         binary_output_problems(_response(golden), bad)
 
 
@@ -343,3 +347,50 @@ def test_the_committed_defaults_still_match_the_range_the_prompt_prints() -> Non
     prompt = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
     assert "between 0.001 and 0.999 inclusive" in prompt
     assert (config.min_probability, config.max_probability) == (0.001, 0.999)
+
+
+def test_this_modules_errors_are_its_own_type_and_still_catch_as_the_packages() -> None:
+    """Round-1 finding: the module must own the error type its callers handle.
+
+    The exact-type half is the finding. The subclass half is why the fix costs nothing:
+    ``generate._parse`` catches ``ForecastSchemaError`` and is unchanged, so both
+    readings of the project's error rule hold at once rather than trading off.
+    """
+    assert issubclass(BinaryOutputError, ForecastSchemaError)
+    assert BinaryOutputError is not ForecastSchemaError
+
+
+@pytest.mark.parametrize(
+    ("label", "call"),
+    [
+        (
+            "out of bounds",
+            lambda golden, config: validate_binary_output(
+                _with_probability(golden, 0.9995), config
+            ),
+        ),
+        (
+            "a response of another question type",
+            lambda golden, config: binary_output_problems("not a response", config),
+        ),
+        (
+            "a config of the wrong type",
+            lambda golden, config: binary_output_problems(_response(golden), None),
+        ),
+        (
+            "an inverted bounds pair",
+            lambda golden, config: binary_output_problems(_response(golden), _bounds(0.9, 0.1)),
+        ),
+    ],
+)
+def test_every_refusal_path_raises_this_modules_own_type_exactly(
+    golden: dict[str, Any], label: str, call: Any
+) -> None:
+    """Exact type, not ``isinstance``: inheriting from the package error must not be a
+    way for the parent to be raised directly on one path and go unnoticed."""
+    with pytest.raises(ForecastSchemaError) as caught:
+        call(golden, _committed_forecast_config())
+    assert type(caught.value) is BinaryOutputError
+    assert caught.value.problems
+    # Still value-free: the sanitized problem list is inherited, not re-invented.
+    assert all(": " in problem for problem in caught.value.problems)
