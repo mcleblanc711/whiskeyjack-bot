@@ -126,7 +126,7 @@ def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     return conn
 
 
-def initialize_ledger(path: Path, *, create: bool = True) -> int:
+def initialize_ledger(path: Path) -> int:
     """Create or upgrade the ledger schema; return the applied schema version.
 
     Idempotent: migrations already recorded in ``schema_migrations`` are
@@ -134,32 +134,71 @@ def initialize_ledger(path: Path, *, create: bool = True) -> int:
     error. Fails safely on schema drift, duplicate migration numbers, or a
     database written by a newer build.
 
-    ``create=False`` verifies and upgrades an **existing** ledger and refuses to bring one
-    into being: neither the parent directory nor the database file is created. That is
-    what lets a command whose whole point is to act on an already-recorded ledger use this
-    for its checksum and version verification without also being the thing that mints an
-    empty one. See :func:`connect`.
+    Opens, migrates and closes. A caller that then *uses* the ledger wants
+    :func:`open_verified_ledger` instead -- see its docstring for why reopening the
+    pathname is not the same thing.
     """
-    if create:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            # from None: the OSError can name parent paths; wrap it with a constant
-            # message so nothing about the target filesystem is reprinted.
-            raise LedgerError(f"cannot create ledger directory for {path}") from None
-    conn = connect(path, create=create)
     try:
-        migrations = _load_migrations()
-        applied = _applied_migrations(conn)
-        _reject_newer_database(applied, migrations)
-        for version, sql, checksum in migrations:
-            if version in applied:
-                _verify_checksum(version, applied[version], checksum)
-                continue
-            _apply_migration(conn, version, sql, checksum)
-        return _current_version(conn)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # from None: the OSError can name parent paths; wrap it with a constant
+        # message so nothing about the target filesystem is reprinted.
+        raise LedgerError(f"cannot create ledger directory for {path}") from None
+    conn = connect(path)
+    try:
+        return _migrate(conn)
     finally:
         conn.close()
+
+
+def open_verified_ledger(path: Path) -> sqlite3.Connection:
+    """Open an **existing** ledger, verify its schema, and return *that* connection.
+
+    For a command that acts on a ledger someone else recorded. Two properties, and the
+    second is the reason this is a function rather than two calls:
+
+    - It never creates. ``sqlite3.connect`` brings a database into being for any path it
+      is handed, so a caller who checks the file exists first still races the check: the
+      file can be removed between the two, and what comes back is a brand-new empty
+      ledger that answers questions about content it never held. Checking again cannot
+      close that; ``create=False`` can.
+    - **It verifies and returns the same open connection.** Verifying through one
+      connection and then reopening the pathname is a second, worse window: both files
+      exist, so refusing to create catches nothing, and an ordinary atomic rotation --
+      a backup, a restore, a log-style rename -- in between means the schema that was
+      checked and the database that is written are different files. On the approval path
+      that lands an immutable decision in a ledger the command never read (M2-701 review
+      round 2, finding 1; reproduced: the command exited 0, printed the *replacement's*
+      hash, and left the verified ledger with no approval). Holding one connection makes
+      the rotation harmless: the open descriptor still refers to the database that was
+      verified, which is the ledger the operator was shown.
+
+    The caller owns the returned connection and must close it.
+    """
+    conn = connect(path, create=False)
+    try:
+        _migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> int:
+    """Apply every pending migration on an open connection; return the schema version.
+
+    Takes a connection rather than a path so that verification and use cannot end up on
+    two different databases. See :func:`open_verified_ledger`.
+    """
+    migrations = _load_migrations()
+    applied = _applied_migrations(conn)
+    _reject_newer_database(applied, migrations)
+    for version, sql, checksum in migrations:
+        if version in applied:
+            _verify_checksum(version, applied[version], checksum)
+            continue
+        _apply_migration(conn, version, sql, checksum)
+    return _current_version(conn)
 
 
 def _applied_migrations(conn: sqlite3.Connection) -> dict[int, str]:

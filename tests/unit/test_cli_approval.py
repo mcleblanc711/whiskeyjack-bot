@@ -55,10 +55,8 @@ def _ledger_path(config_file: Path) -> Path:
     return Path(data["storage"]["sqlite_path"])
 
 
-@pytest.fixture()
-def seeded(config_file: Path) -> Path:
-    """A ledger at the configured path holding one record at `validated`."""
-    path = _ledger_path(config_file)
+def _seed_ledger(path: Path, forecast_sha256: str) -> None:
+    """A ledger holding one record at `validated`, bound to `forecast_sha256`."""
     initialize_ledger(path)
     conn = connect(path)
     try:
@@ -75,11 +73,34 @@ def seeded(config_file: Path) -> Path:
             "forecast_sha256, attempt_id) "
             "VALUES (?, 100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
             "'abc', 'run-1', ?, '{}', '{}', ?, ?, 'att-rec-1')",
-            (RECORD_ID, TS, TS, SHA),
+            (RECORD_ID, TS, TS, forecast_sha256),
         )
         record_validation(conn, record_id=RECORD_ID, occurred_at=OCCURRED)
     finally:
         conn.close()
+
+
+def _isolated_approval_count(path: Path) -> int:
+    """Approvals in the database file itself, with no sidecar able to replay into it.
+
+    Rotating a live SQLite database leaves its WAL behind under the old pathname, and
+    SQLite will replay a foreign WAL beside a database it was not written for. Reading a
+    byte copy is what tells "this database was written" apart from "another database's
+    WAL is sitting next to it".
+    """
+    copy_path = path.parent / f"isolated-{path.name}"
+    copy_path.write_bytes(path.read_bytes())
+    conn = sqlite3.connect(copy_path)
+    try:
+        return int(conn.execute("SELECT count(*) FROM approval_events").fetchone()[0])
+    finally:
+        conn.close()
+
+
+@pytest.fixture()
+def seeded(config_file: Path) -> Path:
+    """A ledger at the configured path holding one record at `validated`."""
+    _seed_ledger(_ledger_path(config_file), SHA)
     return config_file
 
 
@@ -250,6 +271,56 @@ def test_a_ledger_that_disappears_after_the_check_is_refused_not_recreated(
     # The assertion the finding turns on: on the pre-fix code the command got a live
     # connection to a brand-new empty ledger and printed this instead.
     assert "does not name a stored forecast record" not in out
+
+
+def test_a_ledger_rotated_mid_command_is_not_the_one_that_gets_approved(
+    seeded: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verification and the decision must land on one database (round 2, finding 1).
+
+    The command used to verify the ledger through one connection and then reopen the
+    pathname for the decision. Refusing to create catches nothing here -- both files
+    exist -- so an ordinary atomic rotation in between (a backup, a restore, a rename)
+    meant the schema that was checked and the database that was written were different
+    files. The command exited 0, printed the *replacement's* hash, and appended an
+    immutable approval to a ledger it had never read.
+
+    Opening once and holding the connection makes the rotation harmless: the descriptor
+    still refers to the database that was verified and shown to the operator.
+    """
+    from whiskeyjack_bot import ledger as ledger_module
+
+    path = _ledger_path(seeded)
+    replacement = path.parent / "replacement.sqlite3"
+    _seed_ledger(replacement, OTHER_SHA)
+    archive = path.parent / "rotated.sqlite3"
+
+    real_connect = ledger_module.connect
+    opened = 0
+
+    def rotating_connect(target: Path, *, create: bool = True) -> sqlite3.Connection:
+        nonlocal opened
+        conn = real_connect(target, create=create)
+        opened += 1
+        if opened == 1 and Path(target) == path:
+            # The window: the ledger is verified through this connection, and the
+            # pathname is handed to another database before anything is read from it.
+            path.replace(archive)
+            replacement.replace(path)
+        return conn
+
+    monkeypatch.setattr(ledger_module, "connect", rotating_connect)
+
+    code = main(["approve", "--config", str(seeded), "--record-id", RECORD_ID, "--actor", "chris"])
+
+    assert code == EXIT_OK
+    out = capsys.readouterr().out
+    # The hash the operator was shown is the verified ledger's, not the replacement's.
+    assert SHA in out
+    assert OTHER_SHA not in out
+    # And the replacement -- read in isolation, so the verified ledger's stranded WAL
+    # cannot replay into it -- never received the decision.
+    assert _isolated_approval_count(path) == 0
 
 
 def test_an_invalid_config_is_told_apart_from_a_refusal(

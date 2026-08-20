@@ -283,19 +283,15 @@ def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
 def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
     """Open an existing ledger, or print why not and return ``None`` (M2-701).
 
-    **The file must already exist, and no open on this path may create one.** A mistyped
-    ``--config`` would otherwise mint an empty database and report "no such record" against
-    it -- a true statement about the wrong ledger. The existence check answers that case
-    with an actionable message; ``create=False`` is what makes the guarantee hold when the
-    file disappears *after* the check, which no amount of re-checking can close.
-
-    Given that it exists, it is opened through ``initialize_ledger`` rather than
-    ``connect`` alone: that is the only public path that re-verifies every applied
-    migration's checksum and refuses a database written by a newer build, and it is a
-    no-op on a current ledger. The alternative -- a read-only schema-version probe --
-    needs ``ledger._current_version``, which is private to that module.
+    **The file must already exist, and one connection must carry the whole command.**
+    A mistyped ``--config`` would otherwise mint an empty database and report "no such
+    record" against it -- a true statement about the wrong ledger. The existence check
+    answers that case, and only that case: it is what produces an actionable message
+    rather than a bare open failure. Everything else is ``ledger.open_verified_ledger``'s,
+    which neither creates nor hands back a second open of the pathname -- see its
+    docstring for the two races that motivate each half.
     """
-    from whiskeyjack_bot.ledger import LedgerError, connect, initialize_ledger
+    from whiskeyjack_bot.ledger import LedgerError, open_verified_ledger
 
     try:
         exists = path.is_file()
@@ -309,15 +305,10 @@ def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
         print(f"no ledger database at {path}; nothing has been recorded there yet")
         return None
     try:
-        # create=False on both: `sqlite3.connect` creates a database for any path it is
-        # given, so the existence check above races its own answer -- the file can be
-        # removed between the two, and what came back was a brand-new empty ledger that
-        # then reported the requested record absent. That is the wrong-ledger result this
-        # function exists to prevent, arrived at from the other direction (review round 1,
-        # finding 1; reproduced). The check above stays, for the message: it is what tells
-        # a mistyped --config apart from a ledger that vanished mid-command.
-        initialize_ledger(path, create=False)
-        return connect(path, create=False)
+        # The verified connection itself, not a fresh open of the same name: the schema
+        # this checked and the database the command writes must be one file. Review
+        # rounds 1 and 2 both landed here, from opposite directions.
+        return open_verified_ledger(path)
     except LedgerError as exc:
         print(exc)
         return None

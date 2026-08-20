@@ -157,20 +157,39 @@ checksum and refuses a database written by a newer build, and it is a no-op on a
 ledger. The alternative — a read-only schema-version probe — needs `ledger._current_version`,
 which is private to that module.
 
-**The existence check is not what carries the guarantee** (review round 1, finding 1,
-reproduced). It answers a *question* — is this a mistyped `--config`, or a ledger that
-vanished? — and the two need different messages. But `sqlite3.connect` brings a database
-into being for any path it is handed, so a caller that has already checked still races its
-own answer: an ordinary deletion or rotation between the check and the open used to yield a
-brand-new empty ledger, and the command then reported "record_id does not name a stored
-forecast record" against it. That is this decision's own failure mode reached from the other
-side, and the pre-fix code printed exactly that line. Re-checking cannot close the window;
-only an open that *cannot* create can, so `ledger.connect()` and `initialize_ledger()` grew a
-`create` keyword (`file:…?mode=rw`, default `True` so no existing caller moves) and
-`_open_existing_ledger` passes `create=False` to both — the second call is its own window.
-Ordinary local I/O races are reachable reliability conditions under CLAUDE.md's threat
-boundary; this is not a defence against a hostile operator, it is the difference between a
-wrong answer and an error.
+**The existence check is not what carries the guarantee.** It answers a *question* — is
+this a mistyped `--config`, or a ledger that vanished? — and the two need different
+messages. The guarantee is `ledger.open_verified_ledger()`'s, which closes two separate
+windows the review found from opposite directions. Both are ordinary local I/O races, which
+CLAUDE.md's threat boundary keeps in scope as reachable reliability conditions; neither is a
+defence against a hostile operator, and both are the difference between a wrong answer and
+an error.
+
+*Round 1, finding 1 — the file can vanish between the check and the open.* `sqlite3.connect`
+brings a database into being for any path it is handed, so a caller that has already checked
+still races its own answer: a deletion or rotation in between used to yield a brand-new empty
+ledger, and the command then reported "record_id does not name a stored forecast record"
+against it — this decision's own failure mode, reached from the other side. The pre-fix code
+prints exactly that line under `test_a_ledger_that_disappears_after_the_check_is_refused_not_recreated`.
+Re-checking cannot close the window; only an open that *cannot* create can, so `connect()`
+took a `create` keyword (`file:…?mode=rw`; default `True`, so no existing caller moves).
+
+*Round 2, finding 1 — verification and use were two opens of the same name.* The first fix
+passed `create=False` to `initialize_ledger()` and then to `connect()`, which is a second and
+worse window: refusing to create catches nothing here, because both files exist. An atomic
+rotation in between — a backup, a restore, a log-style rename — and the schema that was
+checked is not the database that gets written. Reproduced: the command exited 0, printed the
+*replacement's* hash, and appended an immutable approval to a ledger it had never read, while
+the verified ledger kept its own hash and no approval. An approval is the one record in this
+project that must bind to a forecast someone actually saw, so this is worse than the round-1
+case it grew out of.
+
+The fix is one function that opens once: `open_verified_ledger()` calls `connect(create=False)`,
+runs the migration and checksum verification against *that* connection via the extracted
+`_migrate(conn)`, and hands the same connection back. `initialize_ledger()` returns to its
+pre-branch signature — it opens, migrates and closes, which is right for a caller that is
+creating a ledger rather than acting on one. The rotation is then harmless: the descriptor
+still refers to the database that was verified and shown to the operator.
 
 ### Deviation — `EXIT_REFUSED` lives in `cli.py`, not beside the other exit codes
 
@@ -227,6 +246,29 @@ carries its own small set — around forty lines — and each raises this module
   an operator, which is an argument for fixing it and not a good enough one: it would put
   a one-word change to already-reviewed code into a diff that otherwise touches none, and
   the project's review history is unkind to that. Filed here rather than fixed.
+
+### Standing risk — a rotation still strands the WAL, and that is SQLite's, not ours
+
+Holding one connection fixes *which* database the command reads and writes. It cannot fix
+what a rotation does to the sidecars, because SQLite resolves `-wal` and `-shm` by
+**pathname**, not by the descriptor it holds. Rotate a live ledger and the approval is
+committed to the verified database's WAL — which is still sitting under the old pathname,
+now occupied by the replacement. Measured, with the main files read in isolation:
+
+| | verified ledger | verified ledger + its WAL | replacement |
+|---|---|---|---|
+| before the fix | 0 approvals | 0 approvals | **1 approval** |
+| after the fix | 0 approvals | **1 approval** | 0 approvals |
+
+So the decision does follow the ledger it was bound to, and reuniting the two is a matter of
+moving the sidecar the rotation left behind. Two things remain true and are not this branch's
+to fix: the ledger and its WAL can be separated by a rotation that moves only the main file,
+and anything that opens the replacement while that foreign WAL sits beside it will replay it.
+SQLite documents renaming a database out from under an open connection as unsupported, and it
+is unsupported identically for every other writer in the pipeline — `research.store`,
+`lifecycle`, the M1-602 record writer — none of which this branch introduced or made more
+reachable. `_isolated_approval_count()` in `tests/unit/test_cli_approval.py` is what keeps the
+test honest about the distinction.
 
 ### Standing risk — the reader's cardinality claim rests on an immutable trigger
 
