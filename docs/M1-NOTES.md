@@ -3407,8 +3407,11 @@ parsed. A forecast with no evidence and no failure-mode check was a well-formed 
 - `tests/unit/test_forecast_attribution.py` (65 cases), 9 cases added to
   `tests/unit/test_forecast_generate.py` (7 new plus the import probe going from one case to
   three), 9 properties added to `tests/property/test_forecast_properties.py`. Suite:
-  **1912 -> 1995 passed**, 1 xfailed (the pre-existing `content_sha256` lone-surrogate
-  xfail). Four gates green.
+  **1939 -> 2022 passed** against this branch's diff base (master `c3034d0`, after the daily
+  merge), 1 xfailed (the pre-existing `content_sha256` lone-surrogate xfail) — **+83 tests, all of
+  them this row's.** Measured before the merge the branch read 1912 -> 1995; the 27 tests between
+  the two figures are M1-312's, already approved on PR #35, and naming the real surface after a
+  master merge is CLAUDE.md's rule. Four gates green, `pytest` 151s.
 - No migration, no dependency, no `uv.lock` change, no config-contract change, no prompt edit, and no
   edit to any merged source module other than `generate.py`.
 
