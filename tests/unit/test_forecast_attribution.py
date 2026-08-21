@@ -18,6 +18,7 @@ pre-writes none of Codex's.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import traceback
@@ -25,12 +26,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
+from whiskeyjack_bot.config import ForecastConfig, validate_config_data
 from whiskeyjack_bot.forecast.attribution import (
     AttributionFieldError,
     attribution_problems,
     validate_attribution_fields,
 )
+from whiskeyjack_bot.forecast.binary import binary_output_problems
+from whiskeyjack_bot.forecast.generate import _output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastResponse,
@@ -92,6 +97,19 @@ def _problems(forecast: ForecastResponse, sources: tuple[str, ...] = PROMPT_SOUR
 def _leaks(exc: BaseException) -> bool:
     rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return SECRET in str(exc) or SECRET in rendered
+
+
+def _committed_forecast_config() -> ForecastConfig:
+    """The forecast section of the *committed* ``config.example.yaml``.
+
+    Read rather than hand-built, the ``test_forecast_binary.py`` idiom: a test that
+    invents its own bounds cannot notice the committed defaults drifting.
+    """
+    data = copy.deepcopy(yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text("utf-8")))
+    # The one substitution the committed example demands (D27: the model name ships as a
+    # placeholder that fails validation on purpose). Nothing in the forecast section is touched.
+    data["model"]["name"] = "openrouter/test-model"
+    return validate_config_data(data).forecast
 
 
 @pytest.fixture()
@@ -373,6 +391,69 @@ def test_the_rules_are_cross_type(heading: str, model: type[ForecastResponse]) -
             "failure_modes: must not be empty",
         ]
     )
+
+
+# --- the boundary with M1-403, pinned from this side (review round 1) ------------
+
+
+def test_the_binary_prior_rule_belongs_to_binary_py() -> None:
+    """A binary response must supply both priors -- and that rule is **M1-403's**.
+
+    This test exists because round 1 filed it as a blocking finding against M1-501. The
+    reasoning was sound and the address was wrong: ``schema.py``'s ``_reject_priors``
+    docstring said the converse rule "is M1-501's row", which was true when M1-402 wrote
+    it and stopped being true when the owner settled the rule onto the binary output path
+    in M1-403. A reviewer reading that pointer looks in ``attribution.py``, finds no prior
+    check, and reports a hole.
+
+    So the split is pinned from *both* sides now. ``test_forecast_binary.py`` asserts the
+    rule where it lives; this asserts that M1-501's cross-type checker deliberately does
+    not duplicate it, and the test below asserts the composed path still refuses.
+    """
+    payload = _payload()
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    forecast = validate_forecast_response(payload, BinaryForecastResponse)
+    assert forecast.base_rate.prior_probability is None
+    assert forecast.model_prior is None
+
+    # M1-501's checker is silent, on purpose: the rule is binary-specific by
+    # construction and this module reads no question type for its own rules.
+    assert _problems(forecast) == []
+
+    # M1-403's checker is not, and it names both spellings.
+    problems = binary_output_problems(forecast, _committed_forecast_config())
+    assert problems == [
+        "base_rate.prior_probability: must be supplied for a binary question",
+        "model_prior: must be supplied for a binary question",
+    ]
+
+
+def test_the_two_checkers_compose_so_a_priorless_binary_forecast_is_refused() -> None:
+    """The claim round 1 actually made -- that such a response is "certified attributable"
+    and reaches a caller as valid -- checked against the composed path rather than against
+    either checker alone.
+
+    ``generate._output_problems`` runs M1-501's rules and then M1-403's, so a caller of
+    the forecast package sees both. ``test_forecast_generate.py`` proves the same thing
+    through two billed calls and a repair turn; this is the cheap unit-level statement of
+    it, next to the checker the finding was filed against.
+    """
+    payload = _payload()
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    forecast = validate_forecast_response(payload, BinaryForecastResponse)
+
+    composed = _output_problems(
+        forecast,
+        _committed_forecast_config(),
+        question_id=QUESTION_ID,
+        source_ids=PROMPT_SOURCES,
+    )
+    assert composed == [
+        "base_rate.prior_probability: must be supplied for a binary question",
+        "model_prior: must be supplied for a binary question",
+    ]
 
 
 # --- the error boundary -----------------------------------------------------------

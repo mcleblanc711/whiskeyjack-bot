@@ -3406,8 +3406,8 @@ parsed. A forecast with no evidence and no failure-mode check was a well-formed 
 - `tests/fixtures/forecasts/binary_golden_sources.json` — the five ids M1-403's golden output cites.
 - `tests/unit/test_forecast_attribution.py` (65 cases), 9 cases added to
   `tests/unit/test_forecast_generate.py` (7 new plus the import probe going from one case to
-  three), 9 properties added to `tests/property/test_forecast_properties.py`. Suite:
-  **1939 -> 2022 passed** against this branch's diff base (master `c3034d0`, after the daily
+  three), 9 properties added to `tests/property/test_forecast_properties.py`, plus 2 boundary cases
+  from round 1. Suite: **1939 -> 2024 passed** against this branch's diff base (master `c3034d0`, after the daily
   merge), 1 xfailed (the pre-existing `content_sha256` lone-surrogate xfail) — **+83 tests, all of
   them this row's.** Measured before the merge the branch read 1912 -> 1995; the 27 tests between
   the two figures are M1-312's, already approved on PR #35, and naming the real surface after a
@@ -3632,3 +3632,71 @@ constant the implementation uses passes whatever that constant says (M1-303's le
 all-digit parts first, because `schema._sanitize` renders an int `loc` part as `str(part)` and this
 module spells its nested locations the same way, so `evidence_adjustments.0.source_ids` is
 indistinguishable from a location the sanitizer produced.
+
+### Review round 1 — one blocking finding, rebutted by execution, with two real fixes behind it
+
+Reviewed commit `84510a2`, which was `HEAD`; the diff against `HEAD` was empty, so the finding was
+not stale (the check that has cost this project three rounds elsewhere). The reviewer ran the
+focused suites at that commit and confirmed all five declared risk areas safe.
+
+**The finding:** *"Binary forecasts are accepted without the required prior."* It cites
+`schema.py:267`, notes that `attribution._problems` checks neither prior, and states the reachable
+path as *"`generate_forecast` then treats the response as valid after attribution and bounds
+checks."*
+
+**Reproduced before any fix code, and the reachable path does not hold.** The rule exists — it has
+since **M1-403**, in `binary.py`, which `generate._output_problems` reaches for every binary
+response. Three executions at `84510a2`:
+
+1. The reviewer's literal reproduction — `attribution_problems` alone on a priorless golden —
+   returns `[]`. **True**, and deliberately so: the rule is binary-specific by construction and this
+   module reads no question type for its own rules.
+2. `binary_output_problems` on the same response returns
+   `base_rate.prior_probability: must be supplied for a binary question` and the same for
+   `model_prior`.
+3. `generate_forecast` driven with a priorless reply that stays priorless: **2 invocations,
+   `forecast=None`, `failure_code="schema_invalid"`**, both prior problems in `failure_problems`.
+   The composed path refuses it, spends the one repair M1-402 budgets, and returns no forecast.
+
+So the finding fails the second scope test — the condition is neither introduced nor amplified here —
+and the stated impact, a priorless forecast reaching the ledger as valid, is not reachable. A
+finding that cannot be reproduced gets a rebuttal, not a fix.
+
+**But the reviewer was reading a real defect, and it was ours.** `schema.py`'s `_reject_priors`
+docstring said the converse rule *"is M1-501's row"*. That was true when M1-402 wrote it; M1-403 then
+took the rule, and the owner settled it there because it is binary-specific. Nobody updated the
+pointer. Once M1-501 shipped without the rule, that sentence became a live trap: it tells a careful
+reader to look in `attribution.py`, where the rule correctly is not. It cost a blocking finding and a
+review round, which is precisely the price `docs/LESSONS.md` puts on a stale cross-reference.
+
+Fixed on this branch, in three places:
+
+- `forecast/schema.py` — the docstring now names `binary.py`/M1-403, and records why it used to say
+  M1-501 and what that cost, so the correction cannot be re-reverted as a tidy-up.
+- `tests/unit/test_forecast_schema.py` — `test_a_binary_response_may_carry_priors` repeated the same
+  claim in its docstring; corrected the same way.
+- `tests/unit/test_forecast_attribution.py` — two new tests pin the split **from M1-501's side**,
+  which is the side the reviewer was standing on:
+  `test_the_binary_prior_rule_belongs_to_binary_py` (this checker is silent, M1-403's is not, and it
+  names both spellings) and
+  `test_the_two_checkers_compose_so_a_priorless_binary_forecast_is_refused` (the composed
+  `_output_problems` returns exactly the two prior problems). Both were mutation-checked: removing
+  the prior rule from `binary.py` fails both.
+
+**And one real gap, filed as `M1-506`.** The finding's underlying instinct — that reading one checker
+in isolation makes a rule look absent — is a property of the seam, not of the reviewer.
+`generate._output_problems` composes the checkers, but it is private to the call path, so M1-406
+replaying a stored response and M1-602 validating a record before persisting it would each have to
+know the full list and call every member, with nothing to tell them when the list grows (M1-404 and
+M1-405 both add to it). One public composed entry point, with `generate._output_problems` defined in
+terms of it, closes that. A row rather than a fix here: it is M1-406's and M1-602's interface, and
+pre-deciding it on a branch whose review is about attribution fields is how two items end up
+disagreeing about one function.
+
+**Process note, taken.** The reviewer observed that the mutation campaign "enumerates only the
+implementation's seven chosen rules, so it could not detect omission of this eighth authoritative
+requirement." That is exactly right as a statement about mutation testing, and worth writing down
+next to the one-sided-property lesson above: **a mutation harness measures whether your tests defend
+the rules you wrote; it is silent about a rule you never wrote.** The defence against a missing rule
+is the acceptance criterion read against the spec, and the reviewer is doing that job — which is why
+a finding filed off a wrong pointer still found a defect worth two source fixes and a backlog row.
