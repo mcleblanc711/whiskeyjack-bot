@@ -127,12 +127,16 @@ def write_raw_responses(
     fails, persist the ledger row anyway with ``raw_response_path=None``. A run that
     cost money and produced no artifact is still a run that must be recorded.
 
-    **No function here or in the store performs that composition** -- the caller
-    does. An earlier version of this docstring claimed
-    ``store.persist_retrieval`` did, which was simply false (round 1, non-blocking
-    observation): it takes an already-computed path and has no opinion about how the
-    artifact write went. Filed as a follow-up rather than built here, because the
-    composed API belongs with the orchestrator this item deliberately does not ship.
+    **That composition is** :func:`whiskeyjack_bot.research.persist.persist_paid_run`
+    (M1-312), which catches the ``ArtifactError`` this function raises, commits the run
+    and its documents regardless, and reports the audit loss to its caller. Nothing in
+    this module or in the store performs it: both are primitives, and each takes or
+    returns the path without an opinion about how the other went. An earlier version of
+    this docstring claimed ``store.persist_retrieval`` did it, which was simply false
+    (M1-306 round 1, non-blocking observation), and the correction stands -- it takes an
+    already-computed path. Use this function directly only when you are *not* on the paid
+    path; on it, use the composition, which is the one place the ordering rule is executed
+    rather than described.
     """
     run_id = _require_safe_run_id(retrieval_run_id)
     question = _require_int(question_id, "question_id")
