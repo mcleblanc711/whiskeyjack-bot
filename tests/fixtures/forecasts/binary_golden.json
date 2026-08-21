@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0.0",
+  "question_id": 30412,
+  "question_type": "binary",
+  "as_of_utc": "2026-08-14T12:00:00Z",
+  "base_rate": {
+    "reference_class": "Scheduled FOMC meetings since 2015 that markets priced at 20-40% for a cut one month out",
+    "prior_probability": 0.28,
+    "basis": "Of 41 such meetings, 12 delivered the cut. The committee has moved against a sub-40% priced expectation only twice, both alongside an intermeeting shock.",
+    "source_ids": ["src-001", "src-002"]
+  },
+  "model_prior": 0.28,
+  "status_quo": "No decisive labour-market or inflation print lands before the 17 September decision, and the committee holds the target range unchanged.",
+  "evidence_adjustments": [
+    {
+      "claim": "The August CPI release put core at 2.9% year over year, a third consecutive deceleration, which lowers the bar for easing.",
+      "direction": "up",
+      "magnitude": "medium",
+      "source_ids": ["src-001"],
+      "load_bearing": true
+    },
+    {
+      "claim": "The chair's Jackson Hole remarks described policy as 'well positioned', wording the committee has previously used ahead of holds rather than cuts.",
+      "direction": "down",
+      "magnitude": "small",
+      "source_ids": ["src-003"],
+      "load_bearing": true
+    },
+    {
+      "claim": "Payroll growth slowed to 73k with downward revisions to the prior two months.",
+      "direction": "up",
+      "magnitude": "small",
+      "source_ids": ["src-002"],
+      "load_bearing": false
+    },
+    {
+      "claim": "An unverified account reposted a claim that two governors would dissent; no participant has said so on the record.",
+      "direction": "none",
+      "magnitude": "tiny",
+      "source_ids": ["src-005"],
+      "load_bearing": false
+    }
+  ],
+  "load_bearing_facts": [
+    {
+      "claim": "Core CPI decelerated for a third consecutive month in the August release.",
+      "source_ids": ["src-001"]
+    },
+    {
+      "claim": "The decision date is 17 September 2026, inside the question window.",
+      "source_ids": ["src-004"]
+    }
+  ],
+  "source_disagreements": [
+    "A wire summary reported the chair as signalling a September cut; the released transcript does not contain that signal, and the transcript is taken as authoritative."
+  ],
+  "failure_modes": [
+    "Resolution wording counts only a change in the target range, so a technical adjustment to the administered rates would not resolve YES.",
+    "The strongest evidence is one inflation print; a single upside surprise before the meeting reverses most of the adjustment.",
+    "Coverage of the Jackson Hole remarks is correlated rather than independent, and repeated framing can read as accumulating evidence.",
+    "Little time remains, which favours the status quo unless a qualifying move is already in motion."
+  ],
+  "reasoning_strategy_tags": [
+    "base_rate",
+    "status_quo",
+    "institutional_process",
+    "deadline_hazard",
+    "source_reconciliation"
+  ],
+  "rationale_summary": "Recent meetings priced this way delivered a cut about 28% of the time, and that reference class is the anchor. Three months of decelerating core inflation and a weakening payroll trend push modestly upward. The chair's 'well positioned' language, which has preceded holds, pushes back. One wire report of a September signal is not supported by the released transcript and is set aside. With four weeks left and no qualifying move under way, the status quo carries most of the weight, so the prior moves up only slightly.",
+  "process_confidence": 0.71,
+  "uncertainty_notes": [
+    "No participant speech between the August data and the blackout period was retrieved, so the most recent official signal may be missing.",
+    "The dissent claim reached the packet through a research agent rather than a direct retrieval, so its content and timestamp are claims."
+  ],
+  "final_prediction": {
+    "probability_yes": 0.34
+  }
+}

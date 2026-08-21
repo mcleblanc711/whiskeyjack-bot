@@ -46,7 +46,10 @@ from whiskeyjack_bot.logging_setup import (
 )
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 from whiskeyjack_bot.prompt import LoadedPrompt, load_prompt
-from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalMultipleChoiceQuestion,
+)
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
 from whiskeyjack_bot.research.packet import ResearchPacket, build_packet
 
@@ -814,3 +817,159 @@ def test_no_configuration_can_buy_a_second_repair(config: AppConfig, prompt: Loa
         assert len(client.calls) == value
         assert result.invocations <= MAX_MODEL_INVOCATIONS
         assert sum(1 for c in client.calls if any(m["role"] == "assistant" for m in c)) <= 1
+
+
+# --- M1-403: the configured probability bounds, inside the repair loop -------------
+
+
+def _narrowed(config: AppConfig, minimum: float, maximum: float) -> AppConfig:
+    """A config whose bounds are narrower than the range the prompt prints.
+
+    ``model_copy`` rather than a re-validated dict, so the substitution cannot quietly
+    pick up any other change to ``config.example.yaml``.
+    """
+    forecast = config.forecast.model_copy(
+        update={"min_probability": minimum, "max_probability": maximum}
+    )
+    return config.model_copy(update={"forecast": forecast})
+
+
+def test_an_out_of_bounds_probability_gets_exactly_one_repair_and_it_can_succeed(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The reason the check lives in the parse step rather than on the result.
+
+    0.9995 validates against the schema (``test_forecast_schema.py`` pins that) and is
+    outside the configured maximum. Applied to the returned result it would waste a
+    billed call; applied here it costs the one repair M1-402 already budgets.
+    """
+    client = _Model(good_reply(final_prediction={"probability_yes": 0.9995}), good_reply())
+    result = _generate(client, config, prompt)
+    assert result.invocations == 2
+    assert result.repair_attempted is True
+    assert result.failure_code is None
+    assert isinstance(result.forecast, BinaryForecastResponse)
+    assert result.forecast.final_prediction.probability_yes == 0.37
+
+
+def test_a_probability_that_stays_out_of_bounds_costs_two_calls_and_no_more(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    reply = good_reply(final_prediction={"probability_yes": 0.9995})
+    client = _Model(reply, reply)
+    result = _generate(client, config, prompt)
+    assert result.invocations == 2
+    assert len(client.calls) == 2
+    assert result.forecast is None
+    # Not ``malformed_response``: the reply was well-formed JSON that satisfied the
+    # schema, and the two failures are distinguishable in the ledger for that reason.
+    assert result.failure_code == "schema_invalid"
+    assert len(result.failure_problems) == 1
+    assert result.failure_problems[0].startswith("final_prediction.probability_yes: ")
+
+
+def test_a_missing_prior_is_repairable_like_any_other_problem(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-403's one presence rule reaches the model through the same turn."""
+    first = json.loads(good_reply())
+    first["model_prior"] = None
+    client = _Model(json.dumps(first), good_reply())
+    result = _generate(client, config, prompt)
+    assert result.invocations == 2
+    assert result.failure_code is None
+    assert result.forecast is not None
+
+
+def test_the_repair_turn_names_the_configured_bounds(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """A repair turn that does not state the actual bound is one no model can satisfy.
+
+    ``prompts/forecaster.md`` prints 0.001-0.999 as a literal while config may narrow
+    it, so a model told only "out of bounds" has nothing to aim at. The bounds are
+    operator configuration; the model's own value stays withheld.
+    """
+    narrowed = _narrowed(config, 0.05, 0.95)
+    reply = good_reply(final_prediction={"probability_yes": 0.02})
+    client = _Model(reply, reply)
+    _generate(client, narrowed, prompt)
+
+    turn = client.calls[1][-1]
+    assert turn["role"] == "user"
+    assert "0.05" in turn["content"]
+    assert "0.95" in turn["content"]
+    # The offending probability is not quoted back as a problem. It does reach the
+    # model in the assistant turn immediately before -- the provider produced it, so
+    # returning it is not a leak, while a *log*, an exception or a ledger row would be.
+    assert "0.02" not in turn["content"]
+    assert client.calls[1][-2]["role"] == "assistant"
+
+
+def test_a_probability_the_prompt_allows_is_refused_by_a_narrower_config(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The integration-level proof that ``forecast.min_probability`` has a consumer.
+
+    0.02 is inside the range the prompt prints to the model and outside this config. A
+    check reading the prompt's literal instead of the config would return a forecast.
+    """
+    reply = good_reply(final_prediction={"probability_yes": 0.02})
+    client = _Model(reply, reply)
+    assert _generate(client, config, prompt).forecast is not None
+
+    client = _Model(reply, reply)
+    result = _generate(client, _narrowed(config, 0.05, 0.95), prompt)
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"
+
+
+def test_a_bounds_pair_admitting_no_probability_is_refused_before_any_billable_call(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """``ForecastConfig`` refuses this at load; the preflight refuses it again here.
+
+    Unchecked it would fail every binary forecast through the repair loop -- two billed
+    calls per question to reject a probability no model could have supplied.
+    """
+    # Bound to names rather than written as literals at the call site. ``_leaks``
+    # renders the traceback, which quotes the *source line* that raised -- so a literal
+    # there makes the leak assertion pass or fail for a reason unrelated to the message
+    # (M1-308 round 5's ``tmp_path`` trap, met again here).
+    low, high = 0.87, 0.13
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(client, _narrowed(config, low, high), prompt)
+    assert client.calls == []
+    assert not _leaks(caught.value, "0.87", "0.13")
+
+
+def test_a_non_binary_response_is_not_bound_checked_here(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """Pins M1-404's and M1-405's boundary from the inside, the M1-402 idiom.
+
+    A multiple-choice reply whose probabilities are outside the configured bounds and
+    sum to well over one is returned as typed output: every one of those checks needs
+    the question's option list, which is M1-404's stated criterion. The dispatch is
+    keyed on the question-type literal, so nothing here approximates it in the meantime.
+    """
+    payload = json.loads(good_reply())
+    payload["question_type"] = "multiple_choice"
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    payload["final_prediction"] = {
+        "options": [
+            {"option": "A", "probability": 0.9995},
+            {"option": "B", "probability": 0.9995},
+        ]
+    }
+    question = CanonicalMultipleChoiceQuestion(
+        question_id=42, post_id=7, title="Which X?", options=["A", "B"]
+    )
+    client = _Model(json.dumps(payload))
+    result = _generate(client, config, prompt, question=question)
+    assert result.invocations == 1
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "multiple_choice"
