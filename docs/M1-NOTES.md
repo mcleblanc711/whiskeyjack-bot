@@ -3204,3 +3204,166 @@ this and M1-305's ten rounds was not the code. It was writing the five headings 
 areas and the mutation-check result *before* round 1 instead of discovering them through it. The
 deviation most likely to be read as an oversight — `retrieval_run_id` having no length ceiling —
 was stated first and came back marked "Safe" rather than as a finding.
+
+## M1-312 — Composing artifact and ledger persistence for a paid run
+
+M1-306 shipped `research/artifacts.py` and `research/store.py` as complete primitives and
+deliberately shipped no composition of them, because the composed entry point belongs with the
+retrieval orchestrator that item does not ship. What it left behind was an ordering rule living
+only in a docstring — *write the artifact first; if it fails, persist the ledger row anyway with
+`raw_response_path` NULL* — in a paragraph that said in as many words that **no function here or
+in the store performs that composition**. Nothing outside tests called either primitive, so the
+first caller on the paid path would have had to re-derive the rule. This item is that rule,
+executed, in `research/persist.py`.
+
+The whole design follows from *when* it is called. By then up to `max_queries_per_question * 2`
+billable calls have been made. An artifact is evidence that the rows came from a real provider
+response; the rows are the record. Losing the evidence is an audit loss. Losing the row is losing
+the record that money was spent at all. **Every decision below resolves in favour of the run
+staying recorded, with the loss reported rather than hidden.**
+
+No migration, no dependency, no schema change: `research_runs.raw_response_path` has been
+nullable since `001_initial.sql`.
+
+### Decision — one function, and a result object that cannot misreport what happened
+
+`persist_paid_run(conn, config, run, documents, *, raw_responses, written_at_utc=None,
+run_opened=False)` attempts `artifacts.write_raw_responses` first, catches `ArtifactError`, and
+then calls `store.persist_retrieval` (or `store.complete_run`) with whatever path survived. It
+returns a frozen `PaidRunPersistence` carrying `document_ids`, `raw_response_path`,
+`artifact_outcome` and `artifact_error`.
+
+`artifact_outcome` is a three-valued `Literal`, not a bool, because `retention_disabled` and
+`failed` both leave the path NULL and a caller auditing the ledger cannot otherwise tell "the
+operator asked us not to keep it" from "we tried and lost it". The dataclass's `__post_init__`
+refuses every combination that would misdescribe the outcome — a "written" result with no path, a
+"failed" one with no error, a "disabled" one carrying either — so the report is structurally
+unable to hide an audit loss. That guard is not decoration: it is the second half of "reports the
+audit loss to its caller rather than swallowing it", and mutation 2 below is caught by it.
+
+### Decision — `retrieval.retain_raw_responses AND storage.retain_raw_research`, resolved here
+
+Two configured flags both mean "keep raw research" and **nothing in the project had ever combined
+them**. They are combined with `and`: either one off means no file and no recorded path. Honouring
+the narrower of two switches is the reading that cannot store something an operator turned off,
+and it is the stricter reading of an ambiguity CLAUDE.md says to resolve strictly and note.
+
+`artifacts.py` still reads no config and is still handed an explicit `retain`, as its own
+docstring promises; `persist.py` is the one place that knows what the operator's two switches mean
+together. It takes `config: AppConfig` for the same reason `store.replay_research` does, and
+type-checks `artifact_root` rather than trusting it, so an `AppConfig`-shaped object that is not
+one arrives as `StoreError` instead of a raw `TypeError` from `artifact_root / relative` two calls
+down.
+
+### Decision — every `ArtifactError` degrades, including a caller mistake
+
+`write_raw_responses` raises one exception type for an ordinary I/O failure, a destination that
+already exists, **and** a caller mistake — a run id that satisfies `IdentifierString` but not the
+artifact layout's `_SAFE_RUN_ID_RE` (`run/1` is non-blank and NUL-free, so the model and
+`006_non_blank_identifiers.sql` both accept it, and the artifact layer refuses it because a run id
+becomes a path component). Sorting them by type is not possible, and it is not desirable either:
+the calls are already paid for, so refusing any of them would trade a lost artifact for a lost
+run. All of them degrade to `outcome="failed"` with the message reported and logged.
+
+This is a deliberate departure from M1-303's round-4 rule that a caller mistake is refused *before*
+billing. That rule holds on the other side of the spend; this function is only ever called after
+it.
+
+### Decision — `StoreError`, not a third exception type
+
+The only exception a caller handles is `StoreError`. `persist.py` adds no failure mode of its own:
+an artifact failure never raises out of it by design, and its input refusals are the store's own
+refusals applied one call earlier. A separate `PersistError` would fragment one contract for no
+gain, and callers would have to catch both to learn nothing extra. Both wrapped error types are
+already sanitized, and filesystem paths remain the settled M1-401 carve-out — a path is what makes
+an artifact failure actionable.
+
+### Decision — `run_opened` is a checked bool, not a truthiness test
+
+It selects *which* ledger write happens and has no safe default to guess at: guessing wrong either
+inserts a duplicate or completes the wrong row. Checked with `type(...) is not bool`, which is
+M1-306 round 2's `completed_only=None` defect one argument over — that one returned an **open** run
+from a call asking for finished evidence, by taking the false branch of a truthiness test.
+
+### Deviation — three refusals still lose the run, and the list is deliberately short
+
+`persist_paid_run` raises before doing anything for a non-`ResearchRun`, a run with no
+`completed_at_utc`, and a run already carrying `raw_response_path`. Each of those loses a paid
+run's row, which is the outcome this module exists to prevent, so each has to earn its place by
+being a **contradiction** rather than a mishap:
+
+- the first two are refused by both ledger writers anyway; failing before the artifact write at
+  least leaves no orphan file behind.
+- the third: `store._run_parameters` writes the *argument* and ignores the model's field, so
+  accepting a run that already claims a path would silently discard the caller's claim about where
+  its evidence lives. This function mints that path.
+
+A caller that cannot tolerate the loss opens the run with `store.open_run` before the billable
+calls — which is exactly why the two-phase shape exists — and then this function completes it.
+`written_at_utc` is deliberately *not* pre-validated for the same reason inverted: a bad timestamp
+only affects the artifact, so it degrades through the artifact layer instead of refusing.
+
+### Rejected — recording the artifact failure as a `pipeline_failure_event` (M1-606), and why not
+
+`pipeline_failure_events` is scoped to an `attempt_id` and a `tournament_id` this API does not have
+and should not invent, and its `research_failed` event means the research failed. Here the research
+succeeded and only the evidence copy was lost — recording it as a research failure would make the
+ledger claim something untrue about the retrieval.
+
+### Rejected — deleting an orphan artifact when the ledger write then fails, and why not
+
+If the artifact is written and the ledger write fails, the file stays. An artifact is never
+deleted, for the same reason it is never overwritten; a file with no row is inert, and the next run
+mints a new id, so there is no collision to clean up for. The ledger failure is *raised*, not
+reported — there is no record to report it on.
+
+### Deferred (do not read the absence as an omission)
+
+- **No orchestrator, and no adapter changes.** `AskNewsRetrieval`/`ExaRetrieval` still hold
+  `raw_responses` in memory and nothing calls this function in the product yet. Wiring it is the
+  orchestrator's item; this is the API it will call, and the acceptance criterion is about the API.
+- **The document-level `raw_artifact_path` stays `None`.** Per-document artifacts are a separate
+  layout question the artifact module has not shipped.
+- **Nothing re-attempts a failed artifact write.** A retry API would need to decide what a second
+  attempt means for an immutable record; the criterion asks for the loss to be reported, and it is.
+
+### Standing risk — not verifiable offline
+
+A caller that hands over documents the store refuses (after a successful artifact write) gets a
+`StoreError` and leaves an orphan artifact behind. That is the ordering working as designed, but it
+means document validation happens one step later than the artifact write. Re-validating documents
+before the artifact would duplicate `store._prepare_documents`, and the failure it would avoid is a
+stray file rather than a lost run.
+
+### Verification
+
+`tests/unit/test_research_persist.py` (25 cases) and `tests/property/test_persist_properties.py`
+(2 properties). The acceptance criterion is asserted by three tests driven by **real** failures
+rather than monkeypatched ones — a destination that already exists, an unwritable directory
+(skipped as root), and the `run/1` run id — each asserting no exception, the run row committed,
+`raw_response_path` NULL, the documents present, and the loss reported. The leak test plants
+`privateFAKE123456` in a provider body that `json.dumps` cannot render (`json.dumps` names the
+offending value) and asserts it reaches neither the report, `caplog`, nor `capsys` — both channels,
+because logging's own `%s` interpolation writes to stderr past `caplog` (M1-303).
+
+The properties assert what the unit tests cannot enumerate: over generated runs and documents
+crossed with all three artifact outcomes, the run is always recorded and the path is NULL in
+exactly the two cases where no file was written; and **the packet hash is identical whether the
+artifact was written or lost**, which is the composition-level consequence of `packet.py` excluding
+`raw_response_path` from the digest. That second one is what makes a lost artifact an *audit* loss
+and not a change to what was retrieved.
+
+**Mutation check — all ten discriminate.** `ArtifactError` propagated; the failure swallowed
+without an error; the ledger written before the artifact (caught by the orphan-artifact ordering
+test); retention resolved with `or`; `run_opened` tested for truthiness; the stale-path refusal
+removed; the `run_opened` branch inverted; each of the three result-object guards removed; and the
+artifact's identity taken from something other than the run. Every one turned at least one new test
+red.
+
+One process note worth keeping, because it cost a real correction: the mutation runner's first
+version restored `persist.py` from a backup it took at the start of each run, and a 2-minute
+command timeout killed it mid-mutation, so the `finally` never ran — the *next* invocation then
+backed up the already-mutated file and "restored" the mutation. Rewritten to restore from a
+pristine copy taken once, outside the loop, and to assert byte-equality afterwards. This is
+`docs/LESSONS.md`'s stale-bytecode trap in a different costume: **a mutation harness that can
+silently fail to restore is indistinguishable from a test suite that does not catch the mutation.**
