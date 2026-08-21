@@ -40,7 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-312 | feat/m1-312-compose-paid-run-persistence | whiskeyjack-m1-312 | no | none | 2026-08-20 |
+| M1-501 | feat/m1-501-validate-attribution-fields | whiskeyjack-m1-501 | no | none | 2026-08-21 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
