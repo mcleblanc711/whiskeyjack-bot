@@ -101,24 +101,41 @@ def _question(**overrides: Any) -> CanonicalBinaryQuestion:
     return CanonicalBinaryQuestion(**fields)
 
 
-def _packet(question_id: int = 42) -> ResearchPacket:
+def _document(url: str) -> ResearchDocument:
+    return ResearchDocument(
+        retrieval_run_id="run-1",
+        original_url=url,
+        canonical_url=url,
+        retrieved_at_utc=NOW,
+        source_type="news",
+        provenance="direct_api",
+        content_sha256=hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        summary="a summary",
+    )
+
+
+def _packet(question_id: int = 42, documents: int = 2) -> ResearchPacket:
+    """A packet with two documents by default, which is not arbitrary (M1-501).
+
+    ``forecast.inputs`` mints one ``src-NNN`` per document in ``dedup_key`` order, and
+    M1-501 resolves every citation against exactly that set -- so the packet has to
+    supply what ``good_reply()`` cites. That reply is the *prompt's own example*, which
+    cites ``src-001`` in ``base_rate`` and ``src-002`` in ``evidence_adjustments`` and
+    ``load_bearing_facts``. One document here would fail every reply in this file for a
+    reason that has nothing to do with what the test is about.
+
+    ``documents=0`` builds the no-research packet, which is a real state
+    (``research/store.py``: "a question researched and found nothing") and the one where
+    M1-501's evidence rules deliberately stand down.
+    """
     run = ResearchRun(
         retrieval_run_id="run-1",
         question_id=question_id,
         provider="asknews",
         started_at_utc=NOW,
     )
-    document = ResearchDocument(
-        retrieval_run_id="run-1",
-        original_url="https://a.example/x",
-        canonical_url="https://a.example/x",
-        retrieved_at_utc=NOW,
-        source_type="news",
-        provenance="direct_api",
-        content_sha256=hashlib.sha256(b"x").hexdigest(),
-        summary="a summary",
-    )
-    return build_packet(question_id, [run], [document])
+    urls = ["https://a.example/x", "https://b.example/y"]
+    return build_packet(question_id, [run], [_document(url) for url in urls[:documents]])
 
 
 class _Model:
@@ -615,12 +632,27 @@ _FORBIDDEN = {
 }
 
 
-def test_the_response_schema_reaches_no_provider_client() -> None:
+@pytest.mark.parametrize(
+    "module",
+    [
+        "whiskeyjack_bot.forecast.schema",
+        "whiskeyjack_bot.forecast.binary",
+        "whiskeyjack_bot.forecast.attribution",
+    ],
+)
+def test_the_response_schema_reaches_no_provider_client(module: str) -> None:
     """M1-406 must replay a stored response and reproduce the parsed forecast with
     zero API calls, and M1-306 established that zero-calls is a property of the import
-    graph rather than of a mock count. If the schema cannot reach an SDK, a replay
-    path built on it has no call to make."""
-    added = _added_modules("whiskeyjack_bot.forecast.schema")
+    graph rather than of a mock count. If these cannot reach an SDK, a replay path
+    built on them has no call to make.
+
+    Widened by M1-501 from ``schema`` alone to all three: ``binary.py`` and
+    ``attribution.py`` both make the claim in their docstrings, and ``attribution.py``
+    rests a design decision on it -- it takes primitives rather than a ``ModelInput``
+    precisely so that importing ``forecast.inputs``, which reaches the SDK, is not
+    forced. A claim only a docstring makes is one a later import can quietly end.
+    """
+    added = _added_modules(module)
     assert not (added & _FORBIDDEN), sorted(added & _FORBIDDEN)
 
 
@@ -973,3 +1005,139 @@ def test_a_non_binary_response_is_not_bound_checked_here(
     assert result.failure_code is None
     assert result.forecast is not None
     assert result.forecast.question_type == "multiple_choice"
+
+
+# --- M1-501: the attribution fields and the citations ----------------------------
+
+
+def _citing(field: str, ids: list[str], **overrides: Any) -> str:
+    """``good_reply()`` with one of its ``source_ids`` lists rewritten."""
+    payload = json.loads(good_reply())
+    if field == "base_rate":
+        payload["base_rate"] = {**payload["base_rate"], "source_ids": ids}
+    else:
+        entries = [dict(entry) for entry in payload[field]]
+        entries[0]["source_ids"] = ids
+        payload[field] = entries
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_the_packet_supplies_exactly_what_a_compliant_reply_cites(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The premise every test below rests on, asserted rather than assumed.
+
+    ``good_reply()`` is the prompt's own example and cites ``src-001`` and ``src-002``;
+    ``_packet()`` supplies two documents, so ``forecast.inputs`` mints exactly those two
+    ids. If that ever drifts, these tests would pass or fail for a reason unrelated to
+    what they are about.
+    """
+    result = _generate(_Model(good_reply()), config, prompt)
+    assert [reference.source_id for reference in result.sources] == ["src-001", "src-002"]
+    assert result.failure_code is None
+
+
+def test_an_unresolvable_citation_gets_exactly_one_repair_and_it_can_succeed(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The reason M1-501's checks live in the parse step, like M1-403's.
+
+    A citation naming a document that was never supplied parses, is in bounds, and is
+    invisible at every later layer -- only the source mapping this call is holding can
+    see it. Caught here it costs the repair M1-402 already budgets.
+    """
+    client = _Model(_citing("evidence_adjustments", ["src-009"]), good_reply())
+    result = _generate(client, config, prompt)
+    assert result.invocations == 2
+    assert result.repair_attempted is True
+    assert result.failure_code is None
+    assert isinstance(result.forecast, BinaryForecastResponse)
+
+
+def test_a_citation_that_stays_unresolvable_costs_two_calls_and_no_more(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    reply = _citing("load_bearing_facts", ["src-009"])
+    client = _Model(reply, reply)
+    result = _generate(client, config, prompt)
+    assert result.invocations == 2
+    assert len(client.calls) == 2
+    assert result.forecast is None
+    # Not ``malformed_response``: the reply was well-formed JSON that satisfied the
+    # schema. The distinction is the one the ledger keeps.
+    assert result.failure_code == "schema_invalid"
+    assert result.failure_problems == (
+        "load_bearing_facts.0.source_ids: must name only source_ids supplied in "
+        "research_documents (offending input withheld)",
+    )
+
+
+def test_the_repair_turn_names_the_location_and_not_the_cited_id(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """Deliberately unlike ``test_the_repair_turn_names_the_configured_bounds``.
+
+    M1-403 renders its bounds because the prompt prints a different literal than config
+    may hold, so a model told only "out of bounds" has nothing to aim at. Here the model
+    already holds the whole id list in its own request under ``research_documents``, so
+    neither the cited id nor the supplied set is named back.
+    """
+    invented = "src-009"
+    reply = _citing("evidence_adjustments", [invented])
+    client = _Model(reply, reply)
+    _generate(client, config, prompt)
+
+    turn = client.calls[1][-1]
+    assert turn["role"] == "user"
+    assert "evidence_adjustments.0.source_ids" in turn["content"]
+    # It does reach the model in the assistant turn immediately before -- the provider
+    # produced it, so returning it is not a leak, while a log, an exception or a ledger
+    # row would be.
+    assert invented not in turn["content"]
+    assert client.calls[1][-2]["role"] == "assistant"
+
+
+def test_a_forecast_answering_another_question_is_refused_and_repairable(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """``prompts/forecaster.md`` line 157 asks the model to confirm the question id
+    matches; nothing checked it, so a record could have carried a question the model
+    invented."""
+    client = _Model(good_reply(question_id=99), good_reply())
+    result = _generate(client, config, prompt)
+    assert result.invocations == 2
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_id == 42
+
+
+def test_a_no_research_packet_does_not_fail_every_forecast(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The conditional, at the integration level, and the reason it exists.
+
+    A packet may hold no documents -- ``research/store.py`` names the state. Requiring
+    a citation that cannot exist would cost two billed calls per question to reject a
+    reply no model could have given. **M1-504** owns whether such a forecast may proceed
+    at all; M1-501 declines to decide it here.
+    """
+    reply = _citing("base_rate", [], evidence_adjustments=[], load_bearing_facts=[])
+    client = _Model(reply)
+    result = _generate(client, config, prompt, packet=_packet(documents=0))
+    assert result.invocations == 1
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.sources == ()
+
+
+def test_a_no_research_packet_still_refuses_a_citation(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The other side of the conditional: naming evidence that does not exist is still
+    refused, so nothing passes silently."""
+    client = _Model(good_reply(), good_reply())
+    result = _generate(client, config, prompt, packet=_packet(documents=0))
+    assert result.invocations == 2
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"

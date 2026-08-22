@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import assume, given
+from hypothesis import assume, event, given
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT, research_documents, round_trip
 
@@ -31,6 +31,11 @@ from whiskeyjack_bot.forecast.inputs import (
     render_model_input,
 )
 from whiskeyjack_bot.config import ForecastConfig
+from whiskeyjack_bot.forecast.attribution import (
+    AttributionFieldError,
+    attribution_problems,
+    validate_attribution_fields,
+)
 from whiskeyjack_bot.forecast.binary import binary_output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
@@ -580,3 +585,305 @@ def test_the_invariance_property_can_see_the_bounds_change(
     right = binary_output_problems(forecast, _forecast_config(*second))
     assert left and right
     assert left != right
+
+
+# --- 6. the attribution fields and their citations (M1-501) -----------------------
+
+# Small pools, so a citation that resolves and one that does not are both drawn often
+# rather than by luck. ``src-009`` is never supplied.
+_SUPPLIABLE = ["src-001", "src-002", "src-003"]
+_CITABLE = [*_SUPPLIABLE, "src-009"]
+
+_ADJUSTMENT = VALID_PAYLOAD["evidence_adjustments"][0]
+_FACT = VALID_PAYLOAD["load_bearing_facts"][0]
+_VALID_QUESTION_ID = VALID_PAYLOAD["question_id"]
+
+CITATIONS = st.lists(st.sampled_from(_CITABLE), max_size=2)
+
+
+def _attribution_response(
+    *,
+    base_ids: list[str],
+    adjustment_ids: list[list[str]],
+    fact_ids: list[list[str]],
+    failure_modes: list[str],
+    question_id: int,
+) -> BinaryForecastResponse:
+    payload = json.loads(json.dumps(VALID_PAYLOAD))
+    payload["question_id"] = question_id
+    payload["base_rate"]["source_ids"] = base_ids
+    payload["evidence_adjustments"] = [{**_ADJUSTMENT, "source_ids": ids} for ids in adjustment_ids]
+    payload["load_bearing_facts"] = [{**_FACT, "source_ids": ids} for ids in fact_ids]
+    payload["failure_modes"] = failure_modes
+    return validate_forecast_response(payload, BinaryForecastResponse)
+
+
+@st.composite
+def attribution_cases(draw: st.DrawFn) -> tuple[BinaryForecastResponse, int, tuple[str, ...]]:
+    """A response whose every attribution field was drawn, and the ids it is checked
+    against. Every rule M1-501 states is reachable from this strategy."""
+    supplied = tuple(draw(st.lists(st.sampled_from(_SUPPLIABLE), max_size=3, unique=True)))
+    response = _attribution_response(
+        base_ids=draw(CITATIONS),
+        adjustment_ids=draw(st.lists(CITATIONS, max_size=2)),
+        fact_ids=draw(st.lists(CITATIONS, max_size=2)),
+        failure_modes=draw(st.lists(st.just("a failure mode"), max_size=2)),
+        question_id=draw(st.sampled_from([_VALID_QUESTION_ID, _VALID_QUESTION_ID + 1])),
+    )
+    return response, draw(st.just(_VALID_QUESTION_ID)), supplied
+
+
+HOSTILE_SOURCE_IDS = st.one_of(
+    st.lists(HOSTILE_TEXT, max_size=3),
+    st.tuples(HOSTILE_TEXT),
+    HOSTILE_TEXT,
+    st.none(),
+    st.integers(),
+    st.lists(st.integers(), max_size=2),
+    st.dictionaries(HOSTILE_TEXT, HOSTILE_TEXT, max_size=2),
+)
+
+
+@given(attribution_cases(), HOSTILE_SOURCE_IDS, st.one_of(HOSTILE_TEXT, st.none(), st.floats()))
+def test_attribution_never_raises_outside_its_own_error_type(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+    source_ids: Any,
+    question_id: Any,
+) -> None:
+    """Every malformed shape must arrive as this module's own error type. A raw
+    TypeError out of a membership test against a non-container, or an AttributeError
+    from a response that is not one, is the defect this project has taken as a review
+    finding twice."""
+    response, _, _ = case
+    for arguments in (
+        {"question_id": _VALID_QUESTION_ID, "source_ids": source_ids},
+        {"question_id": question_id, "source_ids": ["src-001"]},
+        {"question_id": question_id, "source_ids": source_ids},
+    ):
+        try:
+            problems = attribution_problems(response, **arguments)
+        except AttributionFieldError:
+            continue
+        assert all(isinstance(problem, str) for problem in problems)
+
+
+@given(st.one_of(HOSTILE_TEXT, st.none(), st.integers(), st.lists(HOSTILE_TEXT, max_size=2)))
+def test_attribution_refuses_anything_that_is_not_a_response(value: Any) -> None:
+    for entry_point in (attribution_problems, validate_attribution_fields):
+        try:
+            entry_point(value, question_id=_VALID_QUESTION_ID, source_ids=["src-001"])
+        except AttributionFieldError:
+            continue
+        raise AssertionError("a non-response was accepted")
+
+
+def _attribution_location_resolves(location: str) -> bool:
+    """``_resolves_through_the_schema`` with list indices dropped.
+
+    ``schema._sanitize`` renders an int ``loc`` part as ``str(part)``, so a nested
+    problem reads ``evidence_adjustments.0.source_ids``. The index is the schema's own
+    rendering rather than a field name, and the rest must still be one.
+    """
+    parts = [part for part in location.split(".") if not part.isdigit()]
+    return _resolves_through_the_schema(".".join(parts))
+
+
+@given(attribution_cases())
+def test_every_attribution_problem_is_reported_at_a_location_the_schema_authored(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+) -> None:
+    """A problem at a location the schema never declared is a location the model
+    invented, which is the leak ``schema._sanitize`` exists to prevent."""
+    response, question_id, supplied = case
+    for problem in attribution_problems(response, question_id=question_id, source_ids=supplied):
+        location, separator, message = problem.partition(": ")
+        assert separator == ": ", problem
+        assert message
+        assert _attribution_location_resolves(location), problem
+
+
+@given(
+    st.lists(st.sampled_from(_SUPPLIABLE), min_size=1, max_size=3, unique=True),
+    st.sampled_from(["base_rate", "evidence_adjustments", "load_bearing_facts"]),
+)
+def test_an_attribution_problem_never_varies_with_the_cited_id_that_failed(
+    supplied: list[str], field: str
+) -> None:
+    """The leak property, written as invariance rather than as a substring check --
+    M1-403's shape, and for the reason restated there: a short marker is a substring of
+    text this module renders for unrelated reasons.
+
+    Two different invented citations, in the same place, must produce byte-identical
+    output. A message echoing any part of the id could not satisfy that.
+    """
+
+    def verdict(invented: str) -> str:
+        response = _attribution_response(
+            base_ids=[invented] if field == "base_rate" else list(supplied[:1]),
+            adjustment_ids=[[invented] if field == "evidence_adjustments" else list(supplied[:1])],
+            fact_ids=[[invented] if field == "load_bearing_facts" else list(supplied[:1])],
+            failure_modes=["a failure mode"],
+            question_id=_VALID_QUESTION_ID,
+        )
+        return "\n".join(
+            attribution_problems(response, question_id=_VALID_QUESTION_ID, source_ids=supplied)
+        )
+
+    first = verdict("AAAAAAAAAA")
+    second = verdict("ZZZZZZZZZZ")
+    assert first == second
+    # Vacuity guard: neither invented id was supplied, so there must *be* a problem.
+    assert first
+
+
+@given(st.sampled_from(_SUPPLIABLE), st.sampled_from(_SUPPLIABLE))
+def test_the_invariance_property_can_see_the_supplied_set_change(cited: str, other: str) -> None:
+    """The twin of the property above, and the pair is the point.
+
+    Invariance alone is satisfied by a constant string, which would pass every leak
+    check while making the checker useless. This says the verdict is *not* invariant in
+    what was supplied: the same citation is a problem when it was not supplied and no
+    problem when it was.
+    """
+    assume(cited != other)
+    response = _attribution_response(
+        base_ids=[cited],
+        adjustment_ids=[[cited]],
+        fact_ids=[[cited]],
+        failure_modes=["a failure mode"],
+        question_id=_VALID_QUESTION_ID,
+    )
+    assert attribution_problems(response, question_id=_VALID_QUESTION_ID, source_ids=[cited]) == []
+    assert attribution_problems(response, question_id=_VALID_QUESTION_ID, source_ids=[other])
+
+
+@given(attribution_cases())
+def test_the_evidence_rules_stand_down_exactly_when_nothing_was_supplied(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+) -> None:
+    """The conditional stated as a biconditional, in both directions at once.
+
+    M1-504 owns whether a no-research forecast may proceed; M1-501 owns only that the
+    citation rules do not fail a reply no model could have given. An implementation
+    that dropped the condition, or inverted it, breaks this in one direction or the
+    other -- which a one-sided example test cannot see.
+    """
+    response, question_id, supplied = case
+    problems = attribution_problems(response, question_id=question_id, source_ids=supplied)
+    conditional = {
+        "evidence_adjustments: must not be empty" in problems,
+        "load_bearing_facts: must not be empty" in problems,
+        any("must cite at least one source_id" in problem for problem in problems),
+    }
+    if not supplied:
+        assert conditional == {False}
+    # The unconditional half never stands down, whatever was supplied.
+    assert ("failure_modes: must not be empty" in problems) == (not response.failure_modes)
+
+
+# The seven rules restated in the test's own words, from the *drawn* inputs rather than
+# from the implementation. Every message is written out here as a literal: importing the
+# module's constants would make this property pass whatever those constants say, which is
+# M1-303's lesson and the reason `_resolves_through_the_schema` walks `model_fields` too.
+#
+# It duplicates logic, deliberately. The failure mode a truth table catches is not "the
+# rule is written wrongly twice" -- the unit suite pins each message against a literal for
+# that -- it is "a rule quietly stopped firing", which every one-sided property misses. The
+# first mutation run proved the point: with only the one-sided conditional property here,
+# removing R1, R3, R4, R5 or R7 outright escaped every property in this file.
+def _expected_attribution_problems(
+    response: BinaryForecastResponse, question_id: int, supplied: tuple[str, ...]
+) -> set[str]:
+    available = set(supplied)
+    require_one = bool(available)
+    expected: set[str] = set()
+    if response.question_id != question_id:
+        expected.add(
+            "question_id: must be the question this forecast was requested for "
+            "(offending input withheld)"
+        )
+    if not response.failure_modes:
+        expected.add("failure_modes: must not be empty")
+
+    lists: list[tuple[str, list[str], bool]] = [
+        ("base_rate.source_ids", list(response.base_rate.source_ids), False)
+    ]
+    if require_one and not response.evidence_adjustments:
+        expected.add("evidence_adjustments: must not be empty")
+    for index, adjustment in enumerate(response.evidence_adjustments):
+        lists.append(
+            (f"evidence_adjustments.{index}.source_ids", list(adjustment.source_ids), require_one)
+        )
+    if require_one and not response.load_bearing_facts:
+        expected.add("load_bearing_facts: must not be empty")
+    for index, fact in enumerate(response.load_bearing_facts):
+        lists.append((f"load_bearing_facts.{index}.source_ids", list(fact.source_ids), require_one))
+
+    for location, cited, needs_one in lists:
+        if needs_one and not cited:
+            expected.add(
+                f"{location}: must cite at least one source_id supplied in research_documents"
+            )
+        if any(value not in available for value in cited):
+            expected.add(
+                f"{location}: must name only source_ids supplied in research_documents "
+                "(offending input withheld)"
+            )
+        if len(set(cited)) != len(cited):
+            expected.add(f"{location}: must not repeat a source_id")
+    return expected
+
+
+@given(attribution_cases())
+def test_the_problem_set_is_exactly_what_the_seven_rules_specify(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+) -> None:
+    """The truth table, enumerated mechanically -- M1-308 round 5's remedy.
+
+    Equality, not containment: a rule that stopped firing fails it, and so does a rule
+    that fires where it should not. The one-sided properties around it each say something
+    this cannot (invariance, location shape, replay stability); what this adds is that
+    every rule is still there at all.
+    """
+    response, question_id, supplied = case
+    problems = attribution_problems(response, question_id=question_id, source_ids=supplied)
+    assert set(problems) == _expected_attribution_problems(response, question_id, supplied)
+    # No duplicates: the set comparison above would not see one.
+    assert len(problems) == len(set(problems))
+
+
+@given(attribution_cases())
+def test_the_truth_table_property_is_not_vacuous(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+) -> None:
+    """The guard on the property above: the strategy must reach both verdicts.
+
+    A truth table asserted only over inputs that produce no problems is a test that the
+    checker returns an empty list. ``attribution_cases`` draws ``src-009``, empty lists,
+    repeats and a mismatched question id, so both halves are reachable -- and hypothesis
+    reports the split rather than this test asserting a rate it cannot know.
+    """
+    response, question_id, supplied = case
+    problems = attribution_problems(response, question_id=question_id, source_ids=supplied)
+    event("problems found" if problems else "no problems")
+    assert isinstance(problems, list)
+
+
+@given(attribution_cases())
+def test_attribution_is_stable_across_the_storage_boundary(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+) -> None:
+    """The verdict must be a function of the *persisted* form, M1-305's rule.
+
+    ``model_dump(mode="json")`` renders exactly what the ledger stores, and M1-602 will
+    validate stored records rather than in-memory ones. A checker whose answer changed
+    across that boundary would pass every test that never went through the ledger.
+    """
+    response, question_id, supplied = case
+    persisted = json.dumps(
+        response.model_dump(mode="json"), ensure_ascii=True, sort_keys=True, allow_nan=False
+    )
+    reloaded = validate_forecast_response(json.loads(persisted), BinaryForecastResponse)
+    assert attribution_problems(
+        reloaded, question_id=question_id, source_ids=supplied
+    ) == attribution_problems(response, question_id=question_id, source_ids=supplied)

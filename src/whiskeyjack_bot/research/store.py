@@ -23,7 +23,10 @@ longer raise a mid-run failure away, and a single terminal insert would still lo
 record of every paid call if the process died before it. Opening the row first means
 the spend stays attributable even when the process does not survive to describe it.
 :func:`persist_retrieval` is the one-shot composition for a caller that already holds
-a completed run.
+a completed run. Neither writer knows anything about the raw artifact beyond the path it
+is handed: a caller on the *paid* path uses
+:func:`whiskeyjack_bot.research.persist.persist_paid_run` (M1-312), which attempts the
+artifact write first and then calls one of these two with whatever path survived.
 
 **Replay reads the normalized rows, never the raw artifacts.** Re-normalizing stored
 provider bodies would make a replayed packet depend on adapter *code version*, so

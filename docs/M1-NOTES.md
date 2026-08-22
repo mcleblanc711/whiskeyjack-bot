@@ -3204,3 +3204,599 @@ this and M1-305's ten rounds was not the code. It was writing the five headings 
 areas and the mutation-check result *before* round 1 instead of discovering them through it. The
 deviation most likely to be read as an oversight — `retrieval_run_id` having no length ceiling —
 was stated first and came back marked "Safe" rather than as a finding.
+
+## M1-312 — Composing artifact and ledger persistence for a paid run
+
+M1-306 shipped `research/artifacts.py` and `research/store.py` as complete primitives and
+deliberately shipped no composition of them, because the composed entry point belongs with the
+retrieval orchestrator that item does not ship. What it left behind was an ordering rule living
+only in a docstring — *write the artifact first; if it fails, persist the ledger row anyway with
+`raw_response_path` NULL* — in a paragraph that said in as many words that **no function here or
+in the store performs that composition**. Nothing outside tests called either primitive, so the
+first caller on the paid path would have had to re-derive the rule. This item is that rule,
+executed, in `research/persist.py`.
+
+The whole design follows from *when* it is called. By then up to `max_queries_per_question * 2`
+billable calls have been made. An artifact is evidence that the rows came from a real provider
+response; the rows are the record. Losing the evidence is an audit loss. Losing the row is losing
+the record that money was spent at all. **Every decision below resolves in favour of the run
+staying recorded, with the loss reported rather than hidden.**
+
+No migration, no dependency, no schema change: `research_runs.raw_response_path` has been
+nullable since `001_initial.sql`.
+
+### Decision — one function, and a result object that cannot misreport what happened
+
+`persist_paid_run(conn, config, run, documents, *, raw_responses, written_at_utc=None,
+run_opened=False)` attempts `artifacts.write_raw_responses` first, catches `ArtifactError`, and
+then calls `store.persist_retrieval` (or `store.complete_run`) with whatever path survived. It
+returns a frozen `PaidRunPersistence` carrying `document_ids`, `raw_response_path`,
+`artifact_outcome` and `artifact_error`.
+
+`artifact_outcome` is a three-valued `Literal`, not a bool, because `retention_disabled` and
+`failed` both leave the path NULL and a caller auditing the ledger cannot otherwise tell "the
+operator asked us not to keep it" from "we tried and lost it". The dataclass's `__post_init__`
+refuses every combination that would misdescribe the outcome — a "written" result with no path, a
+"failed" one with no error, a "disabled" one carrying either — so the report is structurally
+unable to hide an audit loss. That guard is not decoration: it is the second half of "reports the
+audit loss to its caller rather than swallowing it", and mutation 2 below is caught by it.
+
+### Decision — `retrieval.retain_raw_responses AND storage.retain_raw_research`, resolved here
+
+Two configured flags both mean "keep raw research" and **nothing in the project had ever combined
+them**. They are combined with `and`: either one off means no file and no recorded path. Honouring
+the narrower of two switches is the reading that cannot store something an operator turned off,
+and it is the stricter reading of an ambiguity CLAUDE.md says to resolve strictly and note.
+
+`artifacts.py` still reads no config and is still handed an explicit `retain`, as its own
+docstring promises; `persist.py` is the one place that knows what the operator's two switches mean
+together. It takes `config: AppConfig` for the same reason `store.replay_research` does, and
+type-checks `artifact_root` rather than trusting it, so an `AppConfig`-shaped object that is not
+one arrives as `StoreError` instead of a raw `TypeError` from `artifact_root / relative` two calls
+down.
+
+### Decision — every `ArtifactError` degrades, including a caller mistake
+
+`write_raw_responses` raises one exception type for an ordinary I/O failure, a destination that
+already exists, **and** a caller mistake — a run id that satisfies `IdentifierString` but not the
+artifact layout's `_SAFE_RUN_ID_RE` (`run/1` is non-blank and NUL-free, so the model and
+`006_non_blank_identifiers.sql` both accept it, and the artifact layer refuses it because a run id
+becomes a path component). Sorting them by type is not possible, and it is not desirable either:
+the calls are already paid for, so refusing any of them would trade a lost artifact for a lost
+run. All of them degrade to `outcome="failed"` with the message reported and logged.
+
+This is a deliberate departure from M1-303's round-4 rule that a caller mistake is refused *before*
+billing. That rule holds on the other side of the spend; this function is only ever called after
+it.
+
+### Decision — `StoreError`, not a third exception type
+
+The only exception a caller handles is `StoreError`. `persist.py` adds no failure mode of its own:
+an artifact failure never raises out of it by design, and its input refusals are the store's own
+refusals applied one call earlier. A separate `PersistError` would fragment one contract for no
+gain, and callers would have to catch both to learn nothing extra. Both wrapped error types are
+already sanitized, and filesystem paths remain the settled M1-401 carve-out — a path is what makes
+an artifact failure actionable.
+
+### Decision — `run_opened` is a checked bool, not a truthiness test
+
+It selects *which* ledger write happens and has no safe default to guess at: guessing wrong either
+inserts a duplicate or completes the wrong row. Checked with `type(...) is not bool`, which is
+M1-306 round 2's `completed_only=None` defect one argument over — that one returned an **open** run
+from a call asking for finished evidence, by taking the false branch of a truthiness test.
+
+### Deviation — three refusals still lose the run, and the list is deliberately short
+
+`persist_paid_run` raises before doing anything for a non-`ResearchRun`, a run with no
+`completed_at_utc`, and a run already carrying `raw_response_path`. Each of those loses a paid
+run's row, which is the outcome this module exists to prevent, so each has to earn its place by
+being a **contradiction** rather than a mishap:
+
+- the first two are refused by both ledger writers anyway; failing before the artifact write at
+  least leaves no orphan file behind.
+- the third: `store._run_parameters` writes the *argument* and ignores the model's field, so
+  accepting a run that already claims a path would silently discard the caller's claim about where
+  its evidence lives. This function mints that path.
+
+A caller that cannot tolerate the loss opens the run with `store.open_run` before the billable
+calls — which is exactly why the two-phase shape exists — and then this function completes it.
+`written_at_utc` is deliberately *not* pre-validated for the same reason inverted: a bad timestamp
+only affects the artifact, so it degrades through the artifact layer instead of refusing.
+
+### Rejected — recording the artifact failure as a `pipeline_failure_event` (M1-606), and why not
+
+`pipeline_failure_events` is scoped to an `attempt_id` and a `tournament_id` this API does not have
+and should not invent, and its `research_failed` event means the research failed. Here the research
+succeeded and only the evidence copy was lost — recording it as a research failure would make the
+ledger claim something untrue about the retrieval.
+
+### Rejected — deleting an orphan artifact when the ledger write then fails, and why not
+
+If the artifact is written and the ledger write fails, the file stays. An artifact is never
+deleted, for the same reason it is never overwritten; a file with no row is inert, and the next run
+mints a new id, so there is no collision to clean up for. The ledger failure is *raised*, not
+reported — there is no record to report it on.
+
+### Deferred (do not read the absence as an omission)
+
+- **No orchestrator, and no adapter changes.** `AskNewsRetrieval`/`ExaRetrieval` still hold
+  `raw_responses` in memory and nothing calls this function in the product yet. Wiring it is the
+  orchestrator's item; this is the API it will call, and the acceptance criterion is about the API.
+- **The document-level `raw_artifact_path` stays `None`.** Per-document artifacts are a separate
+  layout question the artifact module has not shipped.
+- **Nothing re-attempts a failed artifact write.** A retry API would need to decide what a second
+  attempt means for an immutable record; the criterion asks for the loss to be reported, and it is.
+
+### Standing risk — not verifiable offline
+
+A caller that hands over documents the store refuses (after a successful artifact write) gets a
+`StoreError` and leaves an orphan artifact behind. That is the ordering working as designed, but it
+means document validation happens one step later than the artifact write. Re-validating documents
+before the artifact would duplicate `store._prepare_documents`, and the failure it would avoid is a
+stray file rather than a lost run.
+
+### Verification
+
+`tests/unit/test_research_persist.py` (25 cases) and `tests/property/test_persist_properties.py`
+(2 properties). The acceptance criterion is asserted by three tests driven by **real** failures
+rather than monkeypatched ones — a destination that already exists, an unwritable directory
+(skipped as root), and the `run/1` run id — each asserting no exception, the run row committed,
+`raw_response_path` NULL, the documents present, and the loss reported. The leak test plants
+`privateFAKE123456` in a provider body that `json.dumps` cannot render (`json.dumps` names the
+offending value) and asserts it reaches neither the report, `caplog`, nor `capsys` — both channels,
+because logging's own `%s` interpolation writes to stderr past `caplog` (M1-303).
+
+The properties assert what the unit tests cannot enumerate: over generated runs and documents
+crossed with all three artifact outcomes, the run is always recorded and the path is NULL in
+exactly the two cases where no file was written; and **the packet hash is identical whether the
+artifact was written or lost**, which is the composition-level consequence of `packet.py` excluding
+`raw_response_path` from the digest. That second one is what makes a lost artifact an *audit* loss
+and not a change to what was retrieved.
+
+**Mutation check — all ten discriminate.** `ArtifactError` propagated; the failure swallowed
+without an error; the ledger written before the artifact (caught by the orphan-artifact ordering
+test); retention resolved with `or`; `run_opened` tested for truthiness; the stale-path refusal
+removed; the `run_opened` branch inverted; each of the three result-object guards removed; and the
+artifact's identity taken from something other than the run. Every one turned at least one new test
+red.
+
+One process note worth keeping, because it cost a real correction: the mutation runner's first
+version restored `persist.py` from a backup it took at the start of each run, and a 2-minute
+command timeout killed it mid-mutation, so the `finally` never ran — the *next* invocation then
+backed up the already-mutated file and "restored" the mutation. Rewritten to restore from a
+pristine copy taken once, outside the loop, and to assert byte-equality afterwards. This is
+`docs/LESSONS.md`'s stale-bytecode trap in a different costume: **a mutation harness that can
+silently fail to restore is indistinguishable from a test suite that does not catch the mutation.**
+
+## M1-309 — AskNews caller preflight
+
+Filed off M1-303's round-4 cross-model review, which found five caller-mistake holes in
+`research/exa.py` and noted that two of them are equally present in the already-merged AskNews
+adapter: `queries: Sequence[str]` accepts a bare `str` (which `list()` silently explodes into one
+billable call per character), and malformed run metadata (`question_id`, `retrieval_run_id`, `now`)
+reaches `ResearchRun` validation only at the end of a run, after every call has already been billed.
+The other three round-4 findings (client-URL binding, `decide_fallback`'s bool gating, domain
+canonicalization) have no AskNews analog — no client-URL-spoofing surface, no `include_domains`.
+
+### Decision — a new shared module, `research/preflight.py`
+
+The acceptance criterion requires the guard be shared with Exa, not copied. `string_list` and
+`require_run_metadata` moved there verbatim from `exa.py`'s `_string_list`/`_require_run_metadata`,
+generalized to take the caller's own exception type as `error: type[Exception]` — the guard logic
+lives in exactly one place, while each adapter still raises only its own module's error, per the
+project's error-hygiene rule. `exa.py`'s two private functions are now one-line delegators bound to
+`error=ExaFallbackError`; every existing call site and every existing `test_exa.py` case is
+unchanged.
+
+### Decision — `AskNewsRetrievalError`, parallel to `ExaFallbackError`
+
+AskNews previously raised only `MissingCredentialError` and defined no exception of its own; the
+module docstring said so explicitly. `AskNewsRetrievalError` is the new module-owned error for the
+two preflight refusals, named to parallel `ExaFallbackError` the way the two adapters' docstrings
+already read as one family.
+
+### Deviation — `now` is normalized to UTC in AskNews too, not just checked
+
+`require_run_metadata` is validate-and-return: it hands back `now` converted to UTC, not merely a
+confirmation that it was tz-aware. AskNews's `retrieve_news` previously used the caller's raw `now`
+directly for `started_at_utc`/`completed_at_utc`/`freshness_cutoff_utc`/`retrieved_at_utc` with no
+runtime check at all. Adopting the shared function closes the same coercion-before-billing shape
+Exa's round-4 finding 4 closed — for free, since it's the same call — rather than writing a
+narrower AskNews-only check that only validates and doesn't normalize. Confirmed live by
+`test_now_is_normalized_to_utc_before_any_use`.
+
+### Rejected — Exa-style client/config-binding checks for AskNews, and why not
+
+Exa's `_require_exa_client` and `_ensure_exa_is_configured_fallback` exist because a caller could
+hold an `httpx.Client` built independently of `build_exa_client`, pointed at another host, while the
+run still records `provider="exa"` — the silent-provider-switch concern D18 and M1-303 are about.
+AskNews has no parallel: `build_asknews_client` returns an `AskNewsSDK` object whose request routing
+isn't caller-swappable the way an `httpx.Client`'s `base_url` is, and `config.retrieval.primary`
+already has to name `asknews` for `retrieve_news` to be called at all in the pipeline's own control
+flow — there is no finding this would close.
+
+### Deferred (do not read the absence as an omission)
+
+No change to AskNews's "never raises on provider failure" contract for the query loop itself — the
+two new raises both happen before `config.retrieval` is even read, so no call has been attempted.
+
+### Standing risk — not verifiable offline
+
+None beyond what the Exa adapter already carries via the shared functions: a caller-supplied
+`tzinfo`/broken iterator still runs arbitrary code inside the guard (caught and converted to the
+module's own error, per `research/preflight.py`'s docstring), and that boundary is unchanged by
+this item.
+
+### Verification
+
+`tests/property/test_preflight_properties.py` — totality (`string_list`/`require_run_metadata`
+raise only the bound `error` class, exercised against two distinct dummy error classes so the
+parameterization is proven, not assumed) and correctness on the valid domain (a non-blank string
+list round-trips; a valid tz-aware `now` always returns UTC-aware and denotes the same instant),
+plus the two concrete round-5 regressions (a broken `tzinfo`, a boundary `datetime` whose UTC
+conversion overflows).
+
+`tests/unit/test_asknews.py` adds eleven parametrized cases (five malformed `queries` shapes, six
+malformed run-metadata shapes) asserting `AskNewsRetrievalError` and `sdk.news.calls == []`, plus
+one asserting the UTC-normalization behavior. All eleven were confirmed to fail against the
+pre-fix code before the guard was wired in — one surfaced the exact live bug shape, a raw
+`TypeError: unsupported operand type(s) for -: 'str' and 'datetime.timedelta'` from an unvalidated
+`now` reaching `freshness_cutoff_utc`'s subtraction.
+
+`tests/unit/test_exa.py` unchanged and green — the extraction is behavior-preserving.
+
+### Round 1 review (GPT) — one blocking finding, reproduced
+
+Reviewed commit `64d9790`. **Finding:** `require_run_metadata` accepts an ordinary aware `now`
+near `datetime.min`, but `freshness_cutoff_utc = now_utc - timedelta(days=...)` was still computed
+only inside the final `validate_run({...})` dict, after the query loop — so that `now` billed both
+the current- and historical-strategy calls and then raised a raw `OverflowError`, with no
+recordable run. Exactly the shape Exa's round-5 finding 3 closed, and the analog my round-4
+port missed: I moved `now`'s tz-awareness/UTC-conversion preflight into the shared function, but
+did not also move the freshness-bound subtraction ahead of the loop the way `exa.py`'s
+`retrieve_web` does.
+
+Reproduced by direct execution against `64d9790` before writing any fix: `now=datetime.min` with
+`tzinfo=timezone.utc`, one valid query, a fake SDK — 2 provider calls made, then
+`OverflowError: date value out of range` raised, no `ResearchRun` returned.
+
+**Fix:** `freshness_cutoff_utc` is now computed once, immediately after the two preflight calls
+and before the query loop, wrapped in `try`/`except OverflowError` that raises
+`AskNewsRetrievalError(...) from None` — the same pattern `exa.py`'s `published_after` computation
+already uses. The value is reused (not recomputed) when the run is built. Added
+`("now", datetime.min.replace(tzinfo=timezone.utc))` as a case in
+`test_malformed_run_metadata_is_refused_before_any_call`, mirroring the equivalent case already in
+`test_exa.py`. Re-verified post-fix: `AskNewsRetrievalError` raised, zero calls made.
+
+## M1-501 — Validating the common attribution fields
+
+**Acceptance criterion:** *schema rejects missing or unknown required fields and invalid source IDs.*
+Two clauses again, and again they are satisfied by different things. The first is **half already
+true** — `forecast/schema.py` makes nine fields structurally required and forbids extras — so what
+this row owes is the rest of it. The second is entirely new, and it is the one that matters: nothing
+in this pipeline had ever resolved a citation against the documents the model was actually shown.
+
+### What the criterion is actually guarding against
+
+`forecast/inputs.py` mints `src-001`… over a packet's documents in `dedup_key` order and hands the
+mapping back as `ModelInput.sources`. It is the only structure that knows which evidence a given
+forecast was allowed to cite, it is built one function above the parse step, and **nothing read it**.
+So a response citing `src-009` against a five-document packet parsed, passed M1-403's bounds, came
+out of `generate_forecast` as typed output, and would have reached `forecast_records` as an
+attribution claim with no evidence behind it — discovered, if ever, at an audit where the mapping no
+longer exists.
+
+The same is true one field up. `prompts/forecaster.md:157` asks the model to confirm that "the
+question ID and type match the input". The **type** is enforced, structurally, by which response
+model the dispatch selected. The **id** was taken on trust, so a record could have carried a question
+the model invented.
+
+And three of the fields M1-501's row names — `evidence_adjustments`, `load_bearing_facts`,
+`failure_modes` — carry `default_factory=list` in the schema, so an omitted key or an empty list
+parsed. A forecast with no evidence and no failure-mode check was a well-formed forecast.
+
+### Delivered
+
+- `forecast/attribution.py` — `attribution_problems()` (the pure checker, returning sanitized problem
+  strings) and `validate_attribution_fields()` (the raising wrapper). Seven rules, three of them
+  conditional. Imports no provider SDK, no question model and **not `forecast.inputs`**.
+- `forecast/generate.py` — the cross-type checks threaded into `_output_problems` ahead of the
+  existing question-type dispatch, and `question_id` handed down to `_run_attempts`. No new preflight
+  refusal, and no change to `_classify`, `_repair_turn` or the invocation accounting.
+- `tests/fixtures/forecasts/binary_golden_sources.json` — the five ids M1-403's golden output cites.
+- `tests/unit/test_forecast_attribution.py` (65 cases), 9 cases added to
+  `tests/unit/test_forecast_generate.py` (7 new plus the import probe going from one case to
+  three), 9 properties added to `tests/property/test_forecast_properties.py`, plus 2 boundary cases
+  from round 1. Suite: **1939 -> 2024 passed** against this branch's diff base (master `c3034d0`, after the daily
+  merge), 1 xfailed (the pre-existing `content_sha256` lone-surrogate xfail) — **+83 tests, all of
+  them this row's.** Measured before the merge the branch read 1912 -> 1995; the 27 tests between
+  the two figures are M1-312's, already approved on PR #35, and naming the real surface after a
+  master merge is CLAUDE.md's rule. Four gates green, `pytest` 151s.
+- No migration, no dependency, no `uv.lock` change, no config-contract change, no prompt edit, and no
+  edit to any merged source module other than `generate.py`.
+
+**Two merged test files changed, and both changes are widenings rather than corrections.**
+`_packet()` in `test_forecast_generate.py` built **one** document, so `forecast.inputs` minted only
+`src-001` — while `good_reply()` is the prompt's own example and cites `src-002` in
+`evidence_adjustments` and `load_bearing_facts`. Eleven merged tests failed on the new checks for a
+reason that had nothing to do with what they assert, so the packet now supplies two documents and a
+`documents=0` argument builds the no-research case. And `test_the_response_schema_reaches_no_provider_
+client` was parametrized from `schema` alone over `schema`, `binary` and `attribution`: all three make
+the claim in their docstrings, and this row rests a design decision on it.
+
+### Decision — the rules live on the output path, not in the schema (M1-403's placement, again)
+
+The presence rules need no config and no question, so `min_length=1` on three fields in `schema.py`
+was the shorter diff. It was rejected for three reasons, and the third is the one that decides it:
+
+- it contradicts that module's stated scope in its own docstring;
+- it would break `test_a_structurally_invalid_response_is_refused`, whose payloads pass
+  `"source_ids": []` deliberately, and reverse M1-402's recorded decision rather than layer over it;
+- **a schema failure and a checker problem are not equally repairable.** They are today — `_parse`
+  catches `ForecastSchemaError` and turns it into problems — but that equivalence is `generate.py`'s
+  to keep, not the schema's to depend on. The citation rules *cannot* live in the schema at all
+  (they need the supplied ids), so splitting M1-501 across two modules would have put half of one
+  row's contract behind a boundary the other half cannot cross.
+
+`test_the_schema_alone_still_accepts_an_empty_attribution_field` pins the split from the inside, the
+idiom M1-402 established and M1-403 reused.
+
+### Decision — three lists are required, and three stay optional (owner decision)
+
+Required non-empty: `evidence_adjustments`, `load_bearing_facts`, `failure_modes` — exactly the set
+the row names. Each of the three that stays optional has its own reason, and each has a test so the
+absence is a decision rather than an oversight:
+
+- `source_disagreements` — the prompt's own shared-fields example prints it as `[]`. Requiring it
+  would fail a model that followed the prompt exactly, which is the test M1-402 applied to this very
+  field and M1-403 applied to the priors.
+- `uncertainty_notes` — not named by the row.
+- `base_rate.source_ids` — `prompts/forecaster.md:30` says "if none is defensible, say so and use a
+  broad prior", so a base rate can rest on no citable reference class at all. Ids that *are* present
+  are still resolved; only the *presence* requirement is declined.
+
+### Decision — the evidence rules stand down when there was no evidence (owner decision)
+
+The three rules that require a citation — both evidence lists being non-empty, and each of their
+entries citing at least one id — apply **only when the packet supplied at least one document**.
+
+A zero-document packet is a real state, not a bug: `research/store.py` names it outright, "a question
+researched and found nothing", and refuses to *replay* one for exactly that reason. **M1-504** owns
+the gate over it, with `forecast.fail_on_stale_research` and `forecast.flag_on_stale_research` as its
+committed config, and that row depends on this one.
+
+So the alternative was not "be stricter", it was "decide M1-504's question here and remove its knob"
+— and pay for the decision at two billed calls per question, because an unsatisfiable rule fails
+through the repair loop. That is precisely what `binary.py::_require_config` refuses for an inverted
+bounds pair.
+
+**Nothing passes silently.** The unconditional half still bites with nothing supplied: a citation
+naming evidence that does not exist is still refused, and `failure_modes` — which needs no research
+to write — is still required. What M1-501 declines to decide is whether a no-research forecast may
+proceed at all. `test_the_evidence_rules_stand_down_exactly_when_nothing_was_supplied` states the
+condition as a biconditional, so an implementation that dropped it or inverted it fails in one
+direction or the other.
+
+### Decision — the checker takes primitives, not a `ModelInput` (and why that is not tidiness)
+
+The natural signature takes the built reasoning packet: it carries both the question id and the
+source mapping, and a caller could not then pair a question with another question's ids.
+
+It is not taken. Importing `forecast.inputs` reaches `questions.model` and through it
+`forecasting_tools`, `litellm`, `httpx` and `streamlit` — the coupling `inputs.py` documents and
+**M1-204** was filed for. `forecast/schema.py` and `forecast/binary.py` are both deliberately clean
+of it because M1-406 must replay a stored response and reproduce the parsed forecast with the
+provider client not importable at all, and M1-306 established that zero-calls is a property of the
+import graph rather than of a mock count. A validator M1-406 and M1-602 both have to reach is the
+last module to make SDK-dependent.
+
+The mapping is one line at the one call site. The pairing risk it gives up is already closed twice
+over: `generate_forecast` refuses a packet belonging to another question before anything is spent,
+and `build_model_input` refuses it again.
+
+### Decision — no message renders the supplied ids, unlike `binary.py`
+
+M1-403 renders its configured bounds into the repair turn, and argued the case at length: the prompt
+prints 0.001–0.999 as a literal while config may narrow it, so a model told only "out of bounds" has
+nothing to aim at, and an error nobody can act on is its own failure mode.
+
+**That argument does not carry here, and the asymmetry is deliberate rather than an inconsistency.**
+The model is holding the entire id list already — `forecast.inputs` put it in the request under
+`research_documents`, which is where the ids came from. Naming them back buys nothing, and it grows
+every problem message by every document retrieved (`retrieval.max_queries_per_question` ×
+`max_documents_per_query` is 48 at the committed defaults). Neither side is rendered: not the cited
+value, which is model output, and not the supplied set, which reaches this function from a caller.
+
+`_citation_problems` also aggregates: one problem per rule per location, never one per offending id.
+A per-id list would leak **how many** citations were bad through a channel no leak test that reads
+only message text would see. M1-302's rule is that a channel is a channel.
+
+### Deviation — none
+
+Nothing here departs from the SDK, the spec, the prompt or a sibling module. The two departures from
+`binary.py`'s shape — primitives instead of a value object, and a message that renders nothing — are
+recorded above as decisions with their reasons, and neither changes an interface `binary.py` owns.
+
+### Rejected — options weighed and not taken
+
+- **`min_length=1` in `schema.py`.** See the placement decision above.
+- **Requiring a citation on `base_rate.source_ids`.** The prompt explicitly permits a broad prior
+  with no defensible reference class. A rule that fails a reply which followed the prompt exactly is
+  a rule that will be repaired around, not obeyed.
+- **Refusing a zero-document packet in `generate_forecast`'s preflight.** Strictly the simplest
+  implementation, and pre-spend, which is normally this project's tiebreak. Rejected because it
+  decides M1-504's row from inside M1-501 and leaves that row nothing to configure.
+- **Requiring that every `load_bearing: true` adjustment also appear in `load_bearing_facts`.** A
+  cross-field consistency rule the prompt never states, over two lists it never says are related.
+  Inventing a contract and then enforcing it is how a validator starts failing correct output.
+- **Reporting one problem per offending id.** Leaks the count. See above.
+- **Rendering the supplied ids in the message.** See above.
+- **A `ValidatedForecast` value object** carrying the response plus its resolved citations.
+  `BinaryForecastResponse` plus `ModelInput.sources` already *is* that pair, M1-602 consumes both,
+  and a third near-identical shape is a third thing to keep in agreement (M1-403 rejected the same
+  option for the same reason).
+
+### Deferred (do not read the absence as an omission)
+
+- **The stale/insufficient research gate — M1-504.** Whether a forecast built on no documents, or on
+  stale ones only, may proceed at all, and whether that flags or fails. This row makes the state
+  visible and refuses to invent evidence; it does not choose the policy.
+- **The multiple-choice option set (M1-404) and the numeric percentile levels (M1-405).**
+  `test_the_rules_are_cross_type` asserts M1-501's rules on all three question types; nothing here
+  reads an option list or a percentile level, and `generate._output_problems` still has exactly one
+  type-specific branch.
+- **The comprehensive valid/invalid golden set — Codex's T-901**, authored blind from spec. One
+  companion fixture ships here because this row's tests need the ids M1-403's golden cites.
+- **Binding an approval to a payload — M2-707**, and **the canonical stored form — M1-602**. This row
+  is M1-602's last dependency; it deliberately decides nothing about `record_json` or
+  `final_prediction_json`.
+- **`M1-204`** — the `questions/__init__.py` re-export block that makes any importer of the canonical
+  question model load the provider SDK. Pre-existing, filed, and the reason for this module's
+  signature rather than something it fixes.
+- **The prompt's evidence caps — filed as `M1-505` while implementing this row.**
+  `prompts/forecaster.md:52-53` caps what a document may justify by its `reliability_tag` and
+  `provenance`: an `unverified_social` document "may justify a `tiny` or `small` adjustment at most,
+  never a load-bearing fact". M1-501 resolves a citation to a supplied `source_id`, and a `source_id`
+  is only an *identity* — so a forecast can still rest a load-bearing fact on one unverified social
+  post and be recorded as valid. Enforcing the cap needs the documents themselves, not their ids,
+  which is a wider input than this checker takes and would have made it SDK-dependent for the reason
+  the signature decision gives. A row, not a fix on this branch.
+
+### Standing risk — not verifiable offline
+
+- **A repair turn's effectiveness is unmeasured.** The tests establish that a model shown
+  `evidence_adjustments.0.source_ids` and told the citation was not supplied can correct it in one
+  further call. Whether a real model does so — rather than dropping the claim, or inventing a
+  different id — is not something an offline suite can answer.
+- **The conditional rests on a count, and the count comes from retrieval.** "At least one document"
+  is the only threshold M1-501 can defend without reading config. A packet with one stale, irrelevant
+  document turns every evidence rule back on, which is correct for this row and is exactly the case
+  M1-504 exists to judge.
+- **Nothing checks that the ids in `ModelInput.sources` are the ids the model was actually sent.**
+  They are, structurally — `build_model_input` builds the request and the mapping from one sorted
+  list in one pass, and `test_source_ids_are_a_bijection_independent_of_the_supplied_order` pins the
+  ordering — but this module is handed the mapping rather than the request, and takes it on trust.
+  Closing that would mean parsing the rendered request back, which is a worse dependency than the
+  one it removes.
+
+### On the property tests, and the check that they discriminate
+
+Nine properties, and **nineteen mutations were run against the source before any of them was
+trusted** (`docs/LESSONS.md` #5): each of the seven rules removed; the conditional inverted; the
+conditional dropped; the cited value spliced into the message; the supplied set rendered into the
+message; only the first problem reported; a location the schema never declared; the list index
+dropped from a location; `base_rate` citations not resolved; the parent error raised instead of this
+module's own; a `str` accepted as a sequence of ids; the checks never reached from `_parse`; and the
+wrong `question_id` handed down. **Nineteen of nineteen caught**, at the gate's own profile (`dev`,
+200 draws) rather than `fast` — that was M1-403's harness bug, and 25 draws let a real mutation
+escape one run in three. `__pycache__` is swept and `PYTHONDONTWRITEBYTECODE` set: a same-size
+mutation restored inside one second is otherwise served back from cache.
+
+**The interesting result was the split, and it found a real weakness in a property rather than in
+the source.** On the first run the unit suite caught all nineteen and the properties caught **nine**.
+The mutations the properties missed were mostly one shape: R1, R3, R4, R5 and R7 *removed outright*,
+and the supplied set rendered into the message. The reason is that
+`test_the_evidence_rules_stand_down_exactly_when_nothing_was_supplied` is **one-sided** — it asserts
+that the three conditional rules produce nothing when nothing was supplied, and says nothing about
+their firing when something was. That is enough to catch the condition being inverted or dropped,
+which is what it was written for, and it is not enough to notice a rule that quietly stopped
+existing. This section originally claimed more than it delivered.
+
+Re-measured after the fix below, property leg only: **seven of those eight are now caught by the
+properties alone**, so the properties account for eighteen of the nineteen without the unit suite.
+
+Closed by adding `test_the_problem_set_is_exactly_what_the_seven_rules_specify`: the truth table
+enumerated mechanically from the *drawn* inputs, asserted as set **equality**, with every message
+written out in the test as a literal rather than imported from the module. That is M1-308 round 5's
+remedy applied to a checker instead of a startup path, and the duplication is the point — the
+failure mode it exists for is not "the rule is written wrongly twice", which the unit suite pins
+against literals, but "a rule quietly stopped firing", which every one-sided property misses.
+`test_the_truth_table_property_is_not_vacuous` reports the split through a hypothesis `event`
+(**91.7% of draws produce at least one problem**), because a truth table asserted only over inputs
+that produce nothing is a test that the function returns an empty list.
+
+The one mutation the properties still miss is "a `str` accepted as a sequence of ids" — measured,
+not assumed — and it stays missed on purpose: the never-raises property accepts either a problem list or this module's own
+error, which is exactly the invariant it claims. The unit suite owns that case, with the six other
+caller-shape mistakes beside it.
+
+The two worth reading are still the pair, M1-403's shape adapted.
+`test_an_attribution_problem_never_varies_with_the_cited_id_that_failed` says the output is invariant
+in the model's value; `test_the_invariance_property_can_see_the_supplied_set_change` says it is
+**not** invariant in what was supplied. Either alone is satisfied by a constant string, which would
+pass every leak check while making the checker useless.
+
+`_attribution_location_resolves` reuses `_resolves_through_the_schema`, which walks `model_fields` in
+the *test* rather than importing `schema._schema_field_names` — a property that asserts against the
+constant the implementation uses passes whatever that constant says (M1-303's lesson). It drops
+all-digit parts first, because `schema._sanitize` renders an int `loc` part as `str(part)` and this
+module spells its nested locations the same way, so `evidence_adjustments.0.source_ids` is
+indistinguishable from a location the sanitizer produced.
+
+### Review round 1 — one blocking finding, rebutted by execution, with two real fixes behind it
+
+Reviewed commit `84510a2`, which was `HEAD`; the diff against `HEAD` was empty, so the finding was
+not stale (the check that has cost this project three rounds elsewhere). The reviewer ran the
+focused suites at that commit and confirmed all five declared risk areas safe.
+
+**The finding:** *"Binary forecasts are accepted without the required prior."* It cites
+`schema.py:267`, notes that `attribution._problems` checks neither prior, and states the reachable
+path as *"`generate_forecast` then treats the response as valid after attribution and bounds
+checks."*
+
+**Reproduced before any fix code, and the reachable path does not hold.** The rule exists — it has
+since **M1-403**, in `binary.py`, which `generate._output_problems` reaches for every binary
+response. Three executions at `84510a2`:
+
+1. The reviewer's literal reproduction — `attribution_problems` alone on a priorless golden —
+   returns `[]`. **True**, and deliberately so: the rule is binary-specific by construction and this
+   module reads no question type for its own rules.
+2. `binary_output_problems` on the same response returns
+   `base_rate.prior_probability: must be supplied for a binary question` and the same for
+   `model_prior`.
+3. `generate_forecast` driven with a priorless reply that stays priorless: **2 invocations,
+   `forecast=None`, `failure_code="schema_invalid"`**, both prior problems in `failure_problems`.
+   The composed path refuses it, spends the one repair M1-402 budgets, and returns no forecast.
+
+So the finding fails the second scope test — the condition is neither introduced nor amplified here —
+and the stated impact, a priorless forecast reaching the ledger as valid, is not reachable. A
+finding that cannot be reproduced gets a rebuttal, not a fix.
+
+**But the reviewer was reading a real defect, and it was ours.** `schema.py`'s `_reject_priors`
+docstring said the converse rule *"is M1-501's row"*. That was true when M1-402 wrote it; M1-403 then
+took the rule, and the owner settled it there because it is binary-specific. Nobody updated the
+pointer. Once M1-501 shipped without the rule, that sentence became a live trap: it tells a careful
+reader to look in `attribution.py`, where the rule correctly is not. It cost a blocking finding and a
+review round, which is precisely the price `docs/LESSONS.md` puts on a stale cross-reference.
+
+Fixed on this branch, in three places:
+
+- `forecast/schema.py` — the docstring now names `binary.py`/M1-403, and records why it used to say
+  M1-501 and what that cost, so the correction cannot be re-reverted as a tidy-up.
+- `tests/unit/test_forecast_schema.py` — `test_a_binary_response_may_carry_priors` repeated the same
+  claim in its docstring; corrected the same way.
+- `tests/unit/test_forecast_attribution.py` — two new tests pin the split **from M1-501's side**,
+  which is the side the reviewer was standing on:
+  `test_the_binary_prior_rule_belongs_to_binary_py` (this checker is silent, M1-403's is not, and it
+  names both spellings) and
+  `test_the_two_checkers_compose_so_a_priorless_binary_forecast_is_refused` (the composed
+  `_output_problems` returns exactly the two prior problems). Both were mutation-checked: removing
+  the prior rule from `binary.py` fails both.
+
+**And one real gap, filed as `M1-506`.** The finding's underlying instinct — that reading one checker
+in isolation makes a rule look absent — is a property of the seam, not of the reviewer.
+`generate._output_problems` composes the checkers, but it is private to the call path, so M1-406
+replaying a stored response and M1-602 validating a record before persisting it would each have to
+know the full list and call every member, with nothing to tell them when the list grows (M1-404 and
+M1-405 both add to it). One public composed entry point, with `generate._output_problems` defined in
+terms of it, closes that. A row rather than a fix here: it is M1-406's and M1-602's interface, and
+pre-deciding it on a branch whose review is about attribution fields is how two items end up
+disagreeing about one function.
+
+**Process note, taken.** The reviewer observed that the mutation campaign "enumerates only the
+implementation's seven chosen rules, so it could not detect omission of this eighth authoritative
+requirement." That is exactly right as a statement about mutation testing, and worth writing down
+next to the one-sided-property lesson above: **a mutation harness measures whether your tests defend
+the rules you wrote; it is silent about a rule you never wrote.** The defence against a missing rule
+is the acceptance criterion read against the spec, and the reviewer is doing that job — which is why
+a finding filed off a wrong pointer still found a defect worth two source fixes and a backlog row.

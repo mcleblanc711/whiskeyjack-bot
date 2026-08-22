@@ -275,9 +275,18 @@ def _reject_priors(response: _ForecastResponseBase) -> None:
     type question-specific, so narrowing it on the base would be an override that reads
     as an accident rather than as the design.
 
-    The converse -- that a binary response must *supply* a prior -- is a presence
-    requirement over the attribution fields, which is M1-501's row, and is deliberately
-    not enforced here. See the module notes.
+    The converse -- that a binary response must *supply* a prior -- is deliberately not
+    enforced here, and **it landed in ``forecast/binary.py`` with M1-403**, not in
+    M1-501's cross-type checker. This sentence used to name M1-501, because that is where
+    M1-402 expected the rule to go; the owner settled it onto the binary output path
+    instead, since the rule is binary-specific by construction. Left pointing at M1-501 it
+    became a live trap: M1-501's round-1 review read it, looked in ``attribution.py``,
+    found no prior check and filed a blocking finding for a rule that has been enforced
+    since M1-403. Corrected on the M1-501 branch for that reason.
+
+    ``binary.binary_output_problems`` reports both spellings, ``generate._output_problems``
+    reaches it for every binary response, and
+    ``test_the_binary_prior_rule_belongs_to_binary_py`` pins the split from M1-501's side.
     """
     if response.base_rate.prior_probability is not None or response.model_prior is not None:
         raise ValueError("prior_probability and model_prior must be null for this question type")
