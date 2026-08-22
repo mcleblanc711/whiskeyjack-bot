@@ -523,3 +523,255 @@ A second near-miss is worth recording because it would have produced a false cla
 than a weak test: two of the first mutation attempts were silent no-ops, because `ruff
 format` had rewrapped the lines the patch matched against. A mutation that does not apply
 looks exactly like a property that does not catch it. Assert that the patch applied.
+
+## M2-703 — Dry-run gateway
+
+`CODEX_HANDOFF.md` asks for a `SubmissionGateway` protocol *owned by this repository*
+returning a sanitized `SubmissionReceipt`, and two implementations. This item is the seam
+plus the first of them; `MetaculusSubmissionGateway` is M2-704.
+
+Delivered:
+
+- `src/whiskeyjack_bot/submission_gateway.py` — `GatewayError`, `GatewayMode`, the
+  `SubmissionRequest` / `SubmissionReceipt` value objects, the `SubmissionGateway`
+  protocol, `canonical_payload_json()` / `payload_sha256()`, `dry_run_attempt_id()`,
+  `dry_run_artifact_path()`, `DryRunSubmissionGateway`, `write_dry_run_artifact()` /
+  `read_dry_run_artifact()`, and `attempt_from_receipt()`.
+- `tests/unit/test_submission_gateway.py` (79), `tests/property/test_submission_gateway_properties.py`
+  (104: 13 properties plus a 91-case injectivity table). Suite: 2095 passed, 1 xfailed;
+  four gates green.
+
+No migration, no dependency, no CLI, no config change, no network call on any path.
+`submission.enabled: false`, `dry_run: true` and `no_submit: true` remain the committed
+defaults — see the deferral below.
+
+### Decision — a dry run writes no `submission_attempts` row, and that is not a shortcut
+
+This is the constraint the whole module is arranged around, and it has two independent
+causes, either one fatal:
+
+1. `001` declares `idempotency_key TEXT NOT NULL UNIQUE`. A dry-run row spends the key the
+   real submission needs, so the live post that follows could never be recorded. A live
+   post the ledger cannot record is this product's primary failure mode — the same one
+   M1-603 round 4 withdrew its retry block over.
+2. `lifecycle.record_submission_attempt()` always appends a lifecycle event, and derives
+   its type from `(success, verified_by_refetch)`. `(True, True)` is `submitted`, a lie
+   about a post that never happened. Every other pair is `submission_uncertain` or
+   `submission_failed`, and `submission_failed` moves the record to terminal `failed` — a
+   rehearsal would permanently kill the forecast version it was rehearsing. There is no
+   honest event for "nothing was posted", and `_LEGAL_TRANSITIONS` admits none of them
+   from `draft`, which is where a record sits when a dry run is most useful.
+
+So the acceptance criterion's *"records payload/hash"* is satisfied by a **file** under
+`storage.artifact_root`, and the ledger is untouched. `test_a_dry_run_of_a_draft_records_
+nothing_and_spends_no_key` asserts that positively against a real ledger: status still
+`draft`, `submission_attempts` empty, `lifecycle_events` empty, and the key still free.
+
+**Owner decision** (2026-08-22) to record the receipt as an artifact rather than
+receipt-only or a new `dry_run_receipts` table. A table would have claimed migration `007`
+for a mode that posts nothing, and lane 1's `M1-602` may want it.
+
+### Decision — the refusal on the way into the ledger is the guard, not the absence of code
+
+`attempt_from_receipt()` is the only door from a receipt into `lifecycle`, and it raises
+on any receipt whose `mode` is not `live`. Shipping it *with* the dry-run gateway rather
+than deferring it to M2-704 is the point: without it, "a dry-run receipt can never be
+recorded" is a property of absence, which is a weak thing to hand a reviewer and a weaker
+thing for M2-704 to build on. `test_the_refusal_is_what_stops_a_rehearsal_killing_the_
+record` demonstrates the consequence by hand-assembling what the refusal withheld and
+watching the record reach terminal `failed`.
+
+There is deliberately no `force` parameter. M1-402's rule: a bound any caller can lift is
+not a bound.
+
+### Decision — `success=False`, and no invented `error_type`
+
+`success=True` would be a claim that a post went through, and the whole ledger rests on
+that claim only ever being made by something that actually posted. The mirror case is
+easier to get wrong: a dry run is not a *failure* either, so every HTTP, refetch and error
+field stays `None` rather than being filled with a plausible-looking cause. A fabricated
+`error_type` in an audit record is worse than an empty one.
+
+### Decision — the digest is computed here, from the payload the receipt was handed
+
+`request_payload_sha256` is an *input* to M2-702's key derivation, and nothing in the tree
+turned a payload into one. `payload_sha256()` is that function, and the gateway computes
+it rather than accepting it alongside the payload — a receipt that could claim a digest
+for a payload it never saw is not evidence of anything. The artifact writer re-derives it
+a third time and refuses a receipt whose claim does not match the payload supplied with
+it.
+
+The rendering is M1-305's rule verbatim, the spelling `submission.canonical_key_json` and
+`research/packet.py` already use. `research.hashing.content_sha256` is deliberately *not*
+reused: it collapses whitespace runs, which is meaning-preserving for article prose and
+structurally wrong for a JSON body.
+
+It lives here rather than beside `canonical_key_json` because M2-702's docstring states
+that module does not own the payload, and because the payload→hash binding is what makes
+the receipt honest — it belongs with the receipt.
+
+### Decision — the accepted payload domain is "survives its own canonical rendering"
+
+Two halves, and the second is the one worth reading.
+
+The structural half rejects what JSON silently mangles. Non-`str` object keys are the rule
+with teeth: `json.dumps` *coerces* `int`/`float`/`bool`/`None` keys to strings, so
+`{1: "a", "1": "b"}` renders as one key and one of the two values is gone — a payload the
+operator wrote and the receipt does not describe. `tuple` is refused for the persisted-form
+reason: it renders identically to a `list` and reads back as one, so a payload holding one
+is not equal to the payload a replay reconstructs.
+
+The behavioural half is a **round-trip guard**: the canonical text is reparsed and
+re-rendered, and a disagreement is refused. `ensure_ascii=True` escapes an astral scalar
+and its UTF-16 surrogate-pair spelling to the same two `\uXXXX` units, and `json.loads`
+recombines them — so two such strings used as two object *keys* persist as one key and one
+entry is silently gone.
+
+Defining the domain as a round trip rather than as a list of characters to look for is
+what makes it total, and **the property suite proved that by finding a second mechanism**
+the blocklist version would have missed. `sort_keys` orders by the Python string, so a key
+that reparses to a *different scalar* can sort into a different position without colliding
+with anything at all: `{U+D83D U+DE00: null, U+D83E: null}` renders in one order and
+reparses into the other. Same defect, different mechanism, and no character you could have
+grepped for. This is the third time on this project a test found a defect review did not
+(M1-306's three); it is also the second time the fix was to assert the *post-condition*
+rather than enumerate the inputs.
+
+Two of them as *values* are correctly one value: they persist as one scalar, so a replay
+reproduces one, and the digests must agree. `test_the_same_two_spellings_as_values_are_one_
+value_and_that_is_correct` pins that so a later "fix" cannot make the guard stricter than
+the persisted form.
+
+### Decision — deterministic means derived, not minted
+
+`attempt_id` is `wjdry-1-` + SHA-256 of the idempotency key, not a `uuid4`. A `uuid4`
+would make two dry runs of identical work produce different receipts, and an operator has
+to be able to re-run a dry run and see that nothing changed. It is a hash *of* the key
+rather than the key itself so an attempt id can never be pasted into a query against
+`submission_attempts.idempotency_key` and match, and `_assert_prefix_is_distinct()` fails
+at import if the two identity spaces could ever be confused — `submission._assert_prefix_
+matches_version`'s reason for running at import rather than only in a test.
+
+The clock is the only impure input and it is injected. Two readings bracket the *request*,
+not the artifact write: a receipt's timestamps describe the post it reports on, and the
+bookkeeping that follows is not part of it. A clock that runs backwards is refused, because
+the row this maps into is append-only and a reversed pair would be permanent.
+
+### Decision — the gateway holds no ledger connection and derives no key
+
+The caller derives the key (`submission.submission_key_for_record` admits a `draft`, which
+its own docstring says is *"what a dry run needs"*; `submission_key_for_approved_record`
+is the gated seam) and calls `require_key_unused()` before deciding to post. Pushing
+either behind `submit()` would put the approval boundary inside the thing the boundary
+exists to gate, and would cost the two claims that make this item checkable: a module with
+no connection and no HTTP client is *provably* deterministic and *provably* offline, rather
+than asserted to be.
+
+The path-safety rule on `idempotency_key` runs unconditionally, though — including when no
+artifact will be written. A gateway whose accepted domain depended on a constructor
+argument would let the pure form mint receipts the recording form refuses.
+
+### Deviation — the artifact writer accepts an identical existing file
+
+`research/artifacts.py` refuses an existing destination outright, and is right to: a
+retrieval artifact records a paid call, so a second one at the same path is a collision.
+Here the path is derived from the idempotency key, which is derived from the payload, so an
+existing file means the identical dry run was performed before — and refusing it would make
+the one mode whose entire purpose is repeatability un-repeatable. The bytes are compared
+and only a *disagreement* raises. The `os.link` EEXIST mechanism is unchanged, so "never
+overwrite" is still atomic against a concurrent writer rather than a check that can be
+raced.
+
+One consequence is deliberate and slightly sharp: because the receipt is part of the
+envelope, a second dry run at a *different instant* is a different body at the same path
+and is refused. That is the honest answer — the first file is the record that the rehearsal
+happened, and silently replacing it would destroy it.
+
+### Rejected — writing a dry-run row under a separate key namespace
+
+A `wjdry-`-prefixed idempotency key would keep the real key free, and was rejected: the row
+still forces a lifecycle event, and there is no legal event from `draft` and no honest one
+from `approved`. The failure is in the event, not in the key.
+
+### Rejected — a `question_id` field on the receipt
+
+The artifact path needs a question, and the obvious move is to put one on the receipt. It
+is refused because nothing could check it: the idempotency key is a digest, so the question
+inside it is not recoverable, and a receipt field that must agree with the key while
+nothing verifies it is a value that can disagree with it. The writer takes `question_id`
+from the caller instead. What *can* be checked is checked — the digest.
+
+### Deferred (do not read the absence as an omission)
+
+- **No CLI.** There is no payload builder — M1-502/M1-503 are `Not Started` — so a command
+  could only take `--payload-file`, an operator affordance for a payload nothing can
+  currently produce. It lands with M2-704 and D-1001's runbook.
+- **No config change.** The pre-M2 validator gate on `submission.enabled` / `dry_run` /
+  `no_submit` stays exactly as written, and this module reads no configuration. A gateway
+  that posts nothing is legal under all three; relaxing that gate is M2-704's change and
+  belongs with the code that makes a post reachable.
+- **The duplicated atomic writer.** `_write_or_confirm` re-spells
+  `research/artifacts._write_new_file` rather than importing it — that function is private
+  to its module and raises `ArtifactError`. Extracting a shared helper changes merged,
+  reviewed code, which is its own item: **M2-709**, filed with the behavioural difference
+  named so the shared version takes it as a parameter rather than picking one.
+- **No payload→approval binding.** Still D33 and **M2-707**; nothing here changes it.
+
+### Standing risk — `-0.0`, and floats generally
+
+`0.0 == -0.0` in Python, but they render as `0.0` and `-0.0` and therefore hash
+differently and produce different idempotency keys. Both round-trip exactly, so the replay
+guard does not fire and nothing here is wrong; the risk is that two payloads an operator
+would call equal are two submissions. It becomes reachable when M1-503's CDF arrays exist.
+
+It is named rather than fixed, and deliberately: normalizing floats inside a
+replay-critical hash rule is a change to what every future key means, in exchange for a
+case no builder in the tree can currently produce. The same argument applies to float
+`repr` stability, which CPython guarantees (shortest round-tripping form) but the language
+does not.
+
+### Standing risk — a type name in one refusal
+
+`payload contains a <typename>, which is not a JSON value` interpolates
+`type(value).__name__`. A type name comes from a class definition rather than from payload
+content, so it is not the "value" the hygiene rule guards, and it is the only thing that
+makes that refusal actionable. A caller who names a class after a secret defeats it; that
+is outside CLAUDE.md's threat boundary and is stated here rather than left implicit.
+
+### Deviation — one line of another item's property test was narrowed
+
+`tests/property/test_submission_properties.py` (M2-702) draws a `tournament_id` from
+`ENCODABLE_TEXT` and, in the one property that *stores* what it draws, a whitespace-only
+draw reaches SQLite as a raw `IntegrityError`: `submission._require_text` accepts a blank
+identifier and `006_non_blank_identifiers.sql` refuses one. `006` landed the day after
+M2-702, so this has been a coin-flip gate failure on master ever since — invisible on CI,
+whose `ci` profile is derandomized, and reproducible locally about half the time.
+
+The strategy for that one property is narrowed to what a row can hold, and nothing else in
+that file changes. The **product** disagreement is left alone and filed as **M2-710**:
+widening `submission.py`'s validator would change what an already-shipped, already-reviewed
+writer accepts, smuggled in under a different item, which is the call M1-606 made and
+M1-607 then paid for properly. It is a hardening item rather than a live defect — `config.py`
+already refuses a blank tournament slug, and `submission_key_for_record` reads the value
+back out of a row `006` has vetted — so nothing on a product path reaches it.
+
+**This is a pre-existing failure this branch did not introduce**, and it is named here
+because the reviewer is stateless and will otherwise read the diff line as scope creep.
+
+### On the property pass
+
+Five deliberate mutations were run against the suite before the first review, each
+confirmed to fail the property it is meant to fail: the replay round-trip guard disabled,
+`attempt_id` minted as a `uuid4`, the `live`-mode check on `attempt_from_receipt` disabled,
+a refusal that echoes its offending key, and the artifact writer clobbering a differing
+body with `os.replace`. Each was applied to a pristine copy, run with `__pycache__`
+removed, and restored — M1-312's lesson that a mutation harness killed by a timeout
+silently leaves the mutation applied, and M1-501's that a mutation which fails to apply
+looks exactly like a property that does not catch it. Two attempts here *did* fail to
+apply, because `ruff format` had rewrapped the lines the patch matched; both are visible
+as an explicit `APPLY FAILED`.
+
+The no-leak property closes the message set rather than searching for a substring
+(M1-607): every refusal from `payload_sha256` must match one of eight written-down
+patterns that capture nothing from the input, and the same test asserts `__cause__ is
+None` so no cause chain can reprint what a message withheld.
