@@ -36,10 +36,14 @@ easy to miss and are closed deliberately:
   every ``model_dump`` of provider data passes ``warnings=False``. This is not
   noise suppression; a warning is an egress path to stderr and to captured logs.
 
-The module defines no exception type of its own: provider failure is reported as
-data on the returned :class:`AskNewsRetrieval`, not as a raise (see
-:func:`retrieve_news`). The only exception it raises is ``MissingCredentialError``,
-before any network use.
+Provider failure itself is reported as data on the returned :class:`AskNewsRetrieval`,
+not as a raise (see :func:`retrieve_news`) -- a run that has already billed for some
+calls must stay recordable rather than lose that record to an exception. The module
+does raise two exceptions, both before any network use and therefore before any
+billing: ``MissingCredentialError``, and :class:`AskNewsRetrievalError` for a caller
+argument the run record would reject outright (M1-309, matching the Exa adapter's
+round-4 preflight -- see :mod:`whiskeyjack_bot.research.preflight`, shared by both
+adapters rather than duplicated).
 """
 
 from __future__ import annotations
@@ -62,6 +66,7 @@ from whiskeyjack_bot.research.model import (
     validate_document,
     validate_run,
 )
+from whiskeyjack_bot.research.preflight import require_run_metadata, string_list
 from whiskeyjack_bot.research.transport import apply_connection_retries
 
 # The two passes that together satisfy "current and historical news". AskNews
@@ -75,6 +80,18 @@ _STRATEGY_HISTORICAL: _Strategy = "news knowledge"
 _STRATEGIES: tuple[_Strategy, ...] = (_STRATEGY_CURRENT, _STRATEGY_HISTORICAL)
 
 _HOURS_PER_DAY = 24
+
+
+class AskNewsRetrievalError(Exception):
+    """A retrieval call was requested in a way this module refuses to make.
+
+    Covers caller-side mistakes that must never be papered over: a bare string where a
+    sequence of queries was expected, and run metadata (``question_id``,
+    ``retrieval_run_id``, ``now``) the run record would reject outright. Both fire in
+    :func:`retrieve_news` before any network use, and therefore before any billing (M1-309).
+    Same hygiene rule as the sibling adapters' own errors (e.g. ``ExaFallbackError``): the
+    message is a constant and never echoes the offending value.
+    """
 
 
 @dataclass(frozen=True)
@@ -205,10 +222,20 @@ def retrieve_news(
 ) -> AskNewsRetrieval:
     """Retrieve current and historical news for ``queries`` as normalized documents.
 
+    Refuses, before any network use and therefore before any billing, a caller mistake
+    the run record would otherwise only catch after every call had already been paid
+    for: a bare string (or other non-sequence) in place of ``queries``, and malformed
+    run metadata (``question_id``, ``retrieval_run_id``, ``now`` -- see
+    :func:`whiskeyjack_bot.research.preflight.require_run_metadata`). Both raise
+    :class:`AskNewsRetrievalError` (M1-309, matching the Exa adapter's round-4
+    preflight).
+
     ``now`` is injected rather than read from the clock so ``started_at_utc`` and
-    every ``retrieved_at_utc`` are deterministic under test and under replay.
-    Queries are supplied by the caller; deriving them from a question is not this
-    item's job.
+    every ``retrieved_at_utc`` are deterministic under test and under replay. It is
+    **converted to UTC once, in preflight**, and that value -- not the caller's raw
+    ``now`` -- is what the run and every document carry: the same instant a caller
+    passed, spelled independently of the timezone they spelled it in. Queries are
+    supplied by the caller; deriving them from a question is not this item's job.
 
     **Never raises on provider failure.** A run makes up to
     ``max_queries_per_question * 2`` billable calls; raising partway through would
@@ -217,8 +244,20 @@ def retrieve_news(
     ``provider_failed``, records the failure in ``run.error_summary``, and returns
     everything retrieved so far so M1-306 can still persist and replay it.
     """
+    now_utc = require_run_metadata(
+        question_id=question_id,
+        retrieval_run_id=retrieval_run_id,
+        now=now,
+        error=AskNewsRetrievalError,
+    )
+    validated_queries = string_list(
+        queries,
+        "queries entries must be non-blank strings (offending input withheld)",
+        error=AskNewsRetrievalError,
+    )
+
     retrieval = config.retrieval
-    capped_queries = list(queries)[: retrieval.max_queries_per_question]
+    capped_queries = validated_queries[: retrieval.max_queries_per_question]
     hours_back = retrieval.freshness_days_default * _HOURS_PER_DAY
 
     raw_responses: list[dict[str, Any]] = []
@@ -265,7 +304,7 @@ def retrieve_news(
                     payload = _to_document(
                         article,
                         retrieval_run_id=retrieval_run_id,
-                        retrieved_at=now,
+                        retrieved_at=now_utc,
                     )
                     document = validate_document(payload)
                 except (ResearchSchemaError, AttributeError, TypeError, ValueError):
@@ -293,9 +332,9 @@ def retrieve_news(
                 "return_type": "dicts",
             },
             "queries": capped_queries,
-            "started_at_utc": now,
-            "completed_at_utc": now,
-            "freshness_cutoff_utc": now - timedelta(days=retrieval.freshness_days_default),
+            "started_at_utc": now_utc,
+            "completed_at_utc": now_utc,
+            "freshness_cutoff_utc": now_utc - timedelta(days=retrieval.freshness_days_default),
             "error_summary": _error_summary(
                 provider_failed=provider_failed, retained=len(documents)
             ),
