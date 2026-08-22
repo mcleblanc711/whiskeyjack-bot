@@ -41,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-309 | feat/m1-309-asknews-caller-preflight | whiskeyjack-m1-309 | no | none | 2026-08-21 |
+| M1-501 | feat/m1-501-validate-attribution-fields | whiskeyjack-m1-501 | no | none | 2026-08-21 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave

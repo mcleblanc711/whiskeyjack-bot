@@ -202,8 +202,11 @@ def test_the_rationale_word_cap_is_the_prompts_number_and_is_exact() -> None:
 
 def test_a_binary_response_may_carry_priors() -> None:
     """The converse of the prompt's rule is deliberately *not* enforced here: whether
-    a binary response must supply a prior is a presence requirement over the
-    attribution fields, which is M1-501's row. Both spellings validate."""
+    a binary response must supply a prior is **M1-403's**, on the binary output path.
+
+    This docstring named M1-501 until that row shipped without the rule and its round-1
+    review filed a blocking finding off the pointer. The rule is real and has been since
+    M1-403; only the address was wrong. Both spellings still validate *here*."""
     assert validate_forecast_response(binary_payload(), BinaryForecastResponse) is not None
     without = binary_payload(model_prior=None)
     without["base_rate"] = {**without["base_rate"], "prior_probability": None}
