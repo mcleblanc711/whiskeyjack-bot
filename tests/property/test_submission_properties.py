@@ -72,6 +72,18 @@ ANYTHING = st.one_of(
 # The accepted domain, spelled as strategies rather than as a filter, so that what the
 # module promises about it is visible here.
 TOURNAMENTS = ENCODABLE_TEXT.filter(lambda text: 0 < len(text) <= 200)
+# The subset a row may actually hold. `submission_key` accepts any non-blank-by-length
+# tournament and derives a key from it in memory, but `006_non_blank_identifiers.sql`
+# refuses a whitespace-only `forecast_records.tournament_id` at INSERT -- so a property
+# that *seeds a row* has a narrower domain than one that only derives.
+#
+# Latent since 006 rather than new: `ENCODABLE_TEXT` has always been able to produce " ",
+# and this suite only stopped drawing one by luck. Surfaced while adding M1-602's
+# `007_forecast_version_chain.sql`, which changed nothing about this clause. `str.strip()`
+# is the right comparison because 006's trim() set is exactly the codepoints Python calls
+# whitespace -- that correspondence is what 004's header spells out and why it enumerates
+# them instead of calling one-argument trim().
+SEEDABLE_TOURNAMENTS = TOURNAMENTS.filter(lambda text: text.strip() != "")
 IDENTIFIER_INTS = st.integers(min_value=1, max_value=2**63 - 1)
 DIGESTS = st.text(alphabet="0123456789abcdef", min_size=64, max_size=64)
 
@@ -176,28 +188,51 @@ def _conn() -> sqlite3.Connection:
     return _CONNECTION
 
 
+# The head of each seeded chain, keyed by the pair `001` declares UNIQUE with the version.
+_CHAIN_HEADS: dict[tuple[str, int], tuple[str, int]] = {}
+
+
 def _seed(tournament_id: str, question_id: int) -> tuple[str, int]:
-    """Store one draft record; return its id and the version it was stored at.
+    """Append one draft record to this question's chain; return its id and version.
 
     `001` declares UNIQUE (question_id, tournament_id, forecast_version) and `004` indexes
-    `attempt_id` UNIQUE, so the version and the identifiers come from a counter -- hypothesis
-    reuses a shrunk draw across examples, and two examples drawing the same tournament and
-    question must not collide on the constraint. `forecast_version` is still a real input to
-    the derivation: the caller is handed back the value that was stored and derives from it.
+    `attempt_id` UNIQUE, so no two seeded rows may collide -- hypothesis reuses a shrunk
+    draw across examples, and two examples drawing the same tournament and question land on
+    the same constraint. `forecast_version` is still a real input to the derivation: the
+    caller is handed back the value that was stored and derives from it.
+
+    This used to take the version from a global counter, which produced a version 5 with no
+    versions 1-4 behind it. M1-602's `007_forecast_version_chain.sql` refuses that, and
+    rightly: it is a chain with a hole in it. So the seed keeps a real chain per
+    (tournament, question) and appends to it, which satisfies both the UNIQUE constraint
+    and the parent clause, and is what the ledger actually looks like.
     """
     serial = next(_COUNTER)
     record_id = f"rec-{serial}"
-    forecast_version = serial + 1
+    parent_record_id, parent_version = _CHAIN_HEADS.get((tournament_id, question_id), (None, 0))
+    forecast_version = parent_version + 1
     _conn().execute(
         "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+        "record_id, question_id, tournament_id, forecast_version, parent_record_id, "
+        "question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, ?, ?, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
+        "VALUES (?, ?, ?, ?, ?, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
         "'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (record_id, question_id, tournament_id, forecast_version, TS, TS, SHA, record_id),
+        (
+            record_id,
+            question_id,
+            tournament_id,
+            forecast_version,
+            parent_record_id,
+            TS,
+            TS,
+            SHA,
+            record_id,
+        ),
     )
+    _CHAIN_HEADS[(tournament_id, question_id)] = (record_id, forecast_version)
     return record_id, forecast_version
 
 
@@ -338,7 +373,7 @@ def test_a_changed_payload_hash_always_changes_the_key(
 # --------------------------------------------------------------------------------------
 
 
-@given(tournament_id=TOURNAMENTS, question_id=IDENTIFIER_INTS, digest=DIGESTS)
+@given(tournament_id=SEEDABLE_TOURNAMENTS, question_id=IDENTIFIER_INTS, digest=DIGESTS)
 @settings(max_examples=100)
 def test_a_key_survives_the_store_and_load_round_trip(
     tournament_id: str, question_id: int, digest: str
@@ -486,7 +521,7 @@ def test_the_leaky_shapes_are_all_actually_refused(value: object, position: int)
         )
 
 
-@given(tournament_id=TOURNAMENTS, digest=DIGESTS)
+@given(tournament_id=SEEDABLE_TOURNAMENTS, digest=DIGESTS)
 def test_the_gated_seam_never_mints_a_key_for_an_unapproved_record(
     tournament_id: str, digest: str
 ) -> None:

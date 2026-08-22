@@ -19,13 +19,12 @@ import pytest
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
-from whiskeyjack_bot.questions import (
+from whiskeyjack_bot.questions.groups import is_group_post, unpack_group_post
+from whiskeyjack_bot.questions.normalize import (
     NormalizationError,
     UnsupportedQuestionTypeError,
-    is_group_post,
     normalize_question,
     normalize_questions,
-    unpack_group_post,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
