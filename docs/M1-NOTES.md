@@ -3368,6 +3368,106 @@ pristine copy taken once, outside the loop, and to assert byte-equality afterwar
 `docs/LESSONS.md`'s stale-bytecode trap in a different costume: **a mutation harness that can
 silently fail to restore is indistinguishable from a test suite that does not catch the mutation.**
 
+## M1-309 — AskNews caller preflight
+
+Filed off M1-303's round-4 cross-model review, which found five caller-mistake holes in
+`research/exa.py` and noted that two of them are equally present in the already-merged AskNews
+adapter: `queries: Sequence[str]` accepts a bare `str` (which `list()` silently explodes into one
+billable call per character), and malformed run metadata (`question_id`, `retrieval_run_id`, `now`)
+reaches `ResearchRun` validation only at the end of a run, after every call has already been billed.
+The other three round-4 findings (client-URL binding, `decide_fallback`'s bool gating, domain
+canonicalization) have no AskNews analog — no client-URL-spoofing surface, no `include_domains`.
+
+### Decision — a new shared module, `research/preflight.py`
+
+The acceptance criterion requires the guard be shared with Exa, not copied. `string_list` and
+`require_run_metadata` moved there verbatim from `exa.py`'s `_string_list`/`_require_run_metadata`,
+generalized to take the caller's own exception type as `error: type[Exception]` — the guard logic
+lives in exactly one place, while each adapter still raises only its own module's error, per the
+project's error-hygiene rule. `exa.py`'s two private functions are now one-line delegators bound to
+`error=ExaFallbackError`; every existing call site and every existing `test_exa.py` case is
+unchanged.
+
+### Decision — `AskNewsRetrievalError`, parallel to `ExaFallbackError`
+
+AskNews previously raised only `MissingCredentialError` and defined no exception of its own; the
+module docstring said so explicitly. `AskNewsRetrievalError` is the new module-owned error for the
+two preflight refusals, named to parallel `ExaFallbackError` the way the two adapters' docstrings
+already read as one family.
+
+### Deviation — `now` is normalized to UTC in AskNews too, not just checked
+
+`require_run_metadata` is validate-and-return: it hands back `now` converted to UTC, not merely a
+confirmation that it was tz-aware. AskNews's `retrieve_news` previously used the caller's raw `now`
+directly for `started_at_utc`/`completed_at_utc`/`freshness_cutoff_utc`/`retrieved_at_utc` with no
+runtime check at all. Adopting the shared function closes the same coercion-before-billing shape
+Exa's round-4 finding 4 closed — for free, since it's the same call — rather than writing a
+narrower AskNews-only check that only validates and doesn't normalize. Confirmed live by
+`test_now_is_normalized_to_utc_before_any_use`.
+
+### Rejected — Exa-style client/config-binding checks for AskNews, and why not
+
+Exa's `_require_exa_client` and `_ensure_exa_is_configured_fallback` exist because a caller could
+hold an `httpx.Client` built independently of `build_exa_client`, pointed at another host, while the
+run still records `provider="exa"` — the silent-provider-switch concern D18 and M1-303 are about.
+AskNews has no parallel: `build_asknews_client` returns an `AskNewsSDK` object whose request routing
+isn't caller-swappable the way an `httpx.Client`'s `base_url` is, and `config.retrieval.primary`
+already has to name `asknews` for `retrieve_news` to be called at all in the pipeline's own control
+flow — there is no finding this would close.
+
+### Deferred (do not read the absence as an omission)
+
+No change to AskNews's "never raises on provider failure" contract for the query loop itself — the
+two new raises both happen before `config.retrieval` is even read, so no call has been attempted.
+
+### Standing risk — not verifiable offline
+
+None beyond what the Exa adapter already carries via the shared functions: a caller-supplied
+`tzinfo`/broken iterator still runs arbitrary code inside the guard (caught and converted to the
+module's own error, per `research/preflight.py`'s docstring), and that boundary is unchanged by
+this item.
+
+### Verification
+
+`tests/property/test_preflight_properties.py` — totality (`string_list`/`require_run_metadata`
+raise only the bound `error` class, exercised against two distinct dummy error classes so the
+parameterization is proven, not assumed) and correctness on the valid domain (a non-blank string
+list round-trips; a valid tz-aware `now` always returns UTC-aware and denotes the same instant),
+plus the two concrete round-5 regressions (a broken `tzinfo`, a boundary `datetime` whose UTC
+conversion overflows).
+
+`tests/unit/test_asknews.py` adds eleven parametrized cases (five malformed `queries` shapes, six
+malformed run-metadata shapes) asserting `AskNewsRetrievalError` and `sdk.news.calls == []`, plus
+one asserting the UTC-normalization behavior. All eleven were confirmed to fail against the
+pre-fix code before the guard was wired in — one surfaced the exact live bug shape, a raw
+`TypeError: unsupported operand type(s) for -: 'str' and 'datetime.timedelta'` from an unvalidated
+`now` reaching `freshness_cutoff_utc`'s subtraction.
+
+`tests/unit/test_exa.py` unchanged and green — the extraction is behavior-preserving.
+
+### Round 1 review (GPT) — one blocking finding, reproduced
+
+Reviewed commit `64d9790`. **Finding:** `require_run_metadata` accepts an ordinary aware `now`
+near `datetime.min`, but `freshness_cutoff_utc = now_utc - timedelta(days=...)` was still computed
+only inside the final `validate_run({...})` dict, after the query loop — so that `now` billed both
+the current- and historical-strategy calls and then raised a raw `OverflowError`, with no
+recordable run. Exactly the shape Exa's round-5 finding 3 closed, and the analog my round-4
+port missed: I moved `now`'s tz-awareness/UTC-conversion preflight into the shared function, but
+did not also move the freshness-bound subtraction ahead of the loop the way `exa.py`'s
+`retrieve_web` does.
+
+Reproduced by direct execution against `64d9790` before writing any fix: `now=datetime.min` with
+`tzinfo=timezone.utc`, one valid query, a fake SDK — 2 provider calls made, then
+`OverflowError: date value out of range` raised, no `ResearchRun` returned.
+
+**Fix:** `freshness_cutoff_utc` is now computed once, immediately after the two preflight calls
+and before the query loop, wrapped in `try`/`except OverflowError` that raises
+`AskNewsRetrievalError(...) from None` — the same pattern `exa.py`'s `published_after` computation
+already uses. The value is reused (not recomputed) when the run is built. Added
+`("now", datetime.min.replace(tzinfo=timezone.utc))` as a case in
+`test_malformed_run_metadata_is_refused_before_any_call`, mirroring the equivalent case already in
+`test_exa.py`. Re-verified post-fix: `AskNewsRetrievalError` raised, zero calls made.
+
 ## M1-501 — Validating the common attribution fields
 
 **Acceptance criterion:** *schema rejects missing or unknown required fields and invalid source IDs.*
