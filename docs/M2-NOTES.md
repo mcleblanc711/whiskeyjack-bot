@@ -537,8 +537,8 @@ Delivered:
   protocol, `canonical_payload_json()` / `payload_sha256()`, `dry_run_attempt_id()`,
   `dry_run_artifact_path()`, `DryRunSubmissionGateway`, `write_dry_run_artifact()` /
   `read_dry_run_artifact()`, and `record_receipt()`.
-- `tests/unit/test_submission_gateway.py` (81), `tests/property/test_submission_gateway_properties.py`
-  (104: 13 properties plus a 91-case injectivity table). Suite: 2097 passed, 1 xfailed;
+- `tests/unit/test_submission_gateway.py` (82), `tests/property/test_submission_gateway_properties.py`
+  (104: 13 properties plus a 91-case injectivity table). Suite: 2098 passed, 1 xfailed;
   four gates green.
 
 No migration, no dependency, no CLI, no config change, no network call on any path.
@@ -799,6 +799,13 @@ No follow-up row is filed, because there is no residue.
 
 `test_a_receipt_cannot_be_recorded_against_a_different_record` is the regression test, and
 a sixth mutation — re-adding a `record_id` override parameter — was confirmed to fail it.
+
+Two further tests cover the new boundary's error discipline, because the round-2 request
+claims it and a request must not claim a test that does not exist (M1-308 round 7):
+`record_receipt` turns both the `LifecycleError` of an illegal transition and the
+`sqlite3.IntegrityError` of a spent idempotency key into a `GatewayError` with no cause
+chain. A seventh mutation — removing the `LifecycleError` wrapper — was confirmed to fail
+the first of them.
 
 ### On the property pass
 

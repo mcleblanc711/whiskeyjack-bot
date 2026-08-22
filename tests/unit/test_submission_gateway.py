@@ -507,6 +507,30 @@ def test_a_ledger_refusal_arrives_as_this_modules_error(ledger: sqlite3.Connecti
         record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     assert str(excinfo.value)
     assert excinfo.value.__cause__ is None
+    assert isinstance(excinfo.value, SubmissionError)
+
+
+def test_a_spent_idempotency_key_arrives_as_this_modules_error(
+    ledger: sqlite3.Connection,
+) -> None:
+    """`001`'s UNIQUE constraint is the thing that actually stops a second live post, and
+    it fires as a `sqlite3.IntegrityError` at the write. `lifecycle._insert` already wraps
+    that; this asserts it survives the new boundary rather than assuming it does, because
+    the round-2 request claims it."""
+    _seed_draft(ledger, "rec-2", question_id=101)
+    for record_id in ("rec-1", "rec-2"):
+        record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
+        approve(ledger, record_id=record_id, actor="owner", occurred_at=OCCURRED)
+
+    record_receipt(ledger, receipt=_live("rec-1", "att-live-1"), occurred_at=OCCURRED)
+    # Same key -- `_request()` derives it from the same payload -- against another record.
+    second = replace(_live("rec-2", "att-live-2"), idempotency_key=_key())
+    with pytest.raises(GatewayError) as excinfo:
+        record_receipt(ledger, receipt=second, occurred_at=OCCURRED)
+    assert isinstance(excinfo.value, SubmissionError)
+    assert excinfo.value.__cause__ is None
+    assert current_status(ledger, "rec-2") == "approved"
+    assert ledger.execute("SELECT count(*) FROM submission_attempts").fetchone()[0] == 1
 
 
 # --- the artifact --------------------------------------------------------------------
