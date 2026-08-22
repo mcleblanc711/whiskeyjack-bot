@@ -28,7 +28,11 @@ from asknews_sdk.dto.news import SearchResponse, SearchResponseDictItem
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.logging_setup import SecretRedactionFilter, configure_logging
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
-from whiskeyjack_bot.research.asknews import build_asknews_client, retrieve_news
+from whiskeyjack_bot.research.asknews import (
+    AskNewsRetrievalError,
+    build_asknews_client,
+    retrieve_news,
+)
 from whiskeyjack_bot.research.hashing import content_sha256
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -430,6 +434,62 @@ def test_provider_failure_on_the_very_first_call_still_returns_a_run(config: App
     assert result.raw_responses == ()
     assert result.run.provider == "asknews"
     assert result.run.error_summary is not None
+
+
+# --- M1-309: caller preflight, before any billable call ---------------------
+
+
+@pytest.mark.parametrize(
+    "queries",
+    ["june payrolls", b"june payrolls", ("q", 42), ("q", ""), ("q", None)],
+    ids=["bare-str", "bare-bytes", "int-item", "blank-item", "none-item"],
+)
+def test_malformed_queries_are_refused_before_any_call(config: AppConfig, queries: Any) -> None:
+    """A bare string satisfies Sequence[str], so list(queries) would silently explode it
+    into one billable call per character (matching Exa's round-4 finding 2)."""
+    sdk = _FakeSDK([[_article()]])
+    with pytest.raises(AskNewsRetrievalError):
+        _retrieve(sdk, config, queries=queries)
+    assert sdk.news.calls == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"question_id": "42"},
+        {"question_id": True},
+        {"retrieval_run_id": ""},
+        {"retrieval_run_id": "   \n\t"},
+        {"now": datetime(2026, 7, 21, 12, 0)},  # naive
+        {"now": "2026-07-21"},
+    ],
+    ids=[
+        "question-id-str",
+        "question-id-bool",
+        "run-id-blank",
+        "run-id-whitespace-only",
+        "now-naive",
+        "now-not-a-datetime",
+    ],
+)
+def test_malformed_run_metadata_is_refused_before_any_call(
+    config: AppConfig, overrides: dict[str, Any]
+) -> None:
+    """These would otherwise reach ResearchRun validation only after every call in
+    the run was billed (matching Exa's round-4 finding 4)."""
+    sdk = _FakeSDK([[_article()]])
+    with pytest.raises(AskNewsRetrievalError):
+        _retrieve(sdk, config, **overrides)
+    assert sdk.news.calls == []
+
+
+def test_now_is_normalized_to_utc_before_any_use(config: AppConfig) -> None:
+    offset_now = datetime(2026, 7, 21, 20, 0, tzinfo=timezone(timedelta(hours=8)))
+    result = _retrieve(_FakeSDK([[_article()]]), config, now=offset_now)
+    expected = offset_now.astimezone(timezone.utc)
+    assert result.run.started_at_utc == expected
+    assert result.run.started_at_utc.utcoffset() == timedelta(0)
+    assert result.documents[0].retrieved_at_utc == expected
 
 
 # --- secret hygiene ---------------------------------------------------------

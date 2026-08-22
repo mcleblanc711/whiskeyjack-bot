@@ -40,6 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
+| M1-309 | feat/m1-309-asknews-caller-preflight | whiskeyjack-m1-309 | no | none | 2026-08-21 |
 | M1-501 | feat/m1-501-validate-attribution-fields | whiskeyjack-m1-501 | no | none | 2026-08-21 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
@@ -66,11 +67,14 @@ Three lanes, run concurrently:
 | --- | --- | --- |
 | 1 — critical path | ~~`M1-402`~~ → ~~`M1-403`~~ → **`M1-501`** → `M1-602` | Strictly serial, and nothing shortens it. Protect this lane: merge master into it just after a review round closes, never mid-round. |
 | 2 — M2 path | ~~`M2-701`~~ → ~~`M2-702`~~ → **`M2-703`** | Independent of lane 1 until `M2-702`, which the backlog says needs `M1-602` from it. `lifecycle.py` already documents the seam it plugs into. |
-| 3 — debt queue | ~~`M0-007`~~ → ~~`M1-313`~~ → ~~`M1-607`~~ → **`M1-312`** → `M1-309` → `M1-311` | Six small items, one branch and one worktree each, in series in one terminal. |
+| 3 — debt queue | ~~`M0-007`~~ → ~~`M1-313`~~ → ~~`M1-607`~~ → ~~`M1-312`~~ → **`M1-309`** → `M1-311` | Six small items, one branch and one worktree each, in series in one terminal. |
 
 Struck items are merged. As of 2026-08-21 the live lane heads are **M1-501**, **M2-703**
-and **M1-312**, one worktree each, and nothing in this wave adds a dependency or a
+and **M1-309**, one worktree each, and nothing in this wave adds a dependency or a
 migration — `submission_attempts` and `forecast_records` both ship in `001_initial.sql`.
+**M1-312 merged approved in round 1** (PR #35), the project's third single-round approval;
+its composition (`research/persist.py`) is the API a retrieval orchestrator will call, and
+it added neither a dependency nor a migration, so both slots are still free.
 
 **M1-602 waits for M1-501, and the M2-702 precedent does not license skipping it.** M2-702
 shipped against `forecast_records` while M1-602 was `Not Started`, and its notes say why
