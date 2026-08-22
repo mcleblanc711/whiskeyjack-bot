@@ -3445,6 +3445,29 @@ pre-fix code before the guard was wired in — one surfaced the exact live bug s
 
 `tests/unit/test_exa.py` unchanged and green — the extraction is behavior-preserving.
 
+### Round 1 review (GPT) — one blocking finding, reproduced
+
+Reviewed commit `64d9790`. **Finding:** `require_run_metadata` accepts an ordinary aware `now`
+near `datetime.min`, but `freshness_cutoff_utc = now_utc - timedelta(days=...)` was still computed
+only inside the final `validate_run({...})` dict, after the query loop — so that `now` billed both
+the current- and historical-strategy calls and then raised a raw `OverflowError`, with no
+recordable run. Exactly the shape Exa's round-5 finding 3 closed, and the analog my round-4
+port missed: I moved `now`'s tz-awareness/UTC-conversion preflight into the shared function, but
+did not also move the freshness-bound subtraction ahead of the loop the way `exa.py`'s
+`retrieve_web` does.
+
+Reproduced by direct execution against `64d9790` before writing any fix: `now=datetime.min` with
+`tzinfo=timezone.utc`, one valid query, a fake SDK — 2 provider calls made, then
+`OverflowError: date value out of range` raised, no `ResearchRun` returned.
+
+**Fix:** `freshness_cutoff_utc` is now computed once, immediately after the two preflight calls
+and before the query loop, wrapped in `try`/`except OverflowError` that raises
+`AskNewsRetrievalError(...) from None` — the same pattern `exa.py`'s `published_after` computation
+already uses. The value is reused (not recomputed) when the run is built. Added
+`("now", datetime.min.replace(tzinfo=timezone.utc))` as a case in
+`test_malformed_run_metadata_is_refused_before_any_call`, mirroring the equivalent case already in
+`test_exa.py`. Re-verified post-fix: `AskNewsRetrievalError` raised, zero calls made.
+
 ## M1-501 — Validating the common attribution fields
 
 **Acceptance criterion:** *schema rejects missing or unknown required fields and invalid source IDs.*

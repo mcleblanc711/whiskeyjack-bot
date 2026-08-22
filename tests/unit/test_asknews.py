@@ -462,6 +462,11 @@ def test_malformed_queries_are_refused_before_any_call(config: AppConfig, querie
         {"retrieval_run_id": "   \n\t"},
         {"now": datetime(2026, 7, 21, 12, 0)},  # naive
         {"now": "2026-07-21"},
+        # Aware, but the freshness bound underflows datetime's range: freshness_cutoff_utc
+        # is computed once, before the query loop, in this exact spot (cross-model review
+        # round 1) -- computing it only when the run is built let two calls bill first and
+        # then raise a raw OverflowError with no recordable run.
+        {"now": datetime.min.replace(tzinfo=timezone.utc)},
     ],
     ids=[
         "question-id-str",
@@ -470,6 +475,7 @@ def test_malformed_queries_are_refused_before_any_call(config: AppConfig, querie
         "run-id-whitespace-only",
         "now-naive",
         "now-not-a-datetime",
+        "now-freshness-bound-underflow",
     ],
 )
 def test_malformed_run_metadata_is_refused_before_any_call(

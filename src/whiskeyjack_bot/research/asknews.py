@@ -237,6 +237,12 @@ def retrieve_news(
     passed, spelled independently of the timezone they spelled it in. Queries are
     supplied by the caller; deriving them from a question is not this item's job.
 
+    ``freshness_cutoff_utc`` is likewise computed once, before the query loop, and
+    reused when the run is built. An aware ``now`` near ``datetime.min`` passes the
+    tz-awareness preflight but overflows this subtraction; computing it only when the
+    run is assembled at the end let two calls bill first and then raise a raw
+    ``OverflowError`` with no recordable run (cross-model review round 1).
+
     **Never raises on provider failure.** A run makes up to
     ``max_queries_per_question * 2`` billable calls; raising partway through would
     discard the record of every call already paid for, which is precisely the kind
@@ -259,6 +265,19 @@ def retrieve_news(
     retrieval = config.retrieval
     capped_queries = validated_queries[: retrieval.max_queries_per_question]
     hours_back = retrieval.freshness_days_default * _HOURS_PER_DAY
+    try:
+        # Computed here, before the first billable call, and reused below rather
+        # than re-derived when the run is built: an aware `now` near datetime.min
+        # (a contract-accepted value, not hostile state) passes require_run_metadata's
+        # tz-awareness check but overflows this subtraction, and computing it only
+        # inside the final validate_run() dict let two calls bill first and then
+        # raise a raw OverflowError with no recordable run (cross-model review round
+        # 1, matching Exa's round-5 finding 3).
+        freshness_cutoff_utc = now_utc - timedelta(days=retrieval.freshness_days_default)
+    except OverflowError:
+        raise AskNewsRetrievalError(
+            "now is too early to compute a freshness bound (offending input withheld)"
+        ) from None
 
     raw_responses: list[dict[str, Any]] = []
     documents: list[ResearchDocument] = []
@@ -334,7 +353,7 @@ def retrieve_news(
             "queries": capped_queries,
             "started_at_utc": now_utc,
             "completed_at_utc": now_utc,
-            "freshness_cutoff_utc": now_utc - timedelta(days=retrieval.freshness_days_default),
+            "freshness_cutoff_utc": freshness_cutoff_utc,
             "error_summary": _error_summary(
                 provider_failed=provider_failed, retained=len(documents)
             ),
