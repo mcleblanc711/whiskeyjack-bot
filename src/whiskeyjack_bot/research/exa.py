@@ -125,6 +125,8 @@ from whiskeyjack_bot.research.model import (
     validate_document,
     validate_run,
 )
+from whiskeyjack_bot.research.preflight import require_run_metadata as _shared_run_metadata
+from whiskeyjack_bot.research.preflight import string_list as _shared_string_list
 from whiskeyjack_bot.research.transport import apply_connection_retries
 
 _LOGGER = logging.getLogger(__name__)
@@ -438,105 +440,31 @@ def _require_exa_client(client: httpx.Client) -> None:
 
 
 def _string_list(values: Sequence[str], message: str) -> list[str]:
-    """Return ``values`` as a list of non-blank strings, or raise ``message``.
+    """Return ``values`` as a list of non-blank strings, or raise ``ExaFallbackError``.
 
-    ``str`` **satisfies** ``Sequence[str]``, so ``mypy --strict`` cannot catch a
-    caller passing one, and iterating it yields characters: ``queries="inflation"``
-    silently became six billable single-character searches, and
-    ``include_domains="bls.gov"`` became seven single-character filters
-    (cross-model review round 4, finding 2). ``bytes``/``bytearray`` are refused
-    with them -- they iterate to ints, not strings, but the mistake is the same
-    shape and the error should be too.
-
-    ``list(values)`` is wrapped because a caller can pass any object at runtime:
-    an ``__iter__`` that raises must arrive as this module's error like every
-    other malformed shape, not as whatever it happened to throw. ``None`` and a
-    bare ``int`` are the same defect and arrive the same way -- which is why
-    :func:`_canonical_reasons` routes through here too, having been the one
-    caller argument round 4's hardening missed (round 5, finding 6).
-
-    ``message`` is a constant chosen by the call site, never caller data.
+    A thin binding of :func:`whiskeyjack_bot.research.preflight.string_list` to this
+    module's own error type -- the guard is shared with the AskNews adapter (M1-309)
+    rather than duplicated; see that function's docstring for the full rationale
+    (cross-model review round 4, finding 2; round 5, finding 6).
     """
-    if isinstance(values, (str, bytes, bytearray)):
-        raise ExaFallbackError(message)
-    try:
-        items = list(values)
-    except Exception:
-        raise ExaFallbackError(message) from None
-    for item in items:
-        if not isinstance(item, str) or not item.strip():
-            raise ExaFallbackError(message)
-    return items
+    return _shared_string_list(values, message, error=ExaFallbackError)
 
 
 def _require_run_metadata(*, question_id: int, retrieval_run_id: str, now: datetime) -> datetime:
     """Refuse caller metadata the run record would reject, and return ``now`` in UTC.
 
-    These three reach :func:`validate_run` at the *end* of a run, which is far
-    too late: a malformed one let every billable call happen and then raised,
-    discarding the record of the spend, and it raised
-    ``ResearchSchemaError`` -- a sibling module's error, not this module's
-    (cross-model review round 4, finding 4).
-
-    ``question_id`` is gated **more strictly than the schema**, on purpose.
-    ``ResearchRun`` is not strict about it: pydantic coerces ``"42"`` to ``42``
-    and ``True`` to ``1``, so a string id would validate happily *after* the
-    ``%d`` in the engagement log had already handed it to ``logging``, which
-    prints the raw argument to stderr in its internal error report. An exact
-    ``int`` closes that channel at the source -- ``type(...) is int`` rather than
-    ``isinstance``, which admitted an ``IntEnum`` and made that claim untrue
-    (round 5, non-blocking observation 1); the same exact-type gate M1-203 uses.
-
-    **Validate-and-return**, like :func:`_validated_domains`: the UTC-normalized
-    ``now`` is the value the rest of the run uses. Round 4 converted ``now`` to
-    UTC only inside :func:`validate_run`, at the end -- so an upper-bound
-    ``datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(-timedelta(hours=14)))``
-    passed every preflight, paid for a call, and *then* raised a raw
-    ``OverflowError`` from the conversion (round 5, finding 3). Converting once
-    here means the failure lands before the money and as this module's error, and
-    every later use of the value is already UTC.
-
-    The ``utcoffset()`` gate stays ahead of the conversion and is not redundant
-    with it: ``astimezone`` on a *naive* datetime silently assumes local time and
-    succeeds, so it cannot be the thing that rejects one.
+    A thin binding of :func:`whiskeyjack_bot.research.preflight.require_run_metadata` to
+    this module's own error type -- the guard is shared with the AskNews adapter (M1-309)
+    rather than duplicated; see that function's docstring for the full rationale
+    (cross-model review round 4, finding 4; round 5, finding 3 and non-blocking
+    observation 1).
     """
-    if type(question_id) is not int:
-        raise ExaFallbackError("question_id must be an int (offending input withheld)")
-    # M1-607: `not retrieval_run_id` refuses '' but '\n\t' is truthy, so a
-    # whitespace-only run id passed this preflight, paid for every call in the
-    # run, and only then failed at the ledger -- the exact shape of round 4's
-    # finding 4, which is why this gate exists at all. `str.strip()` is the
-    # definition 006's pinned character set was written from.
-    if (
-        not isinstance(retrieval_run_id, str)
-        or not retrieval_run_id.strip()
-        or "\x00" in retrieval_run_id
-    ):
-        raise ExaFallbackError(
-            "retrieval_run_id must be a non-blank string with no NUL character "
-            "(offending input withheld)"
-        )
-    if not isinstance(now, datetime):
-        raise ExaFallbackError("now must be a timezone-aware datetime (offending input withheld)")
-    try:
-        # A caller-supplied tzinfo runs code here: utcoffset() can raise, and a
-        # broken one must arrive as this module's error like every other
-        # malformed shape rather than as whatever it happened to throw.
-        offset = now.utcoffset()
-    except Exception:
-        raise ExaFallbackError(
-            "now must be a timezone-aware datetime (offending input withheld)"
-        ) from None
-    if offset is None:
-        raise ExaFallbackError("now must be a timezone-aware datetime (offending input withheld)")
-    try:
-        # Same reasoning as above -- astimezone calls the caller's tzinfo again --
-        # plus OverflowError when the UTC instant falls outside datetime's range.
-        return now.astimezone(timezone.utc)
-    except Exception:
-        raise ExaFallbackError(
-            "now cannot be converted to UTC (offending input withheld)"
-        ) from None
+    return _shared_run_metadata(
+        question_id=question_id,
+        retrieval_run_id=retrieval_run_id,
+        now=now,
+        error=ExaFallbackError,
+    )
 
 
 def build_exa_client(config: AppConfig) -> httpx.Client:
