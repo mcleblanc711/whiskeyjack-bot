@@ -385,9 +385,11 @@ def test_a_lone_surrogate_survives_the_rendering() -> None:
     """``model_dump_json()`` raises on one; ``ensure_ascii=True`` escapes it.
 
     Reachable rather than theoretical: a lone surrogate reaches a schema text field from
-    provider JSON, and the question title is one such field. M1-305 round 2.
+    provider JSON. Asserted on a field that reaches no column of its own -- see
+    ``test_a_lone_surrogate_in_a_column_backed_field_is_refused`` for the other half.
+    M1-305 round 2.
     """
-    record = _record(question_domain="econ\ud800data")
+    record = _record(question=_question(resolution_criteria="Resolves if econ\ud800data."))
     rendered = canonical_record_json(record)
     assert "\\ud800" in rendered
     assert record_from_json(rendered) == record
@@ -422,15 +424,164 @@ def test_a_surrogate_pair_is_refused_rather_than_silently_rewritten() -> None:
     assert json.loads(rendered)["t"] != pair
 
 
-def test_a_lone_surrogate_is_accepted_because_it_round_trips() -> None:
+def test_a_lone_surrogate_is_accepted_in_a_field_that_only_record_json_holds() -> None:
     """The converse, so the guard is narrow rather than merely strict.
 
     A lone surrogate escapes to ``"\\ud800"`` and comes back as the same lone surrogate.
-    Refusing it would contradict ``forecast/inputs.render_model_input``, which documents
-    the same rendering rule accepting one.
+    Refusing it in ``record_json`` would contradict ``forecast/inputs.render_model_input``,
+    which documents the same rendering rule accepting one.
+
+    ``resolution_criteria`` lives inside the stored question and reaches no column of its
+    own, which is what makes it the right field for this assertion. Round 1's finding B2 is
+    that the same value in a field the writer *also* copies into a bare TEXT column is a
+    different case entirely -- see the test below.
     """
-    record = _record(question_domain="econ\ud800data")
+    record = _record(question=_question(resolution_criteria="Resolves if econ\ud800data."))
     assert record_from_json(canonical_record_json(record)) == record
+
+
+def test_a_lone_surrogate_in_a_column_backed_field_is_refused() -> None:
+    """Round 1, finding B2, as a regression.
+
+    `record_json` is `ensure_ascii` output and is pure ASCII, so it can carry a lone
+    surrogate as an escape. The writer also copies a dozen scalars into their own bare TEXT
+    columns, and sqlite3 encodes a TEXT parameter as UTF-8 at bind time -- so the same value
+    there raised a raw `UnicodeEncodeError` quoting the character, escaping the module's
+    exception contract *and* leaking. Refused at build time now, before any transaction.
+
+    `question_domain` is the field the finding actually reached, and the test below says
+    why it is the only one.
+    """
+    with pytest.raises(ForecastRecordError, match="text column"):
+        _record(question_domain="a\ud800b")
+
+
+@pytest.mark.parametrize("field", ["tournament_id", "attempt_id", "retrieval_run_id"])
+def test_the_other_column_backed_fields_were_never_reachable(field: str) -> None:
+    """Why `question_domain` was the hole, checked rather than asserted in a comment.
+
+    Every other field the writer projects into a bare TEXT column is a pydantic
+    *constrained* string (`Field(min_length=..., max_length=...)`), and a constrained string
+    refuses a value that cannot be encoded as UTF-8 on its own -- the same behaviour that
+    keeps a surrogate *pair* out of `question.title`. `question_domain` is a bare
+    `str | None`, which accepts one.
+
+    So the refusal still arrives as this module's error, from one layer up. The probe is the
+    fix for `question_domain` and defence in depth for the rest -- and this test is what
+    would notice if a later change relaxed one of those constraints, since it would then
+    start failing on the *message*, not on the type.
+    """
+    with pytest.raises(ForecastRecordError, match="could not be assembled"):
+        _draft(**{field: "a\ud800b"})
+
+
+def test_the_column_probe_covers_every_bare_text_column_the_writer_writes() -> None:
+    """The list of probed fields against the writer's own column set.
+
+    The failure mode this guards is a column added to `forecast.store._projection` and not
+    to `record._BARE_TEXT_PROJECTIONS`, which would silently reopen finding B2 for that
+    column. Compared as **set equality** over the columns that are neither writer-owned nor
+    `ensure_ascii` output, so an addition on either side fails.
+    """
+    from whiskeyjack_bot.forecast import record as record_module
+    from whiskeyjack_bot.forecast import store as store_module
+
+    projected = set(store_module._PROJECTED_COLUMNS)
+    # The two JSON columns are `ensure_ascii` output and cannot hold an unencodable
+    # character; `question_id`, `post_id` and `forecast_version` are INTEGER columns.
+    ascii_json = {"record_json", "final_prediction_json", "forecast_sha256"}
+    integers = {"question_id", "post_id", "forecast_version"}
+    needs_probe = projected - ascii_json - integers
+
+    probed = {path.split(".")[0] for path in record_module._BARE_TEXT_PROJECTIONS}
+    # `model_settings.*` fans out into four columns under different names; map them.
+    probed_columns = {
+        path.rsplit(".", 1)[-1] if "." in path else path
+        for path in record_module._BARE_TEXT_PROJECTIONS
+    }
+    probed_columns = {
+        {"provider": "model_provider", "name": "model_name"}.get(name, name)
+        for name in probed_columns
+    }
+    assert probed_columns == needs_probe, (probed_columns ^ needs_probe, probed)
+
+
+def test_a_pydantic_discriminator_failure_does_not_echo_the_stored_tag() -> None:
+    """Round 1, finding B1, as a regression.
+
+    `include_input=False, include_url=False` suppresses pydantic's `input` field but not
+    the values several of its `msg` strings interpolate. The discriminated union is the
+    reachable case: a stored `forecast.question_type` reached `ForecastRecordError` verbatim
+    through `Input tag '...' found using 'question_type' does not match ...`.
+    """
+    payload = json.loads(canonical_record_json(_record()))
+    payload["forecast"]["question_type"] = SECRET
+    with pytest.raises(ForecastRecordError) as excinfo:
+        record_from_json(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        )
+    assert not _leaks(excinfo.value)
+    # Still actionable: the field path and pydantic's value-free error slug survive.
+    assert "forecast" in str(excinfo.value)
+    assert "union_tag_invalid" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("where", ["top_level", "nested"])
+def test_an_unauthored_field_name_is_withheld_from_the_refusal(where: str) -> None:
+    """The other half of finding B1, found while fixing the first half.
+
+    `include_input=False` suppresses the offending *value*; under `extra="forbid"` the
+    offending **key** is the error's `loc`, and the keys of a stored `record_json` are
+    untrusted. Dropping `msg` did nothing about that: the refusal still read
+    `(WJLEAKMARKER-extra-key: extra_forbidden)`.
+
+    A location part now survives only if this schema declared it. Asserted at both depths,
+    because the nested case is the one a top-level-only field-name set would miss.
+    """
+    payload = json.loads(canonical_record_json(_record()))
+    if where == "top_level":
+        payload[SECRET] = 1
+    else:
+        payload["question"][SECRET] = 1
+    with pytest.raises(ForecastRecordError) as excinfo:
+        record_from_json(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        )
+    assert not _leaks(excinfo.value)
+    assert "<withheld>" in str(excinfo.value)
+
+
+def test_a_field_name_this_schema_authored_still_survives() -> None:
+    """The converse, so the withholding is narrow rather than blanket.
+
+    A refusal rendered as `<withheld>.<withheld>` is one nobody can act on, which is its own
+    failure mode -- the same argument the M1-401 path carve-out makes. `_schema_field_names`
+    walks the whole model tree for that reason.
+    """
+    payload = json.loads(canonical_record_json(_record()))
+    del payload["question"]["title"]
+    with pytest.raises(ForecastRecordError) as excinfo:
+        record_from_json(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        )
+    assert "title" in str(excinfo.value)
+    assert "missing" in str(excinfo.value)
+
+
+def test_a_record_that_already_has_an_identity_cannot_be_given_another() -> None:
+    """Round 1, finding B4, as a regression.
+
+    `ForecastRecord` subclasses `ForecastRecordDraft`, so the old `isinstance` gate accepted
+    one and then raised a raw `TypeError` about duplicate keyword arguments.
+    """
+    record = _record()
+    with pytest.raises(ForecastRecordError, match="already has an identity"):
+        assign_identity(
+            record,
+            record_id="01a02000-0000-7000-8000-00000000000f",
+            forecast_version=2,
+            parent_record_id=record.record_id,
+        )
 
 
 def test_the_hash_moves_with_any_content_change() -> None:

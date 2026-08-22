@@ -57,6 +57,8 @@ from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
     UtcDatetime,
+    _schema_field_names,
+    _WITHHELD,
 )
 from whiskeyjack_bot.questions.model import CanonicalQuestion
 
@@ -331,13 +333,18 @@ def _require_replayable(payload: Any, path: str = "<record>") -> None:
     the model's. That is an attribution loss of exactly the kind this ledger exists to
     prevent, and ``003`` makes the row uncorrectable.
 
-    A **lone** surrogate is deliberately *not* refused, and the distinction is the point.
-    It escapes to ``"\ud800"`` and ``json.loads`` hands back the same lone surrogate, so
-    it round-trips exactly -- ``forecast/inputs.render_model_input`` says as much about the
-    same rendering rule, and refusing it here would contradict a sibling in this
-    subpackage over an input that is provably safe. ``research/store.py`` refuses both,
-    correctly: its columns hold bare TEXT, which cannot carry either. This module's column
-    holds ``ensure_ascii`` output, which is pure ASCII and can carry one.
+    A **lone** surrogate is deliberately *not* refused *here*, and the distinction is the
+    point. It escapes to ``"\ud800"`` and ``json.loads`` hands back the same lone
+    surrogate, so it round-trips exactly -- ``forecast/inputs.render_model_input`` says as
+    much about the same rendering rule, and refusing it in ``record_json`` would contradict
+    a sibling in this subpackage over an input that is provably safe.
+
+    That holds for ``record_json`` and **only** for ``record_json``. Round 1's finding B2 is
+    that the writer also copies a dozen scalars into their own bare TEXT columns, which hold
+    the value as written and cannot carry a lone surrogate at all --
+    :func:`_require_storable_in_a_text_column` is that half of the rule. So this project
+    ends up in the same place ``research/store.py`` is for the fields it stores twice, and a
+    step less strict for the fields it stores only inside canonical ASCII JSON.
 
     Reachable rather than theoretical: this text is a Metaculus question title and raw
     model output, both untrusted under CLAUDE.md's threat boundary.
@@ -361,6 +368,68 @@ def _require_replayable(payload: Any, path: str = "<record>") -> None:
             _require_replayable(item, f"{path}[{index}]")
 
 
+# The record fields `forecast.store` projects into a **bare TEXT** column of
+# `forecast_records`, as dotted paths into the dumped payload.
+#
+# Round 1, finding B2. `record_json` holds `ensure_ascii` output and is therefore pure
+# ASCII, which is why a lone surrogate is storable *there* -- but the writer also copies a
+# dozen scalars into their own columns, and those hold the value as written. sqlite3
+# encodes a TEXT parameter as UTF-8 at bind time, so a lone surrogate in one of them raises
+# a raw `UnicodeEncodeError` that quotes the character. The transaction rolls back and
+# nothing is written, so this is an exception-contract and leak defect rather than a
+# corruption one -- but it is still a raw exception escaping a public boundary, and its
+# text names the offending character.
+#
+# `final_prediction_json` and `record_json` are absent deliberately: both are
+# `ensure_ascii` output and cannot contain an unencodable character. `status` is the
+# literal `'draft'` and `created_at_utc` is `strftime` output.
+#
+# `test_every_bare_text_column_is_probed` pins this list against the writer's own column
+# set, so a column added to one and not the other fails rather than silently reopening this.
+_BARE_TEXT_PROJECTIONS = (
+    "record_id",
+    "parent_record_id",
+    "tournament_id",
+    "question_type",
+    "question_domain",
+    "retrieval_run_id",
+    "attempt_id",
+    "generated_at_utc",
+    "model_settings.provider",
+    "model_settings.name",
+    "model_settings.prompt_version",
+    "model_settings.prompt_sha256",
+)
+
+
+def _require_storable_in_a_text_column(payload: dict[str, Any]) -> None:
+    """Refuse a record whose scalar columns cannot be bound as SQLite TEXT.
+
+    The narrow companion to :func:`_require_replayable`. That one refuses what does not
+    survive the JSON round trip; this one refuses what cannot be *written* at all. Kept as
+    a separate rule with its own field list because the two have different domains: a lone
+    surrogate passes the first and fails this one, which is exactly the case round 1 found.
+    """
+    for path in _BARE_TEXT_PROJECTIONS:
+        value: Any = payload
+        for part in path.split("."):
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(part)
+        if not isinstance(value, str):
+            continue
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            # from None and no value in the message: the UnicodeEncodeError names the
+            # offending character, which is the leak half of this finding.
+            raise ForecastRecordError(
+                "a record field cannot be stored in a text column of the ledger: "
+                f"{path} (offending input withheld from this message)"
+            ) from None
+
+
 def _dumped(record: ForecastRecord) -> dict[str, Any]:
     """``model_dump(mode="json")``, with pydantic's value-echoing warning suppressed.
 
@@ -380,8 +449,9 @@ def _dumped(record: ForecastRecord) -> dict[str, Any]:
         ) from None
     # Checked on every rendering rather than only at build time, so no path to the stored
     # bytes can skip it -- `canonical_record_json`, `record_sha256` and
-    # `canonical_final_prediction_json` all come through here.
+    # `canonical_final_prediction_json` all come through here, and so does every write.
     _require_replayable(dumped)
+    _require_storable_in_a_text_column(dumped)
     return dumped
 
 
@@ -459,17 +529,55 @@ def record_from_json(text: str) -> ForecastRecord:
 def _sanitized(exc: ValidationError) -> ForecastRecordError:
     """Rebuild a ``ValidationError`` as this module's error with no input echoed.
 
-    ``include_input=False, include_url=False`` is the project-wide rule: pydantic's own
-    rendering interpolates the offending input. ``loc`` is kept because it is a field path
-    this module authored -- except for integer entries, which are list indices and are
-    rendered as ``[i]`` rather than dropped, so the path stays readable.
+    ``include_input=False, include_url=False`` is the project-wide rule, and **it is not
+    sufficient on its own**. Round 1, finding B1: those two flags suppress pydantic's
+    ``input`` field, but several of its ``msg`` strings interpolate the offending value
+    into the message text itself. The discriminated union is the reachable case --
+    a stored ``forecast.question_type`` of ``"WJLEAKMARKER-secret"`` produces
+    ``Input tag 'WJLEAKMARKER-secret' found using 'question_type' does not match ...``,
+    which reached ``ForecastRecordError`` verbatim. Reproduced by execution before this fix.
+
+    So the message is rebuilt from ``loc`` and ``type`` only. Both are ours or pydantic's
+    own fixed vocabulary -- ``loc`` is a field path declared in this module, ``type`` is a
+    slug from pydantic's error catalogue (``union_tag_invalid``, ``missing``,
+    ``string_type``) that never carries an input.
+
+    ``msg`` is dropped **entirely**, including for ``value_error`` entries raised by this
+    project's own validators, whose texts happen to be value-free today. That is the
+    stricter reading and it is deliberate: an allowlist keyed on error type would make
+    every future validator's wording part of the leak surface, silently, and this rule has
+    already been breached once by a message nobody wrote.
+
+    **``loc`` is not automatically safe either**, and that half was still open after the
+    first pass at this fix. Under ``extra="forbid"`` the location of an unexpected key *is*
+    that key, and the keys of a stored ``record_json`` are untrusted: a stored object with a
+    key named ``WJLEAKMARKER-extra-key`` produced
+    ``stored record_json does not match the record schema (WJLEAKMARKER-extra-key:
+    extra_forbidden)``. So a location part survives only if this schema authored it -- an
+    integer list index, or a field name declared somewhere in the model tree.
+
+    ``_schema_field_names`` and ``_WITHHELD`` are imported from
+    :mod:`whiskeyjack_bot.forecast.schema` rather than reimplemented. It is a private name
+    from a sibling in the same subpackage, which is deliberate: this is one rule, the
+    traversal is non-trivial (the model tree is five levels deep here), and M1-607's note
+    about a rule written twice is what round 1's finding B4 turned out to be.
+
+    Integer ``loc`` entries are list indices and render as ``[i]`` rather than being
+    dropped, so the path stays readable.
     """
+    known = _schema_field_names(ForecastRecord)
     paths = []
     for error in exc.errors(include_input=False, include_url=False):
-        location = ".".join(
-            f"[{part}]" if isinstance(part, int) else str(part) for part in error["loc"]
-        )
-        paths.append(f"{location or '<record>'}: {error['msg']}")
+        parts = []
+        for part in error["loc"]:
+            if isinstance(part, int):
+                parts.append(f"[{part}]")
+            elif part in known:
+                parts.append(str(part))
+            else:
+                parts.append(_WITHHELD)
+        location = ".".join(parts)
+        paths.append(f"{location or '<record>'}: {error['type']}")
     joined = "; ".join(sorted(set(paths)))
     return ForecastRecordError(f"stored record_json does not match the record schema ({joined})")
 
@@ -577,8 +685,30 @@ def build_forecast_record_draft(
         ) from None
     # Checked here too, so a caller learns the record is unstorable at build time rather
     # than from inside the writer's transaction. `_dumped` is the binding check; this one
-    # is the early one, the same shape as M1-303's "refuse before you spend" rule.
-    _require_replayable(draft.model_dump(mode="json", warnings=False))
+    # is the early one, the same shape as M1-303's "refuse before you spend" rule. The
+    # identity fields are absent from a draft, so the column probe simply skips them here
+    # and catches them on the record.
+    dumped = draft.model_dump(mode="json", warnings=False)
+    _require_replayable(dumped)
+    _require_storable_in_a_text_column(dumped)
+    return draft
+
+
+def require_unassigned_draft(draft: object) -> ForecastRecordDraft:
+    """Return ``draft`` if it is a draft that has not been given an identity yet.
+
+    Exact type rather than ``isinstance``, because :class:`ForecastRecord` subclasses
+    :class:`ForecastRecordDraft`: an already-appended record would otherwise pass the gate
+    and be minted a second identity for a forecast that already has one -- the duplicate
+    ``001``'s UNIQUE constraint exists to prevent. One helper shared by
+    :func:`assign_identity` and :mod:`whiskeyjack_bot.forecast.store`, so the rule cannot
+    hold in one place and not the other (round 1, finding B4).
+    """
+    if type(draft) is not ForecastRecordDraft:
+        raise ForecastRecordError(
+            "draft must be a ForecastRecordDraft; a record that already has an identity "
+            "cannot be given another one"
+        )
     return draft
 
 
@@ -595,9 +725,15 @@ def assign_identity(
     the current chain. Exposed rather than made private so a test can build a record
     without a database, and so the draft/record split is a real boundary rather than a
     convention.
+
+    Refuses by **exact type**, not ``isinstance``. Round 1, finding B4: ``ForecastRecord``
+    subclasses ``ForecastRecordDraft``, so an already-assigned record passed an
+    ``isinstance`` gate and then hit ``ForecastRecord() got multiple values for keyword
+    argument 'record_id'`` -- a raw ``TypeError`` escaping a public boundary. The writer
+    already made this distinction; the shared helper is here so the two cannot disagree
+    about it.
     """
-    if not isinstance(draft, ForecastRecordDraft):
-        raise ForecastRecordError("draft must be a ForecastRecordDraft")
+    require_unassigned_draft(draft)
     try:
         return ForecastRecord(
             **draft.model_dump(warnings=False),

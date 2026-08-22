@@ -319,6 +319,10 @@ _ALLOWED_MESSAGE_PREFIXES = (
     "draft must be a ForecastRecordDraft",
     "invalid forecast response:",
     "<record>",  # the field-path prefix of the replayability refusal
+    # Round 1, finding B2. Written to lead with a constant rather than with the field path
+    # so one prefix closes the whole family -- a message shaped `f"{path} cannot ..."` would
+    # have needed one prefix per projected column, which is a list that drifts.
+    "a record field cannot be stored in a text column of the ledger:",
 )
 
 
@@ -398,6 +402,11 @@ def test_no_message_repeats_the_content_it_refused(
         _build,
         lambda: record_from_json(marked_stored),
         lambda: record_from_json(json.dumps({"resolution_criteria": marked_criteria})),
+        # The marker as a *key*, not a value. Round 1's finding B1 had a second half the
+        # first version of this property could not see: under `extra="forbid"` the offending
+        # key is the error's `loc`, and this property only ever planted the marker in
+        # values. A leak channel a property does not feed is a leak channel it does not test.
+        lambda: record_from_json(json.dumps({marked_criteria: 1})),
         lambda: record_sha256(_build()),
     ]
     for attempt in attempts:

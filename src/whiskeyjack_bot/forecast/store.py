@@ -67,19 +67,62 @@ from whiskeyjack_bot.forecast.record import (
     canonical_record_json,
     record_from_json,
     record_sha256,
+    require_unassigned_draft,
 )
 from whiskeyjack_bot.lifecycle import LifecycleError, transaction
 
-# The row as this module writes and reads it. Spelled out rather than `SELECT *` for the
-# reason approval.py and lifecycle.py give for their own column lists: the mappers below
-# index positionally, so this order is part of the contract and a later ALTER TABLE must
-# not be able to reorder it silently.
-_RECORD_COLUMNS = (
-    "record_id, question_id, tournament_id, forecast_version, parent_record_id, "
-    "forecast_sha256, record_json"
-)
+# The two columns this module writes but does not derive from the record.
+#
+# `status` is the literal `'draft'`: it is not a parameter and there is no branch that
+# could make it anything else. `003`'s trigger refuses a non-draft insert, and a writer
+# able to *request* another state would be a writer able to record an approval that never
+# happened. `created_at_utc` is writer-owned -- when the ledger stored the row, as distinct
+# from `generated_at_utc`, which is when the pipeline produced it and is caller-supplied so
+# a replay can reproduce it.
+_WRITER_OWNED_COLUMNS = ("status", "created_at_utc")
 
-_INSERT_COLUMNS = (
+
+def _projection(record: ForecastRecord) -> dict[str, Any]:
+    """Every ``forecast_records`` column this module derives from the record.
+
+    **One definition, used to write the row and to check it on the way back out.** Round 1,
+    finding B3: the reader compared five identity columns, so a row whose `question_type`
+    column said `numeric` while its `record_json` described a binary forecast was returned
+    as binary -- while `approval.read_forecast_summary`, which reads the column, reported
+    numeric. Two public readers giving incompatible attribution for one immutable record.
+
+    Comparing "the columns the writer derives" against "the record" is only a real check if
+    the two lists cannot drift, so there is one list and it is this function.
+    `test_the_reader_checks_every_column_the_writer_derives` pins it against the table's own
+    column set, so a column added to `forecast_records` and written here without being
+    compared fails rather than silently reopening the finding.
+    """
+    return {
+        "record_id": record.record_id,
+        "question_id": record.question_id,
+        "post_id": record.post_id,
+        "tournament_id": record.tournament_id,
+        "forecast_version": record.forecast_version,
+        "parent_record_id": record.parent_record_id,
+        "question_type": record.question_type,
+        "question_domain": record.question_domain,
+        "model_provider": record.model_settings.provider,
+        "model_name": record.model_settings.name,
+        "prompt_version": record.model_settings.prompt_version,
+        "prompt_sha256": record.model_settings.prompt_sha256,
+        "retrieval_run_id": record.retrieval_run_id,
+        "generated_at_utc": _utc_text(record.generated_at_utc),
+        "final_prediction_json": canonical_final_prediction_json(record),
+        "record_json": canonical_record_json(record),
+        "forecast_sha256": record_sha256(record),
+        "attempt_id": record.attempt_id,
+    }
+
+
+# The order the reader selects in. Spelled out rather than `SELECT *` for the reason
+# approval.py and lifecycle.py give for their own column lists: a later ALTER TABLE must not
+# be able to reorder it silently. Derived from the projection so the two cannot disagree.
+_PROJECTED_COLUMNS: tuple[str, ...] = (
     "record_id",
     "question_id",
     "post_id",
@@ -88,7 +131,6 @@ _INSERT_COLUMNS = (
     "parent_record_id",
     "question_type",
     "question_domain",
-    "status",
     "model_provider",
     "model_name",
     "prompt_version",
@@ -97,15 +139,24 @@ _INSERT_COLUMNS = (
     "generated_at_utc",
     "final_prediction_json",
     "record_json",
-    "created_at_utc",
     "forecast_sha256",
     "attempt_id",
 )
+
+_RECORD_COLUMNS = ", ".join(_PROJECTED_COLUMNS)
+_INSERT_COLUMNS = _PROJECTED_COLUMNS + _WRITER_OWNED_COLUMNS
 
 # The timestamp format the rest of the ledger uses: `lifecycle._utc_text` and
 # `research.store._utc_text` both write `isoformat()` on a UTC-aware datetime, and 003's
 # GLOB pins its 32-character shape. Written the same way here so the columns sort together.
 _UTC_MICROSECONDS = "%Y-%m-%dT%H:%M:%S.%f+00:00"
+
+# The largest value SQLite can hold in an INTEGER column. A head already at this value
+# cannot be incremented into a storable one, and `sqlite3` raises a raw `OverflowError` at
+# bind time rather than anything this module owns (round 1, finding B5). Reachable without
+# a hostile operator: `001`-`006` accepted such a `forecast_version`, and `007` deliberately
+# adds no backfill probe, so an upgraded ledger can still hold one.
+_SQLITE_INT_MAX = 2**63 - 1
 
 _UUID7_VERSION = 0x7
 _UUID7_VARIANT = 0b10
@@ -197,19 +248,11 @@ def _require_connection(conn: object) -> sqlite3.Connection:
 def _require_draft(draft: object) -> ForecastRecordDraft:
     """Refuse anything that is not exactly a draft, a persisted record included.
 
-    ``ForecastRecord`` subclasses ``ForecastRecordDraft``, so ``isinstance`` would accept
-    a record that has already been appended -- and appending one again would mint a second
-    identity for a forecast that already has one, which is the duplicate this table's
-    UNIQUE constraint exists to make impossible. Checked by exact type so the refusal is
-    this module's own message rather than a ``TypeError`` about duplicate keyword
-    arguments two calls further down.
+    ``record.require_unassigned_draft`` rather than a second copy of the rule: round 1's
+    finding B4 was that this check existed here and *not* in ``assign_identity``, which is
+    what a rule written twice does. One definition, two callers.
     """
-    if type(draft) is not ForecastRecordDraft:
-        raise ForecastRecordError(
-            "draft must be a ForecastRecordDraft; an already-appended record has an "
-            "identity and cannot be appended a second time"
-        )
-    return draft
+    return require_unassigned_draft(draft)
 
 
 def append_forecast_version(
@@ -236,6 +279,11 @@ def append_forecast_version(
             if head is None:
                 version, parent = 1, None
             else:
+                if head[1] >= _SQLITE_INT_MAX:
+                    raise ForecastRecordError(
+                        "this question's forecast chain is already at the largest version "
+                        "the ledger can store; no further version can be appended"
+                    )
                 version, parent = head[1] + 1, head[0]
             record = assign_identity(
                 validated,
@@ -302,28 +350,10 @@ def _insert(conn: sqlite3.Connection, record: ForecastRecord) -> None:
     and a writer able to *request* another state would be a writer able to record an
     approval that never happened.
     """
-    record_json = canonical_record_json(record)
     values: dict[str, Any] = {
-        "record_id": record.record_id,
-        "question_id": record.question_id,
-        "post_id": record.post_id,
-        "tournament_id": record.tournament_id,
-        "forecast_version": record.forecast_version,
-        "parent_record_id": record.parent_record_id,
-        "question_type": record.question_type,
-        "question_domain": record.question_domain,
+        **_projection(record),
         "status": "draft",
-        "model_provider": record.model_settings.provider,
-        "model_name": record.model_settings.name,
-        "prompt_version": record.model_settings.prompt_version,
-        "prompt_sha256": record.model_settings.prompt_sha256,
-        "retrieval_run_id": record.retrieval_run_id,
-        "generated_at_utc": _utc_text(record.generated_at_utc),
-        "final_prediction_json": canonical_final_prediction_json(record),
-        "record_json": record_json,
         "created_at_utc": _utcnow_text(),
-        "forecast_sha256": record_sha256(record),
-        "attempt_id": record.attempt_id,
     }
     columns = ", ".join(_INSERT_COLUMNS)
     placeholders = ", ".join(f":{name}" for name in _INSERT_COLUMNS)
@@ -403,26 +433,26 @@ def latest_forecast_version(
 
 
 def _record_from_row(row: tuple[Any, ...]) -> ForecastRecord:
-    record = record_from_json(_stored_text(row[6], "record_json"))
-    if _stored_text(row[5], "forecast_sha256") != record_sha256(record):
+    """Parse the row's record and refuse it unless every projected column agrees with it.
+
+    The comparison is against :func:`_projection` -- the same function that wrote the row --
+    so "the columns agree with the record" is checked over the writer's whole output rather
+    than over a hand-picked subset (round 1, finding B3).
+
+    ``forecast_sha256`` is compared first and separately, because a mismatch there means
+    something different from a mismatch anywhere else: the record does not attest to itself,
+    so an approval bound to the stored hash was bound to a record nobody can reproduce.
+    """
+    stored = dict(zip(_PROJECTED_COLUMNS, row, strict=True))
+    record = record_from_json(_stored_text(stored["record_json"], "record_json"))
+    if _stored_text(stored["forecast_sha256"], "forecast_sha256") != record_sha256(record):
         raise ForecastRecordError(
             "the stored forecast_sha256 does not match the stored record_json"
         )
-    parent = None if row[4] is None else _stored_text(row[4], "parent_record_id")
-    indexed = (
-        _stored_text(row[0], "record_id"),
-        _stored_int(row[1], "question_id"),
-        _stored_text(row[2], "tournament_id"),
-        _stored_int(row[3], "forecast_version"),
-        parent,
-    )
-    if indexed != (
-        record.record_id,
-        record.question_id,
-        record.tournament_id,
-        record.forecast_version,
-        record.parent_record_id,
-    ):
+    if stored != _projection(record):
+        # Which column disagreed is deliberately not named: the columns hold question text,
+        # model names and provider-derived identifiers, and naming one invites naming its
+        # value next.
         raise ForecastRecordError(
             "the stored forecast_records columns do not match the stored record_json"
         )

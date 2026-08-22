@@ -11,6 +11,7 @@ time; the schema exists precisely for the writer that does not exist yet.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import sqlite3
@@ -30,6 +31,7 @@ from whiskeyjack_bot.forecast.record import (
     ForecastRecordError,
     assign_identity,
     build_forecast_record_draft,
+    canonical_final_prediction_json,
     canonical_record_json,
     record_sha256,
 )
@@ -63,6 +65,10 @@ QUESTION_ID = 123
 POST_ID = 456
 TOURNAMENT = "minibench"
 RUN_ID = "run-1"
+# A second run, so a `retrieval_run_id` mismatch can be a *different* value that still
+# satisfies the foreign key. Without it that parametrized case reads back cleanly and
+# proves nothing -- which is what `test_a_coherent_raw_row_reads_back` caught.
+RUN_ID_OTHER = "run-2"
 GENERATED_AT = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
 TIMESTAMP = "2026-08-22T00:00:00.000000+00:00"
 
@@ -152,12 +158,13 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
     initialize_ledger(database)
     connection = connect(database)
     with transaction(connection):
-        connection.execute(
-            "INSERT INTO research_runs "
-            "(retrieval_run_id, provider, started_at_utc, created_at_utc, question_id) "
-            "VALUES (?, 'exa', ?, ?, ?)",
-            (RUN_ID, TIMESTAMP, TIMESTAMP, QUESTION_ID),
-        )
+        for run_id in (RUN_ID, RUN_ID_OTHER):
+            connection.execute(
+                "INSERT INTO research_runs "
+                "(retrieval_run_id, provider, started_at_utc, created_at_utc, question_id) "
+                "VALUES (?, 'exa', ?, ?, ?)",
+                (run_id, TIMESTAMP, TIMESTAMP, QUESTION_ID),
+            )
     return connection
 
 
@@ -436,10 +443,29 @@ def test_an_unknown_record_id_is_refused_and_an_empty_chain_is_reported(
     assert head == record
 
 
+_RAW_SERIAL = itertools.count(1)
+
+
 def _insert_raw(connection: sqlite3.Connection, **overrides: Any) -> str:
-    """A row written straight past the writer, to test what the *reader* refuses."""
+    """A row written straight past the writer, to test what the *reader* refuses.
+
+    **Coherent unless an override makes it otherwise**, and that is the whole point. The
+    first version of this helper wrote `attempt_id` as a fresh `raw-<uuid>` while the record
+    it built said `attempt-1`, so every row it produced already contradicted its own
+    `record_json` -- and every test asserting "the reader refuses a row where column X
+    disagrees" passed without column X mattering at all. Caught while adding round 1's
+    finding-B3 cases; `test_a_coherent_raw_row_reads_back` is the control that keeps it
+    caught.
+
+    The serial gives each call a distinct `attempt_id` -- `004` indexes it UNIQUE -- while
+    keeping the record and the column agreeing on it.
+    """
+    attempt_id = f"raw-attempt-{next(_RAW_SERIAL)}"
     record = assign_identity(
-        _draft(), record_id=mint_record_id(), forecast_version=1, parent_record_id=None
+        _draft(attempt_id),
+        record_id=mint_record_id(),
+        forecast_version=1,
+        parent_record_id=None,
     )
     values: dict[str, Any] = {
         "record_id": record.record_id,
@@ -455,13 +481,13 @@ def _insert_raw(connection: sqlite3.Connection, **overrides: Any) -> str:
         "model_name": record.model_settings.name,
         "prompt_version": record.model_settings.prompt_version,
         "prompt_sha256": record.model_settings.prompt_sha256,
-        "retrieval_run_id": RUN_ID,
-        "generated_at_utc": TIMESTAMP,
-        "final_prediction_json": '{"probability_yes":0.37}',
+        "retrieval_run_id": record.retrieval_run_id,
+        "generated_at_utc": GENERATED_AT.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"),
+        "final_prediction_json": canonical_final_prediction_json(record),
         "record_json": canonical_record_json(record),
         "created_at_utc": TIMESTAMP,
         "forecast_sha256": record_sha256(record),
-        "attempt_id": f"raw-{uuid.uuid4().hex}",
+        "attempt_id": record.attempt_id,
     }
     values.update(overrides)
     columns = ", ".join(values)
@@ -473,19 +499,110 @@ def _insert_raw(connection: sqlite3.Connection, **overrides: Any) -> str:
     return str(values["record_id"])
 
 
+def test_a_coherent_raw_row_reads_back(conn: sqlite3.Connection) -> None:
+    """The control for every refusal below.
+
+    Without it, a `_insert_raw` that contradicted its own record in some column nobody named
+    would make all of them pass while testing nothing -- which is exactly what the first
+    version of that helper did. This asserts the premise the refusals rest on.
+    """
+    record_id = _insert_raw(conn)
+    assert read_forecast_record(conn, record_id).record_id == record_id
+
+
 def test_a_row_whose_hash_disagrees_with_its_record_is_refused(conn: sqlite3.Connection) -> None:
     record_id = _insert_raw(conn, forecast_sha256="e" * 64)
     with pytest.raises(ForecastRecordError, match="forecast_sha256"):
         read_forecast_record(conn, record_id)
 
 
+@pytest.mark.parametrize(
+    "column",
+    [
+        "question_id",
+        "post_id",
+        "tournament_id",
+        "question_type",
+        "question_domain",
+        "model_provider",
+        "model_name",
+        "prompt_version",
+        "prompt_sha256",
+        "retrieval_run_id",
+        "generated_at_utc",
+        "final_prediction_json",
+        "attempt_id",
+    ],
+)
 def test_a_row_whose_columns_disagree_with_its_record_is_refused(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection, column: str
 ) -> None:
-    """``001`` stores identity twice and only this comparison keeps the copies in step."""
-    record_id = _insert_raw(conn, question_id=999)
+    """``001`` stores identity twice and only this comparison keeps the copies in step.
+
+    Round 1, finding B3: the reader compared five identity columns, so a row whose
+    ``question_type`` column read ``numeric`` while its ``record_json`` described a binary
+    forecast came back as binary -- while ``approval.read_forecast_summary``, which reads
+    the column, reported numeric. Two public readers, incompatible attribution, one
+    immutable record. Every projected column is parametrized here rather than the one the
+    finding named, because a subset is how the first version got it wrong.
+    """
+    stored: dict[str, Any] = {
+        "question_id": 999,
+        "post_id": 999,
+        "tournament_id": "other-cup",
+        "question_type": "numeric",
+        "question_domain": "econ_data",
+        "model_provider": "anthropic",
+        "model_name": "some-other-model",
+        "prompt_version": "9.9.9",
+        "prompt_sha256": "f" * 64,
+        "retrieval_run_id": RUN_ID_OTHER,
+        "generated_at_utc": "2020-01-01T00:00:00.000000+00:00",
+        "final_prediction_json": '{"probability_yes":0.99}',
+        "attempt_id": "att-contradiction",
+    }
+    record_id = _insert_raw(conn, **{column: stored[column]})
     with pytest.raises(ForecastRecordError, match="columns"):
         read_forecast_record(conn, record_id)
+
+
+def test_the_reader_checks_every_column_the_writer_derives(conn: sqlite3.Connection) -> None:
+    """One projection, used to write the row and to check it coming back.
+
+    The failure mode this guards is drift: a column added to the INSERT and not to the
+    comparison would silently reopen finding B3 for that column. Asserted as **set
+    equality** against `forecast_records`' own column list, minus the two the writer owns
+    (`status`, pinned to `'draft'`; `created_at_utc`, which is not part of the record).
+    """
+    table_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(forecast_records)").fetchall()
+    }
+    assert set(store_module._PROJECTED_COLUMNS) | set(store_module._WRITER_OWNED_COLUMNS) == (
+        table_columns
+    )
+    assert set(store_module._INSERT_COLUMNS) == table_columns
+
+
+def test_the_chain_refuses_to_grow_past_the_largest_storable_version(
+    conn: sqlite3.Connection,
+) -> None:
+    """Round 1, finding B5, as a regression.
+
+    `001`-`006` accepted a `forecast_version` of `2**63-1` and `007` deliberately adds no
+    backfill probe, so an upgraded ledger can still hold one. Incrementing it produced
+    `2**63`, which sqlite3 refuses at bind time with a raw `OverflowError` -- a raw
+    exception out of a public boundary, not this module's error.
+
+    The trigger is dropped to seed the legacy head, simulating the ledger `007`'s own
+    no-probe decision leaves reachable.
+    """
+    with transaction(conn):
+        conn.execute("DROP TRIGGER forecast_records_require_draft_on_insert")
+    _insert_raw(conn, forecast_version=2**63 - 1, attempt_id="att-legacy-max")
+    with pytest.raises(ForecastRecordError, match="largest version"):
+        append_forecast_version(conn, draft=_draft("attempt-new"))
+    assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 1
+    assert not conn.in_transaction
 
 
 def test_a_row_whose_record_json_is_not_canonical_is_refused(conn: sqlite3.Connection) -> None:

@@ -4062,3 +4062,121 @@ All fourteen were killed: `sort_keys`, `ensure_ascii`, the reader's round-trip c
 version increment, the parent link, the attribution gate, the reader's hash and column checks, the
 pinned `'draft'` status, the UUIDv7 counter, and four clauses of `007`
 (parent, version floor, JSON-object shape, `question_type` vocabulary).
+
+### Round 1 — five blocking findings, all reproduced, all fixed
+
+Reviewed commit `bc64df1`, which was HEAD; nothing was stale. Every finding was reproduced by
+execution before any fix code was written, and none was rebutted — all five were real, in scope,
+and introduced by this branch.
+
+**B1 — pydantic's `msg` echoes the value that `include_input=False` suppresses.** The project-wide
+rule is to rebuild a `ValidationError` with `errors(include_input=False, include_url=False)`. Those
+flags suppress the `input` field; they do **not** stop several of pydantic's `msg` strings from
+interpolating the offending value into the message text. The discriminated union is the reachable
+case: a stored `forecast.question_type` produced `Input tag 'WJLEAKMARKER-secret' found using
+'question_type' does not match ...`, which reached `ForecastRecordError` verbatim.
+
+Fixed by dropping `msg` **entirely** and rebuilding from `loc` and `type` only — a field path this
+module declared, and a slug from pydantic's fixed error catalogue. `msg` is dropped even for
+`value_error` entries raised by this project's own validators, whose texts happen to be value-free
+today: an allowlist keyed on error type would make every future validator's wording part of the
+leak surface, silently, and this rule has already been breached once by a message nobody wrote.
+
+**And it had a second half the first fix did not close.** Dropping `msg` left `loc` alone, and
+under `extra="forbid"` the location of an unexpected key *is* that key — so a stored `record_json`
+carrying a key named `WJLEAKMARKER-extra-key` still produced
+`(WJLEAKMARKER-extra-key: extra_forbidden)`. Found by probing the fix rather than by the property,
+which only ever planted its marker in *values*: **a leak channel a property does not feed is a leak
+channel it does not test.** The property now plants the marker as a key too.
+
+Closed by withholding any `loc` part the schema did not author, reusing
+`schema._schema_field_names` and `schema._WITHHELD` rather than writing the traversal twice — a
+private name from a sibling in the same subpackage, imported deliberately, because a rule written
+twice is exactly what finding B4 turned out to be. Mutated **both ways**: withholding nothing and
+withholding everything are both killed, so the rule is neither absent nor blanket. A refusal
+rendered as `<withheld>.<withheld>` is one nobody can act on, which is its own failure mode.
+
+**This generalizes past M1-602, and is filed as `M0-008` rather than fixed here.**
+`errors(include_input=False, include_url=False)` appears in five merged modules and the codebase
+has been reading it as "the offending value cannot escape". It is not sufficient, on both counts
+above. `forecast/schema.py` and `research/model.py` already guard the `loc` half; `config.py`,
+`research/allowlist.py` and `questions/normalize.py` render `err['msg']` and do not guard the
+first. **No merged module has a reachable leak today** — checked rather than assumed: the only
+discriminated-union adapter in `src/` is `CanonicalQuestionAdapter`, which is defined and never
+called from production code. So it is a latent hazard and a false rule, not a live defect, which is
+what makes it a row instead of a fix on this branch.
+
+**B2 — the lone-surrogate rationale was right about `record_json` and wrong about the columns.**
+The branch argued that a lone surrogate is safe because `record_json` holds `ensure_ascii` output
+and is therefore pure ASCII. True, and beside the point: the writer also copies a dozen scalars
+into their own bare TEXT columns, and sqlite3 encodes a TEXT parameter as UTF-8 at bind time, so
+`question_domain="\ud800"` raised a raw `UnicodeEncodeError` **quoting the character** — a raw
+exception out of a public boundary and a leak in the same line. The transaction rolled back and no
+row was written, so nothing was corrupted.
+
+Fixed with `_require_storable_in_a_text_column`, a second and narrower rule beside
+`_require_replayable`: the first refuses what does not survive the JSON round trip, this one
+refuses what cannot be *written*. Their domains genuinely differ, which is why they are two rules
+and not one.
+
+Worth recording precisely, because the reachable surface is one field: every other projected column
+is a pydantic **constrained** string, and a constrained string refuses a non-UTF-8-encodable value
+on its own — the same behaviour that keeps a surrogate *pair* out of `question.title`.
+`question_domain` is a bare `str | None`. So the probe is the fix for one field and defence in
+depth for eleven, and `test_the_other_column_backed_fields_were_never_reachable` asserts that split
+rather than a comment claiming it.
+
+**B3 — the strict reader was checking five columns out of eighteen.** A row whose `question_type`
+column read `numeric` while its `record_json` described a binary forecast was returned as binary —
+while `approval.read_forecast_summary`, which reads the column, reported numeric. Two public
+readers, incompatible attribution, one immutable record.
+
+Fixed by making the projection a single function, `store._projection`, used to write the row **and**
+to check it coming back. "The columns agree with the record" is only a real check if the two lists
+cannot drift, so there is one list. `test_the_reader_checks_every_column_the_writer_derives`
+compares it as set equality against `PRAGMA table_info(forecast_records)`, so a column added to the
+table and written without being compared fails.
+
+**B4 — a rule written twice held in one place.** `ForecastRecord` subclasses `ForecastRecordDraft`,
+and `store._require_draft` checked `type(...) is` while `record.assign_identity` checked
+`isinstance` — so an already-assigned record reached `ForecastRecord(**dump, record_id=...)` and
+raised `TypeError: got multiple values for keyword argument 'record_id'`. The branch had *made*
+this distinction and then not applied it at the second boundary. Fixed with one shared
+`require_unassigned_draft`, which both call.
+
+**B5 — the no-backfill-probe decision has a consequence the branch did not follow through.**
+`001`-`006` accepted `forecast_version = 2**63-1`, and `007` deliberately adds no probe, so an
+upgraded ledger can still hold such a row. Incrementing it produces `2**63`, which sqlite3 refuses
+at bind time with a raw `OverflowError`. Fixed by refusing a head already at `_SQLITE_INT_MAX`
+before incrementing.
+
+### Round 1 — a vacuity trap found in this branch's own fixture while fixing B3
+
+Adding thirteen parametrized cases for B3 turned up a defect in the test helper they used.
+`_insert_raw` wrote `attempt_id` as a fresh `raw-<uuid>` while the record it built said
+`attempt-1`, so **every row it produced already contradicted its own `record_json`** — and every
+test asserting "the reader refuses a row where column X disagrees" passed without column X
+mattering. Three tests written earlier on this branch were passing for that reason.
+
+Fixed by making `_insert_raw` coherent unless an override makes it otherwise, and by adding
+`test_a_coherent_raw_row_reads_back` as the control. The control earned its place immediately: it
+exposed that the `retrieval_run_id` case was still vacuous, because the "different" value being
+written was the same `RUN_ID` the record already held. A second `research_runs` row fixed it.
+
+This is the same lesson M1-303 and M1-308 both paid for, in a new shape: **a negative test needs a
+positive control, or it cannot tell "the check fired" from "the fixture was broken all along."**
+
+### Round 1 — the non-blocking observation, and what was done with it
+
+The reviewer noted that the UUIDv7 counter proves ordering only within one module instance:
+separate processes seed `rand_a` independently, so two ids minted in different processes inside one
+millisecond do not sort. Correct, and correctly filed as non-blocking — cross-process id ordering is
+not this item's acceptance criterion. Recorded here rather than fixed: closing it needs either a
+durable reservation or an ordering guarantee scoped in the docstring, and the honest version is the
+latter. `mint_record_id`'s docstring already scopes its claim to what the counter provides.
+
+### Round 1 — final state
+
+20 mutations, one per invocation from a pristine copy, 20 killed — the original 14, one per
+blocking finding, and two for the `loc` rule in both directions, so each regression test is shown to
+fail against the pre-fix code. Suite: 2165 pass, 1 xfail. Four gates green.
