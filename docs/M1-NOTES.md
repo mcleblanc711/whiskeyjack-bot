@@ -4175,6 +4175,28 @@ not this item's acceptance criterion. Recorded here rather than fixed: closing i
 durable reservation or an ordering guarantee scoped in the docstring, and the honest version is the
 latter. `mint_record_id`'s docstring already scopes its claim to what the counter provides.
 
+### Round 2 — APPROVE, and the one observation that was worth acting on
+
+Reviewed commit `7117583`, which was HEAD. All five round-1 blockers closed, no blocking findings,
+no finding disputed in either round.
+
+The reviewer's non-blocking observation was a real flake in **this branch's own strategy**, and it
+is fixed rather than filed: `records()` substituted `rationale or "a rationale"`, but `NonBlankStr`
+refuses anything blank *after stripping*, and a whitespace-only draw is truthy — so a rare draw
+raised `ForecastSchemaError` while generating an example, turning a required gate red for a reason
+unrelated to the code under test. Reproduced by execution (`" "`, `"\t"`, `"\n\t"` all reach the
+schema and are refused).
+
+Substituted only for the blank family, never `.strip()`-ed: every draw the schema accepts is fed
+**as written**, because normalizing a property's input is how it stops testing what it was written
+for (M1-303). `test_the_record_strategy_never_raises_while_generating` asserts the substitution
+directly rather than leaving it to the odds of another property drawing one.
+
+The other two observations were correctly non-blocking and are left as they are: cross-process
+UUIDv7 ordering needs a durable reservation and is out of this row's scope (the docstring already
+scopes the claim to what the counter provides), and `M0-008` is the right home for the generalized
+pydantic-sanitizer rule.
+
 ### Round 1 — final state
 
 20 mutations, one per invocation from a pristine copy, 20 killed — the original 14, one per

@@ -142,7 +142,16 @@ def records(draw: st.DrawFn, *, text: st.SearchStrategy[str] = STORABLE_TEXT) ->
         resolution_criteria=criteria or None,
     )
     forecast = _response(
-        rationale_summary=rationale or "a rationale",
+        # `rationale or ...` is not enough: `NonBlankStr` refuses anything blank *after
+        # stripping*, and a whitespace-only draw is truthy, so `records()` could raise
+        # `ForecastSchemaError` while generating an example. Reported as a non-blocking
+        # observation in round 2 and reproduced by execution (`" "`, `"\t"` and `"\n\t"`
+        # all reach the schema and are refused).
+        #
+        # Substituted only for the blank family, never `.strip()`-ed: every draw the schema
+        # accepts is fed **as written**, because normalizing the input is how a property
+        # stops testing the thing it was written for (M1-303).
+        rationale_summary=rationale if rationale.strip() else "a rationale",
         final_prediction={"probability_yes": probability},
     )
     generation = ForecastGeneration(
@@ -474,6 +483,21 @@ def test_a_surrogate_pair_is_always_refused(text: str) -> None:
             research_packet_sha256="d" * 64,
             generated_at=GENERATED_AT,
         )
+
+
+@given(rationale=st.sampled_from(["", " ", "\t", "\n\t", "\u00a0", "a real rationale"]))
+@settings(max_examples=10)
+def test_the_record_strategy_never_raises_while_generating(rationale: str) -> None:
+    """The premise every property above rests on: a draw builds a record.
+
+    Round 2's non-blocking observation. `NonBlankStr` refuses anything blank after
+    stripping, so the blank family has to be substituted rather than merely falsy-checked --
+    otherwise a rare whitespace draw turns a required gate red for a reason that has nothing
+    to do with the code under test. Asserted directly on the substitution rather than left
+    to the odds of the other properties drawing one.
+    """
+    kept = rationale if rationale.strip() else "a rationale"
+    assert _response(rationale_summary=kept).rationale_summary == kept
 
 
 def test_the_leak_detector_is_not_inert() -> None:
