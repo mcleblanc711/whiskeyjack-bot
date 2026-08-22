@@ -800,6 +800,12 @@ No follow-up row is filed, because there is no residue.
 `test_a_receipt_cannot_be_recorded_against_a_different_record` is the regression test, and
 a sixth mutation — re-adding a `record_id` override parameter — was confirmed to fail it.
 
+**Round 2 approved the remediation** at `953b7c6`, closing the finding and marking all five
+nominated risk areas Safe — including the one that mattered, that the narrower fix leaves no
+residue: *"The supported receipt-to-ledger path has one record identifier, taken from the
+receipt; the prior divergent argument is gone."* No new findings, no new backlog
+candidates. Two rounds total.
+
 Two further tests cover the new boundary's error discipline, because the round-2 request
 claims it and a request must not claim a test that does not exist (M1-308 round 7):
 `record_receipt` turns both the `LifecycleError` of an illegal transition and the
