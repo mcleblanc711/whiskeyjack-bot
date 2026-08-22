@@ -536,9 +536,9 @@ Delivered:
   `SubmissionRequest` / `SubmissionReceipt` value objects, the `SubmissionGateway`
   protocol, `canonical_payload_json()` / `payload_sha256()`, `dry_run_attempt_id()`,
   `dry_run_artifact_path()`, `DryRunSubmissionGateway`, `write_dry_run_artifact()` /
-  `read_dry_run_artifact()`, and `attempt_from_receipt()`.
-- `tests/unit/test_submission_gateway.py` (79), `tests/property/test_submission_gateway_properties.py`
-  (104: 13 properties plus a 91-case injectivity table). Suite: 2095 passed, 1 xfailed;
+  `read_dry_run_artifact()`, and `record_receipt()`.
+- `tests/unit/test_submission_gateway.py` (81), `tests/property/test_submission_gateway_properties.py`
+  (104: 13 properties plus a 91-case injectivity table). Suite: 2097 passed, 1 xfailed;
   four gates green.
 
 No migration, no dependency, no CLI, no config change, no network call on any path.
@@ -571,9 +571,9 @@ nothing_and_spends_no_key` asserts that positively against a real ledger: status
 receipt-only or a new `dry_run_receipts` table. A table would have claimed migration `007`
 for a mode that posts nothing, and lane 1's `M1-602` may want it.
 
-### Decision — the refusal on the way into the ledger is the guard, not the absence of code
+### Decision — the writer on the way into the ledger ships here, and the refusal is the guard
 
-`attempt_from_receipt()` is the only door from a receipt into `lifecycle`, and it raises
+`record_receipt()` is the only door from a receipt into `lifecycle`, and it raises
 on any receipt whose `mode` is not `live`. Shipping it *with* the dry-run gateway rather
 than deferring it to M2-704 is the point: without it, "a dry-run receipt can never be
 recorded" is a property of absence, which is a weak thing to hand a reviewer and a weaker
@@ -758,11 +758,53 @@ back out of a row `006` has vetted — so nothing on a product path reaches it.
 **This is a pre-existing failure this branch did not introduce**, and it is named here
 because the reviewer is stateless and will otherwise read the diff line as scope creep.
 
+### Round 1 — one blocking finding, and why the fix is narrower than the one proposed
+
+Reviewed commit `24d5eb5`, verdict CHANGES REQUESTED, one blocking finding; the other six
+risk areas the request nominated came back Safe.
+
+**The finding.** `lifecycle.SubmissionAttempt` carries no `forecast_record_id` — it never
+has, since M1-603 — so the first cut's public `attempt_from_receipt()` handed back an
+attempt and left the caller to re-supply the record to `record_submission_attempt()`. A
+receipt naming `rec-1` could be recorded against `rec-2`. Reproduced by execution against
+`24d5eb5` before any fix code was written, per the standing rule: the write succeeded,
+`submission_attempts.forecast_record_id` held `rec-2`, `rec-2` advanced to `submitted` on
+an approval that authorized nothing, and `rec-1` stayed `approved`. Append-only, so
+permanently.
+
+The two-parameter shape of `record_submission_attempt()` is pre-existing. What **this
+branch** introduced is a *second source of truth* for the record id — a receipt that names
+one — with nothing reconciling the two. That is the amplification, and it is why the
+finding is in scope.
+
+**The fix removes the divergence rather than detecting it.** `attempt_from_receipt()` is
+now private, and `record_receipt(conn, *, receipt, occurred_at, detail_code=None)` is the
+exported door: it takes the record from the receipt and offers **no `record_id`
+parameter**, so nothing exists for a caller to get wrong. M1-402's rule — a bound any
+caller can lift is not a bound — is why the transcription stopped being public rather than
+merely being paired with a safer alternative.
+
+**Rejected — the fix the review proposed.** Adding `forecast_record_id` to
+`lifecycle.SubmissionAttempt` and having `record_submission_attempt()` derive or reconcile
+it is the other way to close this. It changes a merged, reviewed dataclass and its writer,
+owned by M1-603, and five construction sites across `tests/unit/test_lifecycle.py`,
+`tests/unit/test_submission.py`, `tests/property/test_lifecycle_properties.py` and this
+item's own suite would change behaviour under a different item's branch — the call M1-606
+made and M1-607 then paid for properly.
+
+Nothing is left uncovered by the narrower fix, which is the part worth stating rather than
+assuming: a caller who hand-builds a `SubmissionAttempt` supplies exactly **one** record
+id and so has no second source to disagree with. The divergence was new, and it is gone.
+No follow-up row is filed, because there is no residue.
+
+`test_a_receipt_cannot_be_recorded_against_a_different_record` is the regression test, and
+a sixth mutation — re-adding a `record_id` override parameter — was confirmed to fail it.
+
 ### On the property pass
 
 Five deliberate mutations were run against the suite before the first review, each
 confirmed to fail the property it is meant to fail: the replay round-trip guard disabled,
-`attempt_id` minted as a `uuid4`, the `live`-mode check on `attempt_from_receipt` disabled,
+`attempt_id` minted as a `uuid4`, the `live`-mode check on the receipt transcription disabled,
 a refusal that echoes its offending key, and the artifact writer clobbering a differing
 body with `os.replace`. Each was applied to a pristine copy, run with `__pycache__`
 removed, and restored — M1-312's lesson that a mutation harness killed by a timeout

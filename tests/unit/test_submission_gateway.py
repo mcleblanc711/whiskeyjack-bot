@@ -17,6 +17,7 @@ idempotency key is UNIQUE and spending it on a rehearsal makes the real post unr
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import sqlite3
@@ -47,7 +48,7 @@ from whiskeyjack_bot.submission_gateway import (
     SubmissionGateway,
     SubmissionReceipt,
     SubmissionRequest,
-    attempt_from_receipt,
+    record_receipt,
     canonical_payload_json,
     dry_run_artifact_path,
     dry_run_attempt_id,
@@ -303,10 +304,17 @@ def test_a_dry_run_touches_no_httpx_entry_point(
 # --- the ledger is untouched ---------------------------------------------------------
 
 
-def _seed_draft(conn: sqlite3.Connection, record_id: str = "rec-1") -> str:
+def _seed_draft(
+    conn: sqlite3.Connection, record_id: str = "rec-1", *, question_id: int = 100
+) -> str:
+    """Insert a draft directly: M1-602's record writer does not exist yet.
+
+    `001` declares UNIQUE (question_id, tournament_id, forecast_version), so a second
+    record needs its own question rather than a second version of the same one.
+    """
     conn.execute(
-        "INSERT INTO research_runs (retrieval_run_id, provider, question_id, started_at_utc, "
-        "created_at_utc) VALUES ('run-1', 'asknews', 100, ?, ?)",
+        "INSERT OR IGNORE INTO research_runs (retrieval_run_id, provider, question_id, "
+        "started_at_utc, created_at_utc) VALUES ('run-1', 'asknews', 100, ?, ?)",
         (TS, TS),
     )
     conn.execute(
@@ -315,9 +323,9 @@ def _seed_draft(conn: sqlite3.Connection, record_id: str = "rec-1") -> str:
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, 100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
+        "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
         "'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (record_id, TS, TS, SHA, f"att-{record_id}"),
+        (record_id, question_id, TS, TS, SHA, f"att-{record_id}"),
     )
     return record_id
 
@@ -351,11 +359,14 @@ def test_a_dry_run_of_a_draft_records_nothing_and_spends_no_key(
 # --- the guard on the way into the ledger --------------------------------------------
 
 
-def test_a_dry_run_receipt_cannot_become_a_submission_attempt() -> None:
+def test_a_dry_run_receipt_cannot_become_a_submission_attempt(
+    ledger: sqlite3.Connection,
+) -> None:
     receipt = _gateway().submit(_request())
     with pytest.raises(GatewayError) as excinfo:
-        attempt_from_receipt(receipt)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     assert "dry_run" in str(excinfo.value)
+    assert ledger.execute("SELECT count(*) FROM submission_attempts").fetchone()[0] == 0
 
 
 def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
@@ -367,7 +378,7 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
     approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
     receipt = _gateway().submit(_request())
     with pytest.raises(GatewayError):
-        attempt_from_receipt(receipt)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     # Hand the writer what the refusal withheld, and watch the record die.
     record_submission_attempt(
         ledger,
@@ -387,54 +398,85 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
     assert current_status(ledger, "rec-1") == "failed"
 
 
-def test_a_live_receipt_converts_into_a_row_the_ledger_accepts(
+def _live(record_id: str = "rec-1", attempt_id: str = "att-live-1") -> SubmissionReceipt:
+    return replace(
+        _gateway().submit(_request(record_id=record_id)),
+        mode="live",
+        attempt_id=attempt_id,
+        forecast_record_id=record_id,
+        success=True,
+        verified_by_refetch=True,
+        http_status=201,
+        response_body='{"ok": true}',
+    )
+
+
+def test_a_live_receipt_is_recorded_against_the_record_it_names(
     ledger: sqlite3.Connection,
 ) -> None:
     """The bound on every identifier is checked by the writer, not by importing its
     private constant -- which would test the constant, not the writer (M1-303)."""
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
     approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
-    receipt = replace(
-        _gateway().submit(_request()),
-        mode="live",
-        attempt_id="att-live-1",
-        success=True,
-        verified_by_refetch=True,
-        http_status=201,
-        response_body='{"ok": true}',
-    )
-    event = record_submission_attempt(
-        ledger,
-        record_id="rec-1",
-        attempt=attempt_from_receipt(receipt),
-        occurred_at=OCCURRED,
-    )
+    receipt = _live()
+    event = record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     assert event.event_type == "submitted"
+    assert event.forecast_record_id == "rec-1"
     assert current_status(ledger, "rec-1") == "submitted"
     stored = attempt_for_key(ledger, receipt.idempotency_key)
     assert stored is not None
+    assert stored.forecast_record_id == "rec-1"
     assert stored.request_payload_sha256 == receipt.request_payload_sha256
 
 
-def test_the_conversion_drops_what_submission_attempts_has_no_column_for() -> None:
-    receipt = replace(
-        _gateway().submit(_request()), mode="live", artifact_path="submissions/dry_run/x.json"
-    )
-    assert set(asdict(attempt_from_receipt(receipt))) == set(
-        asdict(
-            SubmissionAttempt(
-                attempt_id="a",
-                idempotency_key="k",
-                requested_at_utc=FIXED,
-                completed_at_utc=FIXED,
-                request_payload_sha256="a" * 64,
-                success=True,
-                verified_by_refetch=True,
-            )
-        )
-    )
-    assert "mode" not in asdict(attempt_from_receipt(receipt))
-    assert "artifact_path" not in asdict(attempt_from_receipt(receipt))
+def test_a_receipt_cannot_be_recorded_against_a_different_record(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Round 1's blocking finding, as a regression test.
+
+    Before the fix, `attempt_from_receipt()` handed back a `SubmissionAttempt` -- which
+    carries no `forecast_record_id`, and never has -- leaving the caller to re-supply the
+    record to `record_submission_attempt()`. A receipt naming `rec-1` recorded against
+    `rec-2` succeeded: the attempt row held `rec-2`, `rec-2` advanced to `submitted` on an
+    approval that authorized nothing, and `rec-1` stayed `approved`. Append-only, so
+    permanently.
+
+    There is no `record_id` parameter to get wrong any more, so the test asserts the
+    surface rather than a rejection: the receipt is the only thing that names the record.
+    """
+    _seed_draft(ledger, "rec-2", question_id=101)
+    for record_id in ("rec-1", "rec-2"):
+        record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
+        approve(ledger, record_id=record_id, actor="owner", occurred_at=OCCURRED)
+
+    record_receipt(ledger, receipt=_live("rec-1"), occurred_at=OCCURRED)
+
+    assert current_status(ledger, "rec-1") == "submitted"
+    assert current_status(ledger, "rec-2") == "approved"
+    rows = ledger.execute(
+        "SELECT forecast_record_id FROM submission_attempts ORDER BY attempt_id"
+    ).fetchall()
+    assert [row[0] for row in rows] == ["rec-1"]
+    # `record_receipt` takes no record_id: there is no second source of truth to diverge.
+    assert "record_id" not in inspect.signature(record_receipt).parameters
+
+
+def test_the_recorded_row_drops_what_submission_attempts_has_no_column_for(
+    ledger: sqlite3.Connection,
+) -> None:
+    record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
+    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    receipt = replace(_live(), artifact_path="submissions/dry_run/x.json")
+    record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+    columns = {
+        description[0]
+        for description in ledger.execute("SELECT * FROM submission_attempts LIMIT 1").description
+    }
+    assert "mode" not in columns
+    assert "artifact_path" not in columns
+    stored = attempt_for_key(ledger, receipt.idempotency_key)
+    assert stored is not None
+    assert stored.attempt_id == "att-live-1"
 
 
 @pytest.mark.parametrize(
@@ -444,16 +486,27 @@ def test_the_conversion_drops_what_submission_attempts_has_no_column_for() -> No
         pytest.param(None, id="none"),
     ],
 )
-def test_the_conversion_refuses_a_foreign_object(receipt: Any) -> None:
+def test_the_writer_refuses_a_foreign_object(ledger: sqlite3.Connection, receipt: Any) -> None:
     with pytest.raises(GatewayError):
-        attempt_from_receipt(receipt)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
 
 
-def test_the_conversion_refuses_an_unrecognized_mode() -> None:
+def test_the_writer_refuses_an_unrecognized_mode(ledger: sqlite3.Connection) -> None:
     receipt = replace(_gateway().submit(_request()), mode="rehearsal")  # type: ignore[arg-type]
     with pytest.raises(GatewayError) as excinfo:
-        attempt_from_receipt(receipt)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     assert "rehearsal" not in str(excinfo.value)
+
+
+def test_a_ledger_refusal_arrives_as_this_modules_error(ledger: sqlite3.Connection) -> None:
+    """`record_submission_attempt` raises `LifecycleError`; a caller of this seam handles
+    `SubmissionError`. The message is preserved -- `LifecycleError`'s own contract says it
+    names no stored or caller-supplied value, and it is what makes a refusal actionable."""
+    receipt = _live()  # rec-1 is still `draft`: `submitted` is not legal from there
+    with pytest.raises(GatewayError) as excinfo:
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+    assert str(excinfo.value)
+    assert excinfo.value.__cause__ is None
 
 
 # --- the artifact --------------------------------------------------------------------

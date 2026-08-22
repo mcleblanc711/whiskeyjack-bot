@@ -23,9 +23,13 @@ independent reasons, either one fatal:
 
 So the backlog's *"dry run records payload/hash"* is satisfied by a **file**, not a row:
 the receipt and the payload it hashed are written under ``storage.artifact_root``, and the
-ledger is untouched. :func:`attempt_from_receipt` is the only door from a receipt into the
+ledger is untouched. :func:`record_receipt` is the only door from a receipt into the
 ledger and it **refuses a dry-run receipt**, so "a dry run can never be recorded as a
-submission attempt" is a tested guard rather than a property of absence.
+submission attempt" is a tested guard rather than a property of absence. It is also the
+only thing that names the record a receipt is written against -- it takes that from the
+receipt and offers no parameter to override it, which is round 1's blocking finding: a
+transcription helper that handed the attempt back let a receipt for one record be recorded
+against another, permanently and on an approval that authorized nothing.
 
 **Deterministic** means what it says. Given the same :class:`SubmissionRequest` and the
 same clock readings, :meth:`DryRunSubmissionGateway.submit` returns a byte-identical
@@ -75,6 +79,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -82,7 +87,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol, get_args
 
-from whiskeyjack_bot.lifecycle import SubmissionAttempt
+from whiskeyjack_bot.lifecycle import (
+    FailureCode,
+    LifecycleError,
+    LifecycleEvent,
+    SubmissionAttempt,
+    record_submission_attempt,
+)
 from whiskeyjack_bot.submission import KEY_LENGTH, SubmissionError, submission_key
 
 # Bumping this changes the envelope a reader must understand; it is not the payload's
@@ -90,7 +101,7 @@ from whiskeyjack_bot.submission import KEY_LENGTH, SubmissionError, submission_k
 ARTIFACT_SCHEMA_VERSION = "1.0.0"
 
 # Which gateway produced a receipt. A closed vocabulary rather than a bool, because
-# `attempt_from_receipt` dispatches on it and M2-704 adds no third member by accident:
+# `_attempt_from_receipt` dispatches on it and M2-704 adds no third member by accident:
 # `get_args` below is what a new member has to pass through.
 GatewayMode = Literal["dry_run", "live"]
 
@@ -223,7 +234,7 @@ class SubmissionReceipt:
     The handoff's field list, plus two this module adds:
 
     - ``mode`` -- which gateway produced it. Without it a dry-run receipt is
-      indistinguishable from a live attempt that failed, and :func:`attempt_from_receipt`
+      indistinguishable from a live attempt that failed, and :func:`record_receipt`
       would have nothing to refuse on.
     - ``artifact_path`` -- where the receipt was written, **relative to**
       ``storage.artifact_root``, so a record stays readable after the artifact directory
@@ -232,7 +243,7 @@ class SubmissionReceipt:
     Deliberately **not** :class:`lifecycle.SubmissionAttempt`, which that class's own
     docstring already anticipates. Keeping them separate is what stops a persistence
     concern (column set, size caps) from being decided on behalf of the submission seam,
-    and vice versa; :func:`attempt_from_receipt` is the mapping, and it is one-way.
+    and vice versa; :func:`record_receipt` is the one-way door, and it is the only one.
 
     Field order mirrors ``SubmissionAttempt`` so the mapping reads as a transcription.
     ``created_at_utc`` is absent for that class's reason: it records when the *ledger*
@@ -385,21 +396,81 @@ def dry_run_artifact_path(*, question_id: int, idempotency_key: str) -> str:
     return f"{_SUBMISSIONS_SUBDIR}/{_DRY_RUN_SUBDIR}/{question}/{key}.json"
 
 
-def attempt_from_receipt(receipt: SubmissionReceipt) -> SubmissionAttempt:
-    """Convert a **live** receipt into the row :func:`lifecycle.record_submission_attempt` takes.
+def record_receipt(
+    conn: sqlite3.Connection,
+    *,
+    receipt: SubmissionReceipt,
+    occurred_at: datetime,
+    detail_code: FailureCode | None = None,
+) -> LifecycleEvent:
+    """Write a **live** receipt to the ledger, against the record the receipt names.
 
-    The only door from a receipt into the ledger, and it refuses a dry-run receipt. That
-    refusal is load-bearing, not decorative: a dry-run receipt carries ``success=False``
-    and ``verified_by_refetch=False``, which the writer reads as ``submission_failed`` and
-    which moves the record to terminal ``failed``. A rehearsal would permanently kill the
-    forecast version it was rehearsing.
+    **The only door from a receipt into the ledger**, and the reason it exists rather than
+    a public transcription helper is round 1's blocking finding, reproduced exactly:
+    ``SubmissionAttempt`` carries no ``forecast_record_id`` -- it never has, since M1-603 --
+    so a transcription that handed the attempt back left the caller to re-supply the record
+    separately. A receipt naming ``rec-1`` could then be recorded against ``rec-2``: the
+    write succeeded, ``submission_attempts.forecast_record_id`` held ``rec-2``, ``rec-2``
+    advanced to ``submitted`` on an approval that authorized nothing, and ``rec-1`` stayed
+    ``approved``. Append-only, so permanently.
 
-    ``mode`` is checked rather than trusted-by-convention for M1-402's reason: a bound any
-    caller can lift is not a bound. There is deliberately no ``force`` parameter.
+    The receipt is the *second* source of truth for the record id, and this branch is what
+    introduced it. The fix is therefore to remove the divergence rather than to detect it:
+    there is **no ``record_id`` parameter here**, so nothing exists for a caller to get
+    wrong. M1-402's rule -- a bound any caller can lift is not a bound -- is why the
+    transcription is private and this is the exported surface.
+
+    It deliberately does **not** widen ``lifecycle.SubmissionAttempt`` to carry the record,
+    which is the other way to close it. That dataclass and its writer are merged and
+    reviewed under M1-603, and five construction sites across `tests/unit/test_lifecycle.py`,
+    `tests/unit/test_submission.py`, `tests/property/test_lifecycle_properties.py` and this
+    item's own suite would change behaviour under a different item's branch -- the call
+    M1-606 made and M1-607 then paid for properly. Nothing is left uncovered by the narrower
+    fix: a caller who hand-builds a ``SubmissionAttempt`` supplies exactly one record id and
+    so has no second source to disagree with. The divergence was new, and it is gone.
+
+    ``detail_code`` is forwarded unchanged; ``record_submission_attempt`` decides which
+    outcomes require one, and re-stating that rule here would be a second copy of it.
+    """
+    if type(receipt) is not SubmissionReceipt:
+        raise GatewayError("receipt must be a SubmissionReceipt")
+    record_id = _require_identifier(receipt.forecast_record_id, "receipt.forecast_record_id")
+    attempt = _attempt_from_receipt(receipt)
+    try:
+        return record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=attempt,
+            occurred_at=occurred_at,
+            detail_code=detail_code,
+        )
+    except LifecycleError as exc:
+        # Message preserved, the call `submission._wrap_approval` makes and for its reason:
+        # `LifecycleError`'s own contract guarantees its text names no stored or
+        # caller-supplied value, and that text is the only thing making a refusal
+        # actionable. Replacing it with a constant would satisfy the letter of the
+        # module-own-error rule while destroying what the operator needs.
+        raise GatewayError(str(exc) or "the ledger refused to record this submission") from None
+
+
+def _attempt_from_receipt(receipt: SubmissionReceipt) -> SubmissionAttempt:
+    """Transcribe a **live** receipt into the row the ledger writer takes.
+
+    Private: see :func:`record_receipt` for why. Handing this back to a caller is what
+    made the record id a second, divergent parameter.
+
+    Refuses a dry-run receipt, and that refusal is load-bearing rather than decorative: a
+    dry-run receipt carries ``success=False`` and ``verified_by_refetch=False``, which the
+    writer reads as ``submission_failed`` and which moves the record to terminal ``failed``.
+    A rehearsal would permanently kill the forecast version it was rehearsing.
+
+    ``mode`` is checked rather than trusted-by-convention for M1-402's reason. There is
+    deliberately no ``force`` parameter.
 
     ``artifact_path`` and ``mode`` are dropped: both describe how the receipt was produced
     and recorded, not what was posted, and ``submission_attempts`` has no column for
-    either.
+    either. ``forecast_record_id`` is dropped here and supplied by :func:`record_receipt`
+    from this same receipt.
 
     The remaining fields are **transcribed, not re-validated**, and that is deliberate:
     ``record_submission_attempt`` validates every one of them against the schema it is

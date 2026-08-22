@@ -45,7 +45,7 @@ from whiskeyjack_bot.submission_gateway import (
     DryRunSubmissionGateway,
     GatewayError,
     SubmissionRequest,
-    attempt_from_receipt,
+    record_receipt,
     canonical_payload_json,
     dry_run_artifact_path,
     dry_run_attempt_id,
@@ -174,6 +174,8 @@ def test_submit_raises_only_this_modules_error(
 
 @given(receipt_mode=HOSTILE_TEXT)
 def test_the_ledger_guard_raises_only_this_modules_error(receipt_mode: str) -> None:
+    """No connection is opened: every non-`live` mode is refused before the ledger is
+    touched, so `None` standing in for one is safe and is itself the assertion."""
     base = DryRunSubmissionGateway(clock=lambda: FIXED).submit(
         SubmissionRequest(
             forecast_record_id="rec-1",
@@ -184,7 +186,11 @@ def test_the_ledger_guard_raises_only_this_modules_error(receipt_mode: str) -> N
     )
     assume(receipt_mode != "live")
     with pytest.raises(GatewayError):
-        attempt_from_receipt(replace(base, mode=receipt_mode))  # type: ignore[arg-type]
+        record_receipt(
+            None,  # type: ignore[arg-type]
+            receipt=replace(base, mode=receipt_mode),  # type: ignore[arg-type]
+            occurred_at=FIXED,
+        )
 
 
 # --- 2. replay stability across the persisted form -----------------------------------
