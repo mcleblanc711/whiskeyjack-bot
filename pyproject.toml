@@ -28,6 +28,11 @@ dependencies = [
     # intermediate drops it. Not a new install -- see docs/M1-301-NOTES.md.
     "idna>=3.4,<4",
     "pydantic>=2,<3",
+    # Public Suffix List, for research.exa's include_domains check: a bundled, offline
+    # snapshot (no network fetch at import/read time -- tests run with sockets blocked)
+    # of which hostnames are themselves public suffixes vs. registrable domains beneath
+    # one. Zero mandatory runtime deps of its own (M1-311).
+    "publicsuffixlist>=1.0,<2",
     "pyyaml>=6,<7",
 ]
 
@@ -65,6 +70,12 @@ mypy_path = "src"
 module = "forecasting_tools.*"
 ignore_missing_imports = true
 follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# publicsuffixlist ships no py.typed marker; treat its interface as untyped
+# and keep our own annotations as the boundary.
+module = "publicsuffixlist.*"
+ignore_missing_imports = true
 
 [dependency-groups]
 dev = [

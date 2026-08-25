@@ -4202,3 +4202,104 @@ pydantic-sanitizer rule.
 20 mutations, one per invocation from a pristine copy, 20 killed — the original 14, one per
 blocking finding, and two for the `loc` rule in both directions, so each regression test is shown to
 fail against the pre-fix code. Suite: 2165 pass, 1 xfail. Four gates green.
+
+## M1-311 — Reject public-suffix-only official allowlists
+
+Acceptance: *`include_domains` rejects public suffixes, including multi-label suffixes such as
+`co.uk` and `com.au`, before any provider call, while accepting registrable domains and their
+subdomains.*
+
+PR #16 round 4 closed the single-label case (`_validated_domains` refuses `"com"`, `"gov"`) and
+round 5 tightened it to a two-label heuristic (`"." not in host`). Round 6 named the residual that
+heuristic left open rather than proposing a partial fix on a review branch:
+`include_domains=("co.uk",)` has two labels, clears the heuristic, and `_matches_official_domain`'s
+subdomain rule still labels every host beneath it `official` — `co.uk` is a public suffix, not a
+site. Filed as M1-311 (`docs/M1-303-NOTES.md:440-444,512-516`), sequenced last in the current
+debt-queue wave because it was the only item whose shape turned on a since-answered question:
+whether closing it needs a real public-suffix list (a new dependency) or a defensible
+dependency-free rule.
+
+### Decision — a real public-suffix list, and `publicsuffixlist` specifically
+
+`docs/TRACKS.md`'s dependency-claim row settled the first half before this branch wrote any code:
+"a real public-suffix-list package... rather than a narrower dependency-free rule." A
+dependency-free rule (an extra label-count threshold, a hardcoded exception list for `co.uk`-shaped
+suffixes) would have been exactly the kind of speculative host-classification logic
+`docs/M1-310-NOTES.md`'s canonicalizer history already argues against maintaining locally.
+
+Package choice, confirmed with the owner before implementation: **`publicsuffixlist`**, over two
+alternatives considered —
+
+- `publicsuffix2`: also bundles offline PSL data, but is less actively maintained and its bundled
+  snapshot lags further behind current registrations.
+- `tldextract`: the most widely used option, but by default it caches a *fetched* copy of the list
+  and can attempt a network refresh unless explicitly configured with `suffix_list_urls=()` and a
+  disabled cache — a worse fit for a suite that runs with sockets blocked (`tests/conftest.py`).
+
+`publicsuffixlist` bundles its PSL snapshot as package data (`public_suffix_list.dat`, verified
+present in the installed package), declares zero mandatory runtime dependencies, and its
+`privatesuffix(host)` method answers exactly the question this function needs answered: does
+`host` have anything registrable *beyond* the public-suffix boundary. Verified by direct call
+before writing the fix (`privatesuffix("co.uk") is None`, `privatesuffix("com.au") is None`,
+`privatesuffix("bls.gov") == "bls.gov"`, `privatesuffix("data.bls.gov") == "bls.gov"`,
+`privatesuffix("bbc.co.uk") == "bbc.co.uk"`), so the one check subsumes the round-5 single-label
+rule (a lone label is never more than a suffix) instead of sitting beside it as a second rule.
+
+`publicsuffixlist` ships no `py.typed` marker, so `pyproject.toml` gets an
+`[[tool.mypy.overrides]]` entry for `publicsuffixlist.*` — `ignore_missing_imports = true`,
+mirroring the existing `forecasting_tools.*` override rather than inventing a second pattern for
+the same problem.
+
+### Delivered
+
+- `pyproject.toml` / `uv.lock` — `publicsuffixlist>=1.0,<2` (resolved `1.0.2.20260821`); the mypy
+  override above.
+- `src/whiskeyjack_bot/research/exa.py` — `_PUBLIC_SUFFIXES: Final = PublicSuffixList()`, built
+  once at import time from the bundled snapshot (no network call, so this is safe under the
+  socket-blocked suite); `_validated_domains`'s single-label check replaced with
+  `_PUBLIC_SUFFIXES.privatesuffix(host) is None`; both docstrings (module-level and the function's
+  own) updated to record the residual as closed rather than left stated.
+- `tests/unit/test_exa.py` — four multi-label suffix cases added to
+  `test_malformed_domain_allowlist_is_refused_before_any_call`
+  (`co.uk`, `com.au`, `org.uk`, and a mixed `("bls.gov", "co.uk")`); a new positive-control test,
+  `test_a_registrable_domain_under_a_public_suffix_is_accepted` (`bbc.co.uk` must still earn
+  `official`).
+- `tests/property/test_exa_properties.py` — `_MULTI_LABEL_PUBLIC_SUFFIXES` fixture (hardcoded, not
+  sourced from the `publicsuffixlist` instance under test — the M1-303 lesson about not asserting
+  an implementation against its own oracle applies to a third-party library instance as much as to
+  a private constant); `test_no_validated_entry_is_a_bare_public_suffix`,
+  `test_a_multi_label_public_suffix_is_refused`, and a positive-control property,
+  `test_a_registrable_domain_under_a_public_suffix_is_accepted`, that validates a synthesized
+  `"{label}.{suffix}"` entry unchanged for every sampled suffix.
+
+All six new/changed test cases were run against the pre-fix module first (`git stash` +
+`git checkout HEAD -- src/whiskeyjack_bot/research/exa.py pyproject.toml uv.lock`, keeping only the
+test edits) and confirmed **failing** there: the four unit parametrizations and the two
+discriminating property tests. The two positive-control tests (one unit, one property) passed
+pre-fix as well as post-fix, which is what makes them controls rather than redundant negatives.
+
+### Rejected — keeping the old `"." not in host` check alongside the new one
+
+Defense-in-depth was considered and declined: `privatesuffix(host) is None` is true for *any*
+single-label `host` regardless of whether that label is explicitly listed in the PSL data, because
+with one label there is by definition nothing registrable beyond a suffix boundary — the PSL
+algorithm's own default rule. Keeping both checks would have restated one invariant as two,
+inviting exactly the kind of divergence-by-partial-edit this item exists to close.
+
+### Deferred (do not read the absence as an omission)
+
+- **No live update mechanism for the bundled snapshot.** See Standing risk below.
+- **`_matches_official_domain` is unchanged.** Its subdomain-match logic was already correct; it
+  was only ever as safe as its input, and its input can no longer contain a suffix-only entry.
+- **AskNews's `canonical_url` gap (M1-309) and the terminal root dot (M1-310)** are both already
+  closed on separate branches and are unrelated to this one.
+
+### Standing risk — a static snapshot, not a live list
+
+`publicsuffixlist`'s bundled data is frozen at whatever version is pinned (`1.0.2.20260821`); there
+is no network refresh at runtime, deliberately, since the test suite blocks sockets
+(`tests/conftest.py`). A public suffix registered after that snapshot would not be rejected until
+the pin is bumped. Low impact in practice: every suffix this item's tests assert against (`co.uk`,
+`com.au`, `org.uk`, `gov.uk`) has been an ICANN-section entry for decades, and the risk is
+one-directional — a missed new suffix means a residual identical in shape to the one this item
+closes, not a new failure mode.

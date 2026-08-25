@@ -957,6 +957,22 @@ def test_a_string_suffix_coincidence_is_not_a_subdomain_match(config: AppConfig)
     assert all(d.source_type == "web" for d in result.documents)
 
 
+def test_a_registrable_domain_under_a_public_suffix_is_accepted(config: AppConfig) -> None:
+    """Positive control for M1-311: rejecting ``co.uk`` must not also reject ``bbc.co.uk``.
+
+    ``bbc.co.uk`` has something registrable (``bbc``) beyond the ``co.uk`` public-suffix
+    boundary, so it is a registrable domain like ``bls.gov``, not a bare suffix like
+    ``co.uk`` itself -- an implementation that refused anything merely *ending in* a known
+    suffix, rather than checking what's beyond the boundary, would fail this.
+    """
+    handler = _Exchange(_json_ok(_body(_result(url="https://bbc.co.uk/news"))))
+    result = _retrieve(handler, config, include_domains=("bbc.co.uk",))
+    assert handler.requests[0]["payload"]["includeDomains"] == ["bbc.co.uk"]
+    assert all(d.source_type == "official" for d in result.documents)
+    assert result.run.provider_config is not None
+    assert result.run.provider_config["include_domains"] == ["bbc.co.uk"]
+
+
 def test_official_reason_alone_does_not_make_a_document_official(config: AppConfig) -> None:
     """The allowlist earns the label; the reason does not."""
     handler = _Exchange(_json_ok(_body(_result())))
@@ -998,6 +1014,13 @@ def test_official_reason_alone_does_not_make_a_document_official(config: AppConf
         ("com.",),
         ("bls.gov..",),
         ("bls.gov", "com"),
+        # Multi-label public suffixes: two labels, so the old two-label heuristic
+        # accepted them, and every host beneath one was still labelled `official`
+        # (round 6 residual, closed by M1-311).
+        ("co.uk",),
+        ("com.au",),
+        ("org.uk",),
+        ("bls.gov", "co.uk"),
     ],
 )
 def test_malformed_domain_allowlist_is_refused_before_any_call(
