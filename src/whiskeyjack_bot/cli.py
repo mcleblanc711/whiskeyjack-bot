@@ -95,6 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
         "reject",
         "record a rejection; the record stays validated and may be approved later",
     )
+
+    replay = subparsers.add_parser(
+        "replay",
+        help="re-derive a stored forecast from its saved model output; makes no API call",
+    )
+    replay.add_argument("--config", default="config.yaml", type=Path)
+    replay.add_argument("--record-id", required=True, help="the forecast record to replay")
     return parser
 
 
@@ -280,6 +287,65 @@ def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
         connection.close()
 
 
+def _run_replay(args: argparse.Namespace) -> int:
+    """Re-derive one stored forecast from its saved model output (M1-406).
+
+    The command form of the acceptance criterion, and the entry point Codex's T-903 dry-run
+    acceptance test needs: *"one command produces one validated record, zero provider calls
+    and zero submission calls."*
+
+    Both hashes are printed whatever the verdict, and in that order, for
+    ``_run_approval``'s reason: an operator acting on a replay needs to see the values it
+    compared, not a word that summarizes them. A mismatch exits ``EXIT_REFUSED`` -- it is a
+    finding about the ledger, and a command that exited 0 on one would be a check nothing
+    in CI could gate.
+
+    Nothing here contacts a provider. That is structural rather than promised: every module
+    this imports is pinned by the import-graph test to reach no SDK and no HTTP client.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.forecast.record import ForecastRecordError
+    from whiskeyjack_bot.forecast.replay import replay_forecast
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            result = replay_forecast(connection, config, record_id=args.record_id)
+        except ForecastRecordError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"record:    {result.record_id}")
+        print(f"artifact:  {result.call.raw_output_path}")
+        print(
+            f"calls:     {result.call.model_invocations} invocation(s), "
+            f"{result.raw_response_count} stored repl(y/ies), cost "
+            + ("unknown" if result.call.cost_usd is None else f"{result.call.cost_usd:.6f} USD")
+        )
+        print(f"stored:    {result.stored_sha256}")
+        print(f"replayed:  {result.replayed_sha256 or '(the stored reply no longer parses)'}")
+        for problem in result.problems:
+            print(f"  - {problem}")
+        print(f"verdict:   {'match' if result.matches else 'MISMATCH'}")
+        return EXIT_OK if result.matches else EXIT_REFUSED
+    finally:
+        connection.close()
+
+
 def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
     """Open an existing ledger, or print why not and return ``None`` (M2-701).
 
@@ -331,6 +397,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_approval(args, "approved")
     if args.command == "reject":
         return _run_approval(args, "rejected")
+    if args.command == "replay":
+        return _run_replay(args)
     raise AssertionError(f"unhandled command: {args.command}")
 
 

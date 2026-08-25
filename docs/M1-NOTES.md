@@ -4202,3 +4202,203 @@ pydantic-sanitizer rule.
 20 mutations, one per invocation from a pristine copy, 20 killed — the original 14, one per
 blocking finding, and two for the `loc` rule in both directions, so each regression test is shown to
 fail against the pre-fix code. Suite: 2165 pass, 1 xfail. Four gates green.
+
+---
+
+## M1-406 — Persisting raw model output and replaying it
+
+**Acceptance criterion:** *"Model replay makes zero API calls and reproduces the parsed forecast
+hash."* Both halves are asserted structurally rather than behaviourally, and that is the whole
+shape of this item.
+
+### What shipped
+
+| Module | What it is |
+| --- | --- |
+| `whiskeyjack_bot/artifacts.py` | The filesystem primitives both artifact kinds share, extracted from `research/artifacts.py`: `ArtifactError`, the safe-path-component rule, the int guard, and the atomic never-overwrite writer. |
+| `forecast/parse.py` | A **pure move** of `_strip_fences`, `_NOT_JSON`, `_output_problems`, `_parse`, `_classify`, `ModelSettings` and `ForecastGeneration` out of `generate.py`. No behaviour change; what changed is what importing them costs. |
+| `forecast/artifacts.py` | The raw-model-output envelope: writer, reader, `StoredModelOutput`, `MODEL_OUTPUT_SCHEMA_VERSION`. Namespaced under `forecast/`, keyed on `attempt_id`. |
+| `migrations/008_forecast_raw_output.sql` | `raw_output_path`, `cost_usd`, `model_invocations` on `forecast_records`, plus three clauses appended to `forecast_records_require_draft_on_insert`. |
+| `forecast/store.py` | `ModelCall` (one type for both directions), the three columns as writer-owned, `read_model_call`. |
+| `forecast/persist.py` | The artifact-first ordering rule, executed: `persist_generation` and `persist_raw_output`. |
+| `forecast/replay.py` | `replay_forecast` and `ForecastReplay`. |
+| `cli.py` | `whiskeyjack-bot replay --record-id <id>`. |
+
+### Decision — the split of `forecast/parse.py`, and why the criterion forces it
+
+M1-306 settled that **zero-calls is a property of the import graph, not of a mock count**, and
+`test_the_response_schema_reaches_no_provider_client` is that property asserted out of process. A
+replay must run *the identical parse* the generating call ran — otherwise it verifies a different
+function than the one that produced the record — but reaching that parse inside `generate.py` pulls
+`GeneralLlm` and litellm into the replay process. The two requirements are only compatible if the
+parse lives in a module that imports no SDK. Hence the move.
+
+The import-graph test is **widened from three modules to eight** and is now the acceptance
+criterion itself rather than a property something later rests on. No mock, no double and no call
+counter could establish it, because each of those proves only that *this* test made no call.
+
+### Decision — replay re-derives, and that is the opposite of what retrieval replay does
+
+`research/artifacts.py` argues explicitly that its files are **not** the replay substrate:
+re-normalizing from raw would make a replayed packet depend on adapter code version, so a bug fix
+in a `_to_document` would silently re-derive every historical forecast's evidence — the ledger
+rewriting its own history on a refactor. This item does the opposite and it is not a contradiction,
+because re-parsing *to compare* and re-parsing *to substitute* are different acts:
+
+- the record stays authoritative; nothing in `replay.py` writes, and `003` blocks UPDATE and DELETE
+  on `forecast_records` anyway;
+- the re-parsed forecast is rebuilt into a record carrying the **stored** identity and hashed, and
+  both hashes are reported;
+- a mismatch is an answer, not an exception, and never a new row.
+
+`test_replay_re_derives_rather_than_reading_the_stored_answer_back` is the load-bearing test: it
+edits the stored reply to a different but still valid forecast and requires a mismatch. Mutating
+`replayed_sha256 = record_sha256(rebuilt)` to `= stored_sha256` kills exactly that test and nothing
+else, which is the point — every other test here would pass against the vacuous implementation.
+
+### Decision — the artifact is keyed on `attempt_id`, not `record_id`
+
+An `attempt_id` is minted once per campaign, *before* the call; it is UNIQUE on `forecast_records`
+since `004`; and it is the only key a **failed** generation has, since a generation that produced no
+forecast produces no record. A call that cost money and returned unusable text is still a call whose
+evidence must survive, so `persist_raw_output` writes the artifact for one on its own. The result is
+a file with no row pointing at it, which is the same benign direction `research/persist.py` already
+documents and deliberately does not tidy up.
+
+### Decision — the three columns are indexed beside the record, never hashed into it
+
+`RECORD_SCHEMA_VERSION` is a promise about bytes already written. Adding a field to the record
+changes every future `forecast_sha256` while stored records keep their old ones, so an approval
+bound to one stops verifying — and `test_the_record_carries_exactly_the_contracted_fields` asserts
+the field set as *set equality* precisely so that change cannot be made quietly. Where the artifact
+landed, what the call cost and how many invocations it took are facts about the **call**, not part
+of the forecast's content. So they are columns, they join `_WRITER_OWNED_COLUMNS`, and `_insert`'s
+docstring is corrected from "every scalar column is derived from the record" to "every *indexed*
+column", which is what makes `forecast_sha256` mean something.
+
+`read_model_call` is a separate reader rather than fields on `ForecastRecord` for the same reason: a
+reader that returned them together would invite a caller to believe the hash vouched for all of it.
+
+### Decision — the request is stored, unlike the retrieval envelope
+
+`research/artifacts.py` excludes the request outright because a retrieval request's URL and headers
+carry the API key. A forecaster request carries none — it is the prompt this project rendered, and
+the key travels in a litellm header this module never sees. Without it the artifact cannot show what
+the model was actually asked, which is most of what makes it evidence. `GeneralLlm.to_dict()` is
+still never called anywhere in this project: it dumps `litellm_kwargs` wholesale, API key included.
+
+**D24 is untouched.** What is stored is the provider's returned text — the reply the parser was
+handed — not a reasoning trace, and nothing here has access to one. `record_json` still carries no
+raw response, which `test_the_record_stores_no_hidden_reasoning_and_no_raw_response` asserts on the
+rendered bytes.
+
+### Decision — a configuration change is visible in a replay, on purpose
+
+`_parse` runs the config-dependent output checks (`forecast.min_probability`/`max_probability`, the
+attribution rules) exactly as generation ran them. An operator who narrows the probability bounds
+after a forecast was stored gets a replay reporting that the record no longer re-derives. That is a
+true statement about the ledger under the current configuration, and suppressing it would make the
+instrument agree with itself by construction.
+
+### Deviation — three defects found by this branch's own tests, not by review
+
+1. **A lone surrogate in `raw_output_path` escaped as a raw `UnicodeEncodeError`.** `read_raw_model_output`
+   caught `OSError` around `path.read_bytes()`; `open()` raises `UnicodeEncodeError` (a `ValueError`)
+   *before* any I/O, because the path cannot be encoded for the syscall. A raw exception out of a
+   public boundary is a review finding in this project — it has been, twice. Found by
+   `test_the_reader_raises_only_its_own_error`. The refusal must not render the path, since
+   interpolating it is itself the failing operation.
+2. **`failure_code not in _FAILURE_CODES` raised `TypeError` on an unhashable value**, because
+   membership in a `frozenset` calls `hash()`. Present in both the writer and the reader. Closed by
+   testing `type(...) is not str` first.
+3. **The reader coerced a JSON int to a float** for `cost_usd` and the two float settings fields, so
+   `{"cost_usd": 0}` came back as `0.0` as though it had round-tripped. `json.dumps` renders every
+   float this writer stores with a decimal point, so a bare int in one of those positions is a value
+   the writer could not have produced. The coercion was harmless arithmetically, which is exactly
+   what made it worth closing: a silent coercion on an audited value is indistinguishable from a
+   value that really was stored that way.
+
+**Number 3 is the one worth recording.** It passed the `fast` profile and failed at 200 draws, which
+is the concrete case for the rule that `fast` is never a gate.
+
+### Deviation — a stale docstring claim, corrected rather than inherited
+
+`forecast/inputs.py` and `forecast/attribution.py` both said that importing `forecast.inputs`
+reaches `forecasting_tools`, `litellm` and `httpx` through `questions/__init__.py`'s re-export block
+(filed as **M1-204**). That block has since been gutted, and a fresh interpreter importing
+`forecast.inputs` now loads none of them — measured, not assumed. The correction matters here
+because `replay.py` names `SourceReference` at runtime on the strength of it, so `forecast.inputs`
+joins the import-graph parametrization: a fact a replay path depends on belongs in the assertion
+rather than in prose about it.
+
+**M1-204's acceptance criteria appear already met on master.** Observed, not flipped — that is its
+owner's call, and flipping another item's row from this branch is exactly the cross-item edit the
+workflow forbids.
+
+### Rejected — a `forecast_model_calls` table, and why not
+
+The right shape for a variable number of calls; wrong here. A forecast is one attempt with at most
+two invocations of one model, not a collection, and `research_runs` already carries
+`raw_response_path` and `cost_usd` on the run row. A per-invocation table would add a join to every
+reader in exchange for a row count that is always 1 or 2, and the repair turn's own text is already
+in the artifact the path names. (Owner decision at plan time.)
+
+### Rejected — making `generate.py` a re-export shim for the moved names
+
+The first cut imported all seven moved names back into `generate.py` so no test would change. Ruff
+then removed the four it no longer uses, which is the right answer: `forecast.parse` is the real
+home, and four test modules now name it directly. A shim would have kept the old coupling readable
+and would have made the next reader believe the parse still lives where the SDK is.
+
+### Rejected — a shared `ArtifactOutcome` Literal across the two persist modules
+
+`forecast/persist.py` restates `research/persist.py`'s three-value vocabulary rather than importing
+it. They agree today; a shared alias would make one item's decision to add a fourth outcome silently
+rewrite the other item's contract.
+
+### Deferred (do not read the absence as an omission)
+
+- **A composed output-validation entry point → M1-506.** Moving `_output_problems` to an SDK-free
+  module is adjacent to that row and is not it: the function stays private and uncomposed, and
+  `generate` still calls the checkers rather than being defined in terms of a public entry point.
+- **Budget enforcement → M1-504.** `cost_usd` is now recorded; nothing reads it as a limit.
+- **`pipeline_failure_events` for a failed generation → M1-606's writer.** `persist_raw_output`
+  guarantees the text the money bought is on disk and stops there. Writing the failure row here
+  would be two writers for one failure.
+- **The `run` command → the retrieval/forecast orchestrator.** This branch ships `replay` only;
+  there is still no production caller that generates a forecast end to end.
+- **`M1-314`**, filed off this branch's property suite: `research/artifacts.py::read_raw_responses`
+  has defect 1 above, unfixed. Pre-existing on the diff base, in a merged module, so it is a row and
+  not a cross-item fix — and this branch neither depends on it nor increases its reachability.
+
+### Standing risk — not verifiable offline
+
+- **`MODEL_OUTPUT_SCHEMA_VERSION` is a promise about bytes already written**, the same warning
+  `record.py` and `research/hashing.py` make about their own rules. Changing `ensure_ascii`, the
+  field set, or the float strictness changes what future artifacts look like while stored ones keep
+  their shape, and the reader would then refuse them. If it must change it changes as a new version
+  alongside this one.
+- **A replay verifies the parse, not the model.** It says the stored record is what the stored
+  provider text parses to under today's code and configuration. It cannot say the provider really
+  returned that text — that is what the never-overwrite rule and the write-before-the-row ordering
+  are for, and both are circumstantial.
+- **The suite is slower.** `scripts/gate.sh` measured 234s on this branch against the ~85s in
+  CLAUDE.md. The property file and three new unit files account for it; no individual test is slow.
+  Worth a look before the number normalizes as expected.
+- **`PRAGMA foreign_keys` is still never read back** (`M1-609`), unchanged.
+
+### Mutation checks
+
+Six mutations, one per invocation from a pristine copy, six killed:
+
+| Mutation | Killed by |
+| --- | --- |
+| `ensure_ascii=False` + `surrogatepass` | the round-trip property and the lone-surrogate unit test |
+| settings set-equality weakened to a subset check | `test_the_reader_refuses_extra_settings_fields` |
+| negative `cost_usd` accepted | one writer case and one reader case |
+| `replayed_sha256 = stored_sha256` (read the answer back) | `test_replay_re_derives_rather_than_reading_the_stored_answer_back`, alone |
+| `_require_matching_artifact` made a no-op | the wrong-attempt refusal and the no-leak test |
+| `008`'s three clauses neutered to `WHERE 0` | all eight direct-SQL cases |
+
+Clauses were neutered to `WHERE 0` rather than deleted: an empty trigger body (`BEGIN END;`) is a
+syntax error (M1-607).

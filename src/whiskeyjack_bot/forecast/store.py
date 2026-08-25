@@ -54,9 +54,12 @@ import sqlite3
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any
 
+from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS
 from whiskeyjack_bot.forecast.attribution import AttributionFieldError, validate_attribution_fields
 from whiskeyjack_bot.forecast.record import (
     ForecastRecord,
@@ -71,7 +74,7 @@ from whiskeyjack_bot.forecast.record import (
 )
 from whiskeyjack_bot.lifecycle import LifecycleError, transaction
 
-# The two columns this module writes but does not derive from the record.
+# The columns this module writes but does not derive from the record.
 #
 # `status` is the literal `'draft'`: it is not a parameter and there is no branch that
 # could make it anything else. `003`'s trigger refuses a non-draft insert, and a writer
@@ -79,7 +82,91 @@ from whiskeyjack_bot.lifecycle import LifecycleError, transaction
 # happened. `created_at_utc` is writer-owned -- when the ledger stored the row, as distinct
 # from `generated_at_utc`, which is when the pipeline produced it and is caller-supplied so
 # a replay can reproduce it.
-_WRITER_OWNED_COLUMNS = ("status", "created_at_utc")
+#
+# M1-406's three are caller-owned rather than writer-owned, and they are here rather than in
+# the record for one reason: `RECORD_SCHEMA_VERSION` is a promise about bytes already
+# written. Adding a field to the record changes every future `forecast_sha256` while stored
+# records keep their old ones, so an approval bound to one stops verifying -- and
+# `test_the_record_carries_exactly_the_contracted_fields` asserts the field set as *set
+# equality* precisely so that change cannot be made quietly. Where the artifact landed, what
+# the call cost and how many invocations it took are facts about the call, not part of the
+# forecast's content, so they are indexed beside the record instead of hashed into it.
+_WRITER_OWNED_COLUMNS = (
+    "status",
+    "created_at_utc",
+    "raw_output_path",
+    "cost_usd",
+    "model_invocations",
+)
+
+# The M1-406 columns, read back. Same tuple, same order, used by the reader below.
+_MODEL_CALL_COLUMNS = ("raw_output_path", "cost_usd", "model_invocations")
+
+# `008` caps this column at 200 characters, the ceiling `_require_identifier` and `006`
+# already apply to every identifier the readers look a record up by.
+_MAX_PATH_LENGTH = 200
+
+
+@dataclass(frozen=True)
+class ModelCall:
+    """What the model call cost and where its raw output landed (M1-406).
+
+    One type for both directions -- passed to :func:`append_forecast_version` and returned
+    by :func:`read_model_call` -- so a round trip is comparable without a translation step
+    that could disagree with itself.
+
+    Every field defaults to ``None`` and every ``None`` is a real answer rather than a gap:
+
+    - ``raw_output_path is None`` means no artifact is recorded for this row. Either
+      retention was off, or the write failed and ``forecast/persist.py`` committed the row
+      anyway rather than lose a call that cost money. **Which of the two is not stored
+      here**, and deliberately: it is reported to the caller at write time, and a column
+      that guessed would be a claim the ledger cannot stand behind.
+    - ``cost_usd is None`` means **unknown, not free** -- the M1-303 rule.
+      ``generate_forecast`` publishes a total only when every attempted call reported a
+      usable figure; anything less is a subtotal that looks exactly like a complete one.
+    - ``model_invocations is None`` means nobody recorded it, which is only reachable for a
+      row written before ``008``.
+
+    Validated in ``__post_init__`` so a caller learns the shape is wrong at construction
+    rather than from inside the writer's transaction -- the "refuse before you spend" shape
+    M1-303 settled, applied to an append-only row instead of to money. ``008``'s trigger is
+    still the binding layer; this one is the readable message.
+    """
+
+    raw_output_path: str | None = None
+    cost_usd: float | None = None
+    model_invocations: int | None = None
+
+    def __post_init__(self) -> None:
+        path = self.raw_output_path
+        if path is not None:
+            if type(path) is not str or not path.strip() or len(path) > _MAX_PATH_LENGTH:
+                raise ForecastRecordError(
+                    "raw_output_path must be None or non-blank text of at most "
+                    f"{_MAX_PATH_LENGTH} characters"
+                )
+            if path.startswith("/") or "\x00" in path or ".." in f"/{path}/".split("/"):
+                raise ForecastRecordError(
+                    "raw_output_path must be a relative path inside the artifact root, "
+                    "with no parent-directory segment"
+                )
+        cost = self.cost_usd
+        if cost is not None:
+            # `type() is` rather than `isinstance`: bool subclasses int, and `True`
+            # would otherwise be stored as a cost of one dollar.
+            if type(cost) is not float and type(cost) is not int:
+                raise ForecastRecordError("cost_usd must be None or a number")
+            if not isfinite(cost) or cost < 0:
+                raise ForecastRecordError("cost_usd must be None or a finite, non-negative number")
+        calls = self.model_invocations
+        if calls is not None:
+            if type(calls) is not int:
+                raise ForecastRecordError("model_invocations must be None or an int")
+            if not 1 <= calls <= MAX_MODEL_INVOCATIONS:
+                raise ForecastRecordError(
+                    f"model_invocations must be None or between 1 and {MAX_MODEL_INVOCATIONS}"
+                )
 
 
 def _projection(record: ForecastRecord) -> dict[str, Any]:
@@ -256,13 +343,24 @@ def _require_draft(draft: object) -> ForecastRecordDraft:
 
 
 def append_forecast_version(
-    conn: sqlite3.Connection, *, draft: ForecastRecordDraft
+    conn: sqlite3.Connection,
+    *,
+    draft: ForecastRecordDraft,
+    call: ModelCall | None = None,
 ) -> ForecastRecord:
     """Append ``draft`` as the next forecast version for its question and tournament.
 
     Returns the persisted :class:`ForecastRecord`, carrying the identity the ledger
     assigned: a fresh ``record_id``, ``forecast_version`` one above the current head, and
     ``parent_record_id`` naming that head (``None`` for the first version).
+
+    ``call`` is M1-406's three columns -- where the raw model output landed, what the call
+    cost, how many invocations it took. It is optional and defaults to an all-``None``
+    :class:`ModelCall` because those columns are nullable and because a caller that has no
+    artifact still has a record to store; :func:`whiskeyjack_bot.forecast.persist.persist_generation`
+    is what fills it in on the paid path. The default is constructed here rather than in the
+    signature: a mutable-looking default in a signature is a trap even when the object is
+    frozen, and this one is cheap.
 
     Raises :class:`ForecastRecordError` and nothing else. Caller mistakes -- a wrong type,
     a response citing an unresolvable source -- are refused before the transaction opens,
@@ -272,6 +370,10 @@ def append_forecast_version(
     connection = _require_connection(conn)
     validated = _require_draft(draft)
     _require_attributable(validated)
+    if call is None:
+        call = ModelCall()
+    elif type(call) is not ModelCall:
+        raise ForecastRecordError("call must be a ModelCall")
 
     try:
         with transaction(connection):
@@ -291,7 +393,7 @@ def append_forecast_version(
                 forecast_version=version,
                 parent_record_id=parent,
             )
-            _insert(connection, record)
+            _insert(connection, record, call)
             return record
     except LifecycleError as exc:
         # Message preserved rather than replaced, the rule approval.py settled for the same
@@ -337,8 +439,8 @@ def _current_head(conn: sqlite3.Connection, draft: ForecastRecordDraft) -> tuple
     return _stored_text(row[0], "record_id"), _stored_int(row[1], "forecast_version")
 
 
-def _insert(conn: sqlite3.Connection, record: ForecastRecord) -> None:
-    """Write the row. Every scalar column is derived from the record, never passed in.
+def _insert(conn: sqlite3.Connection, record: ForecastRecord, call: ModelCall) -> None:
+    """Write the row. Every column the record describes is derived from it, never passed in.
 
     That is what makes ``forecast_sha256`` mean something: the hash digests the canonical
     JSON of the whole record, and every indexed column beside it is a projection of that
@@ -349,11 +451,19 @@ def _insert(conn: sqlite3.Connection, record: ForecastRecord) -> None:
     branch that could make it anything else: ``003``'s trigger refuses a non-draft insert,
     and a writer able to *request* another state would be a writer able to record an
     approval that never happened.
+
+    M1-406's three columns are the one thing that *is* passed in, and they are outside the
+    guarantee above by construction: they describe the call, not the forecast, so no
+    projection of the record could produce them. ``008``'s trigger is what constrains them,
+    and it is the binding layer here in the same sense ``007`` is for the version chain.
     """
     values: dict[str, Any] = {
         **_projection(record),
         "status": "draft",
         "created_at_utc": _utcnow_text(),
+        "raw_output_path": call.raw_output_path,
+        "cost_usd": call.cost_usd,
+        "model_invocations": call.model_invocations,
     }
     columns = ", ".join(_INSERT_COLUMNS)
     placeholders = ", ".join(f":{name}" for name in _INSERT_COLUMNS)
@@ -403,6 +513,43 @@ def read_forecast_record(conn: sqlite3.Connection, record_id: str) -> ForecastRe
     if row is None:
         raise ForecastRecordError("record_id does not name a stored forecast record")
     return _record_from_row(row)
+
+
+def read_model_call(conn: sqlite3.Connection, record_id: str) -> ModelCall:
+    """Return one row's M1-406 columns (M1-406).
+
+    Separate from :func:`read_forecast_record` rather than folded into it, because the two
+    answer different questions and only one of them is covered by ``forecast_sha256``. The
+    record is the hashed, self-attesting thing; these three columns describe the *call* and
+    are outside that hash by design, so a reader that returned them together would invite a
+    caller to believe the hash vouched for all of it.
+
+    Raises when ``record_id`` names no stored record, matching :func:`read_forecast_record`:
+    a caller that could not tell "no such record" from "that record recorded no cost" would
+    report the wrong one -- and here the second really is a meaningful answer.
+    """
+    connection = _require_connection(conn)
+    if type(record_id) is not str:
+        raise ForecastRecordError("record_id must be a string")
+    row = _fetch_one(
+        connection,
+        f"SELECT {', '.join(_MODEL_CALL_COLUMNS)} FROM forecast_records WHERE record_id = ?",
+        (record_id,),
+    )
+    if row is None:
+        raise ForecastRecordError("record_id does not name a stored forecast record")
+    path, cost, calls = row
+    # Rebuilt through `ModelCall`, whose `__post_init__` is the writer's own rule -- so a
+    # row that a raw-SQL writer put an absolute path or a negative cost into is refused on
+    # the way out rather than handed back as though `008` had vouched for it. A ledger
+    # upgraded past a row written before `008` holds NULLs here, which every rule permits.
+    if path is not None and type(path) is not str:
+        raise ForecastRecordError("stored raw_output_path is not text")
+    if cost is not None and type(cost) is not float and type(cost) is not int:
+        raise ForecastRecordError("stored cost_usd is not a number")
+    if calls is not None and (type(calls) is not int or isinstance(calls, bool)):
+        raise ForecastRecordError("stored model_invocations is not an integer")
+    return ModelCall(raw_output_path=path, cost_usd=cost, model_invocations=calls)
 
 
 def latest_forecast_version(

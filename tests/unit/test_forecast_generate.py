@@ -638,6 +638,11 @@ _FORBIDDEN = {
         "whiskeyjack_bot.forecast.schema",
         "whiskeyjack_bot.forecast.binary",
         "whiskeyjack_bot.forecast.attribution",
+        "whiskeyjack_bot.forecast.inputs",
+        "whiskeyjack_bot.forecast.parse",
+        "whiskeyjack_bot.forecast.artifacts",
+        "whiskeyjack_bot.forecast.persist",
+        "whiskeyjack_bot.forecast.replay",
     ],
 )
 def test_the_response_schema_reaches_no_provider_client(module: str) -> None:
@@ -649,8 +654,21 @@ def test_the_response_schema_reaches_no_provider_client(module: str) -> None:
     Widened by M1-501 from ``schema`` alone to all three: ``binary.py`` and
     ``attribution.py`` both make the claim in their docstrings, and ``attribution.py``
     rests a design decision on it -- it takes primitives rather than a ``ModelInput``
-    precisely so that importing ``forecast.inputs``, which reaches the SDK, is not
-    forced. A claim only a docstring makes is one a later import can quietly end.
+    precisely so that importing ``forecast.inputs`` is not forced. A claim only a
+    docstring makes is one a later import can quietly end.
+
+    **Widened again by M1-406, and this is now the acceptance criterion itself** rather
+    than a property something later will rest on. ``forecast.replay`` is the replay path;
+    ``forecast.parse`` is the reason it can run the *identical* parse the generating call
+    ran without pulling litellm in behind it; ``forecast.artifacts`` and
+    ``forecast.persist`` are what it reads. Zero API calls is asserted here and nowhere
+    else -- no mock, no double, no call counter could establish it, because each of those
+    proves only that *this* test made no call.
+
+    ``forecast.inputs`` is on the list too, and its presence is a correction. Two
+    docstrings in this package said that module reaches the SDK; it does not, and
+    ``forecast.replay`` names ``SourceReference`` at runtime on the strength of that. A
+    fact a replay path depends on belongs in the assertion rather than in prose about it.
     """
     added = _added_modules(module)
     assert not (added & _FORBIDDEN), sorted(added & _FORBIDDEN)

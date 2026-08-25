@@ -63,7 +63,10 @@ from whiskeyjack_bot.forecast.schema import (
 from whiskeyjack_bot.questions.model import CanonicalQuestion
 
 if TYPE_CHECKING:
-    from whiskeyjack_bot.forecast.generate import ForecastGeneration
+    # `forecast.parse`, not `forecast.generate`: M1-406 moved the value object to the
+    # module that imports no provider SDK, and naming its real home keeps this type-only
+    # import from implying a coupling that is not there.
+    from whiskeyjack_bot.forecast.parse import ForecastGeneration
 
 # The version of the *record* contract. Three versions travel with one forecast and none
 # of them is the others: ``prompts/forecaster.md``'s H1 is the prompt (M1-401),
