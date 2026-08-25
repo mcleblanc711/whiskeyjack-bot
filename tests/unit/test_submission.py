@@ -75,25 +75,32 @@ def _seed_draft(
     question_id: int = 100,
     tournament_id: str = "minibench",
     forecast_version: int = 1,
+    parent_record_id: str | None = None,
 ) -> str:
-    """Insert a draft directly: M1-602's record writer does not exist yet.
+    """Insert a draft directly, past `forecast.store`, to exercise the reader alone.
 
     The same shape `tests/unit/test_approval.py` uses, including the per-record
     `attempt_id` migration 004 indexes UNIQUE.
+
+    `parent_record_id` is required for any version above 1: migration 007 (M1-602) makes
+    version 1 the root of a chain and every later version name the record it supersedes,
+    so a fixture that seeded a bare v2 would be seeding a chain with a hole in it.
     """
     conn.execute(
         "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+        "record_id, question_id, tournament_id, forecast_version, parent_record_id, "
+        "question_type, status, "
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, ?, ?, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
+        "VALUES (?, ?, ?, ?, ?, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
         "'run-1', ?, '{}', '{}', ?, ?, ?)",
         (
             record_id,
             question_id,
             tournament_id,
             forecast_version,
+            parent_record_id,
             TS,
             TS,
             SHA,
@@ -240,7 +247,7 @@ def test_a_second_forecast_version_gets_its_own_key(ledger: sqlite3.Connection) 
     """ "Changed forecast requires a new key", structurally: a changed forecast is a new
     record at a new version (M1-602/D25), and the version is in the key material."""
     _seed_draft(ledger)
-    _seed_draft(ledger, record_id="rec-2", forecast_version=2)
+    _seed_draft(ledger, record_id="rec-2", forecast_version=2, parent_record_id="rec-1")
     first = submission_key_for_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
     second = submission_key_for_record(ledger, "rec-2", request_payload_sha256=PAYLOAD_SHA)
     assert first != second
@@ -591,6 +598,17 @@ def test_a_refused_value_never_reaches_the_message_or_the_traceback(
 def test_a_refusal_from_the_ledger_never_echoes_a_stored_value(
     ledger: sqlite3.Connection,
 ) -> None:
+    """The reader's defence, on a row only a pre-007 ledger can hold.
+
+    M1-602's `007_forecast_version_chain.sql` refuses a non-integer `forecast_version` at
+    INSERT, so this row can no longer be written through the schema as it now stands. It is
+    still reachable: 007 redefines a trigger and adds no backfill probe, so a ledger written
+    before it and upgraded afterwards keeps whatever its rows already held -- which is
+    exactly the population `submission._stored_int` exists to refuse. The trigger is dropped
+    to seed that row, which simulates a reachable condition rather than inventing one, and
+    the connection is this test's own.
+    """
+    ledger.execute("DROP TRIGGER forecast_records_require_draft_on_insert")
     _seed_draft(
         ledger,
         tournament_id="s3cr3t-tournament",

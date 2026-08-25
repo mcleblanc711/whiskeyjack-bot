@@ -3800,3 +3800,405 @@ next to the one-sided-property lesson above: **a mutation harness measures wheth
 the rules you wrote; it is silent about a rule you never wrote.** The defence against a missing rule
 is the acceptance criterion read against the spec, and the reviewer is doing that job — which is why
 a finding filed off a wrong pointer still found a defect worth two source fixes and a backlog row.
+
+## M1-602 — Persisting immutable forecast versions
+
+Acceptance: *updating a question appends v2; v1 remains byte-identical.*
+
+`forecast_records` shipped in `001_initial.sql` with M1-601 and has been *read* by
+`approval.py`, `submission.py` and `lifecycle.py` ever since. Nothing in `src/` had ever written a
+row: every `INSERT INTO forecast_records` in the tree was raw SQL inside a test fixture. This item
+is that writer.
+
+### Delivered
+
+- `src/whiskeyjack_bot/forecast/record.py` — `ForecastRecordDraft` / `ForecastRecord`,
+  `build_forecast_record_draft`, `assign_identity`, `canonical_record_json`,
+  `canonical_final_prediction_json`, `record_sha256`, `record_from_json`,
+  `RecordedModelSettings` / `RecordedSource` / `RecordedCommunityPrediction`,
+  `ForecastRecordError`, `RECORD_SCHEMA_VERSION`.
+- `src/whiskeyjack_bot/forecast/store.py` — `append_forecast_version`, `read_forecast_record`,
+  `latest_forecast_version`, `mint_record_id`.
+- `src/whiskeyjack_bot/migrations/007_forecast_version_chain.sql` — the version/parent chain,
+  the JSON-object shape of both JSON columns and the `question_type` vocabulary, as clauses on
+  a redefined `forecast_records_require_draft_on_insert`; `LEDGER_SCHEMA_VERSION` → 7.
+- `tests/unit/test_forecast_record.py` (39), `tests/unit/test_forecast_store.py` (45),
+  `tests/property/test_forecast_record_properties.py` (10 properties). Suite: 2118 pass, 1 xfail.
+
+Nothing here is reachable from the CLI and nothing calls a provider. `submission.enabled: false`
+and `dry_run: true` are untouched.
+
+### Decision — the writer decides the version and the parent, and the caller cannot
+
+`append_forecast_version` takes a *draft* — a record with no identity — and returns a
+`ForecastRecord` carrying the `record_id`, `forecast_version` and `parent_record_id` the ledger
+assigned. A caller passing its own `forecast_version` would be asserting what the chain looks like
+from outside the transaction that can see it.
+
+The two are different **types**, not one type with three optional fields. `ForecastRecord`
+subclasses `ForecastRecordDraft`, so the writer checks `type(draft) is ForecastRecordDraft` rather
+than `isinstance`: an already-appended record would otherwise pass an `isinstance` gate and be
+minted a second identity, which is the duplicate `001`'s UNIQUE constraint exists to prevent.
+
+The head is read inside `lifecycle.transaction`'s `BEGIN IMMEDIATE`. The lock is taken up front for
+the reason that function's docstring gives: two writers that both read "the head is v1" would both
+mint v2, and a deferred `BEGIN` discovers that only on a lock upgrade that cannot be retried from
+inside an open transaction. `UNIQUE (question_id, tournament_id, forecast_version)` is the second
+line of defence and turns any race that does occur into a loud failure rather than a forked chain.
+
+### Decision — `007` carries the whole invariant, not a subset
+
+`001` gives `forecast_version INTEGER NOT NULL`, a self-referencing `parent_record_id` and the
+UNIQUE triple. Those forbid two rows claiming the same version and a parent pointer naming no row
+at all. They do **not** forbid `forecast_version = 0`; a version 1 carrying a parent; a version 4
+carrying none; a version 2 of question 100 pointing at version 1 of question **200**, or at version
+1 of the same question in a *different tournament*; a version 5 pointing at version 1; or a row
+pointing at itself. Every one of those satisfies the foreign key perfectly, and `003` blocks UPDATE
+and DELETE on this table, so none of them can be corrected afterwards.
+
+Contiguity needs no separate clause: requiring the parent to be version `N-1` of the same
+`(question_id, tournament_id)` makes version N unreachable unless N-1 exists, and the UNIQUE triple
+forbids two children of one parent. So the chain is a path, not a tree. Self-reference falls out
+too — at `BEFORE INSERT` the row's own `record_id` is not in the table yet, so the `EXISTS` finds
+nothing.
+
+Both JSON columns are required to be `json_type(...) = 'object'`. That is the **stricter reading**
+of "the complete Pydantic record as canonical JSON": `001` made them `NOT NULL` and nothing more,
+so `''` and `not json at all` were both permanently storable on a row whose hash claims to attest
+to them. Cost stated because the trigger is immutable once merged: storing a non-object in either
+column later needs a migration to widen it. Same for the `question_type` vocabulary — widening it
+to `discrete` costs one more DROP/CREATE of this trigger, which is `004`'s and `006`'s escape
+hatch, not a table rebuild.
+
+### Decision — a `draft`, and no `validated` event
+
+`M1-603`'s notes say this item "must insert at `status='draft'`, supply `forecast_sha256`, and
+append a `validated` event; it can do both inside one `transaction()`". The first two shipped; the
+third did not, and the owner settled it before any code was written.
+
+`validated` means the output-validation gate passed. That gate is M1-504, and M1-404, M1-405,
+M1-502 and M1-503 are all `Not Started`. Appending the event today would put a claim in an
+append-only ledger for checks that do not exist. `lifecycle.transaction` nests as a `SAVEPOINT`, so
+a caller that wants the record and its first event as one unit still can — `test_the_writer_composes
+_inside_a_callers_transaction` asserts both halves, including the rollback.
+
+What the writer *does* run is `attribution.validate_attribution_fields` (M1-501, shipped, public —
+its own docstring names "a validation pass over a stored record" as its use), before the transaction
+opens. A response citing a source it was never given is exactly the record this project exists to
+prevent, and once appended it cannot be withdrawn. The sanitized problem list is carried through
+rather than replaced with a constant, for the reason `approval.py` carries `LifecycleError`'s text:
+`AttributionFieldError`'s contract guarantees it names no value, and it is the whole account of why
+the record was refused.
+
+### Decision — UUIDv7 with a counter, and the first version of it was wrong
+
+`CODEX_HANDOFF.md` asks for UUIDv7/ULID and M1-601 deferred the choice here. UUIDv7 is built from
+`os.urandom` and a millisecond timestamp in `store.py`: `uuid.uuid7` is Python 3.14, this project
+pins 3.11, and a dependency for eighteen bits of layout would have cost the wave's single
+`uv.lock` slot.
+
+**The first implementation was a plain RFC 9562 § 5.7 UUIDv7 and it did not sort.** A plain UUIDv7
+orders only *across* milliseconds; two ids minted inside one millisecond carry independent random
+draws and sort however the draws fell. That is the case this project actually produces — appending
+five versions in a loop — so "record ids sort in creation order" was a claim that failed on its
+most common input. `test_minted_ids_are_distinct_and_sort_in_creation_order` found it, which is why
+that test mints in a tight loop with no sleep: a version with a `sleep` between draws passes against
+an implementation with no counter at all.
+
+The fix is § 6.2's "Fixed Bit-Length Dedicated Counter": `rand_a` holds a counter seeded randomly at
+each new millisecond and incremented for every id inside it, so `(milliseconds, counter)` is
+strictly increasing. Two edges are handled by holding `_last_milliseconds` rather than trusting the
+clock — a **backwards clock** reuses the last millisecond and increments, an **exhausted counter**
+advances the stored millisecond — both trading a slightly-wrong timestamp for an id that is still
+unique and still ordered, which is the right way round for a primary key. A lock makes the
+read-modify-write atomic; nothing enforces single-threaded use, and two threads interleaving would
+hand out one counter value twice.
+
+### Deviation — a surrogate **pair** is refused, and a lone surrogate is not
+
+Measured, not assumed. Of everything a record can hold, exactly one shape fails to survive
+`model_dump(mode="json")` → `json.dumps(ensure_ascii=True)` → `json.loads`: a UTF-16 **surrogate
+pair**. `"\ud83d\ude00"` is two Python code points going in and `U+1F600` coming back, so a record
+holding one is stored as something the forecaster did not produce and a replay reproduces the
+ledger's version rather than the model's.
+
+A **lone** surrogate is deliberately *not* refused. It escapes to `"\ud800"` and comes back as the
+same lone surrogate — verified — so it round-trips exactly, and
+`forecast/inputs.render_model_input` says as much about the same rendering rule. Refusing it here
+would contradict a sibling in this subpackage over an input that is provably safe.
+`research/store.py` refuses both, correctly: its columns hold bare TEXT, which cannot carry either,
+while this column holds `ensure_ascii` output, which is pure ASCII and can carry one.
+
+Reachable rather than theoretical, and the *reachable surface is narrower than it first looks*: a
+pydantic **constrained** string (`Field(min_length=...)`) refuses a surrogate pair on its own, so
+`question.title` is not a way in. A bare `str` and a `NonBlankStr` (a bare `str` with an
+`AfterValidator`) both accept one — which covers `resolution_criteria`, untrusted Metaculus text,
+and `rationale_summary`, untrusted model output. That distinction is checked in the test rather than
+asserted in a comment.
+
+### Deviation — `questions/__init__.py` gutted to a one-line docstring
+
+`record.py` needs `CanonicalQuestion`, and importing `whiskeyjack_bot.questions.model` executes the
+package `__init__.py` first, which re-exported `normalize` and so pulled in `forecasting_tools`.
+That put the whole SDK on the replay path: M1-306 established that "zero provider calls" is a
+property of the **import graph**, not of a mock count, and M1-406 has to reach this schema without
+the provider client being importable at all. Measured: importing `forecast.record` loaded
+`forecasting_tools`; importing `forecast.schema` did not.
+
+Gutted the way M1-308 gutted `research/__init__.py`, and for the same reason — CLAUDE.md's
+convention is that "subpackages get a one-line-docstring `__init__.py`", which this one had been
+violating. Blast radius was two test files (`test_questions.py`, `test_groups.py`), both repointed
+to submodules; nothing in `src/` imported the package root. Recorded as a deviation because it
+touches a merged module under a different item's number.
+
+### Deviation — three merged test fixtures were writing incoherent rows
+
+`007` turned three latent fixture defects into failures. All three are fixture bugs, not
+accommodations, and none of them was fixed by weakening the migration:
+
+- `tests/property/test_submission_properties.py::_seed` took `forecast_version` from a global
+  counter, so it wrote a version 5 with no versions 1-4 behind it — a chain with a hole. It now
+  keeps a real per-`(tournament, question)` chain and appends to it, which satisfies both the
+  UNIQUE triple and the parent clause and is what the ledger actually looks like.
+- `tests/unit/test_submission.py::_seed_draft` seeded a bare v2. It now takes `parent_record_id`.
+- `tests/unit/test_submission.py::test_a_refusal_from_the_ledger_never_echoes_a_stored_value`
+  seeded `forecast_version = "two"` on purpose, which `007` now refuses at INSERT. The row is still
+  **reachable** — `007` redefines a trigger and adds no backfill probe, so a ledger written before
+  it keeps whatever its rows held, which is the population `submission._stored_int` exists to
+  refuse — so the test drops the trigger to seed it. That simulates a reachable condition rather
+  than inventing one, which is what CLAUDE.md permits.
+
+And one **pre-existing** defect surfaced rather than introduced: `TOURNAMENTS` in
+`test_submission_properties.py` is `ENCODABLE_TEXT` filtered only by length, so it can draw `" "` —
+which `006_non_blank_identifiers.sql` has refused at INSERT since it merged. The suite had only
+stopped drawing one by luck; changing `_seed` changed hypothesis's exploration and it drew one.
+`SEEDABLE_TOURNAMENTS` narrows the domain for the two properties that *store* the value, leaving
+the ones that only derive a key untouched.
+
+### Rejected — deriving `question_domain` from `source_categories`, and why not
+
+`CODEX_HANDOFF.md` lists "domain and question-type tags" and `docs/M1-NOTES.md` (M1-201) points
+`M1-307 / M1-602` at the mapping. Not taken. There is no mechanical mapping from Metaculus
+categories to this project's `config/x_accounts.yaml` taxonomy (`econ_data`, `space_launch`, …),
+M1-308 settled that domains stay free-form, and inventing one under an item whose acceptance
+criterion is about version chains would put a taxonomy nobody reviewed into an append-only column.
+`question_domain` stays an optional caller-supplied string. `source_categories` is carried through
+inside the stored question, so nothing is lost.
+
+### Rejected — storing the research packet rather than stamping its hash
+
+M1-306 decided against a `research_packets` table because a stored hash that no longer matches the
+rows it summarizes is an attribution claim the evidence contradicts. Its notes reserved
+`record_json` for the stamp, and that is what shipped: `research_packet_sha256` records the packet
+the forecast *saw*, and a later audit compares it against a hash recomputed from the evidence rows.
+The stamp lives with the forecast; the truth lives in the rows.
+
+### Rejected — a permissive reader
+
+`read_forecast_record` refuses three things rather than returning a best-effort record: a
+`record_json` that does not re-render to exactly the stored bytes, a `forecast_sha256` that is not
+the hash of what was read, and indexed columns that disagree with the record they index.
+
+The round-trip comparison is the load-bearing one. `_StrictModel` is `extra="forbid"` but **not**
+`strict` — M1-303 round 4 — so pydantic will coerce `"123"` to `123`, and a reader that coerced
+would hand back a record that is not what the ledger holds and that hashes to something other than
+the stored `forecast_sha256`, silently, as a successful read. Comparing the re-rendered bytes to the
+stored text catches coercion, key reordering, dropped defaults and any future drift in the
+rendering rule at once, and it is the exact property the ledger needs.
+
+### Deferred (do not read the absence as an omission)
+
+- **Approval state and history, submission attempts, resolution and score events → M1-604 /
+  `show`.** `CODEX_HANDOFF.md` lists them under the canonical record; M1-603's own notes settle that
+  they are joined at read/export time and never written back, because writing them back means
+  updating a stored forecast version, which is what D25 forbids.
+- **Validation results and the generated numeric CDF → M1-502 / M1-503**, both `Not Started`.
+- **The raw provider response, invocation count and cost → M1-406.** `forecast_records` has no
+  column for any of them, and `ForecastGeneration` carries `request` and `raw_responses` precisely
+  so that item can persist them separately. `test_the_record_stores_no_hidden_reasoning_and_no_raw
+  _response` asserts on the rendered bytes that neither reaches `record_json`.
+- **A composed output-validation entry point → M1-506.** This writer calls
+  `attribution.validate_attribution_fields` by name; when M1-506 lands, that call becomes the
+  composed one. Filed off M1-501's round-1 review for exactly this caller.
+- **The `run` / `replay --record-id` CLI wiring → M1-406 / T-903.** This slice is library-only.
+- **A community-prediction snapshot.** The handoff says "when technically available"; it is not.
+  `normalize.py` deliberately never carries the parent post's payload because it holds
+  community-prediction aggregations. The record stores `snapshot: null` with
+  `used_as_model_input: false` rather than omitting the field, so a reader can tell "unavailable"
+  from "absent". Both snapshot fields are typed `None` and the flag is `Literal[False]`: "community
+  prediction is never a forecaster input in v1" is a hard constraint, and a record able to claim
+  otherwise would be a place for it to be breached quietly. Making it available later is a
+  `RECORD_SCHEMA_VERSION` bump, which is the visible change it should be.
+
+### Standing risk — not verifiable offline
+
+- **`RECORD_SCHEMA_VERSION` is a promise about bytes already written.** Changing any part of the
+  rendering rule — key order, separators, `ensure_ascii`, the field set — changes every future hash
+  while previously stored records keep their old ones, so an approval bound to one stops verifying.
+  `research/hashing.py` makes the same warning about its own rule. If it must change, it changes as
+  a new version alongside this one, never as an edit. `test_the_record_carries_exactly_the
+  _contracted_fields` asserts the key set as **set equality**, so *adding* a field is as much a test
+  failure as removing one — a one-sided assertion would have been vacuous against exactly the change
+  that breaks stored records (M1-501's lesson).
+- **`PRAGMA foreign_keys` is still never read back.** `007`'s parent clause checks the parent row
+  itself, so it does not lean on the foreign key — but the transitive identifier guarantees `006`
+  describes still do. Unchanged from M1-607 and filed as `M1-609`.
+- **Calendar validity of `generated_at_utc`.** Written through `strftime` from an aware datetime, so
+  nothing this writer produces can be malformed; the shape pin is `003`'s GLOB and it pins shape,
+  not that the digits name a real instant. Unchanged from M1-603.
+
+### What the review should look at first
+
+The migration, because it is immutable after merge: the parent clause's three conditions, the
+`json_type(...) = 'object'` decision and the `question_type` vocabulary. Then the split between what
+`record_json` holds and what M1-604 joins — that boundary is D25, and getting it wrong means a
+stored version that has to be updated.
+
+### Mutation check
+
+Fourteen mutations, one per invocation, each applied to a pristine copy and reverted after
+(a harness killed by a command timeout silently leaves the mutation applied — M1-312's lesson).
+All fourteen were killed: `sort_keys`, `ensure_ascii`, the reader's round-trip comparison, the
+version increment, the parent link, the attribution gate, the reader's hash and column checks, the
+pinned `'draft'` status, the UUIDv7 counter, and four clauses of `007`
+(parent, version floor, JSON-object shape, `question_type` vocabulary).
+
+### Round 1 — five blocking findings, all reproduced, all fixed
+
+Reviewed commit `bc64df1`, which was HEAD; nothing was stale. Every finding was reproduced by
+execution before any fix code was written, and none was rebutted — all five were real, in scope,
+and introduced by this branch.
+
+**B1 — pydantic's `msg` echoes the value that `include_input=False` suppresses.** The project-wide
+rule is to rebuild a `ValidationError` with `errors(include_input=False, include_url=False)`. Those
+flags suppress the `input` field; they do **not** stop several of pydantic's `msg` strings from
+interpolating the offending value into the message text. The discriminated union is the reachable
+case: a stored `forecast.question_type` produced `Input tag 'WJLEAKMARKER-secret' found using
+'question_type' does not match ...`, which reached `ForecastRecordError` verbatim.
+
+Fixed by dropping `msg` **entirely** and rebuilding from `loc` and `type` only — a field path this
+module declared, and a slug from pydantic's fixed error catalogue. `msg` is dropped even for
+`value_error` entries raised by this project's own validators, whose texts happen to be value-free
+today: an allowlist keyed on error type would make every future validator's wording part of the
+leak surface, silently, and this rule has already been breached once by a message nobody wrote.
+
+**And it had a second half the first fix did not close.** Dropping `msg` left `loc` alone, and
+under `extra="forbid"` the location of an unexpected key *is* that key — so a stored `record_json`
+carrying a key named `WJLEAKMARKER-extra-key` still produced
+`(WJLEAKMARKER-extra-key: extra_forbidden)`. Found by probing the fix rather than by the property,
+which only ever planted its marker in *values*: **a leak channel a property does not feed is a leak
+channel it does not test.** The property now plants the marker as a key too.
+
+Closed by withholding any `loc` part the schema did not author, reusing
+`schema._schema_field_names` and `schema._WITHHELD` rather than writing the traversal twice — a
+private name from a sibling in the same subpackage, imported deliberately, because a rule written
+twice is exactly what finding B4 turned out to be. Mutated **both ways**: withholding nothing and
+withholding everything are both killed, so the rule is neither absent nor blanket. A refusal
+rendered as `<withheld>.<withheld>` is one nobody can act on, which is its own failure mode.
+
+**This generalizes past M1-602, and is filed as `M0-008` rather than fixed here.**
+`errors(include_input=False, include_url=False)` appears in five merged modules and the codebase
+has been reading it as "the offending value cannot escape". It is not sufficient, on both counts
+above. `forecast/schema.py` and `research/model.py` already guard the `loc` half; `config.py`,
+`research/allowlist.py` and `questions/normalize.py` render `err['msg']` and do not guard the
+first. **No merged module has a reachable leak today** — checked rather than assumed: the only
+discriminated-union adapter in `src/` is `CanonicalQuestionAdapter`, which is defined and never
+called from production code. So it is a latent hazard and a false rule, not a live defect, which is
+what makes it a row instead of a fix on this branch.
+
+**B2 — the lone-surrogate rationale was right about `record_json` and wrong about the columns.**
+The branch argued that a lone surrogate is safe because `record_json` holds `ensure_ascii` output
+and is therefore pure ASCII. True, and beside the point: the writer also copies a dozen scalars
+into their own bare TEXT columns, and sqlite3 encodes a TEXT parameter as UTF-8 at bind time, so
+`question_domain="\ud800"` raised a raw `UnicodeEncodeError` **quoting the character** — a raw
+exception out of a public boundary and a leak in the same line. The transaction rolled back and no
+row was written, so nothing was corrupted.
+
+Fixed with `_require_storable_in_a_text_column`, a second and narrower rule beside
+`_require_replayable`: the first refuses what does not survive the JSON round trip, this one
+refuses what cannot be *written*. Their domains genuinely differ, which is why they are two rules
+and not one.
+
+Worth recording precisely, because the reachable surface is one field: every other projected column
+is a pydantic **constrained** string, and a constrained string refuses a non-UTF-8-encodable value
+on its own — the same behaviour that keeps a surrogate *pair* out of `question.title`.
+`question_domain` is a bare `str | None`. So the probe is the fix for one field and defence in
+depth for eleven, and `test_the_other_column_backed_fields_were_never_reachable` asserts that split
+rather than a comment claiming it.
+
+**B3 — the strict reader was checking five columns out of eighteen.** A row whose `question_type`
+column read `numeric` while its `record_json` described a binary forecast was returned as binary —
+while `approval.read_forecast_summary`, which reads the column, reported numeric. Two public
+readers, incompatible attribution, one immutable record.
+
+Fixed by making the projection a single function, `store._projection`, used to write the row **and**
+to check it coming back. "The columns agree with the record" is only a real check if the two lists
+cannot drift, so there is one list. `test_the_reader_checks_every_column_the_writer_derives`
+compares it as set equality against `PRAGMA table_info(forecast_records)`, so a column added to the
+table and written without being compared fails.
+
+**B4 — a rule written twice held in one place.** `ForecastRecord` subclasses `ForecastRecordDraft`,
+and `store._require_draft` checked `type(...) is` while `record.assign_identity` checked
+`isinstance` — so an already-assigned record reached `ForecastRecord(**dump, record_id=...)` and
+raised `TypeError: got multiple values for keyword argument 'record_id'`. The branch had *made*
+this distinction and then not applied it at the second boundary. Fixed with one shared
+`require_unassigned_draft`, which both call.
+
+**B5 — the no-backfill-probe decision has a consequence the branch did not follow through.**
+`001`-`006` accepted `forecast_version = 2**63-1`, and `007` deliberately adds no probe, so an
+upgraded ledger can still hold such a row. Incrementing it produces `2**63`, which sqlite3 refuses
+at bind time with a raw `OverflowError`. Fixed by refusing a head already at `_SQLITE_INT_MAX`
+before incrementing.
+
+### Round 1 — a vacuity trap found in this branch's own fixture while fixing B3
+
+Adding thirteen parametrized cases for B3 turned up a defect in the test helper they used.
+`_insert_raw` wrote `attempt_id` as a fresh `raw-<uuid>` while the record it built said
+`attempt-1`, so **every row it produced already contradicted its own `record_json`** — and every
+test asserting "the reader refuses a row where column X disagrees" passed without column X
+mattering. Three tests written earlier on this branch were passing for that reason.
+
+Fixed by making `_insert_raw` coherent unless an override makes it otherwise, and by adding
+`test_a_coherent_raw_row_reads_back` as the control. The control earned its place immediately: it
+exposed that the `retrieval_run_id` case was still vacuous, because the "different" value being
+written was the same `RUN_ID` the record already held. A second `research_runs` row fixed it.
+
+This is the same lesson M1-303 and M1-308 both paid for, in a new shape: **a negative test needs a
+positive control, or it cannot tell "the check fired" from "the fixture was broken all along."**
+
+### Round 1 — the non-blocking observation, and what was done with it
+
+The reviewer noted that the UUIDv7 counter proves ordering only within one module instance:
+separate processes seed `rand_a` independently, so two ids minted in different processes inside one
+millisecond do not sort. Correct, and correctly filed as non-blocking — cross-process id ordering is
+not this item's acceptance criterion. Recorded here rather than fixed: closing it needs either a
+durable reservation or an ordering guarantee scoped in the docstring, and the honest version is the
+latter. `mint_record_id`'s docstring already scopes its claim to what the counter provides.
+
+### Round 2 — APPROVE, and the one observation that was worth acting on
+
+Reviewed commit `7117583`, which was HEAD. All five round-1 blockers closed, no blocking findings,
+no finding disputed in either round.
+
+The reviewer's non-blocking observation was a real flake in **this branch's own strategy**, and it
+is fixed rather than filed: `records()` substituted `rationale or "a rationale"`, but `NonBlankStr`
+refuses anything blank *after stripping*, and a whitespace-only draw is truthy — so a rare draw
+raised `ForecastSchemaError` while generating an example, turning a required gate red for a reason
+unrelated to the code under test. Reproduced by execution (`" "`, `"\t"`, `"\n\t"` all reach the
+schema and are refused).
+
+Substituted only for the blank family, never `.strip()`-ed: every draw the schema accepts is fed
+**as written**, because normalizing a property's input is how it stops testing what it was written
+for (M1-303). `test_the_record_strategy_never_raises_while_generating` asserts the substitution
+directly rather than leaving it to the odds of another property drawing one.
+
+The other two observations were correctly non-blocking and are left as they are: cross-process
+UUIDv7 ordering needs a durable reservation and is out of this row's scope (the docstring already
+scopes the claim to what the counter provides), and `M0-008` is the right home for the generalized
+pydantic-sanitizer rule.
+
+### Round 1 — final state
+
+20 mutations, one per invocation from a pristine copy, 20 killed — the original 14, one per
+blocking finding, and two for the `loc` rule in both directions, so each regression test is shown to
+fail against the pre-fix code. Suite: 2165 pass, 1 xfail. Four gates green.

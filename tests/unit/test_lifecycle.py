@@ -3493,8 +3493,9 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     finally:
         conn.close()
 
-    # 6, not 4: M1-306's 005_research_run_counters.sql landed alongside 004, and
-    # M1-607's 006_non_blank_identifiers.sql after them. What this line pins is
+    # 7, not 4: M1-306's 005_research_run_counters.sql landed alongside 004,
+    # M1-607's 006_non_blank_identifiers.sql after them, and M1-602's
+    # 007_forecast_version_chain.sql after that. What this line pins is
     # unchanged -- that LEDGER_SCHEMA_VERSION tracks the migrations actually on disk,
     # and that upgrading a v2 ledger runs all of them. The literal is kept rather than
     # dropped, since a constant compared only against itself pins nothing.
@@ -3502,7 +3503,7 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # The v2 rows this seeds are non-blank in every column 006 guards, so they pass its
     # upgrade precondition; `test_migration_006_refuses_a_ledger_holding_a_blank_
     # identifier` is the other side of that.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 6
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 7
 
     conn = connect(db)
     try:
@@ -4066,9 +4067,14 @@ def _seed_v5_ledger(
 def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # The control for the refusals below. Without it, a migration that refused *every*
     # v5 ledger -- a malformed probe, say -- would pass all of them.
+    #
+    # The name says 006 and the assertion says 7: this test is about 006's precondition,
+    # and `initialize_ledger` applies every unrecorded migration, so it now runs 007
+    # (M1-602) as well. 007 adds no upgrade probe of its own -- it redefines one trigger --
+    # so a clean v5 ledger reaching 7 is the same statement it was when it reached 6.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 6
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 7
 
 
 @pytest.mark.parametrize(
@@ -4173,7 +4179,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 6
+    assert initialize_ledger(db) == 7
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"

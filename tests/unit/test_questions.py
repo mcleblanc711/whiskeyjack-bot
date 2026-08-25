@@ -29,15 +29,16 @@ from forecasting_tools.data_models.questions import (
 from pydantic import ValidationError
 
 from whiskeyjack_bot.logging_setup import JsonFormatter
-from whiskeyjack_bot.questions import (
+from whiskeyjack_bot.questions.events import DeferralEvent, NormalizationResult
+from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestionAdapter,
-    DeferralEvent,
-    NormalizationError,
-    NormalizationResult,
     SourceCategory,
+)
+from whiskeyjack_bot.questions.normalize import (
+    NormalizationError,
     UnsupportedQuestionTypeError,
     normalize_question,
     normalize_questions,
