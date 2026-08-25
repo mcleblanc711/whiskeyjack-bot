@@ -126,7 +126,7 @@ from whiskeyjack_bot.submission_gateway import (
 # Bumping this changes the envelope a reader of `submission_attempts.
 # refetched_forecast_snapshot` must understand. It is not the artifact's version, which
 # `submission_gateway.ARTIFACT_SCHEMA_VERSION` owns.
-VERIFICATION_SCHEMA_VERSION = "1.0.0"
+VERIFICATION_SCHEMA_VERSION = "1.1.0"
 
 # The visible scheme tag on a derived live attempt id, written as a literal for
 # `submission._KEY_PREFIX`'s reason: a computed tag agrees with its version by
@@ -591,6 +591,15 @@ class ForecastHistory:
     """
 
     entries: tuple[ForecastEntry, ...]
+    option_labels: tuple[str, ...] | None = None
+    """The question's option order, for multiple choice. ``None`` if it could not be read.
+
+    It rides along with the history because it comes out of the *same*
+    ``api_json["question"]`` dict in the same defensive pass -- reading it costs no second
+    fetch and no second object. That is what makes the option-ordered comparison below
+    affordable; the original design sorted the values into a multiset to avoid depending on
+    a second readable thing, and there is no second thing.
+    """
 
     @property
     def latest(self) -> ForecastEntry | None:
@@ -659,7 +668,28 @@ def read_my_forecasts(question: object) -> ForecastHistory | None:
                 return None
             values.append(number)
         entries.append(ForecastEntry(start_time=start, values=tuple(values)))
-    return ForecastHistory(tuple(entries))
+    return ForecastHistory(tuple(entries), _read_option_labels(inner))
+
+
+def _read_option_labels(inner: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The question's option order out of the same dict, or ``None``. Never raises.
+
+    ``None`` means *not readable as an option list*, which for a multiple-choice
+    verification is refused rather than worked around -- see :func:`classify_refetch`.
+    Duplicate labels are ``None`` too: they make the label->value mapping ambiguous, which
+    is the one thing this list exists to make unambiguous.
+    """
+    raw = inner.get("options")
+    if not isinstance(raw, list) or not raw:
+        return None
+    labels: list[str] = []
+    for candidate in raw:
+        if type(candidate) is not str or not candidate.strip():
+            return None
+        labels.append(candidate)
+    if len(set(labels)) != len(labels):
+        return None
+    return tuple(labels)
 
 
 def _finite_number(value: object) -> float | None:
@@ -700,23 +730,41 @@ def expected_values(plan: PostPlan) -> tuple[float, ...]:
       comparing only the value that was sent avoids asserting anything about how the
       complement is computed.
     - **numeric** -- the CDF as sent, element for element.
-    - **multiple choice** -- the probabilities **sorted**, compared as a multiset. The
-      platform reports one value per option in the *question's* option order, and this
-      module never reads the option list: ``MultipleChoiceQuestion.options`` exists, but
-      making verification depend on it would add a second thing that must be readable for
-      a post to be confirmable. Two options carrying the same probability are
-      indistinguishable under a multiset comparison, which is a genuine weakening and is
-      the price of not needing the option order; a *different distribution* is still
-      caught.
+    - **multiple choice** -- one probability per category, in the order the *payload*
+      declared them. The platform reports one value per option in the *question's* option
+      order, so the two vectors are aligned by label in :func:`classify_refetch` before
+      they are compared, never by position and never by sorting.
+
+    **This sorted the probabilities into a multiset until M2-704 round-1 review, and that
+    was wrong.** The rationale on record was that a multiset only loses the ability to
+    tell apart two options carrying the *same* probability, while "a different distribution
+    is still caught". That is false, and the review reproduced it: ``{A: 0.1, B: 0.9}`` and
+    ``{A: 0.9, B: 0.1}`` sort to the same tuple, so a post whose categories landed
+    transposed was reported ``confirmed`` and the ledger could record ``submitted`` for a
+    forecast the operator did not make. Category identity is part of the forecast, so
+    verification has to preserve it.
     """
     if plan.question_type == "binary":
         return (plan.probability_yes,)
     if plan.question_type == "numeric":
         return plan.continuous_cdf
-    return tuple(sorted(probability for _, probability in plan.probability_yes_per_category))
+    return tuple(probability for _, probability in plan.probability_yes_per_category)
 
 
-def observed_values(question_type: str, entry: ForecastEntry) -> tuple[float, ...] | None:
+def expected_option_labels(plan: PostPlan) -> tuple[str, ...] | None:
+    """The category labels :func:`expected_values` just projected, or ``None`` if not MC."""
+    if plan.question_type != "multiple_choice":
+        return None
+    return tuple(label for label, _ in plan.probability_yes_per_category)
+
+
+def observed_values(
+    question_type: str,
+    entry: ForecastEntry,
+    *,
+    platform_labels: Sequence[str] | None = None,
+    expected_labels: Sequence[str] | None = None,
+) -> tuple[float, ...] | None:
     """The same projection, taken from what the platform reported. ``None`` if it cannot be.
 
     Keyed on the ``question_type`` string rather than on a plan, because
@@ -724,12 +772,28 @@ def observed_values(question_type: str, entry: ForecastEntry) -> tuple[float, ..
     the plan that produced it is gone. One definition, two callers -- the alternative was
     two implementations of "did the refetch show what we posted", which is exactly the kind
     of pair that agrees at review time and drifts afterwards.
+
+    For multiple choice the platform's values arrive in ``platform_labels`` order and are
+    re-projected into ``expected_labels`` order, so the comparison is by category and not
+    by position. ``None`` -- meaning *nothing was established* -- whenever that alignment
+    cannot be made exactly: either label list missing, the two label *sets* differing, or a
+    value count that does not match the option count. None of those may fall through to a
+    comparison, because every one of them would compare a category against a different one.
     """
     if question_type == "binary":
         return (entry.values[1],) if len(entry.values) == 2 else None
     if question_type == "numeric":
         return entry.values
-    return tuple(sorted(entry.values))
+    if platform_labels is None or expected_labels is None:
+        return None
+    platform = tuple(platform_labels)
+    wanted = tuple(expected_labels)
+    if len(platform) != len(entry.values) or len(wanted) != len(platform):
+        return None
+    if set(platform) != set(wanted) or len(set(platform)) != len(platform):
+        return None
+    by_label = dict(zip(platform, entry.values))
+    return tuple(by_label[label] for label in wanted)
 
 
 def values_match(expected: Sequence[float], observed: Sequence[float]) -> bool:
@@ -762,6 +826,7 @@ def classify_refetch(
     expected: Sequence[float],
     baseline_latest_start_time: float | None,
     observed: ForecastHistory | None,
+    expected_labels: Sequence[str] | None = None,
 ) -> RefetchResult:
     """Decide what a refetch established, given the baseline taken before the post.
 
@@ -783,8 +848,26 @@ def classify_refetch(
         return RefetchResult("absent", "refetch_missing", observed)
     if baseline_latest_start_time is not None and latest.start_time <= baseline_latest_start_time:
         return RefetchResult("absent", "refetch_missing", observed)
-    actual = observed_values(question_type, latest)
-    if actual is None or not values_match(expected, actual):
+    actual = observed_values(
+        question_type,
+        latest,
+        platform_labels=observed.option_labels,
+        expected_labels=expected_labels,
+    )
+    if actual is None:
+        if question_type == "multiple_choice":
+            # Nothing was established. For multiple choice `observed_values` answers `None`
+            # for every way the alignment can fail -- either label list missing, the two
+            # label sets differing, a value count that is not the option count -- and none
+            # of them may fall through to a comparison: by position is the transposition
+            # defect round 1 found, and sorted is the multiset defect it replaced.
+            # `unreadable` rather than `mismatched`, because a comparison that could not be
+            # made is not one that failed, and `mismatched` is what
+            # `verify_uncertain_attempt` refuses on with a message asserting the platform
+            # holds a *different* forecast.
+            return RefetchResult("unreadable", "malformed_response", observed)
+        return RefetchResult("mismatched", "refetch_mismatch", observed)
+    if not values_match(expected, actual):
         return RefetchResult("mismatched", "refetch_mismatch", observed)
     return RefetchResult("confirmed", None, observed)
 
@@ -796,6 +879,7 @@ def build_verification_snapshot(
     baseline_entry_count: int,
     baseline_latest_start_time: float | None,
     result: RefetchResult,
+    expected_labels: Sequence[str] | None = None,
 ) -> str:
     """Render what goes into ``submission_attempts.refetched_forecast_snapshot``.
 
@@ -824,6 +908,11 @@ def build_verification_snapshot(
         "question_type": question_type,
         "outcome": result.outcome,
         "expected_values": list(expected),
+        # The label order `expected_values` is projected in. Stored so a later
+        # verification can align a fresh observation to the same categories the attempt
+        # sent -- without it the replay would be back to comparing by position. `None` for
+        # every type but multiple choice, where position carries no category meaning.
+        "expected_labels": None if expected_labels is None else list(expected_labels),
         "baseline": {
             "entry_count": baseline_entry_count,
             "latest_start_time": baseline_latest_start_time,
@@ -1343,6 +1432,7 @@ class MetaculusSubmissionGateway:
                 None if baseline.latest is None else baseline.latest.start_time
             ),
             observed=history,
+            expected_labels=expected_option_labels(plan),
         )
 
     def _receipt_for(
@@ -1380,6 +1470,7 @@ class MetaculusSubmissionGateway:
                 None if baseline.latest is None else baseline.latest.start_time
             ),
             result=result,
+            expected_labels=expected_option_labels(plan),
         )
         error_type: str | None = None
         error_message: str | None = None
@@ -1724,6 +1815,7 @@ def verify_uncertain_attempt(
     snapshot = read_verification_snapshot(_stored_snapshot(conn, identifier, attempt))
     question_type = _snapshot_question_type(snapshot)
     expected = _snapshot_expected_values(snapshot)
+    expected_labels = _snapshot_expected_labels(snapshot, question_type)
     baseline_latest = _snapshot_baseline_start_time(snapshot)
 
     try:
@@ -1750,6 +1842,7 @@ def verify_uncertain_attempt(
         expected=expected,
         baseline_latest_start_time=baseline_latest,
         observed=history,
+        expected_labels=expected_labels,
     )
     if result.outcome == "unreadable":
         raise LiveSubmissionError(
@@ -1770,6 +1863,7 @@ def verify_uncertain_attempt(
         baseline_entry_count=_snapshot_baseline_entry_count(snapshot),
         baseline_latest_start_time=baseline_latest,
         result=result,
+        expected_labels=expected_labels,
     )
     verification = SubmissionVerification(
         submission_attempt_id=attempt,
@@ -1831,6 +1925,45 @@ def _snapshot_expected_values(snapshot: Mapping[str, object]) -> tuple[float, ..
             )
         numbers.append(number)
     return tuple(numbers)
+
+
+def _snapshot_expected_labels(
+    snapshot: Mapping[str, object], question_type: str
+) -> tuple[str, ...] | None:
+    """The category order the attempt's expected values were projected in.
+
+    Refuses rather than defaults for a multiple-choice attempt: without the labels the
+    replay cannot align a fresh observation to the categories that were posted, and the
+    only alternatives are to compare by position (the transposition defect) or to sort
+    (the multiset defect). Both were the round-1 finding. A snapshot that cannot support
+    the comparison is one a human resolves.
+    """
+    labels = snapshot.get("expected_labels")
+    if labels is None:
+        if question_type == "multiple_choice":
+            raise LiveSubmissionError(
+                "the stored verification snapshot records no category order, so a refetch "
+                "cannot be aligned to the categories this attempt sent"
+            )
+        return None
+    if not isinstance(labels, list) or not labels:
+        raise LiveSubmissionError(
+            "the stored verification snapshot's category order is not a non-empty list"
+        )
+    names: list[str] = []
+    for item in labels:
+        if type(item) is not str or not item.strip():
+            raise LiveSubmissionError(
+                "the stored verification snapshot's category order holds a value that is "
+                "not a non-blank label"
+            )
+        names.append(item)
+    if len(set(names)) != len(names):
+        raise LiveSubmissionError(
+            "the stored verification snapshot's category order repeats a label, so the "
+            "alignment it describes is ambiguous"
+        )
+    return tuple(names)
 
 
 def _snapshot_baseline_start_time(snapshot: Mapping[str, object]) -> float | None:

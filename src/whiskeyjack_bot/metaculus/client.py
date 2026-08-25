@@ -35,7 +35,8 @@ import inspect
 import os
 import threading
 import types
-from collections.abc import Iterator
+import weakref
+from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -149,6 +150,33 @@ def _assert_single_post_is_reachable() -> None:
 _assert_single_post_is_reachable()
 
 
+# The override window shadows an attribute on the *client*, so the mutual exclusion that
+# makes it safe has to be keyed on the client too. A per-adapter lock does not do it: two
+# `SingleAttemptPoster`s over one `MetaculusClient` each hold their own, so B's `finally`
+# can restore the class method while A is still inside its window -- and A's post then
+# resolves the decorated attribute and is retried four times. That is the exact blind
+# retry this class exists to prevent, and it was found by M2-704 round-1 cross-model
+# review (reproduced: one logical post, four POSTs).
+#
+# A `WeakKeyDictionary` so a client that goes out of scope takes its lock with it. It is
+# guarded by a plain module lock because `setdefault` on a `WeakKeyDictionary` is not
+# atomic under free-threading, and two adapters constructed concurrently over one client
+# must not each be handed a different lock -- which would reopen the very race this
+# closes.
+_CLIENT_LOCKS: MutableMapping[MetaculusClient, threading.RLock] = weakref.WeakKeyDictionary()
+_CLIENT_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_client(client: MetaculusClient) -> threading.RLock:
+    """The one lock guarding every override window on *client*, created on first use."""
+    with _CLIENT_LOCKS_GUARD:
+        existing = _CLIENT_LOCKS.get(client)
+        if existing is None:
+            existing = threading.RLock()
+            _CLIENT_LOCKS[client] = existing
+        return existing
+
+
 class SingleAttemptPoster:
     """A Metaculus client that posts **once** per call and refetches with the SDK's retry.
 
@@ -174,7 +202,7 @@ class SingleAttemptPoster:
         if not isinstance(client, MetaculusClient):
             raise PosterContractError("client must be a MetaculusClient")
         self._client = client
-        self._lock = threading.RLock()
+        self._lock = _lock_for_client(client)
 
     def post_binary_question_prediction(
         self, question_id: int, prediction_in_decimal: float
@@ -205,12 +233,22 @@ class SingleAttemptPoster:
         method on a third-party class, and naming it as an attribute would be a type error
         for what is deliberately a runtime shadow.
 
-        The ``finally`` removes the instance attribute rather than restoring a saved one,
-        so the class method is reached again by ordinary lookup. ``delattr`` is guarded
-        because a caller who reached in and removed it first must not turn a completed post
-        into an exception.
+        The lock is shared by every adapter over this client (:func:`_lock_for_client`),
+        not owned by this adapter: the attribute being shadowed belongs to the client, so
+        anything less lets one adapter's ``finally`` restore the class method while another
+        is still inside its window -- and that adapter's post is then retried four times.
+
+        The ``finally`` restores the attribute's **exact prior state** rather than
+        unconditionally deleting it: whatever was in the instance ``__dict__`` on the way in
+        is what is there on the way out, and if nothing was, nothing is. Deleting
+        unconditionally was correct only while no window could ever nest inside another, and
+        that is a property of the lock rather than of this function -- so the restore does
+        not depend on it. ``delattr`` stays guarded because a caller who reached in and
+        removed it first must not turn a completed post into an exception.
         """
         with self._lock:
+            sentinel = object()
+            previous: object = self._client.__dict__.get("_post_question_prediction", sentinel)
             setattr(
                 self._client,
                 "_post_question_prediction",
@@ -219,10 +257,13 @@ class SingleAttemptPoster:
             try:
                 yield
             finally:
-                try:
-                    delattr(self._client, "_post_question_prediction")
-                except AttributeError:  # pragma: no cover - only if a caller removed it
-                    pass
+                if previous is sentinel:
+                    try:
+                        delattr(self._client, "_post_question_prediction")
+                    except AttributeError:  # pragma: no cover - only if a caller removed it
+                        pass
+                else:
+                    setattr(self._client, "_post_question_prediction", previous)
 
 
 def build_poster(config: AppConfig) -> SingleAttemptPoster:

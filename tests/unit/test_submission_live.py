@@ -53,6 +53,7 @@ from whiskeyjack_bot.submission_live import (
     MetaculusSubmissionGateway,
     MultipleChoicePost,
     classify_refetch,
+    expected_option_labels,
     expected_values,
     live_attempt_id,
     plan_from_payload,
@@ -159,6 +160,9 @@ def _draft(attempt_id: str = "attempt-1", **overrides: Any) -> ForecastRecordDra
     return build_forecast_record_draft(**fields)
 
 
+OPTIONS = ["a", "b"]
+
+
 # ── the fake platform ────────────────────────────────────────────────────────
 
 
@@ -179,6 +183,7 @@ class FakeQuestion:
         post_id: int = POST_ID,
         state: str = "open",
         api_json: Any = None,
+        options: list[str] | None = OPTIONS,
     ) -> None:
         self.id_of_question = question_id
         self.id_of_post = post_id
@@ -186,7 +191,14 @@ class FakeQuestion:
         if api_json is not None:
             self.api_json: Any = api_json
         else:
-            self.api_json = {"question": {"my_forecasts": {"history": history or []}}}
+            inner: dict[str, Any] = {"my_forecasts": {"history": history or []}}
+            # The platform sends `options` alongside `my_forecasts` for a multiple-choice
+            # question, and a multiple-choice verification is refused without it (round-1
+            # finding 2). Present by default so every non-MC test is unaffected; pass
+            # `options=None` to drive the unreadable path.
+            if options is not None:
+                inner["options"] = options
+            self.api_json = {"question": inner}
 
 
 def _entry(start_time: float, values: list[float]) -> dict[str, Any]:
@@ -1110,9 +1122,16 @@ def test_a_backwards_clock_does_not_cost_the_row(
 
 
 def test_an_empty_history_and_an_unreadable_one_are_different_answers() -> None:
-    """Collapsing them makes a lost connection a permanent claim about a live forecast."""
-    assert read_my_forecasts(FakeQuestion(history=[])) == ForecastHistory(())
-    assert read_my_forecasts(FakeQuestion(api_json={"question": {}})) == ForecastHistory(())
+    """Collapsing them makes a lost connection a permanent claim about a live forecast.
+
+    Asserted on ``entries`` rather than on the whole value: an unreadable *option list* and
+    an unreadable *history* are themselves two different answers, and this test is about
+    the second. The first has its own case below.
+    """
+    empty = read_my_forecasts(FakeQuestion(history=[]))
+    assert empty is not None and empty.entries == ()
+    bare = read_my_forecasts(FakeQuestion(api_json={"question": {}}))
+    assert bare is not None and bare.entries == ()
     assert read_my_forecasts(FakeQuestion(api_json="not a dict")) is None
     assert read_my_forecasts(FakeQuestion(api_json={"question": {"my_forecasts": 1}})) is None
     assert (
@@ -1126,16 +1145,137 @@ def test_an_empty_history_and_an_unreadable_one_are_different_answers() -> None:
     assert read_my_forecasts(object()) is None
 
 
-def test_a_multiple_choice_comparison_does_not_need_the_option_order() -> None:
-    """Sorted multisets, because the option list is a second thing that must be readable."""
-    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
-    result = classify_refetch(
+def _mc_refetch(
+    plan: MultipleChoicePost,
+    *,
+    platform_labels: tuple[str, ...] | None,
+    values: tuple[float, ...],
+) -> str:
+    """Classify one multiple-choice refetch and return just the outcome."""
+    return classify_refetch(
         question_type="multiple_choice",
         expected=expected_values(plan),
         baseline_latest_start_time=BASELINE_START,
-        observed=ForecastHistory((ForecastEntry(NEW_START, (0.75, 0.25)),)),
-    )
-    assert result.outcome == "confirmed"
+        observed=ForecastHistory((ForecastEntry(NEW_START, values),), platform_labels),
+        expected_labels=expected_option_labels(plan),
+    ).outcome
+
+
+def test_a_transposed_multiple_choice_forecast_is_not_confirmed() -> None:
+    """Round-1 finding 2, reproduced then closed.
+
+    This comparison sorted both sides into a multiset, on the rationale that doing so only
+    lost the ability to tell apart two options carrying the *same* probability while "a
+    different distribution is still caught". **That was false.** ``{a: 0.25, b: 0.75}`` and
+    ``{a: 0.75, b: 0.25}`` sort to the same tuple, so a post whose categories landed
+    transposed was reported ``confirmed`` -- and the ledger would record ``submitted`` for a
+    forecast the operator never made. The values are now aligned by label.
+
+    The replaced test asserted the transposition *was* a confirmation, which is why the
+    defect survived a full property pass: the suite agreed with it.
+    """
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    assert _mc_refetch(plan, platform_labels=("a", "b"), values=(0.75, 0.25)) == "mismatched"
+
+
+def test_an_honest_multiple_choice_forecast_still_confirms() -> None:
+    """The other half of the iff: alignment must not make a true confirmation impossible."""
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    assert _mc_refetch(plan, platform_labels=("a", "b"), values=(0.25, 0.75)) == "confirmed"
+
+
+def test_the_payload_order_is_preserved_and_not_re_sorted() -> None:
+    """A payload that declares its categories in descending order must still confirm.
+
+    This is the case that kills "sort the expected vector again": every other plan here
+    happens to declare its probabilities in ascending order, so sorting is a no-op against
+    them and the mutation survives. It is the M1-501 vacuity shape -- a test that agrees
+    with both the rule and its removal -- and it was caught by mutation, not by reading.
+    """
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.75), ("b", 0.25)))
+    assert expected_values(plan) == (0.75, 0.25)
+    assert _mc_refetch(plan, platform_labels=("a", "b"), values=(0.75, 0.25)) == "confirmed"
+    assert _mc_refetch(plan, platform_labels=("a", "b"), values=(0.25, 0.75)) == "mismatched"
+
+
+def test_the_platform_may_list_the_options_in_its_own_order() -> None:
+    """Alignment is by label, so the platform's ordering is free to differ from the payload's.
+
+    This is what the comparison buys beyond correctness: sorting could not tell a reordered
+    option list from a transposed forecast, and by label the first confirms and the second
+    does not.
+    """
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    assert _mc_refetch(plan, platform_labels=("b", "a"), values=(0.75, 0.25)) == "confirmed"
+
+
+def test_a_multiple_choice_refetch_without_an_option_list_establishes_nothing() -> None:
+    """``unreadable``, never ``confirmed`` and never ``mismatched``.
+
+    Without the option order the values cannot be aligned to categories. Comparing them by
+    position would be the transposition defect and sorting them would be the multiset one,
+    so neither is available: nothing was established. ``unreadable`` rather than
+    ``mismatched`` because a comparison that could not be made is not one that failed --
+    and ``mismatched`` is what ``verify_uncertain_attempt`` refuses on, which would tell an
+    operator the platform holds a *different* forecast when it holds an unread one.
+    """
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    assert _mc_refetch(plan, platform_labels=None, values=(0.25, 0.75)) == "unreadable"
+
+
+def test_a_multiple_choice_refetch_whose_labels_disagree_establishes_nothing() -> None:
+    """A label set that is not the payload's cannot be aligned to it either."""
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    assert _mc_refetch(plan, platform_labels=("a", "c"), values=(0.25, 0.75)) == "unreadable"
+    assert _mc_refetch(plan, platform_labels=("a", "b", "c"), values=(0.25, 0.75)) == "unreadable"
+
+
+def test_a_genuinely_different_multiple_choice_distribution_is_still_caught() -> None:
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    assert _mc_refetch(plan, platform_labels=("a", "b"), values=(0.5, 0.5)) == "mismatched"
+
+
+def test_the_option_order_is_read_from_the_same_dict_as_the_history() -> None:
+    """The option list costs no second fetch, which is what makes alignment affordable.
+
+    The original rationale for sorting was that reading the option list "adds a second
+    thing that must be readable for a post to be confirmable". It does not: ``options`` and
+    ``my_forecasts`` are siblings in one ``api_json["question"]`` dict, already parsed in
+    one pass.
+    """
+
+    class Question:
+        api_json = {
+            "question": {
+                "options": ["a", "b"],
+                "my_forecasts": {
+                    "history": [{"start_time": NEW_START, "forecast_values": [0.25, 0.75]}]
+                },
+            }
+        }
+
+    history = read_my_forecasts(Question())
+    assert history is not None
+    assert history.option_labels == ("a", "b")
+
+
+def test_an_unreadable_option_list_is_labels_none_and_not_an_unreadable_history() -> None:
+    """A malformed option list must not discard the history: the two are separate answers."""
+
+    class Question:
+        api_json = {
+            "question": {
+                "options": ["a", "a"],  # duplicates make the label->value map ambiguous
+                "my_forecasts": {
+                    "history": [{"start_time": NEW_START, "forecast_values": [0.25, 0.75]}]
+                },
+            }
+        }
+
+    history = read_my_forecasts(Question())
+    assert history is not None
+    assert history.option_labels is None
+    assert len(history.entries) == 1
 
 
 def test_a_live_attempt_id_is_derived_and_distinguishable() -> None:

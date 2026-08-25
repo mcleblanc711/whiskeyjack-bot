@@ -1026,14 +1026,50 @@ sanitized record of a call. `LiveSubmissionOutcome` carries the pair instead, so
 shape has to know about the other and `post_approved_forecast` does not have to re-derive
 from a rendered snapshot what this module already knew.
 
-### Rejected — reading `MultipleChoiceQuestion.options` to compare in option order
+### Reversed in round 1 — reading the option list, after rejecting it
 
-The platform reports one value per option in the *question's* option order, so an exact
-ordered comparison needs the option list. Rejected: it adds a second thing that must be
-readable for a post to be confirmable, and a confirmable post is what the whole item turns
-on. The comparison is a sorted multiset instead. Two options carrying the same probability
-become indistinguishable, which is a genuine weakening and is stated rather than hidden; a
-*different distribution* is still caught.
+**The original decision was wrong and the rationale that defended it was false.** It is
+left here in full because the failure is instructive, and because the request that went to
+review carried the false claim as a deliberate choice.
+
+What was written: the platform reports one value per option in the question's option order,
+so an exact ordered comparison needs the option list; rejected because "it adds a second
+thing that must be readable for a post to be confirmable"; the comparison is a sorted
+multiset instead; "two options carrying the same probability become indistinguishable,
+which is a genuine weakening and is stated rather than hidden; a *different distribution*
+is still caught."
+
+Both halves are wrong.
+
+- **A different distribution is not still caught.** `{a: 0.25, b: 0.75}` and
+  `{a: 0.75, b: 0.25}` sort to the same tuple. A **permutation** of a distribution is a
+  different distribution, and the multiset cannot see it — so a post whose categories
+  landed transposed was reported `confirmed`, and the ledger would record `submitted` for
+  a forecast the operator never made. The weakening was not "ties are indistinguishable",
+  it was "category identity is not checked at all".
+- **There is no second thing that must be readable.** `options` and `my_forecasts` are
+  siblings in the same `api_json["question"]` dict, already parsed in a single defensive
+  pass. Reading the option list costs no second fetch and no second object. The premise
+  that made the trade-off look necessary did not hold.
+
+What ships instead: `expected_values` projects multiple-choice probabilities in the
+**payload's** declared order, `read_my_forecasts` carries the platform's option order on
+the `ForecastHistory` beside the entries, and `classify_refetch` aligns the two **by
+label** before comparing. A platform that lists options in its own order still confirms; a
+transposed forecast does not. Where the alignment cannot be made exactly — either label
+list missing, label sets differing, value count not the option count — the outcome is
+`unreadable`, never `confirmed` and never `mismatched`.
+
+**How it survived a full property pass:** `tests/unit/test_submission_live.py` contained
+`test_a_multiple_choice_comparison_does_not_need_the_option_order`, which asserted that a
+transposed history *was* a confirmation. The suite agreed with the defect, so no amount of
+running it could find it. That test is deleted; eight unit tests and two properties replace
+it, and the properties are **iff** rather than implications — a one-sided property holds
+for the honest post and for the transposed one alike, which is precisely why the original
+pass reported clean.
+
+Raised as blocking finding 2 of M2-704 round-1 cross-model review, reproduced by execution
+before any fix code was written.
 
 ### Rejected — a third copy of the atomic artifact writer
 
@@ -1099,6 +1135,74 @@ forecast version behind a fresh human approval.
 
 The alternative was to write `verified_by_refetch=True` for a refetch that never happened,
 which is a lie in the primary artifact. **M2-711** is filed for the missing state.
+
+### Round 1 — three blocking findings, all reproduced by execution first
+
+`GPT_REVIEW_RESPONSE_M2-704_r1.md`, reviewed commit `bc1bbc4`. The review named the exact
+request `HEAD`, so nothing here is a stale-review rebuttal; each finding was reproduced by
+running it before any fix was written, and each fix is pinned by a test that fails on the
+pre-fix code.
+
+**1 — a second poster over one client reopened the blind retry.** `SingleAttemptPoster`
+held a `threading.RLock()` **per adapter**, but the attribute it shadows belongs to the
+*client*. Two adapters over one `MetaculusClient` therefore held different locks, and the
+damaging order is A leaving while B is inside: A's exit restores the attribute to what A
+found, B's post then resolves the *class* attribute — the decorated one — and is retried.
+Reproduced with plain threading primitives and no patching of this project's code: **four
+POSTs for one logical post.**
+
+The docstring had claimed the lock prevented exactly this ("a shadow-and-restore window
+shared between two callers would restore the class method while the other was still inside
+it, and the cost of preventing that is one lock"). It did not, so the mitigation on record
+did not do what it said — which makes it a defect independent of how reachable it is.
+`build_poster()` does construct a fresh client per poster and the pipeline is
+single-threaded, so no *product* path shared a client; `SingleAttemptPoster.__init__` is a
+public boundary that accepts any client, which is where the review put it.
+
+Closed two ways, and the two are independent: the lock is now keyed on the client
+(`_lock_for_client`, a guarded `WeakKeyDictionary`), and the window restores the
+attribute's **exact prior state** instead of deleting unconditionally. Mutation-tested
+separately — reverting either one alone fails tests, and the first regression test written
+for this was **vacuous** (the restore closed the interleaving it drove, so it passed with
+the lock reverted) and was rewritten around the order only the lock can prevent.
+
+**2 — a transposed multiple-choice forecast was confirmed.** See the reversed decision
+above. This is the finding with the widest blast radius: it could put `submitted` in the
+ledger for a forecast the operator did not make, which is the one claim this whole item
+exists to make trustworthy.
+
+**3 — the SDK logged the full response body.** `raise_for_status_with_additional_info`
+builds its message out of the request URL and the complete response text, logs it at ERROR,
+and raises an `HTTPError` carrying the same string — which the retry wrapper logs again as
+`{e}`. Through this project's own handlers that put an unbounded copy of untrusted provider
+content into `logging.file`. Reproduced: a stubbed 400 whose body held a marker put that
+marker in the log file.
+
+The notes already said the SDK "logs it at ERROR level besides", which is exactly the shape
+of a known-and-unaddressed leak: naming it is not closing it. `SecretRedactionFilter`
+covers *configured credential values* and did redact the token in the URL, but a provider
+body is not a configured secret and nothing touched it.
+
+Closed with `ProviderResponseTextFilter`, a handler filter that **replaces** the message of
+any record from `forecasting_tools.util.misc`. Replaces rather than drops: that a call
+failed is a real diagnostic. The **whole module** is closed rather than the one message,
+for the reason `PayloadDebugFilter` gives — every logging call in it interpolates a
+response or an exception, and matching text is a check whose unknown case is "pass". The
+status, allowlisted headers and truncated body an operator needs are already on the
+submission attempt row via `http_details`, so nothing diagnostic is lost.
+
+**Non-blocking, and agreed:** the second clock read can raise after a completed post. The
+production CLI injects the trusted default clock, so the review scoped it out itself. Left
+as-is rather than filed — the clock is not provider input and the threat boundary says the
+operator is non-malicious.
+
+**One schema change.** The verification snapshot now carries `expected_labels`, so
+`verify_uncertain_attempt` can align a fresh observation to the categories the attempt
+sent instead of comparing by position. `VERIFICATION_SCHEMA_VERSION` goes `1.0.0` →
+`1.1.0`, and the reader still refuses any version it does not equal. No compatibility shim
+and no migration: the gateway has never been reachable, `submission.enabled` has never
+been `true` on any branch, and M2-706 is still `Blocked`, so **no stored snapshot exists
+anywhere** to be read back.
 
 ### On the mutation pass
 

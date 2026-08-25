@@ -59,6 +59,7 @@ from whiskeyjack_bot.submission_live import (
     build_verification_snapshot,
     classify_error,
     classify_refetch,
+    expected_option_labels,
     expected_values,
     live_attempt_id,
     observed_values,
@@ -382,6 +383,14 @@ def test_confirmation_requires_both_halves(
         observed=observed,
     )
     assert isinstance(result, RefetchResult)
+    if question_type == "multiple_choice":
+        # No option labels are supplied here, so nothing can be aligned to a category and
+        # a confirmation is not available at any draw. Asserted rather than left implicit:
+        # after the round-1 alignment fix these draws all take the `unreadable` branch, and
+        # an implication whose antecedent is never true is a property that passes against a
+        # rule that has been deleted (M1-501). The alignment itself has its own iff below.
+        assert result.outcome != "confirmed"
+        return
     if result.outcome != "confirmed":
         assert result.detail_code is not None
         return
@@ -392,6 +401,92 @@ def test_confirmation_requires_both_halves(
     assert baseline is None or latest.start_time > baseline
     actual = observed_values(question_type, latest)
     assert actual is not None and values_match(expected, actual)
+
+
+MC_LABELS = st.lists(
+    st.text(alphabet="abcdef", min_size=1, max_size=2), min_size=1, max_size=4, unique=True
+)
+MC_PROBABILITY = st.floats(0.0, 1.0, allow_nan=False, allow_infinity=False, width=32)
+
+
+@given(data=st.data())
+def test_multiple_choice_confirmation_is_by_category_never_by_position(
+    data: st.DataObject,
+) -> None:
+    """`confirmed` **iff** the platform's per-option values, aligned by label, match.
+
+    An iff, not an implication, and that is the whole point: the rule this replaces sorted
+    both sides into a multiset, which is an implication that holds for every honest post
+    and *also* for a transposed one. Round-1 finding 2 was exactly that gap, and a
+    one-sided property could not have found it.
+
+    The platform is free to list options in its own order -- that is drawn as a permutation
+    -- so a reordered option list must still confirm while a reordered *forecast* must not.
+    Sorting cannot tell those apart; alignment by label can, and that difference is what
+    this property pins.
+    """
+    labels = data.draw(MC_LABELS)
+    count = len(labels)
+    probabilities = data.draw(st.lists(MC_PROBABILITY, min_size=count, max_size=count))
+    plan = MultipleChoicePost(
+        probability_yes_per_category=tuple(zip(labels, probabilities, strict=True))
+    )
+    platform_order = tuple(data.draw(st.permutations(labels)))
+    by_label = dict(zip(labels, probabilities, strict=True))
+    honest = tuple(by_label[label] for label in platform_order)
+    reported = data.draw(
+        st.one_of(
+            st.just(honest),
+            st.lists(MC_PROBABILITY, min_size=count, max_size=count).map(tuple),
+        )
+    )
+
+    result = classify_refetch(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_latest_start_time=100.0,
+        observed=ForecastHistory((ForecastEntry(200.0, reported),), platform_order),
+        expected_labels=expected_option_labels(plan),
+    )
+
+    aligned = tuple(dict(zip(platform_order, reported, strict=True))[label] for label in labels)
+    assert (result.outcome == "confirmed") == values_match(expected_values(plan), aligned)
+
+
+@given(data=st.data())
+def test_a_multiple_choice_refetch_never_confirms_without_an_aligned_label_set(
+    data: st.DataObject,
+) -> None:
+    """No label list, or a label set that is not the payload's, establishes nothing.
+
+    Never `confirmed`, and never `mismatched` either: a comparison that could not be made
+    is not one that failed, and `mismatched` is what `verify_uncertain_attempt` refuses on
+    with a message asserting the platform holds a *different* forecast.
+    """
+    labels = data.draw(MC_LABELS)
+    count = len(labels)
+    probabilities = data.draw(st.lists(MC_PROBABILITY, min_size=count, max_size=count))
+    plan = MultipleChoicePost(
+        probability_yes_per_category=tuple(zip(labels, probabilities, strict=True))
+    )
+    platform_labels = data.draw(
+        st.one_of(
+            st.none(),
+            # a set that is not the payload's: a different arity, or a renamed member
+            st.lists(
+                st.text(alphabet="xyz", min_size=1, max_size=2), min_size=1, max_size=4, unique=True
+            ).map(tuple),
+        )
+    )
+    result = classify_refetch(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_latest_start_time=100.0,
+        observed=ForecastHistory((ForecastEntry(200.0, tuple(probabilities)),), platform_labels),
+        expected_labels=expected_option_labels(plan),
+    )
+    assert result.outcome == "unreadable"
+    assert result.detail_code == "malformed_response"
 
 
 @given(observed=st.none() | HISTORIES)

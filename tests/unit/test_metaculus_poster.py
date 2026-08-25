@@ -16,12 +16,21 @@ No network. ``requests.post`` and ``requests.get`` are stubbed per test and coun
 
 from __future__ import annotations
 
+import copy
 import inspect
+import json
+import logging
+import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
 import requests
+import yaml
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
+
+from whiskeyjack_bot.config import AppConfig, validate_config_data
+from whiskeyjack_bot.logging_setup import ProviderResponseTextFilter, configure_logging
 
 from whiskeyjack_bot.metaculus.client import (
     _EXPECTED_POST_PARAMETERS,
@@ -35,6 +44,8 @@ from whiskeyjack_bot.submission_live import (
     classify_error,
     http_details,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 FORECAST_URL_FRAGMENT = "/questions/forecast/"
 
@@ -331,3 +342,192 @@ def test_the_sdk_message_carries_the_response_body_and_is_never_what_we_store(
     with pytest.raises(requests.exceptions.HTTPError) as excinfo:
         SingleAttemptPoster(client).post_binary_question_prediction(123, 0.4)
     assert "SECRETBODY" in str(excinfo.value)
+
+
+# ── round 1, finding 1: two adapters over one client ──────────────────────────
+
+
+def test_two_posters_over_one_client_share_a_lock(client: MetaculusClient) -> None:
+    """The lock is keyed on the client, because the attribute it guards is the client's."""
+    assert SingleAttemptPoster(client)._lock is SingleAttemptPoster(client)._lock
+
+
+def test_a_second_poster_cannot_reopen_the_blind_retry(
+    client: MetaculusClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-1 finding 1, reproduced then closed.
+
+    Two ``SingleAttemptPoster``s over one ``MetaculusClient`` used to hold *different*
+    locks, so their override windows could interleave on the client attribute they both
+    shadow. The damaging order is **A leaving while B is still inside**: A's exit restores
+    the attribute to what A found (nothing), B's post then resolves the *class* attribute
+    -- the decorated one -- and is retried. **Four POSTs for one logical post**, which is
+    the blind retry this class exists to prevent.
+
+    That order is the one the exact-state restore cannot fix by itself, so this test is
+    specifically the lock's: it fails on a per-adapter lock even with the restore in place.
+    The interleaving is forced with ordinary threading primitives and no patching of this
+    project's code. With a per-client lock B cannot enter until A has left, so the sequence
+    never forms and B's post is a single request.
+    """
+    counter = _Counter(requests.exceptions.Timeout("boom"))
+    monkeypatch.setattr(requests, "post", counter)
+
+    poster_a = SingleAttemptPoster(client)
+    poster_b = SingleAttemptPoster(client)
+    b_inside = threading.Event()
+    a_left = threading.Event()
+    failures: list[BaseException] = []
+
+    def run_a() -> None:
+        try:
+            with poster_a._single_attempt():
+                # Wait for B to be inside its own window before leaving. Under the shared
+                # lock B cannot get there, so this times out -- and that is the point.
+                b_inside.wait(timeout=1.0)
+            a_left.set()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
+            failures.append(exc)
+
+    def run_b() -> None:
+        try:
+            with poster_b._single_attempt():
+                b_inside.set()
+                a_left.wait(timeout=2.0)
+                with pytest.raises(requests.exceptions.Timeout):
+                    client.post_binary_question_prediction(123, 0.4)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
+            failures.append(exc)
+
+    thread_a = threading.Thread(target=run_a)
+    thread_b = threading.Thread(target=run_b)
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=10.0)
+    thread_b.join(timeout=10.0)
+
+    assert not failures, failures
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert counter.calls == 1
+
+
+def test_the_window_restores_the_exact_prior_instance_state(client: MetaculusClient) -> None:
+    """Whatever was in the instance dict on the way in is what is there on the way out.
+
+    The window used to ``delattr`` unconditionally, which is right only while no window can
+    nest inside another. That is a property of the lock, not of this function, so the
+    restore no longer depends on it.
+    """
+    poster = SingleAttemptPoster(client)
+    assert "_post_question_prediction" not in client.__dict__
+    with poster._single_attempt():
+        assert "_post_question_prediction" in client.__dict__
+    assert "_post_question_prediction" not in client.__dict__
+
+    marker = object()
+    client.__dict__["_post_question_prediction"] = marker
+    try:
+        with poster._single_attempt():
+            assert client.__dict__["_post_question_prediction"] is not marker
+        assert client.__dict__["_post_question_prediction"] is marker
+    finally:
+        del client.__dict__["_post_question_prediction"]
+
+
+def test_nested_windows_on_one_poster_still_post_once(
+    client: MetaculusClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inner window's exit must not hand the outer one back the decorated method."""
+    counter = _Counter(requests.exceptions.Timeout("boom"))
+    monkeypatch.setattr(requests, "post", counter)
+    poster = SingleAttemptPoster(client)
+    with poster._single_attempt():
+        with poster._single_attempt():
+            pass
+        with pytest.raises(requests.exceptions.Timeout):
+            client.post_binary_question_prediction(123, 0.4)
+    assert counter.calls == 1
+
+
+# ── round 1, finding 3: the SDK logs the whole response body ──────────────────
+
+
+@pytest.fixture()
+def logging_config(tmp_path: Path) -> AppConfig:
+    data = copy.deepcopy(
+        yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    )
+    data["model"]["name"] = "openrouter/test-model"
+    data["logging"]["file"] = str(tmp_path / "logs" / "bot.jsonl")
+    return validate_config_data(data)
+
+
+def test_a_failed_post_writes_no_response_body_to_the_log(
+    client: MetaculusClient,
+    logging_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-1 finding 3, reproduced then closed.
+
+    ``raise_for_status_with_additional_info`` builds its message out of the request URL and
+    the **full response text**, logs it at ERROR, and raises an ``HTTPError`` carrying the
+    same string -- which the retry wrapper logs again as ``{e}``. Through this project's own
+    handlers that put an unbounded copy of untrusted provider content into ``logging.file``,
+    which the "an error message never echoes stored/file/field values" rule forbids.
+
+    Asserted against the log **file**, not a captured record: the file is the artifact that
+    persists, and it is what the finding was about.
+    """
+    configure_logging(logging_config)
+    body = b'{"detail": "PROVIDER_BODY_CONTENT"}'
+    monkeypatch.setattr(requests, "post", _Counter(_response(400, body)))
+    with pytest.raises(requests.exceptions.HTTPError):
+        SingleAttemptPoster(client).post_binary_question_prediction(123, 0.4)
+
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    written = logging_config.logging.file.read_text(encoding="utf-8")
+    assert "PROVIDER_BODY_CONTENT" not in written
+    assert "example.invalid" not in written
+    # The failure is still visible -- the record is replaced, not dropped. Losing it would
+    # trade a content leak for a blind operator.
+    assert any(
+        json.loads(line)["logger"].startswith("forecasting_tools.util.misc")
+        and json.loads(line)["level"] == "ERROR"
+        for line in written.splitlines()
+    )
+
+
+def test_the_provider_response_filter_closes_the_module_not_the_message(
+    logging_config: AppConfig,
+) -> None:
+    """Every logging call in that SDK module interpolates a response or an exception.
+
+    Matching the one known message would be a check whose unknown case is "pass" -- the
+    library rewords a line, or adds a third, and the leak reopens with nothing to notice
+    (``docs/LESSONS.md`` #7). So the filter closes the module, exactly as
+    ``PayloadDebugFilter`` closes the sub-INFO range of the payload loggers.
+    """
+    record = logging.LogRecord(
+        name="forecasting_tools.util.misc",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="Retrying due to error: %s",
+        args=("PROVIDER_BODY_CONTENT",),
+        exc_info=None,
+    )
+    assert ProviderResponseTextFilter().filter(record) is True
+    assert "PROVIDER_BODY_CONTENT" not in record.getMessage()
+
+    untouched = logging.LogRecord(
+        name="whiskeyjack_bot.submission_live",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="a whiskeyjack message survives",
+        args=None,
+        exc_info=None,
+    )
+    assert ProviderResponseTextFilter().filter(untouched) is True
+    assert untouched.getMessage() == "a whiskeyjack message survives"
