@@ -1204,6 +1204,58 @@ and no migration: the gateway has never been reachable, `submission.enabled` has
 been `true` on any branch, and M2-706 is still `Blocked`, so **no stored snapshot exists
 anywhere** to be read back.
 
+### Round 2 — all three prior blockers closed, one new finding from the fix itself
+
+`GPT_REVIEW_RESPONSE_M2-704_r2.md`, reviewed commit `c0ec61b`. Findings 1, 2 and 3 from
+round 1 were each verified CLOSED against the remediation delta. One new blocker, and it is
+the most interesting result of the whole item because **the round-1 fix caused it**.
+
+**Aligning by label made the observed order part of the evidence, and the schema only
+stored the expected one.** `expected_values` is rendered in the *payload's* label order;
+`observed.latest_values` is whatever the platform reported, in the *platform's* option
+order. Round 1 added `expected_labels` and stopped there. So a confirmed multiple-choice
+snapshot for an honestly reordered observation looked like this:
+
+```json
+{"expected_labels": ["a","b"], "expected_values": [0.25,0.75],
+ "observed": {"latest_values": [0.75,0.25]}, "outcome": "confirmed"}
+```
+
+An auditor holding only that row cannot tell an honest reordered observation from a
+transposed forecast, and a positional replay of a *genuine* confirmation says **mismatch**.
+Reproduced by execution before the fix.
+
+This is worth stating plainly: the old sorted comparison was wrong, but its snapshot was at
+least internally consistent, because both sides were sorted. Fixing the verdict broke the
+evidence. **The ledger is the product** — a row whose verdict cannot be recomputed from its
+own contents is exactly the failure this project exists to avoid, and it would have shipped
+behind a correct-looking `submitted`.
+
+Closed by storing `observed.labels` beside `observed.latest_values`. A confirmed
+multiple-choice snapshot now carries all four things the comparison needs — two label
+orders and two value vectors — so the verdict is recomputable from the row alone.
+`VERIFICATION_SCHEMA_VERSION` stays `1.1.0`: that version was introduced on this same
+unmerged branch and has never been written anywhere persistent, so amending its shape
+before merge is not a format change anyone can observe. Bumping again would mint a version
+that never existed.
+
+Pinned by `test_a_multiple_choice_snapshot_reproduces_its_own_verdict` (three orderings)
+and by `test_a_multiple_choice_snapshot_always_reproduces_its_own_verdict`, a property over
+arbitrary option orders and observations. **Both replay the comparison out of the rendered
+JSON by hand rather than calling `classify_refetch`** — the claim is about what the row
+carries, and calling this module's own comparison would assert nothing about it. Two
+mutations confirm they bite: dropping `observed.labels` kills all four, and the subtler one
+— storing the *expected* order in the observed slot — is caught only by the reordered case.
+
+**The non-blocking observation was also fixed**, because it was a false claim rather than a
+missing feature. The sanitized log message said the details "are recorded on the submission
+attempt row", which is true of a failed post and false of a read or any pre-attempt call
+through the same helper — a log line telling an operator to look at a row that does not
+exist. It is now conditional. The reviewer's other half of that note (the replacement also
+discards the SDK's retry count and function name) is accepted and **not** addressed: those
+are interpolated into the same records that carry the response text, and re-admitting a
+subset by parsing is the text-matching check the module-wide replacement exists to avoid.
+
 ### On the mutation pass
 
 Fourteen deliberate mutations were run against the unit suite before the first review, each

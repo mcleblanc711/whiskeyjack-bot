@@ -52,6 +52,7 @@ from whiskeyjack_bot.submission_live import (
     LiveSubmissionError,
     MetaculusSubmissionGateway,
     MultipleChoicePost,
+    build_verification_snapshot,
     classify_refetch,
     expected_option_labels,
     expected_values,
@@ -60,6 +61,7 @@ from whiskeyjack_bot.submission_live import (
     post_approved_forecast,
     read_my_forecasts,
     storable_text,
+    values_match,
     verify_uncertain_attempt,
 )
 
@@ -1276,6 +1278,67 @@ def test_an_unreadable_option_list_is_labels_none_and_not_an_unreadable_history(
     assert history is not None
     assert history.option_labels is None
     assert len(history.entries) == 1
+
+
+def _replay_from_snapshot_alone(rendered: str) -> bool:
+    """Recompute a multiple-choice confirmation using **only** the stored snapshot.
+
+    Deliberately re-implemented here out of the rendered JSON rather than calling
+    `classify_refetch`: the claim under test is that the row carries enough evidence for
+    someone who does not have this module, which is what "replayable" means. Calling the
+    module's own comparison would assert nothing about the row.
+    """
+    snapshot = json.loads(rendered)
+    observed = snapshot["observed"]
+    by_label = dict(zip(observed["labels"], observed["latest_values"], strict=True))
+    aligned = [by_label[label] for label in snapshot["expected_labels"]]
+    return values_match(snapshot["expected_values"], aligned)
+
+
+@pytest.mark.parametrize(
+    ("platform_order", "reported", "outcome"),
+    [
+        # The platform is free to list its options in its own order. This is the case the
+        # snapshot could not previously reproduce.
+        (("b", "a"), (0.75, 0.25), "confirmed"),
+        (("a", "b"), (0.25, 0.75), "confirmed"),
+        (("a", "b"), (0.75, 0.25), "mismatched"),
+    ],
+)
+def test_a_multiple_choice_snapshot_reproduces_its_own_verdict(
+    platform_order: tuple[str, ...], reported: tuple[float, ...], outcome: str
+) -> None:
+    """Round-2 finding, reproduced then closed.
+
+    Aligning by label made the **observed** label order part of the evidence, but the first
+    version of the schema persisted only the expected order. A confirmed snapshot therefore
+    held `expected_values` in the payload's order and `latest_values` in the platform's,
+    with nothing recording the second -- so an auditor holding the row could not tell an
+    honest reordered observation from a transposed forecast, and a positional replay of a
+    genuine confirmation said *mismatch*.
+
+    The ledger exists to be replayable; a row whose verdict cannot be recomputed from its
+    own evidence is the failure this project is built to avoid.
+    """
+    plan = MultipleChoicePost(probability_yes_per_category=(("a", 0.25), ("b", 0.75)))
+    result = classify_refetch(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_latest_start_time=BASELINE_START,
+        observed=ForecastHistory((ForecastEntry(NEW_START, reported),), platform_order),
+        expected_labels=expected_option_labels(plan),
+    )
+    assert result.outcome == outcome
+    rendered = build_verification_snapshot(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_entry_count=0,
+        baseline_latest_start_time=BASELINE_START,
+        result=result,
+        expected_labels=expected_option_labels(plan),
+    )
+    assert json.loads(rendered)["observed"]["labels"] == list(platform_order)
+    assert _replay_from_snapshot_alone(rendered) is (outcome == "confirmed")
 
 
 def test_a_live_attempt_id_is_derived_and_distinguishable() -> None:

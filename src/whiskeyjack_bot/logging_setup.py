@@ -54,10 +54,15 @@ _PAYLOAD_LOGGER_PREFIXES = ("forecasting_tools", "litellm", "LiteLLM")
 # here, only the uncontrolled copy.
 _PROVIDER_RESPONSE_LOGGER_PREFIXES = ("forecasting_tools.util.misc",)
 
+# Context-neutral on purpose. An earlier wording said the details "are recorded on the
+# submission attempt row", which is true of a failed post and **false** of a read or of any
+# pre-attempt call through the same helper -- a log line that tells an operator to go and
+# look at a row that does not exist. A replacement message is the one piece of text here
+# that is always emitted, so it may only claim what is always true.
 _SANITIZED_PROVIDER_MESSAGE = (
     "a forecasting-tools HTTP record was replaced: its text embeds the full response body "
-    "and request URL. The status, allowlisted headers and truncated body are recorded on "
-    "the submission attempt row."
+    "and request URL. Where the call was a submission attempt, its status, allowlisted "
+    "headers and truncated body are on that attempt's ledger row."
 )
 
 

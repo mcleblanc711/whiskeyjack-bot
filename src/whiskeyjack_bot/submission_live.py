@@ -889,6 +889,12 @@ def build_verification_snapshot(
     that were seen, and the verdict -- so :func:`verify_uncertain_attempt` reconstructs the
     comparison from the ledger alone, and an auditor can re-run it by hand.
 
+    **A confirmed multiple-choice snapshot is replayable from itself**: `expected_labels`
+    with `expected_values`, and `observed.labels` with `observed.latest_values`, are the
+    four things the comparison needs, so an auditor can recompute the verdict from the
+    stored row alone rather than taking it on trust. That is the property this whole
+    package exists for, and the alignment fix would have quietly cost it.
+
     The rendering is M1-305's rule verbatim, the same spelling every other canonical form
     in this package uses: ``json.dumps(..., ensure_ascii=True, sort_keys=True,
     separators=(",", ":"), allow_nan=False)``. Every value in it is a plain ``float``,
@@ -924,6 +930,19 @@ def build_verification_snapshot(
                 "entry_count": len(result.history.entries),
                 "latest_start_time": None if latest is None else latest.start_time,
                 "latest_values": None if latest is None else list(latest.values),
+                # The order `latest_values` is reported in, which for multiple choice is
+                # the *platform's* option order and need not be the payload's. Without it
+                # the snapshot records a verdict it cannot support: `expected_values` is in
+                # `expected_labels` order, `latest_values` is in this one, and an auditor
+                # holding only the row could not tell an honest reordered observation from
+                # a transposed forecast. Round-2 finding: alignment by label made the
+                # observed order part of the evidence, and the first version of the schema
+                # persisted only the expected order.
+                "labels": (
+                    None
+                    if result.history.option_labels is None
+                    else list(result.history.option_labels)
+                ),
             }
         ),
     }

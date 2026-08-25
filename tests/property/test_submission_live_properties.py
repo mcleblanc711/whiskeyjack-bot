@@ -454,6 +454,57 @@ def test_multiple_choice_confirmation_is_by_category_never_by_position(
 
 
 @given(data=st.data())
+def test_a_multiple_choice_snapshot_always_reproduces_its_own_verdict(
+    data: st.DataObject,
+) -> None:
+    """The stored row recomputes the verdict, for any option order and any observation.
+
+    Replayed out of the rendered JSON by hand rather than through `classify_refetch`: the
+    claim is about what the *row* carries, and calling this module's own comparison would
+    assert nothing about it. This is the ledger's whole purpose, and aligning by label
+    would have quietly cost it -- `expected_values` is in the payload's order while
+    `latest_values` is in the platform's, and until round 2 nothing recorded the second.
+    """
+    labels = data.draw(MC_LABELS)
+    count = len(labels)
+    probabilities = data.draw(st.lists(MC_PROBABILITY, min_size=count, max_size=count))
+    plan = MultipleChoicePost(
+        probability_yes_per_category=tuple(zip(labels, probabilities, strict=True))
+    )
+    platform_order = tuple(data.draw(st.permutations(labels)))
+    by_label = dict(zip(labels, probabilities, strict=True))
+    honest = tuple(by_label[label] for label in platform_order)
+    reported = data.draw(
+        st.one_of(
+            st.just(honest),
+            st.lists(MC_PROBABILITY, min_size=count, max_size=count).map(tuple),
+        )
+    )
+    result = classify_refetch(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_latest_start_time=100.0,
+        observed=ForecastHistory((ForecastEntry(200.0, reported),), platform_order),
+        expected_labels=expected_option_labels(plan),
+    )
+    snapshot = json.loads(
+        build_verification_snapshot(
+            question_type="multiple_choice",
+            expected=expected_values(plan),
+            baseline_entry_count=0,
+            baseline_latest_start_time=100.0,
+            result=result,
+            expected_labels=expected_option_labels(plan),
+        )
+    )
+    observed = snapshot["observed"]
+    replayed_map = dict(zip(observed["labels"], observed["latest_values"], strict=True))
+    aligned = [replayed_map[label] for label in snapshot["expected_labels"]]
+    replayed = values_match(snapshot["expected_values"], aligned)
+    assert replayed == (result.outcome == "confirmed")
+
+
+@given(data=st.data())
 def test_a_multiple_choice_refetch_never_confirms_without_an_aligned_label_set(
     data: st.DataObject,
 ) -> None:
