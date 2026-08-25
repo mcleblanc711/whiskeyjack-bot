@@ -12,6 +12,7 @@ the shape verified against https://api.exa.ai/openapi.json on 2026-07-27.
 import copy
 import json
 import logging
+import subprocess
 import sys
 import traceback
 import warnings
@@ -957,6 +958,22 @@ def test_a_string_suffix_coincidence_is_not_a_subdomain_match(config: AppConfig)
     assert all(d.source_type == "web" for d in result.documents)
 
 
+def test_a_registrable_domain_under_a_public_suffix_is_accepted(config: AppConfig) -> None:
+    """Positive control for M1-311: rejecting ``co.uk`` must not also reject ``bbc.co.uk``.
+
+    ``bbc.co.uk`` has something registrable (``bbc``) beyond the ``co.uk`` public-suffix
+    boundary, so it is a registrable domain like ``bls.gov``, not a bare suffix like
+    ``co.uk`` itself -- an implementation that refused anything merely *ending in* a known
+    suffix, rather than checking what's beyond the boundary, would fail this.
+    """
+    handler = _Exchange(_json_ok(_body(_result(url="https://bbc.co.uk/news"))))
+    result = _retrieve(handler, config, include_domains=("bbc.co.uk",))
+    assert handler.requests[0]["payload"]["includeDomains"] == ["bbc.co.uk"]
+    assert all(d.source_type == "official" for d in result.documents)
+    assert result.run.provider_config is not None
+    assert result.run.provider_config["include_domains"] == ["bbc.co.uk"]
+
+
 def test_official_reason_alone_does_not_make_a_document_official(config: AppConfig) -> None:
     """The allowlist earns the label; the reason does not."""
     handler = _Exchange(_json_ok(_body(_result())))
@@ -998,6 +1015,13 @@ def test_official_reason_alone_does_not_make_a_document_official(config: AppConf
         ("com.",),
         ("bls.gov..",),
         ("bls.gov", "com"),
+        # Multi-label public suffixes: two labels, so the old two-label heuristic
+        # accepted them, and every host beneath one was still labelled `official`
+        # (round 6 residual, closed by M1-311).
+        ("co.uk",),
+        ("com.au",),
+        ("org.uk",),
+        ("bls.gov", "co.uk"),
     ],
 )
 def test_malformed_domain_allowlist_is_refused_before_any_call(
@@ -1479,3 +1503,50 @@ def test_redaction_filter_covers_the_exa_key(monkeypatch: pytest.MonkeyPatch) ->
     record = logging.LogRecord("any", logging.INFO, __file__, 1, "key is %s", (FAKE_KEY,), None)
     SecretRedactionFilter(["EXA_API_KEY"]).filter(record)
     assert FAKE_KEY not in record.getMessage()
+
+
+# --- an unreadable bundled public-suffix file (M1-311, review round 1 finding) ---------
+
+# Must run in a fresh interpreter: _PUBLIC_SUFFIXES is built once at import time, so once
+# whiskeyjack_bot.research.exa is already in sys.modules (as it is by the time this test
+# module runs), patching `open` afterwards cannot reach that construction again.
+_UNREADABLE_PSL_PROBE = """
+import builtins
+
+_real_open = builtins.open
+
+def _patched_open(path, *args, **kwargs):
+    if str(path).endswith("public_suffix_list.dat"):
+        raise PermissionError("simulated ordinary unreadable PSL package data")
+    return _real_open(path, *args, **kwargs)
+
+builtins.open = _patched_open
+
+try:
+    import whiskeyjack_bot.research.exa
+except Exception as exc:
+    print("RAISED:" + type(exc).__name__)
+    print("MESSAGE:" + str(exc))
+else:
+    print("RAISED:none")
+    print("MESSAGE:")
+"""
+
+
+def test_an_unreadable_public_suffix_file_raises_the_module_error() -> None:
+    """A raw PermissionError escaping at import time is a review-round-1 finding, not a
+    hypothetical: reproduced by patching `open` for exactly the bundled PSL data file, which
+    simulates an ordinary local I/O failure (unreadable package data), not hostile input.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _UNREADABLE_PSL_PROBE],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = result.stdout.splitlines()
+    raised = next(line.removeprefix("RAISED:") for line in lines if line.startswith("RAISED:"))
+    message = next(line.removeprefix("MESSAGE:") for line in lines if line.startswith("MESSAGE:"))
+    assert raised == "ExaFallbackError", result.stdout
+    assert "PermissionError" not in message
+    assert "public_suffix_list.dat" not in message
