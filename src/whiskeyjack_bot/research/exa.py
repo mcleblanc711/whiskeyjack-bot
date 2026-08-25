@@ -165,11 +165,6 @@ _EXPECTED_REQUEST_URL: Final = httpx.URL(f"{_BASE_URL}{_SEARCH_PATH}")
 # why those forms are refused rather than forwarded unverifiable.
 _DISALLOWED_IN_DOMAIN: Final[frozenset[str]] = frozenset("/:@*?#%[]\\ \t\r\n\v\f")
 
-# Built once from the bundled offline snapshot (M1-311): no network fetch, so this
-# is safe to construct at import time under the socket-blocked test suite. See
-# _validated_domains for what it's used to refuse.
-_PUBLIC_SUFFIXES: Final = PublicSuffixList()
-
 # One constant for every allowlist refusal: the entry is caller content, and a
 # message that named which rule it broke would narrow it. The public-suffix
 # rule is named here rather than given its own message for exactly that reason.
@@ -220,10 +215,29 @@ class ExaFallbackError(Exception):
 
     Covers the caller-side mistakes that must never be papered over: an Exa call
     with no recorded reason, a reason outside the vocabulary, a malformed domain
-    allowlist, and a configuration whose fallback provider is not Exa. Same
-    hygiene rule as ``ConfigError``/``ResearchSchemaError``: the message is a
-    constant and never echoes the offending value.
+    allowlist, and a configuration whose fallback provider is not Exa. Also
+    covers an ordinary local I/O failure reading the bundled public-suffix data
+    this module needs at import time (M1-311) -- not a caller mistake, but the
+    same hygiene rule applies: a raw exception must not escape this module's
+    boundary. Same hygiene rule as ``ConfigError``/``ResearchSchemaError``: the
+    message is a constant and never echoes the offending value.
     """
+
+
+# Constant message for a failure loading the bundled public-suffix data below --
+# an ordinary local I/O failure (unreadable package data, a broken install), not
+# hostile input, but still one that must not escape this module's boundary raw
+# (CLAUDE.md error hygiene; cross-model review round 1).
+_BAD_PUBLIC_SUFFIX_DATA: Final = "failed to load the bundled public suffix list"
+
+try:
+    # Built once from the bundled offline snapshot (M1-311): no network fetch, so
+    # this is safe to construct at import time under the socket-blocked test
+    # suite. See _validated_domains for what it's used to refuse. Defined after
+    # ExaFallbackError so the ordinary-I/O-failure path below can raise it.
+    _PUBLIC_SUFFIXES: Final = PublicSuffixList()
+except OSError:
+    raise ExaFallbackError(_BAD_PUBLIC_SUFFIX_DATA) from None
 
 
 @dataclass(frozen=True)

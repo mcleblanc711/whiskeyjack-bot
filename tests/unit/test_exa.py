@@ -12,6 +12,7 @@ the shape verified against https://api.exa.ai/openapi.json on 2026-07-27.
 import copy
 import json
 import logging
+import subprocess
 import sys
 import traceback
 import warnings
@@ -1502,3 +1503,50 @@ def test_redaction_filter_covers_the_exa_key(monkeypatch: pytest.MonkeyPatch) ->
     record = logging.LogRecord("any", logging.INFO, __file__, 1, "key is %s", (FAKE_KEY,), None)
     SecretRedactionFilter(["EXA_API_KEY"]).filter(record)
     assert FAKE_KEY not in record.getMessage()
+
+
+# --- an unreadable bundled public-suffix file (M1-311, review round 1 finding) ---------
+
+# Must run in a fresh interpreter: _PUBLIC_SUFFIXES is built once at import time, so once
+# whiskeyjack_bot.research.exa is already in sys.modules (as it is by the time this test
+# module runs), patching `open` afterwards cannot reach that construction again.
+_UNREADABLE_PSL_PROBE = """
+import builtins
+
+_real_open = builtins.open
+
+def _patched_open(path, *args, **kwargs):
+    if str(path).endswith("public_suffix_list.dat"):
+        raise PermissionError("simulated ordinary unreadable PSL package data")
+    return _real_open(path, *args, **kwargs)
+
+builtins.open = _patched_open
+
+try:
+    import whiskeyjack_bot.research.exa
+except Exception as exc:
+    print("RAISED:" + type(exc).__name__)
+    print("MESSAGE:" + str(exc))
+else:
+    print("RAISED:none")
+    print("MESSAGE:")
+"""
+
+
+def test_an_unreadable_public_suffix_file_raises_the_module_error() -> None:
+    """A raw PermissionError escaping at import time is a review-round-1 finding, not a
+    hypothetical: reproduced by patching `open` for exactly the bundled PSL data file, which
+    simulates an ordinary local I/O failure (unreadable package data), not hostile input.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _UNREADABLE_PSL_PROBE],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = result.stdout.splitlines()
+    raised = next(line.removeprefix("RAISED:") for line in lines if line.startswith("RAISED:"))
+    message = next(line.removeprefix("MESSAGE:") for line in lines if line.startswith("MESSAGE:"))
+    assert raised == "ExaFallbackError", result.stdout
+    assert "PermissionError" not in message
+    assert "public_suffix_list.dat" not in message

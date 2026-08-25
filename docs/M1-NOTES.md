@@ -4303,3 +4303,39 @@ the pin is bumped. Low impact in practice: every suffix this item's tests assert
 `com.au`, `org.uk`, `gov.uk`) has been an ICANN-section entry for decades, and the risk is
 one-directional — a missed new suffix means a residual identical in shape to the one this item
 closes, not a new failure mode.
+
+### Round 1 — GPT cross-model review (PR #40) — CHANGES REQUESTED, one blocking finding, fixed
+
+Reviewed commit `5f553004d12ceab9c88f8f1a3133b031c3d480a4`. One blocking finding, reproduced by
+execution before any fix code was written: `_PUBLIC_SUFFIXES = PublicSuffixList()` ran as a bare
+module-level statement at import time, so an ordinary local I/O failure reading the bundled
+`public_suffix_list.dat` (a permission error, a broken install) escaped as a raw `PermissionError`
+rather than this module's own `ExaFallbackError` — in scope under the threat boundary (ordinary
+local I/O failures are reachable reliability conditions, and the reviewer's monkeypatch simulated
+exactly one: `open` raising `PermissionError` only for that filename).
+
+Fixed by moving the construction below `ExaFallbackError`'s definition and wrapping it in
+`try/except OSError: raise ExaFallbackError(_BAD_PUBLIC_SUFFIX_DATA) from None`, matching the
+`except OSError` sanitization pattern already used throughout the codebase (`prompt.py`,
+`config.py`, `research/allowlist.py`, `metaculus/snapshots.py`, `research/artifacts.py`). The
+message is a bare constant, not path-carrying: unlike the M1-401 carve-out's operator-supplied
+config paths, the PSL data file's location is an installed-package implementation detail with no
+operator action tied to it, so it stays out of the message like every other constant in this
+module. `ExaFallbackError`'s docstring is widened by one clause to say so, rather than left
+describing only caller-side mistakes while now also covering this.
+
+Regression test: `tests/unit/test_exa.py::test_an_unreadable_public_suffix_file_raises_the_module_error`,
+run in a fresh interpreter subprocess (the singleton is built once at import time, so patching
+`open` after `whiskeyjack_bot.research.exa` is already in `sys.modules` — as it is by the time any
+other test in the file has run — cannot reach the construction again). Confirmed **failing** against
+the pre-fix commit before the remediation (`RAISED:PermissionError`, not `ExaFallbackError`).
+
+**Process note, not a code finding:** this round's request was generated via
+`scripts/run-review.sh M1-311 --round 1` (no `--dry-run`), which calls `review-request.py` fresh and
+overwrites any hand-spliced `## Deliberate choices` / `## Risk areas` content back to its blank
+`TODO(author)` template — confirmed by the reviewer's own remark that the risk-areas section
+"contains only its template placeholder," and by re-checking the request file after the round ran.
+The blocking finding is unaffected (it does not depend on that section), but the round did not
+carry the context those sections exist to pre-empt. Round 2 is generated with `--dry-run`, spliced
+by hand, and sent with a direct `codex exec` call rather than through the wrapper, to avoid
+repeating this.
