@@ -407,6 +407,12 @@ _UNVERIFIABLE_FILTERS = (
 # around the rule.
 _SINGLE_LABELS = ("com", "gov", "org", "localhost", "рф", "com.", "gov.")
 
+# Two labels cleared round 5's bar while still naming no site -- the residual
+# round 5 stated rather than half-fixed, closed by M1-311. Hardcoded rather
+# than sourced from the production PublicSuffixList instance: asserting the
+# module's output against its own oracle cannot catch a mistake in that oracle.
+_MULTI_LABEL_PUBLIC_SUFFIXES = ("co.uk", "com.au", "org.uk", "gov.uk")
+
 # What a bare host cannot contain, stated here rather than imported from the
 # module under test: a post-condition asserted against the implementation's own
 # constant cannot catch a mistake *in* that constant.
@@ -621,6 +627,50 @@ def test_no_validated_entry_is_a_single_label(domains: list[str]) -> None:
 def test_a_single_label_entry_is_refused(entry: str) -> None:
     with pytest.raises(ExaFallbackError):
         _validated_domains((entry,))
+
+
+@given(
+    st.one_of(
+        st.lists(HOSTILE_TEXT, max_size=3),
+        st.lists(
+            st.sampled_from(_BASE_DOMAINS + _IDN_DOMAINS + _MULTI_LABEL_PUBLIC_SUFFIXES),
+            max_size=4,
+        ),
+    )
+)
+def test_no_validated_entry_is_a_bare_public_suffix(domains: list[str]) -> None:
+    """A multi-label public suffix made every host beneath it ``official`` too (M1-311).
+
+    Same shape as ``test_no_validated_entry_is_a_single_label``, extended to the
+    residual round 5 named rather than half-fixed: two labels cleared that
+    round's bar while the entry was still nothing but a suffix.
+    """
+    try:
+        validated = _validated_domains(domains)
+    except ExaFallbackError:
+        return
+    for domain in validated:
+        assert domain not in _MULTI_LABEL_PUBLIC_SUFFIXES
+        assert not domain.startswith(".") and not domain.endswith(".")
+
+
+@given(st.sampled_from(_MULTI_LABEL_PUBLIC_SUFFIXES))
+def test_a_multi_label_public_suffix_is_refused(entry: str) -> None:
+    with pytest.raises(ExaFallbackError):
+        _validated_domains((entry,))
+
+
+@given(st.sampled_from(_MULTI_LABEL_PUBLIC_SUFFIXES), _DOMAIN_LABEL)
+def test_a_registrable_domain_under_a_public_suffix_is_accepted(suffix: str, label: str) -> None:
+    """Positive control: rejecting the suffix must not also reject a domain under it.
+
+    Without this, a too-aggressive fix -- refusing any host merely *ending in* a
+    known suffix, rather than checking what's registrable beyond the boundary --
+    would pass every test above while breaking real allowlist entries like
+    ``bbc.co.uk``.
+    """
+    entry = f"{label}.{suffix}"
+    assert _validated_domains((entry,)) == [entry]
 
 
 # --- the reason container (PR #16 round-5 finding 6) ------------------------
