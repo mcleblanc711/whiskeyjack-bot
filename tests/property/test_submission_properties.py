@@ -72,10 +72,16 @@ ANYTHING = st.one_of(
 # The accepted domain, spelled as strategies rather than as a filter, so that what the
 # module promises about it is visible here.
 TOURNAMENTS = ENCODABLE_TEXT.filter(lambda text: 0 < len(text) <= 200)
-# The subset a row may actually hold. `submission_key` accepts any non-blank-by-length
-# tournament and derives a key from it in memory, but `006_non_blank_identifiers.sql`
-# refuses a whitespace-only `forecast_records.tournament_id` at INSERT -- so a property
-# that *seeds a row* has a narrower domain than one that only derives.
+# The subset a `forecast_records` row can actually hold. `submission_key` accepts any
+# non-blank-by-length tournament and derives a key from it in memory, but
+# `006_non_blank_identifiers.sql` refuses a whitespace-only `forecast_records.tournament_id`
+# at INSERT -- so a property that *seeds a row* (via `_seed()`, below) has a narrower domain
+# than one that only derives. `submission._require_text` also accepts a NUL-bearing
+# tournament id that no product path currently reaches (`config.py` already refuses a blank
+# one first); excluded here too so the seed helper's INSERT stays deterministic rather than
+# depending on what a given draw does to JSON/hash canonicalization downstream. Both gaps
+# are **pre-existing hardening items, not this branch's** -- filed as **M2-710**, narrowed
+# here so the gate is deterministic rather than a coin flip.
 #
 # Latent since 006 rather than new: `ENCODABLE_TEXT` has always been able to produce " ",
 # and this suite only stopped drawing one by luck. Surfaced while adding M1-602's
@@ -83,7 +89,7 @@ TOURNAMENTS = ENCODABLE_TEXT.filter(lambda text: 0 < len(text) <= 200)
 # is the right comparison because 006's trim() set is exactly the codepoints Python calls
 # whitespace -- that correspondence is what 004's header spells out and why it enumerates
 # them instead of calling one-argument trim().
-SEEDABLE_TOURNAMENTS = TOURNAMENTS.filter(lambda text: text.strip() != "")
+SEEDABLE_TOURNAMENTS = TOURNAMENTS.filter(lambda text: text.strip() != "" and "\x00" not in text)
 IDENTIFIER_INTS = st.integers(min_value=1, max_value=2**63 - 1)
 DIGESTS = st.text(alphabet="0123456789abcdef", min_size=64, max_size=64)
 

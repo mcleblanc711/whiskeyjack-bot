@@ -42,6 +42,7 @@ to the registry, and neither is a habit you can form by reflex.
 | --- | --- | --- | --- | --- | --- |
 | M1-309 | feat/m1-309-asknews-caller-preflight | whiskeyjack-m1-309 | no | none | 2026-08-21 |
 | M1-602 | feat/m1-602-persist-forecast-versions | whiskeyjack-m1-602 | no | 007 | 2026-08-21 |
+| M2-703 | feat/m2-703-dry-run-gateway | whiskeyjack-m2-703 | no | none | 2026-08-21 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
