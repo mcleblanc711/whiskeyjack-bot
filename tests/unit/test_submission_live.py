@@ -47,6 +47,10 @@ from whiskeyjack_bot.lifecycle import current_status, record_validation, transac
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
 from whiskeyjack_bot.submission_gateway import SubmissionRequest, read_live_artifact
 from whiskeyjack_bot.submission_live import (
+    _MAX_BODY,
+    _MAX_CATEGORIES,
+    _MAX_OPTION_LABEL,
+    BinaryPost,
     ForecastEntry,
     ForecastHistory,
     LiveSubmissionError,
@@ -1290,8 +1294,10 @@ def _replay_from_snapshot_alone(rendered: str) -> bool:
     """
     snapshot = json.loads(rendered)
     observed = snapshot["observed"]
-    by_label = dict(zip(observed["labels"], observed["latest_values"], strict=True))
-    aligned = [by_label[label] for label in snapshot["expected_labels"]]
+    expected_labels = snapshot["expected_labels"]
+    aligned: list[float] = [0.0] * len(expected_labels)
+    for position, index in enumerate(observed["label_order"]):
+        aligned[index] = observed["latest_values"][position]
     return values_match(snapshot["expected_values"], aligned)
 
 
@@ -1337,8 +1343,162 @@ def test_a_multiple_choice_snapshot_reproduces_its_own_verdict(
         result=result,
         expected_labels=expected_option_labels(plan),
     )
-    assert json.loads(rendered)["observed"]["labels"] == list(platform_order)
+    # The permutation, not the strings: `label_order[p]` is where platform position `p`
+    # sits in `expected_labels`.
+    expected_labels = list(expected_option_labels(plan) or ())
+    assert json.loads(rendered)["observed"]["label_order"] == [
+        expected_labels.index(label) for label in platform_order
+    ]
     assert _replay_from_snapshot_alone(rendered) is (outcome == "confirmed")
+
+
+def test_a_maximal_multiple_choice_snapshot_still_carries_its_evidence() -> None:
+    """The bound is measured here, not asserted in a comment.
+
+    `_MAX_OPTION_LABEL` exists so the worst accepted multiple-choice snapshot fits
+    `_MAX_BODY` **by construction**. This renders that worst case -- `_MAX_CATEGORIES`
+    labels at the full length, every character one that `ensure_ascii=True` escapes to six
+    bytes, values that render long, and the platform reporting them in reverse order -- and
+    asserts the envelope still holds its evidence. If someone raises either constant, this
+    test is what fails.
+    """
+    count = _MAX_CATEGORIES
+    labels = tuple(
+        # A non-ASCII character so each one renders as \uXXXX: the six-bytes-per-character
+        # worst case the bound was computed against, not the one-byte best case.
+        ("\u00e9" * (_MAX_OPTION_LABEL - 3)) + f"{index:03d}"
+        for index in range(count)
+    )
+    probabilities = tuple(1.0 / count for _ in range(count))
+    plan = MultipleChoicePost(
+        probability_yes_per_category=tuple(zip(labels, probabilities, strict=True))
+    )
+    assert all(len(label) == _MAX_OPTION_LABEL for label in labels)
+
+    platform_order = tuple(reversed(labels))
+    by_label = dict(zip(labels, probabilities, strict=True))
+    result = classify_refetch(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_latest_start_time=BASELINE_START,
+        observed=ForecastHistory(
+            (ForecastEntry(NEW_START, tuple(by_label[label] for label in platform_order)),),
+            platform_order,
+        ),
+        expected_labels=expected_option_labels(plan),
+    )
+    assert result.outcome == "confirmed"
+
+    rendered = build_verification_snapshot(
+        question_type="multiple_choice",
+        expected=expected_values(plan),
+        baseline_entry_count=1,
+        baseline_latest_start_time=BASELINE_START,
+        result=result,
+        expected_labels=expected_option_labels(plan),
+    )
+    assert len(rendered) <= _MAX_BODY
+    snapshot = json.loads(rendered)
+    assert "values_omitted" not in snapshot
+    assert snapshot["observed"]["label_order"] is not None
+    assert _replay_from_snapshot_alone(rendered) is True
+
+
+def test_a_payload_option_label_past_the_bound_is_refused_before_any_post() -> None:
+    """Refused pre-post, so the cost never lands after one, and the value is not echoed."""
+    payload = {
+        "question_type": "multiple_choice",
+        "probability_yes_per_category": {"a" * (_MAX_OPTION_LABEL + 1): 0.5, "b": 0.5},
+    }
+    with pytest.raises(LiveSubmissionError) as excinfo:
+        plan_from_payload(payload, expected_cdf_points=201)
+    assert "a" * 32 not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        [f"option-{index:05d}" for index in range(_MAX_CATEGORIES + 1)],
+        ["a" * (_MAX_OPTION_LABEL + 1), "b"],
+    ],
+)
+def test_an_oversized_platform_option_list_reads_as_no_labels(options: list[str]) -> None:
+    """Unbounded provider JSON must not become an unbounded row.
+
+    `None` here, not an exception and not a truncated list: for multiple choice it makes
+    the refetch `unreadable`, so the post lands uncertain rather than confirmed on evidence
+    the snapshot could not hold.
+    """
+    question = FakeQuestion(history=[_entry(NEW_START, [0.25, 0.75])], options=options)
+    history = read_my_forecasts(question)
+    assert history is not None
+    assert history.option_labels is None
+    assert len(history.entries) == 1
+
+
+def test_a_binary_snapshot_keeps_its_evidence_whatever_options_the_provider_sends() -> None:
+    """A binary question's option list is irrelevant to its values and is never stored.
+
+    Round-3 finding: the observed order was written into the row for every question type,
+    so 6,000 provider options on a *binary* question pushed a confirmed snapshot into the
+    evidence-free envelope. `label_order` is multiple-choice only.
+    """
+    plan = BinaryPost(probability_yes=0.6)
+    result = classify_refetch(
+        question_type="binary",
+        expected=expected_values(plan),
+        baseline_latest_start_time=BASELINE_START,
+        observed=ForecastHistory(
+            (ForecastEntry(NEW_START, (0.4, 0.6)),),
+            tuple(f"option-{index:05d}" for index in range(6000)),
+        ),
+        expected_labels=None,
+    )
+    assert result.outcome == "confirmed"
+    rendered = build_verification_snapshot(
+        question_type="binary",
+        expected=expected_values(plan),
+        baseline_entry_count=0,
+        baseline_latest_start_time=BASELINE_START,
+        result=result,
+        expected_labels=None,
+    )
+    snapshot = json.loads(rendered)
+    assert len(rendered) <= _MAX_BODY
+    assert "values_omitted" not in snapshot
+    assert snapshot["observed"]["label_order"] is None
+    assert snapshot["observed"]["latest_values"] == [0.4, 0.6]
+
+
+def test_a_non_multiple_choice_snapshot_never_records_a_label_order() -> None:
+    """Dispatch is on the `question_type` literal, at the public boundary.
+
+    Both in-tree callers derive `expected_labels` from the plan or the stored snapshot, and
+    both answer `None` for binary and numeric -- so this guard is unreachable from inside
+    the package, and a mutation removing it survived the rest of the suite. It is kept
+    because `build_verification_snapshot` is public and its two arguments are independent:
+    nothing in the signature stops a caller pairing a binary `question_type` with a label
+    list, and for binary the platform's option list has no relationship to `latest_values`.
+    Writing an order derived from it would be a fabricated alignment in the row.
+    """
+    for question_type, expected in (("binary", (0.6,)), ("numeric", (0.1, 0.9))):
+        rendered = build_verification_snapshot(
+            question_type=question_type,
+            expected=expected,
+            baseline_entry_count=0,
+            baseline_latest_start_time=BASELINE_START,
+            result=classify_refetch(
+                question_type=question_type,
+                expected=expected,
+                baseline_latest_start_time=BASELINE_START,
+                observed=ForecastHistory((ForecastEntry(NEW_START, (0.4, 0.6)),), ("a", "b")),
+                expected_labels=None,
+            ),
+            # A caller pairing labels with a non-multiple-choice type: accepted by the
+            # signature, and must not reach the row.
+            expected_labels=("a", "b"),
+        )
+        assert json.loads(rendered)["observed"]["label_order"] is None
 
 
 def test_a_live_attempt_id_is_derived_and_distinguishable() -> None:

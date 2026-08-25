@@ -1256,6 +1256,72 @@ discards the SDK's retry count and function name) is accepted and **not** addres
 are interpolated into the same records that carry the response text, and re-admitting a
 subset by parsing is the text-matching check the module-wide replacement exists to avoid.
 
+### Round 3 — the fix to the fix to the fix, and where that chain stopped
+
+`GPT_REVIEW_RESPONSE_M2-704_r3.md`, reviewed commit `67b5f29`. All four prior blockers
+verified CLOSED. One new blocker, and it is the third consecutive round in which **the
+previous round's remediation caused the next finding**. That pattern is the record worth
+keeping from this item.
+
+**The chain, stated plainly:**
+
+1. Verification sorted multiple-choice values into a multiset — a transposed forecast
+   confirmed. *(round 1)*
+2. Fixed by aligning on labels. That made the observed label order part of the evidence,
+   and the schema stored only the expected order — a confirmed row could not be replayed.
+   *(round 2)*
+3. Fixed by storing the observed labels too. That wrote the one **unbounded** thing in the
+   envelope a second time, and provider JSON supplies it — so a confirmed row could exceed
+   `_MAX_BODY` and degrade to an envelope naming no values at all. *(round 3)*
+
+Each fix was correct about the defect it named and each created the next one, because each
+moved cost into the snapshot without checking what the snapshot could hold.
+
+**The round-3 reproduction, both halves.** A **binary** question whose provider JSON carries
+6,000 options: the gateway posts once, returns `success=True, verified_by_refetch=True`, and
+stores `{"outcome":"confirmed","question_type":"binary","values_omitted":true,...}` — 108
+bytes, no baseline, no expected values, no observed values. The option list is irrelevant to
+a binary question's values and was being written anyway. And a **multiple-choice** payload
+with a 32,700-character label, which `plan_from_payload` accepted: the envelope was 32,986
+characters before the round-2 field and 65,704 after it.
+
+**Also worth recording: the round-3 request asserted this could not happen.** Risk area 3
+claimed "labels are bounded by `_MAX_CATEGORIES`". `_MAX_CATEGORIES` bounds the *count* of
+payload categories; nothing bounded label *length*, and `_read_option_labels` bounded
+neither count nor length for the platform's list. The reviewer falsified a claim the author
+wrote, which is what the risk-areas section is for.
+
+**Closed three ways**, and the third is the one that makes the property true rather than
+likely:
+
+- `label_order` replaces the duplicated label strings: the observed order is stored as
+  **indices into `expected_labels`**. A confirmation already requires the two label sets to
+  be equal, so the permutation is the whole of what the second list carried — and 64 small
+  integers cost what 64 labels cannot.
+- It is written for **multiple choice only**. A binary question's option list has no
+  relationship to its values, so an order derived from it would be a fabricated alignment.
+- `_MAX_OPTION_LABEL = 128` bounds label length at both ends. A payload past it is refused
+  **before any post**, visible and actionable; a platform option list past it makes the
+  refetch `unreadable`, so the post lands uncertain rather than confirmed-without-evidence.
+  `_read_option_labels` also bounds the option *count* by `_MAX_CATEGORIES`, which it never
+  did.
+
+The bound is not a guess dressed as a constant.
+`test_a_maximal_multiple_choice_snapshot_still_carries_its_evidence` renders the worst
+accepted case — 64 labels at full length, every character one that `ensure_ascii=True`
+escapes to six bytes, platform order reversed — and measures it: **49,997 bytes against a
+65,536 limit, 15,539 to spare, evidence intact.** Raising either constant fails that test.
+
+**Six mutations, all killed.** Two are worth noting. Writing `label_order` for every
+question type initially **survived**, because both in-tree callers derive `expected_labels`
+from the plan or the snapshot and both answer `None` for binary — making the type check
+unreachable from inside the package. It was kept rather than deleted (unlike round 2's
+redundant guard) because `build_verification_snapshot` is **public** and its two arguments
+are independent: nothing in the signature stops a caller pairing a binary `question_type`
+with a label list. A test that makes exactly that public call now kills the mutation. And
+raising `_MAX_OPTION_LABEL` to 512 is killed by the maximal-snapshot test, which is the
+point of measuring the envelope rather than asserting it.
+
 ### On the mutation pass
 
 Fourteen deliberate mutations were run against the unit suite before the first review, each

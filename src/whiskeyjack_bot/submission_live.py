@@ -165,6 +165,27 @@ _CATEGORY_SUM_TOLERANCE = 1e-6
 # categories) before the post. Metaculus multiple-choice questions carry a few dozen.
 _MAX_CATEGORIES = 64
 
+# The longest option label this module will accept, in characters. Two things rest on it,
+# and the second is why it is a *number* rather than a shrug: a verification snapshot must
+# stay inside `_MAX_BODY` while still carrying the evidence its verdict was reached from,
+# because the alternative is `build_verification_snapshot`'s reduced envelope -- which is
+# correct, degrades rather than raises, and names no values at all. A `confirmed` row with
+# no evidence is the exact ledger-integrity failure this package exists to prevent, and it
+# is reachable from provider JSON, so the bound has to make the worst case fit by
+# construction rather than by hoping labels are short.
+#
+# Worst case, with `ensure_ascii=True` rendering one character as six bytes:
+# `_MAX_CATEGORIES` labels at 6 bytes/char plus quoting (~49.2 KB), both value vectors
+# (~3.1 KB), the observed order as indices (~0.3 KB) and the envelope's own keys (~0.4 KB)
+# -- about 53 KB against a 64 KB limit. `tests/unit/test_submission_live.py` pins that
+# arithmetic by rendering a maximal snapshot rather than by restating it here.
+#
+# 128 is generous for a Metaculus option label ("Yes", "Democrat", "More than 5%"). A
+# payload that exceeds it is refused *before* any post, which is visible and actionable; a
+# platform option list that exceeds it makes the refetch `unreadable`, so the post lands
+# uncertain rather than falsely confirmed. Both directions are safe.
+_MAX_OPTION_LABEL = 128
+
 # Response headers worth keeping, lowercased. The handoff says "allowlisted only"; these
 # are the four that explain a failure without carrying content. `Authorization` is a
 # *request* header and is not reachable here, but the allowlist is what makes that a
@@ -557,6 +578,16 @@ def _require_categories(value: object, field: str) -> tuple[tuple[str, float], .
             raise LiveSubmissionError(
                 f"payload.{field} keys must be non-blank option labels (offending key withheld)"
             )
+        if len(label) > _MAX_OPTION_LABEL:
+            # Refused here, before the post, because the cost of accepting it lands after
+            # one: the label is evidence, it is stored twice over in the verification
+            # snapshot, and a snapshot that outgrows `_MAX_BODY` degrades to an envelope
+            # naming no values -- a `confirmed` row that cannot show what confirmed it.
+            raise LiveSubmissionError(
+                f"payload.{field} names an option label longer than {_MAX_OPTION_LABEL} "
+                "characters, which no Metaculus option carries and which a verification "
+                "snapshot could not record (offending key withheld)"
+            )
         pairs.append((label, _require_probability(probability, field)))
     total = math.fsum(probability for _, probability in pairs)
     if abs(total - 1.0) > _CATEGORY_SUM_TOLERANCE:
@@ -682,9 +713,17 @@ def _read_option_labels(inner: Mapping[str, object]) -> tuple[str, ...] | None:
     raw = inner.get("options")
     if not isinstance(raw, list) or not raw:
         return None
+    if len(raw) > _MAX_CATEGORIES:
+        return None
     labels: list[str] = []
     for candidate in raw:
         if type(candidate) is not str or not candidate.strip():
+            return None
+        if len(candidate) > _MAX_OPTION_LABEL:
+            # Same bound as the payload's, for the same reason and with a gentler failure:
+            # this makes the refetch `unreadable`, so the post lands uncertain instead of
+            # confirmed-without-evidence. Provider JSON is untrusted and unbounded; the
+            # snapshot is not.
             return None
         labels.append(candidate)
     if len(set(labels)) != len(labels):
@@ -935,13 +974,19 @@ def build_verification_snapshot(
                 # the snapshot records a verdict it cannot support: `expected_values` is in
                 # `expected_labels` order, `latest_values` is in this one, and an auditor
                 # holding only the row could not tell an honest reordered observation from
-                # a transposed forecast. Round-2 finding: alignment by label made the
-                # observed order part of the evidence, and the first version of the schema
-                # persisted only the expected order.
-                "labels": (
-                    None
-                    if result.history.option_labels is None
-                    else list(result.history.option_labels)
+                # a transposed forecast (round-2 finding).
+                #
+                # Stored as **indices into `expected_labels`** rather than as the labels
+                # themselves. Round 3: writing the strings a second time doubled the one
+                # unbounded thing in the envelope, and a snapshot that outgrows `_MAX_BODY`
+                # degrades to an envelope naming no values -- so a `confirmed` row could
+                # lose the evidence it was confirmed by. The permutation is the whole of
+                # what the second list added, because a confirmation already requires the
+                # two label *sets* to be equal, and 64 small integers cost what 64 labels
+                # cannot. `None` when the two sets are not equal, which is every case the
+                # verdict is not `confirmed` on anyway.
+                "label_order": _observed_label_order(
+                    question_type, expected_labels, result.history.option_labels
                 ),
             }
         ),
@@ -959,6 +1004,37 @@ def build_verification_snapshot(
     )
     # Names nothing and cannot fail: every value in the reduced envelope is a literal.
     return reduced if reduced is not None else "{}"
+
+
+def _observed_label_order(
+    question_type: str,
+    expected_labels: Sequence[str] | None,
+    platform_labels: Sequence[str] | None,
+) -> list[int] | None:
+    """Where each platform position sits in ``expected_labels``, or ``None``.
+
+    ``result[p] == j`` means the platform reported category ``expected_labels[j]`` at
+    position ``p``, so an auditor replays the comparison by walking ``latest_values``
+    alongside this list. Multiple choice only: for binary and numeric the platform's option
+    list carries no meaning for the values, and writing it into the row was how a binary
+    question's 6,000 irrelevant options could push a confirmed snapshot into the
+    evidence-free envelope.
+
+    ``None`` unless the two label lists are exactly a permutation of one another. Never
+    raises: it runs after a post.
+    """
+    if question_type != "multiple_choice":
+        return None
+    if expected_labels is None or platform_labels is None:
+        return None
+    expected = list(expected_labels)
+    platform = list(platform_labels)
+    if len(expected) != len(platform) or set(expected) != set(platform):
+        return None
+    if len(set(expected)) != len(expected):
+        return None
+    position = {label: index for index, label in enumerate(expected)}
+    return [position[label] for label in platform]
 
 
 def _render_snapshot(envelope: Mapping[str, object]) -> str | None:

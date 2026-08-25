@@ -498,8 +498,9 @@ def test_a_multiple_choice_snapshot_always_reproduces_its_own_verdict(
         )
     )
     observed = snapshot["observed"]
-    replayed_map = dict(zip(observed["labels"], observed["latest_values"], strict=True))
-    aligned = [replayed_map[label] for label in snapshot["expected_labels"]]
+    aligned = [0.0] * len(snapshot["expected_labels"])
+    for position, index in enumerate(observed["label_order"]):
+        aligned[index] = observed["latest_values"][position]
     replayed = values_match(snapshot["expected_values"], aligned)
     assert replayed == (result.outcome == "confirmed")
 
