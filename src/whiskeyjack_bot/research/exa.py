@@ -40,12 +40,13 @@ rather than by convention:
   request URL, and nothing stronger -- a caller-supplied transport or
   ``event_hooks`` can still send the bytes elsewhere, and this module does not
   attempt to close that boundary (see :func:`_require_exa_client`).
-- ``include_domains`` accepts only bare hostnames of at least two labels,
-  canonicalized through the same code that canonicalizes result URLs. Exa also
-  documents path and wildcard filters; this module refuses them rather than
-  forward a restriction it cannot then verify per result. A single label
-  (``com``) is refused because the subdomain rule below would then label every
-  host beneath it ``official``. See :func:`_validated_domains`.
+- ``include_domains`` accepts only bare hostnames with something registrable
+  beyond the public-suffix boundary, canonicalized through the same code that
+  canonicalizes result URLs. Exa also documents path and wildcard filters; this
+  module refuses them rather than forward a restriction it cannot then verify
+  per result. A bare public suffix -- single-label (``com``) or multi-label
+  (``co.uk``, M1-311) -- is refused because the subdomain rule below would then
+  label every host beneath it ``official``. See :func:`_validated_domains`.
 
 Transport: the Exa HTTP API directly, over ``httpx``.
 
@@ -94,9 +95,13 @@ uses a constant message.
 
 Failure is data, not an exception: provider failure is reported on the returned
 :class:`ExaRetrieval`. The exceptions this module *does* raise --
-:class:`ExaFallbackError` and ``MissingCredentialError`` -- are caller mistakes
-(an unattributed switch, a misconfigured provider, an absent credential) and all
-of them fire before any network use, and therefore before any billing.
+:class:`ExaFallbackError` and ``MissingCredentialError`` -- are mostly caller
+mistakes (an unattributed switch, a misconfigured provider, an absent
+credential), plus one operational case that is not: an ordinary local I/O
+failure loading the bundled public-suffix data this module needs at import
+time (M1-311, review round 1) also arrives as :class:`ExaFallbackError` rather
+than escaping raw. All of them fire before any network use, and therefore
+before any billing.
 """
 
 from __future__ import annotations
@@ -111,6 +116,7 @@ from typing import Any, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 import httpx
+from publicsuffixlist import PublicSuffixList
 
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
@@ -164,8 +170,8 @@ _EXPECTED_REQUEST_URL: Final = httpx.URL(f"{_BASE_URL}{_SEARCH_PATH}")
 _DISALLOWED_IN_DOMAIN: Final[frozenset[str]] = frozenset("/:@*?#%[]\\ \t\r\n\v\f")
 
 # One constant for every allowlist refusal: the entry is caller content, and a
-# message that named which rule it broke would narrow it. The two-label rule is
-# named here rather than given its own message for exactly that reason.
+# message that named which rule it broke would narrow it. The public-suffix
+# rule is named here rather than given its own message for exactly that reason.
 _BAD_DOMAIN: Final = (
     "include_domains entries must be bare hostnames of at least two labels -- no "
     "scheme, path, port, userinfo or wildcard, and no bare public suffix "
@@ -213,10 +219,29 @@ class ExaFallbackError(Exception):
 
     Covers the caller-side mistakes that must never be papered over: an Exa call
     with no recorded reason, a reason outside the vocabulary, a malformed domain
-    allowlist, and a configuration whose fallback provider is not Exa. Same
-    hygiene rule as ``ConfigError``/``ResearchSchemaError``: the message is a
-    constant and never echoes the offending value.
+    allowlist, and a configuration whose fallback provider is not Exa. Also
+    covers an ordinary local I/O failure reading the bundled public-suffix data
+    this module needs at import time (M1-311) -- not a caller mistake, but the
+    same hygiene rule applies: a raw exception must not escape this module's
+    boundary. Same hygiene rule as ``ConfigError``/``ResearchSchemaError``: the
+    message is a constant and never echoes the offending value.
     """
+
+
+# Constant message for a failure loading the bundled public-suffix data below --
+# an ordinary local I/O failure (unreadable package data, a broken install), not
+# hostile input, but still one that must not escape this module's boundary raw
+# (CLAUDE.md error hygiene; cross-model review round 1).
+_BAD_PUBLIC_SUFFIX_DATA: Final = "failed to load the bundled public suffix list"
+
+try:
+    # Built once from the bundled offline snapshot (M1-311): no network fetch, so
+    # this is safe to construct at import time under the socket-blocked test
+    # suite. See _validated_domains for what it's used to refuse. Defined after
+    # ExaFallbackError so the ordinary-I/O-failure path below can raise it.
+    _PUBLIC_SUFFIXES: Final = PublicSuffixList()
+except OSError:
+    raise ExaFallbackError(_BAD_PUBLIC_SUFFIX_DATA) from None
 
 
 @dataclass(frozen=True)
@@ -832,12 +857,15 @@ def _validated_domains(include_domains: Sequence[str]) -> list[str]:
     deferred this as allowlist policy beyond the finding; round 5 demonstrated it
     is not policy but a defect, and the deferral is reversed.
 
-    Known residual, stated rather than half-fixed: a *multi-label* public suffix
-    (``co.uk``, ``com.au``) still over-attributes everything beneath it. Closing
-    that needs a public-suffix list, i.e. a new dependency -- which serializes
-    against every other track through ``uv.lock`` (CLAUDE.md) and is a wave-level
-    decision, not a review fix. The two-label rule is the part that can be had
-    for nothing.
+    **Multi-label public suffixes are refused too** (M1-311). The single-label
+    rule above left ``include_domains=("co.uk",)`` accepted -- two labels, so it
+    passed -- and every host beneath ``co.uk`` was still labelled ``official``.
+    Round 5 named this residual rather than half-fixing it on a review branch,
+    because closing it needs a real public-suffix list (a new dependency, and
+    therefore a wave-level decision, not a review fix). ``_PUBLIC_SUFFIXES``
+    is that list: an entry is refused unless it has something registrable
+    *beyond* the public-suffix boundary, which subsumes the single-label rule
+    (a lone label is never more than a suffix) and closes the multi-label gap.
     """
     domains = _string_list(
         include_domains,
@@ -853,9 +881,13 @@ def _validated_domains(include_domains: Sequence[str]) -> list[str]:
             raise ExaFallbackError(_BAD_DOMAIN) from None
         if host is None:
             raise ExaFallbackError(_BAD_DOMAIN)
-        # Canonicalization has already removed the root dot (M1-310), so `gov.` is
-        # refused here for the same reason `gov` is, on the same one-label test.
-        if "." not in host:
+        # A host with nothing registrable beyond the public-suffix boundary would
+        # let _matches_official_domain's subdomain rule label every host beneath
+        # it `official` -- true of a bare single label ("com", "gov": M1-303
+        # round 5) and equally true of a multi-label public suffix ("co.uk",
+        # "com.au": M1-311). Canonicalization has already removed the root dot
+        # (M1-310), so `gov.` is refused here for the same reason `gov` is.
+        if _PUBLIC_SUFFIXES.privatesuffix(host) is None:
             raise ExaFallbackError(_BAD_DOMAIN)
         canonical.append(host)
     return canonical
