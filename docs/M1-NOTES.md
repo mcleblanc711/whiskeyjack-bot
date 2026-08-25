@@ -4613,3 +4613,35 @@ Three further mutations, one per invocation from a pristine copy, three killed:
 | set equality weakened to a subset check | `test_the_reader_refuses_an_unknown_envelope_field` |
 
 Suite: 2494 pass, 1 xfail. Four gates green.
+
+### Round 2 — approved, final state
+
+Reviewed `e334385`. **APPROVE.** Finding 1 closed; no blocking findings; all five risk areas safe.
+The reviewer verified each half of the fix independently — key equality enforced after schema-version
+validation, deleted nullables refused while an explicit `null` is still accepted, noncanonical UTC
+renderings refused, and no stored value in any diagnostic — and ran the targeted artifact unit and
+property suites itself (78 tests).
+
+Two judgment calls in the remediation were put to the round explicitly and both held:
+
+- **the timestamp fix is stricter than the finding required.** The review demonstrated `+02:00`; an
+  offset-only check would close that and still admit `Z` and a `.000000` this writer omits. The
+  exact-round-trip form is the ambiguity rule applied, and risk area 1 came back safe on the
+  ground that the writer normalizes through the same representation the reader demands.
+- **the analogous `.get()` shape in `research/artifacts.py` was not fixed here.** Round 2:
+  "remains correctly assigned to M1-314 and does not block this branch." Pre-existing, in a module
+  this branch does not modify, and not the same defect — that reader is not on a replay path, so a
+  field it waves through costs an audit trail rather than a false hash match.
+
+**Two rounds.** The one finding was in risk area 3 — the area named in the round-1 request as most
+likely to be wrong — which is what that section is for: it did not prevent the finding, it aimed the
+round at it. The other five areas were answered and closed without a round of their own.
+
+The transferable lesson is not the missing check but why 200 property draws never reached it.
+`test_the_reader_refuses_any_value_the_writer_could_not_emit` replaces a value under an *existing*
+key, so it cannot construct an envelope whose key set differs from the writer's. **A shape property
+and a value property are different properties, and the value one cannot subsume the key set.** The
+same blind spot had a second half in the hand-kept missing-field list, which omitted exactly the two
+nullable fields; both are now derived from `_ENVELOPE_FIELDS`.
+
+Final: 2494 pass, 1 xfail. Four gates green. Both CI checks green on `e334385`.
