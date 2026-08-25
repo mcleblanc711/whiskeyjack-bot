@@ -31,6 +31,7 @@ from strategies import HOSTILE_TEXT
 
 from whiskeyjack_bot.artifacts import ArtifactError
 from whiskeyjack_bot.forecast.artifacts import (
+    _ENVELOPE_FIELDS,
     MODEL_OUTPUT_SCHEMA_VERSION,
     artifact_relative_path,
     read_raw_model_output,
@@ -400,6 +401,54 @@ def test_the_reader_refuses_any_value_the_writer_could_not_emit(
         assert _canonical(
             {name: getattr(stored.settings, name) for name in _SETTINGS_FIELDS}
         ) == _canonical(value)
+
+
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(
+    dropped=st.frozensets(st.sampled_from(sorted(_ENVELOPE_FIELDS)), max_size=3),
+    added=st.frozensets(
+        st.text(min_size=1, max_size=12).filter(lambda k: k not in _ENVELOPE_FIELDS),
+        max_size=2,
+    ),
+)
+def test_the_reader_refuses_any_envelope_whose_key_set_the_writer_could_not_emit(
+    tmp_path_factory: pytest.TempPathFactory,
+    dropped: frozenset[str],
+    added: frozenset[str],
+) -> None:
+    """The *shape* half of "admits exactly what the writer emits" (round 1 finding 1).
+
+    ``test_the_reader_refuses_any_value_the_writer_could_not_emit`` replaces a value under
+    an existing key, so it can never produce an envelope whose key set differs from the
+    writer's -- and the key set was exactly where the reader was lax. Deleting a nullable
+    field read back as ``None`` (the value the writer emits for "cost was not reported"),
+    and an unknown key was ignored outright.
+
+    Either edit yields a shape this writer cannot render, so the only correct outcome is a
+    refusal; an unedited draw is the positive control and must still read back.
+    """
+    root = tmp_path_factory.mktemp("artifacts")
+    relative = write_raw_model_output(
+        root,
+        attempt_id="attempt-1",
+        question_id=1,
+        generation=_generation(),
+        written_at_utc=WHEN,
+        retain=True,
+    )
+    assert relative is not None
+    envelope = json.loads((root / relative).read_text(encoding="utf-8"))
+    for key in dropped:
+        del envelope[key]
+    for key in added:
+        envelope[key] = "x"
+    (root / relative).write_text(_canonical(envelope), encoding="utf-8")
+
+    if not dropped and not added:
+        assert read_raw_model_output(root, relative).attempt_id == "attempt-1"
+        return
+    with pytest.raises(ArtifactError):
+        read_raw_model_output(root, relative)
 
 
 # --------------------------------------------------------------------------------------

@@ -28,6 +28,7 @@ import pytest
 from whiskeyjack_bot.artifacts import ArtifactError
 from whiskeyjack_bot.forecast.artifacts import (
     MODEL_OUTPUT_SCHEMA_VERSION,
+    _ENVELOPE_FIELDS,
     artifact_relative_path,
     read_raw_model_output,
     write_raw_model_output,
@@ -298,21 +299,7 @@ def test_a_naive_timestamp_is_refused(artifacts: Path) -> None:
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "artifact_schema_version",
-        "attempt_id",
-        "question_id",
-        "model_settings",
-        "request",
-        "raw_responses",
-        "invocations",
-        "repair_attempted",
-        "failure_problems",
-        "written_at_utc",
-    ],
-)
+@pytest.mark.parametrize("field", sorted(_ENVELOPE_FIELDS))
 def test_the_reader_refuses_an_envelope_missing_any_required_field(
     artifacts: Path, field: str
 ) -> None:
@@ -320,8 +307,14 @@ def test_the_reader_refuses_an_envelope_missing_any_required_field(
 
     The first cut of the retrieval reader checked the version and the bodies and returned,
     which made an artifact carrying neither run id, question, provider nor timestamp a
-    valid one. Every field here is required, and the test is parametrized off the field
-    list rather than sampling it so that adding a field without validating it fails.
+    valid one. Every field here is required, and the test is parametrized off
+    ``_ENVELOPE_FIELDS`` itself rather than a hand-kept list so that adding a field without
+    validating it fails.
+
+    Round 1 finding 1: the hand-kept list omitted ``cost_usd`` and ``failure_code``, the two
+    nullable fields, and those were exactly the two the ``.get()``-based reader waved
+    through -- a deleted ``cost_usd`` read back as ``None``, which is the envelope's way of
+    saying "recorded, and the cost was unknown".
     """
     relative = _write(artifacts)
     assert relative is not None
@@ -359,6 +352,90 @@ def test_the_reader_refuses_extra_settings_fields(artifacts: Path) -> None:
     _rewrite(artifacts, relative, envelope)
     with pytest.raises(ArtifactError):
         read_raw_model_output(artifacts, relative)
+
+
+def test_the_writer_emits_exactly_the_envelope_fields(artifacts: Path) -> None:
+    """Pin ``_ENVELOPE_FIELDS`` against what the writer actually renders.
+
+    The reader now refuses any envelope whose key set differs from this constant, so the
+    constant drifting from the writer would turn every freshly written artifact into an
+    unreadable one. A constant compared only against itself pins nothing (M1-406's own
+    lesson about the schema-version literals): this compares it against the rendered bytes.
+    """
+    relative = _write(artifacts)
+    assert relative is not None
+    assert set(_envelope(artifacts, relative)) == _ENVELOPE_FIELDS
+
+
+def test_the_reader_refuses_an_unknown_envelope_field(artifacts: Path) -> None:
+    """Set equality at the top level, matching what ``model_settings`` already enforced.
+
+    Round 1 finding 1. The nested settings dict was checked with set equality and the
+    envelope containing it was not, so a key the writer cannot emit rode through the outer
+    layer and was ignored -- hiding the version skew the schema version exists to surface.
+    """
+    relative = _write(artifacts)
+    assert relative is not None
+    envelope = _envelope(artifacts, relative)
+    envelope["reasoning_trace"] = "smuggled"
+    _rewrite(artifacts, relative, envelope)
+    with pytest.raises(ArtifactError):
+        read_raw_model_output(artifacts, relative)
+
+
+@pytest.mark.parametrize("field", ["cost_usd", "failure_code"])
+def test_a_missing_nullable_field_is_not_read_as_an_explicit_null(
+    artifacts: Path, field: str
+) -> None:
+    """The audit-meaning half of round 1 finding 1.
+
+    ``cost_usd: null`` is a real thing the writer emits: the call happened and its cost was
+    not reported. A *deleted* ``cost_usd`` is a truncated or version-skewed artifact. Under
+    ``.get()`` the two were the same value, so a replay could report a clean hash match
+    while inventing the audit claim "cost unknown" for an artifact that never recorded one.
+
+    Both halves are asserted here: the deletion is refused, and the explicit null still
+    reads back -- otherwise this would pass by refusing everything.
+    """
+    relative = _write(artifacts, cost_usd=None, failure_code=None)
+    assert relative is not None
+
+    explicit = _envelope(artifacts, relative)
+    assert explicit[field] is None
+    _rewrite(artifacts, relative, explicit)
+    assert getattr(read_raw_model_output(artifacts, relative), field, None) is None
+
+    truncated = _envelope(artifacts, relative)
+    del truncated[field]
+    _rewrite(artifacts, relative, truncated)
+    with pytest.raises(ArtifactError):
+        read_raw_model_output(artifacts, relative)
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "2026-08-24T14:00:00+02:00",  # the same instant, a rendering the writer never emits
+        "2026-08-24T12:00:00Z",  # `Z` rather than `+00:00`
+        "2026-08-24T12:00:00.000000+00:00",  # a fraction the writer would have omitted
+    ],
+)
+def test_the_reader_refuses_a_noncanonical_utc_rendering(artifacts: Path, stored: str) -> None:
+    """Round 1 finding 1: checking the offset alone accepts the first of these.
+
+    The writer emits ``written_at_utc.astimezone(timezone.utc).isoformat()`` and nothing
+    else. Every case here parses to a timezone-aware datetime -- the old check -- and the
+    first two denote the very instant the writer stored, which is what makes accepting them
+    a format-skew hole rather than a wrong-value one.
+    """
+    relative = _write(artifacts)
+    assert relative is not None
+    envelope = _envelope(artifacts, relative)
+    envelope["written_at_utc"] = stored
+    _rewrite(artifacts, relative, envelope)
+    with pytest.raises(ArtifactError) as caught:
+        read_raw_model_output(artifacts, relative)
+    assert stored not in str(caught.value)
 
 
 def test_the_reader_refuses_another_schema_version(artifacts: Path) -> None:

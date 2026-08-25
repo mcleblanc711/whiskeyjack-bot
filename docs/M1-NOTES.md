@@ -4559,3 +4559,57 @@ Six mutations, one per invocation from a pristine copy, six killed:
 
 Clauses were neutered to `WHERE 0` rather than deleted: an empty trigger body (`BEGIN END;`) is a
 syntax error (M1-607).
+
+### Round 1 — one blocking finding, remediated
+
+Reviewed `5329743`. **CHANGES REQUESTED**, one blocking finding; risk areas 1, 2, 4, 5 and 6 all
+returned safe. Risk area 3 — the one flagged as most likely to be wrong — was the finding, which is
+the outcome the section is for.
+
+**Finding 1: the reader accepted envelopes the writer cannot produce.** `_settings` enforced set
+equality on the nested `model_settings` dict, citing M1-501's lesson about one-sided assertions; the
+envelope *containing* it was read field-by-field with `.get()` and enforced nothing about its own key
+set. Three sub-cases, all reproduced by execution before any fix was written:
+
+| Sub-case | Pre-fix behaviour |
+| --- | --- |
+| `cost_usd` key deleted | accepted, read back as `None` |
+| unknown top-level key added | accepted, ignored |
+| `written_at_utc` re-rendered as `+02:00` | accepted |
+
+The first is the one with audit meaning. `cost_usd: null` is a real thing the writer emits — the call
+happened and its cost was not reported — so under `.get()` a **truncated** artifact and one that
+**recorded an unknown cost** were the same value, and a replay could report a clean hash match while
+inventing the second claim from the first. The third matters because the writer only ever emits
+`astimezone(timezone.utc).isoformat()`: checking `tzinfo is not None` accepts a different rendering
+of the very instant stored, which is format skew rather than a wrong value.
+
+The fix is the rule already applied one level down: `_ENVELOPE_FIELDS`, set equality checked **after**
+the schema-version check so a genuine skew still reports as a skew, and an exact canonical-form
+comparison for `written_at_utc`. Missing is now refused; explicit `null` still reads back.
+
+Scope was checked before fixing rather than after: persisted artifact content is untrusted under this
+project's boundary, no malicious operator is required (truncation and version skew reach it), the
+reader is new on this branch, and all three reproduced at the exact request HEAD.
+
+**Regression cover.** The missing-field parametrization is now driven off `_ENVELOPE_FIELDS` itself
+rather than a hand-kept list — the hand-kept list had omitted `cost_usd` and `failure_code`, the two
+nullable fields, which is precisely the gap. Added
+`test_the_writer_emits_exactly_the_envelope_fields` (a constant compared only against itself pins
+nothing), `test_the_reader_refuses_an_unknown_envelope_field`,
+`test_a_missing_nullable_field_is_not_read_as_an_explicit_null` (asserting both halves, so it cannot
+pass by refusing everything), and `test_the_reader_refuses_a_noncanonical_utc_rendering`.
+
+The existing property replaced a value under an existing key, so it structurally could not reach a
+key-set difference. `test_the_reader_refuses_any_envelope_whose_key_set_the_writer_could_not_emit`
+draws deletions and insertions instead, with the unedited draw as its positive control.
+
+Three further mutations, one per invocation from a pristine copy, three killed:
+
+| Mutation | Killed by |
+| --- | --- |
+| top-level set equality → `if False:` | both nullable missing-field cases, the unknown-key test, both halves of the nullable test, and the new property |
+| canonical-UTC check → `if False:` | all three `test_the_reader_refuses_a_noncanonical_utc_rendering` cases |
+| set equality weakened to a subset check | `test_the_reader_refuses_an_unknown_envelope_field` |
+
+Suite: 2494 pass, 1 xfail. Four gates green.

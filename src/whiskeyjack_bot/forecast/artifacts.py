@@ -94,6 +94,29 @@ _SETTINGS_TEXT_FIELDS = ("provider", "name", "prompt_version", "prompt_sha256")
 _SETTINGS_INT_FIELDS = ("max_output_tokens", "allowed_tries")
 _SETTINGS_FLOAT_FIELDS = ("temperature", "timeout_seconds")
 
+# The envelope's own top-level field set, for the same reason and enforced the same way as
+# `model_settings`' (see `_settings`). The reader checked each field with `.get()`, which
+# made a *missing* nullable field read back as `None` -- indistinguishable from a cost that
+# was explicitly recorded as unknown -- and let an unknown key through untouched. Round 1
+# finding 1. `test_the_writer_emits_exactly_the_envelope_fields` pins this against what the
+# writer actually renders, since a constant compared only against itself pins nothing.
+_ENVELOPE_FIELDS: frozenset[str] = frozenset(
+    {
+        "artifact_schema_version",
+        "attempt_id",
+        "question_id",
+        "model_settings",
+        "request",
+        "raw_responses",
+        "invocations",
+        "repair_attempted",
+        "cost_usd",
+        "failure_code",
+        "failure_problems",
+        "written_at_utc",
+    }
+)
+
 
 @dataclass(frozen=True)
 class StoredModelOutput:
@@ -422,6 +445,15 @@ def read_raw_model_output(artifact_root: Path, relative_path: str) -> StoredMode
             f"raw model output artifact schema version is not {MODEL_OUTPUT_SCHEMA_VERSION} "
             f"(found value withheld): {path}"
         )
+    if set(envelope) != _ENVELOPE_FIELDS:
+        # After the version check, so a genuine version skew still reports as one. Set
+        # equality rather than a subset: within a declared schema version, a missing field
+        # and an extra field are equally shapes this writer cannot emit, and accepting
+        # either would hide the skew the version exists to make visible. The key names are
+        # this module's own constant; the found ones are file content and are withheld.
+        raise ArtifactError(
+            f"raw model output artifact does not carry exactly the recorded envelope fields: {path}"
+        )
     attempt_id = require_safe_component(_text(envelope, "attempt_id", path), field="attempt_id")
     if type(envelope.get("question_id")) is not int:
         raise ArtifactError(
@@ -437,6 +469,16 @@ def read_raw_model_output(artifact_root: Path, relative_path: str) -> StoredMode
         ) from None
     if parsed.tzinfo is None:
         raise ArtifactError(f"raw model output artifact written_at_utc has no offset: {path}")
+    if parsed.astimezone(timezone.utc).isoformat() != written_at:
+        # The writer emits `written_at_utc.astimezone(timezone.utc).isoformat()` and nothing
+        # else, so any other rendering of the same instant -- a `+02:00` offset, a trailing
+        # `Z`, a `.000000` the writer would have omitted -- is a shape it cannot produce.
+        # Checking the offset alone would accept the first of those. The value is file
+        # content and is withheld; only the rule is named.
+        raise ArtifactError(
+            f"raw model output artifact written_at_utc is not the canonical UTC "
+            f"form the writer emits: {path}"
+        )
 
     # `request` is the one text field the writer stores without a non-blank rule: it is
     # `render_model_input`'s output, and refusing an empty one here would be a rule the
