@@ -95,6 +95,34 @@ def build_parser() -> argparse.ArgumentParser:
         "reject",
         "record a rejection; the record stays validated and may be approved later",
     )
+
+    submit = subparsers.add_parser(
+        "submit",
+        help="post one approved forecast to Metaculus and verify it by refetch",
+    )
+    submit.add_argument("--config", default="config.yaml", type=Path)
+    submit.add_argument("--record-id", required=True, help="the approved forecast record to post")
+    submit.add_argument(
+        "--payload-file",
+        required=True,
+        type=Path,
+        help=(
+            "JSON file holding the Metaculus request payload: question_type plus one of "
+            "probability_yes / continuous_cdf / probability_yes_per_category"
+        ),
+    )
+
+    verify = subparsers.add_parser(
+        "verify-submission",
+        help="refetch an uncertain submission attempt and record what the platform shows",
+    )
+    verify.add_argument("--config", default="config.yaml", type=Path)
+    verify.add_argument("--record-id", required=True, help="the forecast record to check")
+    verify.add_argument(
+        "--attempt-id",
+        required=True,
+        help="the uncertain attempt to resolve; submit prints it when it leaves one open",
+    )
     return parser
 
 
@@ -280,6 +308,211 @@ def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
         connection.close()
 
 
+def _run_submit(args: argparse.Namespace) -> int:
+    """Post one approved forecast, and print what was recorded (M2-704).
+
+    **This is the only command in the tree that can cause a live Metaculus post**, and it
+    is arranged so an operator sees what is about to happen before it does: the record's
+    identity, its derived status, the hash the approval binds to, the payload digest and
+    the derived idempotency key are all printed first. That is ``approve``'s shape and it
+    is here for the same reason -- a submission whose payload the operator never saw
+    described is an attribution claim with nothing behind it.
+
+    ``--payload-file`` rather than a built payload because there is no payload builder:
+    M1-502/M1-503 are ``Not Started``. M2-703's notes anticipated exactly this and said the
+    file argument lands here.
+
+    Every refusal is ``EXIT_REFUSED`` and prints why. A refusal from
+    :func:`submission_live.post_approved_forecast` means nothing was posted -- every gate
+    it applies runs in front of the post -- with one exception the message names: a post
+    the ledger then refused to record, which is the one case where an error follows a live
+    call.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.approval import ApprovalError, read_forecast_summary
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_poster
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.submission import SubmissionError
+    from whiskeyjack_bot.submission_gateway import payload_sha256
+    from whiskeyjack_bot.submission_live import (
+        LiveSubmissionError,
+        post_approved_forecast,
+        require_live_submission_enabled,
+    )
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    payload = _read_payload_file(args.payload_file)
+    if payload is None:
+        return EXIT_REFUSED
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            summary = read_forecast_summary(connection, args.record_id)
+        except ApprovalError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"record:    {summary.record_id}")
+        print(
+            f"question:  {summary.question_id}  tournament: {summary.tournament_id}  "
+            f"version: {summary.forecast_version}  type: {summary.question_type}"
+        )
+        print(f"status:    {summary.status}")
+        print(f"hash:      {summary.forecast_sha256 or '(none stored)'}")
+        try:
+            digest = payload_sha256(payload)
+        except SubmissionError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"payload:   sha256 {digest}")
+
+        # Before the poster, because constructing one reads METACULUS_TOKEN: an operator
+        # running this against the committed configuration should be told that submission
+        # is off, not that a credential is missing. `post_approved_forecast` checks it
+        # again as its first act.
+        try:
+            require_live_submission_enabled(config)
+        except LiveSubmissionError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        try:
+            poster = build_poster(config)
+        except MissingCredentialError as exc:
+            print(f"refused: {exc}")
+            return EXIT_ENV_MISSING
+        try:
+            recorded = post_approved_forecast(
+                connection,
+                record_id=args.record_id,
+                payload=payload,
+                poster=poster,
+                config=config,
+                occurred_at=datetime.now(tz=timezone.utc),
+            )
+        except LiveSubmissionError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        receipt = recorded.receipt
+        print(f"attempt:   {receipt.attempt_id}")
+        print(f"key:       {receipt.idempotency_key}")
+        print(
+            f"result:    {recorded.event.event_type} "
+            f"(success={receipt.success}, verified_by_refetch={receipt.verified_by_refetch})"
+        )
+        if receipt.error_type is not None:
+            print(f"error:     {receipt.error_type}: {receipt.error_message}")
+        if recorded.artifact_path is not None:
+            print(f"artifact:  {config.storage.artifact_root / recorded.artifact_path}")
+        else:
+            print(f"artifact:  NOT WRITTEN -- {recorded.artifact_error}")
+        if recorded.event.event_type == "submission_uncertain":
+            print(
+                "the outcome is unresolved; run "
+                f"`whiskeyjack-bot verify-submission --record-id {summary.record_id} "
+                f"--attempt-id {receipt.attempt_id}` before submitting anything else "
+                "for this record"
+            )
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _run_verify_submission(args: argparse.Namespace) -> int:
+    """Refetch an uncertain attempt and record what the platform shows (M2-704).
+
+    Reads only. It makes no post and reads no submission flags, so it is safe to run at any
+    time -- which matters, because it is the command that reopens the gate
+    :func:`submission_live.post_approved_forecast` closes after an uncertain outcome.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_poster
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.submission_live import LiveSubmissionError, verify_uncertain_attempt
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            poster = build_poster(config)
+        except MissingCredentialError as exc:
+            print(f"refused: {exc}")
+            return EXIT_ENV_MISSING
+        try:
+            event = verify_uncertain_attempt(
+                connection,
+                record_id=args.record_id,
+                attempt_id=args.attempt_id,
+                poster=poster,
+                occurred_at=datetime.now(tz=timezone.utc),
+            )
+        except LiveSubmissionError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"record:    {args.record_id}")
+        print(f"attempt:   {args.attempt_id}")
+        print(f"result:    {event.event_type} (lifecycle seq {event.event_seq})")
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _read_payload_file(path: Path) -> dict[str, object] | None:
+    """Load a submission payload from disk, or print why not and return ``None``.
+
+    Refuses anything the gateway would refuse later, but earlier and with the *path* in the
+    message -- which is the M1-401 carve-out's whole justification: a "cannot read payload"
+    with no path is not actionable. The file's *contents* are never echoed: a payload is
+    content, and the gateway's own validators name fields rather than values for the same
+    reason.
+    """
+    import json
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        print(f"refused: cannot read the payload file {path}")
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        print(f"refused: the payload file is not valid JSON: {path}")
+        return None
+    if not isinstance(payload, dict):
+        print(f"refused: the payload file must hold a JSON object: {path}")
+        return None
+    return payload
+
+
 def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
     """Open an existing ledger, or print why not and return ``None`` (M2-701).
 
@@ -331,6 +564,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_approval(args, "approved")
     if args.command == "reject":
         return _run_approval(args, "rejected")
+    if args.command == "submit":
+        return _run_submit(args)
+    if args.command == "verify-submission":
+        return _run_verify_submission(args)
     raise AssertionError(f"unhandled command: {args.command}")
 
 

@@ -3,6 +3,7 @@ replaced; invalid live-submit combinations and unknown keys are rejected; no
 input value ever leaks into a rendered configuration error."""
 
 import copy
+import itertools
 import traceback
 from pathlib import Path
 
@@ -88,22 +89,76 @@ def test_unknown_nested_key_rejected(valid_data: dict) -> None:
     expect_rejection(valid_data, "auto_submit")
 
 
-# ── live-submit combinations (all invalid before M2) ─────────────────────────
+# ── live-submit combinations (M2-704: the path exists; the invariants remain) ─
+
+# Every triple, and the accepted set written out. Enumerating rather than probing three
+# cases is M1-308's lesson: that item's startup-validation hole moved every round because
+# each round tested the case it had just thought of. A set equality fails on a rule that
+# was *removed* as loudly as on one that was added, which a list of positive cases does
+# not (M1-501's vacuity lesson).
+_ACCEPTED_SUBMISSION_FLAGS = {
+    # Submission off: the brakes are irrelevant, so every combination parses.
+    (False, False, False),
+    (False, False, True),
+    (False, True, False),
+    (False, True, True),
+    # Submission on: both brakes must be off. This is the only accepted `enabled` triple.
+    (True, False, False),
+}
 
 
-def test_submission_enabled_rejected(valid_data: dict) -> None:
+def test_the_accepted_submission_flag_triples_are_exactly_these(valid_data: dict) -> None:
+    """M2-704 removed the pre-M2 refusals and added the contradiction check.
+
+    Before this item all three of `enabled: true`, `dry_run: false` and `no_submit: false`
+    were refused outright -- there was no submission path to configure. There is one now,
+    so the flags mean what they say; what must not change is that `enabled` still requires
+    both brakes off, which is the row this table pins.
+    """
+    accepted = set()
+    for enabled, dry_run, no_submit in itertools.product((False, True), repeat=3):
+        data = copy.deepcopy(valid_data)
+        data["submission"]["enabled"] = enabled
+        data["submission"]["dry_run"] = dry_run
+        data["submission"]["no_submit"] = no_submit
+        try:
+            validate_config_data(data)
+        except ConfigError:
+            continue
+        accepted.add((enabled, dry_run, no_submit))
+    assert accepted == _ACCEPTED_SUBMISSION_FLAGS
+
+
+def test_the_committed_defaults_are_still_the_no_post_combination(example_data: dict) -> None:
+    """The shipped config must remain one that cannot post, whatever the validator allows."""
+    submission = example_data["submission"]
+    assert (submission["enabled"], submission["dry_run"], submission["no_submit"]) == (
+        False,
+        True,
+        True,
+    )
+
+
+def test_enabled_with_a_brake_still_on_names_both_flags(valid_data: dict) -> None:
     valid_data["submission"]["enabled"] = True
-    expect_rejection(valid_data, "Milestone 2")
+    valid_data["submission"]["dry_run"] = True
+    valid_data["submission"]["no_submit"] = True
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config_data(valid_data)
+    message = str(excinfo.value)
+    assert "dry_run: false" in message
+    assert "no_submit: false" in message
 
 
-def test_dry_run_false_rejected(valid_data: dict) -> None:
+def test_the_pre_milestone_refusal_is_gone(valid_data: dict) -> None:
+    """The removal is asserted, not just the addition.
+
+    A test suite that only checks what the new rule accepts would still pass if the old
+    refusal had been left in place under a different message, and `submit` would then be
+    unreachable for a reason no one could see from the config layer.
+    """
     valid_data["submission"]["dry_run"] = False
-    expect_rejection(valid_data, "dry_run")
-
-
-def test_no_submit_false_rejected(valid_data: dict) -> None:
-    valid_data["submission"]["no_submit"] = False
-    expect_rejection(valid_data, "no_submit")
+    validate_config_data(valid_data)
 
 
 def test_enabled_without_human_approval_names_every_violation(valid_data: dict) -> None:

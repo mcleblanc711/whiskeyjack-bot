@@ -248,6 +248,27 @@ class SubmissionConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _reject_live_submit_combinations(self) -> SubmissionConfig:
+        """Refuse a configuration that could post without the guarantees it claims.
+
+        **M2-704 removed three refusals from here and added one.** Until this item there
+        was no submission path at all, so ``enabled: true``, ``dry_run: false`` and
+        ``no_submit: false`` were each rejected outright -- a configuration describing
+        behaviour no code could perform. ``submission_live`` is that code, so the flags now
+        mean what they say and the operator may set them.
+
+        Nothing about the *defaults* changed: ``config.example.yaml`` still commits
+        ``enabled: false``, ``dry_run: true`` and ``no_submit: true``, and
+        ``submission_live._require_live_submission_enabled`` refuses to post unless all
+        three are deliberately flipped. Turning on a live submission path is three explicit
+        edits, and every safety invariant below still gates it.
+
+        The added refusal is the contradiction the removals made reachable: ``enabled:
+        true`` alongside ``dry_run: true`` or ``no_submit: true`` describes a deployment
+        that both may and may not post. Resolving that at runtime -- by picking one flag as
+        dominant -- would put the answer somewhere no reader of the config can see, so it
+        is refused at load instead. This is the *stricter reading* of an ambiguous
+        combination, per CLAUDE.md.
+        """
         problems: list[str] = []
         # Invariants that hold in every milestone (hard constraints).
         if self.enabled and not self.require_human_approval:
@@ -258,19 +279,18 @@ class SubmissionConfig(_StrictModel):
             problems.append("submission.enabled requires verify_by_refetch: true")
         if self.enabled and not self.block_retry_on_uncertain_result:
             problems.append("submission.enabled requires block_retry_on_uncertain_result: true")
-        # v1 gate until M2 lands: the committed safe defaults are the only
-        # legal values; there is no reachable submission path to configure.
-        if self.enabled:
+        # The combination that has no coherent meaning. `dry_run` and `no_submit` are two
+        # independent brakes on one path and either one alone stops it; `enabled: true`
+        # with a brake still on is a configuration whose author expected a post.
+        if self.enabled and self.dry_run:
             problems.append(
-                "submission.enabled: true is invalid before Milestone 2; no submission path exists"
+                "submission.enabled: true requires dry_run: false; a run cannot both "
+                "submit and rehearse"
             )
-        if not self.dry_run:
+        if self.enabled and self.no_submit:
             problems.append(
-                "submission.dry_run: false is invalid before Milestone 2; no submission path exists"
-            )
-        if not self.no_submit:
-            problems.append(
-                "submission.no_submit: false is invalid before Milestone 2; no submission path exists"
+                "submission.enabled: true requires no_submit: false; no_submit is the "
+                "kill switch and it is still on"
             )
         if problems:
             raise ValueError("; ".join(problems))

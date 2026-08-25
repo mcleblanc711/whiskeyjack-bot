@@ -1,4 +1,4 @@
-"""Single construction point for the forecasting-tools MetaculusClient (M0-101).
+"""Single construction point for the forecasting-tools MetaculusClient (M0-101, M2-704).
 
 Everything that talks to Metaculus goes through :func:`build_client`; nothing
 else in the codebase may instantiate ``MetaculusClient`` directly. The token
@@ -6,15 +6,45 @@ is read from the configured environment variable at construction time, passed
 to the SDK, and never stored, logged, or echoed by this module. Constructing
 the SDK client performs no network I/O (verified against the pinned
 forecasting-tools==0.2.92 source).
+
+**M2-704 added :class:`SingleAttemptPoster`, and it is the only place in the tree that
+knows the pinned SDK retries.** ``MetaculusClient._post_question_prediction`` carries
+``@retry_with_exponential_backoff()`` (``max_retries=3``) whose ``retry_on_exceptions`` is
+``requests.exceptions.RequestException`` -- which ``HTTPError`` subclasses. Measured
+against ``forecasting-tools==0.2.92`` with ``requests.post`` stubbed: **four POSTs on a
+timeout, four on a 400.** A timed-out post that actually landed is re-posted three more
+times under one idempotency key with no refetch in between, which is the blind retry
+M2-704's acceptance criterion forbids, arriving from inside the dependency.
+
+The line this module draws is **reads may retry, writes must not**. A GET is idempotent
+and its retry is kept exactly as the SDK ships it; the POST is made through the
+undecorated function the decorator wrapped, so exactly one request is sent and the real
+exception propagates. That is a *guarded* dependency on a private name, which is what
+``M2-705``'s acceptance criterion contemplates ("no private package method dependency
+without a guard") -- and it is not the dependency D28 rejected, which was on a private
+method to *capture a response body*. Nothing here reads a response; it only declines to
+have the request repeated. The guards are :func:`_assert_single_post_is_reachable` at
+import and ``tests/unit/test_metaculus_poster.py``, which drives the real SDK class with a
+counted stub and asserts four-without / one-with. A version bump that changes the shape is
+a red build, not a silent return to four posts.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
+import threading
+import types
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from whiskeyjack_bot.config import AppConfig
+
+if TYPE_CHECKING:  # pragma: no cover - import-time typing only, never at runtime
+    from whiskeyjack_bot.submission_live import MetaculusPoster
 
 
 class MissingCredentialError(Exception):
@@ -51,3 +81,165 @@ def build_client(config: AppConfig) -> MetaculusClient:
         sleep_jitter_seconds=config.metaculus.request_jitter_seconds,
         token=token,
     )
+
+
+class PosterContractError(Exception):
+    """The pinned SDK no longer has the shape :class:`SingleAttemptPoster` depends on.
+
+    Raised at **import** rather than at first use, for the reason
+    ``submission._assert_prefix_matches_version`` gives: a guard only a test enforces is a
+    guard the next module to import this one does not have. Failing to import is the
+    correct outcome -- the alternative is a build that silently posts four times.
+
+    Same hygiene rule as the rest of the package: the message names only this module's own
+    expectations about the dependency, never a value.
+    """
+
+
+# The undecorated function `@retry_with_exponential_backoff()` wrapped. `functools.wraps`
+# sets `__wrapped__`, so this is the documented way back to the original -- not a reach
+# into the decorator's closure.
+_RAW_POST_PREDICTION: Any = getattr(MetaculusClient._post_question_prediction, "__wrapped__", None)
+
+# The signature that function must have for the shadowing below to be a pass-through rather
+# than a re-implementation. `post_binary_question_prediction` and its two siblings build
+# `forecast_payload` and call it with exactly these two arguments.
+_EXPECTED_POST_PARAMETERS = ("self", "question_id", "forecast_payload")
+
+
+def _assert_single_post_is_reachable() -> None:
+    """Fail at import unless exactly one post can still be made through the public methods.
+
+    Three checks, and each one closes a different way the guard could quietly stop working:
+
+    1. ``__wrapped__`` exists -- the retry decorator is still applied and still uses
+       ``functools.wraps``. If a future version drops the decorator entirely this fails,
+       which is the right outcome: the guard's premise would be gone and its absence should
+       be a decision, not a discovery.
+    2. It is not the decorated attribute itself, so the unwrapping is real.
+    3. Its parameters are the ones the public post methods pass. A renamed or re-ordered
+       parameter would make the shadowed call a different call, and a *silently* different
+       call is the failure mode this whole adapter exists to prevent.
+    """
+    if _RAW_POST_PREDICTION is None:
+        raise PosterContractError(
+            "the pinned forecasting-tools MetaculusClient no longer exposes an unwrapped "
+            "_post_question_prediction; a single-attempt post cannot be guaranteed"
+        )
+    if _RAW_POST_PREDICTION is MetaculusClient._post_question_prediction:
+        raise PosterContractError(
+            "the pinned forecasting-tools MetaculusClient's _post_question_prediction is "
+            "its own __wrapped__, so unwrapping it removes no retry"
+        )
+    try:
+        parameters = tuple(inspect.signature(_RAW_POST_PREDICTION).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - a builtin would land here
+        raise PosterContractError(
+            "the pinned forecasting-tools MetaculusClient's unwrapped "
+            "_post_question_prediction has no readable signature"
+        ) from None
+    if parameters != _EXPECTED_POST_PARAMETERS:
+        raise PosterContractError(
+            "the pinned forecasting-tools MetaculusClient's unwrapped "
+            f"_post_question_prediction takes {parameters!r}, not "
+            f"{_EXPECTED_POST_PARAMETERS!r}; the single-attempt guard cannot be applied"
+        )
+
+
+_assert_single_post_is_reachable()
+
+
+class SingleAttemptPoster:
+    """A Metaculus client that posts **once** per call and refetches with the SDK's retry.
+
+    Satisfies ``submission_live.MetaculusPoster``. The three post methods are pass-throughs
+    to the SDK's public ones -- so every bound and every payload shape those enforce still
+    applies, and this is not the narrow HTTP adapter M2-705 spikes -- wrapped in a window
+    where ``_post_question_prediction`` resolves to the function the retry decorator wraps
+    rather than to the decorator. Instance attributes shadow class attributes, so the
+    public method's own ``self._post_question_prediction(...)`` finds it.
+
+    ``get_question_by_post_id`` is a plain pass-through **with its retry intact**. A GET is
+    idempotent, retrying it is free of consequence, and it is what makes the "refetch could
+    not be performed" case rare enough to be an edge rather than a routine outcome.
+
+    The window is held under a lock. The pipeline is single-threaded today
+    (``run_limits.max_parallel_questions`` is 1), so this is not fixing a live bug -- it is
+    that a shadow-and-restore window shared between two callers would restore the class
+    method while the other was still inside it, and the cost of preventing that is one
+    lock.
+    """
+
+    def __init__(self, client: MetaculusClient) -> None:
+        if not isinstance(client, MetaculusClient):
+            raise PosterContractError("client must be a MetaculusClient")
+        self._client = client
+        self._lock = threading.RLock()
+
+    def post_binary_question_prediction(
+        self, question_id: int, prediction_in_decimal: float
+    ) -> None:
+        with self._single_attempt():
+            self._client.post_binary_question_prediction(question_id, prediction_in_decimal)
+
+    def post_numeric_question_prediction(self, question_id: int, cdf_values: list[float]) -> None:
+        with self._single_attempt():
+            self._client.post_numeric_question_prediction(question_id, cdf_values)
+
+    def post_multiple_choice_question_prediction(
+        self, question_id: int, options_with_probabilities: dict[str, float]
+    ) -> None:
+        with self._single_attempt():
+            self._client.post_multiple_choice_question_prediction(
+                question_id, options_with_probabilities
+            )
+
+    def get_question_by_post_id(self, post_id: int) -> object:
+        return self._client.get_question_by_post_id(post_id)
+
+    @contextmanager
+    def _single_attempt(self) -> Iterator[None]:
+        """Bind the undecorated post for the duration of one call, then unbind it.
+
+        ``setattr``/``delattr`` by name rather than attribute syntax: the target is a bound
+        method on a third-party class, and naming it as an attribute would be a type error
+        for what is deliberately a runtime shadow.
+
+        The ``finally`` removes the instance attribute rather than restoring a saved one,
+        so the class method is reached again by ordinary lookup. ``delattr`` is guarded
+        because a caller who reached in and removed it first must not turn a completed post
+        into an exception.
+        """
+        with self._lock:
+            setattr(
+                self._client,
+                "_post_question_prediction",
+                types.MethodType(_RAW_POST_PREDICTION, self._client),
+            )
+            try:
+                yield
+            finally:
+                try:
+                    delattr(self._client, "_post_question_prediction")
+                except AttributeError:  # pragma: no cover - only if a caller removed it
+                    pass
+
+
+def build_poster(config: AppConfig) -> SingleAttemptPoster:
+    """Construct the one configured single-attempt poster.
+
+    The seam the CLI calls. It goes through :func:`build_client`, so the token still has
+    exactly one construction point and the ``MissingCredentialError`` contract is unchanged.
+    """
+    return SingleAttemptPoster(build_client(config))
+
+
+if TYPE_CHECKING:  # pragma: no cover - a static conformance check, never executed
+
+    def _poster_conforms(poster: SingleAttemptPoster) -> MetaculusPoster:
+        """Fail ``mypy --strict`` if the adapter drifts from the protocol it promises.
+
+        In ``src`` rather than in a test because the gate type-checks ``src`` only, and a
+        protocol conformance nobody checks is a protocol nobody keeps.
+        """
+        return poster

@@ -83,6 +83,11 @@ numeric_calibration:
   calibration_profile: "identity"
 
 submission:
+  # These three are the committed safe values and stay that way. As of M2-704 a live
+  # submission path exists, so setting them is no longer refused at load -- but a post
+  # requires all three flipped together (enabled: true, dry_run: false, no_submit: false)
+  # and the record approved, and `submit` refuses otherwise. Flipping them is a deliberate
+  # operator act, not a default anyone inherits.
   enabled: false
   dry_run: true
   no_submit: true
