@@ -95,9 +95,13 @@ uses a constant message.
 
 Failure is data, not an exception: provider failure is reported on the returned
 :class:`ExaRetrieval`. The exceptions this module *does* raise --
-:class:`ExaFallbackError` and ``MissingCredentialError`` -- are caller mistakes
-(an unattributed switch, a misconfigured provider, an absent credential) and all
-of them fire before any network use, and therefore before any billing.
+:class:`ExaFallbackError` and ``MissingCredentialError`` -- are mostly caller
+mistakes (an unattributed switch, a misconfigured provider, an absent
+credential), plus one operational case that is not: an ordinary local I/O
+failure loading the bundled public-suffix data this module needs at import
+time (M1-311, review round 1) also arrives as :class:`ExaFallbackError` rather
+than escaping raw. All of them fire before any network use, and therefore
+before any billing.
 """
 
 from __future__ import annotations

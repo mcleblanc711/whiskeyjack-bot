@@ -4339,3 +4339,21 @@ The blocking finding is unaffected (it does not depend on that section), but the
 carry the context those sections exist to pre-empt. Round 2 is generated with `--dry-run`, spliced
 by hand, and sent with a direct `codex exec` call rather than through the wrapper, to avoid
 repeating this.
+
+### Round 2 — GPT cross-model review (PR #40) — APPROVE
+
+Reviewed commit `bde091164ffec0c41e5330a1b638e77a5c4335a6`. Round-1's blocker confirmed **CLOSED**
+against a fresh reproduction: the same unreadable-PSL-data simulation now raises `ExaFallbackError`
+with the constant message, with neither `PermissionError` nor `public_suffix_list.dat` appearing in
+the rendered traceback. No blocking findings. This round's request was generated with `--dry-run`
+and spliced by hand (see the round-1 process note above), so the deliberate-choices and risk-areas
+sections reached the reviewer intact this time.
+
+One non-blocking observation, acted on rather than filed: the module-level docstring still said
+every exception this module raises is a caller mistake, which became stale the moment the round-1
+fix added a case that is not one (an ordinary local I/O failure loading the bundled PSL data).
+Fixed directly — the docstring now names both categories — since it is a one-line precision fix
+with no behavior change, not a new finding needing its own round.
+
+Suite: 2361 pass, 1 xfail (the standing lone-surrogate xfail predates this branch). Four gates
+green on `bde0911` plus the docstring fix.
