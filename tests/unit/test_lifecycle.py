@@ -3503,7 +3503,11 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # The v2 rows this seeds are non-blank in every column 006 guards, so they pass its
     # upgrade precondition; `test_migration_006_refuses_a_ledger_holding_a_blank_
     # identifier` is the other side of that.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 7
+    #
+    # 008 (M1-406) adds three NULLable columns and appends clauses to the same insert
+    # trigger, with no upgrade probe of its own, so a v2 ledger reaching 8 is the same
+    # statement it was when it reached 7.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 8
 
     conn = connect(db)
     try:
@@ -4070,11 +4074,12 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     #
     # The name says 006 and the assertion says 7: this test is about 006's precondition,
     # and `initialize_ledger` applies every unrecorded migration, so it now runs 007
-    # (M1-602) as well. 007 adds no upgrade probe of its own -- it redefines one trigger --
-    # so a clean v5 ledger reaching 7 is the same statement it was when it reached 6.
+    # (M1-602) and 008 (M1-406) as well. Neither adds an upgrade probe of its own -- each
+    # redefines the one insert trigger, and 008's added columns are NULLable -- so a clean
+    # v5 ledger reaching 8 is the same statement it was when it reached 6.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 7
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 8
 
 
 @pytest.mark.parametrize(
@@ -4179,7 +4184,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 7
+    assert initialize_ledger(db) == 8
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"
