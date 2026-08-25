@@ -32,7 +32,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Claim | Held by | Notes |
 | --- | --- | --- |
-| Dependency additions (`pyproject.toml` + `uv.lock`) | **M1-311**, claimed 2026-08-25 | **One track at a time.** `uv.lock` is a 760 KB generated file; two branches adding dependencies produce a conflict no merge tool resolves usefully. Previously claimed by M1-303 on 2026-07-27 and **released unused** (the Exa adapter used `httpx`, already declared, instead of adding `exa-py`). **M1-311 now holds it**, for a real public-suffix-list package to reject multi-label suffixes (`co.uk`, `com.au`) rather than a narrower dependency-free rule — the owner decision made when this item started. Release it here if the item ends up not spending it. |
+| Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | Previously claimed by M1-303 on 2026-07-27 and **released unused** (the Exa adapter used `httpx` instead of adding `exa-py`). **M1-311 claimed it 2026-08-25, spent it, and merged** (PR #40, round-2 approval, 2026-08-25): `publicsuffix2` rejects multi-label suffixes (`co.uk`, `com.au`) that the old dependency-free rule missed. Released now that the branch is on master. |
 | Workflow / test-infrastructure change | *free* — **and should stay free until this wave closes** | Three concurrent lanes means every workflow change lands in three open review cycles at once, which is lesson 1 at triple cost. If one is genuinely needed mid-wave, claim the slot here and **say so in the next review request on every open lane** — the reviewer is stateless and reads a format change as a substantive one. Lesson 1: a workflow change is a track and takes a slot. Held 2026-08-17 by `test/tmpfs-temp-root` (PR #24) and `chore/review-loop` (PR #25), **both merged and released the same day**. #24 moved pytest's temp root to tmpfs (`tests/conftest.py`): full suite 497.7s → 81.3s, `test_lifecycle.py` 96.5s → 3.2s, because the dev machine's only drive is a 7200rpm platter at 49.6ms/fsync. #25 added `scripts/gate.sh`, `scripts/run-review.sh` and the `fast` hypothesis profile. They landed **mid-wave** by deliberate exception, having been checked against every live branch first — the only conflict was this table. **Say so in the next review request:** the conftest change moves where temp files land, nothing about what is asserted. |
 | Next free migration number | `008` — nothing holds it | `001`-`007` are immutable on master; `006_non_blank_identifiers.sql` landed with **M1-607** and **`007_forecast_version_chain.sql` landed with M1-602** (merged 2026-08-24, PR #38 — the branch spent `007` on 2026-08-22, well before it merged, which is the whole point of a claim living on its branch). None of M2-704, M1-406 or M1-311 currently expects a migration; the first of them to need one takes `008`. Remember this column is advisory and nothing reads it — `.github/scripts/check-migrations.sh` plus master's up-to-date-branch requirement is the enforcement, as the earlier `004` collision between M1-606 and M1-306 recorded. |
 
@@ -42,7 +42,6 @@ to the registry, and neither is a habit you can form by reflex.
 | --- | --- | --- | --- | --- | --- |
 | M2-704 | feat/m2-704-package-backed-gateway | whiskeyjack-m2-704 | no | none | 2026-08-25 |
 | M1-406 | feat/m1-406-persist-raw-output-replay | whiskeyjack-m1-406 | no | none | 2026-08-25 |
-| M1-311 | feat/m1-311-public-suffix-rejection | whiskeyjack-m1-311 | yes | none | 2026-08-25 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
@@ -68,13 +67,14 @@ Three lanes, run concurrently:
 | --- | --- | --- |
 | 1 — critical path | ~~`M1-402`~~ → ~~`M1-403`~~ → ~~`M1-501`~~ → ~~`M1-602`~~ → **`M1-406`** | `M1-602` merged (PR #38, 2026-08-24); `M1-406` (persist raw output + replay) is now unblocked and is the item that closes the replay loop the ledger exists for. |
 | 2 — M2 path | ~~`M2-701`~~ → ~~`M2-702`~~ → ~~`M2-703`~~ → **`M2-704`** | `M2-703` merged (PR #39, 2026-08-22). `M2-704` (package-backed gateway) is the first item in the repo that can actually post to Metaculus — sized L, highest blast radius so far. |
-| 3 — debt queue | ~~`M0-007`~~ → ~~`M1-313`~~ → ~~`M1-607`~~ → ~~`M1-312`~~ → ~~`M1-309`~~ → **`M1-311`** | `M1-309` merged (PR #37, 2026-08-22). `M1-311` is now the live head — see below for the dependency decision. |
+| 3 — debt queue | ~~`M0-007`~~ → ~~`M1-313`~~ → ~~`M1-607`~~ → ~~`M1-312`~~ → ~~`M1-309`~~ → ~~`M1-311`~~ | Closed. `M1-311` merged (PR #40, round-2 approval, 2026-08-25) — the last of the six small items. |
 
-Struck items are merged. As of 2026-08-25 the live lane heads are **M1-406**, **M2-704**
-and **M1-311**, one worktree each. Neither `M1-406` nor `M2-704` expects a new dependency
-or migration; `M1-311` claims the dependency slot (below). **M1-312 merged approved in
-round 1** (PR #35), the project's third single-round approval; its composition
-(`research/persist.py`) is the API a retrieval orchestrator will call.
+Struck items are merged. As of 2026-08-25 the live lane heads are **M1-406** and
+**M2-704**, one worktree each; lane 3 is closed. Neither `M1-406` nor `M2-704` expects a
+new dependency or migration, and the dependency slot is free again now that `M1-311`
+spent and released it. **M1-312 merged approved in round 1** (PR #35), the project's
+third single-round approval; its composition (`research/persist.py`) is the API a
+retrieval orchestrator will call.
 
 **M1-602 waits for M1-501, and the M2-702 precedent does not license skipping it.** M2-702
 shipped against `forecast_records` while M1-602 was `Not Started`, and its notes say why
@@ -88,11 +88,10 @@ The lane-3 order is not the numeric one, and the two departures are the point:
 - **M1-607 was third, not last.** It puts the non-blank identifier guard on
   `forecast_records.record_id`, and `M1-602` — last on lane 1 — is the item that starts
   writing that column. The guard is on master before the writer, which was the whole point.
-- **M1-311 was sequenced last while its shape was unknown; that's now resolved.** Rejecting
-  multi-label public suffixes (`co.uk`, `com.au`) needs either a real public-suffix list or an
-  explicit restriction narrow enough to defend without one — the owner decision (2026-08-25) was
-  to take the real list, so `M1-311` now claims the dependency slot above rather than the
-  narrower dependency-free rule.
+- **M1-311 was sequenced last because its shape was unknown, and it was — it spent the
+  dependency slot.** Rejecting multi-label public suffixes (`co.uk`, `com.au`) needed a real
+  public-suffix-list package rather than the narrower dependency-free rule (owner decision,
+  2026-08-25); it merged the same day and the slot is free again above.
 
 `scripts/start-item.sh <ITEM> <slug> [--deps]` creates the worktree and prints the row
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per
