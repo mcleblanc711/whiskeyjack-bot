@@ -50,12 +50,14 @@ from whiskeyjack_bot.submission_live import (
     _MAX_BODY,
     _MAX_CATEGORIES,
     _MAX_OPTION_LABEL,
+    _MAX_SNAPSHOT_VALUES,
     BinaryPost,
     ForecastEntry,
     ForecastHistory,
     LiveSubmissionError,
     MetaculusSubmissionGateway,
     MultipleChoicePost,
+    NumericPost,
     build_verification_snapshot,
     classify_refetch,
     expected_option_labels,
@@ -1499,6 +1501,86 @@ def test_a_non_multiple_choice_snapshot_never_records_a_label_order() -> None:
             expected_labels=("a", "b"),
         )
         assert json.loads(rendered)["observed"]["label_order"] is None
+
+
+@pytest.mark.parametrize(
+    ("question_type", "expected", "outcome"),
+    [
+        ("numeric", tuple(index / 200 for index in range(201)), "mismatched"),
+        ("binary", (0.6,), "mismatched"),
+    ],
+)
+def test_an_oversized_observed_vector_does_not_cost_the_row_its_evidence(
+    question_type: str, expected: tuple[float, ...], outcome: str
+) -> None:
+    """`forecast_values` is provider JSON and is bounded nowhere.
+
+    Found while writing the round-4 request rather than by review: it is the same class as
+    round 3 -- unbounded provider data rendered into a fixed-size envelope -- one field
+    over. A 50,000-element vector used to push the snapshot past `_MAX_BODY` and collapse
+    it to the form that names no values at all.
+
+    A *confirmed* row could never reach it, because every path to `confirmed` has already
+    required the observed vector to match a bounded expected one. This is about the
+    `mismatched` and `absent` rows, which is where an operator most needs to see what the
+    platform actually held.
+    """
+    result = classify_refetch(
+        question_type=question_type,
+        expected=expected,
+        baseline_latest_start_time=BASELINE_START,
+        observed=ForecastHistory((ForecastEntry(NEW_START, (0.5,) * 50000),)),
+        expected_labels=None,
+    )
+    assert result.outcome == outcome
+    rendered = build_verification_snapshot(
+        question_type=question_type,
+        expected=expected,
+        baseline_entry_count=1,
+        baseline_latest_start_time=BASELINE_START,
+        result=result,
+        expected_labels=None,
+    )
+    snapshot = json.loads(rendered)
+    assert len(rendered) <= _MAX_BODY
+    assert "values_omitted" not in snapshot
+    # The sample is capped; the true length is recorded beside it, so the truncation is
+    # visible and the row never implies it saw fewer values than it did.
+    assert len(snapshot["observed"]["latest_values"]) == _MAX_SNAPSHOT_VALUES
+    assert snapshot["observed"]["latest_value_count"] == 50000
+    assert snapshot["expected_values"] == list(expected)
+
+
+def test_an_honest_verification_is_never_truncated() -> None:
+    """The cap sits above every count a confirmed comparison can need.
+
+    `expected_cdf_points` is a `Literal[201]` and the option count is bounded by
+    `_MAX_CATEGORIES`, so no honest observation is ever sampled rather than recorded.
+    """
+    assert _MAX_SNAPSHOT_VALUES > 201
+    assert _MAX_SNAPSHOT_VALUES > _MAX_CATEGORIES
+    cdf = tuple(index / 200 for index in range(201))
+    plan = NumericPost(continuous_cdf=cdf)
+    result = classify_refetch(
+        question_type="numeric",
+        expected=expected_values(plan),
+        baseline_latest_start_time=BASELINE_START,
+        observed=ForecastHistory((ForecastEntry(NEW_START, cdf),)),
+        expected_labels=None,
+    )
+    assert result.outcome == "confirmed"
+    snapshot = json.loads(
+        build_verification_snapshot(
+            question_type="numeric",
+            expected=expected_values(plan),
+            baseline_entry_count=1,
+            baseline_latest_start_time=BASELINE_START,
+            result=result,
+            expected_labels=None,
+        )
+    )
+    assert snapshot["observed"]["latest_values"] == list(cdf)
+    assert snapshot["observed"]["latest_value_count"] == 201
 
 
 def test_a_live_attempt_id_is_derived_and_distinguishable() -> None:

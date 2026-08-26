@@ -126,7 +126,7 @@ from whiskeyjack_bot.submission_gateway import (
 # Bumping this changes the envelope a reader of `submission_attempts.
 # refetched_forecast_snapshot` must understand. It is not the artifact's version, which
 # `submission_gateway.ARTIFACT_SCHEMA_VERSION` owns.
-VERIFICATION_SCHEMA_VERSION = "1.1.0"
+VERIFICATION_SCHEMA_VERSION = "1.2.0"
 
 # The visible scheme tag on a derived live attempt id, written as a literal for
 # `submission._KEY_PREFIX`'s reason: a computed tag agrees with its version by
@@ -185,6 +185,23 @@ _MAX_CATEGORIES = 64
 # platform option list that exceeds it makes the refetch `unreadable`, so the post lands
 # uncertain rather than falsely confirmed. Both directions are safe.
 _MAX_OPTION_LABEL = 128
+
+# How many observed values a snapshot renders. `forecast_values` is provider JSON and is
+# bounded nowhere -- `read_my_forecasts` accepts a 50,000-element vector, and rendering one
+# pushes the envelope past `_MAX_BODY` into the reduced form that names no values at all.
+#
+# A *confirmed* row is unaffected and cannot reach this: every comparison that returns
+# `confirmed` has already required the observed vector to match a bounded expected one --
+# exactly 2 for binary, `expected_cdf_points` (a `Literal[201]`) for numeric, and the option
+# count for multiple choice. So this is not round 3's failure, where a row claimed a
+# confirmation it could not show. It is the `mismatched` and `absent` rows, which is where
+# an operator most needs to see what the platform actually held.
+#
+# 256 is above every count a confirmed comparison can need, so no honest verification is
+# ever truncated; `latest_value_count` records the true length beside the sample, so a
+# truncation is visible rather than silent, and the row never implies it saw fewer values
+# than it did.
+_MAX_SNAPSHOT_VALUES = 256
 
 # Response headers worth keeping, lowercased. The handoff says "allowlisted only"; these
 # are the four that explain a failure without carrying content. `Authorization` is a
@@ -929,10 +946,12 @@ def build_verification_snapshot(
     comparison from the ledger alone, and an auditor can re-run it by hand.
 
     **A confirmed multiple-choice snapshot is replayable from itself**: `expected_labels`
-    with `expected_values`, and `observed.labels` with `observed.latest_values`, are the
-    four things the comparison needs, so an auditor can recompute the verdict from the
-    stored row alone rather than taking it on trust. That is the property this whole
-    package exists for, and the alignment fix would have quietly cost it.
+    with `expected_values`, and `observed.label_order` with `observed.latest_values`, are
+    the four things the comparison needs, so an auditor can recompute the verdict from the
+    stored row alone rather than taking it on trust. `label_order` holds *indices into*
+    `expected_labels`, not the label strings a second time -- see :func:`_observed_label_
+    order` for why round 3 made that trade. That is the property this whole package exists
+    for, and the alignment fix would have quietly cost it.
 
     The rendering is M1-305's rule verbatim, the same spelling every other canonical form
     in this package uses: ``json.dumps(..., ensure_ascii=True, sort_keys=True,
@@ -941,11 +960,21 @@ def build_verification_snapshot(
     content -- but the guard stays, because this function is called *after* a post and an
     exception here would cost the ledger row.
 
-    The value counts are bounded by :func:`plan_from_payload` (one value for binary,
-    ``expected_cdf_points`` for numeric, :data:`_MAX_CATEGORIES` for multiple choice), so
-    the rendering cannot approach ``_MAX_BODY``. The fallback below is unreachable given
-    those bounds and exists anyway: a snapshot that could not be rendered must degrade to a
-    smaller one, never to an exception.
+    **Every unbounded input is bounded at the point it enters this envelope, and each
+    bound was bought by a review round.** :func:`plan_from_payload` bounds only the
+    *expected* side (one value for binary, ``expected_cdf_points`` for numeric,
+    :data:`_MAX_CATEGORIES` for multiple choice). The *observed* side is provider JSON and
+    is bounded nowhere upstream: label length and count by :data:`_MAX_OPTION_LABEL` and
+    :data:`_MAX_CATEGORIES` (round 3), and the observed vector by
+    :data:`_MAX_SNAPSHOT_VALUES` (round 4). Do not read those caps as belt-and-braces --
+    removing any one of them puts the maximal accepted envelope back over ``_MAX_BODY``,
+    and a property test fails if you do.
+
+    So the fallback below **is** reachable in principle, and that is exactly why it must
+    never be reached by a ``confirmed`` row: it names no values, so a row would claim a
+    confirmation it cannot show. A snapshot that could not be rendered must degrade to a
+    smaller one, never to an exception -- but degradation is evidence loss, not a safe
+    default, and the caps above are what keep it out of the honest cases.
     """
     latest = result.history.latest if result.history is not None else None
     envelope: dict[str, object] = {
@@ -968,7 +997,12 @@ def build_verification_snapshot(
             else {
                 "entry_count": len(result.history.entries),
                 "latest_start_time": None if latest is None else latest.start_time,
-                "latest_values": None if latest is None else list(latest.values),
+                "latest_values": (
+                    None if latest is None else list(latest.values[:_MAX_SNAPSHOT_VALUES])
+                ),
+                # The true length, beside a possibly-truncated sample. Their difference is
+                # what tells an auditor a truncation happened, so it cannot be silent.
+                "latest_value_count": None if latest is None else len(latest.values),
                 # The order `latest_values` is reported in, which for multiple choice is
                 # the *platform's* option order and need not be the payload's. Without it
                 # the snapshot records a verdict it cannot support: `expected_values` is in

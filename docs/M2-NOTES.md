@@ -1322,6 +1322,107 @@ with a label list. A test that makes exactly that public call now kills the muta
 raising `_MAX_OPTION_LABEL` to 512 is killed by the maximal-snapshot test, which is the
 point of measuring the envelope rather than asserting it.
 
+### Before round 4 — the same class again, found by the author this time
+
+Writing round 4's risk-areas section meant asking what *else* is unbounded on its way into
+the snapshot, since that was three rounds running. One more field was:
+`ForecastEntry.values` comes from `forecast_values` in provider JSON and
+`read_my_forecasts` bounds it nowhere — it accepts a 50,000-element vector, and rendering
+one pushed the envelope past `_MAX_BODY` into the reduced form that names no values at all.
+
+**It is not round 3's failure, and the difference matters.** Every path to `confirmed` has
+already required the observed vector to match a bounded expected one — exactly 2 for
+binary, `expected_cdf_points` (a `Literal[201]`) for numeric, the option count for multiple
+choice — so a confirmed row could never reach it. Verified by execution across all three
+types before deciding severity. What was exposed is the `mismatched` and `absent` rows,
+which carry no false claim but are where an operator most needs to see what the platform
+actually held.
+
+Closed by rendering at most `_MAX_SNAPSHOT_VALUES = 256` observed values and recording the
+**true** length beside the sample as `latest_value_count`. The cap sits above every count an
+honest comparison can need, so no genuine verification is ever sampled rather than
+recorded; the count is what makes a truncation visible instead of silent, so the row never
+implies it saw fewer values than it did. The maximal multiple-choice case — 64 full-length
+labels *and* a 50,000-element observation — now renders with its evidence intact. Measured
+at the true worst case rather than a convenient one: labels padded with a character
+`ensure_ascii=True` escapes to six bytes, *and* observed values chosen for the longest
+`json.dumps` rendering a float has (`2.2250738585072014e-308`, 23 characters). That is
+**55,593 bytes against a 65,536 limit, 9,943 to spare**. An earlier draft of this note said
+50,473, which was measured with `0.5` as the observed value — a three-character rendering,
+so 256 values understated the envelope by about 3,800 bytes. Round 3's lesson was to
+measure the envelope rather than assert it; measuring it with the *easy* input is the same
+mistake one level down.
+
+Three mutations, all killed: removing the cap, lowering it below an honest CDF, and
+reporting the truncated length as the true one.
+
+**The lesson, since this is the fourth instance:** a fixed-size evidence envelope and an
+unbounded input are a standing pair, and the fix is not to widen the envelope but to bound
+each input at the point it enters. `_MAX_BODY`'s all-or-nothing degradation is what turns a
+size overrun into total evidence loss, and a staged degradation — drop the least essential
+field first, keep the verdict and the baseline — would be the structural fix. That is a
+change to a merged, reviewed function with its own callers, so it is **not** made here;
+it is the shape of the follow-up if this recurs.
+
+### Round 4 — closing the class instead of the fourth instance
+
+Three rounds found one class by hand, and the fuzzer watched all three go by. Round 3's
+review said why, precisely: *"the new multiple-choice property bounds generated labels to
+24 characters, while the general snapshot property uses `ForecastHistory(())`, so neither
+exercises large observed labels."* `test_a_snapshot_is_storable_and_survives_its_own_round_
+trip` **did** assert `len(snapshot) <= _MAX_BODY` — against an empty history, so the branch
+that renders observed values was never entered. The assertion was there and it was vacuous,
+which is this project's most expensive recurring defect (M1-501's one-sided conditional,
+M1-607's substring no-leak, and the three properties in this item's own first pass that
+passed against broken code).
+
+So round 4 adds the property those three rounds should have been.
+`test_no_accepted_input_can_cost_a_snapshot_its_evidence` asserts the invariant the caps
+exist to guarantee, rather than a consequence of it:
+
+> For every input this module accepts, the envelope fits `_MAX_BODY` **and still names its
+> evidence** — the reduced `values_omitted` form is unreachable.
+
+It draws every bound at its maximum simultaneously — up to `_MAX_CATEGORIES` labels at
+`_MAX_OPTION_LABEL` characters, each character one `ensure_ascii=True` escapes to six
+bytes, against observed vectors up to 2,000 long — and carries a stronger claim on the
+`confirmed` branch, which is the row an auditor may later have to check: a confirmation
+must always be able to show the values it was confirmed by. The observed vector is drawn
+as a *length* and repeated rather than element-wise, because the property is about
+rendered size and drawing 2,000 floats per example would spend the budget on the strategy
+instead of the assertion.
+
+**Three mutations, all killed** — removing the `_MAX_SNAPSHOT_VALUES` cap, raising
+`_MAX_OPTION_LABEL` to 512, and reporting the truncated length as the true one. The second
+is worth reading: it fails with `{'outcome': 'unreadable', 'values_omitted': True}`, which
+is the exact shape round 3 spent a round on.
+
+`ENTRIES` was also widened from `max_size=6` to 32. Six is below every vector this module
+actually sees — 201 for a CDF, up to `_MAX_CATEGORIES` for multiple choice — so the
+comparison properties had been judging only lengths the platform never sends.
+
+### Round 4 — two docstring claims that had gone false
+
+`build_verification_snapshot`'s docstring still asserted that value counts *"are bounded by
+`plan_from_payload` … so the rendering cannot approach `_MAX_BODY`"* and that *"the
+fallback below is unreachable given those bounds"*. `plan_from_payload` bounds only the
+**expected** side; the observed side is provider JSON, and rounds 3 and 4 both reached that
+fallback. It also promised replayability through `observed.labels`, a field round 3
+replaced with `label_order`. In a module whose docstring *is* the format's documentation,
+a claim that invites a maintainer to delete a cap is a defect, so both were rewritten to
+say what is true: each bound is named, each is attributed to the round that bought it, and
+the fallback is described as reachable-in-principle and forbidden to `confirmed` rows.
+
+### Round 4 — the schema version follows the envelope
+
+`latest_value_count` is a new field, so `VERIFICATION_SCHEMA_VERSION` goes to **1.2.0**,
+matching the branch's own precedent (round 1 bumped `1.0.0 → 1.1.0` for the same kind of
+additive change). Nothing in-tree reads the field — `verify_uncertain_attempt` consumes
+only `question_type`, `expected_values`, `expected_labels` and `baseline.latest_start_time`
+— and no row has ever been persisted, so this cannot cause a misread today. It is a
+consistency fix, and free: `read_verification_snapshot` keys on exact equality, and two
+different envelope shapes must not share one version string.
+
 ### On the mutation pass
 
 Fourteen deliberate mutations were run against the unit suite before the first review, each

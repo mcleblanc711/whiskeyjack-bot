@@ -48,7 +48,10 @@ from whiskeyjack_bot.submission_live import (
     _CATEGORY_SUM_TOLERANCE,
     _LIVE_ERROR_TYPES,
     _MAX_BODY,
+    _MAX_CATEGORIES,
     _MAX_IDENTIFIER,
+    _MAX_OPTION_LABEL,
+    _MAX_SNAPSHOT_VALUES,
     BinaryPost,
     ForecastEntry,
     ForecastHistory,
@@ -348,8 +351,11 @@ def test_a_cdf_is_accepted_exactly_at_the_configured_point_count(length: int) ->
 ENTRIES = st.builds(
     ForecastEntry,
     start_time=st.floats(min_value=0.0, max_value=1e12, allow_nan=False, allow_infinity=False),
+    # Was `max_size=6`. Six is below every real vector this module sees -- 201 for a CDF,
+    # up to `_MAX_CATEGORIES` for multiple choice -- so the comparison properties were
+    # judging only lengths the platform never sends. Round 4.
     values=st.lists(
-        st.floats(0.0, 1.0, allow_nan=False, allow_infinity=False), min_size=1, max_size=6
+        st.floats(0.0, 1.0, allow_nan=False, allow_infinity=False), min_size=1, max_size=32
     ).map(tuple),
 )
 
@@ -621,6 +627,124 @@ def test_a_snapshot_is_storable_and_survives_its_own_round_trip(
     parsed = read_verification_snapshot(snapshot)
     assert parsed["question_type"] == plan.question_type
     assert tuple(parsed["expected_values"]) == expected_values(plan)  # type: ignore[arg-type]
+
+
+# ── the evidence envelope ────────────────────────────────────────────────────
+#
+# Round 4. Three consecutive review rounds found the same class by hand -- an unbounded
+# provider-supplied field rendered into a fixed-size envelope, pushing it past `_MAX_BODY`
+# and collapsing it to the reduced form that names no values at all. Round 1 found it in
+# the option list, round 3 in the label strings, round 4 in the observed vector.
+#
+# The reason a fuzzer never found it is written in round 3's review: the multiple-choice
+# properties bounded generated labels to a couple of characters, and the snapshot
+# round-trip property passed `ForecastHistory(())` -- an *empty* history, so the branch
+# that renders observed values was never entered. Its `len(snapshot) <= _MAX_BODY`
+# assertion was therefore vacuous for exactly the invariant that kept failing. That is the
+# `strategy could not reach the branch it claims to cover` failure this file's own header
+# warns about, and M1-501 and M1-607 before it.
+#
+# So the invariant is asserted directly, at the maximum of every accepted input at once.
+
+MAXIMAL_LABELS = st.builds(
+    # Unique by the index suffix, and padded with a character `ensure_ascii=True` escapes
+    # to six bytes -- the worst case the bound was computed against, not the ASCII best
+    # case that would make any cap look sufficient.
+    lambda count, length: tuple(("é" * (length - 3)) + f"{index:03d}" for index in range(count)),
+    count=st.integers(1, _MAX_CATEGORIES),
+    length=st.integers(4, _MAX_OPTION_LABEL),
+)
+
+
+@given(
+    question_type=st.sampled_from(["binary", "numeric", "multiple_choice"]),
+    labels=MAXIMAL_LABELS,
+    # Far past anything the platform should send, and past `_MAX_SNAPSHOT_VALUES`. Drawn
+    # as a *length* and repeated rather than drawn element-wise: the property is about the
+    # rendered size, and generating two thousand floats per example would spend the whole
+    # budget on the strategy instead of the assertion.
+    observed_length=st.integers(0, 2000),
+    observed_value=st.floats(0.0, 1.0, allow_nan=False, allow_infinity=False),
+    reversed_order=st.booleans(),
+)
+def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
+    question_type: str,
+    labels: tuple[str, ...],
+    observed_length: int,
+    observed_value: float,
+    reversed_order: bool,
+) -> None:
+    """The reduced `values_omitted` envelope is unreachable for anything this module accepts.
+
+    **This is the property the three rounds should have been.** It says the thing the caps
+    exist to guarantee, rather than a consequence of it: whatever the operator's payload
+    and whatever the platform reports back, the snapshot fits `_MAX_BODY` *and still names
+    its evidence*. Delete `_MAX_SNAPSHOT_VALUES`, or raise `_MAX_OPTION_LABEL`, and the
+    maximal envelope goes back over the limit and this fails.
+
+    The `confirmed` case carries the stronger claim, because that is the row that makes an
+    assertion an auditor may later have to check: a confirmation must always be able to
+    show the values it was confirmed by.
+    """
+    if question_type == "multiple_choice":
+        probabilities = tuple(1.0 / len(labels) for _ in labels)
+        plan = MultipleChoicePost(
+            probability_yes_per_category=tuple(zip(labels, probabilities, strict=True))
+        )
+        expected = expected_values(plan)
+        expected_labels: tuple[str, ...] | None = expected_option_labels(plan)
+        platform_order: tuple[str, ...] | None = (
+            tuple(reversed(labels)) if reversed_order else labels
+        )
+    elif question_type == "numeric":
+        expected = tuple(index / (CDF_POINTS - 1) for index in range(CDF_POINTS))
+        expected_labels = None
+        platform_order = None
+    else:
+        expected = (0.6,)
+        expected_labels = None
+        platform_order = None
+
+    observed = ForecastHistory(
+        (ForecastEntry(200.0, (observed_value,) * observed_length),), platform_order
+    )
+    result = classify_refetch(
+        question_type=question_type,
+        expected=expected,
+        baseline_latest_start_time=100.0,
+        observed=observed,
+        expected_labels=expected_labels,
+    )
+    rendered = build_verification_snapshot(
+        question_type=question_type,
+        expected=expected,
+        baseline_entry_count=1,
+        baseline_latest_start_time=100.0,
+        result=result,
+        expected_labels=expected_labels,
+    )
+    snapshot = read_verification_snapshot(rendered)
+
+    assert len(rendered) <= _MAX_BODY
+    # The whole point: the envelope never degrades to the form that names nothing.
+    assert "values_omitted" not in snapshot
+    assert snapshot["expected_values"] == list(expected)
+
+    seen = snapshot["observed"]
+    assert isinstance(seen, dict)
+    # The true length, always -- never the truncated one. A row that reported the sample
+    # size as the real size would hide the truncation instead of recording it.
+    assert seen["latest_value_count"] == observed_length
+    assert len(seen["latest_values"]) == min(observed_length, _MAX_SNAPSHOT_VALUES)
+
+    if result.outcome == "confirmed":
+        # A confirmation is an assertion about a paid post, so it must be replayable from
+        # the row alone: nothing it was confirmed by may have been sampled away.
+        assert observed_length <= _MAX_SNAPSHOT_VALUES
+        assert seen["latest_values"] == [observed_value] * observed_length
+        if question_type == "multiple_choice":
+            assert snapshot["expected_labels"] == list(labels)
+            assert seen["label_order"] is not None
 
 
 @given(snapshot=ANY_VALUE)
