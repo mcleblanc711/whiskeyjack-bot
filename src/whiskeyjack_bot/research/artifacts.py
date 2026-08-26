@@ -44,13 +44,17 @@ Purely local file I/O: no network access on any path through here.
 from __future__ import annotations
 
 import json
-import os
-import re
-import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from whiskeyjack_bot.artifacts import (
+    ArtifactError,
+    require_int,
+    require_safe_component,
+    write_new_file,
+)
 
 ARTIFACT_SCHEMA_VERSION = "1.0.0"
 
@@ -58,41 +62,29 @@ ARTIFACT_SCHEMA_VERSION = "1.0.0"
 # other artifact kinds (raw model output, M1-406) get their own namespace.
 _RESEARCH_SUBDIR = "research"
 
-# A retrieval run id becomes a path component, so it is constrained to characters that
-# cannot escape the artifact root or name a directory entry with a meaning of its own.
-# The operator is not the adversary here (see CLAUDE.md's threat boundary) -- this
-# refuses a *caller mistake*, before any I/O, rather than an attack: a run id carrying
-# a separator would write outside the tree the ledger's relative paths are resolved in.
-_SAFE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# What this module's messages call its artifacts, passed to the shared writer so its
+# "never overwritten" message names the kind. A literal, never content.
+_WHAT = "retrieval artifact"
 
-
-class ArtifactError(Exception):
-    """A retrieval artifact cannot be written or read back.
-
-    Same hygiene rule as ``SnapshotError``: the message never echoes a provider
-    response body, and sanitizing raises use ``from None`` so an underlying
-    exception cannot reprint one through its text or a rendered traceback.
-    Filesystem paths are the carve-out and are rendered.
-    """
+# `ArtifactError`, the safe-path-component rule, the int guard and the atomic
+# never-overwrite writer moved to `whiskeyjack_bot.artifacts` when M1-406 added a second
+# artifact kind. `ArtifactError` is re-exported here rather than renamed: it is this
+# module's public error type and every caller imports it from here.
+__all__ = [
+    "ARTIFACT_SCHEMA_VERSION",
+    "ArtifactError",
+    "artifact_relative_path",
+    "read_raw_responses",
+    "write_raw_responses",
+]
 
 
 def _require_safe_run_id(retrieval_run_id: object) -> str:
-    if type(retrieval_run_id) is not str or not _SAFE_RUN_ID_RE.match(retrieval_run_id):
-        # No value in the message: a run id is row content. The rule it broke is
-        # this module's own literal and is safe to state.
-        raise ArtifactError(
-            "retrieval_run_id must be 1-128 characters of [A-Za-z0-9._-] starting "
-            "alphanumeric: it becomes a path component (offending input withheld)"
-        )
-    return retrieval_run_id
+    return require_safe_component(retrieval_run_id, field="retrieval_run_id")
 
 
 def _require_int(value: object, field: str) -> int:
-    # type() is int rather than isinstance: bool subclasses int, and True would
-    # otherwise become the directory "1".
-    if type(value) is not int:
-        raise ArtifactError(f"{field} must be an int")
-    return value
+    return require_int(value, field)
 
 
 def artifact_relative_path(*, question_id: int, retrieval_run_id: str) -> str:
@@ -178,56 +170,8 @@ def write_raw_responses(
 
     relative = artifact_relative_path(question_id=question, retrieval_run_id=run_id)
     destination = artifact_root / relative
-    _write_new_file(destination, payload)
+    write_new_file(destination, payload, what=_WHAT)
     return relative
-
-
-def _write_new_file(destination: Path, payload: bytes) -> None:
-    """Create ``destination`` with ``payload``, atomically, never overwriting.
-
-    A temp file in the destination's own directory is written and fsynced, then
-    ``os.link`` moves it into place -- ``link`` fails with ``EEXIST`` rather than
-    replacing, so "do not overwrite" is atomic against a concurrent writer instead
-    of a check that can be raced. ``os.replace`` would have been the usual atomic
-    rename and is exactly wrong here: it clobbers.
-
-    The failure mode is a stray temp file, never a half-written artifact.
-    """
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        raise ArtifactError(f"cannot create artifact directory {destination.parent}") from None
-    if destination.exists():
-        # Reported before the write attempt so the common case has a message that
-        # says what happened; the link below is what actually makes it safe.
-        raise ArtifactError(
-            f"retrieval artifact already exists and is never overwritten: {destination}"
-        )
-    handle, temp_name = -1, ""
-    try:
-        handle, temp_name = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
-        with os.fdopen(handle, "wb") as stream:
-            handle = -1  # fdopen took ownership; the finally below must not close it twice.
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temp_name, destination)
-    except FileExistsError:
-        raise ArtifactError(
-            f"retrieval artifact already exists and is never overwritten: {destination}"
-        ) from None
-    except OSError:
-        raise ArtifactError(f"cannot write retrieval artifact {destination}") from None
-    finally:
-        if handle != -1:
-            os.close(handle)
-        if temp_name:
-            # The link either succeeded (the content now has two names) or failed
-            # (the temp file is garbage). Either way the temp name goes.
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
 
 
 def _reject_json_constant(token: str) -> object:

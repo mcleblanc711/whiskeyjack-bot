@@ -96,11 +96,8 @@ from config instead.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-from collections.abc import Sequence
-from dataclasses import dataclass, field
 from datetime import datetime
 from math import isfinite
 from typing import Any, Protocol
@@ -111,8 +108,6 @@ from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import 
 )
 
 from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS, AppConfig, ForecastConfig
-from whiskeyjack_bot.forecast.attribution import attribution_problems
-from whiskeyjack_bot.forecast.binary import binary_output_problems
 from whiskeyjack_bot.forecast.inputs import (
     ForecastInputError,
     ModelInput,
@@ -120,11 +115,22 @@ from whiskeyjack_bot.forecast.inputs import (
     build_model_input,
     render_model_input,
 )
+
+# The parse path and the two value objects it produces live in `forecast.parse`, which
+# imports no provider SDK, so M1-406's replay can run the *identical* parse without pulling
+# a client into the process. Only what this module actually uses is imported back --
+# `forecast.parse` is the real home and every other consumer names it directly, rather than
+# this module becoming a shim that quietly keeps the old coupling readable.
+from whiskeyjack_bot.forecast.parse import (
+    ForecastGeneration,
+    ModelSettings,
+    _classify,
+    _parse,
+)
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
     ForecastSchemaError,
     response_model_for,
-    validate_forecast_response,
 )
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
@@ -144,16 +150,6 @@ _REPAIR_PREAMBLE = (
     "nothing else: no Markdown fences, no commentary, no trailing text. Keep every "
     "field required by the schema for this question type. The problems were:"
 )
-
-# Used when the previous reply was not one JSON object at all. Deliberately a
-# constant: a JSONDecodeError's text is positional rather than quoting content today,
-# but that is a property of the stdlib's current wording and not a contract.
-_NOT_JSON = "the reply was not a single JSON object"
-
-# Markdown fences the model may wrap its JSON in despite being told not to. The
-# package's own strip_code_block_markdown only fires when the string both starts and
-# ends with a fence; this is the same idea without entering that module.
-_FENCES = ("```json", "```JSON", "```")
 
 
 class ForecastGenerationError(Exception):
@@ -184,49 +180,6 @@ class Forecaster(Protocol):
     model: str
 
     async def invoke(self, prompt: Any, system_prompt: str | None = None) -> str: ...
-
-
-@dataclass(frozen=True)
-class ModelSettings:
-    """What the call was actually made with, for M1-406 to persist.
-
-    Built from config and the loaded prompt, never from ``GeneralLlm.to_dict()``,
-    which dumps the API key verbatim.
-    """
-
-    provider: str
-    name: str
-    temperature: float
-    max_output_tokens: int
-    timeout_seconds: float
-    allowed_tries: int
-    prompt_version: str
-    prompt_sha256: str
-
-
-@dataclass(frozen=True)
-class ForecastGeneration:
-    """The outcome of one forecast attempt, successful or not.
-
-    ``forecast`` is ``None`` exactly when ``failure_code`` is set. Both the request
-    and every response are carried so M1-406 can persist and replay them, and both are
-    ``repr=False`` for the reason ``LoadedPrompt.text`` is: the default dataclass repr
-    would print a whole research packet and a whole model response through any log
-    line or frame-capturing traceback.
-    """
-
-    forecast: ForecastResponse | None
-    settings: ModelSettings
-    sources: tuple[SourceReference, ...]
-    request: str = field(repr=False)
-    raw_responses: tuple[str, ...] = field(repr=False)
-    invocations: int
-    repair_attempted: bool
-    cost_usd: float | None
-    failure_code: PreForecastFailureCode | None
-    # The sanitized problem list from forecast.schema: field paths and validator
-    # messages, safe to log and to store. Empty on success.
-    failure_problems: tuple[str, ...]
 
 
 def _require_forecaster(client: Forecaster, config: AppConfig) -> None:
@@ -294,91 +247,6 @@ def _require_provider_matches_model(config: AppConfig) -> None:
             "model.provider does not match the prefix of model.name; the ledger "
             "records both and they must agree (offending input withheld)"
         )
-
-
-def _strip_fences(text: str) -> str:
-    stripped = text.strip()
-    for fence in _FENCES:
-        if stripped.startswith(fence) and stripped.endswith("```") and len(stripped) > len(fence):
-            return stripped[len(fence) :].removesuffix("```").strip()
-    return stripped
-
-
-def _output_problems(
-    forecast: ForecastResponse,
-    forecast_config: ForecastConfig,
-    *,
-    question_id: int,
-    source_ids: Sequence[str],
-) -> list[str]:
-    """The config-, question- and input-dependent checks ``forecast.schema`` omits.
-
-    Two layers. **M1-501's cross-type attribution rules run first**, and they apply to
-    every question type: the fields that row names, plus every citation resolved against
-    the ids ``forecast.inputs`` actually minted for this packet.
-
-    Then the type-specific layer, keyed on the ``question_type`` literal and never
-    ``isinstance``: ``DiscreteQuestion`` subclasses ``NumericQuestion`` in the pinned
-    SDK, and this project has the rule because dispatching the other way silently
-    forecasts an unsupported type as numeric.
-
-    Only ``binary`` has type-specific checks today. The multiple-choice option set is
-    **M1-404's** stated criterion and the numeric percentile levels are **M1-405's**;
-    each adds its branch below, and neither is approximated in the meantime.
-    """
-    problems = attribution_problems(forecast, question_id=question_id, source_ids=source_ids)
-    if forecast.question_type == "binary":
-        problems.extend(binary_output_problems(forecast, forecast_config))
-    return problems
-
-
-def _parse(
-    text: str,
-    model: type[ForecastResponse],
-    forecast_config: ForecastConfig,
-    *,
-    question_id: int,
-    source_ids: Sequence[str],
-) -> tuple[ForecastResponse | None, list[str]]:
-    """Parse and validate one response; returns the forecast or the problems.
-
-    An empty problem list with a ``None`` forecast is impossible: every failure path
-    supplies at least one sanitized problem string.
-
-    The configured-bounds and attribution checks run *here*, inside the attempt loop,
-    rather than on the returned result. That is what makes an out-of-bounds probability
-    or an unresolvable citation repairable at the cost of the second call this module
-    already budgets, instead of a billed call thrown away -- and their problems are the
-    same sanitized shape as the schema's, so the repair turn and the failure
-    classification below need no special case for them.
-    """
-    try:
-        payload = json.loads(_strip_fences(text))
-    except Exception:
-        # Broad and scoped to the one call, the M1-308 round-7 rule: json.loads
-        # raises more than JSONDecodeError once the input is not a str.
-        return None, [_NOT_JSON]
-    if not isinstance(payload, dict):
-        return None, [_NOT_JSON]
-    try:
-        forecast = validate_forecast_response(payload, model)
-    except ForecastSchemaError as exc:
-        return None, list(exc.problems)
-    # Cannot raise: the response is provably the model this dispatch selected,
-    # ``generate_forecast`` refuses an inverted bounds pair before anything is spent,
-    # and it exact-type gates ``question_id`` there too -- so neither checker can meet
-    # the caller mistakes each of them refuses.
-    problems = _output_problems(
-        forecast, forecast_config, question_id=question_id, source_ids=source_ids
-    )
-    if problems:
-        return None, problems
-    return forecast, []
-
-
-def _classify(problems: list[str]) -> PreForecastFailureCode:
-    """``malformed_response`` when the reply was not JSON, else ``schema_invalid``."""
-    return "malformed_response" if problems == [_NOT_JSON] else "schema_invalid"
 
 
 def _repair_turn(problems: list[str]) -> str:
@@ -584,7 +452,9 @@ def _run_attempts(
     # ``forecast.inputs`` assigned over this packet's documents in ``dedup_key`` order,
     # and it is exactly what the model was shown under ``research_documents``. Mapped
     # here rather than inside ``forecast.attribution``, which must stay free of
-    # ``forecast.inputs`` and the provider SDK that module reaches (M1-406's replay path).
+    # ``forecast.inputs`` (M1-406's replay path). That module no longer reaches a provider
+    # SDK -- see its header -- but the independence is a property of attribution.py's own
+    # signature rather than of another package's __init__.py, which is the point.
     source_ids = tuple(reference.source_id for reference in sources)
     raw_responses: list[str] = []
     # The exa.py accounting shape: attempts are counted the moment a call is about to

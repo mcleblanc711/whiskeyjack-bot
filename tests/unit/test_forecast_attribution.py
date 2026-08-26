@@ -35,7 +35,7 @@ from whiskeyjack_bot.forecast.attribution import (
     validate_attribution_fields,
 )
 from whiskeyjack_bot.forecast.binary import binary_output_problems
-from whiskeyjack_bot.forecast.generate import _output_problems
+from whiskeyjack_bot.forecast.parse import _output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastResponse,

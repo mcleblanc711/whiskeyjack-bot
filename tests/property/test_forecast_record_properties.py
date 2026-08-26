@@ -27,7 +27,7 @@ from hypothesis import strategies as st
 
 from strategies import HOSTILE_TEXT  # type: ignore[import-not-found]
 
-from whiskeyjack_bot.forecast.generate import ForecastGeneration, ModelSettings
+from whiskeyjack_bot.forecast.parse import ForecastGeneration, ModelSettings
 from whiskeyjack_bot.forecast.inputs import SourceReference
 from whiskeyjack_bot.forecast.record import (
     ForecastRecord,

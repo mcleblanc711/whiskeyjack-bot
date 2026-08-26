@@ -27,20 +27,24 @@ supplied order on purpose, and replay reads documents back ordered by
 ``canonical_url, content_sha256``, so anything keyed on the tuple order would assign
 different ids to the same evidence on replay.
 
-This module imports no provider SDK **itself**, and that claim is deliberately not
-widened, because measuring it says otherwise: importing
-``whiskeyjack_bot.questions.model`` loads ``forecasting_tools``, ``asknews_sdk``,
-``litellm``, ``httpx`` and ``streamlit``. The coupling is not here -- it is the
-``questions/__init__.py`` re-export block, which pulls in ``normalize`` and through it
-the pinned SDK, so *any* importer of the canonical question model inherits it.
+This module imports no provider SDK, **and that is now measured rather than hedged.**
+When M1-402 wrote this paragraph it said the opposite, and correctly so at the time:
+``questions/__init__.py`` re-exported every submodule, so importing
+``whiskeyjack_bot.questions.model`` pulled in ``normalize`` and through it
+``forecasting_tools``, ``asknews_sdk``, ``litellm``, ``httpx`` and ``streamlit``. That
+block has since been gutted -- the same fix M1-308 round 4 applied to
+``research/__init__.py`` -- and a fresh interpreter importing this module now loads none
+of them.
 
-That is the same condition M1-308 round 4 found and fixed for ``research/__init__.py``
-(7.0s and three stray warnings into ``verify-env``'s output, 0.204s after gutting),
-and it is **pre-existing on this branch's diff base** with no live symptom:
-``env_verify`` and ``cli`` import no canonical question, and
-``tests/unit/test_env_verify.py`` already fails if that changes. Filed as **M1-204**
-rather than fixed here, per the rule that a pre-existing condition is a backlog row
-and not a cross-item edit on a review branch.
+M1-406 turned that from a nice property into a load-bearing one: ``forecast/replay.py``
+names :class:`SourceReference` at runtime, so a re-export block reappearing in
+``questions/__init__.py`` would put a provider client back on the replay path. It is
+asserted out of process by
+``tests/unit/test_forecast_generate.py::test_the_response_schema_reaches_no_provider_client``
+rather than described here, because a fact a replay path depends on belongs in the
+assertion. **M1-204's acceptance criteria appear already met on master** -- observed while
+building M1-406, left as a backlog row for its owner to verify and flip rather than
+flipped from another item's branch.
 
 ``forecast.schema`` *is* clean, and that one is load-bearing rather than tidy: M1-406
 must replay a stored response without the provider client being reachable at all.

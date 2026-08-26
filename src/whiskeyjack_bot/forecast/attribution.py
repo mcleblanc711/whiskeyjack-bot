@@ -76,12 +76,19 @@ both.
 
 **Primitives, not ``ModelInput``.** The natural signature would take the built reasoning
 packet, which carries both the question id and the source mapping. It is not taken,
-because importing ``forecast.inputs`` reaches ``questions.model`` and through it
-``forecasting_tools``, ``litellm`` and ``httpx`` (``inputs.py``, filed as M1-204) -- and
-like ``forecast/schema.py`` and ``forecast/binary.py``, this has to stay reachable from
-M1-406's replay path with the provider client not importable at all. The caller maps
+because when M1-501 chose the signature, importing ``forecast.inputs`` reached
+``questions.model`` and through it ``forecasting_tools``, ``litellm`` and ``httpx``
+(``inputs.py``, filed as M1-204) -- and like ``forecast/schema.py`` and
+``forecast/binary.py``, this has to stay reachable from M1-406's replay path with the
+provider client not importable at all. The caller maps
 ``tuple(reference.source_id for reference in model_input.sources)``, which is one line at
 the one call site.
+
+That coupling is **gone** -- ``questions/__init__.py``'s re-export block has since been
+gutted, and M1-406's import-graph test now pins ``forecast.inputs`` clean alongside this
+module. The signature stays as it is anyway: taking primitives is what makes this
+module's independence a property of its own interface rather than of another package's
+``__init__.py``, which is exactly the thing that changed underneath it once already.
 """
 
 from __future__ import annotations
