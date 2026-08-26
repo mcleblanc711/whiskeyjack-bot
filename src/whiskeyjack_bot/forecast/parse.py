@@ -22,9 +22,13 @@ reconstructs a ``ForecastGeneration`` from a stored artifact and hands it to
 ``forecast.record.build_forecast_record_draft``, and a value object that cannot be built
 without the SDK is not a value object a replay can use.
 
-**This is adjacent to M1-506 but is not it.** ``_output_problems`` stays private and
-uncomposed; M1-506's row is a *public* composed output-validation entry point that
-``generate`` defines itself in terms of. Moving a private function does not close that.
+**M1-506 has since closed the seam this module used to hold open.** The private
+``_output_problems`` that composed the output checkers lived here, with one caller; it is
+gone, and ``_parse`` calls ``forecast.validate.output_problems`` instead. That is the whole
+of "defined in terms of it rather than beside it" -- there is no local copy left to
+diverge, and a caller that is not generating (``forecast.store``, a replay) reaches the
+same composition by name. ``forecast.validate`` obeys the same no-SDK rule as this module
+and is pinned by the same import-graph test.
 """
 
 from __future__ import annotations
@@ -34,14 +38,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from whiskeyjack_bot.config import ForecastConfig
-from whiskeyjack_bot.forecast.attribution import attribution_problems
-from whiskeyjack_bot.forecast.binary import binary_output_problems
 from whiskeyjack_bot.forecast.inputs import SourceReference
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
     ForecastSchemaError,
     validate_forecast_response,
 )
+from whiskeyjack_bot.forecast.validate import output_problems
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
 
 
@@ -107,34 +110,6 @@ def _strip_fences(text: str) -> str:
     return stripped
 
 
-def _output_problems(
-    forecast: ForecastResponse,
-    forecast_config: ForecastConfig,
-    *,
-    question_id: int,
-    source_ids: Sequence[str],
-) -> list[str]:
-    """The config-, question- and input-dependent checks ``forecast.schema`` omits.
-
-    Two layers. **M1-501's cross-type attribution rules run first**, and they apply to
-    every question type: the fields that row names, plus every citation resolved against
-    the ids ``forecast.inputs`` actually minted for this packet.
-
-    Then the type-specific layer, keyed on the ``question_type`` literal and never
-    ``isinstance``: ``DiscreteQuestion`` subclasses ``NumericQuestion`` in the pinned
-    SDK, and this project has the rule because dispatching the other way silently
-    forecasts an unsupported type as numeric.
-
-    Only ``binary`` has type-specific checks today. The multiple-choice option set is
-    **M1-404's** stated criterion and the numeric percentile levels are **M1-405's**;
-    each adds its branch below, and neither is approximated in the meantime.
-    """
-    problems = attribution_problems(forecast, question_id=question_id, source_ids=source_ids)
-    if forecast.question_type == "binary":
-        problems.extend(binary_output_problems(forecast, forecast_config))
-    return problems
-
-
 def _parse(
     text: str,
     model: type[ForecastResponse],
@@ -167,11 +142,13 @@ def _parse(
         forecast = validate_forecast_response(payload, model)
     except ForecastSchemaError as exc:
         return None, list(exc.problems)
-    # Cannot raise: the response is provably the model this dispatch selected,
-    # ``generate_forecast`` refuses an inverted bounds pair before anything is spent,
-    # and it exact-type gates ``question_id`` there too -- so neither checker can meet
-    # the caller mistakes each of them refuses.
-    problems = _output_problems(
+    # Cannot raise, on all three of its paths: the response is provably the model this
+    # dispatch selected, so its ``question_type`` is a validated Literal the registry
+    # covers and the member checkers cannot meet a response of the wrong category;
+    # ``generate_forecast`` refuses an inverted bounds pair before anything is spent; and
+    # it exact-type gates ``question_id`` there too. Those are the caller mistakes
+    # ``validate.output_problems`` and its members refuse, and none is reachable here.
+    problems = output_problems(
         forecast, forecast_config, question_id=question_id, source_ids=source_ids
     )
     if problems:
