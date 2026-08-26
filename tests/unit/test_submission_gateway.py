@@ -114,8 +114,15 @@ def test_dry_run_gateway_satisfies_the_protocol() -> None:
 
 
 def test_receipt_carries_every_handoff_field() -> None:
-    """CODEX_HANDOFF's list, plus `mode` and `artifact_path`, and nothing silently absent."""
-    assert set(asdict(_gateway().submit(_request()))) == {
+    """CODEX_HANDOFF's list, plus `mode` and `artifact_path`, and nothing silently absent.
+
+    `verified_by_refetch` is in the handoff's list and is deliberately NOT here: M2-711
+    made it a derived property over `refetch_outcome`, and `asdict` renders fields. It is
+    asserted as an attribute in the test below, which is how every caller reads it.
+    """
+    receipt = _gateway().submit(_request())
+    assert receipt.verified_by_refetch is False
+    assert set(asdict(receipt)) == {
         "mode",
         "attempt_id",
         "forecast_record_id",
@@ -129,7 +136,7 @@ def test_receipt_carries_every_handoff_field() -> None:
         "success",
         "error_type",
         "error_message",
-        "verified_by_refetch",
+        "refetch_outcome",
         "refetched_forecast_snapshot",
         "artifact_path",
     }
@@ -140,6 +147,9 @@ def test_a_dry_run_claims_no_post_and_invents_no_failure() -> None:
     receipt = _gateway().submit(_request())
     assert receipt.mode == "dry_run"
     assert receipt.success is False
+    # `unreadable`, not `absent`: no refetch ran, so claiming the platform was looked at
+    # and found empty would be the fabricated cause this test is named for (M2-711).
+    assert receipt.refetch_outcome == "unreadable"
     assert receipt.verified_by_refetch is False
     assert receipt.http_status is None
     assert receipt.response_body is None
@@ -390,7 +400,7 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
             completed_at_utc=receipt.completed_at_utc,
             request_payload_sha256=receipt.request_payload_sha256,
             success=False,
-            verified_by_refetch=False,
+            refetch_outcome="absent",
         ),
         occurred_at=OCCURRED,
         detail_code="internal_error",
@@ -405,7 +415,7 @@ def _live(record_id: str = "rec-1", attempt_id: str = "att-live-1") -> Submissio
         attempt_id=attempt_id,
         forecast_record_id=record_id,
         success=True,
-        verified_by_refetch=True,
+        refetch_outcome="confirmed",
         http_status=201,
         response_body='{"ok": true}',
     )

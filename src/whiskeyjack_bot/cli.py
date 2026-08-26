@@ -419,7 +419,7 @@ def _run_submit(args: argparse.Namespace) -> int:
         print(f"key:       {receipt.idempotency_key}")
         print(
             f"result:    {recorded.event.event_type} "
-            f"(success={receipt.success}, verified_by_refetch={receipt.verified_by_refetch})"
+            f"(success={receipt.success}, refetch={receipt.refetch_outcome})"
         )
         if receipt.error_type is not None:
             print(f"error:     {receipt.error_type}: {receipt.error_message}")

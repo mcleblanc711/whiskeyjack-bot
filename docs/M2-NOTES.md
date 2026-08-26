@@ -1136,6 +1136,14 @@ forecast version behind a fresh human approval.
 The alternative was to write `verified_by_refetch=True` for a refetch that never happened,
 which is a lie in the primary artifact. **M2-711** is filed for the missing state.
 
+**Closed by M2-711** (2026-08-26, migration `009`). The state exists now: such a post lands
+`submission_uncertain`, the record stays `approved`, and a later refetch can still decide
+it. The mitigation this section describes is gone with the risk —
+`test_a_failed_post_and_an_unreadable_refetch_says_so_in_the_row` is now
+`..._is_unknown_not_failed` and asserts the *absence* of the prose note, because the ledger
+says it in a column. What M2-711 did **not** need was a twelfth `event_type`; see its own
+section for why that would have cost a rebuild of `lifecycle_events`.
+
 ### Round 1 — three blocking findings, all reproduced by execution first
 
 `GPT_REVIEW_RESPONSE_M2-704_r1.md`, reviewed commit `bc1bbc4`. The review named the exact
@@ -1499,3 +1507,240 @@ defect: refusals from `canonical_payload_json` were arriving as the **base**
 `GatewayError`, which `LiveSubmissionError` subclasses — so `except LiveSubmissionError`
 did not catch them and `cli._run_submit` would have printed a traceback instead of
 `refused:`. `_wrap_gateway()` closes it, message preserved.
+
+## M2-711 — Record a submission whose outcome is unknown
+
+M2-704's own filed defect, closed. `record_submission_attempt` derived its event from
+`(success, verified_by_refetch)`, and that pair had no member meaning *"the post raised
+**and** the refetch could not be performed"*. It fell into `(False, False)` alongside the
+genuinely failed attempt, which `003` maps to `submission_failed` and therefore to terminal
+`failed` — a permanent claim that the post did not go through, made on no observation at
+all. See M2-704's "Standing risk" section above, now marked closed.
+
+The information already existed one layer up and the seam threw it away.
+`submission_live.classify_refetch` has returned a four-valued outcome since M2-704 —
+`confirmed` / `absent` / `mismatched` / `unreadable` — and its own docstring says why:
+*"`unreadable` is not `absent` either: a refetch that could not be performed observed
+nothing, and recording that as 'the forecast is not there' would let a lost connection
+become a permanent claim about a live forecast."* This item carries that vocabulary across
+the seam into the ledger.
+
+Delivered:
+
+- `src/whiskeyjack_bot/migrations/009_submission_refetch_outcome.sql` — one `ADD COLUMN`
+  (`submission_attempts.refetch_outcome`) and two `DROP`/`CREATE` trigger rewrites.
+- `src/whiskeyjack_bot/lifecycle.py` — `RefetchOutcome`; `SubmissionAttempt.refetch_outcome`
+  with `verified_by_refetch` derived; the widened partition in `record_submission_attempt`.
+- `src/whiskeyjack_bot/submission_gateway.py` — the same field/property change on
+  `SubmissionReceipt`, `refetch_outcome` in the artifact envelope,
+  `ARTIFACT_SCHEMA_VERSION` → `1.1.0`.
+- `src/whiskeyjack_bot/submission_live.py` — the outcome passed through instead of reduced;
+  the `_UNESTABLISHED_NOTE` prose removed; `RefetchOutcome` re-exported from `lifecycle`.
+- `src/whiskeyjack_bot/submission.py`, `src/whiskeyjack_bot/cli.py` — `AttemptSummary`
+  reports the column; `submit` prints it.
+- `tests/unit/test_lifecycle.py` (the eight-row partition, five raw-SQL trigger tests, the
+  pre-`009` legacy test), `tests/property/test_lifecycle_properties.py` (totality),
+  `tests/unit/test_submission_live.py` (the criterion end to end, both halves).
+
+Migration `009`, claimed in `docs/TRACKS.md` before the worktree existed. No new dependency.
+
+### Decision — the vocabulary member goes on `submission_attempts`, not `lifecycle_events`
+
+The backlog row says closing this *"needs a vocabulary member and therefore a migration"*.
+It does not say **which** vocabulary, and the two readings cost very different things.
+
+`lifecycle_events.event_type` is a column `CHECK` with eleven members. SQLite cannot widen a
+`CHECK` without rebuilding the table, and rebuilding `lifecycle_events` means dropping its
+append-only block triggers and copying every row out and back — which `003`'s own header
+calls *"precisely the operation the ledger exists to make impossible"*. `detail_code` is a
+`CHECK` on the same table, so a new `FailureCode` member would cost the same rebuild.
+
+`submission_attempts` has no such problem: `ADD COLUMN` reaches it, which is how `002`,
+`004` and `008` all added constrained columns, with the constraint living in a `BEFORE
+INSERT` trigger because `ADD COLUMN` cannot carry one. So `refetch_outcome` goes there, and
+`submission_uncertain` widens to cover the new cell.
+
+That is not a workaround wearing a design's clothes. `submission_uncertain` already means
+exactly what this state is: `approved → approved`, named by `unresolved_uncertainties` so
+`post_approved_forecast`'s gate stays shut against a blind retry, resolvable by
+`record_submission_verification` when a later refetch does establish something. A distinct
+event type would have been a **second name for one lifecycle state**, bought with a rebuild
+of the table every guarantee in this ledger rests on. *Why* an attempt is uncertain is
+carried by `detail_code` and now by `refetch_outcome`, which is what they are for.
+
+No `FailureCode` member was needed either: the post's own error code — `timeout`,
+`provider_unavailable`, `http_error` — is the honest account of why the outcome is unknown,
+and the trigger already requires an uncertain event to carry one.
+
+(Owner decision at plan time, with the alternative and its cost put side by side.)
+
+### Decision — four members, not a boolean, and `mismatched` moves with `unreadable`
+
+The minimal fix is one bit: *was the refetch performed at all*. Rejected for two reasons.
+
+It would be a **second spelling of part of** a vocabulary that already exists in
+`classify_refetch`, and the ledger would hold a lossy projection of a value the caller
+already had in full. `LiveErrorType`/`FailureCode` set the precedent for the opposite: the
+gateway's vocabulary and the ledger's are related by a total mapping written down once.
+
+And it would have left half the cell wrong. `classify_refetch` returns `mismatched` **only
+when an entry newer than the baseline is on the platform and does not match what was
+sent** — so for a post that also raised, "it did not go through and nothing is there" is
+false of `mismatched` too, in exactly the way it is false of `unreadable`. Whether that
+newer entry is this post landing garbled or something else entirely is a human judgement,
+and an uncertain record is where a human can still make it; terminal `failed` is where they
+cannot. Fixing one half of a cell and leaving the other is the stricter reading declined.
+
+This is wider than the row's literal words ("the refetch could not be performed"), and it is
+**the same cell and the same defect**, not a second item. Flagged here rather than left for
+a reviewer to notice.
+
+### Decision — `verified_by_refetch` becomes derived on both value objects
+
+`refetch_outcome = 'confirmed'` and `verified_by_refetch = True` are one fact. Keeping both
+as fields would have made them two things that can disagree, and the fix would have been a
+cross-check — which is exactly what M2-703's review rejected: *a value the writer also takes
+separately is a second source of truth; remove it, do not cross-check it.*
+
+So on `lifecycle.SubmissionAttempt` and `submission_gateway.SubmissionReceipt`,
+`verified_by_refetch` is now a `@property` over `refetch_outcome`. Every reader is unchanged
+— the CLI, the artifact envelope, the ledger writer all still ask the same question — and
+no caller can hand the writer two answers. The column is still written, because `001`
+declares it `NOT NULL`; it is derived in `record_submission_attempt` from the vocabulary
+member just validated, not read back off the property.
+
+The **raw-SQL path** is what the schema closes:
+`submission_attempts_require_receipt_on_insert` refuses a row where
+`(refetch_outcome = 'confirmed') <> (verified_by_refetch = 1)`. That clause is also why
+`lifecycle_events_validate_on_insert`'s `submitted` probe is left exactly as `003` wrote it
+— with the equivalence in force, `success = 1 AND verified_by_refetch = 1` and
+`success = 1 AND refetch_outcome = 'confirmed'` are the same condition, and restating it
+would be a second spelling rather than a second rule.
+
+One consequence worth naming: `dataclasses.asdict` renders fields, not properties, so an
+`asdict`ed receipt now carries `refetch_outcome` and not `verified_by_refetch`.
+`test_receipt_carries_every_handoff_field` asserts both halves of that deliberately.
+
+### Decision — `COALESCE(refetch_outcome, 'absent')`, and why it is not a default
+
+`ADD COLUMN` cannot add `NOT NULL` without a default, and no default is honest for a row
+nobody observed — `002`, `003`, `004` and `008` all say the same thing about their own added
+columns. So the column is `NULL`able in the DDL and **required by the trigger on every new
+row**: an attempt that declines to say what its refetch established reopens the exact
+question the column exists to settle.
+
+That leaves pre-`009` rows holding `NULL`, and the failed-event probe reads them as
+`absent`, which reproduces `003`'s rule for them verbatim. Nothing already written changes
+meaning. The `COALESCE` is unreachable for anything the ledger accepts from here on, and
+`test_an_attempt_written_before_009_still_partitions_by_the_old_rule` builds a genuine
+version-8 database — packaged migrations applied directly, real checksums recorded, so
+`ledger.py` accepts it as one a previous build produced — upgrades it, and drives both
+events through it.
+
+### Decision — `ARTIFACT_SCHEMA_VERSION` → `1.1.0`
+
+`_receipt_envelope` is shared by the dry-run and live artifact writers, and the live
+artifact is the operator-facing evidence of a live post, so `refetch_outcome` belongs in it.
+`read_submission_artifact` is exact-match on the version, so a `1.0.0` artifact is now
+refused rather than read with a field missing — and that is what the version is for.
+
+Accepting both versions was considered and rejected: a reader admitting two shapes has to
+decide what the absent field means for the older one, and the only honest answer
+("unknown") is a value the field has no member for. The practical cost is nil — M2-704
+merged the day before this branch and the submission path has never run against Metaculus,
+so no live artifact exists; a rehearsal artifact regenerates for free.
+
+### Rejected — a new `submission_outcome_unknown` event type
+
+Covered above: it is a second name for a state that already exists, and it costs a rebuild
+of `lifecycle_events`. It would read marginally better in a history dump. It is not worth
+dropping the block triggers on an append-only table to get, and the schema-level reason is
+written into `009`'s header so the next person weighing it sees the price first.
+
+### Rejected — widening `submission_verifications.outcome` to four members
+
+`VerificationOutcome` stays two-valued, and the asymmetry with the attempt path is
+deliberate. An **attempt** stores all four members because the question it answers is *what
+did we see when we posted*, and "nothing" is a real answer to it. A **verification** exists
+to decide an open uncertainty, and only `confirmed` and `absent` decide anything — so
+`verify_uncertain_attempt` still refuses to record `mismatched` or `unreadable` and leaves
+the uncertainty standing, which keeps the post gate closed, the conservative direction.
+Widening that table would add rows asserting no conclusion, on the table whose rows *are*
+the conclusions.
+
+### Deferred (do not read the absence as an omission)
+
+- **No backfill of `refetch_outcome` for pre-`009` rows.** There is nothing to backfill
+  *from*: the distinction the column records was not observed when those rows were written.
+  `NULL` is the honest value and the triggers read it as `003` did.
+- **`AttemptSummary` keeps both `verified_by_refetch` and `refetch_outcome` as real
+  fields.** It is a reader of two stored columns, and reporting what the ledger holds is its
+  whole job. The derivation belongs to the writer, where there is one fact to derive from.
+- **No CLI surface for "show me the attempts whose outcome is unknown".** `submit` prints
+  the outcome and `unresolved_uncertainties` already drives the refusal and the
+  `verify-submission` hint; a query command over the column is M1-604/`show` territory.
+- **`_REFETCH_ATTEMPTS` is unchanged at 3.** Its justification changed — it is no longer
+  what stands between a lost connection and a wrong permanent record — but a transient read
+  failure that resolves on the second try still records what the platform actually shows
+  instead of an honest `unreadable` an operator then has to chase by hand.
+
+### Standing risk — `mismatched` is now a state an operator must resolve by hand
+
+Before this item, a post that raised while a newer non-matching entry appeared on the
+platform was recorded `submission_failed` and the record was done with. It now stands as an
+uncertainty, and `verify_uncertain_attempt` deliberately **will not** clear it — a mismatch
+is a human judgement. So a record can sit `approved` with an unresolvable-by-machine
+uncertainty blocking every further submission for it.
+
+That is the conservative direction and it is the intended behaviour: the alternative is
+killing a forecast version on evidence that *a* forecast exists. But it is a real
+operational cost, and there is no command today that lets an operator say "I looked; it is
+not mine" and close it. Recording a human's judgement about a mismatch is not a gap this
+item could close honestly — it needs an actor, a note, and an approval-shaped boundary,
+which is an item, not a clause. Named here rather than discovered in an outage.
+
+### Standing risk — the equivalence clause cannot see a blob
+
+`(NEW.refetch_outcome = 'confirmed') <> (NEW.verified_by_refetch = 1)` compares two truth
+values, and a blob in `verified_by_refetch` makes the right-hand side false rather than
+raising. `001`'s column `CHECK (verified_by_refetch IN (0, 1))` catches that — but column
+`CHECK`s run *after* `BEFORE INSERT` triggers, so the row is refused by the `CHECK` with
+`001`'s message rather than by this clause with `009`'s. Both refuse it; only the message
+differs. Left as it is because narrowing the clause to `typeof()` would duplicate a
+constraint that already holds, on a trigger that is immutable once merged.
+
+### On the mutation pass
+
+Five mutations, each reverting one clause to what it replaced or neutering it to
+`WHERE 0`, run with `__pycache__` cleared first (a same-size same-second edit can otherwise
+be served back stale). Every one was caught, and by the test that claims to own it:
+
+| Mutation | Caught by |
+| --- | --- |
+| writer's derivation → `if success == 0` (the pre-M2-711 rule) | 7 tests across all three layers |
+| trigger's uncertain probe → `success <> verified_by_refetch` | the 2 partition rows, the 2 raw-SQL rows, both live tests |
+| `COALESCE(...)` → bare `refetch_outcome = 'absent'` | the pre-`009` legacy test, alone |
+| equivalence clause → `WHERE 0` | all 4 disagreement rows |
+| required/vocabulary clause → `WHERE 0` | the "must say" test and all 6 vocabulary rows |
+
+The third is the one worth noticing: exactly one test failed, which is what a clause that
+exists solely for already-written rows should look like.
+
+### On the property pass
+
+One new property, `test_every_attempt_shape_has_exactly_one_recordable_outcome`, over every
+`(success, refetch_outcome)` pair. It asserts **totality** — a pair with no legal event is
+an outcome that happened and cannot be recorded, which is the dual of the defect this item
+closes — and drives the real writer against the real schema rather than against
+`_DESTINATIONS`, so it fails if either layer drifts.
+
+The strategy is `st.booleans()` × `st.sampled_from(REFETCH_OUTCOMES)`, and that is the
+guard against the vacuous-property class in `docs/LESSONS.md`: the existing writer fuzzers
+send `ANYTHING` and so never reach the derivation with a valid vocabulary member *and* a
+valid record — they exercise the type gate standing in front of it. `test_the_submission_
+writer_raises_only_lifecycle_error` was widened to draw from the vocabulary as well as from
+junk for the same reason.
+
+`test_the_partition_covers_every_pair_exactly_once` is the cheap companion in the unit
+suite: the parametrized test drives every row it is given and would pass just as well with a
+row missing, so the table is asserted total and single-valued against `get_args`.

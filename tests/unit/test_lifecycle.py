@@ -41,6 +41,7 @@ from whiskeyjack_bot.lifecycle import (
     PreForecastEventType,
     PreForecastFailure,
     PreForecastFailureCode,
+    RefetchOutcome,
     SubmissionAttempt,
     SubmissionVerification,
     current_status,
@@ -215,7 +216,7 @@ def _attempt(
     attempt_id: str = "att-1",
     key: str = "idem-1",
     success: bool = True,
-    verified: bool = True,
+    refetch: RefetchOutcome = "confirmed",
     **extra: object,
 ) -> SubmissionAttempt:
     return SubmissionAttempt(
@@ -225,7 +226,7 @@ def _attempt(
         completed_at_utc=extra.pop("completed_at_utc", WHEN),  # type: ignore[arg-type]
         request_payload_sha256=PAYLOAD_SHA,
         success=success,
-        verified_by_refetch=verified,
+        refetch_outcome=refetch,
         **extra,  # type: ignore[arg-type]
     )
 
@@ -253,7 +254,8 @@ def _insert_attempt(
     conn.execute(
         "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
         "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
-        "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)",
+        "verified_by_refetch, refetch_outcome, created_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'confirmed', ?)",
         (
             attempt_id,
             record_id,
@@ -434,7 +436,7 @@ def test_one_attempt_cannot_back_two_lifecycle_events(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(success=True, verified=False),
+        attempt=_attempt(success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -674,9 +676,17 @@ def test_replace_cannot_downgrade_a_verified_submission(
     )
     record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        _replace_row(conn, "submission_attempts", success=0, verified_by_refetch=0)
-    stored = conn.execute("SELECT success, verified_by_refetch FROM submission_attempts").fetchone()
-    assert tuple(stored) == (1, 1)
+        _replace_row(
+            conn,
+            "submission_attempts",
+            success=0,
+            verified_by_refetch=0,
+            refetch_outcome="absent",
+        )
+    stored = conn.execute(
+        "SELECT success, verified_by_refetch, refetch_outcome FROM submission_attempts"
+    ).fetchone()
+    assert tuple(stored) == (1, 1, "confirmed")
     assert current_status(conn, record_id) == "submitted"
 
 
@@ -854,17 +864,21 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
         "created_at_utc) VALUES (?, 'rejected', 'chris', ?, ?)",
         (record_id, SHA, TS),
     ).lastrowid
-    # One attempt of each shape the (success, verified_by_refetch) partition recognizes,
-    # so an event type is never refused merely for citing the wrong kind of attempt.
-    for attempt_id, success, verified in (
-        (f"att-ok-{suffix}", 1, 1),
-        (f"att-unsure-{suffix}", 1, 0),
-        (f"att-bad-{suffix}", 0, 0),
+    # One attempt of each shape the (success, refetch_outcome) partition recognizes, so an
+    # event type is never refused merely for citing the wrong kind of attempt. `att-unknown`
+    # is M2-711's: a post that raised whose refetch could not be read, which is uncertain
+    # rather than failed and so is a *different* kind of attempt from `att-bad`.
+    for attempt_id, success, verified, refetch in (
+        (f"att-ok-{suffix}", 1, 1, "confirmed"),
+        (f"att-unsure-{suffix}", 1, 0, "absent"),
+        (f"att-bad-{suffix}", 0, 0, "absent"),
+        (f"att-unknown-{suffix}", 0, 0, "unreadable"),
     ):
         conn.execute(
             "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
             "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
-            "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "verified_by_refetch, refetch_outcome, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 attempt_id,
                 record_id,
@@ -874,6 +888,7 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
                 PAYLOAD_SHA,
                 success,
                 verified,
+                refetch,
                 TS,
             ),
         )
@@ -1529,40 +1544,256 @@ def _approve(conn: sqlite3.Connection, record_id: str) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("success", "verified", "expected", "status"),
-    [
-        (True, True, "submitted", "submitted"),
-        (True, False, "submission_uncertain", "approved"),
-        (False, True, "submission_uncertain", "approved"),
-        (False, False, "submission_failed", "failed"),
-    ],
+# Every (success, refetch_outcome) pair there is -- all eight, spelled out rather than
+# generated, so the table below is readable as the rule and a wrong cell is a wrong line
+# rather than a wrong expression. `_PARTITION` is reused by the totality test that follows.
+_PARTITION: tuple[tuple[bool, RefetchOutcome, str, str], ...] = (
+    (True, "confirmed", "submitted", "submitted"),
+    (True, "absent", "submission_uncertain", "approved"),
+    (True, "mismatched", "submission_uncertain", "approved"),
+    (True, "unreadable", "submission_uncertain", "approved"),
+    (False, "confirmed", "submission_uncertain", "approved"),
+    (False, "absent", "submission_failed", "failed"),
+    # M2-711. Both of these were `submission_failed` and terminal before it.
+    (False, "mismatched", "submission_uncertain", "approved"),
+    (False, "unreadable", "submission_uncertain", "approved"),
 )
+
+
+@pytest.mark.parametrize(("success", "refetch", "expected", "status"), _PARTITION)
 def test_the_attempt_pair_decides_the_event(
     draft: tuple[sqlite3.Connection, str],
     success: bool,
-    verified: bool,
+    refetch: RefetchOutcome,
     expected: str,
     status: str,
 ) -> None:
-    """The whole (success, verified_by_refetch) partition, and where each outcome lands.
+    """The whole (success, refetch_outcome) partition, and where each outcome lands.
 
-    Two of the four are the uncertain case, and they are the reason the pair is read
-    rather than `success` alone: the signals disagreeing is a third outcome, not a
-    failure. Recording it as one moved the record to terminal `failed` (round 2,
-    finding 3).
+    Six of the eight are the uncertain case, and they are the reason the outcome is read
+    rather than `success` alone: the post and the platform disagreeing, or the platform
+    never being read, is a third outcome and not a failure. Recording either as one moved
+    the record to terminal `failed` -- round 2, finding 3 for the disagreement, M2-711 for
+    the unread platform.
+
+    The two M2-711 rows are the item's acceptance criterion at this layer: *"a post whose
+    outcome no refetch established is recorded as neither submitted nor failed"*. That the
+    record lands `approved` rather than `failed` is what the `status` column asserts, and
+    it is the half that makes the outcome still resolvable.
     """
     conn, record_id = draft
     _approve(conn, record_id)
     event = record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(success=success, verified=verified),
+        attempt=_attempt(success=success, refetch=refetch),
         occurred_at=WHEN,
         detail_code=None if expected == "submitted" else "refetch_missing",
     )
     assert event.event_type == expected
     assert current_status(conn, record_id) == status
+
+
+def test_the_partition_covers_every_pair_exactly_once() -> None:
+    """The table above is total and single-valued over the vocabulary it partitions.
+
+    Cheap, and it is the assertion the parametrized test cannot make: that one drives every
+    row it is given, and would pass just as well if a row were missing. A pair with no legal
+    event is an outcome the ledger cannot record -- which is the defect M2-711 exists to
+    close, so it is worth an assertion that fails when it recurs rather than a reader
+    counting rows.
+    """
+    pairs = [(success, refetch) for success, refetch, _, _ in _PARTITION]
+    assert len(pairs) == len(set(pairs))
+    assert set(pairs) == {(s, r) for s in (True, False) for r in get_args(RefetchOutcome)}
+    # ... and `submitted` is reachable from exactly one of them, which is M2-704's
+    # "success requires refetch confirmation" stated as a property of the table.
+    assert [p for p in _PARTITION if p[2] == "submitted"] == [
+        (True, "confirmed", "submitted", "submitted")
+    ]
+
+
+# ── M2-711: the schema half of the same rule ─────────────────────────────────
+#
+# Every test above drives the writer. These drive raw SQL, because the writer agreeing
+# with itself is not the guarantee -- `009_submission_refetch_outcome.sql` is, and a rule
+# that lives only in Python is one INSERT away from not existing.
+
+
+def _raw_attempt(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    attempt_id: str = "att-raw",
+    success: object = 0,
+    verified: object = 0,
+    refetch: object = "absent",
+) -> None:
+    """Write a `submission_attempts` row directly, naming `refetch_outcome` explicitly.
+
+    Separate from `_insert_attempt`, which pins a well-formed confirmed row for the tests
+    that need a *valid* attempt and nothing more. Here the three columns under test are all
+    parameters and typed `object`, because what the schema does with a malformed one is the
+    subject.
+    """
+    conn.execute(
+        "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
+        "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+        "verified_by_refetch, refetch_outcome, created_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            attempt_id,
+            record_id,
+            f"idem-{attempt_id}",
+            TS,
+            TS,
+            PAYLOAD_SHA,
+            success,
+            verified,
+            refetch,
+            TS,
+        ),
+    )
+
+
+def _raw_submission_event(
+    conn: sqlite3.Connection, record_id: str, event_type: str, attempt_id: str = "att-raw"
+) -> None:
+    """Append one submission lifecycle event by raw SQL, citing `attempt_id`.
+
+    Bypasses `_append_event`'s derivation entirely, which is the point: it asks the
+    *database* whether this event may cite this attempt. `to_status` follows from the event
+    type, so an illegal pairing is refused by the transition probe rather than by this
+    helper picking a destination that hides the failure under test.
+    """
+    seq = conn.execute(
+        "SELECT coalesce(max(event_seq), 0) + 1 FROM lifecycle_events WHERE forecast_record_id = ?",
+        (record_id,),
+    ).fetchone()[0]
+    to_status = {
+        "submitted": "submitted",
+        "submission_uncertain": "approved",
+        "submission_failed": "failed",
+    }[event_type]
+    conn.execute(
+        "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
+        "to_status, detail_code, submission_attempt_id, occurred_at_utc, created_at_utc) "
+        "VALUES (?, ?, ?, 'approved', ?, ?, ?, ?, ?)",
+        (
+            record_id,
+            seq,
+            event_type,
+            to_status,
+            None if event_type == "submitted" else "refetch_missing",
+            attempt_id,
+            TS,
+            TS,
+        ),
+    )
+
+
+def test_a_new_attempt_must_say_what_its_refetch_established(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """An attempt that does not say is exactly the ambiguity M2-711 closes.
+
+    Omitting the column leaves it NULL, which is the shape every row written before `009`
+    has -- legal for those, and refused for a new one, because a writer that may decline to
+    answer reopens the question the column exists to settle.
+    """
+    conn, record_id = draft
+    with pytest.raises(sqlite3.IntegrityError, match="refetch_outcome is required"):
+        conn.execute(
+            "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
+            "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+            "verified_by_refetch, created_at_utc) VALUES ('att-raw', ?, 'idem-raw', ?, ?, ?, "
+            "0, 0, ?)",
+            (record_id, TS, TS, PAYLOAD_SHA, TS),
+        )
+    assert _counts(conn)["submission_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "unknown",
+        "CONFIRMED",
+        "",
+        " absent ",
+        0,
+        # A blob: TEXT affinity leaves it a blob, so `NOT IN (...)` is true of it and the
+        # typeof() gate is what makes the refusal say so rather than depending on that.
+        b"absent",
+    ],
+)
+def test_the_database_refuses_a_refetch_outcome_outside_the_vocabulary(
+    draft: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    conn, record_id = draft
+    with pytest.raises(sqlite3.IntegrityError, match="refetch_outcome"):
+        _raw_attempt(conn, record_id, refetch=value, success=1, verified=0)
+    assert _counts(conn)["submission_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    ("verified", "refetch"),
+    [
+        # A confirmation that does not claim verification, and a verification with nothing
+        # that confirmed it. Both directions, because a one-sided implication leaves the
+        # other half of the equivalence enforced by nothing.
+        (0, "confirmed"),
+        (1, "absent"),
+        (1, "mismatched"),
+        (1, "unreadable"),
+    ],
+)
+def test_the_two_refetch_columns_cannot_disagree(
+    draft: tuple[sqlite3.Connection, str], verified: object, refetch: object
+) -> None:
+    """`verified_by_refetch` is derived in Python; this is what closes the raw-SQL path.
+
+    It is also what lets `lifecycle_events_validate_on_insert`'s `submitted` probe stay as
+    003 wrote it: with this clause in force, "success = 1 AND verified_by_refetch = 1" and
+    "success = 1 AND refetch_outcome = 'confirmed'" are the same condition, so restating it
+    there would be a second spelling rather than a second rule.
+    """
+    conn, record_id = draft
+    with pytest.raises(sqlite3.IntegrityError, match="must agree"):
+        _raw_attempt(conn, record_id, success=1, verified=verified, refetch=refetch)
+    assert _counts(conn)["submission_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    ("success", "verified", "refetch", "legal", "illegal"),
+    [
+        (0, 0, "absent", "submission_failed", "submission_uncertain"),
+        (0, 0, "unreadable", "submission_uncertain", "submission_failed"),
+        (0, 0, "mismatched", "submission_uncertain", "submission_failed"),
+        (1, 0, "unreadable", "submission_uncertain", "submission_failed"),
+    ],
+)
+def test_the_database_decides_the_submission_event_from_the_refetch_outcome(
+    draft: tuple[sqlite3.Connection, str],
+    success: int,
+    verified: int,
+    refetch: str,
+    legal: str,
+    illegal: str,
+) -> None:
+    """The partition, enforced by the trigger rather than agreed to by the writer.
+
+    Both halves are asserted for every row: the legal event is accepted **and** the other
+    one is refused. Asserting only the refusal would pass against a trigger that refused
+    everything, and asserting only the acceptance would pass against one that enforced
+    nothing -- which is the shape of defect this item exists to fix.
+    """
+    conn, record_id = draft
+    _approve(conn, record_id)
+    _raw_attempt(conn, record_id, success=success, verified=verified, refetch=refetch)
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_submission_event(conn, record_id, illegal)
+    _raw_submission_event(conn, record_id, legal)
+    assert read_history(conn, record_id)[-1].event_type == legal
 
 
 def _verification(
@@ -1590,7 +1821,7 @@ def _leave_uncertain(conn: sqlite3.Connection, record_id: str) -> None:
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(success=True, verified=False),
+        attempt=_attempt(success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -1728,7 +1959,7 @@ def test_a_second_attempt_while_uncertain_is_recorded_not_refused(
     second = record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, verified=False),
+        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -1768,7 +1999,7 @@ def test_unresolved_uncertainties_is_the_pre_request_seam(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(success=True, verified=False),
+        attempt=_attempt(success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -1777,7 +2008,7 @@ def test_unresolved_uncertainties_is_the_pre_request_seam(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, verified=False),
+        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -1833,7 +2064,7 @@ def test_a_refetch_cannot_resolve_another_records_attempt(
     record_submission_attempt(
         ledger,
         record_id="rec-2",
-        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, verified=False),
+        attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -2077,7 +2308,7 @@ def test_an_uncertain_submission_requires_a_detail_code(
         record_submission_attempt(
             conn,
             record_id=record_id,
-            attempt=_attempt(success=True, verified=False),
+            attempt=_attempt(success=True, refetch="absent"),
             occurred_at=WHEN,
         )
     assert current_status(conn, record_id) == "approved"
@@ -2128,7 +2359,7 @@ def test_an_unverified_attempt_requires_a_detail_code(
         record_submission_attempt(
             conn,
             record_id=record_id,
-            attempt=_attempt(success=False, verified=False),
+            attempt=_attempt(success=False, refetch="absent"),
             occurred_at=WHEN,
         )
     assert current_status(conn, record_id) == "approved"
@@ -2254,7 +2485,7 @@ def test_a_refetch_observed_one_microsecond_too_early_is_refused(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt(success=True, verified=False, completed_at_utc=completed),
+        attempt=_attempt(success=True, refetch="absent", completed_at_utc=completed),
         occurred_at=WHEN,
         detail_code="refetch_missing",
     )
@@ -2837,7 +3068,7 @@ def _leak_cases(
                 completed_at_utc=WHEN,
                 request_payload_sha256=PAYLOAD_SHA,
                 success=True,
-                verified_by_refetch=True,
+                refetch_outcome="confirmed",
             ),
             occurred_at=WHEN,
         )
@@ -2989,7 +3220,7 @@ def test_a_submission_attempt_subclass_is_refused(
                 completed_at_utc=WHEN,
                 request_payload_sha256=PAYLOAD_SHA,
                 success=True,
-                verified_by_refetch=True,
+                refetch_outcome="confirmed",
             ),
             occurred_at=WHEN,
         )
@@ -3507,7 +3738,7 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # 008 (M1-406) adds three NULLable columns and appends clauses to the same insert
     # trigger, with no upgrade probe of its own, so a v2 ledger reaching 8 is the same
     # statement it was when it reached 7.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 8
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
 
     conn = connect(db)
     try:
@@ -4002,6 +4233,119 @@ def test_the_run_id_column_has_no_length_ceiling_and_that_is_deliberate(
     )
 
 
+# The migrations a ledger at version 8 has applied -- everything before M2-711. Spelled
+# out rather than sliced off a listing of the package, for `_PRE_006_MIGRATIONS`' reason:
+# a list that grows by itself would silently stop describing "before 009" the day 010
+# lands, and this fixture's whole subject is what a pre-009 ledger looks like.
+_PRE_009_MIGRATIONS = [
+    "001_initial.sql",
+    "002_research_document_fields.sql",
+    "003_lifecycle_events.sql",
+    "004_pipeline_failure_events.sql",
+    "005_research_run_counters.sql",
+    "006_non_blank_identifiers.sql",
+    "007_forecast_version_chain.sql",
+    "008_forecast_raw_output.sql",
+]
+
+
+def _seed_v8_ledger(db: Path, *, record_id: str = "rec-legacy") -> str:
+    """A ledger at version 8 holding an approved record and a failed, unverified attempt.
+
+    `_seed_v5_ledger`'s method -- the packaged migration files applied directly, their real
+    checksums recorded -- so `ledger.py` accepts it as a database a previous build genuinely
+    produced. The attempt is `(success=0, verified_by_refetch=0)`, the cell M2-711 splits,
+    written when there was no column to split it on.
+    """
+    attempt_id = "att-legacy"
+    conn = connect(db)
+    try:
+        for name in _PRE_009_MIGRATIONS:
+            conn.executescript(files("whiskeyjack_bot.migrations").joinpath(name).read_text())
+        conn.execute(
+            "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+            "started_at_utc, created_at_utc) VALUES ('run-1', 'asknews', 100, ?, ?)",
+            (TS, TS),
+        )
+        conn.execute(
+            "INSERT INTO forecast_records ("
+            "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+            "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+            "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+            "forecast_sha256, attempt_id) "
+            "VALUES (?, 100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
+            "'abc', 'run-1', ?, '{}', '{}', ?, ?, 'att-record')",
+            (record_id, TS, TS, SHA),
+        )
+        approval = conn.execute(
+            "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+            "created_at_utc) VALUES (?, 'approved', 'chris', ?, ?)",
+            (record_id, SHA, TS),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, occurred_at_utc, created_at_utc) "
+            "VALUES (?, 1, 'validated', 'draft', 'validated', ?, ?)",
+            (record_id, TS, TS),
+        )
+        conn.execute(
+            "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, "
+            "from_status, to_status, approval_event_id, occurred_at_utc, created_at_utc) "
+            "VALUES (?, 2, 'approved', 'validated', 'approved', ?, ?, ?)",
+            (record_id, approval, TS, TS),
+        )
+        conn.execute(
+            "INSERT INTO submission_attempts (attempt_id, forecast_record_id, "
+            "idempotency_key, requested_at_utc, completed_at_utc, request_payload_sha256, "
+            "success, verified_by_refetch, created_at_utc) "
+            "VALUES (?, ?, 'idem-legacy', ?, ?, ?, 0, 0, ?)",
+            (attempt_id, record_id, TS, TS, PAYLOAD_SHA, TS),
+        )
+        for version, name in enumerate(_PRE_009_MIGRATIONS, start=1):
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at_utc, checksum) "
+                "VALUES (?, ?, ?)",
+                (version, TS, _checksum_of(name)),
+            )
+    finally:
+        conn.close()
+    return attempt_id
+
+
+def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
+    tmp_path: Path,
+) -> None:
+    """M2-711 must not change what an already-written row means.
+
+    `009` adds a NULLable column, so every pre-existing attempt holds NULL in it -- and
+    both triggers read that NULL as 003 read the absence of the information:
+    `COALESCE(refetch_outcome, 'absent')`. So a legacy `(0, 0)` attempt is still
+    `submission_failed` and still cannot be recorded as uncertain.
+
+    This is the reason the COALESCE is not a default. A new row cannot reach it: the receipt
+    trigger refuses one that does not name an outcome (asserted above). It exists for rows
+    written when there was nothing to name.
+    """
+    db = tmp_path / "ledger.sqlite3"
+    attempt_id = _seed_v8_ledger(db)
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
+
+    conn = connect(db)
+    try:
+        stored = conn.execute(
+            "SELECT refetch_outcome FROM submission_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        assert stored[0] is None
+        # Uncertain is what the widened rule would say if NULL fell through it; it does not.
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_submission_event(conn, "rec-legacy", "submission_uncertain", attempt_id)
+        _raw_submission_event(conn, "rec-legacy", "submission_failed", attempt_id)
+        assert current_status(conn, "rec-legacy") == "failed"
+    finally:
+        conn.close()
+
+
 # The migrations a ledger at version 5 has applied -- everything before this item.
 _PRE_006_MIGRATIONS = [
     "001_initial.sql",
@@ -4079,7 +4423,7 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # v5 ledger reaching 8 is the same statement it was when it reached 6.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 8
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
 
 
 @pytest.mark.parametrize(
@@ -4184,7 +4528,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 8
+    assert initialize_ledger(db) == 9
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"

@@ -100,6 +100,7 @@ from whiskeyjack_bot.lifecycle import (
     FailureCode,
     LifecycleError,
     LifecycleEvent,
+    RefetchOutcome,
     SubmissionAttempt,
     record_submission_attempt,
 )
@@ -107,7 +108,16 @@ from whiskeyjack_bot.submission import KEY_LENGTH, SubmissionError, submission_k
 
 # Bumping this changes the envelope a reader must understand; it is not the payload's
 # schema, which belongs to whatever built the payload.
-ARTIFACT_SCHEMA_VERSION = "1.0.0"
+#
+# 1.1.0 (M2-711) adds `refetch_outcome` to the receipt envelope. The reader below is
+# exact-match by design, so a 1.0.0 artifact is refused rather than read with a missing
+# field -- and that is what the version is for. Accepting both was considered and rejected:
+# a reader that admits two shapes has to decide what the absent field means for the older
+# one, and the only honest answer ("unknown") is a value the field has no member for. No
+# live artifact has ever been written -- M2-704 merged the day before this branch and the
+# submission path has never run against Metaculus -- so the cost is a rehearsal artifact an
+# operator can regenerate for free.
+ARTIFACT_SCHEMA_VERSION = "1.1.0"
 
 # Which gateway produced a receipt. A closed vocabulary rather than a bool, because
 # `_attempt_from_receipt` dispatches on it and M2-704 added no third member: `live` was
@@ -269,6 +279,14 @@ class SubmissionReceipt:
     Field order mirrors ``SubmissionAttempt`` so the mapping reads as a transcription.
     ``created_at_utc`` is absent for that class's reason: it records when the *ledger*
     stored the row, so only the write path may set it.
+
+    ``refetch_outcome`` replaced a ``verified_by_refetch: bool`` **field** in M2-711, and
+    it is the mirror of the same change on :class:`lifecycle.SubmissionAttempt`: the
+    boolean could not distinguish a refetch that looked and found nothing from one that
+    could not be performed, so a post that raised and could not be checked was recorded as
+    terminal ``submission_failed``. ``verified_by_refetch`` survives as a derived property,
+    which is what keeps every existing reader -- the CLI, the artifact envelope, the ledger
+    writer -- asking the question it was already asking.
     """
 
     mode: GatewayMode
@@ -279,7 +297,7 @@ class SubmissionReceipt:
     completed_at_utc: datetime
     request_payload_sha256: str
     success: bool
-    verified_by_refetch: bool
+    refetch_outcome: RefetchOutcome
     http_status: int | None = None
     response_body: str | None = None
     response_headers: str | None = None
@@ -287,6 +305,19 @@ class SubmissionReceipt:
     error_message: str | None = None
     refetched_forecast_snapshot: str | None = None
     artifact_path: str | None = None
+
+    @property
+    def verified_by_refetch(self) -> bool:
+        """Whether a refetch confirmed the post -- derived, never supplied.
+
+        :attr:`lifecycle.SubmissionAttempt.verified_by_refetch`'s reasoning, on this side
+        of the seam: exactly one member of :data:`~lifecycle.RefetchOutcome` is a
+        confirmation, and a stored second copy of that fact is a second thing that can be
+        wrong. Note the consequence for ``dataclasses.asdict``, which renders fields and
+        not properties: an asdict'ed receipt carries ``refetch_outcome`` and not this, and
+        the artifact envelope writes both because it is a published shape.
+        """
+        return self.refetch_outcome == "confirmed"
 
 
 class SubmissionGateway(Protocol):
@@ -481,9 +512,13 @@ def _attempt_from_receipt(receipt: SubmissionReceipt) -> SubmissionAttempt:
     made the record id a second, divergent parameter.
 
     Refuses a dry-run receipt, and that refusal is load-bearing rather than decorative: a
-    dry-run receipt carries ``success=False`` and ``verified_by_refetch=False``, which the
-    writer reads as ``submission_failed`` and which moves the record to terminal ``failed``.
-    A rehearsal would permanently kill the forecast version it was rehearsing.
+    dry-run receipt carries ``success=False`` and ``refetch_outcome='unreadable'``, which
+    the writer reads as ``submission_uncertain`` -- so a rehearsal would leave the record
+    holding an open uncertainty that :func:`lifecycle.unresolved_uncertainties` reports and
+    that blocks every later submission for that record until a refetch it can never have
+    resolves it. Before M2-711 the same receipt read as ``submission_failed`` and would
+    have killed the forecast version outright. The failure mode changed; the reason for the
+    refusal did not, and neither did its necessity.
 
     ``mode`` is checked rather than trusted-by-convention for M1-402's reason. There is
     deliberately no ``force`` parameter.
@@ -520,7 +555,7 @@ def _attempt_from_receipt(receipt: SubmissionReceipt) -> SubmissionAttempt:
         completed_at_utc=receipt.completed_at_utc,
         request_payload_sha256=receipt.request_payload_sha256,
         success=receipt.success,
-        verified_by_refetch=receipt.verified_by_refetch,
+        refetch_outcome=receipt.refetch_outcome,
         http_status=receipt.http_status,
         response_body=receipt.response_body,
         response_headers=receipt.response_headers,
@@ -566,12 +601,20 @@ class DryRunSubmissionGateway:
     def submit(self, request: SubmissionRequest) -> SubmissionReceipt:
         """Return the deterministic receipt for a submission that was not made.
 
-        ``success`` is ``False`` and ``verified_by_refetch`` is ``False``, and neither is a
-        placeholder. ``success=True`` would be a claim that a post went through; the
+        ``success`` is ``False`` and ``refetch_outcome`` is ``'unreadable'``, and neither
+        is a placeholder. ``success=True`` would be a claim that a post went through; the
         record's whole purpose is that such a claim is only ever made by something that
-        actually posted. Every HTTP, refetch and error field is ``None`` for the mirror
-        reason: a dry run is not a failure either, so inventing an ``error_type`` for it
-        would put a fabricated cause into an audit record.
+        actually posted. ``'unreadable'`` is the member that means *no observation was
+        made*, which is the literal truth of a rehearsal: no refetch ran, so ``'absent'``
+        would assert the platform was looked at and found empty. Every HTTP, refetch and
+        error field is ``None`` for the mirror reason: a dry run is not a failure either,
+        so inventing an ``error_type`` for it would put a fabricated cause into an audit
+        record.
+
+        None of this makes the receipt writable to the ledger -- :func:`_attempt_from_
+        receipt` refuses it on ``mode`` -- and the honest values here are what make that
+        refusal the only thing standing between a rehearsal and the ledger, rather than
+        one of two overlapping guards.
 
         The two clock readings bracket the *request* -- which is to say, nothing -- rather
         than the artifact write. A receipt's timestamps describe the post it reports on,
@@ -614,7 +657,7 @@ class DryRunSubmissionGateway:
             completed_at_utc=completed,
             request_payload_sha256=digest,
             success=False,
-            verified_by_refetch=False,
+            refetch_outcome="unreadable",
         )
         if self._artifact_root is None:
             return receipt
@@ -897,6 +940,7 @@ def _receipt_envelope(receipt: SubmissionReceipt) -> dict[str, object]:
         "request_payload_sha256": receipt.request_payload_sha256,
         "success": receipt.success,
         "verified_by_refetch": receipt.verified_by_refetch,
+        "refetch_outcome": receipt.refetch_outcome,
         "http_status": receipt.http_status,
         "response_body": receipt.response_body,
         "response_headers": receipt.response_headers,

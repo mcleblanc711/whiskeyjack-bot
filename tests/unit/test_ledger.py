@@ -98,7 +98,7 @@ def _seed_attempt(
         "INSERT INTO submission_attempts ("
         "attempt_id, forecast_record_id, idempotency_key, requested_at_utc, "
         "completed_at_utc, request_payload_sha256, success, verified_by_refetch, "
-        "created_at_utc) VALUES (?, ?, ?, ?, ?, 'deadbeef', 0, 0, ?)",
+        "refetch_outcome, created_at_utc) VALUES (?, ?, ?, ?, ?, 'deadbeef', 0, 0, 'absent', ?)",
         (attempt_id, record_id, key, TS, TS, TS),
     )
 
