@@ -4017,9 +4017,15 @@ rendering rule at once, and it is the exact property the ledger needs.
   column for any of them, and `ForecastGeneration` carries `request` and `raw_responses` precisely
   so that item can persist them separately. `test_the_record_stores_no_hidden_reasoning_and_no_raw
   _response` asserts on the rendered bytes that neither reaches `record_json`.
-- **A composed output-validation entry point → M1-506.** This writer calls
-  `attribution.validate_attribution_fields` by name; when M1-506 lands, that call becomes the
-  composed one. Filed off M1-501's round-1 review for exactly this caller.
+- **A composed output-validation entry point → M1-506, and the persist path → M1-507.** This
+  writer calls `attribution.validate_attribution_fields` by name. **Corrected after M1-506
+  shipped:** this paragraph used to say "when M1-506 lands, that call becomes the composed one",
+  and it does not. M1-506 built `forecast.validate.validate_output` but deliberately left this
+  caller alone — running it here needs `ForecastConfig` threaded into `append_forecast_version`,
+  a signature change to a merged public entry point, which is `M1-507`. Left as written, this
+  sentence would have told the next reader the gap was closed; that is the exact failure mode
+  `schema.py::_reject_priors`'s stale pointer cost M1-501 a blocking finding and a review round,
+  so it is corrected here rather than repeated.
 - **The `run` / `replay --record-id` CLI wiring → M1-406 / T-903.** This slice is library-only.
 - **A community-prediction snapshot.** The handoff says "when technically available"; it is not.
   `normalize.py` deliberately never carries the parent post's payload because it holds
@@ -4645,3 +4651,195 @@ same blind spot had a second half in the hand-kept missing-field list, which omi
 nullable fields; both are now derived from `_ENVELOPE_FIELDS`.
 
 Final: 2494 pass, 1 xfail. Four gates green. Both CI checks green on `e334385`.
+
+---
+
+## M1-609 — Verifying SQLite foreign-key enforcement after connection setup
+
+Acceptance: *`ledger.connect` reads `PRAGMA foreign_keys` back and raises `LedgerError` unless it is
+enabled, with a message naming the path and no stored value; a test asserts the refusal, and the
+existing `journal_mode`/`recursive_triggers` read-backs are the shape to follow.*
+
+Closes the standing risk carried since M1-607 and restated unchanged through M1-602 and M1-406:
+`connect()` set `PRAGMA foreign_keys = ON` but never read it back, so the transitive coverage
+`006_non_blank_identifiers.sql` describes — every unguarded identifier column is a foreign key into
+one of the five guarded primary keys — rested on an assumption rather than a verified setting. Fixed
+by giving `foreign_keys` the exact `journal_mode`/`recursive_triggers` shape: read back immediately
+after the `= ON` pragma, check `== 1`, close and raise `LedgerError(f"ledger database at {path} does
+not support foreign keys")` otherwise. No stored value in the message, matching the other two.
+
+### Deferred (do not read the absence as an omission)
+
+No migration and no new dependency — this is a connection-contract change only, so migration `009`
+stays free for the next item in the debt-queue wave.
+
+### Standing risk — not verifiable offline
+
+As the acceptance criteria states up front, no deterministic failure is reproducible on the supported
+SQLite runtime: `PRAGMA foreign_keys` is recognized and takes effect outside a transaction on every
+build this project runs against, so the refusal branch has no real trigger to exercise. The new test,
+`test_foreign_keys_not_enabled_raises_ledger_error`, installs a `sqlite3.Connection` subclass as
+`sqlite3.connect`'s `factory` (the built-in type is immutable, so its bound method can't be
+monkeypatched directly) that intercepts only the bare `"PRAGMA foreign_keys"` read-back and reports
+it disabled, leaving every other pragma and query untouched. This exercises the refusal branch's
+logic, not a reproduced defect.
+
+Four gates green.
+
+---
+
+## M1-506 — One composed output-validation entry point
+
+The row was filed off **M1-501's round-1 cross-model review**, and the filing is worth restating
+because it is what decides the scope. The review reported *"binary forecasts are accepted without
+the required prior"* against `attribution.py`. The rule was in `binary.py`, the composed path did
+refuse the response, and the finding was reproduced by execution and rebutted in round 2 — at the
+price of a round. The reviewer was not careless. `parse._output_problems` composed the checkers but
+was **private with one caller**, so nothing a reader could reach showed the two layers together.
+
+The deliverable is `forecast/validate.py`: `output_problems` / `validate_output`, a
+`ForecastOutputError`, and a table keyed on the `question_type` literal with an explicit entry per
+supported type. `parse._output_problems` is **gone**, not delegating.
+
+### Decision — a new module, not an extension of `attribution.py`
+
+The composition has to import `binary.py`. Putting it in `attribution.py` would have made M1-501's
+module import M1-403's, which is precisely the cross-type / type-specific split the round-1 rebuttal
+turned on: `attribution.py`'s own docstring rests a design decision on reading no question type. One
+module per backlog item also keeps the docstring able to say what this item is *for*.
+
+Placing it in `parse.py` was the other candidate and is the smaller diff — the function already
+lived there. Rejected: `parse.py`'s stated job (M1-406) is the SDK-free parse, and M1-404, M1-405
+and M1-507 would then all import `forecast.parse` in order to *validate*.
+
+### Decision — the registry is total over the supported types, and `None` is an entry
+
+`_TYPE_CHECKERS` carries all three keys today; two are `None`. That is deliberate and it is what
+makes the acceptance criterion's coverage test discriminating **now** rather than after M1-404 and
+M1-405 land: `None` means "supported, and no type-specific checks yet", which is a decision, and the
+absence of a key means nobody decided. The set of keys is asserted equal to
+`get_args(SupportedQuestionType)` in both directions — `schema.SUPPORTED_RESPONSE_TYPES`' idiom, and
+`test_lifecycle.py`'s both-directions argument, because a subset assertion either way is green for
+one of the two defects.
+
+### Decision — `_TypeChecker` is typed over `Any`, and this is the one loose annotation
+
+`binary_output_problems` takes a `BinaryForecastResponse`, so it is not assignable to a `Callable`
+declared over the `ForecastResponse` union — parameters are contravariant and `mypy --strict` is
+right to refuse it. The narrowing the table relies on is a runtime fact the type system cannot
+express through a heterogeneous mapping: the lookup is keyed on `question_type`, and every checker
+exact-type gates its own argument anyway, so a mis-keyed entry surfaces as `BinaryOutputError`
+rather than as a wrong answer.
+
+`validate_output`'s own TypeVar is bound to the **union**, not to `schema.ForecastResponseT`'s
+broader `_ForecastResponseBase`, so a caller that passes a `BinaryForecastResponse` gets that type
+back.
+
+### Decision — one error carrying the whole list
+
+`validate_output` raises a single `ForecastOutputError` with every problem from both layers, rather
+than letting whichever member fired first raise its own type. The complete list is the entire
+account of why the response was refused; that is `store.py::_require_attributable`'s argument for
+carrying `AttributionFieldError`'s text through instead of replacing it with a constant.
+`ForecastOutputError` subclasses `ForecastSchemaError` for `BinaryOutputError`'s stated reason, so a
+caller writing one `except` clause still catches every route through the entry point — including the
+member modules' caller-mistake errors, which is asserted as a property rather than assumed.
+
+### Decision — the private function is deleted, and the criterion is asserted as an absence
+
+*"Defined in terms of it rather than beside it, so the two cannot diverge."* A one-line delegating
+wrapper also cannot diverge, but deleting leaves one name for the next reader and makes the property
+structural. `test_the_parse_path_has_no_second_composition` asserts that `parse` has no
+`_output_problems` and that **no other module in the package** holds `attribution_problems` or
+`binary_output_problems` behind the entry point's back. A test comparing the two lists would have
+proved only that they agree at the moment it ran.
+
+### Deviation — three stale cross-references fixed, and one of them was ours to fix
+
+M1-501 lost a blocking finding and a round to a docstring pointer that had been true when it was
+written. This branch renames the composition, which creates the same condition three times:
+`generate.py`'s header, `schema.py::_reject_priors` (the docstring M1-501 already had to correct
+once), and `docs/M1-NOTES.md:4020` — which said of `store.py` *"when M1-506 lands, that call becomes
+the composed one."* **It does not.** That is M1-507, and the sentence is corrected below rather than
+left to mislead the next reader the way its predecessor did. Each correction records what it used to
+say, so it cannot be re-reverted as a tidy-up.
+
+### Rejected — per-type adapter lambdas to avoid the `Any`
+
+`{"binary": lambda f, c: binary_output_problems(f, c) if isinstance(f, BinaryForecastResponse) ...}`
+types cleanly and reintroduces exactly what the table exists to remove: a second place per question
+type for M1-404 and M1-405 to edit, and an `isinstance` narrowing in a project whose stated gotcha
+is that `DiscreteQuestion` subclasses `NumericQuestion`.
+
+### Rejected — a re-export shim in `parse.py`
+
+Keeping `_output_problems = output_problems` so no test would change. It would have kept the old
+coupling readable and told the next reader the composition still lives where it does not — the same
+reason M1-406 rejected the shim for its own move.
+
+### Rejected — running the composed check from `store.py` on this branch
+
+That is M1-507, filed before any code was written here. It needs `ForecastConfig` threaded into
+`append_forecast_version`, a signature change to a merged and reviewed public entry point, and this
+row's criteria do not ask for it. Same convention as M1-314, M2-709 and M1-608.
+
+### Deferred (do not read the absence as an omission)
+
+- **The persist path → `M1-507`.** `forecast/store.py` still runs
+  `attribution.validate_attribution_fields` alone, so a probability outside the configured bounds
+  can be persisted even though `forecast.generate` refuses it. Not reachable from the product path
+  — `persist_generation` runs the composed check inside the attempt loop before anything reaches
+  the writer — reachable by any other caller of the public writer, and widening when M1-404 and
+  M1-405 register their checkers. `store.py`'s docstring now names the gap and the row.
+- **The multiple-choice and numeric checkers → `M1-404` / `M1-405`.** Their registry entries are
+  `None` and nothing approximates them in the meantime. Each is one changed line, which is the
+  whole reason this item leads the wave.
+- **`forecast/__init__.py` re-exports.** This package has never had any (`research/artifacts.py`
+  holds the only `__all__` in `src/`), and adding one for this item alone would make the entry
+  point look like a different kind of name than its members.
+
+### Standing risk — not verifiable offline
+
+- **The reachability test's discovery hook is a naming convention.**
+  `test_no_output_checker_in_the_package_is_unreachable` walks the package for public functions
+  named `*_output_problems`. Every checker follows it today and the entry point falls outside it
+  for free (`output_problems` has no type prefix, so no leading underscore before `output`), which
+  is asserted rather than assumed. But **a checker named off the convention escapes the test** —
+  `check_option_set`, say. Nothing can catch that mechanically without a registration decorator,
+  which would move the coupling rather than remove it. Declared here so a reviewer does not have to
+  find it, and named in the test's own docstring so M1-404 and M1-405 read it at the moment it
+  matters.
+- **The walk imports every module in the package**, `generate.py` included, and so pulls litellm
+  into the test process. It is a unit test that reads no network — `tests/conftest.py` blocks
+  sockets and the run emits its hostname-resolution warning — but it is the one test in this file
+  that is not import-cheap. `forecast.validate` itself stays SDK-free and is pinned in
+  `test_the_response_schema_reaches_no_provider_client`.
+
+### Tests, and what each mutation killed
+
+Four mutations against `validate.py`, each killed by the test that claims it:
+
+| Mutation | Killed by |
+| --- | --- |
+| `"binary"`'s checker set to `None` | `test_no_output_checker_in_the_package_is_unreachable` (+5 others) |
+| `"numeric"` key removed | `test_every_supported_type_has_an_explicit_registry_entry` (+3) |
+| composition order reversed | `test_the_composition_runs_attribution_first_then_the_type_specific_layer` |
+| `validate_output` raises the attribution half only | `test_validate_output_raises_with_exactly_the_problems_the_other_half_returns` |
+| type-specific layer dropped entirely | `test_the_composition_is_exactly_its_two_layers_in_order` (property) |
+| `attribution._citation_problems` made to append the offending ids | `test_a_composed_problem_never_varies_with_the_cited_id_that_failed` (property) |
+
+**One property was drafted wrong and the suite caught it, which is worth recording.** The composed
+leak property was first written as `hostile not in message` over independently drawn hostile text,
+and it failed on a drawn `"_"` — a substring of `source_ids` and `research_documents`, which the
+messages render for reasons that have nothing to do with leaking. That is the precise trap
+`test_an_attribution_problem_never_varies_with_the_cited_id_that_failed`'s docstring already warned
+about two sections above, in this same file. Rewritten to the project's shape — **invariance**: two
+different invented citations in the same place must produce byte-identical composed output. The
+mutation above confirms it bites. The lesson is not the wasted draft; it is that the existing
+property said so in prose and the prose was not read before writing a new one beside it.
+
+The property section's anti-vacuity guard is `test_the_composition_is_reached_on_both_sides`, which
+event-tags the four cells: over 200 draws the type-specific layer bites on **29.8%** and is silent
+on 62.3%, and the attribution layer bites on 91.6%. Without that spread the equality property would
+be asserting a concatenation with an empty list — the vacuous-property class this project has paid
+for more than any other.

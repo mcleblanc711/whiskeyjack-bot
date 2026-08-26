@@ -147,6 +147,36 @@ def test_connect_enables_wal_and_foreign_keys(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_foreign_keys_not_enabled_raises_ledger_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No reachable SQLite build here ever ignores `PRAGMA foreign_keys = ON`, so this
+    # patches the read-back query itself to report the disabled value -- exercising the
+    # refusal path per M1-609's acceptance note that no deterministic failure is
+    # reproducible on the supported runtime.
+    db = tmp_path / "ledger.db"
+    initialize_ledger(db)
+
+    class _ForeignKeysDisabledConnection(sqlite3.Connection):
+        # sqlite3.Connection is a C type: its methods can't be monkeypatched on the
+        # instance or the class, so the fake reports the disabled read-back through a
+        # subclass installed as sqlite3.connect's factory instead.
+        def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+            if sql == "PRAGMA foreign_keys":
+                return super().execute("SELECT 0")
+            return super().execute(sql, *args)
+
+    real_connect = sqlite3.connect
+
+    def fake_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = _ForeignKeysDisabledConnection
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(LedgerError, match="does not support foreign keys"):
+        connect(db)
+
+
 def test_forecast_version_uniqueness_enforced(tmp_path: Path) -> None:
     db = tmp_path / "ledger.db"
     initialize_ledger(db)

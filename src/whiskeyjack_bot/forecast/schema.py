@@ -284,9 +284,11 @@ def _reject_priors(response: _ForecastResponseBase) -> None:
     found no prior check and filed a blocking finding for a rule that has been enforced
     since M1-403. Corrected on the M1-501 branch for that reason.
 
-    ``binary.binary_output_problems`` reports both spellings, ``generate._output_problems``
-    reaches it for every binary response, and
-    ``test_the_binary_prior_rule_belongs_to_binary_py`` pins the split from M1-501's side.
+    ``binary.binary_output_problems`` reports both spellings,
+    ``validate.output_problems`` reaches it for every binary response (M1-506; the
+    composition was ``generate._output_problems`` when the paragraph above was written),
+    and ``test_the_binary_prior_rule_belongs_to_binary_py`` pins the split from M1-501's
+    side.
     """
     if response.base_rate.prior_probability is not None or response.model_prior is not None:
         raise ValueError("prior_probability and model_prior must be null for this question type")

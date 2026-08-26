@@ -93,6 +93,7 @@ def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
         journal_mode_row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
+        foreign_keys_row = conn.execute("PRAGMA foreign_keys").fetchone()
         # The append-only guarantee depends on this one. `INSERT OR REPLACE` (and
         # `UPDATE OR REPLACE`) resolve a constraint conflict by DELETING the row in the
         # way -- and with recursive_triggers off, which is SQLite's default, those
@@ -114,6 +115,17 @@ def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
     if journal_mode != "wal":
         conn.close()
         raise LedgerError(f"ledger database at {path} does not support WAL journal mode")
+    # Read back for the same reason: an unknown or ignored PRAGMA is a silent no-op in
+    # SQLite, and M1-607's non-blank-identifier guard leans on every unguarded identifier
+    # column being an enforced foreign key into a guarded primary key -- a transitivity
+    # that only holds if this pragma actually took. No deterministic failure is
+    # reproducible on the supported SQLite runtime (the PRAGMA is recognized and set
+    # outside a transaction), so this closes an unverified assumption rather than a
+    # demonstrated defect (M1-609).
+    foreign_keys = int(foreign_keys_row[0]) if foreign_keys_row is not None else 0
+    if foreign_keys != 1:
+        conn.close()
+        raise LedgerError(f"ledger database at {path} does not support foreign keys")
     # Read back for the same reason: an unknown or ignored PRAGMA is a silent no-op in
     # SQLite, and a silently-off recursive_triggers restores the hole invisibly. The
     # setting is per *connection*, so this makes the append-only guarantee one about
