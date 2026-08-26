@@ -4645,3 +4645,35 @@ same blind spot had a second half in the hand-kept missing-field list, which omi
 nullable fields; both are now derived from `_ENVELOPE_FIELDS`.
 
 Final: 2494 pass, 1 xfail. Four gates green. Both CI checks green on `e334385`.
+
+## M1-609 — Verifying SQLite foreign-key enforcement after connection setup
+
+Acceptance: *`ledger.connect` reads `PRAGMA foreign_keys` back and raises `LedgerError` unless it is
+enabled, with a message naming the path and no stored value; a test asserts the refusal, and the
+existing `journal_mode`/`recursive_triggers` read-backs are the shape to follow.*
+
+Closes the standing risk carried since M1-607 and restated unchanged through M1-602 and M1-406:
+`connect()` set `PRAGMA foreign_keys = ON` but never read it back, so the transitive coverage
+`006_non_blank_identifiers.sql` describes — every unguarded identifier column is a foreign key into
+one of the five guarded primary keys — rested on an assumption rather than a verified setting. Fixed
+by giving `foreign_keys` the exact `journal_mode`/`recursive_triggers` shape: read back immediately
+after the `= ON` pragma, check `== 1`, close and raise `LedgerError(f"ledger database at {path} does
+not support foreign keys")` otherwise. No stored value in the message, matching the other two.
+
+### Deferred (do not read the absence as an omission)
+
+No migration and no new dependency — this is a connection-contract change only, so migration `009`
+stays free for the next item in the debt-queue wave.
+
+### Standing risk — not verifiable offline
+
+As the acceptance criteria states up front, no deterministic failure is reproducible on the supported
+SQLite runtime: `PRAGMA foreign_keys` is recognized and takes effect outside a transaction on every
+build this project runs against, so the refusal branch has no real trigger to exercise. The new test,
+`test_foreign_keys_not_enabled_raises_ledger_error`, installs a `sqlite3.Connection` subclass as
+`sqlite3.connect`'s `factory` (the built-in type is immutable, so its bound method can't be
+monkeypatched directly) that intercepts only the bare `"PRAGMA foreign_keys"` read-back and reports
+it disabled, leaving every other pragma and query untouched. This exercises the refusal branch's
+logic, not a reproduced defect.
+
+Four gates green.
