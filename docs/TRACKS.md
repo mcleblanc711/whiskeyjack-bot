@@ -41,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-506 | feat/m1-506-composed-output-validation | whiskeyjack-m1-506 | no | none | 2026-08-25 |
+| M1-405 | feat/m1-405-numeric-percentile-path | whiskeyjack-m1-405 | no | none | 2026-08-26 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
