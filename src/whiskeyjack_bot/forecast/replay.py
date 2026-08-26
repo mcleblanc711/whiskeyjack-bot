@@ -206,13 +206,29 @@ def replay_forecast(
         raise ForecastRecordError(str(exc)) from None
 
     source_ids = tuple(source.source_id for source in record.sources)
-    forecast, problems = _parse(
-        stored.raw_responses[-1],
-        model,
-        config.forecast,
-        question=record.question,
-        source_ids=source_ids,
-    )
+    try:
+        forecast, problems = _parse(
+            stored.raw_responses[-1],
+            model,
+            config.forecast,
+            question=record.question,
+            source_ids=source_ids,
+        )
+    except ForecastSchemaError as exc:
+        # The same translation as ``response_model_for`` above, for the same reason, and
+        # round 1 found the path: ``_parse`` reaches the type-specific checkers, and those
+        # refuse a *question* they cannot check a forecast against -- ``numeric``'s is a
+        # ``zero_point`` at or above ``lower_bound``, which ``CanonicalNumericQuestion``
+        # and ``ForecastRecordDraft`` both accept and which every writer accepted before
+        # M1-405 registered a numeric checker at all. So the state is ordinary, already in
+        # the ledger, and not something a replay may crash on with another module's
+        # exception type.
+        #
+        # The generating path needs no such handler: ``generate_forecast`` refuses that
+        # question in its preflight before anything is spent. Replay has no preflight --
+        # it is reading a row that already exists -- which is exactly why the boundary is
+        # here. ``from None`` because the chained cause would re-render the problem list.
+        raise ForecastRecordError(str(exc)) from None
     if forecast is None:
         return ForecastReplay(
             record_id=record.record_id,

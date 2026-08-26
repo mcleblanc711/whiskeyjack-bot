@@ -1131,13 +1131,19 @@ def test_a_percentile_problem_that_persists_costs_two_calls_and_no_more(
     assert all(p.startswith("final_prediction.percentiles: ") for p in result.failure_problems)
 
 
-def test_the_repair_turn_names_the_questions_bounds_and_not_the_models_value(
+def test_the_repair_turn_names_neither_the_questions_bounds_nor_the_models_value(
     config: AppConfig, prompt: LoadedPrompt
 ) -> None:
-    """The M1-403 asymmetry, applied to question data instead of config.
+    """Round 1's blocking finding, at the level where the string is actually spent.
 
-    The bound is what the model has to aim at, so it is rendered; the value that missed it
-    is model output, so it is withheld. It does reach the model in the assistant turn
+    The M1-403 asymmetry does **not** transfer. It renders the configured probability bounds
+    because the prompt prints ``0.001``-``0.999`` as a literal config may narrow, so a binary
+    model does not know its effective bound. A numeric model does: ``forecast/inputs.py``
+    puts ``lower_bound``, ``upper_bound``, ``open_*_bound`` and ``zero_point`` into the
+    request it was sent. Naming them back buys nothing and puts provider data into a string
+    that, after a second failure, is stored in the raw-output artifact.
+
+    The model's own value is withheld here too. It does reach the model in the assistant turn
     immediately before -- the provider produced it, so returning it is not a leak, while a
     log, an exception or a ledger row would be.
     """
@@ -1156,7 +1162,10 @@ def test_the_repair_turn_names_the_questions_bounds_and_not_the_models_value(
 
     turn = client.calls[1][-1]
     assert turn["role"] == "user"
-    assert "3.0" in turn["content"]
+    # The rule and the field it is about, so the turn is still actionable.
+    assert "lower_bound" in turn["content"]
+    # Neither the question's bound nor the model's value.
+    assert "3.0" not in turn["content"]
     assert "777" not in turn["content"]
     assert client.calls[1][-2]["role"] == "assistant"
 

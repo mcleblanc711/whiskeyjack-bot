@@ -145,14 +145,21 @@ def _parse(
         forecast = validate_forecast_response(payload, model)
     except ForecastSchemaError as exc:
         return None, list(exc.problems)
-    # Cannot raise, on any of its paths: the response is provably the model this dispatch
-    # selected, so its ``question_type`` is a validated Literal the registry covers, it
-    # agrees with ``question.qtype`` because ``generate_forecast`` selected the model *from*
-    # that field, and the member checkers cannot meet a response of the wrong category;
-    # ``generate_forecast`` refuses an inverted bounds pair and an unsatisfiable zero point
-    # before anything is spent, and it exact-type gates the question and its id there too.
-    # Those are the caller mistakes ``validate.output_problems`` and its members refuse, and
-    # none is reachable here.
+    # Cannot raise **when the caller is ``generate_forecast``**, and that qualifier is the
+    # correction round 1 forced. The response is provably the model this dispatch selected,
+    # so its ``question_type`` is a validated Literal the registry covers and it agrees with
+    # ``question.qtype`` because the model was selected *from* that field; the member
+    # checkers cannot meet a response of the wrong category; and the inverted bounds pair
+    # and the unsatisfiable ``zero_point`` are both refused in that function's preflight,
+    # before anything is spent.
+    #
+    # Every one of those rests on the preflight, so the claim does not extend to a caller
+    # that has none. ``forecast.replay`` reads a row that already exists and can hold a
+    # question no preflight ever saw -- a ``zero_point`` at or above ``lower_bound`` is
+    # accepted by ``CanonicalNumericQuestion`` and by ``ForecastRecordDraft``, and was
+    # written by every version of the writer that predates M1-405's checker. It therefore
+    # wraps this call and translates into its own ``ForecastRecordError``. A caller added
+    # later owes the same handler or the same preflight; this function promises neither.
     problems = output_problems(forecast, forecast_config, question=question, source_ids=source_ids)
     if problems:
         return None, problems

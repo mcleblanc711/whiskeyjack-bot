@@ -901,21 +901,65 @@ def _numeric_verdict_differs(
     return bites(first) != bites(second)
 
 
-def test_the_percentile_invariance_property_can_see_the_bounds_change() -> None:
-    """The companion check: the message is invariant in the model's value and *not*
-    invariant in the question's bounds, which is what makes a repair turn actionable.
+@given(numeric_cases(), st.floats(min_value=1.0, max_value=1e6, allow_nan=False))
+def test_a_percentile_problem_never_varies_with_the_question_it_was_checked_against(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion], scale: float
+) -> None:
+    """Round 1's blocking finding, as a property.
 
-    Without this, the property above would be satisfied by a checker whose every message
-    was a constant -- and a constant is exactly the message no model can act on.
+    The first cut rendered the question's bounds into these messages. They reach
+    ``ForecastGeneration.failure_problems`` and from there the persisted artifact, and a
+    question field is provider data under CLAUDE.md's threat boundary -- the path carve-out
+    is about operator configuration, not about content.
+
+    So: scale the question's bounds by any factor and, for a response that violates the
+    *same rules* either way, the text must be byte-identical. Stronger than the value
+    invariance above, and it is the claim the finding was about.
+    """
+    _, question = case
+    config = _forecast_config(0.001, 0.999)
+    # Values far outside any drawn bound, so the same rules bite at both scales.
+    extreme = _numeric_response(
+        DECLARED_PERCENTILE_LEVELS, (-1e9,) * (len(DECLARED_PERCENTILE_LEVELS) - 1) + (1e9,)
+    )
+    scaled = _numeric_question(
+        lower_bound=question.lower_bound * scale - 1.0,
+        upper_bound=question.upper_bound * scale + 1.0,
+        open_lower_bound=question.open_lower_bound,
+        open_upper_bound=question.open_upper_bound,
+        zero_point=None if question.zero_point is None else question.zero_point * scale - 2.0,
+    )
+    assert numeric_output_problems(extreme, config, question) == numeric_output_problems(
+        extreme, config, scaled
+    )
+
+
+def test_the_percentile_messages_still_distinguish_the_rule_they_report() -> None:
+    """The companion the fix re-aimed, and it is why the property above is not vacuous.
+
+    Before round 1 the companion showed the message varied with the *bound*, which is what
+    made a repair turn actionable. That is no longer true and must not be. What has to stay
+    true is that value-free is not the same as uninformative: a checker whose every message
+    was one constant would satisfy every invariance property here and tell a reader nothing.
+    Each rule names the field of the question it is about -- ``lower_bound``, ``upper_bound``,
+    ``zero_point``, names this project's canonical model authored -- so the five are distinct.
     """
     config = _forecast_config(0.001, 0.999)
-    below = _numeric_response(
-        DECLARED_PERCENTILE_LEVELS, (-50.0,) + (24.0,) * (len(DECLARED_PERCENTILE_LEVELS) - 1)
-    )
-    left = numeric_output_problems(below, config, _numeric_question(lower_bound=0.0))
-    right = numeric_output_problems(below, config, _numeric_question(lower_bound=-10.0))
-    assert left and right
-    assert left != right
+    nine = len(DECLARED_PERCENTILE_LEVELS)
+    below = _numeric_response(DECLARED_PERCENTILE_LEVELS, (-50.0,) + (24.0,) * (nine - 1))
+    above = _numeric_response(DECLARED_PERCENTILE_LEVELS, (24.0,) * (nine - 1) + (500.0,))
+    descending = _numeric_response(DECLARED_PERCENTILE_LEVELS, tuple(range(nine, 0, -1)))
+    short = _numeric_response(DECLARED_PERCENTILE_LEVELS[:2], (1.0, 2.0))
+    messages = {
+        numeric_output_problems(below, config, _numeric_question())[0],
+        numeric_output_problems(above, config, _numeric_question())[0],
+        numeric_output_problems(descending, config, _numeric_question(lower_bound=-100.0))[0],
+        numeric_output_problems(short, config, _numeric_question())[0],
+        numeric_output_problems(
+            below, config, _numeric_question(open_lower_bound=True, zero_point=-10.0)
+        )[0],
+    }
+    assert len(messages) == 5, sorted(messages)
 
 
 @given(numeric_cases())

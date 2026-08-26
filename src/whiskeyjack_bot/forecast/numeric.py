@@ -51,13 +51,33 @@ Its strings are the shape ``schema._sanitize`` produces -- a schema-authored fie
 colon, a value-free message -- so ``generate._repair_turn`` renders them uniformly and
 ``generate._classify`` reads them as ``schema_invalid`` with no change on either side.
 
-**The bound messages name the question's numbers; the model's values are withheld.** Same
-asymmetry ``binary.py`` argues for its configured bounds, and the argument is if anything
-stronger: a percentile value is untrusted model output, while ``lower_bound`` and
-``zero_point`` are platform-supplied question data the model was **already shown** in its
-own request (``forecast/inputs.py`` renders them under the numeric fields). A repair turn
-that says "respect the closed lower bound" without saying which number that is asks for a
-correction the model cannot aim at. Nothing else in this module renders a value.
+**No message renders a value -- not the model's, and not the question's.** The first cut
+rendered ``lower_bound``, ``upper_bound`` and ``zero_point``, reasoning from ``binary.py``
+that a repair turn which does not name the bound is one no model can aim at. Round 1 was
+right to refuse that, and the reason is that ``binary.py``'s argument does not survive the
+move. It holds there because ``prompts/forecaster.md`` prints ``0.001``-``0.999`` to the
+model as a **literal** while config is free to narrow it, so the model genuinely does not
+know the effective bound. Here it does: ``forecast/inputs.py`` puts ``lower_bound``,
+``upper_bound``, ``open_lower_bound``, ``open_upper_bound`` and ``zero_point`` into the
+model's own request under the numeric fields, so naming them back buys nothing.
+
+``attribution.py`` had already drawn exactly this line -- it declines to render the supplied
+``source_ids`` because "the model already holds the whole id list in its own request, under
+``research_documents``" -- and this module cited ``binary.py``'s side of it without checking
+that one. The rule these messages state is enough to act on; the numbers were never the
+part the model was missing.
+
+That matters beyond tidiness, because these strings do not stop at the repair turn. A
+response that fails twice puts them in ``ForecastGeneration.failure_problems``, which
+``forecast/artifacts.py`` writes into the persisted raw-output envelope. Question fields
+come from Metaculus payloads, which CLAUDE.md classes as untrusted, and the carve-out that
+lets a *path* be rendered is about operator configuration, not about provider content. So a
+rendered bound is provider data entering the ledger's diagnostics.
+
+The nine declared levels **are** still named, and they are a different category: they are
+this project's own constant, transcribed from the hashed prompt, and naming them is what
+``schema.response_model_for`` does when it prints the supported question types. Nothing
+reached through ``forecast`` or ``question`` is interpolated anywhere in this module.
 
 **This module reads the canonical question, and that is a widening of the M1-506 seam.**
 ``docs/TRACKS.md`` predicted M1-404 and M1-405 would each be one changed line in
@@ -103,6 +123,24 @@ DECLARED_PERCENTILE_LEVELS: tuple[float, ...] = (
 # the sequence as a whole, and an index is a fact about the model's output.
 _PERCENTILES_LOC = "final_prediction.percentiles"
 
+# The three bound rules, stated as constants so no call site can interpolate a question
+# field by accident. Each names the field of the question it is about -- ``lower_bound``,
+# ``upper_bound``, ``zero_point`` are names this project's canonical model authored, and
+# the model was sent all three under the numeric fields of its own request -- and none
+# names a number. "offending input withheld" is said of the model's value, which is the
+# one thing a reader might otherwise expect to see here.
+_BELOW_CLOSED_LOWER = (
+    "every value must be at or above the question's lower_bound, which is closed "
+    "for this question (offending input withheld)"
+)
+_ABOVE_CLOSED_UPPER = (
+    "every value must be at or below the question's upper_bound, which is closed "
+    "for this question (offending input withheld)"
+)
+_BELOW_ZERO_POINT = (
+    "every value must be at or above the question's zero_point (offending input withheld)"
+)
+
 
 class NumericOutputError(ForecastSchemaError):
     """A numeric forecast cannot be used, or was asked for in a way this module refuses.
@@ -117,14 +155,14 @@ class NumericOutputError(ForecastSchemaError):
     """
 
 
-def _format_number(value: float) -> str:
-    """Render one question-supplied number for the repair turn.
-
-    ``binary._format_bound``'s rule and its reason: ``repr`` is the shortest string that
-    round-trips, so the number the model is shown is exactly the number it is checked
-    against. A truncated bound is one the model could aim at and still miss.
-    """
-    return repr(value)
+# The declared levels, rendered once. ``repr`` is ``binary._format_bound``'s rule and its
+# reason survives here even though the bounds no longer use it: it is the shortest string
+# that round-trips, so a level the model is asked for is exactly a level it is checked
+# against. A truncated ``0.010`` would be a level the model could aim at and still miss.
+# ``test_the_rendered_levels_round_trip_back_to_the_levels_exactly`` pins that by parsing
+# the tokens back rather than by matching ``repr``'s output, which would agree with any
+# renderer that happened to be ``repr`` -- including a wrong one.
+_DECLARED_LEVELS_TEXT = ", ".join(repr(level) for level in DECLARED_PERCENTILE_LEVELS)
 
 
 def _levels_problem(forecast: NumericForecastResponse) -> str | None:
@@ -146,8 +184,7 @@ def _levels_problem(forecast: NumericForecastResponse) -> str | None:
     return (
         f"{_PERCENTILES_LOC}: must be exactly the "
         f"{len(DECLARED_PERCENTILE_LEVELS)} declared levels "
-        + ", ".join(_format_number(level) for level in DECLARED_PERCENTILE_LEVELS)
-        + " in ascending order, each once (offending input withheld)"
+        f"{_DECLARED_LEVELS_TEXT} in ascending order, each once (offending input withheld)"
     )
 
 
@@ -188,24 +225,12 @@ def _bound_problems(
     values = [point.value for point in forecast.final_prediction.percentiles]
     problems: list[str] = []
     if not question.open_lower_bound and any(value < question.lower_bound for value in values):
-        problems.append(
-            f"{_PERCENTILES_LOC}: values must be at least "
-            f"{_format_number(question.lower_bound)} for this question's closed lower "
-            "bound (offending input withheld)"
-        )
+        problems.append(f"{_PERCENTILES_LOC}: {_BELOW_CLOSED_LOWER}")
     if not question.open_upper_bound and any(value > question.upper_bound for value in values):
-        problems.append(
-            f"{_PERCENTILES_LOC}: values must be at most "
-            f"{_format_number(question.upper_bound)} for this question's closed upper "
-            "bound (offending input withheld)"
-        )
+        problems.append(f"{_PERCENTILES_LOC}: {_ABOVE_CLOSED_UPPER}")
     zero_point = question.zero_point
     if zero_point is not None and any(value < zero_point for value in values):
-        problems.append(
-            f"{_PERCENTILES_LOC}: values must be at least "
-            f"{_format_number(zero_point)}, this question's zero point "
-            "(offending input withheld)"
-        )
+        problems.append(f"{_PERCENTILES_LOC}: {_BELOW_ZERO_POINT}")
     return problems
 
 
@@ -222,6 +247,15 @@ def _require_question(question: CanonicalNumericQuestion) -> None:
     pinned SDK refuses it outright (``_check_log_scaled_fields``: "Lower bound must be
     greater than the zero point"), so a question carrying one cannot produce a submittable
     distribution however the percentiles are drawn.
+
+    **This raise is reachable from a stored record, and round 1 found where.** The canonical
+    model accepts ``zero_point == lower_bound``, so does ``ForecastRecordDraft``, and so did
+    every writer before this item existed -- numeric had no checker at the pinned base. A
+    replay of such a record reaches here through ``parse._parse``, which is why
+    ``forecast/replay.py`` now translates a ``ForecastSchemaError`` out of that call into
+    its own ``ForecastRecordError``, exactly as it already did for ``response_model_for``.
+    The raise stays a raise: it is not a problem the model can repair, and turning it into
+    one would ask a model to fix a question.
     """
     if not isinstance(question, CanonicalNumericQuestion):
         raise NumericOutputError(["question: must be a canonical numeric question"])

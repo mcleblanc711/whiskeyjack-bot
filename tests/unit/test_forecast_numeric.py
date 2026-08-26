@@ -272,9 +272,9 @@ def test_one_ulp_outside_a_closed_bound_is_refused() -> None:
     below = nextafter(0.0, -1.0)
     above = nextafter(100.0, float("inf"))
     low_problems = _problems(_with_values(below, 12, 14, 18, 24, 31, 38, 42, 50))
-    assert [p for p in low_problems if "closed lower" in p] != []
+    assert [p for p in low_problems if "lower_bound" in p] != []
     high_problems = _problems(_with_values(10, 12, 14, 18, 24, 31, 38, 42, above))
-    assert [p for p in high_problems if "closed upper" in p] != []
+    assert [p for p in high_problems if "upper_bound" in p] != []
 
 
 def test_an_open_bound_constrains_nothing_here() -> None:
@@ -292,42 +292,86 @@ def test_an_open_bound_constrains_nothing_here() -> None:
     assert _problems(far_above) != []
 
 
-def test_the_bound_in_the_message_is_the_questions_and_not_a_constant() -> None:
-    """A repair turn that does not name the actual bound is one no model can aim at."""
-    forecast = _with_values(10, 12, 14, 18, 24, 31, 38, 42, 50)
-    problems = _problems(forecast, lower_bound=20.0, upper_bound=40.0)
-    assert any("20.0" in p for p in problems)
-    assert any("40.0" in p for p in problems)
+def test_no_message_renders_a_question_field_value() -> None:
+    """Round 1's blocking finding, asserted as **invariance** rather than substring absence.
 
+    The first cut rendered the bounds, reasoning from ``binary.py`` that a repair turn which
+    does not name them is one no model can aim at. That argument is binary's alone: the
+    prompt prints ``0.001``-``0.999`` as a literal config may narrow, so a binary model does
+    not know its effective bound, while ``forecast/inputs.py`` puts every numeric bound into
+    the model's own request. Question fields come from Metaculus payloads, which CLAUDE.md
+    classes as untrusted, and these strings reach ``ForecastGeneration.failure_problems`` and
+    from there the persisted artifact.
 
-@pytest.mark.parametrize(
-    "bound",
-    [0.1, 1 / 3, 0.123456789012345, 1e-7, 12345678.910111213, 6.02e23],
-    ids=["one decimal", "a third", "fifteen digits", "tiny", "large", "huge"],
-)
-def test_the_rendered_bound_round_trips_back_to_the_bound_exactly(bound: float) -> None:
-    """``repr``, not a fixed precision -- M1-403's ``_format_bound`` argument.
-
-    A bound rendered as ``0.00`` is one the model could aim at and still miss, and a
-    repair turn that names an unreachable target is worse than one that names none. The
-    claim is that the number in the message *is* the number checked against, so it is
-    asserted by parsing the message back rather than by matching a string: a test that
-    compared against ``repr(bound)`` would agree with any renderer that happened to be
-    ``repr``, including a wrong one.
-
-    Found by mutation: ``repr`` -> ``f"{value:.2f}"`` survived every other test in this
-    file and in the property suite.
+    Invariance, not ``"20.0" not in message``: the messages name ``lower_bound`` and
+    ``zero_point``, so short digit runs are substrings of nothing here but the level list,
+    and a substring test would pass or fail for unrelated reasons (M1-303's trap). Two
+    questions that trigger the same rules with wildly different numbers must produce
+    byte-identical output.
     """
-    forecast = _with_values(*([bound + abs(bound) + 1.0] * 9))
-    problems = _problems(
-        forecast, lower_bound=bound - abs(bound) - 1.0, upper_bound=bound, open_upper_bound=False
+    forecast = _with_values(-1e9, 12, 14, 18, 24, 31, 38, 42, 1e9)
+    first = _problems(forecast, lower_bound=20.0, upper_bound=40.0)
+    second = _problems(
+        forecast, lower_bound=3.141592653589793, upper_bound=98765.4321, zero_point=2.5
     )
-    rendered = [p for p in problems if "closed upper" in p]
-    assert len(rendered) == 1
-    numbers = [
-        token for token in re.findall(r"[-+0-9.eE]+", rendered[0]) if _parses_as(token) == bound
-    ]
-    assert numbers, rendered[0]
+    assert first, "both draws must trigger the bound rules or this proves nothing"
+    # The zero-point rule fires only on the second, so compare the two bound problems that
+    # both draws share rather than the whole list.
+    shared = [p for p in second if "zero_point" not in p]
+    assert first == shared
+    for rendered in first + second:
+        for leaked in ("20.0", "40.0", "3.14159", "98765", "2.5", "1e+09", "1000000000"):
+            assert leaked not in rendered, rendered
+
+
+def test_the_messages_still_distinguish_the_rule_they_report() -> None:
+    """The companion to the invariance above: value-free must not mean uninformative.
+
+    A checker whose every message was one constant would satisfy the leak property
+    perfectly and tell a reader nothing. Each rule names the field of the question it is
+    about -- names this project's canonical model authored -- so the five are distinct and
+    a repair turn says which one was broken.
+    """
+    low = _problems(_with_values(-5, 12, 14, 18, 24, 31, 38, 42, 50))
+    high = _problems(_with_values(10, 12, 14, 18, 24, 31, 38, 42, 500))
+    zero = _problems(
+        _with_values(1, 12, 14, 18, 24, 31, 38, 42, 50),
+        lower_bound=2.0,
+        zero_point=1.5,
+        open_lower_bound=True,
+    )
+    order = _problems(_with_values(50, 42, 38, 31, 24, 18, 14, 12, 10))
+    levels = _problems(
+        _response(final_prediction={"percentiles": [{"percentile": 0.5, "value": 24.0}]})
+    )
+    rendered = [low, high, zero, order, levels]
+    assert all(len(group) == 1 for group in rendered), rendered
+    assert len({group[0] for group in rendered}) == 5
+
+
+def test_the_rendered_levels_round_trip_back_to_the_levels_exactly() -> None:
+    """``repr``, not a fixed precision -- M1-403's ``_format_bound`` argument, retargeted.
+
+    Round 1 removed the rendered bounds, which is what that argument originally protected
+    here. It still applies to the one thing this module does render: a level printed as
+    ``0.010`` would be a level the model could aim at and still miss. Asserted by parsing
+    the tokens back out of the message, not by comparing against ``repr`` -- a test compared
+    against ``repr`` agrees with any renderer that happens to be ``repr``, including a wrong
+    one.
+
+    The mutation that motivated this in round 1 (``repr`` -> ``f"{v:.2f}"``) no longer has a
+    bound to survive on, and ``.2f`` happens to round-trip for all nine of these levels. So
+    the sharper mutation is the one this kills: a renderer that truncates.
+    """
+    problems = _problems(
+        _response(final_prediction={"percentiles": [{"percentile": 0.5, "value": 24.0}]})
+    )
+    assert len(problems) == 1
+    tokens = re.findall(r"[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?", problems[0])
+    parsed = [value for value in (_parses_as(token) for token in tokens) if value is not None]
+    # The nine levels appear in order, as a contiguous run; the leading "9" is the count.
+    assert parsed[0] == float(len(DECLARED_PERCENTILE_LEVELS))
+    assert tuple(parsed[1:]) == DECLARED_PERCENTILE_LEVELS
 
 
 def _parses_as(token: str) -> float | None:
@@ -357,7 +401,7 @@ def test_a_value_below_the_zero_point_is_refused() -> None:
     forecast = _with_values(1, 12, 14, 18, 24, 31, 38, 42, 50)
     assert _problems(forecast, lower_bound=0.5, zero_point=0.25) == []
     problems = _problems(forecast, lower_bound=2.0, zero_point=1.5)
-    assert [p for p in problems if "zero point" in p] != []
+    assert [p for p in problems if "zero_point" in p] != []
 
 
 def test_a_value_exactly_on_the_zero_point_is_accepted() -> None:
@@ -371,7 +415,7 @@ def test_a_value_exactly_on_the_zero_point_is_accepted() -> None:
     assert _problems(forecast, lower_bound=2.0, zero_point=1.5, open_lower_bound=True) == []
     just_below = _with_values(nextafter(1.5, 0.0), 12, 14, 18, 24, 31, 38, 42, 50)
     problems = _problems(just_below, lower_bound=2.0, zero_point=1.5, open_lower_bound=True)
-    assert [p for p in problems if "zero point" in p] != []
+    assert [p for p in problems if "zero_point" in p] != []
 
 
 def test_a_question_whose_zero_point_is_not_below_its_lower_bound_is_a_caller_mistake() -> None:
