@@ -1,4 +1,13 @@
-"""The submission seam, and the gateway that posts nothing (M2-703).
+"""The submission seam, and the gateway that posts nothing (M2-703, M2-704).
+
+**M2-704 added two functions here and nothing else.** :func:`live_artifact_path` and
+:func:`write_live_artifact` are the live twins of the dry-run pair below, and they live in
+this module rather than in ``submission_live`` for one reason: they share
+:func:`_write_or_confirm`. That helper is already spelled twice in the tree -- here and in
+``research/artifacts._write_new_file`` -- and **M2-709** is the filed item for merging
+them. A third copy of a race-sensitive atomic write is what that item exists to prevent,
+and importing a sibling module's private helper is the wrong direction. Everything else
+M2-704 needed is in ``submission_live``, which imports this module's public surface.
 
 ``CODEX_HANDOFF.md`` asks for a :class:`SubmissionGateway` protocol *owned by this
 repository* returning a sanitized :class:`SubmissionReceipt`, with two implementations:
@@ -101,8 +110,8 @@ from whiskeyjack_bot.submission import KEY_LENGTH, SubmissionError, submission_k
 ARTIFACT_SCHEMA_VERSION = "1.0.0"
 
 # Which gateway produced a receipt. A closed vocabulary rather than a bool, because
-# `_attempt_from_receipt` dispatches on it and M2-704 adds no third member by accident:
-# `get_args` below is what a new member has to pass through.
+# `_attempt_from_receipt` dispatches on it and M2-704 added no third member: `live` was
+# already here, and `get_args` below is what any future member has to pass through.
 GatewayMode = Literal["dry_run", "live"]
 
 _GATEWAY_MODES: frozenset[str] = frozenset(get_args(GatewayMode))
@@ -113,11 +122,12 @@ _GATEWAY_MODES: frozenset[str] = frozenset(get_args(GatewayMode))
 # that matters -- it cannot be confused with a submission key.
 _DRY_RUN_ATTEMPT_PREFIX = "wjdry-1-"
 
-# Where dry-run artifacts live under `storage.artifact_root`. Two components, so that
-# `submissions/live/...` (M2-704) and `research/...` (M1-306) each keep their own
-# namespace and a reader can tell what a file is from its path alone.
+# Where submission artifacts live under `storage.artifact_root`. Two components, so that
+# `submissions/dry_run/...`, `submissions/live/...` and `research/...` (M1-306) each keep
+# their own namespace and a reader can tell what a file is from its path alone.
 _SUBMISSIONS_SUBDIR = "submissions"
 _DRY_RUN_SUBDIR = "dry_run"
+_LIVE_SUBDIR = "live"
 
 # An idempotency key becomes a path component, so it is constrained to characters that
 # cannot escape the artifact root or name a directory entry with a meaning of its own.
@@ -208,12 +218,22 @@ _assert_prefix_is_distinct()
 class SubmissionRequest:
     """What a gateway is asked to submit.
 
-    Four values, and each is here because *any* gateway needs it: the record the receipt
-    attributes to, the question a live post addresses, the key that makes the post
-    idempotent, and the payload itself. ``tournament_id`` and ``forecast_version`` are not
-    here -- they are already inside the key (``submission.canonical_key_json``), and a
-    second spelling of a value that must agree with the key is a value that can disagree
-    with it.
+    Four values every gateway needs, plus one only a live gateway can use: the record the
+    receipt attributes to, the question a live post addresses, the key that makes the post
+    idempotent, the payload itself, and the *post* the question belongs to.
+    ``tournament_id`` and ``forecast_version`` are not here -- they are already inside the
+    key (``submission.canonical_key_json``), and a second spelling of a value that must
+    agree with the key is a value that can disagree with it.
+
+    ``post_id`` is the M2-704 addition and it defaults to ``None``, which is what a dry run
+    supplies: nothing is fetched, so there is no post to name. A live gateway requires it,
+    because the pinned SDK posts by *question* id and refetches by *post* id, and those are
+    different numbers -- a group question's siblings share one post and differ only in
+    their question ids (M1-202). It is deliberately **not** derived from ``question_id``
+    and is deliberately not a second source of truth for it: ``submission_live`` fills it
+    from the same ``forecast_records`` row the question id comes from, and then checks the
+    pair against the platform before posting anything. A value that is checked is not the
+    divergence round 1 of M2-703 found; a value that is merely supplied would be.
 
     **Not validated at construction.** ``payload`` is a :class:`Mapping`, which the caller
     can mutate afterwards, so a constructor check would be a bound that decays between
@@ -225,6 +245,7 @@ class SubmissionRequest:
     question_id: int
     idempotency_key: str
     payload: Mapping[str, object]
+    post_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -687,14 +708,131 @@ def write_dry_run_artifact(
     return relative
 
 
-def read_dry_run_artifact(artifact_root: Path, relative_path: str) -> dict[str, object]:
-    """Read one dry-run artifact back, or raise :class:`GatewayError`.
+def live_artifact_path(*, question_id: int, idempotency_key: str) -> str:
+    """The path a **live** submission artifact is stored at, relative to ``artifact_root``.
 
-    Admits exactly what the writer can emit, which is why it refuses the non-finite JSON
+    The twin of :func:`dry_run_artifact_path`, in the sibling namespace the two-component
+    layout was split for. A reader can tell a rehearsal from a real post by the path alone,
+    which is the same property ``_DRY_RUN_ATTEMPT_PREFIX`` gives the attempt id.
+    """
+    question = _require_question_id(question_id, "question_id")
+    key = _require_safe_key(idempotency_key)
+    return f"{_SUBMISSIONS_SUBDIR}/{_LIVE_SUBDIR}/{question}/{key}.json"
+
+
+def write_live_artifact(
+    artifact_root: Path,
+    *,
+    receipt: SubmissionReceipt,
+    question_id: int,
+    payload: Mapping[str, object],
+    context: Mapping[str, object] | None = None,
+) -> str:
+    """Write one live submission's payload and receipt; return the path to record.
+
+    **This is the only place the posted payload is kept verbatim.**
+    ``submission_attempts`` stores ``request_payload_sha256`` and nothing else, so without
+    this file M2-706's *"ledger has approval, payload, attempt and verification snapshot"*
+    has no payload in it. The envelope holds the canonical payload beside the digest the
+    receipt claims, so an auditor re-derives the hash from the file rather than trusting
+    the row.
+
+    ``context`` is the live-only addition: whatever the caller needs an auditor to see
+    about *how* the post was made and verified -- the baseline the refetch was compared
+    against, the poster's own description of itself. It is rendered as canonical JSON with
+    the same rules as the payload, so it cannot make the artifact unwritable.
+
+    Shares :func:`_write_or_confirm` with :func:`write_dry_run_artifact`; that is the whole
+    reason this lives here rather than in ``submission_live``. A third copy of a
+    race-sensitive atomic write is exactly what **M2-709** was filed to stop, and importing
+    a sibling module's private helper is the wrong direction.
+
+    It **raises** on any write failure, exactly as its dry-run twin does, and the
+    difference in what that means is the caller's to handle: before a post there is nothing
+    to degrade to, but ``submission_live.post_approved_forecast`` calls this *after* the
+    post and therefore treats every failure as a degradation (M1-312's rule). Keeping the
+    raise here means the writer has one contract and the caller decides the policy.
+    """
+    if type(receipt) is not SubmissionReceipt:
+        raise GatewayError("receipt must be a SubmissionReceipt")
+    if not isinstance(artifact_root, Path):
+        raise GatewayError("artifact_root must be a Path")
+    mode = _require_mode(receipt.mode)
+    if mode != "live":
+        raise GatewayError(f"a {mode} receipt is not written to the live artifact tree")
+
+    key = _require_safe_key(receipt.idempotency_key)
+    question = _require_question_id(question_id, "question_id")
+    # Rendered once and digested from that rendering, for `write_dry_run_artifact`'s
+    # reason: hashing a second render would compare two runs of the same code, not the
+    # file and its hash.
+    canonical = canonical_payload_json(payload)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if digest != _require_sha256(receipt.request_payload_sha256, "receipt.request_payload_sha256"):
+        raise GatewayError(
+            "the receipt's request_payload_sha256 does not match the payload supplied "
+            "with it (detail withheld: it can echo the payload)"
+        )
+
+    envelope: dict[str, object] = {
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "mode": mode,
+        "question_id": question,
+        "request_payload": json.loads(canonical),
+        "receipt": _receipt_envelope(receipt),
+    }
+    if context is not None:
+        envelope["context"] = json.loads(canonical_payload_json(context))
+    try:
+        body = json.dumps(envelope, ensure_ascii=True, sort_keys=True, allow_nan=False).encode(
+            "utf-8"
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise GatewayError(
+            "the live submission artifact could not be rendered as JSON "
+            "(detail withheld: it can echo the payload)"
+        ) from None
+
+    relative = live_artifact_path(question_id=question, idempotency_key=key)
+    _write_or_confirm(artifact_root / relative, body)
+    return relative
+
+
+def read_dry_run_artifact(artifact_root: Path, relative_path: str) -> dict[str, object]:
+    """Read one **dry-run** artifact back, or raise :class:`GatewayError`.
+
+    Kept as its own function with its own mode check rather than widened to admit a live
+    artifact: a reader that returns either one leaves every caller to check which it got,
+    and the whole reason ``mode`` is on the receipt is that a rehearsal and a real post
+    must never be mistaken for each other.
+    """
+    return read_submission_artifact(artifact_root, relative_path, expected_mode="dry_run")
+
+
+def read_live_artifact(artifact_root: Path, relative_path: str) -> dict[str, object]:
+    """Read one **live** submission artifact back, or raise :class:`GatewayError` (M2-704).
+
+    The twin of :func:`read_dry_run_artifact`, and the way an auditor re-derives
+    ``request_payload_sha256`` from the payload the post actually carried --
+    ``submission_attempts`` stores the digest and not the payload.
+    """
+    return read_submission_artifact(artifact_root, relative_path, expected_mode="live")
+
+
+def read_submission_artifact(
+    artifact_root: Path, relative_path: str, *, expected_mode: GatewayMode
+) -> dict[str, object]:
+    """Read one submission artifact of a named mode back, or raise :class:`GatewayError`.
+
+    Admits exactly what the writers can emit, which is why it refuses the non-finite JSON
     constants ``json.loads`` accepts by default: a reader that admits more than its writer
     produces is not reading the format it documents (``research/artifacts.py`` round 1,
     finding 7).
+
+    ``expected_mode`` is required rather than defaulted, so a caller states which kind of
+    record it believes it is reading and gets a refusal when it is wrong.
     """
+    _require_mode(expected_mode)
     if not isinstance(artifact_root, Path):
         raise GatewayError("artifact_root must be a Path")
     if type(relative_path) is not str or not relative_path.strip():
@@ -703,35 +841,37 @@ def read_dry_run_artifact(artifact_root: Path, relative_path: str) -> dict[str, 
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        raise GatewayError(f"cannot read dry-run artifact {path}") from None
+        raise GatewayError(f"cannot read submission artifact {path}") from None
     try:
         envelope = json.loads(text, parse_constant=_reject_json_constant)
     except ValueError:
-        raise GatewayError(f"dry-run artifact is not valid JSON: {path}") from None
+        raise GatewayError(f"submission artifact is not valid JSON: {path}") from None
     if not isinstance(envelope, dict):
-        raise GatewayError(f"dry-run artifact is not a JSON object: {path}")
+        raise GatewayError(f"submission artifact is not a JSON object: {path}")
     version = envelope.get("artifact_schema_version")
     if type(version) is not str or not version.strip():
-        raise GatewayError(f"dry-run artifact schema version is missing or malformed: {path}")
+        raise GatewayError(f"submission artifact schema version is missing or malformed: {path}")
     if version != ARTIFACT_SCHEMA_VERSION:
         # The version is this module's own literal on one side; the other is named only as
         # "unsupported", because a stored value is content until it is proven to be a
         # member of a vocabulary this module defines.
         raise GatewayError(
-            f"dry-run artifact was written under an unsupported schema version "
+            f"submission artifact was written under an unsupported schema version "
             f"(this build reads {ARTIFACT_SCHEMA_VERSION}): {path}"
         )
     # The structural half of "admit exactly what the writer emits". Shapes only: the
     # values inside are content this module does not interpret, and re-deriving the digest
     # is the caller's check to make against the receipt it holds.
-    if _require_mode(envelope.get("mode")) != "dry_run":
-        raise GatewayError(f"dry-run artifact does not record a dry run: {path}")
+    if _require_mode(envelope.get("mode")) != expected_mode:
+        # `expected_mode` is a member of this module's own closed vocabulary, so naming it
+        # is safe; what the file actually said is stored content and is not echoed.
+        raise GatewayError(f"submission artifact does not record a {expected_mode}: {path}")
     if type(envelope.get("question_id")) is not int:
-        raise GatewayError(f"dry-run artifact question_id is missing or malformed: {path}")
+        raise GatewayError(f"submission artifact question_id is missing or malformed: {path}")
     if not isinstance(envelope.get("request_payload"), dict):
-        raise GatewayError(f"dry-run artifact request_payload is missing or malformed: {path}")
+        raise GatewayError(f"submission artifact request_payload is missing or malformed: {path}")
     if not isinstance(envelope.get("receipt"), dict):
-        raise GatewayError(f"dry-run artifact receipt is missing or malformed: {path}")
+        raise GatewayError(f"submission artifact receipt is missing or malformed: {path}")
     return envelope
 
 
@@ -769,12 +909,15 @@ def _receipt_envelope(receipt: SubmissionReceipt) -> dict[str, object]:
 def _reject_json_constant(token: str) -> object:
     """Refuse ``NaN``/``Infinity``/``-Infinity`` while parsing an artifact."""
     raise GatewayError(
-        "dry-run artifact contains a non-finite JSON constant, which this format does not permit"
+        "submission artifact contains a non-finite JSON constant, which this format does not permit"
     )
 
 
 def _write_or_confirm(destination: Path, body: bytes) -> None:
     """Create ``destination`` with ``body``, atomically; accept an identical existing file.
+
+    Shared by :func:`write_dry_run_artifact` and :func:`write_live_artifact`; the messages
+    below therefore say "submission artifact" rather than naming either one.
 
     A temp file in the destination's own directory is written and fsynced, then
     ``os.link`` moves it into place -- ``link`` fails with ``EEXIST`` rather than
@@ -797,7 +940,7 @@ def _write_or_confirm(destination: Path, body: bytes) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         raise GatewayError(
-            f"cannot create dry-run artifact directory {destination.parent}"
+            f"cannot create submission artifact directory {destination.parent}"
         ) from None
     handle, temp_name = -1, ""
     try:
@@ -812,7 +955,7 @@ def _write_or_confirm(destination: Path, body: bytes) -> None:
         except FileExistsError:
             _confirm_identical(destination, body)
     except OSError:
-        raise GatewayError(f"cannot write dry-run artifact {destination}") from None
+        raise GatewayError(f"cannot write submission artifact {destination}") from None
     finally:
         if handle != -1:
             os.close(handle)
@@ -826,18 +969,24 @@ def _write_or_confirm(destination: Path, body: bytes) -> None:
 
 
 def _confirm_identical(destination: Path, body: bytes) -> None:
-    """Accept an existing artifact whose bytes match; raise if they do not."""
+    """Accept an existing artifact whose bytes match; raise if they do not.
+
+    On the live path an existing destination should be unreachable -- the path is derived
+    from an idempotency key ``submission.require_key_unused`` has just declared unspent --
+    so a collision there means something outside this module wrote the file, and the
+    comparison is what turns that into a refusal rather than a silent overwrite.
+    """
     try:
         existing = destination.read_bytes()
     except OSError:
         raise GatewayError(
-            f"a dry-run artifact already exists at {destination} and could not be read back "
-            "to confirm it records the same dry run"
+            f"a submission artifact already exists at {destination} and could not be read "
+            "back to confirm it records the same submission"
         ) from None
     if existing != body:
         # Names neither body: both are payload-derived content.
         raise GatewayError(
-            f"a different dry-run artifact already exists at {destination} and is never "
+            f"a different submission artifact already exists at {destination} and is never "
             "overwritten (detail withheld: it can echo the payload)"
         )
 

@@ -39,6 +39,32 @@ _MIN_SECRET_LENGTH = 4
 # transport diagnostics for no content gain.
 _PAYLOAD_LOGGER_PREFIXES = ("forecasting_tools", "litellm", "LiteLLM")
 
+# The pinned SDK's HTTP helper module. **Every** logging call in it interpolates either a
+# response or an exception, and for an HTTP failure those are the same thing: it builds
+# `f"HTTPError. Url: {response.url}. Status code: {...}. Response reason: {...}. Response
+# text: {response_text}. Response JSON: {response_json}."`, logs it at ERROR, and *then*
+# raises an HTTPError carrying that same string -- which its own retry wrapper logs twice
+# more as `{e}`. So the full untrusted response body and the request URL reach a log record
+# on an ordinary 4xx. Reproduced by execution in M2-704 review round 1, finding 3.
+#
+# The whole module is closed rather than the one message, for the reason PayloadDebugFilter
+# gives: matching text is a check whose unknown case is "pass". The status, allowlisted
+# headers and truncated body an operator actually needs are on the submission attempt row,
+# put there deliberately by `submission_live.http_details` -- so nothing diagnostic is lost
+# here, only the uncontrolled copy.
+_PROVIDER_RESPONSE_LOGGER_PREFIXES = ("forecasting_tools.util.misc",)
+
+# Context-neutral on purpose. An earlier wording said the details "are recorded on the
+# submission attempt row", which is true of a failed post and **false** of a read or of any
+# pre-attempt call through the same helper -- a log line that tells an operator to go and
+# look at a row that does not exist. A replacement message is the one piece of text here
+# that is always emitted, so it may only claim what is always true.
+_SANITIZED_PROVIDER_MESSAGE = (
+    "a forecasting-tools HTTP record was replaced: its text embeds the full response body "
+    "and request URL. Where the call was a submission attempt, its status, allowlisted "
+    "headers and truncated body are on that attempt's ledger row."
+)
+
 
 def _redact_text(text: str, env_var_names: list[str]) -> str:
     """Replace the value of any named environment variable found in *text*.
@@ -112,6 +138,34 @@ class PayloadDebugFilter(logging.Filter):
         return not record.name.startswith(_PAYLOAD_LOGGER_PREFIXES)
 
 
+class ProviderResponseTextFilter(logging.Filter):
+    """Replace the message of any record from the SDK module that logs response bodies.
+
+    **Replaces rather than drops.** That a call to the platform failed is a real
+    diagnostic and an operator needs to see it; what they must not get is an unbounded
+    copy of untrusted provider content in ``logging.file``, which
+    ``CLAUDE.md``'s "an error message never echoes stored/file/field values" forbids and
+    which would also carry anything the endpoint chose to echo back. The level, the logger
+    name and the timestamp survive; only the text is swapped.
+
+    ``record.args`` is cleared with the message, because a replaced ``msg`` holding no
+    format placeholders would raise on interpolation if the args were left behind.
+
+    Like :class:`PayloadDebugFilter` this is a **handler** filter, so it protects the
+    handlers this project installs and cannot be undone by the library raising its own
+    level. A library that installs a handler of its own is outside this module's reach and
+    is a standing risk rather than a claim.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.startswith(_PROVIDER_RESPONSE_LOGGER_PREFIXES):
+            record.msg = _SANITIZED_PROVIDER_MESSAGE
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
 class JsonFormatter(logging.Formatter):
     """Serialize records as JSON with every string field redacted.
 
@@ -158,6 +212,7 @@ def configure_logging(config: AppConfig) -> None:
     secret_names = config.secret_env_var_names()
     redaction = SecretRedactionFilter(secret_names)
     payload_debug = PayloadDebugFilter()
+    provider_response = ProviderResponseTextFilter()
     formatter = JsonFormatter(secret_names)
 
     stream_handler = logging.StreamHandler()
@@ -169,5 +224,6 @@ def configure_logging(config: AppConfig) -> None:
         handler.setFormatter(formatter)
         handler.addFilter(redaction)
         handler.addFilter(payload_debug)
+        handler.addFilter(provider_response)
         setattr(handler, "_whiskeyjack", True)  # noqa: B010 - marker for idempotent re-setup
         root.addHandler(handler)

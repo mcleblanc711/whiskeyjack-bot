@@ -97,6 +97,13 @@ def test_empty_string_counts_as_missing(config_file: Path, monkeypatch: pytest.M
 def test_invalid_live_submit_config_exits_config_invalid(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`enabled: true` with the brakes still on is refused, and verify-env says so.
+
+    Before M2-704 this failed on "invalid before Milestone 2"; that refusal is gone,
+    because a submission path now exists. What replaced it is the contradiction check --
+    the example config leaves `dry_run` and `no_submit` on, so turning `enabled` on alone
+    still cannot load. The rule changed; the outcome for this configuration did not.
+    """
     set_all_env(monkeypatch)
     data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     data["submission"]["enabled"] = True
@@ -104,7 +111,8 @@ def test_invalid_live_submit_config_exits_config_invalid(
     bad.write_text(yaml.safe_dump(data), encoding="utf-8")
     report = verify_environment(bad)
     assert report.exit_code == EXIT_CONFIG_INVALID
-    assert any("Milestone 2" in p for p in report.config_problems)
+    assert any("dry_run: false" in p for p in report.config_problems)
+    assert any("no_submit: false" in p for p in report.config_problems)
 
 
 def test_social_enabled_requires_xai_key_and_allowlist(

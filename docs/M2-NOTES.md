@@ -830,3 +830,672 @@ The no-leak property closes the message set rather than searching for a substrin
 (M1-607): every refusal from `payload_sha256` must match one of eight written-down
 patterns that capture nothing from the input, and the same test asserts `__cause__ is
 None` so no cause chain can reprint what a message withheld.
+
+## M2-704 — Package-backed gateway
+
+The first item in the repository that can cause a live Metaculus post. Everything it
+stands on was already merged with no caller: M2-701's approval boundary and
+`effective_approval()`, M2-702's idempotency keys and `require_key_unused()`, M2-703's
+`SubmissionGateway` protocol and `SubmissionReceipt`, and — since M1-603 — the whole
+submission vocabulary: `submitted` / `submission_uncertain` / `submission_failed`,
+`submission_confirmed` / `submission_disconfirmed`, `record_submission_attempt()`,
+`record_submission_verification()` and `unresolved_uncertainties()`. This item is the
+caller of all of it.
+
+Delivered:
+
+- `src/whiskeyjack_bot/submission_live.py` — `LiveSubmissionError`, the `MetaculusPoster`
+  protocol, `MetaculusSubmissionGateway`, the payload→post-call validator
+  (`plan_from_payload`), the refetch comparison (`read_my_forecasts`, `classify_refetch`,
+  `expected_values` / `observed_values` / `values_match`), the verification snapshot
+  (`build_verification_snapshot` / `read_verification_snapshot`), the error classifier
+  (`classify_error`, `http_details`, `storable_text`), the orchestrator
+  `post_approved_forecast()` and the resolution command `verify_uncertain_attempt()`.
+- `src/whiskeyjack_bot/metaculus/client.py` — `SingleAttemptPoster`, `build_poster()`,
+  `PosterContractError` and the import-time contract guard.
+- `src/whiskeyjack_bot/submission_gateway.py` — two functions only: `live_artifact_path()`
+  and `write_live_artifact()`, plus `read_live_artifact()` / `read_submission_artifact()`
+  and one new field, `SubmissionRequest.post_id`.
+- `src/whiskeyjack_bot/config.py` — the pre-M2 refusals removed, the contradiction check
+  added; `config.example.yaml`'s values unchanged.
+- `src/whiskeyjack_bot/cli.py` — `submit` and `verify-submission`.
+- `tests/unit/test_submission_live.py`, `tests/unit/test_metaculus_poster.py`,
+  `tests/unit/test_cli_submit.py`, `tests/property/test_submission_live_properties.py`,
+  and rewritten submission-flag cases in `tests/unit/test_config.py` /
+  `tests/unit/test_env_verify.py`.
+
+No migration — `submission_attempts` and `lifecycle_events` already carry every column and
+every vocabulary member this needs. No new dependency: the dependency slot is held by
+M1-311 this wave and stays held (see the deviation below).
+
+### What execution established about the pinned SDK
+
+Four things, all measured against `forecasting-tools==0.2.92` with `requests` stubbed, and
+all now pinned by `tests/unit/test_metaculus_poster.py` so a version bump is a red build:
+
+1. **`MetaculusClient` blind-retries every POST four times.**
+   `_post_question_prediction` carries `@retry_with_exponential_backoff()`
+   (`max_retries=3`) whose `retry_on_exceptions` is `requests.exceptions.RequestException`
+   — which `HTTPError` subclasses. Measured: **four POSTs on a `Timeout`, four on a 400.**
+2. Binding `_post_question_prediction.__wrapped__` on the instance yields exactly **one**
+   POST, and the real `requests.exceptions.Timeout` propagates.
+3. The SDK's `HTTPError` message embeds the **full response body and the request URL**
+   (`raise_for_status_with_additional_info`), and logs it at ERROR level besides.
+4. The status is nevertheless recoverable: the SDK re-raises a bare `HTTPError` (its own
+   `.response` is `None`) chained `from` the original, so `exc.__cause__.response` is
+   reachable through public attributes — 429 and `Retry-After` both came back that way.
+
+### Decision — the SDK's blind retry is neutralized, and that is the item's core
+
+Point 1 *is* the thing the acceptance criterion forbids, arriving from inside the
+dependency: a timed-out post that actually landed is re-posted three more times, under one
+idempotency key, with no refetch in between. Recording it correctly afterwards would not
+help; by then four forecasts have been sent.
+
+`metaculus/client.py`'s `SingleAttemptPoster` is the only place that knows this. Per post
+call it binds `types.MethodType(MetaculusClient._post_question_prediction.__wrapped__,
+client)` on the instance, so the SDK's own **public** `post_binary_question_prediction`
+(and its two siblings) still build the payload, still enforce their bounds, and still make
+the request — the decorator is simply not between them and it. The line drawn is **reads
+may retry, writes must not**: `get_question_by_post_id` is passed through with its retry
+intact, because a GET is idempotent and retrying it is what keeps "the refetch could not be
+performed" an edge case.
+
+**This is not the private-method dependency D28 rejected.** D28's rejected alternative is
+"private method; raw API from day one" *as the way to capture an exact response body*.
+Nothing here reads a response through a private name; the guard only declines to have a
+request repeated. M2-705's own acceptance criterion — "no private package method dependency
+without a guard" — is the standard this is written to, and the guards are three:
+`_assert_single_post_is_reachable()` fails at **import** if `__wrapped__` is missing, is the
+decorated attribute itself, or takes different parameters; `tests/unit/test_metaculus_poster.py`
+drives the real class with a counted stub and asserts four-without / one-with; and
+`test_dependency_pins.py` already makes an upgrade a red build.
+
+**Owner decision, 2026-08-25**, taken against two alternatives: accept the retry and record
+it as a standing risk (rejected — a hard constraint breached by accepted behaviour is a
+defect, not a risk, which is M1-402's finding), or write the narrow HTTP adapter now
+(rejected — that is M2-705, and D28 keeps the SDK path default until the smoke test passes).
+
+### Decision — the config gate is relaxed, the committed defaults are not
+
+`SubmissionConfig` refused `enabled: true`, `dry_run: false` and `no_submit: false`
+outright, on the grounds that no submission path existed. One does now, so the three
+refusals are gone and the flags mean what they say. `config.example.yaml` still commits
+`enabled: false`, `dry_run: true`, `no_submit: true`, and
+`submission_live._require_live_submission_enabled()` refuses to post unless all three are
+deliberately flipped — so turning on a live path is three explicit edits plus an approval.
+Every safety invariant survives: `enabled` still requires `require_human_approval`,
+`approval_must_match_forecast_hash`, `verify_by_refetch` and
+`block_retry_on_uncertain_result`.
+
+One refusal was **added**, and it is the stricter reading of a combination the removals made
+reachable: `enabled: true` alongside `dry_run: true` or `no_submit: true` describes a
+deployment that both may and may not post. Resolving that at runtime — picking one flag as
+dominant — would put the answer somewhere no reader of the config can see. `test_config.py`
+now enumerates all eight triples and asserts the accepted set is exactly five, so a rule
+that is *removed* fails as loudly as one that is added (M1-501's vacuity lesson).
+
+**Owner decision, 2026-08-25.** The alternative was to keep the gate closed and pass an
+`allow_live_post` argument, which would have shipped a path nothing could reach and blocked
+M2-706 on a second config item.
+
+### Decision — verification is a before/after comparison, keyed on a baseline
+
+The handoff says to "refetch the question and verify `previous_forecasts` **changed** as
+expected". The *changed* is why the gateway fetches the question **before** posting and
+keeps the latest of the operator's own forecasts as a baseline. A confirmation requires
+both halves: an entry whose `start_time` is strictly greater than the baseline's, and
+values matching what was posted. Without the first half, a question the operator had
+already forecast on would confirm a submission that never landed. Comparing against a
+baseline rather than against this machine's clock also removes any dependence on clock
+agreement with Metaculus.
+
+`classify_refetch` is four-valued where `lifecycle.VerificationOutcome` is two-valued, and
+both extra members earn their place. `mismatched` is not `absent`: something is there and
+it is not what was sent. `unreadable` is not `absent` either — a refetch that could not be
+performed observed nothing, and recording that as "the forecast is not there" is how a lost
+connection becomes a permanent claim about a live forecast.
+
+### Decision — the payload is the Metaculus wire body plus a discriminator
+
+`{"question_type": ..., "<wire key>": ...}`, where the wire key is the pinned SDK's own:
+`probability_yes`, `continuous_cdf`, `probability_yes_per_category`. M1-502/M1-503 then
+have one shape to emit rather than a private format to translate. Dispatch is on the
+`question_type` literal, never on which key is present (CLAUDE.md's rule). Exactly two keys
+are accepted: a third is refused rather than ignored, because a key this module would
+silently drop is a forecast nobody reviewed.
+
+Every bound the SDK's public methods enforce is restated in `plan_from_payload`, and the
+duplication is deliberate: the SDK raises a bare `ValueError` from inside the dependency,
+at a point this module cannot distinguish from a failure that had already posted. Restating
+them means the refusal happens before any network call and arrives as
+`LiveSubmissionError` (M1-303 round 4's rule). All three types are accepted rather than
+binary alone, so the item is not reopened when M1-403/404/405 land.
+
+### Decision — order of operations, and where the boundary is
+
+Everything that can refuse refuses before the single `post` call; nothing after it refuses.
+That is M1-303 round 4 joined to M1-312, and the post is the boundary. In order, all
+before any network call: the config gate; `unresolved_uncertainties()` must be empty;
+`read_forecast_record()` supplies `question_id`, `post_id` and `question_type` **from the
+one ledger row**; the payload's type must match the record's;
+`submission_key_for_approved_record()`; `require_key_unused()`. Then the baseline fetch and
+the platform identity check. After the post: the artifact is written and every failure of it
+degrades to `artifact_error` on the result, and the ledger row is written regardless.
+`LiveSubmissionRecord` cannot represent a lie about that — `artifact_path` is `None`
+exactly when `artifact_error` is not.
+
+Two smaller consequences of the same rule. A clock that ran backwards is **clamped**, not
+refused: `record_submission_attempt` rejects a reversed pair outright, and refusing there
+would leave a completed post unrecordable. And every string on the receipt goes through
+`storable_text()` before the receipt exists, so a hostile provider body — NUL, lone
+surrogate, 200 KB — cannot make `record_receipt` refuse a post that has already happened.
+
+### Deviation — `my_forecasts.history`, not `previous_forecasts`
+
+The handoff names `previous_forecasts`. In the pinned SDK that field is populated only by
+`BinaryQuestion` and `NumericQuestion`; `MultipleChoiceQuestion` inherits the base class's
+`None` and never fills it in. A rule built on it would silently never confirm a
+multiple-choice submission — an honest post recorded as uncertain forever, which is the
+worst available failure. `api_json["question"]["my_forecasts"]["history"]` is what all
+three subclasses read *from*, so it is the one basis that is uniform. It is untrusted
+provider JSON and is parsed defensively; `read_my_forecasts` never raises, because its
+caller reaches it after a post.
+
+### Deviation — the dependency slot is not taken, so `requests` is never imported
+
+`submission_live` classifies transport exceptions by walking the exception's MRO and
+matching class names restricted to the `requests.exceptions` module, and reads
+`http_status` / headers / body through `getattr` on `exc.__cause__.response`. Importing
+`requests` would make it a declared dependency — the rule `test_dependency_pins.py`
+enforces for `idna`, `asknews` and `httpx` — and the slot is held by M1-311 this wave. It
+is also better layering: the seam talks to `MetaculusPoster` and should not know the
+transport. The vocabulary is pinned against the **real** exception classes in
+`test_metaculus_poster.py`, which imports `requests` freely because a test may.
+
+`ConnectTimeout` is deliberately classified as a *connection* error rather than a timeout:
+a connect timeout never established a connection, so nothing was sent. A `ReadTimeout` is
+the genuinely ambiguous case. Both still refetch, so a misjudgement costs audit fidelity
+and never safety.
+
+### Rejected — widening `SubmissionReceipt` with a `detail_code`
+
+`record_receipt` takes `detail_code` separately, and the obvious move is to put it on the
+receipt. Rejected: `FailureCode` is a *ledger* vocabulary and the receipt is the gateway's
+sanitized record of a call. `LiveSubmissionOutcome` carries the pair instead, so neither
+shape has to know about the other and `post_approved_forecast` does not have to re-derive
+from a rendered snapshot what this module already knew.
+
+### Reversed in round 1 — reading the option list, after rejecting it
+
+**The original decision was wrong and the rationale that defended it was false.** It is
+left here in full because the failure is instructive, and because the request that went to
+review carried the false claim as a deliberate choice.
+
+What was written: the platform reports one value per option in the question's option order,
+so an exact ordered comparison needs the option list; rejected because "it adds a second
+thing that must be readable for a post to be confirmable"; the comparison is a sorted
+multiset instead; "two options carrying the same probability become indistinguishable,
+which is a genuine weakening and is stated rather than hidden; a *different distribution*
+is still caught."
+
+Both halves are wrong.
+
+- **A different distribution is not still caught.** `{a: 0.25, b: 0.75}` and
+  `{a: 0.75, b: 0.25}` sort to the same tuple. A **permutation** of a distribution is a
+  different distribution, and the multiset cannot see it — so a post whose categories
+  landed transposed was reported `confirmed`, and the ledger would record `submitted` for
+  a forecast the operator never made. The weakening was not "ties are indistinguishable",
+  it was "category identity is not checked at all".
+- **There is no second thing that must be readable.** `options` and `my_forecasts` are
+  siblings in the same `api_json["question"]` dict, already parsed in a single defensive
+  pass. Reading the option list costs no second fetch and no second object. The premise
+  that made the trade-off look necessary did not hold.
+
+What ships instead: `expected_values` projects multiple-choice probabilities in the
+**payload's** declared order, `read_my_forecasts` carries the platform's option order on
+the `ForecastHistory` beside the entries, and `classify_refetch` aligns the two **by
+label** before comparing. A platform that lists options in its own order still confirms; a
+transposed forecast does not. Where the alignment cannot be made exactly — either label
+list missing, label sets differing, value count not the option count — the outcome is
+`unreadable`, never `confirmed` and never `mismatched`.
+
+**How it survived a full property pass:** `tests/unit/test_submission_live.py` contained
+`test_a_multiple_choice_comparison_does_not_need_the_option_order`, which asserted that a
+transposed history *was* a confirmation. The suite agreed with the defect, so no amount of
+running it could find it. That test is deleted; eight unit tests and two properties replace
+it, and the properties are **iff** rather than implications — a one-sided property holds
+for the honest post and for the transposed one alike, which is precisely why the original
+pass reported clean.
+
+Raised as blocking finding 2 of M2-704 round-1 cross-model review, reproduced by execution
+before any fix code was written.
+
+### Rejected — a third copy of the atomic artifact writer
+
+`write_live_artifact` lives in `submission_gateway.py`, next to its dry-run twin, rather
+than in `submission_live`. That module already spells `_write_or_confirm` once and
+`research/artifacts._write_new_file` spells it again; **M2-709** is the filed item for
+merging them, and a third copy of a race-sensitive write is exactly what that item exists
+to prevent. Importing a sibling module's private helper was the other option and is the
+wrong direction.
+
+### Rejected — refusing a mismatch by recording it as `absent`
+
+`verify_uncertain_attempt` refuses on `mismatched` and on `unreadable` rather than writing
+a verification. `absent` is terminal, so recording a mismatch as absent would end a live
+forecast version on evidence that *a* forecast exists. Leaving the uncertainty standing is
+the conservative direction: the post gate stays closed and a human decides. D-1001's
+runbook is where the manual path belongs.
+
+### Deferred (do not read the absence as an omission)
+
+- **No payload builder.** M1-502/M1-503 are `Not Started`, so `submit` takes
+  `--payload-file`. M2-703's notes said this is where that lands, and it does.
+- **D33 / M2-707 — the payload→approval binding is still open.** An approval binds to
+  `forecast_sha256`, so one approved forecast still covers every payload built from it.
+  What is checkable today *is* checked: the payload's `question_type` must equal the
+  record's. The gap is pinned by `test_the_documented_payload_binding_gap_is_real_and_is_
+  asserted` rather than described in prose, so a later change that closes it fails a test
+  and forces this note to be updated.
+- **M2-708 — the key is not reserved atomically.** `require_key_unused()` is a read and
+  says so; two concurrent commands could both see one key as unused. Nothing changed here.
+- **M2-705 — exact response capture.** This item produces the evidence that spike needs:
+  statuses, allowlisted headers and a truncated body on *failure*, and nothing at all on
+  success, because the public post methods return `None`.
+- **The response body of a successful post is not captured**, for the same reason.
+- **No numeric CDF construction.** `plan_from_payload` validates a 201-point CDF; building
+  one from percentiles is M1-503.
+
+### Standing risk — value equality against a platform that may normalize
+
+`values_match` admits a difference of `1e-9`, which is representation noise and nothing
+more. Whether Metaculus round-trips a forecast value exactly is **not knowable offline**.
+If it quantizes, a genuine post reads as `refetch_mismatch` and lands as *uncertain* rather
+than as a false `submitted` — the failure is in the safe direction, and `verify-submission`
+would then refuse rather than record. **M2-706's smoke test is what settles this**, and it
+turns a guess into a measurement; the tolerance is a one-line change once there is a real
+observation to set it from. It is named rather than pre-emptively widened, because widening
+a comparison on speculation is how a `submitted` gets written for a forecast that is not
+there.
+
+### Standing risk — one ledger state this item cannot record honestly (M2-711, filed)
+
+`record_submission_attempt` derives its event from `(success, verified_by_refetch)`, and
+that pair has no member meaning *"the post raised **and** the refetch could not be
+performed, so the platform state is unknown"*. `(False, False)` is `submission_failed`,
+which is terminal and claims the post did not go through — more than is known.
+
+Three mitigations, and then the honest admission. The refetch is retried (reads may retry),
+so the cell is rare. The row's `error_message` says in words that the platform state was
+not established, and `test_a_failed_post_and_an_unreadable_refetch_says_so_in_the_row` pins
+that so it cannot drift while the item is open. And terminal `failed` is the conservative
+direction: no further automatic post is possible for that record, and a retry is a new
+forecast version behind a fresh human approval.
+
+The alternative was to write `verified_by_refetch=True` for a refetch that never happened,
+which is a lie in the primary artifact. **M2-711** is filed for the missing state.
+
+### Round 1 — three blocking findings, all reproduced by execution first
+
+`GPT_REVIEW_RESPONSE_M2-704_r1.md`, reviewed commit `bc1bbc4`. The review named the exact
+request `HEAD`, so nothing here is a stale-review rebuttal; each finding was reproduced by
+running it before any fix was written, and each fix is pinned by a test that fails on the
+pre-fix code.
+
+**1 — a second poster over one client reopened the blind retry.** `SingleAttemptPoster`
+held a `threading.RLock()` **per adapter**, but the attribute it shadows belongs to the
+*client*. Two adapters over one `MetaculusClient` therefore held different locks, and the
+damaging order is A leaving while B is inside: A's exit restores the attribute to what A
+found, B's post then resolves the *class* attribute — the decorated one — and is retried.
+Reproduced with plain threading primitives and no patching of this project's code: **four
+POSTs for one logical post.**
+
+The docstring had claimed the lock prevented exactly this ("a shadow-and-restore window
+shared between two callers would restore the class method while the other was still inside
+it, and the cost of preventing that is one lock"). It did not, so the mitigation on record
+did not do what it said — which makes it a defect independent of how reachable it is.
+`build_poster()` does construct a fresh client per poster and the pipeline is
+single-threaded, so no *product* path shared a client; `SingleAttemptPoster.__init__` is a
+public boundary that accepts any client, which is where the review put it.
+
+Closed two ways, and the two are independent: the lock is now keyed on the client
+(`_lock_for_client`, a guarded `WeakKeyDictionary`), and the window restores the
+attribute's **exact prior state** instead of deleting unconditionally. Mutation-tested
+separately — reverting either one alone fails tests, and the first regression test written
+for this was **vacuous** (the restore closed the interleaving it drove, so it passed with
+the lock reverted) and was rewritten around the order only the lock can prevent.
+
+**2 — a transposed multiple-choice forecast was confirmed.** See the reversed decision
+above. This is the finding with the widest blast radius: it could put `submitted` in the
+ledger for a forecast the operator did not make, which is the one claim this whole item
+exists to make trustworthy.
+
+**3 — the SDK logged the full response body.** `raise_for_status_with_additional_info`
+builds its message out of the request URL and the complete response text, logs it at ERROR,
+and raises an `HTTPError` carrying the same string — which the retry wrapper logs again as
+`{e}`. Through this project's own handlers that put an unbounded copy of untrusted provider
+content into `logging.file`. Reproduced: a stubbed 400 whose body held a marker put that
+marker in the log file.
+
+The notes already said the SDK "logs it at ERROR level besides", which is exactly the shape
+of a known-and-unaddressed leak: naming it is not closing it. `SecretRedactionFilter`
+covers *configured credential values* and did redact the token in the URL, but a provider
+body is not a configured secret and nothing touched it.
+
+Closed with `ProviderResponseTextFilter`, a handler filter that **replaces** the message of
+any record from `forecasting_tools.util.misc`. Replaces rather than drops: that a call
+failed is a real diagnostic. The **whole module** is closed rather than the one message,
+for the reason `PayloadDebugFilter` gives — every logging call in it interpolates a
+response or an exception, and matching text is a check whose unknown case is "pass". The
+status, allowlisted headers and truncated body an operator needs are already on the
+submission attempt row via `http_details`, so nothing diagnostic is lost.
+
+**Non-blocking, and agreed:** the second clock read can raise after a completed post. The
+production CLI injects the trusted default clock, so the review scoped it out itself. Left
+as-is rather than filed — the clock is not provider input and the threat boundary says the
+operator is non-malicious.
+
+**One schema change.** The verification snapshot now carries `expected_labels`, so
+`verify_uncertain_attempt` can align a fresh observation to the categories the attempt
+sent instead of comparing by position. `VERIFICATION_SCHEMA_VERSION` goes `1.0.0` →
+`1.1.0`, and the reader still refuses any version it does not equal. No compatibility shim
+and no migration: the gateway has never been reachable, `submission.enabled` has never
+been `true` on any branch, and M2-706 is still `Blocked`, so **no stored snapshot exists
+anywhere** to be read back.
+
+### Round 2 — all three prior blockers closed, one new finding from the fix itself
+
+`GPT_REVIEW_RESPONSE_M2-704_r2.md`, reviewed commit `c0ec61b`. Findings 1, 2 and 3 from
+round 1 were each verified CLOSED against the remediation delta. One new blocker, and it is
+the most interesting result of the whole item because **the round-1 fix caused it**.
+
+**Aligning by label made the observed order part of the evidence, and the schema only
+stored the expected one.** `expected_values` is rendered in the *payload's* label order;
+`observed.latest_values` is whatever the platform reported, in the *platform's* option
+order. Round 1 added `expected_labels` and stopped there. So a confirmed multiple-choice
+snapshot for an honestly reordered observation looked like this:
+
+```json
+{"expected_labels": ["a","b"], "expected_values": [0.25,0.75],
+ "observed": {"latest_values": [0.75,0.25]}, "outcome": "confirmed"}
+```
+
+An auditor holding only that row cannot tell an honest reordered observation from a
+transposed forecast, and a positional replay of a *genuine* confirmation says **mismatch**.
+Reproduced by execution before the fix.
+
+This is worth stating plainly: the old sorted comparison was wrong, but its snapshot was at
+least internally consistent, because both sides were sorted. Fixing the verdict broke the
+evidence. **The ledger is the product** — a row whose verdict cannot be recomputed from its
+own contents is exactly the failure this project exists to avoid, and it would have shipped
+behind a correct-looking `submitted`.
+
+Closed by storing `observed.labels` beside `observed.latest_values`. A confirmed
+multiple-choice snapshot now carries all four things the comparison needs — two label
+orders and two value vectors — so the verdict is recomputable from the row alone.
+`VERIFICATION_SCHEMA_VERSION` stays `1.1.0`: that version was introduced on this same
+unmerged branch and has never been written anywhere persistent, so amending its shape
+before merge is not a format change anyone can observe. Bumping again would mint a version
+that never existed.
+
+Pinned by `test_a_multiple_choice_snapshot_reproduces_its_own_verdict` (three orderings)
+and by `test_a_multiple_choice_snapshot_always_reproduces_its_own_verdict`, a property over
+arbitrary option orders and observations. **Both replay the comparison out of the rendered
+JSON by hand rather than calling `classify_refetch`** — the claim is about what the row
+carries, and calling this module's own comparison would assert nothing about it. Two
+mutations confirm they bite: dropping `observed.labels` kills all four, and the subtler one
+— storing the *expected* order in the observed slot — is caught only by the reordered case.
+
+**The non-blocking observation was also fixed**, because it was a false claim rather than a
+missing feature. The sanitized log message said the details "are recorded on the submission
+attempt row", which is true of a failed post and false of a read or any pre-attempt call
+through the same helper — a log line telling an operator to look at a row that does not
+exist. It is now conditional. The reviewer's other half of that note (the replacement also
+discards the SDK's retry count and function name) is accepted and **not** addressed: those
+are interpolated into the same records that carry the response text, and re-admitting a
+subset by parsing is the text-matching check the module-wide replacement exists to avoid.
+
+### Round 3 — the fix to the fix to the fix, and where that chain stopped
+
+`GPT_REVIEW_RESPONSE_M2-704_r3.md`, reviewed commit `67b5f29`. All four prior blockers
+verified CLOSED. One new blocker, and it is the third consecutive round in which **the
+previous round's remediation caused the next finding**. That pattern is the record worth
+keeping from this item.
+
+**The chain, stated plainly:**
+
+1. Verification sorted multiple-choice values into a multiset — a transposed forecast
+   confirmed. *(round 1)*
+2. Fixed by aligning on labels. That made the observed label order part of the evidence,
+   and the schema stored only the expected order — a confirmed row could not be replayed.
+   *(round 2)*
+3. Fixed by storing the observed labels too. That wrote the one **unbounded** thing in the
+   envelope a second time, and provider JSON supplies it — so a confirmed row could exceed
+   `_MAX_BODY` and degrade to an envelope naming no values at all. *(round 3)*
+
+Each fix was correct about the defect it named and each created the next one, because each
+moved cost into the snapshot without checking what the snapshot could hold.
+
+**The round-3 reproduction, both halves.** A **binary** question whose provider JSON carries
+6,000 options: the gateway posts once, returns `success=True, verified_by_refetch=True`, and
+stores `{"outcome":"confirmed","question_type":"binary","values_omitted":true,...}` — 108
+bytes, no baseline, no expected values, no observed values. The option list is irrelevant to
+a binary question's values and was being written anyway. And a **multiple-choice** payload
+with a 32,700-character label, which `plan_from_payload` accepted: the envelope was 32,986
+characters before the round-2 field and 65,704 after it.
+
+**Also worth recording: the round-3 request asserted this could not happen.** Risk area 3
+claimed "labels are bounded by `_MAX_CATEGORIES`". `_MAX_CATEGORIES` bounds the *count* of
+payload categories; nothing bounded label *length*, and `_read_option_labels` bounded
+neither count nor length for the platform's list. The reviewer falsified a claim the author
+wrote, which is what the risk-areas section is for.
+
+**Closed three ways**, and the third is the one that makes the property true rather than
+likely:
+
+- `label_order` replaces the duplicated label strings: the observed order is stored as
+  **indices into `expected_labels`**. A confirmation already requires the two label sets to
+  be equal, so the permutation is the whole of what the second list carried — and 64 small
+  integers cost what 64 labels cannot.
+- It is written for **multiple choice only**. A binary question's option list has no
+  relationship to its values, so an order derived from it would be a fabricated alignment.
+- `_MAX_OPTION_LABEL = 128` bounds label length at both ends. A payload past it is refused
+  **before any post**, visible and actionable; a platform option list past it makes the
+  refetch `unreadable`, so the post lands uncertain rather than confirmed-without-evidence.
+  `_read_option_labels` also bounds the option *count* by `_MAX_CATEGORIES`, which it never
+  did.
+
+The bound is not a guess dressed as a constant.
+`test_a_maximal_multiple_choice_snapshot_still_carries_its_evidence` renders the worst
+accepted case — 64 labels at full length, every character one that `ensure_ascii=True`
+escapes to six bytes, platform order reversed — and measures it: **49,997 bytes against a
+65,536 limit, 15,539 to spare, evidence intact.** Raising either constant fails that test.
+
+**Six mutations, all killed.** Two are worth noting. Writing `label_order` for every
+question type initially **survived**, because both in-tree callers derive `expected_labels`
+from the plan or the snapshot and both answer `None` for binary — making the type check
+unreachable from inside the package. It was kept rather than deleted (unlike round 2's
+redundant guard) because `build_verification_snapshot` is **public** and its two arguments
+are independent: nothing in the signature stops a caller pairing a binary `question_type`
+with a label list. A test that makes exactly that public call now kills the mutation. And
+raising `_MAX_OPTION_LABEL` to 512 is killed by the maximal-snapshot test, which is the
+point of measuring the envelope rather than asserting it.
+
+### Before round 4 — the same class again, found by the author this time
+
+Writing round 4's risk-areas section meant asking what *else* is unbounded on its way into
+the snapshot, since that was three rounds running. One more field was:
+`ForecastEntry.values` comes from `forecast_values` in provider JSON and
+`read_my_forecasts` bounds it nowhere — it accepts a 50,000-element vector, and rendering
+one pushed the envelope past `_MAX_BODY` into the reduced form that names no values at all.
+
+**It is not round 3's failure, and the difference matters.** Every path to `confirmed` has
+already required the observed vector to match a bounded expected one — exactly 2 for
+binary, `expected_cdf_points` (a `Literal[201]`) for numeric, the option count for multiple
+choice — so a confirmed row could never reach it. Verified by execution across all three
+types before deciding severity. What was exposed is the `mismatched` and `absent` rows,
+which carry no false claim but are where an operator most needs to see what the platform
+actually held.
+
+Closed by rendering at most `_MAX_SNAPSHOT_VALUES = 256` observed values and recording the
+**true** length beside the sample as `latest_value_count`. The cap sits above every count an
+honest comparison can need, so no genuine verification is ever sampled rather than
+recorded; the count is what makes a truncation visible instead of silent, so the row never
+implies it saw fewer values than it did. The maximal multiple-choice case — 64 full-length
+labels *and* a 50,000-element observation — now renders with its evidence intact. Measured
+at the true worst case rather than a convenient one: labels padded with a character
+`ensure_ascii=True` escapes to six bytes, *and* observed values chosen for the longest
+`json.dumps` rendering a float has — `-2.2250738585072014e-308`, **24** characters with its
+sign. That is **55,849 bytes against a 65,536 limit, 9,687 to spare**.
+
+That figure took two corrections, and both are the same mistake at different depths. The
+first draft said 50,473, measured with `0.5` — a three-character rendering, so 256 values
+understated the envelope by about 3,800 bytes. The second said 55,593, measured with the
+longest *non-negative* float; round 4's reviewer pointed out that the sign is a character
+too, and that a 24-character value is inside the accepted domain because observed values
+are provider JSON and nothing upstream constrains them to probabilities. Round 3's lesson
+was to measure the envelope rather than assert it. Measuring it with a convenient input is
+the same failure, and searching only half the domain for the worst case is that failure
+once more.
+
+Three mutations, all killed: removing the cap, lowering it below an honest CDF, and
+reporting the truncated length as the true one.
+
+**The lesson, since this is the fourth instance:** a fixed-size evidence envelope and an
+unbounded input are a standing pair, and the fix is not to widen the envelope but to bound
+each input at the point it enters. `_MAX_BODY`'s all-or-nothing degradation is what turns a
+size overrun into total evidence loss, and a staged degradation — drop the least essential
+field first, keep the verdict and the baseline — would be the structural fix. That is a
+change to a merged, reviewed function with its own callers, so it is **not** made here;
+it is the shape of the follow-up if this recurs.
+
+### Round 4 — closing the class instead of the fourth instance
+
+Three rounds found one class by hand, and the fuzzer watched all three go by. Round 3's
+review said why, precisely: *"the new multiple-choice property bounds generated labels to
+24 characters, while the general snapshot property uses `ForecastHistory(())`, so neither
+exercises large observed labels."* `test_a_snapshot_is_storable_and_survives_its_own_round_
+trip` **did** assert `len(snapshot) <= _MAX_BODY` — against an empty history, so the branch
+that renders observed values was never entered. The assertion was there and it was vacuous,
+which is this project's most expensive recurring defect (M1-501's one-sided conditional,
+M1-607's substring no-leak, and the three properties in this item's own first pass that
+passed against broken code).
+
+So round 4 adds the property those three rounds should have been.
+`test_no_accepted_input_can_cost_a_snapshot_its_evidence` asserts the invariant the caps
+exist to guarantee, rather than a consequence of it:
+
+> For every input this module accepts, the envelope fits `_MAX_BODY` **and still names its
+> evidence** — the reduced `values_omitted` form is unreachable.
+
+It draws every bound at its maximum simultaneously — up to `_MAX_CATEGORIES` labels at
+`_MAX_OPTION_LABEL` characters, each character one `ensure_ascii=True` escapes to six
+bytes, against observed vectors up to 2,000 long — and carries a stronger claim on the
+`confirmed` branch, which is the row an auditor may later have to check: a confirmation
+must always be able to show the values it was confirmed by. The observed vector is drawn
+as a *length* and repeated rather than element-wise, because the property is about
+rendered size and drawing 2,000 floats per example would spend the budget on the strategy
+instead of the assertion.
+
+**Three mutations, all killed** — removing the `_MAX_SNAPSHOT_VALUES` cap, raising
+`_MAX_OPTION_LABEL` to 512, and reporting the truncated length as the true one. The second
+is worth reading: it fails with `{'outcome': 'unreadable', 'values_omitted': True}`, which
+is the exact shape round 3 spent a round on.
+
+`ENTRIES` was also widened from `max_size=6` to 32. Six is below every vector this module
+actually sees — 201 for a CDF, up to `_MAX_CATEGORIES` for multiple choice — so the
+comparison properties had been judging only lengths the platform never sends.
+
+### Round 4 — two docstring claims that had gone false
+
+`build_verification_snapshot`'s docstring still asserted that value counts *"are bounded by
+`plan_from_payload` … so the rendering cannot approach `_MAX_BODY`"* and that *"the
+fallback below is unreachable given those bounds"*. `plan_from_payload` bounds only the
+**expected** side; the observed side is provider JSON, and rounds 3 and 4 both reached that
+fallback. It also promised replayability through `observed.labels`, a field round 3
+replaced with `label_order`. In a module whose docstring *is* the format's documentation,
+a claim that invites a maintainer to delete a cap is a defect, so both were rewritten to
+say what is true: each bound is named, each is attributed to the round that bought it, and
+the fallback is described as reachable-in-principle and forbidden to `confirmed` rows.
+
+### Round 4 — approved, and the two observations that followed
+
+Round 4 returned **APPROVE at `7551681`, no blocking findings**, and confirmed round 3's
+sole blocker CLOSED by direct execution across all three question types. It also confirmed
+the severity argument this round rested on: oversized observations resolve only to
+`mismatched` or `unreadable`, because confirmation requires exact vector-length equality
+against bounded expected values.
+
+Two non-blocking observations came back, and both are this file's own recurring defect one
+level down, so both were closed rather than filed:
+
+1. **The maximal envelope was measured over half its domain.** The worst-rendering float is
+   negative — the sign is a 24th character — so the true figure is 55,849 bytes, not the
+   55,593 recorded above. The property's `observed_value` strategy was drawing from
+   `[0.0, 1.0]`; it now draws the full finite range, which is the honest domain anyway,
+   since observed values are provider JSON and nothing upstream constrains them to
+   probabilities.
+2. **Numeric `confirmed` was unreachable inside the new property.** The observed vector was
+   one value repeated, and a valid CDF varies, so the branch carrying the strongest claim —
+   that a confirmation can always show the values it was confirmed by — was never entered
+   for numeric. Exactly the vacuous-strategy failure this round was written to end. Closed
+   with an `echo_expected` draw that has the platform report back what was sent: the
+   complementary pair for binary, the CDF itself for numeric, and the expected vector
+   permuted into platform order for multiple choice. All three now reach `confirmed`,
+   verified by execution, and the three mutations still die.
+
+The lesson is worth stating plainly, because this item has now produced it four times: a
+property is only as strong as the reachability of the branch it asserts about, and the
+author is the worst judge of that. Two of the four instances were caught by measuring, one
+by a reviewer, and one by asking what else shared the shape.
+
+### Round 4 — the schema version follows the envelope
+
+`latest_value_count` is a new field, so `VERIFICATION_SCHEMA_VERSION` goes to **1.2.0**,
+matching the branch's own precedent (round 1 bumped `1.0.0 → 1.1.0` for the same kind of
+additive change). Nothing in-tree reads the field — `verify_uncertain_attempt` consumes
+only `question_type`, `expected_values`, `expected_labels` and `baseline.latest_start_time`
+— and no row has ever been persisted, so this cannot cause a misread today. It is a
+consistency fix, and free: `read_verification_snapshot` keys on exact equality, and two
+different envelope shapes must not share one version string.
+
+### On the mutation pass
+
+Fourteen deliberate mutations were run against the unit suite before the first review, each
+applied to a pristine copy and restored afterwards (M1-312's lesson: a harness killed by a
+timeout silently leaves the mutation applied). Thirteen were killed. **One survived, and it
+was a real gap**: collapsing `unreadable` into `absent` inside `classify_refetch` passed all
+52 tests, because the *submit* path never hands that function a `None` — it returns
+`unreadable` itself when the retry loop gives up. `verify_uncertain_attempt` is the only
+caller that can reach the branch, and nothing tested it. Untested, a lost connection would
+have ended a live forecast version by recording `submission_disconfirmed` on no evidence at
+all. Two tests were added and the mutation is now killed.
+
+### On the property pass
+
+Eleven mutations were run against the property suite. **Three properties passed against
+broken code** — the M1-303 ratio almost exactly — and each was a strategy failing to reach
+the branch it was meant to cover:
+
+- `storable_text`'s truncation was never exercised, because `ANY_VALUE` never generated
+  text longer than the limit. Fixed with an explicit oversized-text strategy.
+- `read_my_forecasts` was asserted to return "`None` or a `ForecastHistory`", which passes
+  against a reader that answers *empty* for everything it cannot parse — the exact collapse
+  the four-valued outcome exists to prevent. The property now states which answer each shape
+  requires.
+- The multiple-choice sum rule could be deleted entirely, because every generated vector
+  already summed to one. Replaced with an **iff** property, and the same treatment given to
+  the binary bounds and to the CDF's length and monotonicity: a one-sided property is
+  vacuous against "the rule was removed" (M1-501).
+
+All six now fail on the weakened module and pass on the real one.
+
+The no-leak property closes the message set rather than searching for a substring (M1-607):
+every refusal from `plan_from_payload` must match one of twenty-six written-down patterns
+that capture nothing from the input, and the same test asserts `__cause__ is None` so no
+cause chain can reprint what a message withheld. Writing that set out is what found a real
+defect: refusals from `canonical_payload_json` were arriving as the **base**
+`GatewayError`, which `LiveSubmissionError` subclasses — so `except LiveSubmissionError`
+did not catch them and `cli._run_submit` would have printed a traceback instead of
+`refused:`. `_wrap_gateway()` closes it, message preserved.
