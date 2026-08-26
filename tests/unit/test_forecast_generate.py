@@ -638,6 +638,7 @@ _FORBIDDEN = {
         "whiskeyjack_bot.forecast.schema",
         "whiskeyjack_bot.forecast.binary",
         "whiskeyjack_bot.forecast.attribution",
+        "whiskeyjack_bot.forecast.validate",
         "whiskeyjack_bot.forecast.inputs",
         "whiskeyjack_bot.forecast.parse",
         "whiskeyjack_bot.forecast.artifacts",
@@ -669,6 +670,13 @@ def test_the_response_schema_reaches_no_provider_client(module: str) -> None:
     docstrings in this package said that module reaches the SDK; it does not, and
     ``forecast.replay`` names ``SourceReference`` at runtime on the strength of that. A
     fact a replay path depends on belongs in the assertion rather than in prose about it.
+
+    **M1-506 added ``forecast.validate``**, and it is load-bearing twice over.
+    ``forecast.parse`` now reaches the composed output checks through it, so the replay
+    path's zero-call guarantee runs through this module; and M1-507 will call it from
+    ``forecast.store``, which must stay importable wherever the ledger is. Its docstring
+    makes the no-SDK claim, and a claim only a docstring makes is one a later import can
+    quietly end.
     """
     added = _added_modules(module)
     assert not (added & _FORBIDDEN), sorted(added & _FORBIDDEN)

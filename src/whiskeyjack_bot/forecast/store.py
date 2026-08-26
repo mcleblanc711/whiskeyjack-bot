@@ -35,6 +35,19 @@ is M1-501's public entry point and names "a validation pass over a stored record
 use; running it one moment earlier costs nothing and is the last point at which refusing is
 still possible.
 
+**It is the cross-type half only, and that gap is M1-507.** Since M1-506 there is one
+composed entry point, ``forecast.validate.validate_output``, which runs the attribution
+rules *and* the rules specific to the response's question type. This module does not call
+it, because the type-specific checkers need a ``ForecastConfig`` and
+:func:`append_forecast_version` has no parameter for one -- so a probability outside the
+configured ``forecast.min_probability``/``max_probability`` can be persisted here even
+though ``forecast.generate`` refuses it. Not reachable from the product path
+(``persist_generation`` runs the full composed check inside the attempt loop before
+anything reaches this writer), reachable by any other caller of this public entry point,
+and widening when M1-404 and M1-405 register their checkers. Closing it is a signature
+change to a merged, reviewed public entry point, which is why M1-506 filed the row rather
+than taking it -- same convention as M1-314, M2-709 and M1-608.
+
 **What this module does not do.** It does not append a ``validated`` lifecycle event. A
 record is born ``draft`` and every later state is reachable only through
 ``lifecycle_events``; ``validated`` means the full output-validation gate passed, and that
