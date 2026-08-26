@@ -1,8 +1,10 @@
 """One structured call to the configured forecaster model (M1-402, M1-403, M1-501).
 
 **M1-403 added the config-dependent output checks to the parse step** rather than to the
-returned result. ``forecast/binary.py`` owns the rules; ``_output_problems`` dispatches to
-them on the ``question_type`` literal, and because their problems are the same sanitized
+returned result. ``forecast/binary.py`` owns the rules; ``forecast/validate.py``'s
+``output_problems`` dispatches to them on the ``question_type`` literal (M1-506 made that
+composition public; it was ``generate._output_problems``, then briefly
+``parse._output_problems``), and because their problems are the same sanitized
 shape the schema produces, the repair loop, the failure classification and the invocation
 accounting below are unchanged. The effect is that an out-of-bounds probability costs the
 one repair this module already budgets instead of throwing a billed call away.

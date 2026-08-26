@@ -40,7 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M2-704 | feat/m2-704-package-backed-gateway | whiskeyjack-m2-704 | no | none | 2026-08-25 |
+| M1-506 | feat/m1-506-composed-output-validation | whiskeyjack-m1-506 | no | none | 2026-08-25 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
@@ -60,28 +60,39 @@ exist cannot be distinguished from a stale row whose branch was deleted, and the
 registry rests on being able to tell those apart. **The three-line collision is the
 cheaper problem.** Take it.
 
-Three lanes, run concurrently:
+Wave 9, three lanes, run concurrently. **Lane 1 is two stages**: `M1-506` must be *on
+master* before `M1-404`/`M1-405` start, because both of those register a checker into the
+seam `M1-506` moves and neither can be written against the private `parse._output_problems`
+they would otherwise both edit (lesson 1 — a seam that changes underneath an open review).
 
 | Lane | Items, in order | Notes |
 | --- | --- | --- |
-| 1 — critical path | ~~`M1-402`~~ → ~~`M1-403`~~ → ~~`M1-501`~~ → ~~`M1-602`~~ → ~~`M1-406`~~ | Closed. `M1-406` merged (PR #41, 2026-08-25), spending migration `008`; it closed the replay loop the ledger exists for. |
-| 2 — M2 path | ~~`M2-701`~~ → ~~`M2-702`~~ → ~~`M2-703`~~ → **`M2-704`** | `M2-703` merged (PR #39, 2026-08-22). `M2-704` (package-backed gateway) is the first item in the repo that can actually post to Metaculus — sized L, highest blast radius so far. |
-| 3 — debt queue | ~~`M0-007`~~ → ~~`M1-313`~~ → ~~`M1-607`~~ → ~~`M1-312`~~ → ~~`M1-309`~~ → ~~`M1-311`~~ | Closed. `M1-311` merged (PR #40, round-2 approval, 2026-08-25) — the last of the six small items. |
+| 1 — critical path | **`M1-506`** → then `M1-405` ∥ `M1-404` **in parallel** | `M1-506` exposes one public composed output-validation entry point as a **table keyed on the `question_type` literal** with an explicit entry per supported type. That shape is what reduces `M1-404` and `M1-405` to one changed line each in the shared file, so the two can run concurrently instead of serially. `M1-405` (Critical) unblocks `M1-503` → `T-904`; `M1-404` unblocks `M1-502`; `M2-707` needs both. |
+| 2 — M2 path | **`M2-711`** | Records a submission whose outcome no refetch established — the `(False, False)` cell that today reads as terminal `submission_failed`, which is more than the ledger knows. Needs a lifecycle vocabulary member and therefore **migration `009`**, claimed above. No `forecast/` overlap with lane 1. |
+| 3 — debt queue | **`M1-609`** → `M2-710` → `M1-608` → `M1-314` → `M2-709` | One branch each, sequentially. Every one closes a deferral already filed off a previous review, which is `docs/LESSONS.md` checklist item 4 paid down rather than re-reported as a finding next round. All sized S. |
 
-Struck items are merged. As of 2026-08-25 the only live lane head is **M2-704**,
-one worktree; lanes 1 and 3 are closed. `M2-704` expects no new dependency and no
-migration, and the dependency slot is free now that `M1-311` spent and released it. **M1-312 merged approved in round 1** (PR #35), the project's
-third single-round approval; its composition (`research/persist.py`) is the API a
-retrieval orchestrator will call.
+As of 2026-08-25 all three lane heads are live: `M1-506`, `M2-711`, `M1-609`. Stage B takes
+the wave to four concurrent worktrees, which is `wj-layout`'s `max_panes` exactly.
 
-**M1-602 waits for M1-501, and the M2-702 precedent does not license skipping it.** M2-702
-shipped against `forecast_records` while M1-602 was `Not Started`, and its notes say why
-that was safe: it reads three columns that have been immutable since `001`, and it
-anticipates nothing about M1-602's shape. M1-602 is the opposite case — it writes
-`record_json` and `final_prediction_json`, which are exactly what M1-501 constrains. So the
-serial hop is paid on purpose (owner decision, 2026-08-21).
+**Why `M1-506` leads rather than follows `M1-404`/`M1-405`.** The opposite order is the
+tempting one — its criterion is *"a test fails if a supported question type has a checker the
+entry point does not reach"*, which sounds like it wants the other two checkers to exist first.
+It does not. `forecast/schema.py`'s `_RESPONSE_MODELS` already carries all three keys
+(`binary`, `multiple_choice`, `numeric`), so the coverage test is fully discriminating today:
+the failure it must catch is *a supported type with no entry*, and two of the three types are
+in exactly that state right now. Running it first is also what keeps the other two off one
+shared private function on concurrent branches.
 
-The lane-3 order is not the numeric one, and the two departures are the point:
+**One thing `M1-506` deliberately does not fix, filed as `M1-507`.** `forecast/store.py`
+never imports `ForecastConfig` and never calls `binary_output_problems` — `_require_attributable`
+runs `validate_attribution_fields` alone, so the persist path validates attribution but not the
+type-specific bounds. Closing that needs `ForecastConfig` threaded into `append_forecast_version`,
+a signature change to a merged, reviewed public entry point, and `M1-506`'s criteria do not ask
+for it. Same convention as `M1-314`, `M2-709` and `M1-608`: an adjacent pre-existing defect is a
+row, not a cross-item fix.
+
+**From wave 8, kept because the reasoning still applies.** Its lane-3 order was not the
+numeric one either, and the two departures are why:
 
 - **M1-607 was third, not last.** It puts the non-blank identifier guard on
   `forecast_records.record_id`, and `M1-602` — last on lane 1 — is the item that starts

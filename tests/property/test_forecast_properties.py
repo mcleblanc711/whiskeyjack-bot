@@ -43,6 +43,12 @@ from whiskeyjack_bot.forecast.schema import (
     response_model_for,
     validate_forecast_response,
 )
+from whiskeyjack_bot.forecast.validate import (
+    _TYPE_CHECKERS,
+    ForecastOutputError,
+    output_problems,
+    validate_output,
+)
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 from whiskeyjack_bot.research.dedup import dedup_key
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
@@ -887,3 +893,259 @@ def test_attribution_is_stable_across_the_storage_boundary(
     assert attribution_problems(
         reloaded, question_id=question_id, source_ids=supplied
     ) == attribution_problems(response, question_id=question_id, source_ids=supplied)
+
+
+# --- 7. the composed output-validation entry point (M1-506) -----------------------
+#
+# The members are fuzzed above, one section each. What is new here is the *composition*,
+# and it has its own failure modes: a layer that stops being reached, an order that is not
+# stable, a raise that carries half the account, and a verdict that changes across the
+# ledger boundary M1-507 will validate over.
+
+
+@st.composite
+def composed_cases(
+    draw: st.DrawFn,
+) -> tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig]:
+    """An attribution case plus the bounds the binary layer is checked against.
+
+    Both layers must be *reachable* from one strategy or the composition properties are
+    vacuous -- the defect class this project has paid for more than any other. The bounds
+    are drawn wide and narrow so the type-specific layer is silent on some draws and biting
+    on others, and ``test_the_composition_is_reached_on_both_sides`` is the event-tagged
+    proof that both happen.
+    """
+    response, question_id, supplied = draw(attribution_cases())
+    low, high = draw(
+        st.sampled_from(
+            [
+                # The committed bounds, and the widest ``ForecastConfig`` permits --
+                # it refuses anything outside [0.001, 0.999] at load, so 0.0/1.0 is not
+                # a config an operator can produce.
+                (0.001, 0.999),
+                (0.002, 0.998),
+                # Narrow enough to exclude the valid payload's probability, so the binary
+                # layer contributes a problem to a response the attribution layer may well
+                # be happy with.
+                (0.9, 0.95),
+                (0.001, 0.002),
+            ]
+        )
+    )
+    return response, question_id, supplied, _forecast_config(low, high)
+
+
+def _composed(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> list[str]:
+    response, question_id, supplied, config = case
+    return output_problems(response, config, question_id=question_id, source_ids=supplied)
+
+
+@given(composed_cases())
+def test_the_composition_is_reached_on_both_sides(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> None:
+    """The anti-vacuity guard for every property in this section.
+
+    A composition property that only ever draws responses the type-specific layer is
+    silent about proves nothing about the composition. This tags the four cells and the
+    others below are only meaningful because this one shows they are populated.
+    """
+    response, question_id, supplied, config = case
+    attribution_half = attribution_problems(response, question_id=question_id, source_ids=supplied)
+    binary_half = binary_output_problems(response, config)
+    event(f"attribution bites: {bool(attribution_half)}")
+    event(f"type-specific bites: {bool(binary_half)}")
+
+
+@given(composed_cases())
+def test_the_composition_is_exactly_its_two_layers_in_order(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> None:
+    """Equality with the concatenation, not a subset or a set.
+
+    The entry point exists so a caller need not know the member list; that is only true if
+    it returns *everything* the members do. A subset assertion would be green for an entry
+    point that had quietly dropped a layer -- which is the exact regression M1-404 and
+    M1-405 could introduce when they register their checkers.
+    """
+    response, question_id, supplied, config = case
+    checker = _TYPE_CHECKERS[response.question_type]
+    expected = attribution_problems(response, question_id=question_id, source_ids=supplied)
+    if checker is not None:
+        expected = expected + checker(response, config)
+    assert _composed(case) == expected
+
+
+@given(composed_cases())
+def test_the_pair_agrees_on_every_draw(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> None:
+    """``validate_output`` raises iff ``output_problems`` is non-empty, and carries the
+    whole list.
+
+    The two halves of the pair are a single rule stated twice; a caller that switched
+    between them and got a different verdict would have no way to tell which was right.
+    """
+    response, question_id, supplied, config = case
+    problems = _composed(case)
+    try:
+        returned = validate_output(response, config, question_id=question_id, source_ids=supplied)
+    except ForecastOutputError as exc:
+        assert problems != []
+        assert exc.problems == problems
+    else:
+        assert problems == []
+        # Nothing is clamped, repaired or renumbered: the same object comes back.
+        assert returned is response
+
+
+@given(composed_cases())
+def test_the_composed_verdict_is_stable_across_the_storage_boundary(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> None:
+    """M1-305's rule, applied to the composition rather than to one member.
+
+    M1-507 will run this entry point over a record on its way into the ledger, so its
+    answer has to be a function of the *persisted* form. A composition whose verdict
+    changed across ``model_dump(mode="json")`` would pass every test that never went
+    through the ledger and refuse a record the generating path accepted.
+    """
+    response, question_id, supplied, config = case
+    persisted = json.dumps(
+        response.model_dump(mode="json"), ensure_ascii=True, sort_keys=True, allow_nan=False
+    )
+    reloaded = validate_forecast_response(json.loads(persisted), BinaryForecastResponse)
+    assert output_problems(
+        reloaded, config, question_id=question_id, source_ids=supplied
+    ) == _composed(case)
+
+
+@given(composed_cases(), HOSTILE_SOURCE_IDS, st.one_of(HOSTILE_TEXT, st.none(), st.floats()))
+def test_the_entry_point_never_raises_outside_the_packages_error_type(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+    source_ids: Any,
+    question_id: Any,
+) -> None:
+    """Every malformed shape must arrive as a ``ForecastSchemaError``.
+
+    Deliberately asserted against the *parent* type rather than ``ForecastOutputError``
+    alone: the composition's contract is that a caller writing one ``except`` clause
+    catches every route through it, including the member modules' own caller-mistake
+    errors. A raw ``TypeError`` or ``AttributeError`` escaping is the defect this project
+    has taken as a review finding twice.
+    """
+    response, _, _, config = case
+    for arguments in (
+        {"question_id": _VALID_QUESTION_ID, "source_ids": source_ids},
+        {"question_id": question_id, "source_ids": ["src-001"]},
+        {"question_id": question_id, "source_ids": source_ids},
+    ):
+        try:
+            problems = output_problems(response, config, **arguments)
+        except ForecastSchemaError:
+            continue
+        assert all(isinstance(problem, str) for problem in problems)
+
+
+@given(
+    st.one_of(HOSTILE_TEXT, st.none(), st.integers(), st.lists(HOSTILE_TEXT, max_size=2)),
+    BOUNDS,
+)
+def test_the_entry_point_refuses_anything_that_is_not_a_response(
+    value: Any, bounds: list[float]
+) -> None:
+    low, high = bounds
+    config = _forecast_config(low, high)
+    for entry_point in (output_problems, validate_output):
+        try:
+            entry_point(value, config, question_id=_VALID_QUESTION_ID, source_ids=["src-001"])
+        except ForecastSchemaError:
+            continue
+        raise AssertionError("a non-response was accepted")
+
+
+@given(composed_cases())
+def test_every_composed_problem_is_reported_at_a_location_the_schema_authored(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> None:
+    """A problem at a location the schema never declared is a location the model invented.
+
+    The members each assert this for themselves; the composition is asserted separately
+    because concatenating two safe lists is not the only thing an entry point could do --
+    one that wrapped, summarised or re-prefixed its members' strings would satisfy both
+    members and still produce a path a reader of a stored failure cannot resolve.
+    """
+    for problem in _composed(case):
+        location, separator, _ = problem.partition(": ")
+        assert separator == ": ", problem
+        assert _attribution_location_resolves(location), problem
+
+
+@given(
+    st.lists(st.sampled_from(_SUPPLIABLE), min_size=1, max_size=3, unique=True),
+    st.sampled_from(["base_rate", "evidence_adjustments", "load_bearing_facts"]),
+    BOUNDS,
+)
+def test_a_composed_problem_never_varies_with_the_cited_id_that_failed(
+    supplied: list[str], field: str, bounds: list[float]
+) -> None:
+    """The leak property for the composition, written as **invariance** rather than as a
+    substring check.
+
+    The shape is M1-403's and M1-501's, and the reason is restated at
+    ``test_an_attribution_problem_never_varies_with_the_cited_id_that_failed``: a short
+    marker is a substring of text these modules render for unrelated reasons. Drafting
+    this one as ``hostile not in message`` failed on a drawn ``"_"``, which appears in
+    ``source_ids`` and ``research_documents`` -- the exact trap that comment describes,
+    walked into and then out of.
+
+    Two different invented citations, in the same place, must produce byte-identical
+    composed output. An entry point echoing any part of the id -- in a member's message or
+    in wrapping of its own -- could not satisfy that.
+    """
+    low, high = bounds
+    config = _forecast_config(low, high)
+
+    def verdict(invented: str) -> str:
+        response = _attribution_response(
+            base_ids=[invented] if field == "base_rate" else list(supplied[:1]),
+            adjustment_ids=[[invented] if field == "evidence_adjustments" else list(supplied[:1])],
+            fact_ids=[[invented] if field == "load_bearing_facts" else list(supplied[:1])],
+            failure_modes=["a failure mode"],
+            question_id=_VALID_QUESTION_ID,
+        )
+        return "\n".join(
+            output_problems(response, config, question_id=_VALID_QUESTION_ID, source_ids=supplied)
+        )
+
+    first = verdict("AAAAAAAAAA")
+    second = verdict("ZZZZZZZZZZ")
+    assert first == second
+    # Vacuity guard: neither invented id was supplied, so there must *be* a problem.
+    assert first
+
+
+@given(composed_cases())
+def test_an_unregistered_question_type_is_refused_rather_than_passed(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
+) -> None:
+    """A type the table does not cover must not validate as though it had no rules.
+
+    Unreachable through the schema, and asserted anyway: this is the branch that decides
+    whether a fourth question type added to config fails loudly or forecasts silently
+    unchecked, and a ``.get()`` default would have made it the latter.
+    """
+    response, question_id, supplied, config = case
+    mutated = response.model_copy()
+    object.__setattr__(mutated, "question_type", "date")
+    try:
+        output_problems(mutated, config, question_id=question_id, source_ids=supplied)
+    except ForecastOutputError as exc:
+        assert exc.problems == [
+            "question_type: must be one of binary, multiple_choice, numeric "
+            "(offending input withheld)"
+        ]
+    else:
+        raise AssertionError("an unregistered question type was validated")

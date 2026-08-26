@@ -35,7 +35,6 @@ from whiskeyjack_bot.forecast.attribution import (
     validate_attribution_fields,
 )
 from whiskeyjack_bot.forecast.binary import binary_output_problems
-from whiskeyjack_bot.forecast.parse import _output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastResponse,
@@ -45,6 +44,7 @@ from whiskeyjack_bot.forecast.schema import (
     response_model_for,
     validate_forecast_response,
 )
+from whiskeyjack_bot.forecast.validate import output_problems
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -434,17 +434,22 @@ def test_the_two_checkers_compose_so_a_priorless_binary_forecast_is_refused() ->
     and reaches a caller as valid -- checked against the composed path rather than against
     either checker alone.
 
-    ``generate._output_problems`` runs M1-501's rules and then M1-403's, so a caller of
+    ``validate.output_problems`` runs M1-501's rules and then M1-403's, so a caller of
     the forecast package sees both. ``test_forecast_generate.py`` proves the same thing
     through two billed calls and a repair turn; this is the cheap unit-level statement of
     it, next to the checker the finding was filed against.
+
+    Asserted through the **public** composed entry point since M1-506. It used to name
+    the private ``parse._output_problems``, which is what this test was really about all
+    along: the finding was that a caller reading one checker cannot see the other, and a
+    private composition is one no caller can reach.
     """
     payload = _payload()
     payload["model_prior"] = None
     payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
     forecast = validate_forecast_response(payload, BinaryForecastResponse)
 
-    composed = _output_problems(
+    composed = output_problems(
         forecast,
         _committed_forecast_config(),
         question_id=QUESTION_ID,
