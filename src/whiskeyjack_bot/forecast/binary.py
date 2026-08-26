@@ -58,6 +58,8 @@ all.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from whiskeyjack_bot.config import ForecastConfig
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
@@ -126,13 +128,25 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
 
 
 def binary_output_problems(
-    forecast: BinaryForecastResponse, forecast_config: ForecastConfig
+    forecast: BinaryForecastResponse,
+    forecast_config: ForecastConfig,
+    *,
+    options: Sequence[str] | None = None,
 ) -> list[str]:
     """Every configured-bounds and binary-prior problem with one binary response.
 
     An empty list means the response is usable as a binary forecast. Each string is a
     schema-authored field path, a colon, and a value-free message -- safe to log, to
     store, and to send back to the model as a repair turn.
+
+    ``options`` is **accepted and never read**. It exists so this function satisfies
+    ``validate._TypeChecker``, the uniform signature M1-404 gave the type-specific
+    dispatch table when the multiple-choice rule turned out to need the question's option
+    list. A binary question has no option list, and ``validate.output_problems`` pairs the
+    argument with the question type in both directions, so the only value that reaches
+    this parameter through the entry point is ``None``. It is not validated here for that
+    reason: a rule about an argument this function has no opinion on belongs to the layer
+    that does.
 
     Raises :class:`BinaryOutputError` only for a caller mistake (a response or a config
     of the wrong type, or a config admitting no probability at all). Those are not

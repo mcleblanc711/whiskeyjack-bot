@@ -227,7 +227,14 @@ def test_configured_probability_bounds_are_not_applied_here() -> None:
 def test_multiple_choice_option_identity_is_not_checked_here() -> None:
     """Options that duplicate, that sum to well over one, and that name nothing the
     question offered all validate: every one of those needs the question's option
-    list, and M1-404 owns them."""
+    list, and M1-404 owns them.
+
+    **Still true after M1-404 shipped, and that is the point of keeping it.** The rules
+    now exist, in ``forecast/multiple_choice.py``, reached through
+    ``forecast.validate.output_problems``; this module is still where they are *not*, and
+    the split is deliberate (M1-403's placement decision, applied a second time). The
+    pointer names the module rather than only the row, because a pointer that says only
+    where a rule is not is how M1-501 lost a round."""
     payload = {**_shared(), **_prediction("Multiple-choice schema")}
     payload["model_prior"] = None
     payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}

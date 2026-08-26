@@ -117,11 +117,16 @@ def _parse(
     *,
     question_id: int,
     source_ids: Sequence[str],
+    options: Sequence[str] | None,
 ) -> tuple[ForecastResponse | None, list[str]]:
     """Parse and validate one response; returns the forecast or the problems.
 
     An empty problem list with a ``None`` forecast is impossible: every failure path
     supplies at least one sanitized problem string.
+
+    ``options`` is the question's option list for a multiple-choice question and
+    ``None`` for every other type; see ``forecast.validate.output_problems``, which pairs
+    the two and refuses a mismatch.
 
     The configured-bounds and attribution checks run *here*, inside the attempt loop,
     rather than on the returned result. That is what makes an out-of-bounds probability
@@ -142,14 +147,22 @@ def _parse(
         forecast = validate_forecast_response(payload, model)
     except ForecastSchemaError as exc:
         return None, list(exc.problems)
-    # Cannot raise, on all three of its paths: the response is provably the model this
+    # Cannot raise, on any of its paths: the response is provably the model this
     # dispatch selected, so its ``question_type`` is a validated Literal the registry
     # covers and the member checkers cannot meet a response of the wrong category;
     # ``generate_forecast`` refuses an inverted bounds pair before anything is spent; and
-    # it exact-type gates ``question_id`` there too. Those are the caller mistakes
+    # it exact-type gates ``question_id`` there too. The fourth path is M1-404's pairing
+    # gate, and it closes the same way: ``options`` is
+    # ``ModelInput.packet.options``, which ``forecast.inputs`` populates for exactly the
+    # multiple-choice questions and leaves ``None`` for every other type -- the same
+    # dispatch on ``qtype`` that chose ``model`` here. Those are the caller mistakes
     # ``validate.output_problems`` and its members refuse, and none is reachable here.
     problems = output_problems(
-        forecast, forecast_config, question_id=question_id, source_ids=source_ids
+        forecast,
+        forecast_config,
+        question_id=question_id,
+        source_ids=source_ids,
+        options=options,
     )
     if problems:
         return None, problems
