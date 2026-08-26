@@ -1346,12 +1346,18 @@ implies it saw fewer values than it did. The maximal multiple-choice case — 64
 labels *and* a 50,000-element observation — now renders with its evidence intact. Measured
 at the true worst case rather than a convenient one: labels padded with a character
 `ensure_ascii=True` escapes to six bytes, *and* observed values chosen for the longest
-`json.dumps` rendering a float has (`2.2250738585072014e-308`, 23 characters). That is
-**55,593 bytes against a 65,536 limit, 9,943 to spare**. An earlier draft of this note said
-50,473, which was measured with `0.5` as the observed value — a three-character rendering,
-so 256 values understated the envelope by about 3,800 bytes. Round 3's lesson was to
-measure the envelope rather than assert it; measuring it with the *easy* input is the same
-mistake one level down.
+`json.dumps` rendering a float has — `-2.2250738585072014e-308`, **24** characters with its
+sign. That is **55,849 bytes against a 65,536 limit, 9,687 to spare**.
+
+That figure took two corrections, and both are the same mistake at different depths. The
+first draft said 50,473, measured with `0.5` — a three-character rendering, so 256 values
+understated the envelope by about 3,800 bytes. The second said 55,593, measured with the
+longest *non-negative* float; round 4's reviewer pointed out that the sign is a character
+too, and that a 24-character value is inside the accepted domain because observed values
+are provider JSON and nothing upstream constrains them to probabilities. Round 3's lesson
+was to measure the envelope rather than assert it. Measuring it with a convenient input is
+the same failure, and searching only half the domain for the worst case is that failure
+once more.
 
 Three mutations, all killed: removing the cap, lowering it below an honest CDF, and
 reporting the truncated length as the true one.
@@ -1412,6 +1418,37 @@ replaced with `label_order`. In a module whose docstring *is* the format's docum
 a claim that invites a maintainer to delete a cap is a defect, so both were rewritten to
 say what is true: each bound is named, each is attributed to the round that bought it, and
 the fallback is described as reachable-in-principle and forbidden to `confirmed` rows.
+
+### Round 4 — approved, and the two observations that followed
+
+Round 4 returned **APPROVE at `7551681`, no blocking findings**, and confirmed round 3's
+sole blocker CLOSED by direct execution across all three question types. It also confirmed
+the severity argument this round rested on: oversized observations resolve only to
+`mismatched` or `unreadable`, because confirmation requires exact vector-length equality
+against bounded expected values.
+
+Two non-blocking observations came back, and both are this file's own recurring defect one
+level down, so both were closed rather than filed:
+
+1. **The maximal envelope was measured over half its domain.** The worst-rendering float is
+   negative — the sign is a 24th character — so the true figure is 55,849 bytes, not the
+   55,593 recorded above. The property's `observed_value` strategy was drawing from
+   `[0.0, 1.0]`; it now draws the full finite range, which is the honest domain anyway,
+   since observed values are provider JSON and nothing upstream constrains them to
+   probabilities.
+2. **Numeric `confirmed` was unreachable inside the new property.** The observed vector was
+   one value repeated, and a valid CDF varies, so the branch carrying the strongest claim —
+   that a confirmation can always show the values it was confirmed by — was never entered
+   for numeric. Exactly the vacuous-strategy failure this round was written to end. Closed
+   with an `echo_expected` draw that has the platform report back what was sent: the
+   complementary pair for binary, the CDF itself for numeric, and the expected vector
+   permuted into platform order for multiple choice. All three now reach `confirmed`,
+   verified by execution, and the three mutations still die.
+
+The lesson is worth stating plainly, because this item has now produced it four times: a
+property is only as strong as the reachability of the branch it asserts about, and the
+author is the worst judge of that. Two of the four instances were caught by measuring, one
+by a reviewer, and one by asking what else shared the shape.
 
 ### Round 4 — the schema version follows the envelope
 

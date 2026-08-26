@@ -664,7 +664,18 @@ MAXIMAL_LABELS = st.builds(
     # rendered size, and generating two thousand floats per example would spend the whole
     # budget on the strategy instead of the assertion.
     observed_length=st.integers(0, 2000),
-    observed_value=st.floats(0.0, 1.0, allow_nan=False, allow_infinity=False),
+    # The full finite range, not [0, 1]. Observed values are provider JSON and nothing
+    # upstream constrains them to probabilities -- and the longest rendering a float has
+    # is 24 characters with its sign (`-2.2250738585072014e-308`), which a non-negative
+    # strategy can never draw. Round 4 review, non-blocking observation 1: the envelope
+    # must be measured at the real worst case, not a convenient one.
+    observed_value=st.floats(allow_nan=False, allow_infinity=False),
+    # When true the platform echoes back exactly what was sent, which is the only way to
+    # reach `confirmed`. Without it the observed vector is one repeated value, and a valid
+    # CDF varies -- so numeric confirmation was unreachable inside this property. Round 4
+    # review, non-blocking observation 2; it is this file's own recurring defect (a
+    # strategy that cannot reach the branch it claims to cover) one level down.
+    echo_expected=st.booleans(),
     reversed_order=st.booleans(),
 )
 def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
@@ -672,6 +683,7 @@ def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
     labels: tuple[str, ...],
     observed_length: int,
     observed_value: float,
+    echo_expected: bool,
     reversed_order: bool,
 ) -> None:
     """The reduced `values_omitted` envelope is unreachable for anything this module accepts.
@@ -705,9 +717,24 @@ def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
         expected_labels = None
         platform_order = None
 
-    observed = ForecastHistory(
-        (ForecastEntry(200.0, (observed_value,) * observed_length),), platform_order
-    )
+    if not echo_expected:
+        vector = (observed_value,) * observed_length
+    elif question_type == "binary":
+        # `observed_values` reads `values[1]` of exactly two, so an honest binary
+        # observation is the complementary pair.
+        vector = (1.0 - expected[0], expected[0])
+    elif question_type == "numeric":
+        vector = expected
+    else:
+        # The platform reports in its own order, so an honest multiple-choice observation
+        # is the expected vector permuted into that order -- which is precisely what
+        # `label_order` exists to let an auditor undo.
+        by_label = dict(zip(labels, expected, strict=True))
+        assert platform_order is not None
+        vector = tuple(by_label[label] for label in platform_order)
+
+    true_length = len(vector)
+    observed = ForecastHistory((ForecastEntry(200.0, vector),), platform_order)
     result = classify_refetch(
         question_type=question_type,
         expected=expected,
@@ -734,14 +761,14 @@ def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
     assert isinstance(seen, dict)
     # The true length, always -- never the truncated one. A row that reported the sample
     # size as the real size would hide the truncation instead of recording it.
-    assert seen["latest_value_count"] == observed_length
-    assert len(seen["latest_values"]) == min(observed_length, _MAX_SNAPSHOT_VALUES)
+    assert seen["latest_value_count"] == true_length
+    assert len(seen["latest_values"]) == min(true_length, _MAX_SNAPSHOT_VALUES)
 
     if result.outcome == "confirmed":
         # A confirmation is an assertion about a paid post, so it must be replayable from
         # the row alone: nothing it was confirmed by may have been sampled away.
-        assert observed_length <= _MAX_SNAPSHOT_VALUES
-        assert seen["latest_values"] == [observed_value] * observed_length
+        assert true_length <= _MAX_SNAPSHOT_VALUES
+        assert seen["latest_values"] == list(vector)
         if question_type == "multiple_choice":
             assert snapshot["expected_labels"] == list(labels)
             assert seen["label_order"] is not None
