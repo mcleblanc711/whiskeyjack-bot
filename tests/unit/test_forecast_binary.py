@@ -33,6 +33,10 @@ from whiskeyjack_bot.forecast.schema import (
     NumericForecastResponse,
     validate_forecast_response,
 )
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalNumericQuestion,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -60,6 +64,23 @@ def _bounds(minimum: float, maximum: float) -> ForecastConfig:
     return config.model_copy(update={"min_probability": minimum, "max_probability": maximum})
 
 
+def _question(**overrides: Any) -> CanonicalBinaryQuestion:
+    """The canonical question M1-405 put on every checker's signature.
+
+    ``binary_output_problems`` does not read it -- it has no rule a question decides -- but
+    it gates it, so the argument is supplied here for the same reason a config is: a checker
+    that refuses the wrong shape has to be handed the right one to test anything else.
+    """
+    fields: dict[str, Any] = {
+        "question_id": 123,
+        "post_id": 456,
+        "title": "Will the thing happen?",
+        "resolution_criteria": "Resolves YES if the thing happens.",
+    }
+    fields.update(overrides)
+    return CanonicalBinaryQuestion(**fields)
+
+
 @pytest.fixture()
 def golden() -> dict[str, Any]:
     return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
@@ -77,8 +98,8 @@ def _with_probability(golden: dict[str, Any], probability: float) -> BinaryForec
 def test_the_golden_output_validates_within_the_configured_bounds(golden: dict[str, Any]) -> None:
     """The acceptance criterion, both halves, against the committed defaults."""
     forecast = _response(golden)
-    assert binary_output_problems(forecast, _committed_forecast_config()) == []
-    assert validate_binary_output(forecast, _committed_forecast_config()) is forecast
+    assert binary_output_problems(forecast, _committed_forecast_config(), _question()) == []
+    assert validate_binary_output(forecast, _committed_forecast_config(), _question()) is forecast
 
 
 def test_the_golden_output_includes_base_rate_adjustments_and_failure_modes(
@@ -127,7 +148,7 @@ def test_the_golden_output_cites_the_source_id_form_the_pipeline_mints(
 def test_the_configured_bounds_are_inclusive(golden: dict[str, Any], probability: float) -> None:
     """The prompt's own wording: "between 0.001 and 0.999 **inclusive**"."""
     forecast = _with_probability(golden, probability)
-    assert binary_output_problems(forecast, _committed_forecast_config()) == []
+    assert binary_output_problems(forecast, _committed_forecast_config(), _question()) == []
 
 
 @pytest.mark.parametrize(
@@ -150,7 +171,7 @@ def test_a_probability_outside_the_configured_bounds_is_refused(
     that boundary: it validates there and is refused here.
     """
     forecast = _with_probability(golden, probability)
-    problems = binary_output_problems(forecast, _committed_forecast_config())
+    problems = binary_output_problems(forecast, _committed_forecast_config(), _question())
     assert len(problems) == 1
     assert problems[0].startswith("final_prediction.probability_yes: ")
 
@@ -163,8 +184,8 @@ def test_the_bound_is_configured_and_not_the_prompts_literal(golden: dict[str, A
     rather than the config, this would pass.
     """
     forecast = _with_probability(golden, 0.02)
-    assert binary_output_problems(forecast, _committed_forecast_config()) == []
-    assert binary_output_problems(forecast, _bounds(0.05, 0.95)) != []
+    assert binary_output_problems(forecast, _committed_forecast_config(), _question()) == []
+    assert binary_output_problems(forecast, _bounds(0.05, 0.95), _question()) != []
 
 
 def test_the_bound_problem_names_the_configured_numbers(golden: dict[str, Any]) -> None:
@@ -176,7 +197,7 @@ def test_the_bound_problem_names_the_configured_numbers(golden: dict[str, Any]) 
     see the next test.
     """
     forecast = _with_probability(golden, 0.02)
-    problems = binary_output_problems(forecast, _bounds(0.05, 0.95))
+    problems = binary_output_problems(forecast, _bounds(0.05, 0.95), _question())
     assert "0.05" in problems[0]
     assert "0.95" in problems[0]
 
@@ -193,8 +214,8 @@ def test_two_different_out_of_bounds_values_produce_identical_text(
     producing byte-identical text is the claim that actually discriminates.
     """
     config = _committed_forecast_config()
-    first = binary_output_problems(_with_probability(golden, 0.99951), config)
-    second = binary_output_problems(_with_probability(golden, 0.99997), config)
+    first = binary_output_problems(_with_probability(golden, 0.99951), config, _question())
+    second = binary_output_problems(_with_probability(golden, 0.99997), config, _question())
     assert first == second
     assert "0.99951" not in first[0]
     assert "0.99997" not in first[0]
@@ -227,7 +248,7 @@ def test_a_binary_response_must_supply_its_prior(
     else:
         payload.update(overrides)
     forecast = validate_forecast_response(payload, BinaryForecastResponse)
-    problems = binary_output_problems(forecast, _committed_forecast_config())
+    problems = binary_output_problems(forecast, _committed_forecast_config(), _question())
     assert [problem.split(":")[0] for problem in problems] == [expected]
 
 
@@ -242,7 +263,7 @@ def test_every_problem_is_reported_at_once(golden: dict[str, Any]) -> None:
     payload["model_prior"] = None
     payload["final_prediction"] = {"probability_yes": 0.9995}
     forecast = validate_forecast_response(payload, BinaryForecastResponse)
-    assert len(binary_output_problems(forecast, _committed_forecast_config())) == 3
+    assert len(binary_output_problems(forecast, _committed_forecast_config(), _question())) == 3
 
 
 def test_nothing_is_clamped(golden: dict[str, Any]) -> None:
@@ -254,19 +275,21 @@ def test_nothing_is_clamped(golden: dict[str, Any]) -> None:
     forbids.
     """
     forecast = _with_probability(golden, 0.5)
-    returned = validate_binary_output(forecast, _committed_forecast_config())
+    returned = validate_binary_output(forecast, _committed_forecast_config(), _question())
     assert returned is forecast
     assert returned.final_prediction.probability_yes == 0.5
     with pytest.raises(BinaryOutputError):
-        validate_binary_output(_with_probability(golden, 0.9995), _committed_forecast_config())
+        validate_binary_output(
+            _with_probability(golden, 0.9995), _committed_forecast_config(), _question()
+        )
 
 
 def test_the_raising_entry_point_carries_the_same_problems(golden: dict[str, Any]) -> None:
     forecast = _with_probability(golden, 0.9995)
     config = _committed_forecast_config()
     with pytest.raises(BinaryOutputError) as caught:
-        validate_binary_output(forecast, config)
-    assert caught.value.problems == binary_output_problems(forecast, config)
+        validate_binary_output(forecast, config, _question())
+    assert caught.value.problems == binary_output_problems(forecast, config, _question())
 
 
 @pytest.mark.parametrize(
@@ -308,7 +331,7 @@ def test_a_response_of_another_question_type_is_a_caller_mistake(
     }
     forecast = validate_forecast_response(payload, response_type)
     with pytest.raises(BinaryOutputError) as caught:
-        binary_output_problems(forecast, _committed_forecast_config())
+        binary_output_problems(forecast, _committed_forecast_config(), _question())
     assert caught.value.problems == ["forecast: must be a binary forecast response"]
 
 
@@ -322,9 +345,58 @@ def test_a_config_that_admits_no_probability_is_refused(golden: dict[str, Any]) 
     """
     forecast = _response(golden)
     with pytest.raises(BinaryOutputError):
-        binary_output_problems(forecast, _bounds(0.9, 0.1))
+        binary_output_problems(forecast, _bounds(0.9, 0.1), _question())
     with pytest.raises(BinaryOutputError):
-        binary_output_problems(forecast, _bounds(0.5, 0.5))
+        binary_output_problems(forecast, _bounds(0.5, 0.5), _question())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(0.5, id="a float"),
+        pytest.param("question", id="a string"),
+        pytest.param(
+            CanonicalNumericQuestion(
+                question_id=123,
+                post_id=456,
+                title="How many things?",
+                lower_bound=0.0,
+                upper_bound=100.0,
+                open_lower_bound=False,
+                open_upper_bound=False,
+                cdf_size=201,
+            ),
+            id="a numeric question",
+        ),
+    ],
+)
+def test_a_question_of_the_wrong_type_arrives_as_this_projects_error(
+    golden: dict[str, Any], bad: Any
+) -> None:
+    """M1-405 put the question on this signature; this is what binary spends it on.
+
+    The parameter is not read by any rule here, so the only thing that could make it
+    load-bearing is the gate -- and a gate nothing tests is a gate that can be deleted
+    without a failure. ``validate.output_problems`` checks the *pairing* centrally before
+    the lookup, which is why this one only has to know its own type.
+    """
+    with pytest.raises(BinaryOutputError) as caught:
+        binary_output_problems(_response(golden), _committed_forecast_config(), bad)
+    assert caught.value.problems == ["question: must be a canonical binary question"]
+
+
+def test_the_question_is_accepted_and_not_read(golden: dict[str, Any]) -> None:
+    """Stated in the module docstring, asserted here: no field of the question changes the
+    verdict. If a later item gives binary a question-dependent rule, this test is the one
+    that has to be edited to say so."""
+    forecast = _with_probability(golden, 0.9995)
+    config = _committed_forecast_config()
+    assert binary_output_problems(forecast, config, _question()) == binary_output_problems(
+        forecast,
+        config,
+        _question(question_id=999, post_id=1, title="Something else entirely?"),
+    )
 
 
 @pytest.mark.parametrize("bad", [None, 0.5, "config", {"min_probability": 0.1}])
@@ -334,7 +406,7 @@ def test_a_config_of_the_wrong_type_arrives_as_this_projects_error(
     """Every malformed shape arrives as the module's own error type, never an
     AttributeError -- the rule this project has taken as a review finding twice."""
     with pytest.raises(BinaryOutputError):
-        binary_output_problems(_response(golden), bad)
+        binary_output_problems(_response(golden), bad, _question())
 
 
 def test_the_committed_defaults_still_match_the_range_the_prompt_prints() -> None:
@@ -366,20 +438,26 @@ def test_this_modules_errors_are_its_own_type_and_still_catch_as_the_packages() 
         (
             "out of bounds",
             lambda golden, config: validate_binary_output(
-                _with_probability(golden, 0.9995), config
+                _with_probability(golden, 0.9995), config, _question()
             ),
         ),
         (
             "a response of another question type",
-            lambda golden, config: binary_output_problems("not a response", config),
+            lambda golden, config: binary_output_problems("not a response", config, _question()),
         ),
         (
             "a config of the wrong type",
-            lambda golden, config: binary_output_problems(_response(golden), None),
+            lambda golden, config: binary_output_problems(_response(golden), None, _question()),
         ),
         (
             "an inverted bounds pair",
-            lambda golden, config: binary_output_problems(_response(golden), _bounds(0.9, 0.1)),
+            lambda golden, config: binary_output_problems(
+                _response(golden), _bounds(0.9, 0.1), _question()
+            ),
+        ),
+        (
+            "a question of another type",
+            lambda golden, config: binary_output_problems(_response(golden), config, None),
         ),
     ],
 )

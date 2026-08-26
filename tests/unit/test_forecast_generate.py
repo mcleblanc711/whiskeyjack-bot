@@ -49,6 +49,7 @@ from whiskeyjack_bot.prompt import LoadedPrompt, load_prompt
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
+    CanonicalNumericQuestion,
 )
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
 from whiskeyjack_bot.research.packet import ResearchPacket, build_packet
@@ -1005,12 +1006,16 @@ def test_a_bounds_pair_admitting_no_probability_is_refused_before_any_billable_c
 def test_a_non_binary_response_is_not_bound_checked_here(
     config: AppConfig, prompt: LoadedPrompt
 ) -> None:
-    """Pins M1-404's and M1-405's boundary from the inside, the M1-402 idiom.
+    """Pins M1-404's boundary from the inside, the M1-402 idiom.
 
     A multiple-choice reply whose probabilities are outside the configured bounds and
     sum to well over one is returned as typed output: every one of those checks needs
     the question's option list, which is M1-404's stated criterion. The dispatch is
     keyed on the question-type literal, so nothing here approximates it in the meantime.
+
+    It named M1-405 too until that item landed. Numeric now has a checker, and the
+    section below is the same statement from the other side: a numeric reply *is*
+    checked, against the question's bounds rather than against these probability bounds.
     """
     payload = json.loads(good_reply())
     payload["question_type"] = "multiple_choice"
@@ -1031,6 +1036,167 @@ def test_a_non_binary_response_is_not_bound_checked_here(
     assert result.failure_code is None
     assert result.forecast is not None
     assert result.forecast.question_type == "multiple_choice"
+
+
+# --- M1-405: the declared percentiles, inside the repair loop ---------------------
+
+
+def _numeric_question(**overrides: Any) -> CanonicalNumericQuestion:
+    fields: dict[str, Any] = {
+        "question_id": 42,
+        "post_id": 7,
+        "title": "How many things?",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "cdf_size": 201,
+    }
+    fields.update(overrides)
+    return CanonicalNumericQuestion(**fields)
+
+
+def numeric_reply(**overrides: Any) -> str:
+    """``good_reply()``'s numeric twin, built from the prompt's own numeric block."""
+    payload = {
+        **json.loads(_json_block("Shared fields")),
+        **json.loads("{" + _json_block("Numeric schema") + "}"),
+        "question_id": 42,
+        # The prompt's own rule for a non-binary response.
+        "model_prior": None,
+    }
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_the_prompts_own_numeric_example_is_returned_unchanged(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The premise the tests below rest on: one call, no repair, a numeric forecast.
+
+    A rule that failed the prompt's own example would be a rule no model could satisfy,
+    and every repair-turn test here would then be measuring the wrong thing.
+    """
+    client = _Model(numeric_reply())
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert result.invocations == 1
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "numeric"
+
+
+def test_a_percentile_problem_gets_exactly_one_repair_and_it_can_succeed(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The reason the check lives in the parse step rather than on the result.
+
+    A reply with two percentiles validates against the schema
+    (``test_forecast_schema.py::test_numeric_percentile_levels_are_not_checked_here``
+    pins that) and fails M1-405's levels rule. Applied to the returned result it would
+    waste a billed call; applied here it costs the one repair M1-402 already budgets.
+    """
+    short = numeric_reply(
+        final_prediction={
+            "percentiles": [
+                {"percentile": 0.5, "value": 24.0},
+                {"percentile": 0.9, "value": 38.0},
+            ]
+        }
+    )
+    client = _Model(short, numeric_reply())
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert result.invocations == 2
+    assert result.repair_attempted is True
+    assert result.failure_code is None
+    assert result.forecast is not None
+
+
+def test_a_percentile_problem_that_persists_costs_two_calls_and_no_more(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    reply = numeric_reply(
+        final_prediction={
+            "percentiles": [{"percentile": 0.5, "value": 24.0}],
+        }
+    )
+    client = _Model(reply, reply)
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert result.invocations == 2
+    assert len(client.calls) == 2
+    assert result.forecast is None
+    # Not ``malformed_response``: the reply was well-formed JSON that satisfied the
+    # schema, and the two failures stay distinguishable in the ledger for that reason.
+    assert result.failure_code == "schema_invalid"
+    assert all(p.startswith("final_prediction.percentiles: ") for p in result.failure_problems)
+
+
+def test_the_repair_turn_names_the_questions_bounds_and_not_the_models_value(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The M1-403 asymmetry, applied to question data instead of config.
+
+    The bound is what the model has to aim at, so it is rendered; the value that missed it
+    is model output, so it is withheld. It does reach the model in the assistant turn
+    immediately before -- the provider produced it, so returning it is not a leak, while a
+    log, an exception or a ledger row would be.
+    """
+    reply = numeric_reply(
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": -777.5 if index == 0 else 24.0 + index}
+                for index, level in enumerate(
+                    [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
+                )
+            ]
+        }
+    )
+    client = _Model(reply, reply)
+    _generate(client, config, prompt, question=_numeric_question(lower_bound=3.0))
+
+    turn = client.calls[1][-1]
+    assert turn["role"] == "user"
+    assert "3.0" in turn["content"]
+    assert "777" not in turn["content"]
+    assert client.calls[1][-2]["role"] == "assistant"
+
+
+def test_a_question_no_percentile_set_could_satisfy_is_refused_before_any_billable_call(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The ``zero_point`` preflight, beside the inverted-bounds one and for its reason.
+
+    The pinned SDK refuses a question whose ``zero_point`` is at or above its lower bound
+    outright, so no percentile set could produce a submittable distribution. Unchecked it
+    would fail every numeric forecast through the repair loop -- two billed calls per
+    question to reject something no model could have supplied.
+    """
+    # Bound to names rather than written as literals at the call site: ``_leaks`` renders
+    # the traceback, which quotes the source line that raised (M1-308 round 5's trap).
+    lower, zero = 5.0, 9.5
+    client = _Model(numeric_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(
+            client,
+            config,
+            prompt,
+            question=_numeric_question(lower_bound=lower, zero_point=zero),
+        )
+    assert client.calls == []
+    assert not _leaks(caught.value, "5.0", "9.5")
+
+
+def test_a_satisfiable_zero_point_is_not_refused(config: AppConfig, prompt: LoadedPrompt) -> None:
+    """The companion: the preflight above must refuse the unsatisfiable pair and nothing
+    else, or every log-scaled question would be blocked."""
+    client = _Model(numeric_reply())
+    result = _generate(
+        client,
+        config,
+        prompt,
+        question=_numeric_question(lower_bound=5.0, zero_point=1.0),
+    )
+    assert result.forecast is not None
 
 
 # --- M1-501: the attribution fields and the citations ----------------------------

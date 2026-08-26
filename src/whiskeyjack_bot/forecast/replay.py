@@ -210,7 +210,7 @@ def replay_forecast(
         stored.raw_responses[-1],
         model,
         config.forecast,
-        question_id=record.question_id,
+        question=record.question,
         source_ids=source_ids,
     )
     if forecast is None:

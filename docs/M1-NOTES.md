@@ -4809,3 +4809,236 @@ event-tags the four cells: over 200 draws the type-specific layer bites on **29.
 on 62.3%, and the attribution layer bites on 91.6%. Without that spread the equality property would
 be asserting a concatenation with an empty list — the vacuous-property class this project has paid
 for more than any other.
+
+## M1-405 — The numeric percentile path
+
+*"Produce the nine declared percentiles for conversion by forecasting-tools. Percentile levels are
+exact; values are finite, ordered and compatible with question bounds."*
+
+### What the criterion is actually guarding against
+
+Before this item a numeric response reached `forecast_records` with **no semantic check at all**.
+`schema.NumericPrediction` takes `percentiles: list[PercentilePoint]` with `min_length=1` and says
+so outright, deferring every clause here; `validate._TYPE_CHECKERS["numeric"]` was `None`, the
+explicit "supported, and no checker yet" entry M1-506 put there for this row to fill. So a reply
+carrying two percentiles, or nine descending ones, or values a hundred times outside a closed bound,
+was stored as a forecast and handed to M1-503 to fail inside the SDK — where the failure is a
+`ValueError` whose message **prints the offending percentiles verbatim**, one billed call after the
+point where a repair turn was still free.
+
+The rules are all cheap and all repairable. What makes the row size `M` is that its last clause
+needed a channel that did not exist.
+
+### Delivered
+
+- **`src/whiskeyjack_bot/forecast/numeric.py`** — `DECLARED_PERCENTILE_LEVELS`,
+  `NumericOutputError`, `numeric_output_problems`, `validate_numeric_output`. `binary.py`'s shape,
+  including the returner/raiser pair and the `repr`-rendered bound.
+- **The seam widened** — `validate._TypeChecker` is now
+  `Callable[[Any, ForecastConfig, Any], list[str]]`; `output_problems` / `validate_output` take
+  `question: CanonicalQuestion` in place of `question_id: int`; `binary_output_problems` takes the
+  question and gates it; `parse._parse`, `generate._run_attempts` and `replay` thread it.
+- **A second preflight in `generate_forecast`** — a question whose `zero_point` is at or above its
+  `lower_bound`, refused before any billable call.
+- **Tests** — `tests/unit/test_forecast_numeric.py` (36), an M1-405 section in
+  `test_forecast_generate.py` (6), a `5b.` section in `tests/property/test_forecast_properties.py`
+  (9), and new coverage in `test_forecast_binary.py` / `test_forecast_validate.py` for the widened
+  signature.
+
+### Decision — non-decreasing, not strictly increasing
+
+The row says "ordered". `prompts/forecaster.md` says **non-decreasing**, twice (line 48 and line
+153). CLAUDE.md's stricter-reading rule would ordinarily resolve that upward; it is not applied
+here, and the reason is that the stricter reading *contradicts* the prompt rather than sharpening
+it. A reply with two equal values followed the instructions exactly, and refusing it spends the one
+budgeted repair call on this project's own inconsistency — `schema.py` makes the same argument about
+`source_disagreements`, and `binary.py`'s `_PRIOR_REQUIRED` comment makes it about the priors.
+
+The pinned SDK agrees with the prompt, whatever its message says:
+`NumericDistribution._check_percentiles_increasing` raises on `percentiles[i].value >
+percentiles[i + 1].value` — a tie passes. Verified by reading `numeric_report.py` at 0.2.92 and by
+executing the constructor in `test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts`.
+
+**The cost of that decision is filed, not hidden.** What the SDK then does with a tie is
+`_check_and_update_repeating_values`, which **mutates `declared_percentiles` in place**, nudging a
+repeated value by `1e-6` inside the bounds or `1e-10` at one — inside the `model_validator`, so on
+construction, before `get_cdf` is called. The record stores what the model returned; a CDF built
+from it would be built from values this project neither produced nor persists. Against "nothing is
+clamped" that is a real divergence. It is **M1-508**, filed against M1-503, because the nudge
+happens in the conversion M1-503 owns and every remedy — record the nudged values as a derived
+artifact, refuse ties at the conversion boundary, or bump the prompt to ask for strictly increasing
+values and re-hash — is that row's or the prompt owner's to weigh.
+
+### Decision — the bound rules are the ones that hold for *any* configuration
+
+`NumericDistribution` applies two tiers. One runs unconditionally: `_check_percentiles_increasing`
+and `_check_log_scaled_fields` (`lower_bound > zero_point`, and no value below `zero_point`). The
+other runs only under `strict_validation` **and** `standardize_cdf`: `_check_too_far_from_bounds`'s
+25%-wiggle and 2×-range tail rules, `_check_percentile_spacing`, `_check_distribution_too_tall`.
+
+Both of those flags are `config.numeric_calibration`, which is a **sibling of** `config.forecast` on
+`AppConfig`, not a member of it — so a checker handed a `ForecastConfig` cannot see them. Applying a
+conditional rule unconditionally would refuse a forecast a permissive config accepts, and this
+module has no way to know which it is looking at. So the line between M1-405 and M1-503 is drawn at
+the config boundary rather than guessed at: **M1-405 owns what is true of a percentile set for any
+configuration** — the exact levels, non-decreasing values, closed bounds, and `zero_point` — and
+M1-503 owns everything `numeric_calibration` decides, along with the 201-point CDF itself.
+
+`test_an_open_bound_constrains_nothing_here` is the clause that proves the rule reads
+`open_lower_bound`/`open_upper_bound` rather than applying the bound flat.
+
+### Decision — the question replaces `question_id` on the composed entry point
+
+`output_problems(forecast, config, *, question_id, source_ids)` could not answer this row's last
+clause, so a question had to reach it. Adding one *beside* `question_id` would put two sources of
+truth for the same fact inside one entry point and then require a cross-check between them — which
+is exactly what M2-703's round-1 review said to remove rather than guard. So the primitive is gone
+and `question.question_id` is what `attribution_problems` is called with.
+
+`attribution.py` keeps its primitive signature deliberately. Its docstring rests a design decision
+on taking primitives — "taking primitives is what makes this module's independence a property of its
+own interface rather than of another package's `__init__.py`" — and nothing about this item argues
+against that.
+
+**Import cost: none.** `questions/model.py` reaches no provider SDK and `forecast/inputs.py` has
+imported it since M1-402; `test_the_response_schema_reaches_no_provider_client` pins both, and
+`forecast/numeric.py` was added to the probed list.
+
+### Decision — every checker takes the question, including the one with no use for it
+
+`binary_output_problems` now takes a third argument it has no *rule* for. The alternative was a
+per-type adapter in `_TYPE_CHECKERS` narrowing the question — and `validate.py`'s own note on
+`_TypeChecker` already rejects an adapter, for the reason that an adapter is a second place per type
+to edit and the table exists so there is one. A uniform signature means the type that needs the
+question and the type that does not are registered identically, which is what keeps M1-404's change
+to a single line.
+
+The parameter is not decoration: binary spends it on the same exact-type gate it already applies to
+its other two arguments, and `test_a_question_of_the_wrong_type_arrives_as_this_projects_error`
+kills the mutation that deletes it. The *pairing* — question type equals response type — is checked
+once in `output_problems`, centrally, so no checker has to reason about the relationship between two
+of its arguments.
+
+### Deviation — `docs/TRACKS.md` said "one changed line each" and it was wrong
+
+The wave was planned on M1-506's prediction that M1-404 and M1-405 would each change one line of
+`forecast/validate.py` and could therefore run concurrently. That held for the registration and not
+for the signature. Both items need the question — M1-405 for the bounds, M1-404 for the option list
+— so both would have edited the same three signatures and met at a conflict the registry could not
+have warned either about.
+
+M1-405 took the widening; **lane 1 stage B is serial**, and `docs/TRACKS.md` now says so with the
+reasoning attached. M1-404 merges master after this lands and does get its one line. `validate.py`'s
+docstring records the falsified prediction rather than quietly deleting it, because the shape of the
+mistake — a seam sized against the *registration* and not against the *arguments* — is the reusable
+part.
+
+### Rejected — re-checking that values are finite
+
+The criterion says "values are finite". `schema.PercentilePoint.value` carries
+`Field(allow_inf_nan=False)`, so a non-finite value is refused before any checker is called. A
+duplicate check in `numeric.py` could only be reached through `model_construct`, and a test that has
+to bypass the schema to reach the branch it asserts is the vacuous-property class this project has
+paid for more than any other. Pinned instead as a schema fact that *can* fail —
+`test_a_non_finite_value_never_reaches_this_module` drives `Infinity`, `-Infinity` and `NaN` through
+`validate_forecast_response` and asserts each is refused.
+
+Recorded here because reading `numeric.py` alone, the rule looks absent — which is the seam defect
+M1-506 exists to close, met from a third direction.
+
+### Rejected — a tolerance on the declared levels
+
+Every level is a decimal literal in the prompt and arrives through `json.loads`, which maps a
+literal to the nearest double: `0.10`, `0.1` and `1e-1` are the same value, asserted in
+`test_a_level_written_another_way_is_the_same_double`. So exact equality is not brittle, and the
+only thing a tolerance would buy is accepting levels the prompt does not print. Comparing the whole
+tuple rather than the set also settles count, order and duplication in one step — and it is what
+makes the ordering rule well defined, since "non-decreasing values" is only a rule once the levels
+they belong to are known to ascend.
+
+### Rejected — pre-checking the 201-point CDF or the PMF step cap
+
+`M1-503`'s criterion, verbatim: *"Exactly 201 monotone values for normal numeric questions;
+maintained PMF constraint passes."* Nothing here approximates it. `config.numeric_calibration`
+(`expected_cdf_points`, `max_adjacent_pmf`, `strict_validation`,
+`use_forecasting_tools_standardization`, `calibration_profile`) still has no consumer in `src/`
+outside `submission_live.py`'s length check — the same "this item defines them" condition M1-403
+found for the probability bounds, and it is M1-503's to define, not this row's.
+
+### Deferred (do not read the absence as an omission)
+
+- **The tie nudge → M1-508**, filed this branch. Above.
+- **The persist path → M1-507.** Widened by this item (a malformed percentile set is now refused by
+  `generate` and still persistable by `append_forecast_version`) and simultaneously made cheaper to
+  close: the composed entry point wants a `CanonicalQuestion`, and `ForecastRecordDraft.question`
+  already carries one that `_one_question` has validated against the row's own `question_id` and
+  `question_type`. Only `ForecastConfig` is still missing. `store.py`'s docstring and the M1-507 row
+  both say so now.
+- **The `validated` lifecycle event → M1-504.** Unchanged: `store.py` still does not append one, and
+  M1-404, M1-502 and M1-503 are still outstanding.
+- **`unit_of_measure` in the prompt's Inputs list.** `forecast/inputs.py` has flagged this as a
+  candidate for the prompt's next version bump since M1-402, and it is directly numeric-relevant — a
+  percentile *value* has no meaning without its unit, and the bounds it must respect are printed in
+  that unit. Not taken here: a prompt bump is a re-hash, a `RELEASED_PROMPT_SHA256` entry, a
+  `config.example.yaml` edit and a third test, and bundling it into a checker item would put an
+  unrelated attribution-surface change inside this review.
+
+### Standing risk — not verifiable offline
+
+`test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts` constructs a
+`NumericDistribution` with `strict_validation=False`, which is exactly the SDK's unconditional tier
+and is the whole claim this module makes about agreement. It does **not** establish that Metaculus
+accepts the resulting CDF — that is M1-503's boundary and, past it, a live call. The claim in the
+docstring is deliberately narrow for that reason.
+
+The 0.25 wiggle factor and the 2× buffer are read from `numeric_report.py` at the pin and are *not*
+duplicated here, so there is nothing in this module for a pin move to invalidate. What a pin move
+could invalidate is the agreement test itself, which is why it is written as a construction rather
+than as a description.
+
+### Tests, and what each mutation killed
+
+Ten mutations against `numeric.py`, run with `HYPOTHESIS_PROFILE=ci` and `__pycache__` cleared
+between each (the stale-bytecode trap: a same-size, same-second edit is served from cache).
+
+| Mutation | Killed by |
+| --- | --- |
+| non-decreasing → strictly increasing | `test_equal_neighbouring_values_are_accepted` |
+| levels compared as a multiset (order lost) | `test_the_levels_must_be_exactly_the_declared_ones[right set, wrong order]` |
+| levels compared as a subset (count lost) | `test_the_levels_must_be_exactly_the_declared_ones[one missing]` |
+| lower bound applied even when open | `test_an_open_bound_constrains_nothing_here` |
+| upper-bound check removed | `test_one_ulp_outside_a_closed_bound_is_refused` |
+| lower bound inclusive → exclusive | `test_a_value_exactly_on_a_closed_bound_is_accepted` |
+| `zero_point` check removed | `test_a_value_below_the_zero_point_is_refused` |
+| `zero_point` preflight `<=` → `<` | `test_a_question_whose_zero_point_is_not_below_its_lower_bound_is_a_caller_mistake` |
+| question gate removed | `test_every_refusal_path_raises_this_modules_own_type_exactly[a binary question]` |
+| `_format_number`: `repr` → `f"{v:.2f}"` | **survived the first pass** — see below |
+
+**The tenth mutation is the one worth recording.** `repr` rather than a fixed precision is M1-403's
+`_format_bound` decision, and its reason is that a bound rendered as `0.00` is one the model could
+aim at and still miss. Nothing in thirty-five tests and nine properties noticed when it was
+replaced: the bounds these tests happened to use (`0.0`, `100.0`, `3.0`, `20.0`) all render
+identically either way. Closed by
+`test_the_rendered_bound_round_trips_back_to_the_bound_exactly`, which parses the number back out of
+the message and compares it to the bound — asserted by round-trip rather than against `repr(bound)`,
+because a test comparing against `repr` agrees with any renderer that happens to be `repr`,
+including a wrong one. Four of its six parameters fail under the mutation.
+
+**Anti-vacuity.** `test_every_numeric_rule_is_reached` event-tags all five rules; over 200 draws
+each of the ten cells is populated — levels exact on 14.8% / not on 80.9%, non-decreasing on 25.8% /
+not on 69.9%, closed-lower biting on 39.7%, closed-upper on 44.5%, `zero_point` on 32.5%. That
+spread is not free: the first draft drew the nine values freely, and an unsorted list of nine is
+non-decreasing about once in 400,000, so the ordering rule bit on essentially every example and the
+`iff` property never saw its accepting side. The strategy now sorts on half the draws, and the
+`sampled_from` pool is built out of both bounds, one ulp either side of each, and a repeat.
+
+**Two properties were drafted wrong and the suite caught both.**
+`test_a_percentile_problem_never_varies_with_the_value_that_failed` first put the drawn value in the
+*first* position and constants elsewhere, so a large draw made the ordering rule fire for one value
+and not the other and the property was comparing two different rules; it now fills every position,
+where a constant list is trivially non-decreasing and only the value-rendering rules can speak.
+`test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts` was written as
+`assume(problems == [])` over the general strategy, and hypothesis refused it outright — fifty
+filtered, none generated. Constructing the accepted case is also the more honest strategy: the claim
+is about the accepted set, so that is what should be sampled, and `accepted_numeric_cases` carries
+its own vacuity guard asserting the cases it builds really are accepted.

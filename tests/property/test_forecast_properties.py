@@ -16,11 +16,13 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from itertools import pairwise
 from math import nextafter
 from pathlib import Path
 from typing import Any
 
 import pytest
+from forecasting_tools import NumericDistribution, Percentile
 from hypothesis import assume, event, given
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT, research_documents, round_trip
@@ -37,9 +39,16 @@ from whiskeyjack_bot.forecast.attribution import (
     validate_attribution_fields,
 )
 from whiskeyjack_bot.forecast.binary import binary_output_problems
+from whiskeyjack_bot.forecast.numeric import (
+    DECLARED_PERCENTILE_LEVELS,
+    NumericOutputError,
+    numeric_output_problems,
+    validate_numeric_output,
+)
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastSchemaError,
+    NumericForecastResponse,
     response_model_for,
     validate_forecast_response,
 )
@@ -49,7 +58,7 @@ from whiskeyjack_bot.forecast.validate import (
     output_problems,
     validate_output,
 )
-from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
+from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalNumericQuestion
 from whiskeyjack_bot.research.dedup import dedup_key
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
 from whiskeyjack_bot.research.packet import PacketError, build_packet
@@ -431,6 +440,37 @@ def _forecast_config(minimum: float, maximum: float) -> ForecastConfig:
     )
 
 
+def _binary_question(question_id: int | None = None) -> CanonicalBinaryQuestion:
+    """The canonical question M1-405 put on every checker's signature.
+
+    ``binary_output_problems`` does not read it and ``output_problems`` reads only its
+    ``question_id`` and its ``qtype``, so it is built rather than drawn: what varies in
+    these properties is the response and the config, and a drawn question would add draws
+    to a strategy whose vacuity is already the thing being guarded against.
+    """
+    return CanonicalBinaryQuestion(
+        question_id=_VALID_QUESTION_ID if question_id is None else question_id,
+        post_id=7,
+        title="Will X happen?",
+    )
+
+
+def _numeric_question(**overrides: Any) -> CanonicalNumericQuestion:
+    """A numeric question, bounded 0..100 closed unless a draw says otherwise."""
+    fields: dict[str, Any] = {
+        "question_id": _VALID_QUESTION_ID,
+        "post_id": 7,
+        "title": "How many things?",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "cdf_size": 201,
+    }
+    fields.update(overrides)
+    return CanonicalNumericQuestion(**fields)
+
+
 def _binary_response(
     probability: float, *, prior: bool = True, model_prior: bool = True
 ) -> BinaryForecastResponse:
@@ -446,8 +486,7 @@ def _binary_response(
 # The schema's own field names, walked from the models rather than imported from
 # ``schema._schema_field_names``: a property that asserts against the constant the
 # implementation uses passes whatever that constant says (M1-303's lesson).
-def _resolves_through_the_schema(location: str) -> bool:
-    model: Any = BinaryForecastResponse
+def _resolves_through_the_schema(location: str, model: Any = BinaryForecastResponse) -> bool:
     for part in location.split("."):
         fields = getattr(model, "model_fields", None)
         if fields is None or part not in fields:
@@ -519,7 +558,7 @@ def test_the_bounds_check_accepts_exactly_the_probabilities_inside_them(
     """
     low, high, probability = drawn
     forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
-    problems = binary_output_problems(forecast, _forecast_config(low, high))
+    problems = binary_output_problems(forecast, _forecast_config(low, high), _binary_question())
     expected = (low <= probability <= high) and prior and model_prior
     assert (problems == []) is expected
 
@@ -532,7 +571,7 @@ def test_the_bounds_check_never_raises_for_a_valid_response_and_a_valid_config(
     formed one must arrive as data. Nothing in this function may raise at all."""
     low, high = bounds
     forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
-    problems = binary_output_problems(forecast, _forecast_config(low, high))
+    problems = binary_output_problems(forecast, _forecast_config(low, high), _binary_question())
     assert all(isinstance(problem, str) for problem in problems)
 
 
@@ -548,7 +587,9 @@ def test_every_problem_is_reported_at_a_location_the_schema_authored(
     """
     low, high = bounds
     forecast = _binary_response(probability, prior=prior, model_prior=model_prior)
-    for problem in binary_output_problems(forecast, _forecast_config(low, high)):
+    for problem in binary_output_problems(
+        forecast, _forecast_config(low, high), _binary_question()
+    ):
         location, separator, message = problem.partition(": ")
         assert separator == ": "
         assert message
@@ -571,9 +612,10 @@ def test_a_bounds_problem_never_varies_with_the_probability_that_failed(
     assume(not low <= first <= high)
     assume(not low <= second <= high)
     config = _forecast_config(low, high)
-    assert binary_output_problems(_binary_response(first), config) == binary_output_problems(
-        _binary_response(second), config
-    )
+    question = _binary_question()
+    assert binary_output_problems(
+        _binary_response(first), config, question
+    ) == binary_output_problems(_binary_response(second), config, question)
 
 
 @given(BOUNDS, BOUNDS)
@@ -587,10 +629,410 @@ def test_the_invariance_property_can_see_the_bounds_change(
     assume(not first[0] <= outside <= first[1])
     assume(not second[0] <= outside <= second[1])
     forecast = _binary_response(outside)
-    left = binary_output_problems(forecast, _forecast_config(*first))
-    right = binary_output_problems(forecast, _forecast_config(*second))
+    left = binary_output_problems(forecast, _forecast_config(*first), _binary_question())
+    right = binary_output_problems(forecast, _forecast_config(*second), _binary_question())
     assert left and right
     assert left != right
+
+
+# --- 5b. the declared percentiles and the question's bounds (M1-405) --------------
+
+# Values are drawn from a small pool that straddles the question bounds this section
+# uses (0..100), rather than from an unrestricted float strategy. The interesting bug is
+# at the boundary, and ``docs/LESSONS.md`` #5 is the record of what a continuous draw
+# costs: hitting ``value == lower_bound`` exactly is measure-zero, so an inclusive/
+# exclusive slip survives every example. The pool includes both bounds, one ulp either
+# side of each, a duplicate-prone repeat, and interior points.
+_NUMERIC_VALUES = st.sampled_from(
+    [
+        -50.0,
+        nextafter(0.0, -1.0),
+        0.0,
+        nextafter(0.0, 1.0),
+        1.5,
+        24.0,
+        24.0,
+        50.0,
+        nextafter(100.0, 0.0),
+        100.0,
+        nextafter(100.0, float("inf")),
+        150.0,
+    ]
+)
+
+# Levels: the declared nine, and mutations of them that each break one clause of the
+# tuple comparison -- short, long, reordered, duplicated, and one level the prompt does
+# not print. Every branch of ``_levels_problem`` is reachable from this.
+_PERCENTILE_LEVELS = st.sampled_from(
+    [
+        DECLARED_PERCENTILE_LEVELS,
+        DECLARED_PERCENTILE_LEVELS[:-1],
+        (*DECLARED_PERCENTILE_LEVELS, 0.995),
+        (DECLARED_PERCENTILE_LEVELS[1], DECLARED_PERCENTILE_LEVELS[0])
+        + DECLARED_PERCENTILE_LEVELS[2:],
+        (DECLARED_PERCENTILE_LEVELS[0],) + DECLARED_PERCENTILE_LEVELS[1:] + (0.99,),
+        (0.02,) + DECLARED_PERCENTILE_LEVELS[1:],
+    ]
+)
+
+
+def _numeric_response(
+    levels: tuple[float, ...], values: tuple[float, ...]
+) -> NumericForecastResponse:
+    payload = json.loads(json.dumps(VALID_PAYLOAD))
+    payload["question_type"] = "numeric"
+    # The prompt's own rule, which ``schema.py`` enforces on a non-binary response.
+    payload["model_prior"] = None
+    payload["base_rate"]["prior_probability"] = None
+    payload["final_prediction"] = {
+        "percentiles": [
+            {"percentile": level, "value": value}
+            for level, value in zip(levels, values, strict=False)
+        ]
+    }
+    return validate_forecast_response(payload, NumericForecastResponse)
+
+
+# ``(lower_bound, upper_bound, zero_point)``, always with ``zero_point < lower_bound``.
+# The pair the *other* way round is a question no percentile set could satisfy, and this
+# module raises for it rather than reporting a problem -- so it is a caller-mistake case
+# (``tests/unit/test_forecast_numeric.py``) and not a draw for properties that are about
+# the verdict. Each row makes a different rule reachable against ``_NUMERIC_VALUES``:
+# ``None`` switches the zero-point rule off, ``-1.0`` puts it just under the drawn -50.0,
+# ``-100.0`` puts it out of reach so the rule is live and silent, and ``(2.0, 1.5)`` moves
+# both it and the lower bound into the middle of the pool.
+_BOUNDS_AND_ZERO_POINT = st.sampled_from(
+    [
+        (0.0, 100.0, None),
+        (0.0, 100.0, -1.0),
+        (0.0, 100.0, -100.0),
+        (2.0, 100.0, 1.5),
+    ]
+)
+
+
+@st.composite
+def numeric_cases(
+    draw: st.DrawFn,
+) -> tuple[NumericForecastResponse, CanonicalNumericQuestion]:
+    """A numeric response and the question it is checked against.
+
+    Both bounds are opened and closed on different draws and a ``zero_point`` is present
+    on some, so every rule in ``forecast/numeric.py`` is reachable from this one strategy
+    -- which is the anti-vacuity requirement ``test_every_numeric_rule_is_reached``
+    tags and the rest of this section depends on.
+    """
+    levels = draw(_PERCENTILE_LEVELS)
+    drawn = draw(st.lists(_NUMERIC_VALUES, min_size=len(levels), max_size=len(levels)))
+    # Sorted on half the draws. Left free, an unsorted list of nine is non-decreasing about
+    # once in 400,000, so the ordering rule would bite on essentially every example and the
+    # ``iff`` property would never see its accepting side -- green for the wrong reason,
+    # which is the whole subject of ``docs/LESSONS.md`` #5. ``test_every_numeric_rule_is_reached``
+    # is where that is measured rather than asserted here.
+    values = tuple(sorted(drawn) if draw(st.booleans()) else drawn)
+    lower, upper, zero_point = draw(_BOUNDS_AND_ZERO_POINT)
+    question = _numeric_question(
+        lower_bound=lower,
+        upper_bound=upper,
+        open_lower_bound=draw(st.booleans()),
+        open_upper_bound=draw(st.booleans()),
+        zero_point=zero_point,
+    )
+    return _numeric_response(levels, values), question
+
+
+def _numeric_problems(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> list[str]:
+    response, question = case
+    return numeric_output_problems(response, _forecast_config(0.001, 0.999), question)
+
+
+@given(numeric_cases())
+def test_every_numeric_rule_is_reached(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The anti-vacuity guard for every property in this section.
+
+    A strategy that never draws a value below a *closed* lower bound proves nothing about
+    the closed-lower-bound rule, and the properties below would all be green over the
+    empty case. This tags each rule's cell so the run itself shows they are populated --
+    the defect class this project has paid for more than any other.
+    """
+    response, question = case
+    values = [point.value for point in response.final_prediction.percentiles]
+    levels = tuple(point.percentile for point in response.final_prediction.percentiles)
+    event(f"levels exact: {levels == DECLARED_PERCENTILE_LEVELS}")
+    event(f"non-decreasing: {all(a <= b for a, b in pairwise(values))}")
+    event(
+        "closed lower bites: "
+        f"{not question.open_lower_bound and any(v < question.lower_bound for v in values)}"
+    )
+    event(
+        "closed upper bites: "
+        f"{not question.open_upper_bound and any(v > question.upper_bound for v in values)}"
+    )
+    event(
+        "zero point bites: "
+        f"{question.zero_point is not None and any(v < question.zero_point for v in values)}"
+    )
+
+
+@given(numeric_cases())
+def test_the_percentile_check_accepts_exactly_the_sets_every_rule_admits(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The discriminating post-condition, restated independently of the implementation.
+
+    An ``iff`` over the conjunction of all four rules, computed here from the response and
+    the question rather than by calling any private helper -- a property written in terms
+    of the code it is testing agrees with it by construction.
+    """
+    response, question = case
+    values = [point.value for point in response.final_prediction.percentiles]
+    levels = tuple(point.percentile for point in response.final_prediction.percentiles)
+    expected = (
+        levels == DECLARED_PERCENTILE_LEVELS
+        and all(first <= second for first, second in pairwise(values))
+        and (question.open_lower_bound or all(v >= question.lower_bound for v in values))
+        and (question.open_upper_bound or all(v <= question.upper_bound for v in values))
+        and (question.zero_point is None or all(v >= question.zero_point for v in values))
+    )
+    assert (_numeric_problems(case) == []) is expected
+
+
+@given(numeric_cases())
+def test_the_percentile_check_never_raises_for_a_valid_response_and_a_valid_question(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """A well-formed argument must arrive as data, never as an exception."""
+    problems = _numeric_problems(case)
+    assert all(isinstance(problem, str) for problem in problems)
+
+
+@given(
+    st.one_of(HOSTILE_TEXT, st.none(), st.integers(), st.lists(HOSTILE_TEXT, max_size=2)),
+    st.one_of(HOSTILE_TEXT, st.none(), st.integers()),
+)
+def test_the_percentile_check_refuses_every_malformed_shape_as_its_own_error(
+    response: Any, question: Any
+) -> None:
+    """A raw ``AttributeError`` or ``TypeError`` escaping is the defect this project has
+    taken as a review finding twice."""
+    config = _forecast_config(0.001, 0.999)
+    for entry_point in (numeric_output_problems, validate_numeric_output):
+        for arguments in (
+            (response, config, _numeric_question()),
+            (_numeric_response(DECLARED_PERCENTILE_LEVELS, (1.0,) * 9), config, question),
+            (response, config, question),
+        ):
+            try:
+                entry_point(*arguments)
+            except ForecastSchemaError:
+                continue
+            raise AssertionError("a malformed shape was accepted")
+
+
+@given(numeric_cases())
+def test_every_percentile_problem_is_reported_at_a_location_the_schema_authored(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """A repair turn's field paths must be resolvable, and must be *ours*.
+
+    Walked through ``model_fields`` rather than compared against this module's own
+    ``_PERCENTILES_LOC`` constant -- M1-303's lesson: a test that reads the implementation's
+    constant agrees with a wrong constant.
+    """
+    for problem in _numeric_problems(case):
+        location, separator, message = problem.partition(": ")
+        assert separator == ": ", problem
+        assert message
+        assert _resolves_through_the_schema(location, NumericForecastResponse), problem
+
+
+@given(numeric_cases(), _NUMERIC_VALUES, _NUMERIC_VALUES)
+def test_a_percentile_problem_never_varies_with_the_value_that_failed(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+    first: float,
+    second: float,
+) -> None:
+    """Invariance, not substring absence -- the M1-403 leak-property shape.
+
+    "The value does not appear in the message" is unwritable here: the message renders the
+    question's bounds, so a drawn ``0.0`` or ``100.0`` is a substring of it for reasons
+    that have nothing to do with the model's output. Two different offending values
+    producing byte-identical text is the claim that discriminates.
+
+    The drawn value fills **every** position rather than the first. A single odd value among
+    constants would make the ordering rule fire for one draw and not the other, and the
+    property would then be comparing two different rules rather than two renderings of one.
+    A constant list is trivially non-decreasing, so only the bound and zero-point rules can
+    speak -- which are the only ones that render a number at all.
+    """
+    _, question = case
+    config = _forecast_config(0.001, 0.999)
+
+    def verdict(value: float) -> list[str]:
+        values = (value,) * len(DECLARED_PERCENTILE_LEVELS)
+        response = _numeric_response(DECLARED_PERCENTILE_LEVELS, values)
+        return numeric_output_problems(response, config, question)
+
+    assert verdict(first) == verdict(second) or _numeric_verdict_differs(question, first, second)
+
+
+def _numeric_verdict_differs(
+    question: CanonicalNumericQuestion, first: float, second: float
+) -> bool:
+    """Whether the two drawn values legitimately fall on different sides of a rule.
+
+    The invariance claim is about the *text* of a problem, not about whether there is one:
+    a value inside the bounds and a value outside them must differ, or the checker would be
+    accepting both. So the property above is invariance **given the same verdict**, and this
+    is what tells the two cases apart -- computed from the question, never from the message.
+    """
+
+    def bites(value: float) -> tuple[bool, bool, bool]:
+        return (
+            not question.open_lower_bound and value < question.lower_bound,
+            not question.open_upper_bound and value > question.upper_bound,
+            question.zero_point is not None and value < question.zero_point,
+        )
+
+    return bites(first) != bites(second)
+
+
+def test_the_percentile_invariance_property_can_see_the_bounds_change() -> None:
+    """The companion check: the message is invariant in the model's value and *not*
+    invariant in the question's bounds, which is what makes a repair turn actionable.
+
+    Without this, the property above would be satisfied by a checker whose every message
+    was a constant -- and a constant is exactly the message no model can act on.
+    """
+    config = _forecast_config(0.001, 0.999)
+    below = _numeric_response(
+        DECLARED_PERCENTILE_LEVELS, (-50.0,) + (24.0,) * (len(DECLARED_PERCENTILE_LEVELS) - 1)
+    )
+    left = numeric_output_problems(below, config, _numeric_question(lower_bound=0.0))
+    right = numeric_output_problems(below, config, _numeric_question(lower_bound=-10.0))
+    assert left and right
+    assert left != right
+
+
+@given(numeric_cases())
+def test_the_percentile_verdict_is_stable_across_the_storage_boundary(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """M1-305's rule, applied to this checker.
+
+    M1-507 will run the composed entry point over a record on its way into the ledger, so
+    the verdict has to be a function of the *persisted* form. A rule whose answer changed
+    across ``model_dump(mode="json")`` would pass every test that never went through the
+    ledger and refuse a record the generating path accepted.
+    """
+    response, question = case
+    persisted = json.dumps(
+        response.model_dump(mode="json"), ensure_ascii=True, sort_keys=True, allow_nan=False
+    )
+    reloaded = validate_forecast_response(json.loads(persisted), NumericForecastResponse)
+    assert numeric_output_problems(
+        reloaded, _forecast_config(0.001, 0.999), question
+    ) == _numeric_problems(case)
+
+
+@st.composite
+def accepted_numeric_cases(
+    draw: st.DrawFn,
+) -> tuple[NumericForecastResponse, CanonicalNumericQuestion]:
+    """A percentile set this checker accepts, **built** rather than filtered for.
+
+    ``assume(problems == [])`` over ``numeric_cases()`` is what this was first written as,
+    and hypothesis rejected it outright: an unsorted draw over twelve values is
+    non-decreasing about once in half a million, so the health check saw fifty filtered
+    inputs and none generated. Constructing the accepted case is also the more honest
+    strategy -- the claim is about the accepted set, so that is what should be sampled.
+    """
+    lower, upper, zero_point = draw(_BOUNDS_AND_ZERO_POINT)
+    open_lower = draw(st.booleans())
+    open_upper = draw(st.booleans())
+    floor = lower if not open_lower else min(lower, -50.0)
+    if zero_point is not None:
+        floor = max(floor, zero_point)
+    ceiling = upper if not open_upper else max(upper, 150.0)
+    values = tuple(
+        sorted(
+            draw(
+                st.lists(
+                    st.floats(
+                        min_value=floor,
+                        max_value=ceiling,
+                        allow_nan=False,
+                        allow_infinity=False,
+                    ),
+                    min_size=len(DECLARED_PERCENTILE_LEVELS),
+                    max_size=len(DECLARED_PERCENTILE_LEVELS),
+                )
+            )
+        )
+    )
+    question = _numeric_question(
+        lower_bound=lower,
+        upper_bound=upper,
+        open_lower_bound=open_lower,
+        open_upper_bound=open_upper,
+        zero_point=zero_point,
+    )
+    return _numeric_response(DECLARED_PERCENTILE_LEVELS, values), question
+
+
+@given(accepted_numeric_cases())
+def test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The agreement claim, stated exactly rather than aspirationally.
+
+    ``NumericDistribution`` runs two checks unconditionally -- ``_check_percentiles_increasing``
+    and ``_check_log_scaled_fields`` -- and everything else only under ``strict_validation``,
+    which is ``numeric_calibration``'s knob and therefore M1-503's. So the claim this module
+    can make is precisely: what it accepts, the SDK's *unconditional* tier accepts. Asserted
+    by construction rather than described, because the pin can move.
+    """
+    response, question = case
+    # The vacuity guard: the strategy claims to build accepted cases, and this is what
+    # makes the claim falsifiable rather than an assumption the property rests on.
+    assert _numeric_problems(case) == []
+    NumericDistribution(
+        declared_percentiles=[
+            Percentile(percentile=point.percentile, value=point.value)
+            for point in response.final_prediction.percentiles
+        ],
+        open_upper_bound=question.open_upper_bound,
+        open_lower_bound=question.open_lower_bound,
+        upper_bound=question.upper_bound,
+        lower_bound=question.lower_bound,
+        zero_point=question.zero_point,
+        cdf_size=question.cdf_size,
+        strict_validation=False,
+    )
+
+
+@given(numeric_cases())
+def test_nothing_is_clamped_by_the_percentile_check(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The response is never sorted, padded, truncated or pulled inside a bound.
+
+    The pinned SDK *does* nudge repeated values inside ``NumericDistribution``; that is
+    M1-503's to decide, and it is the reason this is asserted here rather than assumed.
+    """
+    response, question = case
+    before = response.model_dump(mode="json")
+    try:
+        returned = validate_numeric_output(response, _forecast_config(0.001, 0.999), question)
+    except NumericOutputError:
+        assert response.model_dump(mode="json") == before
+        return
+    assert returned is response
+    assert response.model_dump(mode="json") == before
 
 
 # --- 6. the attribution fields and their citations (M1-501) -----------------------
@@ -939,7 +1381,9 @@ def _composed(
     case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
 ) -> list[str]:
     response, question_id, supplied, config = case
-    return output_problems(response, config, question_id=question_id, source_ids=supplied)
+    return output_problems(
+        response, config, question=_binary_question(question_id), source_ids=supplied
+    )
 
 
 @given(composed_cases())
@@ -954,7 +1398,7 @@ def test_the_composition_is_reached_on_both_sides(
     """
     response, question_id, supplied, config = case
     attribution_half = attribution_problems(response, question_id=question_id, source_ids=supplied)
-    binary_half = binary_output_problems(response, config)
+    binary_half = binary_output_problems(response, config, _binary_question(question_id))
     event(f"attribution bites: {bool(attribution_half)}")
     event(f"type-specific bites: {bool(binary_half)}")
 
@@ -974,7 +1418,7 @@ def test_the_composition_is_exactly_its_two_layers_in_order(
     checker = _TYPE_CHECKERS[response.question_type]
     expected = attribution_problems(response, question_id=question_id, source_ids=supplied)
     if checker is not None:
-        expected = expected + checker(response, config)
+        expected = expected + checker(response, config, _binary_question(question_id))
     assert _composed(case) == expected
 
 
@@ -991,7 +1435,9 @@ def test_the_pair_agrees_on_every_draw(
     response, question_id, supplied, config = case
     problems = _composed(case)
     try:
-        returned = validate_output(response, config, question_id=question_id, source_ids=supplied)
+        returned = validate_output(
+            response, config, question=_binary_question(question_id), source_ids=supplied
+        )
     except ForecastOutputError as exc:
         assert problems != []
         assert exc.problems == problems
@@ -1018,15 +1464,28 @@ def test_the_composed_verdict_is_stable_across_the_storage_boundary(
     )
     reloaded = validate_forecast_response(json.loads(persisted), BinaryForecastResponse)
     assert output_problems(
-        reloaded, config, question_id=question_id, source_ids=supplied
+        reloaded, config, question=_binary_question(question_id), source_ids=supplied
     ) == _composed(case)
 
 
-@given(composed_cases(), HOSTILE_SOURCE_IDS, st.one_of(HOSTILE_TEXT, st.none(), st.floats()))
+HOSTILE_QUESTIONS = st.one_of(
+    HOSTILE_TEXT,
+    st.none(),
+    st.floats(),
+    st.integers(),
+    st.dictionaries(HOSTILE_TEXT, HOSTILE_TEXT, max_size=2),
+    # A *real* canonical question of the wrong type, which is the hostile value the gate
+    # exists for: the others are refused by the isinstance check, and only this one
+    # reaches the pairing check the entry point makes before the lookup.
+    st.just(_numeric_question()),
+)
+
+
+@given(composed_cases(), HOSTILE_SOURCE_IDS, HOSTILE_QUESTIONS)
 def test_the_entry_point_never_raises_outside_the_packages_error_type(
     case: tuple[BinaryForecastResponse, int, tuple[str, ...], ForecastConfig],
     source_ids: Any,
-    question_id: Any,
+    question: Any,
 ) -> None:
     """Every malformed shape must arrive as a ``ForecastSchemaError``.
 
@@ -1038,9 +1497,9 @@ def test_the_entry_point_never_raises_outside_the_packages_error_type(
     """
     response, _, _, config = case
     for arguments in (
-        {"question_id": _VALID_QUESTION_ID, "source_ids": source_ids},
-        {"question_id": question_id, "source_ids": ["src-001"]},
-        {"question_id": question_id, "source_ids": source_ids},
+        {"question": _binary_question(), "source_ids": source_ids},
+        {"question": question, "source_ids": ["src-001"]},
+        {"question": question, "source_ids": source_ids},
     ):
         try:
             problems = output_problems(response, config, **arguments)
@@ -1060,7 +1519,7 @@ def test_the_entry_point_refuses_anything_that_is_not_a_response(
     config = _forecast_config(low, high)
     for entry_point in (output_problems, validate_output):
         try:
-            entry_point(value, config, question_id=_VALID_QUESTION_ID, source_ids=["src-001"])
+            entry_point(value, config, question=_binary_question(), source_ids=["src-001"])
         except ForecastSchemaError:
             continue
         raise AssertionError("a non-response was accepted")
@@ -1117,7 +1576,7 @@ def test_a_composed_problem_never_varies_with_the_cited_id_that_failed(
             question_id=_VALID_QUESTION_ID,
         )
         return "\n".join(
-            output_problems(response, config, question_id=_VALID_QUESTION_ID, source_ids=supplied)
+            output_problems(response, config, question=_binary_question(), source_ids=supplied)
         )
 
     first = verdict("AAAAAAAAAA")
@@ -1141,7 +1600,9 @@ def test_an_unregistered_question_type_is_refused_rather_than_passed(
     mutated = response.model_copy()
     object.__setattr__(mutated, "question_type", "date")
     try:
-        output_problems(mutated, config, question_id=question_id, source_ids=supplied)
+        output_problems(
+            mutated, config, question=_binary_question(question_id), source_ids=supplied
+        )
     except ForecastOutputError as exc:
         assert exc.problems == [
             "question_type: must be one of binary, multiple_choice, numeric "
