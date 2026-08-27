@@ -4903,6 +4903,47 @@ happens in the conversion M1-503 owns and every remedy — record the nudged val
 artifact, refuse ties at the conversion boundary, or bump the prompt to ask for strictly increasing
 values and re-hash — is that row's or the prompt owner's to weigh.
 
+### Decision — no message renders a value, and round 1 corrected this one
+
+**The first cut rendered the bounds, and the reasoning was wrong.** It read `binary.py`'s
+argument — a repair turn that does not name the bound is one no model can aim at — and applied it
+here. Round 1 filed it blocking, and reproducing it took one call:
+
+```
+final_prediction.percentiles: values must be at least 3.141592653589793 for this question's
+closed lower bound (offending input withheld)
+```
+
+`binary.py`'s argument holds *there* for a specific reason: `prompts/forecaster.md` prints
+`0.001`-`0.999` to the model as a **literal**, while config is free to narrow it, so a binary model
+genuinely does not know its effective bound. A numeric model does — `forecast/inputs.py:284-290`
+puts `lower_bound`, `upper_bound`, `open_lower_bound`, `open_upper_bound` and `zero_point` into the
+request it was sent. Naming them back buys nothing.
+
+`attribution.py` had already drawn this exact line and written it down: it declines to render the
+supplied `source_ids` because "the model already holds the whole id list in its own request, under
+`research_documents`, so naming them back buys nothing". Two modules, two sides of one distinction,
+and this one cited `binary.py`'s side without reading `attribution.py`'s. **The lesson is not that
+the rule was unclear — it is that the project had already resolved it in prose, in a sibling file,
+and the prose was not read before writing a third module beside them.** That is the same shape
+M1-506's round-1 leak-property draft hit.
+
+It is also not confined to a repair turn. A response that fails twice puts these strings in
+`ForecastGeneration.failure_problems`, and `forecast/artifacts.py` writes that into the persisted
+raw-output envelope. Question fields come from Metaculus payloads, which CLAUDE.md classes as
+untrusted; the carve-out that lets a *path* be rendered is about operator-supplied configuration,
+not provider content. So a rendered bound was provider data entering the ledger's diagnostics.
+
+The three messages are now constants naming the rule and the question field it is about
+(`lower_bound`, `upper_bound`, `zero_point` — names this project's canonical model authored).
+Nothing reached through `forecast` or `question` is interpolated anywhere in the module. The nine
+declared levels are still named and are a different category: this project's own constant,
+transcribed from the hashed prompt, the same thing `schema.response_model_for` prints.
+
+`binary.py` is left alone and the difference is now deliberate — **M1-509** is filed to settle
+whether its configured bounds belong in a diagnostic at all, which is a question about
+`ForecastConfig` and CLAUDE.md's carve-out rather than about this row.
+
 ### Decision — the bound rules are the ones that hold for *any* configuration
 
 `NumericDistribution` applies two tiers. One runs unconditionally: `_check_percentiles_increasing`
@@ -5076,3 +5117,67 @@ where a constant list is trivially non-decreasing and only the value-rendering r
 filtered, none generated. Constructing the accepted case is also the more honest strategy: the claim
 is about the accepted set, so that is what should be sampled, and `accepted_numeric_cases` carries
 its own vacuity guard asserting the cases it builds really are accepted.
+
+### Round 1 — two blocking findings, both reproduced before any fix
+
+The review is `GPT_REVIEW_RESPONSE_M1-405_r1.md` against `4ace6c6`. Both findings were reproduced by
+execution against that exact commit first, per the standing rule; neither was stale and neither was
+rebutted.
+
+**Finding 1 — question-field values in the diagnostics.** Written up as its own Decision above,
+because the correction replaces a rationale this file originally stated the other way round.
+
+**Finding 2 — `replay_forecast` could raise `NumericOutputError`.** `CanonicalNumericQuestion`
+accepts `zero_point == lower_bound`; so does `ForecastRecordDraft`; and so did every writer before
+this branch, because numeric had no checker at the pinned base. `numeric._require_question` raises
+for that question rather than reporting a repairable problem — correctly, since no percentile set
+could satisfy it — and `generate_forecast` refuses it in a preflight before anything is spent.
+**Replay has no preflight.** It reads a row that already exists, so it reached `_parse` and let a
+member module's exception out of a public boundary, which `replay.py`'s own docstring calls a review
+finding in this project. Reproduced by building a draft with `lower_bound=1.0, zero_point=1.0`,
+persisting it (the writer accepts it — that is the premise), and replaying.
+
+Fixed with the handler `response_model_for` already had one line above:
+`except ForecastSchemaError as exc: raise ForecastRecordError(str(exc)) from None`.
+
+**What generalised.** `parse._parse` carried a comment claiming it "cannot raise, on any of its
+paths". Every clause of that claim rested on `generate_forecast`'s preflight, so it was never true
+of a caller without one — the comment asserted a property of the *function* that was really a
+property of one *call site*. It now says so and names replay as the caller that owes its own
+handler. A caller added later owes the same.
+
+### Round 1 — mutations, including the findings themselves
+
+Both findings are pinned as mutations of their own, so a regression reintroducing either fails:
+
+| Mutation | Killed by |
+| --- | --- |
+| finding 1: `lower_bound` rendered again | `test_no_message_renders_a_question_field_value` |
+| finding 1: `upper_bound` rendered again | `test_one_ulp_outside_a_closed_bound_is_refused` |
+| finding 1: `zero_point` rendered again | `test_no_message_renders_a_question_field_value` |
+| finding 2: replay stops translating | `test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error` |
+| the five messages collapse to one | `test_the_messages_still_distinguish_the_rule_they_report` |
+| levels renderer `repr` → `.1f` | `test_the_rendered_levels_round_trip_back_to_the_levels_exactly` |
+
+**One mutation survives and it is equivalent, not a gap.** `repr` → `f"{v:.2f}"` on the declared
+levels: all nine have at most two decimals, so `.2f` round-trips exactly and is a *correct*
+renderer. The genuinely truncating `.1f` (`0.01` → `"0.0"`) is killed. After finding 1's fix the only
+rendered values are that fixed constant, so the renderer choice is a convention here rather than a
+load-bearing one — recorded rather than papered over with a test contrived to kill a correct
+mutation. Round 1's version of this entry claimed the `repr` decision was load-bearing for the
+bounds; it was, and those bounds are gone.
+
+**The leak property had to be re-aimed, and its companion with it.** The old companion asserted the
+message *varied* with the question's bounds — that is exactly what must no longer be true. What
+replaces it is `test_a_percentile_problem_never_varies_with_the_question_it_was_checked_against`
+(scale the bounds by any factor; identical text for a response violating the same rules) plus
+`test_the_percentile_messages_still_distinguish_the_rule_they_report`, which is the real
+anti-vacuity guard: a checker whose every message was one constant would satisfy every invariance
+property here and tell a reader nothing.
+
+**A process note on the mutation harness.** The round-1 harness snapshotted the source to `/tmp`
+and restored from that snapshot; one snapshot was taken inside a previous mutation's window, so a
+mutation survived into the working tree and was only caught because the suite went red on clean
+code. The round-2 harness restores with `git checkout --` and asserts `git diff --quiet` after every
+restore. A harness that can silently leave a mutation behind is worse than no harness, because its
+"killed" results are then attributed to the wrong change.
