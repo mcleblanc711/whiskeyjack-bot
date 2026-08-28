@@ -5575,3 +5575,41 @@ a third registration cannot leave the anti-vacuity guard silently checking two.
 
 `numeric._require_question` still carried a comment saying its two question numbers "are rendered
 elsewhere in this module", which round 1's remediation had made false. Corrected.
+
+### M1-405 round 3 — APPROVE, and the one observation is a false claim of mine
+
+`GPT_REVIEW_RESPONSE_M1-405_r3.md`, reviewed `ac73229`. **APPROVE. No blocking findings.** All
+three prior findings confirmed closed, including round 2's stale-comment observation.
+
+The one non-blocking observation falsifies **risk 15 of the round-3 request**, which I wrote and
+which was wrong. I claimed that dispatching `_type_specific_half` through `_TYPE_CHECKERS` meant
+"a third registration cannot leave the guard checking two". The dispatch is registry-driven; the
+**strategy feeding it is not**. Verified by execution over 300 draws:
+
+| type | registered | drawn |
+| --- | --- | --- |
+| `binary` | yes | 110 |
+| `multiple_choice` | yes | 190 |
+| `numeric` | yes | **0** |
+
+So `numeric_output_problems` is never reached through the composed entry point by any property.
+No product defect follows — section 5b covers that checker directly, and the reviewer said so in
+declining to block — but this is the project's most expensive defect class reappearing one level
+up. The recorded forms are "the strategy cannot reach the branch the assertion is about" (M1-305,
+M1-501) and, from M1-404 round 1, "the strategy reaches it and the assertion is not about it".
+This is a third: **the assertion is registry-complete and the strategy is not**, so the guard whose
+entire job is anti-vacuity is itself partly vacuous, and silently worsens with each registration.
+
+Filed as **M1-510** rather than fixed here: widening the strategy needs a numeric arm that reaches
+both a biting and a silent verdict, which is a substantive property change on an approved branch and
+would earn a round 4 for a test-only gap the reviewer declined to block.
+
+Two comments were corrected in place, because leaving them is the stale-pointer failure that cost
+M1-501 a round: `_type_specific_half`'s docstring now says the *helper* cannot fall behind a
+registration while the strategy currently does, and `composed_cases()` no longer says "both
+registered types" now that there are three.
+
+**The generalizable rule.** Registry-driven dispatch behind a hand-written strategy is not
+registry-complete coverage, and the two are easy to conflate precisely because the dispatch half
+looks rigorous. When a guard claims completeness against a table, assert the *draws* against that
+table, not just the lookup.

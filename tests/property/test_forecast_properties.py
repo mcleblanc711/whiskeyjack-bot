@@ -1834,10 +1834,12 @@ def composed_cases(draw: st.DrawFn) -> _ComposedCase:
     on others, and ``test_the_composition_is_reached_on_both_sides`` is the event-tagged
     proof that both happen.
 
-    **M1-404 widened this to draw both registered types.** Until this row the strategy drew
+    **M1-404 widened this to draw two registered types.** Until that row the strategy drew
     only ``BinaryForecastResponse``, so every composition property was a statement about
     the one type whose entry was not ``None`` -- and the multiple-choice entry could have
-    been registered wrong without a single one of them failing.
+    been registered wrong without a single one of them failing. It said "both" until
+    M1-405 registered a third; ``numeric`` is **not** drawn here and ``M1-510`` is the row
+    that makes this strategy registry-complete.
 
     **At the M1-404/M1-405 merge the fifth element became the paired question** rather than
     a loose option list: the entry point reads the option list off the question, so a case
@@ -1882,8 +1884,16 @@ def _composed(case: _ComposedCase) -> list[str]:
 def _type_specific_half(case: _ComposedCase) -> list[str]:
     """The type-specific layer alone, dispatched the way the entry point dispatches it.
 
-    Written against ``_TYPE_CHECKERS`` rather than as an if/else over the two registered
-    types, so a third registration cannot leave this helper silently checking two.
+    Written against ``_TYPE_CHECKERS`` rather than as an if/else, so *this helper* cannot
+    fall behind a new registration.
+
+    **The strategy that feeds it can, and currently does -- see M1-405 round 3.**
+    ``composed_cases()`` draws binary and multiple-choice only, so ``numeric`` is
+    registered and never reaches this helper through the composed entry point: 300 draws
+    gave 190 multiple-choice, 110 binary, 0 numeric. Registry-driven dispatch behind a
+    hand-written strategy is not registry-complete coverage, and reading this docstring
+    as though it were is the mistake M1-405's own round-3 request made in writing.
+    ``M1-510`` closes it; section 5b covers ``numeric_output_problems`` directly meanwhile.
     """
     response, _question_id, _supplied, config, question = case
     checker = _TYPE_CHECKERS[response.question_type]
