@@ -70,6 +70,7 @@ question costs nothing there.
 
 from __future__ import annotations
 
+
 from whiskeyjack_bot.config import ForecastConfig
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,

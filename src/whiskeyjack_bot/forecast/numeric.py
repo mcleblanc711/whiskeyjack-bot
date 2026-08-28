@@ -260,8 +260,11 @@ def _require_question(question: CanonicalNumericQuestion) -> None:
     if not isinstance(question, CanonicalNumericQuestion):
         raise NumericOutputError(["question: must be a canonical numeric question"])
     if question.zero_point is not None and question.lower_bound <= question.zero_point:
-        # Both numbers are question data and are rendered elsewhere in this module; here
-        # they buy nothing the message does not already say.
+        # Neither number is rendered -- not here and not anywhere else in this module.
+        # Round 1 found that the bound diagnostics disclosed question-field values and
+        # they were made value-free; this comment still claimed the opposite, which
+        # round 2 filed as a non-blocking observation. The message names the schema's
+        # own field names and nothing about their values.
         raise NumericOutputError(
             ["question: zero_point must be strictly below lower_bound for a log-scaled question"]
         )

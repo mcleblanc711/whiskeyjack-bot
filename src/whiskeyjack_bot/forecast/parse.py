@@ -126,6 +126,12 @@ def _parse(
     An empty problem list with a ``None`` forecast is impossible: every failure path
     supplies at least one sanitized problem string.
 
+    ``question`` carries every question fact the type-specific checkers need -- the
+    numeric bounds and the multiple-choice option list alike. It replaced a bare
+    ``question_id`` (M1-405) and then absorbed a separate ``options`` argument (M1-404's
+    original shape) at the merge of the two: the packet field it came from is built as
+    ``list(question.options)``, so carrying both was one fact reached two ways.
+
     The configured-bounds and attribution checks run *here*, inside the attempt loop,
     rather than on the returned result. That is what makes an out-of-bounds probability
     or an unresolvable citation repairable at the cost of the second call this module

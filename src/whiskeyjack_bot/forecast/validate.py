@@ -4,8 +4,8 @@ The checks a valid response must pass are split across modules **on purpose**, a
 split is not what this item changes. ``forecast/attribution.py`` owns the cross-type
 rules (M1-501); ``forecast/binary.py`` owns the binary-specific ones (M1-403);
 ``forecast/numeric.py`` owns the percentile levels, ordering and bound compatibility
-(M1-405); M1-404 will own the multiple-choice option set. Each rule lives with the type it
-is a rule about, and each module states why.
+(M1-405); ``forecast/multiple_choice.py`` owns the option set and its distribution
+(M1-404). Each rule lives with the type it is a rule about, and each module states why.
 
 What was wrong was the **seam**. ``parse._output_problems`` composed them, but it was
 private with a single caller, so every other caller -- ``forecast/store.py`` validating a
@@ -31,12 +31,30 @@ gotcha ``questions/normalize.py`` carries the regression test for. Every support
 holds an **explicit** entry, ``None`` where the checker is not written yet, so
 "decided, and there is nothing" is distinguishable from "forgotten".
 
-**M1-405 widened the checker signature, and the prediction it falsified is worth keeping.**
-This paragraph used to end "and M1-404/M1-405 each become one changed line", and
-``docs/TRACKS.md`` planned the wave around that. It held for the *registration* and not for
-the signature: M1-405's criterion is "percentile levels are exact; values are finite,
-ordered and **compatible with question bounds**", and nothing on this path carried a
-question. So every checker now takes ``(response, ForecastConfig, CanonicalQuestion)``.
+**Both M1-404 and M1-405 widened the checker signature, and the prediction they
+falsified is worth keeping.** This paragraph used to end "and M1-404/M1-405 each become one
+changed line", and ``docs/TRACKS.md`` planned the wave around that. It held for the
+*registration* and not for the signature: M1-405's criterion is "percentile levels are
+exact; values are finite, ordered and **compatible with question bounds**" and M1-404's is
+"every exact option once", and nothing on this path carried a question. So every checker now
+takes ``(response, ForecastConfig, CanonicalQuestion)``.
+
+**The two items reached that conclusion independently and by different routes, and this is
+where they converged.** M1-404 merged first, carrying a keyword-only ``options: Sequence[str]
+| None`` threaded from ``ModelInput.packet`` beside a bare ``question_id: int``; M1-405
+replaced the id with the question itself. Carrying both would have been the same data reached
+two ways inside one entry point -- ``inputs.py`` builds the packet field as
+``list(question.options)``, so they cannot differ -- which is the second-source-of-truth shape
+M2-703's round-1 review filed a lesson about, and the same lesson that removed ``question_id``
+here. So the option list is now read from the question like every other question fact, the
+separate argument is gone, and ``multiple_choice_output_problems`` takes the question.
+
+Two things fell out of that rather than being designed. M1-404's **biconditional option/type
+pairing gate is retired**: it existed to catch a multiple-choice response validated against no
+option list, or an option list handed to another type, and neither is expressible once the
+list comes from the question the ``qtype`` gate below already pairs. And M1-404's standing
+risk -- that nothing verified the packet copy against the labels the request rendered -- is
+retired with it, because there is no copy.
 
 The alternative was a per-type adapter narrowing the third argument, which the note on
 ``_TypeChecker`` below rejects for the same reason it rejected one for the first: an
@@ -68,6 +86,7 @@ from typing import Any, TypeVar
 from whiskeyjack_bot.config import ForecastConfig
 from whiskeyjack_bot.forecast.attribution import attribution_problems
 from whiskeyjack_bot.forecast.binary import binary_output_problems
+from whiskeyjack_bot.forecast.multiple_choice import multiple_choice_output_problems
 from whiskeyjack_bot.forecast.numeric import numeric_output_problems
 from whiskeyjack_bot.forecast.schema import (
     SUPPORTED_RESPONSE_TYPES,
@@ -110,9 +129,7 @@ _TypeChecker = Callable[[Any, ForecastConfig, Any], list[str]]
 # entry at all, and fails again if a checker exists in this package that no entry reaches.
 _TYPE_CHECKERS: dict[str, _TypeChecker | None] = {
     "binary": binary_output_problems,
-    # M1-404 registers the option-set checker here; the criterion is exact multiple-choice
-    # normalization, and nothing approximates it in the meantime.
-    "multiple_choice": None,
+    "multiple_choice": multiple_choice_output_problems,
     "numeric": numeric_output_problems,
 }
 

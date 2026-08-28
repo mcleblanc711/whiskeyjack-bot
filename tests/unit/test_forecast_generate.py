@@ -638,6 +638,8 @@ _FORBIDDEN = {
     [
         "whiskeyjack_bot.forecast.schema",
         "whiskeyjack_bot.forecast.binary",
+        "whiskeyjack_bot.forecast.multiple_choice",
+        "whiskeyjack_bot.forecast.numeric",
         "whiskeyjack_bot.forecast.attribution",
         "whiskeyjack_bot.forecast.validate",
         "whiskeyjack_bot.forecast.inputs",
@@ -1003,39 +1005,108 @@ def test_a_bounds_pair_admitting_no_probability_is_refused_before_any_billable_c
     assert not _leaks(caught.value, "0.87", "0.13")
 
 
-def test_a_non_binary_response_is_not_bound_checked_here(
-    config: AppConfig, prompt: LoadedPrompt
-) -> None:
-    """Pins M1-404's boundary from the inside, the M1-402 idiom.
-
-    A multiple-choice reply whose probabilities are outside the configured bounds and
-    sum to well over one is returned as typed output: every one of those checks needs
-    the question's option list, which is M1-404's stated criterion. The dispatch is
-    keyed on the question-type literal, so nothing here approximates it in the meantime.
-
-    It named M1-405 too until that item landed. Numeric now has a checker, and the
-    section below is the same statement from the other side: a numeric reply *is*
-    checked, against the question's bounds rather than against these probability bounds.
-    """
+def _multiple_choice(options: list[dict[str, Any]]) -> str:
+    """``good_reply()`` retyped as a multiple-choice reply with the given option list."""
     payload = json.loads(good_reply())
     payload["question_type"] = "multiple_choice"
+    # The prompt's own rule, which ``schema.py`` enforces: a non-binary reply nulls both.
     payload["model_prior"] = None
     payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
-    payload["final_prediction"] = {
-        "options": [
-            {"option": "A", "probability": 0.9995},
-            {"option": "B", "probability": 0.9995},
-        ]
-    }
-    question = CanonicalMultipleChoiceQuestion(
-        question_id=42, post_id=7, title="Which X?", options=["A", "B"]
+    payload["final_prediction"] = {"options": options}
+    return json.dumps(payload)
+
+
+_MC_QUESTION = CanonicalMultipleChoiceQuestion(
+    question_id=42, post_id=7, title="Which X?", options=["A", "B"]
+)
+
+
+def test_a_compliant_multiple_choice_response_returns_typed_output_in_one_call(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-404 must not cost a call on a reply that followed the prompt.
+
+    The companion to the refusal below, and the half that matters most: a checker whose
+    rule a compliant reply cannot satisfy is a checker that bills two calls per question
+    to discover, which is what ``binary._require_config`` refuses for an inverted bounds
+    pair.
+    """
+    client = _Model(
+        _multiple_choice(
+            [{"option": "A", "probability": 0.55}, {"option": "B", "probability": 0.45}]
+        )
     )
-    client = _Model(json.dumps(payload))
-    result = _generate(client, config, prompt, question=question)
+    result = _generate(client, config, prompt, question=_MC_QUESTION)
     assert result.invocations == 1
     assert result.failure_code is None
     assert result.forecast is not None
     assert result.forecast.question_type == "multiple_choice"
+
+
+def test_a_multiple_choice_response_is_option_checked_here(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-404's rules reach the generate path, and cost exactly one repair turn.
+
+    **This test replaces ``test_a_non_binary_response_is_not_bound_checked_here``**, which
+    pinned the absence of these checks from the inside (the M1-402 idiom) and passed the
+    very reply below as typed output. That absence is what this row closes, so the pin is
+    inverted rather than deleted -- the numeric half of it survives below, because M1-405
+    still owns that one.
+    """
+    reply = _multiple_choice(
+        [{"option": "A", "probability": 0.9995}, {"option": "B", "probability": 0.9995}]
+    )
+    client = _Model(reply)
+    result = _generate(client, config, prompt, question=_MC_QUESTION)
+
+    # One repair turn, then the same bad reply again: two calls, no forecast.
+    assert result.invocations == 2
+    assert result.repair_attempted
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"
+    assert list(result.failure_problems) == [
+        "final_prediction.options: each probability must be between 0.001 and 0.999 "
+        "inclusive (offending input withheld)",
+        "final_prediction.options: probabilities must sum to 1 within 1e-06 "
+        "(observed sum withheld)",
+    ]
+
+
+def test_the_repair_turn_for_a_bad_option_set_names_no_label(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The leak rule, at the one place the problems are rendered back to the model.
+
+    A missing option is the case that tempts a checker into naming the label, and the
+    argument against is M1-501's: the model is already holding the list -- ``inputs.py``
+    put it in the request under ``options`` -- so naming it back buys nothing and echoes
+    output. Asserted against the *second* request, which is the one carrying the repair.
+    """
+    # Three options so *missing* can bite alone. With two, a reply naming one of them
+    # cannot be both inside [0.001, 0.999] and sum to 1, so the bounds and sum rules fire
+    # as well and the assertion below would be about all three rules rather than this one.
+    question = CanonicalMultipleChoiceQuestion(
+        question_id=42, post_id=7, title="Which X?", options=["A", "B", "C"]
+    )
+    client = _Model(
+        _multiple_choice([{"option": "A", "probability": 0.5}, {"option": "B", "probability": 0.5}])
+    )
+    result = _generate(client, config, prompt, question=question)
+    assert result.invocations == 2
+
+    repair = str(client.calls[-1])
+    assert "must name every option the question supplied" in repair
+    # The reply omitted "C"; no label may appear as a *quoted* string in the problems. The
+    # request itself renders the option list under ``options``, which is why this asserts
+    # on the problems rather than on the whole message.
+    assert not any(
+        f'"{label}"' in problem for label in ("A", "B", "C") for problem in result.failure_problems
+    )
+    assert list(result.failure_problems) == [
+        "final_prediction.options: must name every option the question supplied "
+        "(offending labels withheld)"
+    ]
 
 
 # --- M1-405: the declared percentiles, inside the repair loop ---------------------

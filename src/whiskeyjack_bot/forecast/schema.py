@@ -187,7 +187,10 @@ class MultipleChoicePrediction(_ResponsePart):
 
     That every *supplied* option appears exactly once and that the probabilities sum
     to 1 within 1e-6 is M1-404's acceptance criterion: both need the question's option
-    list, which this module does not read.
+    list, which this module does not read. **That rule now exists**, in
+    ``forecast/multiple_choice.py``, reached through ``forecast.validate``; this
+    docstring used to stop at "which this module does not read", and a pointer that says
+    only where a rule is *not* is how M1-501 lost a round.
     """
 
     options: list[OptionProbability] = Field(min_length=1)

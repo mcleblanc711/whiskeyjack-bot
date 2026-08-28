@@ -150,13 +150,19 @@ def _question(question_type: str = "binary", **overrides: Any) -> CanonicalQuest
     if question_type == "binary":
         return CanonicalBinaryQuestion(**common)
     if question_type == "multiple_choice":
-        options = [
-            option["option"]
-            for option in json.loads("{" + _json_block(HEADINGS["multiple_choice"]) + "}")[
-                "final_prediction"
-            ]["options"]
-        ]
-        return CanonicalMultipleChoiceQuestion(options=options, **common)
+        # The prompt's own labels by default, so the question and the reply that answers it
+        # are a matched pair by construction -- but overridable, because a caller testing
+        # the option rules needs labels the reply does *not* answer.
+        common.setdefault(
+            "options",
+            [
+                option["option"]
+                for option in json.loads("{" + _json_block(HEADINGS["multiple_choice"]) + "}")[
+                    "final_prediction"
+                ]["options"]
+            ],
+        )
+        return CanonicalMultipleChoiceQuestion(**common)
     return CanonicalNumericQuestion(
         lower_bound=0.0,
         upper_bound=100.0,
@@ -331,6 +337,36 @@ def test_the_type_specific_rules_reach_binary() -> None:
     assert problems == [
         "final_prediction.probability_yes: must be between 0.4 and 0.6 inclusive "
         "(offending input withheld)"
+    ]
+
+
+def test_the_type_specific_rules_reach_multiple_choice() -> None:
+    """M1-404's option-set rule, through the composed entry point rather than directly.
+
+    The sibling of ``test_the_type_specific_rules_reach_binary``, and the reason it exists
+    is that ``multiple_choice`` was the registry's ``None`` entry until M1-404: a
+    composition that reached only the entry it already had would have been green for the
+    whole of M1-506 and green again after.
+
+    **Converted at the M1-404/M1-405 merge.** It used to pass a separate
+    ``options=("Some other option", "Yet another option")`` beside a bare ``question_id``.
+    The option list now comes from the question, so the two unanswered labels are the
+    *question's* labels; the rules that bite and the problems asserted are unchanged.
+    """
+    forecast = _response("multiple_choice")
+    problems = _problems(
+        forecast,
+        # Labels the prompt's example never answers, so *missing* bites; the labels it does
+        # answer are then unknown, so *unknown* bites too. Two of them, not one: a
+        # one-option question cannot exist (``min_length=2``), and M1-404's round 1 found
+        # that a singleton makes the sum and bounds rules cover the line between them.
+        question=_question("multiple_choice", options=["Some other option", "Yet another"]),
+    )
+    assert problems == [
+        "final_prediction.options: must name only options the question supplied "
+        "(offending labels withheld)",
+        "final_prediction.options: must name every option the question supplied "
+        "(offending labels withheld)",
     ]
 
 
