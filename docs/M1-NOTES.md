@@ -5613,3 +5613,157 @@ registered types" now that there are three.
 registry-complete coverage, and the two are easy to conflate precisely because the dispatch half
 looks rigorous. When a guard claims completeness against a table, assert the *draws* against that
 table, not just the lookup.
+
+## M1-502 — Validate categorical forecasts
+
+*"Apply binary bounds and exact multiple-choice normalization. Boundary and sum tests pass; no
+arbitrary post-hoc renormalization is hidden."*
+
+### Decision — this row is a pin, not a build, and the evidence is why
+
+**There is no `src/` diff, and that is the finding rather than an omission.** M1-502's two
+dependencies shipped its mechanism before its own row opened:
+
+- **M1-403** → `forecast/binary.py:174` bounds `probability_yes` inside
+  `forecast.min_probability`/`max_probability`, inclusive. `validate_binary_output`'s docstring
+  already cites this row by name — *"Nothing is clamped … M1-502's criterion is that 'no arbitrary
+  post-hoc renormalization is hidden'"*.
+- **M1-404** → `forecast/multiple_choice.py` holds exact string equality against the question's
+  option list, per-option bounds, and `math.fsum` against `_SUM_TOLERANCE = 1e-6`. Its own notes
+  above (`### Decision — exact string equality, and nothing is renormalized`) quote this row's
+  criterion as the reason a bad sum is refused rather than rescaled.
+- **M1-506** → `forecast/validate.py:130-134` composes them, and `_TYPE_CHECKERS` has no `None`
+  entry left for this row to fill.
+
+Two more facts close the gap structurally rather than by inspection. `schema.Probability` is
+`Field(ge=0.0, le=1.0, allow_inf_nan=False)` (`schema.py:137`), so no NaN or infinity reaches a
+checker and every comparison below is over an ordered domain. `config.py:192-193` pins both bounds
+into `[0.001, 0.999]`, so a configured pair can only ever *narrow* the range
+`submission_live._require_probability` enforces at post time — the two gates cannot disagree in the
+direction that would matter, which is generation accepting what a post refuses.
+
+A repo-wide sweep for rescaling, clamping or division by a total finds nothing anywhere on the
+forecast path. So the criterion's second sentence is the deliverable: make the boundary and sum
+behaviour, and the *absence* of renormalization, hold as pinned facts across the whole path rather
+than at each module's own edge.
+
+### Decision — "normalization" in the row title is implemented as refusal
+
+The title says *exact multiple-choice normalization*; the code refuses a non-normalized vector and
+never produces one. The criterion's own second clause is the argument, and M1-404 made it first: a
+scaled vector is a distribution the model did not produce, and the ledger would record a forecast
+nobody made, with nothing in the record to show it had been altered. `submission_live`
+`_require_categories` reaches the same conclusion from the other end and records it as a stricter
+reading — the platform's behaviour for a non-normalized vector is not knowable offline, and neither
+silent renormalization nor rejection is something an attribution record should have to explain after
+the fact.
+
+### Delivered
+
+Tests, notes and backlog only.
+
+- **`tests/unit/test_forecast_generate.py`** — an M1-502 section: the sum rule end to end. It was
+  the one categorical rule with no test of its own on this path. M1-404's
+  `test_a_multiple_choice_response_is_option_checked_here` reaches it *incidentally* — its two
+  0.9995 options trip the bounds rule as well and its assertion is about both — so nothing said what
+  a bad sum alone costs. Four tests: one repair and a successful correction; a sum that stays wrong
+  costing exactly two calls with a one-element `failure_problems`; the `1e-6` straddle through
+  `generate` rather than at the checker; and the repair turn naming the tolerance and no probability.
+- **`tests/unit/test_forecast_multiple_choice.py`** — `test_the_configured_bounds_are_inclusive_to
+  _one_ulp`, `test_nothing_at_a_bound_is_nudged_onto_it`, and
+  `test_the_verdict_cannot_depend_on_the_order_the_model_answered_in`.
+- **`tests/unit/test_forecast_record.py`** — an M1-502 section pinning that the numbers the ledger
+  stores are the numbers the model produced.
+- **`tests/property/test_forecast_properties.py`** — `_MC_BOUND_NEIGHBOURS`: the strategy now draws
+  both float neighbours of every bound in `_MC_BOUNDS`.
+- **`tests/unit/test_forecast_validate.py`** — `multiple_choice_output_problems` named in
+  `test_the_discovery_walk_would_notice_a_checker`.
+
+### Decision — the boundary work went into the property strategy, not a new property
+
+Section 8 already holds a full independent oracle (`_expected_option_problems`, with the sum
+predicate computed in `Fraction`) and an event-tagged anti-vacuity guard. A new "bounds iff" property
+beside it would have restated a truth table that was already asserted, so the gap had to be somewhere
+else — and it was in the **draws**, not the assertions. `_MC_PROBABILITIES` was ten round values plus
+the bounds themselves: it reaches every boundary and can never cross one by the smallest step that
+exists. Section 5's `bounds_and_probability` records what that costs in this exact codebase — an
+off-by-one-ulp boundary error survived the mutation harness there until the neighbours were drawn
+explicitly, "the single earlier catch being hypothesis's boundary heuristics being lucky".
+
+**The strengthening is measured, not asserted.** With the bound comparison mutated to a tolerant
+`low - 1e-12 <= p <= high + 1e-12` — the sloppy-epsilon defect one ulp exists to catch — the
+truth-table property `test_the_option_rules_accept_exactly_the_valid_set` **fails with the
+neighbours in the pool and passes without them**. That is the direct evidence that this is coverage
+the section did not have, rather than a strategy edit that looks thorough.
+
+### Decision — `math.fsum` is defensive here, and the surviving mutation is provably equivalent
+
+`fsum` → `sum` survives the harness, and this is the account rather than a gap. The two cannot reach
+different verdicts on any admissible vector, and the arithmetic says so: the per-option minimum and
+the sum rule together cap the option count at `1 / min_probability` — 1000 at the committed default —
+and naive accumulation of n values totalling 1 carries an error of order `n · 2⁻⁵³`, about 1e-13 at
+n = 1000. That is seven orders of magnitude inside `_SUM_TOLERANCE`, and a 1000-option vector at
+0.001 was executed in three orderings to confirm the two routes agree to the last bit.
+
+`fsum` stays, because the bound depends on `min_probability` remaining non-trivial and that is
+config; the cost is zero. `test_the_verdict_cannot_depend_on_the_order_the_model_answered_in` records
+the measurement so the survivor is explained where a reader meets it.
+
+**The sum comparison's `>` → `>=` also survives, and is equivalent for a reason already written
+down**: `test_the_tolerance_is_applied_where_the_criterion_says` states that no probability vector's
+distance from 1 is *exactly* `1e-6`, because neither `1.0 + 1e-6` nor `1.0 - 1e-6` round-trips to
+that difference. With the boundary case unreachable, the two operators cannot be told apart.
+
+### Deviation — the criterion was satisfied before its own row opened
+
+M1-404 could not state its criterion ("every exact option once, tolerance `1e-6`") without building
+the sum rule, so it built it while M1-502 read `Not Started`. Nothing went wrong; it is worth
+recording because a reviewer meeting a `Done` flip with no `src/` diff will otherwise read it as a
+row closed without work, and because the same shape is coming for **M1-503** — M1-508 already sits
+against it, filed by M1-405.
+
+### Rejected — options weighed and not taken
+
+- **Threading the composed check into `store.py`.** That is **M1-507**, filed by M1-506 before this
+  branch existed and widened by M1-404 and M1-405 in turn. A record whose options are unknown,
+  missing, duplicated or out of bounds is still persistable by a direct caller of the public writer.
+  Taking it here would be scope theft from a row that already names its own signature change.
+- **Capping the option count at generation** to match `submission_live._MAX_CATEGORIES = 64`. The
+  ordering argument is the one M1-404 used for per-option bounds: a payload with 65 options is
+  refused at *post* time, after the forecast is recorded and approved, where a repair turn at
+  generation would have cost one call against a live post that cannot happen. M1-404 rejected it
+  anyway — *"a cap this row invented would refuse a question Metaculus accepted"* — and that
+  argument is unchanged. **Filed as a backlog row** rather than decided twice in notes.
+- **A guard for jointly unsatisfiable rules.** With `min_probability = 0.001`, a question carrying
+  more than 1000 options makes the per-option bound and the sum rule unsatisfiable together, so
+  every reply burns two calls and fails. Real, and unreachable: Metaculus multiple-choice questions
+  carry a few dozen, and `submission_live` says so at `_MAX_CATEGORIES`. Filed, not built.
+- **Unifying `multiple_choice._SUM_TOLERANCE` with `submission_live._CATEGORY_SUM_TOLERANCE`.** Same
+  number, two owners, deliberately independent — `multiple_choice.py:86` says so, and the submission
+  package does not import the forecast package.
+- **A new "bounds iff" property.** Above: the truth table was already asserted, and the gap was in
+  the draws.
+- **Renormalizing anything.** The criterion forbids it.
+
+### Deferred (do not read the absence as an omission)
+
+- **The persist path → M1-507.** Unchanged and not widened here; this row adds no rule.
+- **The `validated` lifecycle event → M1-504.** M1-603's notes deferred it until the output-validation
+  gate existed. With this row closed, **M1-503 is the last of the four it named** (M1-404, M1-405,
+  M1-502, M1-503) still outstanding, so M1-504 becomes reachable immediately after it.
+- **The submission payload built from a validated categorical forecast → M2-707.** This row decides
+  nothing about `final_prediction_json`'s use at post time or the option order a post carries.
+- **The comprehensive valid/invalid golden set → Codex's T-901.** No fixture ships here: every reply
+  in the new tests is built from `prompts/forecaster.md`'s own JSON blocks, so the reply and the
+  option list are a matched pair by construction and cannot drift from the prompt.
+
+### Standing risk — not verifiable offline
+
+- **What Metaculus does with a vector that sums to 1 only within `1e-6`.** This project accepts it
+  and stores it unscaled; the platform may renormalize it silently. If it does, the ledger and the
+  platform will disagree in the last few bits of a recorded forecast. M2-711's refetch vocabulary is
+  where that would surface, not here.
+- **The per-option bound is this project's, not the platform's.** `prompts/forecaster.md:130` prints
+  0.001–0.999 and `submission_live` enforces the same pair, but neither is read from Metaculus. A
+  platform that widened its accepted range would leave this project refusing forecasts it would have
+  taken.

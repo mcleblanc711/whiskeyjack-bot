@@ -12,6 +12,7 @@ import json
 import re
 import traceback
 from datetime import datetime, timezone
+from math import fsum
 from pathlib import Path
 from typing import Any
 
@@ -762,3 +763,82 @@ def test_a_draft_is_not_mutated_by_being_given_an_identity() -> None:
     )
     assert draft.model_dump(mode="json", warnings=False) == before
     assert copy.deepcopy(before) == before
+
+
+# --------------------------------------------------------------------------------------
+# M1-502: the numbers the ledger stores are the numbers the model produced
+# --------------------------------------------------------------------------------------
+#
+# ``forecast/binary.py`` and ``forecast/multiple_choice.py`` each carry a
+# ``test_nothing_is_clamped``, and both stop at the checker: they prove a *verdict* is not
+# quietly repaired. M1-502's criterion is broader -- "no arbitrary post-hoc renormalization
+# is hidden" -- and the place a renormalization could actually hide is between the accepted
+# response and the bytes the ledger stores, which nothing asserted. A rescaled option
+# vector would satisfy every checker in the package and still record a distribution the
+# model never produced.
+
+
+def _stored_prediction(question_type: str) -> Any:
+    """The prediction as ``forecast_records.final_prediction_json`` really holds it."""
+    return json.loads(canonical_final_prediction_json(_record(question_type)))
+
+
+@pytest.mark.parametrize("question_type", ("binary", "multiple_choice"))
+def test_the_stored_prediction_is_the_models_own_numbers(question_type: str) -> None:
+    """Compared against the response's own object, not against a literal.
+
+    ``repr`` rather than ``==`` on the floats: ``0.55 == 0.5500000000000001`` is False, but
+    a comparison that went through a rescale-and-round would be much closer than that, and
+    ``repr`` is the shortest string that round-trips -- the same reason ``binary.py``
+    renders its bounds with it. A widening in the last bit is visible here and invisible to
+    an approximate compare.
+    """
+    response = _response(question_type)
+    expected = response.model_dump(mode="json", warnings=False)["final_prediction"]
+    assert _stored_prediction(question_type) == expected
+
+    stored = json.dumps(_stored_prediction(question_type), sort_keys=True)
+    assert stored == json.dumps(expected, sort_keys=True)
+
+
+def test_an_option_vector_that_barely_sums_to_one_is_stored_unscaled() -> None:
+    """The criterion, at the one input where scaling would be tempting and invisible.
+
+    The vector is inside ``_SUM_TOLERANCE`` of 1 and not equal to it, so every checker in
+    the package accepts it -- pinned next door by
+    ``test_forecast_multiple_choice.py::test_the_tolerance_is_applied_where_the_criterion
+    _says``, which straddles that tolerance by one ulp, rather than re-asserted here
+    against a config this module otherwise has no reason to read. A writer that "helpfully" normalized would produce a vector
+    that is *also* accepted, differs only in the last few bits, and is not what the model
+    said -- and the ledger would carry a forecast nobody made, with nothing to show it.
+    """
+    tolerance = 1e-6
+    probabilities = (0.25, 0.75 - tolerance / 2)
+    labels = [
+        entry["option"]
+        for entry in _response("multiple_choice").model_dump(mode="json", warnings=False)[
+            "final_prediction"
+        ]["options"]
+    ]
+    forecast = _response(
+        "multiple_choice",
+        final_prediction={
+            "options": [
+                {"option": option, "probability": probability}
+                for option, probability in zip(labels, probabilities)
+            ]
+        },
+    )
+    record = _record(
+        "multiple_choice",
+        generation=_generation("multiple_choice", forecast=forecast),
+    )
+
+    stored = json.loads(canonical_final_prediction_json(record))["options"]
+    assert [entry["probability"] for entry in stored] == list(probabilities)
+    # The premise: this vector is admissible but is *not* normalized, so a writer that
+    # normalized would be visible above. Without this the test would still pass against a
+    # vector that already summed to exactly 1.
+    total = fsum(entry["probability"] for entry in stored)
+    assert total != 1.0
+    assert abs(total - 1.0) < tolerance

@@ -19,6 +19,7 @@ import traceback
 import warnings
 from datetime import datetime, timezone
 from enum import IntEnum
+from math import fsum, nextafter
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from whiskeyjack_bot.forecast.generate import (
     build_forecaster_client,
     generate_forecast,
 )
+from whiskeyjack_bot.forecast.multiple_choice import _SUM_TOLERANCE
 from whiskeyjack_bot.forecast.schema import BinaryForecastResponse
 from whiskeyjack_bot.logging_setup import (
     PayloadDebugFilter,
@@ -1413,3 +1415,141 @@ def test_a_no_research_packet_still_refuses_a_citation(
     assert result.invocations == 2
     assert result.forecast is None
     assert result.failure_code == "schema_invalid"
+
+
+# --- M1-502: the sum rule, end to end -------------------------------------------
+#
+# M1-403 and M1-404 built the categorical rules and each pinned them at its own module
+# boundary; M1-404's ``test_a_multiple_choice_response_is_option_checked_here`` above is
+# the only place the sum rule reaches this path, and it reaches it *incidentally* -- the
+# two 0.9995 options trip the bounds rule as well, and the assertion is about both. So
+# nothing here asserted what a bad sum alone costs, which is M1-502's "sum tests pass".
+#
+# Every reply below keeps each option inside the configured bounds and names the exact
+# option set, so the sum rule is the only one that can fire.
+
+
+def _probabilities(total: float) -> tuple[float, float]:
+    """Two distinct probabilities summing to ``total``.
+
+    Split as ``(0.25, total - 0.25)`` rather than into equal halves so the two differ: a
+    checker that read only the first option would reach the same verdict on equal halves,
+    and that is a mutation this file could not see.
+    """
+    return 0.25, total - 0.25
+
+
+def _summing_to(total: float) -> str:
+    """A reply naming both of ``_MC_QUESTION``'s options and summing to ``total``."""
+    first, second = _probabilities(total)
+    return _multiple_choice(
+        [
+            {"option": "A", "probability": first},
+            {"option": "B", "probability": second},
+        ]
+    )
+
+
+def test_a_bad_sum_gets_exactly_one_repair_and_it_can_succeed(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The sum rule alone is repairable, and a corrected reply is accepted.
+
+    0.25 + 0.55 satisfies the schema, names every option exactly once and leaves both
+    probabilities inside the configured bounds, so the sum is the only rule it breaks.
+    """
+    client = _Model(_summing_to(0.8), _summing_to(1.0))
+    result = _generate(client, config, prompt, question=_MC_QUESTION)
+    assert result.invocations == 2
+    assert result.repair_attempted is True
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "multiple_choice"
+    # The accepted vector is the model's own, unscaled: M1-502's "no arbitrary post-hoc
+    # renormalization is hidden", asserted where a repair loop could have hidden one.
+    assert [
+        (entry.option, entry.probability) for entry in result.forecast.final_prediction.options
+    ] == [("A", 0.25), ("B", 0.75)]
+
+
+def test_a_sum_that_stays_wrong_costs_two_calls_and_no_more(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """``test_a_probability_that_stays_out_of_bounds_costs_two_calls_and_no_more``'s twin.
+
+    The sum problem arrives alone, which is what makes this the sum rule's own test: a
+    ``failure_problems`` of length one cannot be satisfied by the bounds or option rules.
+    """
+    reply = _summing_to(0.8)
+    client = _Model(reply, reply)
+    result = _generate(client, config, prompt, question=_MC_QUESTION)
+    assert result.invocations == 2
+    assert len(client.calls) == 2
+    assert result.forecast is None
+    # Well-formed JSON that satisfied the schema, so not ``malformed_response``.
+    assert result.failure_code == "schema_invalid"
+    assert list(result.failure_problems) == [
+        "final_prediction.options: probabilities must sum to 1 within 1e-06 (observed sum withheld)"
+    ]
+
+
+def test_a_sum_just_outside_the_tolerance_is_refused_and_just_inside_is_not(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The tolerance is the criterion's own number, and it holds on this path too.
+
+    ``test_forecast_multiple_choice.py`` straddles ``1e-6`` by one ulp at the checker.
+    This is the same straddle through ``generate``: the accepted side must cost one call
+    and the refused side two, because a tolerance that only holds in a unit test is one
+    the repair loop can still spend a call discovering.
+    """
+    inside_total = 1.0 - _SUM_TOLERANCE / 2
+    outside_total = nextafter(1.0 + _SUM_TOLERANCE, 2.0)
+    # The premise, asserted rather than assumed. ``_summing_to`` reaches its total
+    # through a subtraction, and a rounding there would move either reply to the other
+    # side of the bound and leave both halves below passing for the wrong reason -- the
+    # vacuity this project has paid for more than any other defect.
+    assert abs(fsum(_probabilities(inside_total)) - 1.0) <= _SUM_TOLERANCE
+    assert abs(fsum(_probabilities(outside_total)) - 1.0) > _SUM_TOLERANCE
+
+    inside = _summing_to(inside_total)
+    outside = _summing_to(outside_total)
+
+    accepted = _generate(_Model(inside), config, prompt, question=_MC_QUESTION)
+    assert accepted.invocations == 1
+    assert accepted.failure_code is None
+    assert accepted.forecast is not None
+
+    refused = _Model(outside, outside)
+    result = _generate(refused, config, prompt, question=_MC_QUESTION)
+    assert result.invocations == 2
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"
+
+
+def test_the_repair_turn_for_a_bad_sum_names_the_tolerance_and_no_probability(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-404's asymmetry, at the one place the problems are rendered back to the model.
+
+    The tolerance is this project's own constant and the prompt already prints it, so
+    naming it costs nothing and keeps the repair turn aimable. The observed sum and the
+    individual probabilities are model output and stay withheld -- the *assistant* turn
+    immediately before carries them, which is not a leak because the provider produced
+    them, while a problem string reaches ``failure_problems`` and the raw-output artifact.
+    """
+    reply = _summing_to(0.8)
+    client = _Model(reply, reply)
+    result = _generate(client, config, prompt, question=_MC_QUESTION)
+
+    turn = client.calls[1][-1]
+    assert turn["role"] == "user"
+    assert "1e-06" in turn["content"]
+    assert client.calls[1][-2]["role"] == "assistant"
+    # 0.8 is the observed sum and 0.55 the option that made it wrong; neither is a value
+    # this project may render. Asserted against the problems rather than the whole turn,
+    # because the assistant turn above legitimately quotes the model its own reply.
+    for problem in result.failure_problems:
+        assert "0.8" not in problem
+        assert "0.55" not in problem
+        assert "0.25" not in problem

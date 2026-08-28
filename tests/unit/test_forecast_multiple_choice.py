@@ -19,7 +19,7 @@ import copy
 import json
 import re
 import traceback
-from math import nextafter
+from math import fsum, nextafter
 from pathlib import Path
 from typing import Any
 
@@ -218,9 +218,106 @@ def test_an_out_of_bounds_probability_is_refused() -> None:
     assert _problems(forecast) == []
 
 
+def test_the_configured_bounds_are_inclusive_to_one_ulp() -> None:
+    """M1-502's boundary clause for the per-option rule.
+
+    ``test_an_out_of_bounds_probability_is_refused`` above proves the rule has a consumer;
+    it does not say what happens *at* the bound. ``test_forecast_binary.py`` straddles both
+    of its bounds by one ulp with ``nextafter`` and this module straddles ``1e-6`` the same
+    way, so the per-option bound was the one boundary in the categorical path stated only
+    to the nearest hundredth.
+
+    **Three options, not two**, and the reason is the sum rule: with two, moving one
+    probability off a bound forces the other across the opposite one, and the assertion
+    would be about both bounds at once. With three, the third absorbs nothing and does not
+    have to -- one ulp moves the sum by about 1e-17, which is nine orders of magnitude
+    inside ``_SUM_TOLERANCE``, and each assertion below pins an *exact* problem list so a
+    sum problem appearing would fail rather than hide.
+    """
+    options = (A, B, "A third option")
+
+    def problems(config: ForecastConfig, *vector: float) -> list[str]:
+        return _problems(
+            _response(_answers(*zip(options, vector))),
+            options=options,
+            config=config,
+        )
+
+    # The minimum, under bounds a three-option vector can sit on: 0.1 + 0.1 + 0.8.
+    low_config = _narrowed(0.1, 0.9)
+    assert problems(low_config, 0.1, 0.1, 0.8) == []
+    assert problems(low_config, nextafter(0.1, 0.0), 0.1, 0.8) == [_bounds_problem(0.1, 0.9)]
+
+    # The maximum needs its own pair, and that is the point rather than an inconvenience:
+    # under (0.1, 0.9) no three-option vector can put one probability on 0.9 while keeping
+    # the other two at or above 0.1, so a straddle of the maximum there would be a straddle
+    # of the minimum by two other options at once. Under (0.1, 0.5), 0.5 + 0.3 + 0.2 sits
+    # on the maximum with every other option comfortably inside both bounds.
+    high_config = _narrowed(0.1, 0.5)
+    assert problems(high_config, 0.5, 0.3, 0.2) == []
+    assert problems(high_config, nextafter(0.5, 1.0), 0.3, 0.2) == [_bounds_problem(0.1, 0.5)]
+
+    # Each refusal above must fail for the bound and not for the sum. Stated as its own
+    # assertion because an exact-list comparison that began failing for the *other* rule
+    # would still read as a bound test.
+    for vector in (
+        (nextafter(0.1, 0.0), 0.1, 0.8),
+        (nextafter(0.5, 1.0), 0.3, 0.2),
+    ):
+        assert abs(fsum(vector) - 1.0) <= _SUM_TOLERANCE
+
+
+def test_nothing_at_a_bound_is_nudged_onto_it() -> None:
+    """The criterion's other half, at the boundary: a value *at* a bound is stored as it
+    came.
+
+    ``test_nothing_is_clamped`` below makes this point for a value outside the bounds,
+    where a clamp would be visible as a changed verdict. A value exactly on the bound is
+    the case a "helpful" implementation reaches for instead -- snapping to the bound, or
+    to a canonical 0.1 -- and it would be invisible in the problem list, because the
+    verdict is silent either way.
+    """
+    low, high = 0.1, 0.9
+    forecast = _response(_answers((A, low), (B, high)))
+    assert _problems(forecast, config=_narrowed(low, high)) == []
+    assert [(entry.option, entry.probability) for entry in forecast.final_prediction.options] == [
+        (A, low),
+        (B, high),
+    ]
+
+
 def test_a_vector_that_is_not_a_distribution_is_refused() -> None:
     forecast = _response(_answers((A, 0.6), (B, 0.6)))
     assert _problems(forecast) == [_SUM]
+
+
+def test_the_verdict_cannot_depend_on_the_order_the_model_answered_in() -> None:
+    """Why ``math.fsum`` is defensive here rather than load-bearing, stated as a bound.
+
+    The module chose ``fsum`` so a re-ordered response cannot move the total across the
+    tolerance -- a verdict that depended on answer order is one a replay could not
+    reproduce. **No admissible vector can exercise that**, and the arithmetic says so
+    rather than the absence of a counterexample: the per-option minimum and the sum rule
+    together cap the option count at ``1 / min_probability`` (1000 at the committed
+    default), and naive left-to-right accumulation of n values whose total is 1 carries an
+    error of order ``n * 2**-53``, about 1e-13 at n = 1000 -- seven orders of magnitude
+    inside ``_SUM_TOLERANCE``.
+
+    So swapping ``fsum`` for ``sum`` is an **equivalent mutation** on this input domain,
+    and this test records that as a measured fact instead of leaving a survivor
+    unexplained. It is still the right call in the code: the bound above depends on
+    ``min_probability`` staying non-trivial, which is config, and ``fsum`` costs nothing.
+    """
+    largest_admissible = int(1.0 / _committed_forecast_config().min_probability)
+    assert largest_admissible == 1000
+    vector = [_committed_forecast_config().min_probability] * largest_admissible
+
+    for ordering in (vector, list(reversed(vector)), sorted(vector, reverse=True)):
+        assert abs(sum(ordering) - fsum(ordering)) < _SUM_TOLERANCE
+        # Both routes agree on the verdict, which is the property the choice protects.
+        assert (abs(sum(ordering) - 1.0) > _SUM_TOLERANCE) == (
+            abs(fsum(ordering) - 1.0) > _SUM_TOLERANCE
+        )
 
 
 def test_the_tolerance_is_applied_where_the_criterion_says() -> None:
