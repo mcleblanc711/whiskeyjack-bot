@@ -5839,3 +5839,26 @@ untouched) and wrong about one structural premise it leaned on. Three source fil
   pinned to the minimum — so it stays as the worst case for the accumulation bound, and a
   heterogeneous 500-option vector (each entry distinct, all ≥ the minimum, summing to 1) carries
   the ordering claim across four genuinely distinct orderings, asserted distinct.
+
+### Round 2 — APPROVE, prior finding closed, one row filed
+
+The round-1 blocker is closed at its own reproduction: the `0.0`/`1.0` copied config now raises
+from both categorical checkers and is refused by `generate_forecast` before client construction or
+any billable call.
+
+One non-blocking observation, and it is a fair correction to **risk claim 4**, which I wrote as
+"there is exactly one source for the two literals in `src/`". That was true only of the *forecast*
+package: `submission_live.py` still declares its own executable `0.001`/`0.999`, and the new
+diagnostics embed the endpoints as literal strings in their messages rather than deriving them
+from the constants. Two sources for one spec number, with nothing failing if they drift.
+
+Filed as **M1-513** with the reviewer's acceptance wording. It is deliberately *not* M1-509:
+M1-509 asks whether a **configured** pair may be rendered at all, and M1-513 asks who owns the
+**spec** endpoints. Non-blocking here because the submission declarations predate both this branch
+and the pinned base, and the two sources agree today.
+
+**Two rounds, and the reason is worth recording.** M1-502's round-1 request stated nine falsifiable
+risk claims; the review falsified two of them (6 blocking, 4 non-blocking) and confirmed the other
+seven. That is the mechanism `docs/LESSONS.md` describes working as intended — the blocking finding
+was *found by my own claim being specific enough to check*. A vaguer claim 6 ("config validates the
+bounds") would have passed unexamined and shipped the defect.
