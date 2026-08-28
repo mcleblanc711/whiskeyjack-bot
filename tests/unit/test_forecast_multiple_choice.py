@@ -20,6 +20,7 @@ import json
 import re
 import traceback
 from math import fsum, nextafter
+from random import Random
 from pathlib import Path
 from typing import Any
 
@@ -308,11 +309,39 @@ def test_the_verdict_cannot_depend_on_the_order_the_model_answered_in() -> None:
     unexplained. It is still the right call in the code: the bound above depends on
     ``min_probability`` staying non-trivial, which is config, and ``fsum`` costs nothing.
     """
-    largest_admissible = int(1.0 / _committed_forecast_config().min_probability)
+    minimum = _committed_forecast_config().min_probability
+    largest_admissible = int(1.0 / minimum)
     assert largest_admissible == 1000
-    vector = [_committed_forecast_config().min_probability] * largest_admissible
 
-    for ordering in (vector, list(reversed(vector)), sorted(vector, reverse=True)):
+    # The n = 1000 vector is the worst case for the accumulation bound above, and it is
+    # also the *only* admissible vector at that size: 1000 * 0.001 is exactly 1, so every
+    # option is pinned to the minimum and no reordering of it is a different list. It is
+    # kept because it is where the error bound bites, not as an ordering case.
+    uniform = [minimum] * largest_admissible
+
+    # M1-502 round 1 caught the ordering claim resting on `uniform` alone, where reversed()
+    # and sorted() return the same values and "three orderings" was really one. Ordering
+    # needs distinct values, which needs n below the ceiling: 500 options each carrying the
+    # minimum leaves 0.5 to distribute unevenly, so every entry differs from every other.
+    weights = range(1, 501)
+    total = sum(weights)
+    heterogeneous = [minimum + 0.5 * w / total for w in weights]
+    assert len(set(heterogeneous)) == len(heterogeneous), "the ordering case must be distinct"
+    assert min(heterogeneous) >= minimum
+    assert abs(fsum(heterogeneous) - 1.0) <= _SUM_TOLERANCE
+
+    shuffled = list(heterogeneous)
+    Random(0).shuffle(shuffled)
+    orderings = (
+        uniform,
+        heterogeneous,
+        list(reversed(heterogeneous)),
+        sorted(heterogeneous, reverse=True),
+        shuffled,
+    )
+    assert len({tuple(o) for o in orderings}) == 4, "the ordering cases must really differ"
+
+    for ordering in orderings:
         assert abs(sum(ordering) - fsum(ordering)) < _SUM_TOLERANCE
         # Both routes agree on the verdict, which is the property the choice protects.
         assert (abs(sum(ordering) - 1.0) > _SUM_TOLERANCE) == (
@@ -642,3 +671,60 @@ def test_this_module_and_binary_refuse_the_same_inverted_config() -> None:
     )
     assert any("between 0.2 and 0.8 inclusive" in problem for problem in mine_problems)
     assert any("between 0.2 and 0.8 inclusive" in problem for problem in theirs_problems)
+
+
+# --- M1-502 round 1: the spec's probability envelope, re-checked away from ForecastConfig ---
+#
+# ``model_copy(update=...)`` builds a ForecastConfig without running its field validators --
+# a public pydantic API, and the one ``_narrowed`` above already uses. Round 1 found that
+# ``_require_config`` re-checked only ``low < high``, so a copied config carrying 0.0/1.0
+# let this checker accept a distribution ``submission_live._require_probability``
+# deterministically refuses. The cost is not a repair loop: it is a forecast billed,
+# recorded and approved for a post that cannot happen.
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [
+        (0.0, 0.999),
+        (0.001, 1.0),
+        (0.0, 1.0),
+        (0.0005, 0.999),
+        (0.001, 0.9995),
+    ],
+)
+def test_a_config_outside_the_spec_envelope_is_refused(minimum: float, maximum: float) -> None:
+    with pytest.raises(MultipleChoiceOutputError) as caught:
+        _problems(_response(), config=_narrowed(minimum, maximum))
+    (problem,) = caught.value.problems
+    assert problem == (
+        "forecast_config: min_probability and max_probability must lie within "
+        "0.001 and 0.999 inclusive (configured pair withheld)"
+    )
+
+
+def test_the_envelope_check_does_not_render_the_configured_pair() -> None:
+    """The envelope's two ends are the spec's; the configured pair is not echoed."""
+    with pytest.raises(MultipleChoiceOutputError) as caught:
+        _problems(_response(), config=_narrowed(0.0004, 0.9996))
+    message = " ".join(caught.value.problems)
+    assert "0.0004" not in message
+    assert "0.9996" not in message
+
+
+def test_the_envelope_ends_themselves_are_accepted() -> None:
+    """The committed pair is the envelope, so the check must be inclusive at both ends."""
+    assert _problems(_response(), config=_narrowed(0.001, 0.999)) == []
+
+
+def test_the_envelope_check_closes_the_gap_the_submission_path_would_have_found() -> None:
+    """The exact round-1 reproduction: a 0.0/1.0 vector this checker used to accept."""
+    forecast = _response(
+        [
+            {"option": PROMPT_OPTIONS[0], "probability": 0.0},
+            {"option": PROMPT_OPTIONS[1], "probability": 1.0},
+        ]
+        + [{"option": option, "probability": 0.0} for option in PROMPT_OPTIONS[2:]]
+    )
+    with pytest.raises(MultipleChoiceOutputError):
+        _problems(forecast, config=_narrowed(0.0, 1.0))

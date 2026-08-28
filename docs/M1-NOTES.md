@@ -5767,3 +5767,75 @@ against it, filed by M1-405.
   0.001–0.999 and `submission_live` enforces the same pair, but neither is read from Metaculus. A
   platform that widened its accepted range would leave this project refusing forecasts it would have
   taken.
+
+### Round 1 — CHANGES REQUESTED, one blocking finding, and it falsified a risk claim I wrote
+
+The request's risk claim 6 said `config.py:192-193` made it impossible for a configured bound
+pair to be wider than the one `submission_live._require_probability` enforces. **That claim is
+false, and the review falsified it exactly as intended.** `ForecastConfig.model_copy(update=...)`
+builds a config *without* running its field validators — a public pydantic API this repo's own
+test helpers use (`test_forecast_binary.py::_bounds`, `test_forecast_multiple_choice.py::_narrowed`,
+`test_forecast_generate.py::_narrowed`) — and both `_require_config`s re-checked only `low < high`.
+
+Reproduced by execution at the reviewed commit before any fix was written:
+
+- `ForecastConfig(...)` **refuses** `0.0`/`1.0` with a `ValidationError`; `model_copy` on the
+  committed config **produces** it.
+- `multiple_choice_output_problems` returns `[]` for a `0.0`/`1.0` two-option vector under that
+  config, while `submission_live._require_categories` raises `LiveSubmissionError` on the same
+  numbers.
+
+The cost is not a repair loop, which is what makes it worse than the `min < max` check sitting
+beside it: nothing fails at generation, so a forecast is **billed, recorded and approved** for a
+post that deterministically cannot happen.
+
+**Scope.** Pre-existing at the base — but the branch depends on it, documents it as proven, and
+closed the row on that basis, which is the "depends on it" arm of the non-blocking test. Fixed
+rather than rebutted.
+
+### Decision — the envelope lives in `config.py`, and the checkers read it from there
+
+The obvious fix was to write `0.001` and `0.999` into both `_require_config`s. That would have
+made a **fourth** copy of the literals (`config.py`, `prompts/forecaster.md`, `submission_live`,
+and now two checkers), which is precisely the silent-drift shape M1-509 already exists for. So
+`config.py` names `PROBABILITY_BOUND_FLOOR`/`PROBABILITY_BOUND_CEILING`, its own `Field(ge=…, le=…)`
+is expressed in them, and `forecast/binary.py`, `forecast/multiple_choice.py` and
+`forecast/generate.py` re-check against the same two constants. The envelope is the spec's
+(`CODEX_HANDOFF.md § Configuration schema`: `0.001 <= min < max <= 0.999`), so enforcing it is
+faithful rather than a bound this project invented — the distinction M1-511 turns on.
+
+The preflight in `generate.py` is widened alongside the checkers so the refusal happens **before
+any billable call**, matching the two preflights already there.
+
+The message names the envelope's two ends and withholds the configured pair. The ends are spec
+constants, not values read off this config; `submission_live` words its own the same way. That is
+deliberately *stricter* than the surrounding module, which does render the configured pair — see
+the M1-509 note below.
+
+### Deviation — this row now has a `src/` diff after all
+
+The round-1 section above supersedes "Decision — this row is a pin, not a build" to this extent:
+the pin was right about the mechanism (nothing renormalizes, and that is still true and still
+untouched) and wrong about one structural premise it leaned on. Three source files change:
+`config.py`, `forecast/binary.py`, `forecast/multiple_choice.py`, plus the `generate.py` preflight.
+
+### Non-blocking observations — what was accepted and what was corrected
+
+- **Risk claim 4 was overstated.** `test_the_repair_turn_for_a_bad_sum_names_the_tolerance_and_no_probability`
+  carries no exact invocation-count assertion; the sibling persistent-bad-sum test pins that path
+  with both `result.invocations == 2` and `len(client.calls) == 2`. Accepted as stated, no product
+  gap, no change.
+- **Risk claim 5 was false, and M1-509 is widened.** The new one-ulp boundary tests compare exact
+  problem lists built by `_bounds_problem(low, high)`, so they *do* assert messages containing
+  configured bounds. The rendering is pre-existing (M1-404 built it), so it is not blocking — but
+  the row's framing of `binary.py` as the lone outlier was wrong: `multiple_choice.py` renders the
+  same pair. M1-509's description, dependencies and acceptance criteria are widened to cover both
+  categorical checkers.
+- **The order-independence test really tested one ordering.** With all 1000 entries equal to
+  `min_probability`, `reversed()` and `sorted()` return the same list. The reviewer judged the
+  analytic argument sufficient and asked for no backlog row; the test is fixed anyway, because a
+  test that names ordering and cannot vary it is this project's top recurring defect class wearing
+  a different hat. The n = 1000 vector is *forced* — 1000 × 0.001 is exactly 1, so every entry is
+  pinned to the minimum — so it stays as the worst case for the accumulation bound, and a
+  heterogeneous 500-option vector (each entry distinct, all ≥ the minimum, summing to 1) carries
+  the ordering claim across four genuinely distinct orderings, asserted distinct.

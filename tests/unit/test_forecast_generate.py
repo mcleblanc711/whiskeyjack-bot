@@ -1553,3 +1553,44 @@ def test_the_repair_turn_for_a_bad_sum_names_the_tolerance_and_no_probability(
         assert "0.8" not in problem
         assert "0.55" not in problem
         assert "0.25" not in problem
+
+
+# --- M1-502 round 1: a config outside the spec envelope costs nothing --------------
+#
+# The preflight's sibling check (``min < max``) refuses a pair that would fail *every*
+# forecast through the repair loop. This pair is worse and quieter: it fails nothing at
+# generation, so without the check a forecast is billed, recorded and approved carrying a
+# probability ``submission_live._require_probability`` deterministically refuses. Refused
+# before any billable call, which is what these assert.
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [(0.0, 0.999), (0.001, 1.0), (0.0, 1.0), (0.0005, 0.999), (0.001, 0.9995)],
+)
+def test_a_config_outside_the_spec_envelope_costs_no_billable_call(
+    config: AppConfig, prompt: LoadedPrompt, minimum: float, maximum: float
+) -> None:
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError):
+        _generate(client, _narrowed(config, minimum, maximum), prompt)
+    assert client.calls == [], "refusal must happen before any billable call"
+
+
+def test_the_envelope_preflight_names_no_configured_value(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(client, _narrowed(config, 0.0004, 0.9996), prompt)
+    assert "0.0004" not in str(caught.value)
+    assert "0.9996" not in str(caught.value)
+    assert client.calls == []
+
+
+def test_the_committed_envelope_still_generates(config: AppConfig, prompt: LoadedPrompt) -> None:
+    """The committed pair IS the envelope, so the preflight must be inclusive at both ends."""
+    client = _Model(good_reply())
+    result = _generate(client, _narrowed(config, 0.001, 0.999), prompt)
+    assert len(client.calls) == 1
+    assert result.invocations == 1

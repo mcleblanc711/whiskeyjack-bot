@@ -472,3 +472,44 @@ def test_every_refusal_path_raises_this_modules_own_type_exactly(
     assert caught.value.problems
     # Still value-free: the sanitized problem list is inherited, not re-invented.
     assert all(": " in problem for problem in caught.value.problems)
+
+
+# --- M1-502 round 1: the spec's probability envelope, re-checked away from ForecastConfig ---
+#
+# The multiple-choice half of this carries the full account
+# (``test_forecast_multiple_choice.py``). Repeated here because ``_bounds`` above is the
+# helper that demonstrates the hole: ``model_copy(update=...)`` skips the field validators,
+# and ``_require_config`` re-checked only ``low < high``.
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [(0.0, 0.999), (0.001, 1.0), (0.0, 1.0), (0.0005, 0.999), (0.001, 0.9995)],
+)
+def test_a_config_outside_the_spec_envelope_is_refused(
+    golden: dict[str, Any], minimum: float, maximum: float
+) -> None:
+    with pytest.raises(BinaryOutputError) as caught:
+        binary_output_problems(
+            _with_probability(golden, 0.5), _bounds(minimum, maximum), _question()
+        )
+    (problem,) = caught.value.problems
+    assert problem == (
+        "forecast_config: min_probability and max_probability must lie within "
+        "0.001 and 0.999 inclusive (configured pair withheld)"
+    )
+
+
+def test_the_envelope_check_does_not_render_the_configured_pair(golden: dict[str, Any]) -> None:
+    with pytest.raises(BinaryOutputError) as caught:
+        binary_output_problems(_with_probability(golden, 0.5), _bounds(0.0004, 0.9996), _question())
+    message = " ".join(caught.value.problems)
+    assert "0.0004" not in message
+    assert "0.9996" not in message
+
+
+def test_the_envelope_ends_themselves_are_accepted(golden: dict[str, Any]) -> None:
+    assert (
+        binary_output_problems(_with_probability(golden, 0.5), _bounds(0.001, 0.999), _question())
+        == []
+    )
