@@ -43,7 +43,12 @@ to the registry, and neither is a habit you can form by reflex.
 | M1-609 | feat/m1-609-verify-foreign-keys | whiskeyjack-m1-609 | no | none | 2026-08-25 |
 | M1-405 | feat/m1-405-numeric-percentile-path | whiskeyjack-m1-405 | no | none | 2026-08-26 |
 | M2-711 | feat/m2-711-submission-outcome-unknown | whiskeyjack-m2-711 | no | 009 (spent) | 2026-08-25 |
-*(rows above; each lands on its own branch as it starts — see the planned wave below)*
+| M2-708 | feat/m2-708-atomic-idempotency-reservation | whiskeyjack-m2-708 | no | none | 2026-08-28 |
+*(rows above; each lands on its own branch as it starts — see the planned wave below. The
+three rows above this one are Wave 9's, now merged — `feat/m1-502-categorical-validation`
+sweeps them; take that version at the next `sync-worktrees.sh --merge` rather than
+re-sweeping here. If the idempotency reservation ends up needing a schema change, claim
+migration `010` here and in the standing-claims table before writing the `.sql` file.)*
 
 ## Planned next wave
 
