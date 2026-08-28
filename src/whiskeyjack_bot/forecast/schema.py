@@ -29,7 +29,8 @@ and the one cross-field rule the prompt states outright (a non-binary question h
 ``prior_probability`` and no ``model_prior``). It deliberately does not read the
 question's option list, its numeric bounds, or ``forecast.min_probability`` /
 ``forecast.max_probability`` -- those are M1-404, M1-405 and M1-403 respectively, and
-each is that row's stated acceptance criterion.
+each is that row's stated acceptance criterion. Two of the three have since landed, in
+``forecast/binary.py`` and ``forecast/numeric.py``; the split has not changed.
 
 Models are strict (``extra="forbid"``, reusing ``config._StrictModel``). Use
 :func:`validate_forecast_response` rather than a bare ``model_validate``: model output
@@ -186,7 +187,10 @@ class MultipleChoicePrediction(_ResponsePart):
 
     That every *supplied* option appears exactly once and that the probabilities sum
     to 1 within 1e-6 is M1-404's acceptance criterion: both need the question's option
-    list, which this module does not read.
+    list, which this module does not read. **That rule now exists**, in
+    ``forecast/multiple_choice.py``, reached through ``forecast.validate``; this
+    docstring used to stop at "which this module does not read", and a pointer that says
+    only where a rule is *not* is how M1-501 lost a round.
     """
 
     options: list[OptionProbability] = Field(min_length=1)
@@ -204,7 +208,11 @@ class NumericPrediction(_ResponsePart):
 
     That the nine levels are exactly the declared ones, non-decreasing and compatible
     with the question's bounds is M1-405's acceptance criterion; all three need the
-    question, which this module does not read.
+    question, which this module does not read. They live in ``forecast/numeric.py``,
+    reached for every numeric response through ``forecast.validate.output_problems``.
+    ``tests/unit/test_forecast_schema.py::test_numeric_percentile_levels_are_not_checked_here``
+    pins this boundary from the inside and stays green: the rule is on the output path,
+    not here.
     """
 
     percentiles: list[PercentilePoint] = Field(min_length=1)

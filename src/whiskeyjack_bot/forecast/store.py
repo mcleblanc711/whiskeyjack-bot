@@ -44,14 +44,23 @@ configured ``forecast.min_probability``/``max_probability`` can be persisted her
 though ``forecast.generate`` refuses it. Not reachable from the product path
 (``persist_generation`` runs the full composed check inside the attempt loop before
 anything reaches this writer), reachable by any other caller of this public entry point,
-and widening when M1-404 and M1-405 register their checkers. Closing it is a signature
-change to a merged, reviewed public entry point, which is why M1-506 filed the row rather
-than taking it -- same convention as M1-314, M2-709 and M1-608.
+and widening when M1-404 registers its checker.
+
+**M1-405 both widened that gap and shrank what closing it costs.** Widened: a numeric
+record whose percentiles are not the declared nine, are out of order, or fall outside the
+question's bounds is now refused by ``forecast.generate`` and still persistable here.
+Shrank: the composed entry point takes a ``CanonicalQuestion`` rather than a bare
+``question_id``, and ``ForecastRecordDraft.question`` already carries one -- validated by
+``_one_question`` to agree with the row's own ``question_id`` and ``question_type``. So
+M1-507 needs only the ``ForecastConfig`` threaded in; the question it would otherwise have
+had to thread as well is already inside the argument this writer is handed. Closing it is
+still a signature change to a merged, reviewed public entry point, which is why M1-506
+filed the row rather than taking it -- same convention as M1-314, M2-709 and M1-608.
 
 **What this module does not do.** It does not append a ``validated`` lifecycle event. A
 record is born ``draft`` and every later state is reachable only through
 ``lifecycle_events``; ``validated`` means the full output-validation gate passed, and that
-gate is M1-504 with M1-404, M1-405, M1-502 and M1-503 still to land. Asserting it here
+gate is M1-504 with M1-404, M1-502 and M1-503 still to land. Asserting it here
 would put a claim in an append-only ledger for checks that do not exist yet.
 :func:`whiskeyjack_bot.lifecycle.transaction` nests as a ``SAVEPOINT``, so a caller that
 wants the record and its first event in one unit can have it without this module deciding

@@ -41,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-609 | feat/m1-609-verify-foreign-keys | whiskeyjack-m1-609 | no | none | 2026-08-25 |
+| M1-405 | feat/m1-405-numeric-percentile-path | whiskeyjack-m1-405 | no | none | 2026-08-26 |
 | M2-711 | feat/m2-711-submission-outcome-unknown | whiskeyjack-m2-711 | no | 009 (spent) | 2026-08-25 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
@@ -68,7 +69,35 @@ they would otherwise both edit (lesson 1 — a seam that changes underneath an o
 
 | Lane | Items, in order | Notes |
 | --- | --- | --- |
-| 1 — critical path | **`M1-506`** → then `M1-405` ∥ `M1-404` **in parallel** | `M1-506` exposes one public composed output-validation entry point as a **table keyed on the `question_type` literal** with an explicit entry per supported type. That shape is what reduces `M1-404` and `M1-405` to one changed line each in the shared file, so the two can run concurrently instead of serially. `M1-405` (Critical) unblocks `M1-503` → `T-904`; `M1-404` unblocks `M1-502`; `M2-707` needs both. |
+| 1 — critical path | **`M1-506`** → `M1-404` → `M1-405` | `M1-506` exposes one public composed output-validation entry point as a **table keyed on the `question_type` literal** with an explicit entry per supported type. That shape was expected to reduce `M1-404` and `M1-405` to one changed line each so the two could run concurrently. **It did not, for either of them, and both corrections are below.** `M1-405` (Critical) unblocks `M1-503` → `T-904`; `M1-404` unblocks `M1-502`; `M2-707` needs both. |
+
+**Lane 1 stage B was serial, and neither branch predicted it correctly.** The "one changed
+line each" claim held for the *registration* and not for the *signature*, and both items
+discovered that independently, at the same time, in the same file.
+
+`M1-405`'s criterion is "percentile levels are exact; values are finite, ordered and
+**compatible with question bounds**"; `M1-404`'s is "every exact option once". Neither the
+response nor the config carried a question, so each branch widened `_TypeChecker`,
+`output_problems`/`validate_output`, `parse._parse` and `generate._run_attempts` — and each
+wrote into its own notes that the *other* would be the easy one-line case. Both were wrong.
+They differed in shape, too: `M1-404` added a keyword-only `options: Sequence[str] | None`
+threaded from `ModelInput.packet` and kept `question_id: int`; `M1-405` replaced the id with
+`question: CanonicalQuestion`.
+
+**`M1-404` merged first (PR #47, 2026-08-28), so `M1-405` converged onto it.** The converged
+seam is `question`-only: `multiple_choice_output_problems` reads `question.options` rather
+than a separate argument, because `forecast/inputs.py` builds that packet field as
+`list(question.options)` and carrying both is one fact reached two ways — M2-703's
+second-source-of-truth lesson, the same one that removed `question_id`. Two things fell out
+rather than being designed: `M1-404`'s biconditional option/type pairing gate is retired
+(the `qtype` gate subsumes it), and so is its standing risk that nothing verified the packet
+copy, because there is no copy.
+
+**The registry could not have prevented this and should not be read as though it could.**
+Nothing here records *which signatures* an item will touch, only deps and migration numbers.
+Two items editing one file's signature in incompatible ways is a collision this table is
+blind to by construction — worth knowing before the next wave plans two checkers against one
+dispatch table.
 | 2 — M2 path | **`M2-711`** | Records a submission whose outcome no refetch established — the `(False, False)` cell that today reads as terminal `submission_failed`, which is more than the ledger knows. Needs a lifecycle vocabulary member and therefore **migration `009`**, claimed above. No `forecast/` overlap with lane 1. |
 | 3 — debt queue | **`M1-609`** → `M2-710` → `M1-608` → `M1-314` → `M2-709` | One branch each, sequentially. Every one closes a deferral already filed off a previous review, which is `docs/LESSONS.md` checklist item 4 paid down rather than re-reported as a finding next round. All sized S. |
 

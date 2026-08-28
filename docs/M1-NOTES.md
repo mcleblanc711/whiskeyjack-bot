@@ -4843,3 +4843,773 @@ event-tags the four cells: over 200 draws the type-specific layer bites on **29.
 on 62.3%, and the attribution layer bites on 91.6%. Without that spread the equality property would
 be asserting a concatenation with an empty list — the vacuous-property class this project has paid
 for more than any other.
+
+## M1-404 — The multiple-choice output path
+
+*"Produce every exact option once with probabilities summing to one. Unknown/missing/duplicate
+options fail validation; tolerance is 1e-6."*
+
+The deliverable is `forecast/multiple_choice.py` — `multiple_choice_output_problems` /
+`validate_multiple_choice_output`, a `MultipleChoiceOutputError`, and the registry entry in
+`forecast/validate.py` that `M1-506` left at `None` for it. Nothing compared a reply's option
+labels against the question's before this row: three tests pinned that absence deliberately
+(`test_forecast_schema.py`, `test_forecast_generate.py`, and `schema.py`'s own docstring), and one
+of them passed a reply naming two options at 0.9995 each as valid typed output.
+
+### Decision — the seam had to widen, and "one changed line" was wrong
+
+`docs/TRACKS.md` and `docs/M1-NOTES.md:4760` both advertise this item as one changed line in
+`_TYPE_CHECKERS`. That is true of `M1-405` and false here. `_TypeChecker` was
+`Callable[[Any, ForecastConfig], list[str]]` and `output_problems` took `question_id` and
+`source_ids`; **none of the three carries the question's option list**, and without it "every exact
+option once" is unsatisfiable. `schema.py:184-192` said so already — *"both need the question's
+option list, which this module does not read"* — so the gap was known and its size was not.
+
+Four places grew an `options` argument: the callable type, `output_problems` /`validate_output`,
+`parse._parse`, and `generate._run_attempts`. `replay.py` was the fifth and was not predicted; it
+calls `_parse` directly, which is exactly the coupling M1-406 built it to have.
+
+### Decision — a `Protocol`, not a `Callable` alias, and `binary_output_problems` declares the argument
+
+`options` is keyword-only and `Callable` cannot spell that. Keyword-only is what keeps the table
+uniform without every checker taking an argument positionally in an order it does not care about.
+`binary_output_problems` gains `*, options: Sequence[str] | None = None` and never reads it; its
+docstring says so and says why. The alternatives were both worse and both were M1-506's own
+rejected options in another form: a `QuestionFacts` value object builds M1-405's field before
+M1-405 has asked for it, and a special case beside the table is the heterogeneous dispatch M1-506
+exists to remove.
+
+### Decision — `options` is a **required** keyword on the entry points, not a defaulted one
+
+The same rule M1-506 applied to the registry's own entries: `None` is a decision, not a gap. A
+defaulted argument turns a caller's omission from a signature error into a multiple-choice response
+validated against no option list — silently passing the only type-specific check that type has,
+which is the precise failure the table's explicit `None` entries exist to prevent. The blast radius
+was two call sites, because `store.py` still does not reach this entry point (M1-507).
+
+### Decision — the pairing rule lives in the dispatcher, in both directions
+
+`output_problems` refuses a `multiple_choice` response with no option list **and** a non-`None`
+option list with any other type. It is stated here rather than in the member checkers because this
+is the only layer that sees both the type and the argument for *every* supported type — including
+`numeric`, whose entry is still `None` and which therefore has no checker to hold a rule of its own.
+Both directions for `test_every_supported_type_has_an_explicit_registry_entry`'s reason: a
+one-directional gate is green for one of the two defects. It runs *after* the `question_type` gate,
+so an unregistered type reports that rather than sending a caller after the option list.
+
+### Decision — per-option bounds are enforced here (owner decision, 2026-08-26)
+
+The criterion names three failures and a tolerance. The owner settled a fifth rule onto the row:
+each option probability must lie inside `forecast.min_probability`/`max_probability`.
+`prompts/forecaster.md:130` already tells the model *"Probabilities must be between 0.001 and
+0.999"*, so a compliant reply passes unchanged and no repair turn is spent discovering the rule.
+What it buys is the ordering: `submission_live._require_probability` refuses an out-of-bounds option
+at **post** time, after the forecast is recorded and approved, and a repair turn at generation costs
+one call against a live post that cannot happen.
+
+### Decision — exact string equality, and nothing is renormalized
+
+`questions/normalize.py` hands the SDK's labels through byte-for-byte and `schema.NonBlankStr`
+validates without stripping, so `" A"` answered against a supplied `"A"` is one *unknown* plus one
+*missing*. That is the criterion's word. A rule that quietly accepted the near-miss would store a
+forecast against a label the platform will not score, and the disagreement would be invisible in the
+ledger. For the same reason a bad sum is refused rather than rescaled: M1-502's criterion is that
+*"no arbitrary post-hoc renormalization is hidden"*, and a scaled vector is a distribution the model
+did not produce.
+
+### Decision — the bounds and the tolerance are rendered; no label, probability or count ever is
+
+M1-403's asymmetry and M1-501's, applied together and for their own reasons. The bounds are operator
+configuration and a repair turn that does not state the actual bound is one no model can satisfy.
+The labels are the opposite case: the model is **already holding the option list** — `inputs.py:284`
+put it in the request under `options` — so naming them back buys nothing and echoes model output.
+Each rule contributes at most one problem, never one per offending label, because a per-label list
+leaks *how many* were wrong through a channel no leak test that reads only message text would see.
+
+### Decision — the option list comes from `ModelInput.packet`, not from `question.options`
+
+`generate_forecast` holds both. It passes the packet's copy, which is what `build_model_input`
+rendered into the request, so the checker compares the reply against the list the model was actually
+shown rather than against a second read of the same source. M1-501 records the converse as a
+standing risk for `source_ids` — that module is handed the mapping rather than the request — and
+there was no reason to reproduce it. `replay.py` takes the same list from the stored record's own
+`CanonicalQuestion`, dispatching on the `qtype` literal.
+
+### Deviation — `_require_config` and `_format_bound` are copied from `binary.py`
+
+Not extracted. Every module in this project owns its own sanitized exception, which is a hard
+constraint rather than a style, so a shared helper would have to be parameterized by the error type
+it raises — more machinery than the eight lines it saves, and a refactor of a merged and reviewed
+module inside an item that is not about it.
+`test_this_module_and_binary_refuse_the_same_inverted_config` pins both halves of the copy, the
+refusal and the rendered bound, so a change to one that is not made to the other fails there.
+
+### Deviation — one pinned-absence test was inverted rather than deleted
+
+`test_a_non_binary_response_is_not_bound_checked_here` (M1-403's, the M1-402 idiom) asserted that a
+multiple-choice reply with two options at 0.9995 returned as typed output in one call. That absence
+is what this row closes. The test is now
+`test_a_multiple_choice_response_is_option_checked_here`, asserting the two problems and the one
+repair turn, and its docstring records what it used to say so it cannot be re-reverted as a tidy-up.
+**The numeric half of the old pin survives** as
+`test_a_numeric_response_is_not_percentile_checked_here`, because M1-405 still owns that one.
+
+### Deviation — three stale pointers swept, M1-506's own deviation applied again
+
+`schema.py`'s module header and `MultipleChoicePrediction`'s docstring both said the option rule
+needs a list *"which this module does not read"* — true when written, and a pointer that says only
+where a rule is **not** is how M1-501 lost a round. Both now name `forecast/multiple_choice.py`, and
+each records what it used to say.
+
+### Rejected — options weighed and not taken
+
+- **A `QuestionFacts` value object as the third checker argument.** Types cleanly and is genuinely
+  more extensible, which is the problem: it decides the shape of the input M1-405 has not specified
+  yet, on a branch that cannot know it.
+- **A special case for `multiple_choice` beside the table.** Smallest diff to `binary.py` and
+  reintroduces the second dispatch path M1-506 deleted.
+- **`min_length=2` on `MultipleChoicePrediction.options` in `schema.py`.** The shorter diff again,
+  and M1-403's placement decision again: that module's stated scope reads no question, the *missing*
+  rule already catches a short list, and a schema failure and a checker problem are not equally
+  repairable.
+- **Reporting one problem per offending label.** Leaks the count. See above.
+- **Rendering the supplied labels in the message.** See above.
+- **Refusing an option list longer than some cap**, `submission_live._MAX_CATEGORIES`' rule. That
+  bound exists to keep a verification snapshot inside `_MAX_BODY`; nothing here serializes, and a
+  cap this row invented would refuse a question Metaculus accepted.
+- **Threading the composed check into `store.py`.** That is `M1-507`, filed by M1-506 before this
+  branch existed, and it needs `ForecastConfig` *and now `options`* threaded into
+  `append_forecast_version`. This row widens that gap and does not close it.
+
+### Deferred (do not read the absence as an omission)
+
+- **The persist path → `M1-507`.** `forecast/store.py` still runs
+  `attribution.validate_attribution_fields` alone. The gap this row widens is exactly the one M1-506
+  predicted it would: a record whose options are unknown, missing or duplicated can be persisted by
+  any caller of the public writer, even though the generating path refuses it. M1-507's signature
+  change now carries two arguments rather than one, which is worth knowing before it starts.
+- **The numeric percentile levels → `M1-405`.** Its registry entry is still `None` and nothing here
+  approximates it. `test_a_numeric_response_is_not_percentile_checked_here` pins that from the
+  inside.
+- **The submission payload built from a validated multiple-choice forecast → `M2-707`.** This row
+  decides nothing about `final_prediction_json` or the option ordering a post uses.
+- **The comprehensive valid/invalid golden set — Codex's `T-901`**, authored blind from spec. This
+  row ships **no** new fixture: the reply and the question's option list are both read back out of
+  `prompts/forecaster.md`'s own multiple-choice block, so the two are a matched pair by construction
+  and cannot drift from the prompt.
+
+### Tests, and what each mutation killed
+
+Nineteen mutations against `multiple_choice.py` and `validate.py`, each aimed at the defect the
+property it targets is *named for* (LESSONS #9), run at the gate's own profile (`dev`, 200 draws)
+rather than `fast`, with `__pycache__` swept and `PYTHONDONTWRITEBYTECODE` set (LESSONS #8).
+**17 of 19 killed**, and the two survivors are the two declared as standing risks below — both
+survive by construction rather than through a gap in the tests.
+
+| Mutation | Killed by |
+| --- | --- |
+| each of the five rules removed, one at a time | its own unit test, and `test_the_option_rules_accept_exactly_the_valid_set` |
+| exact match relaxed to `.strip()` | `test_matching_is_exact_string_equality` |
+| exact match relaxed to `.casefold()` | `test_matching_is_exact_string_equality` |
+| tolerance widened to `1e-5` | `test_the_tolerance_is_applied_where_the_criterion_says` |
+| bare-`str` `options` guard dropped | `test_an_option_list_that_would_make_a_rule_lie_is_a_caller_mistake[bare-str]` |
+| repeated supplied label tolerated | the same, `[repeated]` |
+| one problem per offending label (count leak) | `test_an_option_problem_never_varies_with_how_many_labels_failed` |
+| offending label spliced into the message | `test_two_different_offending_label_sets_produce_identical_text` |
+| only the first problem reported | `test_every_problem_is_reported_at_once` |
+| registry entry put back to `None` | `test_no_output_checker_in_the_package_is_unreachable` (+6 others) |
+| pairing gate dropped | `test_the_option_list_and_the_question_type_are_paired_in_both_directions` |
+| pairing gate made one-directional | the same test's second half |
+| `options` never passed to the checker | `test_the_type_specific_rules_reach_multiple_choice` (+ the generate and replay tests) |
+| **`>` → `>=` on the tolerance** | **survived — no float is at distance exactly `1e-6` from 1** |
+| **`math.fsum` → `sum`** | **survived — the difference is ~1e-16 against a 1e-6 tolerance** |
+
+A twentieth was run separately against `replay.py`, because M1-404 gave that module a branch and
+nothing in `tests/unit/test_forecast_replay.py` reached it — every record built there is binary, so
+`options` was `None` on every replay and the side that reads the stored question's option list was
+dead under test. Forcing `options = None` there is killed by both new tests, and the failure it
+produces is worth noting: it arrives as the **pairing gate**, not as a wrong answer. A replay that
+silently skipped the option rules is exactly what that gate exists to make impossible.
+
+### On the mutation harness, and a way it can lie that cost this branch an hour
+
+`docs/LESSONS.md` #8 says a mutation check can be answered by stale bytecode. This branch found a
+second way it can be answered wrongly, and the mechanism is worth writing down because the failure
+**looks exactly like a clean result**.
+
+The harness applies one textual mutation, runs the suite, and restores the file in a `finally`. The
+first run was launched in the foreground and killed by a two-minute tool timeout **that did not reap
+the Python child**. A second instance was then started, and the two raced: each had read its own
+"pristine" snapshot, so each restore wrote back a file the *other* had already mutated. The result
+was two live mutations welded into `multiple_choice.py` — the sum comparison left at `>=`, and the
+unknown rule left reporting one problem per offending label — while two other mutations reported
+"anchor matched 0 times" and were silently skipped.
+
+**`git diff` could not see any of it**: `forecast/multiple_choice.py` is a new file and was
+untracked, so the check that would normally catch a stray edit reported nothing to report. The two
+greps run to confirm the restore both happened to land on lines neither mutation touched.
+
+Three things now stand between that and a false report, and all three are cheap:
+
+- the harness takes an **exclusive lockfile** and refuses to start while another instance holds it;
+- every restore is **read back and asserted equal** to the snapshot it wrote;
+- an **audit script** checks, independently of the harness, that every mutation's *anchor* is present
+  and every mutation's *replacement* is absent. That is what actually found the corruption, and it is
+  the only one of the three that works after the fact.
+
+The rule this generalizes to: **a mutation harness must be able to prove the tree is pristine when it
+finishes**, because the state it leaves behind is invisible to the one tool everyone reaches for. A
+LESSONS entry is the right home for it; it is not written there on this branch because a workflow-layer
+change lands at a wave boundary (lesson 1), and two other lanes are open.
+
+### Standing risk — not verifiable offline
+
+- **The `1e-6` tolerance has no reachable boundary case, so its strictness cannot be tested.**
+  There is no probability vector whose distance from 1 is exactly `1e-6`: neither `1.0 + 1e-6` nor
+  `1.0 - 1e-6` round-trips to that difference in binary floating point (they land at
+  `9.999999999177334e-07` and `1.0000000000287557e-06`). So `>` and `>=` are observationally
+  identical here and the `>= ` mutation **survives by construction**, not by a gap in the tests.
+  `test_the_tolerance_is_applied_where_the_criterion_says` straddles the boundary by a single ulp,
+  which pins the comparison to the right place; nothing can pin its strictness.
+- **`math.fsum` is defensive here rather than load-bearing, and the mutation to `sum` survives.**
+  With at most a few dozen options of magnitude ~1, naive summation error is ~1e-16 — four orders of
+  magnitude below the tolerance — so no reply this checker will meet can be judged differently by
+  the two. `fsum` is kept because it makes the verdict exactly order-independent rather than
+  approximately so, and `test_the_option_verdict_does_not_depend_on_the_order_answered` states that
+  as the property it buys. It is recorded here rather than defended with a test that cannot fail.
+- **Nothing checks that the labels in `ModelInput.packet.options` are the labels the request
+  rendered.** They are, structurally — `build_model_input` writes the field and
+  `render_model_input` prints it in one pass — but this checker is handed the packet rather than the
+  rendered request. Closing it would mean parsing the request back, which is a worse dependency than
+  the one it removes. The same sentence M1-501 wrote about `source_ids`, and for the same reason.
+- **Whether a real model repairs an option set in one turn is unmeasured.** The tests establish that
+  a reply told *"must name every option the question supplied"* has everything it needs — the list
+  is in its own request. Whether it re-answers rather than dropping the claim is not something an
+  offline suite can answer.
+
+### Round 1 — one blocking finding, and the shape of the miss
+
+`GPT_REVIEW_RESPONSE_M1-404_r1.md`, reviewed commit `a6ab19e`. **CHANGES REQUESTED, one blocking
+finding, zero non-blocking observations.** Eight of the nine declared risk areas came back *safe*;
+risk 4 — "every caller-mistake path raises `MultipleChoiceOutputError`, never a raw error" — did
+not, and it was wrong in a way the section above did not anticipate.
+
+**The finding.** `_supplied_options` refused `None`, a bare `str`, a non-`str` member, an empty
+list, a repeated label and a blank label, and its docstring said each *"mirrors an invariant
+`CanonicalMultipleChoiceQuestion` already enforces"*. It did not refuse a **one-element** list, and
+that model's field is `options: list[str] = Field(min_length=2)`. So the guard set mirrored
+`min_length=1`.
+
+**Reproduced by execution before any fix was written**, per the standing rule, and the reproduction
+went further than the review did. The review showed one case; the question worth answering was
+whether *any* singleton reply could pass. Against the committed `0.001`/`0.999` bounds, none can:
+
+| sole probability | verdict before the fix |
+| --- | --- |
+| `1.0` | *bounds* |
+| `0.999` | *sum* |
+| `0.9999995` | *bounds* |
+
+The two rules cover the line between them and leave no gap — summing to 1 within `1e-6` forces the
+sole probability to at least `1 - 1e-6 = 0.999999`, which is already above `max_probability`. So
+the pre-fix behaviour returned a *repairable problem* for a response no model could ever repair,
+which is exactly the failure `_require_config` refuses for an inverted bounds pair, reached through
+the other argument, at two billed calls per question. That is what makes it blocking rather than
+cosmetic, and it is the argument the fix is justified by.
+
+**The fix.** `len(supplied) < 2` raises `MultipleChoiceOutputError`, beside the empty-list check it
+generalizes. Three tests, each killed by removing the guard (mutation run with `__pycache__` swept,
+`PYTHONDONTWRITEBYTECODE` set, and the restore read back and asserted byte-identical):
+
+- the `[singleton]` case in `test_an_option_list_that_would_make_a_rule_lie_is_a_caller_mistake`;
+- `test_no_reply_to_a_singleton_option_list_could_ever_have_passed`, which pins the *reason* as an
+  assertion on the committed config — `max_probability < 1 - _SUM_TOLERANCE` — so a future config
+  that narrowed the gap and made a singleton satisfiable would fail here rather than silently
+  invalidate the guard's rationale;
+- `test_an_option_list_of_fewer_than_two_always_raises_rather_than_returning` in
+  `tests/property/`.
+
+### Why the existing property did not catch it — the vacuity trap, one layer up
+
+Worth writing down, because the strategy was **not** the problem. `HOSTILE_OPTIONS` already drew
+`st.tuples(HOSTILE_TEXT)` and `st.lists(HOSTILE_TEXT, max_size=3)`, both of which produce
+one-element lists. The singleton branch was reachable, and was reached, on a large fraction of
+draws.
+
+`test_multiple_choice_never_raises_outside_its_own_error_type` passed anyway — before the fix and
+after it — because its assertion is only that nothing escapes `MultipleChoiceOutputError`, and it
+`continue`s on that exception. A *returned* list of problems satisfies it exactly as well as a
+raise. The property was true of both behaviours, so it could not distinguish them.
+
+This is the vacuous-property class the project already tracks, with the usual diagnosis inverted.
+The recorded form is *"the strategy cannot reach the branch the assertion is about"*; this one is
+**the strategy reaches the branch and the assertion is not about it**. Widening the strategy would
+have done nothing. The fix is a second property whose assertion is arity itself, and the mutation
+check is what tells the two cases apart — a property that survives removing the code it is named
+for is not evidence, whichever of the two reasons it survived for.
+
+### The generalization worth carrying to M1-405
+
+The nineteen mutations, the eight properties and the leak-invariance work above were all sound, and
+the miss was upstream of all of it: the guard list was derived from another model's invariants
+**by reading them off rather than enumerating them**. Five of six were mirrored. The sixth was the
+only constraint about *how many* rather than about what each element is — and arity is precisely
+the constraint whose absence makes a rule set unsatisfiable rather than merely wrong, because the
+other rules keep answering and their answers look repairable.
+
+Same shape as M1-308's round-7 lesson (when a finding names one exception type from a third-party
+parser, enumerate the siblings by execution): the escape is a class, not an instance. Here the
+class is "every constraint on the model this guard claims to mirror", and the cheap discipline is
+to list that model's fields and check them off one by one. `M1-405` takes an option list's
+counterpart in the question bounds and should do exactly that against
+`CanonicalNumericQuestion` before its own round 1.
+
+## M1-405 — The numeric percentile path
+
+*"Produce the nine declared percentiles for conversion by forecasting-tools. Percentile levels are
+exact; values are finite, ordered and compatible with question bounds."*
+
+### What the criterion is actually guarding against
+
+Before this item a numeric response reached `forecast_records` with **no semantic check at all**.
+`schema.NumericPrediction` takes `percentiles: list[PercentilePoint]` with `min_length=1` and says
+so outright, deferring every clause here; `validate._TYPE_CHECKERS["numeric"]` was `None`, the
+explicit "supported, and no checker yet" entry M1-506 put there for this row to fill. So a reply
+carrying two percentiles, or nine descending ones, or values a hundred times outside a closed bound,
+was stored as a forecast and handed to M1-503 to fail inside the SDK — where the failure is a
+`ValueError` whose message **prints the offending percentiles verbatim**, one billed call after the
+point where a repair turn was still free.
+
+The rules are all cheap and all repairable. What makes the row size `M` is that its last clause
+needed a channel that did not exist.
+
+### Delivered
+
+- **`src/whiskeyjack_bot/forecast/numeric.py`** — `DECLARED_PERCENTILE_LEVELS`,
+  `NumericOutputError`, `numeric_output_problems`, `validate_numeric_output`. `binary.py`'s shape,
+  including the returner/raiser pair and the `repr`-rendered bound.
+- **The seam widened** — `validate._TypeChecker` is now
+  `Callable[[Any, ForecastConfig, Any], list[str]]`; `output_problems` / `validate_output` take
+  `question: CanonicalQuestion` in place of `question_id: int`; `binary_output_problems` takes the
+  question and gates it; `parse._parse`, `generate._run_attempts` and `replay` thread it.
+- **A second preflight in `generate_forecast`** — a question whose `zero_point` is at or above its
+  `lower_bound`, refused before any billable call.
+- **Tests** — `tests/unit/test_forecast_numeric.py` (36), an M1-405 section in
+  `test_forecast_generate.py` (6), a `5b.` section in `tests/property/test_forecast_properties.py`
+  (9), and new coverage in `test_forecast_binary.py` / `test_forecast_validate.py` for the widened
+  signature.
+
+### Decision — non-decreasing, not strictly increasing
+
+The row says "ordered". `prompts/forecaster.md` says **non-decreasing**, twice (line 48 and line
+153). CLAUDE.md's stricter-reading rule would ordinarily resolve that upward; it is not applied
+here, and the reason is that the stricter reading *contradicts* the prompt rather than sharpening
+it. A reply with two equal values followed the instructions exactly, and refusing it spends the one
+budgeted repair call on this project's own inconsistency — `schema.py` makes the same argument about
+`source_disagreements`, and `binary.py`'s `_PRIOR_REQUIRED` comment makes it about the priors.
+
+The pinned SDK agrees with the prompt, whatever its message says:
+`NumericDistribution._check_percentiles_increasing` raises on `percentiles[i].value >
+percentiles[i + 1].value` — a tie passes. Verified by reading `numeric_report.py` at 0.2.92 and by
+executing the constructor in `test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts`.
+
+**The cost of that decision is filed, not hidden.** What the SDK then does with a tie is
+`_check_and_update_repeating_values`, which **mutates `declared_percentiles` in place**, nudging a
+repeated value by `1e-6` inside the bounds or `1e-10` at one — inside the `model_validator`, so on
+construction, before `get_cdf` is called. The record stores what the model returned; a CDF built
+from it would be built from values this project neither produced nor persists. Against "nothing is
+clamped" that is a real divergence. It is **M1-508**, filed against M1-503, because the nudge
+happens in the conversion M1-503 owns and every remedy — record the nudged values as a derived
+artifact, refuse ties at the conversion boundary, or bump the prompt to ask for strictly increasing
+values and re-hash — is that row's or the prompt owner's to weigh.
+
+### Decision — no message renders a value, and round 1 corrected this one
+
+**The first cut rendered the bounds, and the reasoning was wrong.** It read `binary.py`'s
+argument — a repair turn that does not name the bound is one no model can aim at — and applied it
+here. Round 1 filed it blocking, and reproducing it took one call:
+
+```
+final_prediction.percentiles: values must be at least 3.141592653589793 for this question's
+closed lower bound (offending input withheld)
+```
+
+`binary.py`'s argument holds *there* for a specific reason: `prompts/forecaster.md` prints
+`0.001`-`0.999` to the model as a **literal**, while config is free to narrow it, so a binary model
+genuinely does not know its effective bound. A numeric model does — `forecast/inputs.py:284-290`
+puts `lower_bound`, `upper_bound`, `open_lower_bound`, `open_upper_bound` and `zero_point` into the
+request it was sent. Naming them back buys nothing.
+
+`attribution.py` had already drawn this exact line and written it down: it declines to render the
+supplied `source_ids` because "the model already holds the whole id list in its own request, under
+`research_documents`, so naming them back buys nothing". Two modules, two sides of one distinction,
+and this one cited `binary.py`'s side without reading `attribution.py`'s. **The lesson is not that
+the rule was unclear — it is that the project had already resolved it in prose, in a sibling file,
+and the prose was not read before writing a third module beside them.** That is the same shape
+M1-506's round-1 leak-property draft hit.
+
+It is also not confined to a repair turn. A response that fails twice puts these strings in
+`ForecastGeneration.failure_problems`, and `forecast/artifacts.py` writes that into the persisted
+raw-output envelope. Question fields come from Metaculus payloads, which CLAUDE.md classes as
+untrusted; the carve-out that lets a *path* be rendered is about operator-supplied configuration,
+not provider content. So a rendered bound was provider data entering the ledger's diagnostics.
+
+The three messages are now constants naming the rule and the question field it is about
+(`lower_bound`, `upper_bound`, `zero_point` — names this project's canonical model authored).
+Nothing reached through `forecast` or `question` is interpolated anywhere in the module. The nine
+declared levels are still named and are a different category: this project's own constant,
+transcribed from the hashed prompt, the same thing `schema.response_model_for` prints.
+
+`binary.py` is left alone and the difference is now deliberate — **M1-509** is filed to settle
+whether its configured bounds belong in a diagnostic at all, which is a question about
+`ForecastConfig` and CLAUDE.md's carve-out rather than about this row.
+
+### Decision — the bound rules are the ones that hold for *any* configuration
+
+`NumericDistribution` applies two tiers. One runs unconditionally: `_check_percentiles_increasing`
+and `_check_log_scaled_fields` (`lower_bound > zero_point`, and no value below `zero_point`). The
+other runs only under `strict_validation` **and** `standardize_cdf`: `_check_too_far_from_bounds`'s
+25%-wiggle and 2×-range tail rules, `_check_percentile_spacing`, `_check_distribution_too_tall`.
+
+Both of those flags are `config.numeric_calibration`, which is a **sibling of** `config.forecast` on
+`AppConfig`, not a member of it — so a checker handed a `ForecastConfig` cannot see them. Applying a
+conditional rule unconditionally would refuse a forecast a permissive config accepts, and this
+module has no way to know which it is looking at. So the line between M1-405 and M1-503 is drawn at
+the config boundary rather than guessed at: **M1-405 owns what is true of a percentile set for any
+configuration** — the exact levels, non-decreasing values, closed bounds, and `zero_point` — and
+M1-503 owns everything `numeric_calibration` decides, along with the 201-point CDF itself.
+
+`test_an_open_bound_constrains_nothing_here` is the clause that proves the rule reads
+`open_lower_bound`/`open_upper_bound` rather than applying the bound flat.
+
+### Decision — the question replaces `question_id` on the composed entry point
+
+`output_problems(forecast, config, *, question_id, source_ids)` could not answer this row's last
+clause, so a question had to reach it. Adding one *beside* `question_id` would put two sources of
+truth for the same fact inside one entry point and then require a cross-check between them — which
+is exactly what M2-703's round-1 review said to remove rather than guard. So the primitive is gone
+and `question.question_id` is what `attribution_problems` is called with.
+
+`attribution.py` keeps its primitive signature deliberately. Its docstring rests a design decision
+on taking primitives — "taking primitives is what makes this module's independence a property of its
+own interface rather than of another package's `__init__.py`" — and nothing about this item argues
+against that.
+
+**Import cost: none.** `questions/model.py` reaches no provider SDK and `forecast/inputs.py` has
+imported it since M1-402; `test_the_response_schema_reaches_no_provider_client` pins both, and
+`forecast/numeric.py` was added to the probed list.
+
+### Decision — every checker takes the question, including the one with no use for it
+
+`binary_output_problems` now takes a third argument it has no *rule* for. The alternative was a
+per-type adapter in `_TYPE_CHECKERS` narrowing the question — and `validate.py`'s own note on
+`_TypeChecker` already rejects an adapter, for the reason that an adapter is a second place per type
+to edit and the table exists so there is one. A uniform signature means the type that needs the
+question and the type that does not are registered identically, which is what keeps M1-404's change
+to a single line.
+
+The parameter is not decoration: binary spends it on the same exact-type gate it already applies to
+its other two arguments, and `test_a_question_of_the_wrong_type_arrives_as_this_projects_error`
+kills the mutation that deletes it. The *pairing* — question type equals response type — is checked
+once in `output_problems`, centrally, so no checker has to reason about the relationship between two
+of its arguments.
+
+### Deviation — `docs/TRACKS.md` said "one changed line each" and it was wrong
+
+The wave was planned on M1-506's prediction that M1-404 and M1-405 would each change one line of
+`forecast/validate.py` and could therefore run concurrently. That held for the registration and not
+for the signature. Both items need the question — M1-405 for the bounds, M1-404 for the option list
+— so both would have edited the same three signatures and met at a conflict the registry could not
+have warned either about.
+
+M1-405 took the widening; **lane 1 stage B is serial**, and `docs/TRACKS.md` now says so with the
+reasoning attached. M1-404 merges master after this lands and does get its one line. `validate.py`'s
+docstring records the falsified prediction rather than quietly deleting it, because the shape of the
+mistake — a seam sized against the *registration* and not against the *arguments* — is the reusable
+part.
+
+### Rejected — re-checking that values are finite
+
+The criterion says "values are finite". `schema.PercentilePoint.value` carries
+`Field(allow_inf_nan=False)`, so a non-finite value is refused before any checker is called. A
+duplicate check in `numeric.py` could only be reached through `model_construct`, and a test that has
+to bypass the schema to reach the branch it asserts is the vacuous-property class this project has
+paid for more than any other. Pinned instead as a schema fact that *can* fail —
+`test_a_non_finite_value_never_reaches_this_module` drives `Infinity`, `-Infinity` and `NaN` through
+`validate_forecast_response` and asserts each is refused.
+
+Recorded here because reading `numeric.py` alone, the rule looks absent — which is the seam defect
+M1-506 exists to close, met from a third direction.
+
+### Rejected — a tolerance on the declared levels
+
+Every level is a decimal literal in the prompt and arrives through `json.loads`, which maps a
+literal to the nearest double: `0.10`, `0.1` and `1e-1` are the same value, asserted in
+`test_a_level_written_another_way_is_the_same_double`. So exact equality is not brittle, and the
+only thing a tolerance would buy is accepting levels the prompt does not print. Comparing the whole
+tuple rather than the set also settles count, order and duplication in one step — and it is what
+makes the ordering rule well defined, since "non-decreasing values" is only a rule once the levels
+they belong to are known to ascend.
+
+### Rejected — pre-checking the 201-point CDF or the PMF step cap
+
+`M1-503`'s criterion, verbatim: *"Exactly 201 monotone values for normal numeric questions;
+maintained PMF constraint passes."* Nothing here approximates it. `config.numeric_calibration`
+(`expected_cdf_points`, `max_adjacent_pmf`, `strict_validation`,
+`use_forecasting_tools_standardization`, `calibration_profile`) still has no consumer in `src/`
+outside `submission_live.py`'s length check — the same "this item defines them" condition M1-403
+found for the probability bounds, and it is M1-503's to define, not this row's.
+
+### Deferred (do not read the absence as an omission)
+
+- **The tie nudge → M1-508**, filed this branch. Above.
+- **The persist path → M1-507.** Widened by this item (a malformed percentile set is now refused by
+  `generate` and still persistable by `append_forecast_version`) and simultaneously made cheaper to
+  close: the composed entry point wants a `CanonicalQuestion`, and `ForecastRecordDraft.question`
+  already carries one that `_one_question` has validated against the row's own `question_id` and
+  `question_type`. Only `ForecastConfig` is still missing. `store.py`'s docstring and the M1-507 row
+  both say so now.
+- **The `validated` lifecycle event → M1-504.** Unchanged: `store.py` still does not append one, and
+  M1-404, M1-502 and M1-503 are still outstanding.
+- **`unit_of_measure` in the prompt's Inputs list.** `forecast/inputs.py` has flagged this as a
+  candidate for the prompt's next version bump since M1-402, and it is directly numeric-relevant — a
+  percentile *value* has no meaning without its unit, and the bounds it must respect are printed in
+  that unit. Not taken here: a prompt bump is a re-hash, a `RELEASED_PROMPT_SHA256` entry, a
+  `config.example.yaml` edit and a third test, and bundling it into a checker item would put an
+  unrelated attribution-surface change inside this review.
+
+### Standing risk — not verifiable offline
+
+`test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts` constructs a
+`NumericDistribution` with `strict_validation=False`, which is exactly the SDK's unconditional tier
+and is the whole claim this module makes about agreement. It does **not** establish that Metaculus
+accepts the resulting CDF — that is M1-503's boundary and, past it, a live call. The claim in the
+docstring is deliberately narrow for that reason.
+
+The 0.25 wiggle factor and the 2× buffer are read from `numeric_report.py` at the pin and are *not*
+duplicated here, so there is nothing in this module for a pin move to invalidate. What a pin move
+could invalidate is the agreement test itself, which is why it is written as a construction rather
+than as a description.
+
+### Tests, and what each mutation killed
+
+Ten mutations against `numeric.py`, run with `HYPOTHESIS_PROFILE=ci` and `__pycache__` cleared
+between each (the stale-bytecode trap: a same-size, same-second edit is served from cache).
+
+| Mutation | Killed by |
+| --- | --- |
+| non-decreasing → strictly increasing | `test_equal_neighbouring_values_are_accepted` |
+| levels compared as a multiset (order lost) | `test_the_levels_must_be_exactly_the_declared_ones[right set, wrong order]` |
+| levels compared as a subset (count lost) | `test_the_levels_must_be_exactly_the_declared_ones[one missing]` |
+| lower bound applied even when open | `test_an_open_bound_constrains_nothing_here` |
+| upper-bound check removed | `test_one_ulp_outside_a_closed_bound_is_refused` |
+| lower bound inclusive → exclusive | `test_a_value_exactly_on_a_closed_bound_is_accepted` |
+| `zero_point` check removed | `test_a_value_below_the_zero_point_is_refused` |
+| `zero_point` preflight `<=` → `<` | `test_a_question_whose_zero_point_is_not_below_its_lower_bound_is_a_caller_mistake` |
+| question gate removed | `test_every_refusal_path_raises_this_modules_own_type_exactly[a binary question]` |
+| `_format_number`: `repr` → `f"{v:.2f}"` | **survived the first pass** — see below |
+
+**The tenth mutation is the one worth recording.** `repr` rather than a fixed precision is M1-403's
+`_format_bound` decision, and its reason is that a bound rendered as `0.00` is one the model could
+aim at and still miss. Nothing in thirty-five tests and nine properties noticed when it was
+replaced: the bounds these tests happened to use (`0.0`, `100.0`, `3.0`, `20.0`) all render
+identically either way. Closed by
+`test_the_rendered_bound_round_trips_back_to_the_bound_exactly`, which parses the number back out of
+the message and compares it to the bound — asserted by round-trip rather than against `repr(bound)`,
+because a test comparing against `repr` agrees with any renderer that happens to be `repr`,
+including a wrong one. Four of its six parameters fail under the mutation.
+
+**Anti-vacuity.** `test_every_numeric_rule_is_reached` event-tags all five rules; over 200 draws
+each of the ten cells is populated — levels exact on 14.8% / not on 80.9%, non-decreasing on 25.8% /
+not on 69.9%, closed-lower biting on 39.7%, closed-upper on 44.5%, `zero_point` on 32.5%. That
+spread is not free: the first draft drew the nine values freely, and an unsorted list of nine is
+non-decreasing about once in 400,000, so the ordering rule bit on essentially every example and the
+`iff` property never saw its accepting side. The strategy now sorts on half the draws, and the
+`sampled_from` pool is built out of both bounds, one ulp either side of each, and a repeat.
+
+**Two properties were drafted wrong and the suite caught both.**
+`test_a_percentile_problem_never_varies_with_the_value_that_failed` first put the drawn value in the
+*first* position and constants elsewhere, so a large draw made the ordering rule fire for one value
+and not the other and the property was comparing two different rules; it now fills every position,
+where a constant list is trivially non-decreasing and only the value-rendering rules can speak.
+`test_a_percentile_set_this_checker_accepts_is_one_the_pinned_sdk_accepts` was written as
+`assume(problems == [])` over the general strategy, and hypothesis refused it outright — fifty
+filtered, none generated. Constructing the accepted case is also the more honest strategy: the claim
+is about the accepted set, so that is what should be sampled, and `accepted_numeric_cases` carries
+its own vacuity guard asserting the cases it builds really are accepted.
+
+### Round 1 — two blocking findings, both reproduced before any fix
+
+The review is `GPT_REVIEW_RESPONSE_M1-405_r1.md` against `4ace6c6`. Both findings were reproduced by
+execution against that exact commit first, per the standing rule; neither was stale and neither was
+rebutted.
+
+**Finding 1 — question-field values in the diagnostics.** Written up as its own Decision above,
+because the correction replaces a rationale this file originally stated the other way round.
+
+**Finding 2 — `replay_forecast` could raise `NumericOutputError`.** `CanonicalNumericQuestion`
+accepts `zero_point == lower_bound`; so does `ForecastRecordDraft`; and so did every writer before
+this branch, because numeric had no checker at the pinned base. `numeric._require_question` raises
+for that question rather than reporting a repairable problem — correctly, since no percentile set
+could satisfy it — and `generate_forecast` refuses it in a preflight before anything is spent.
+**Replay has no preflight.** It reads a row that already exists, so it reached `_parse` and let a
+member module's exception out of a public boundary, which `replay.py`'s own docstring calls a review
+finding in this project. Reproduced by building a draft with `lower_bound=1.0, zero_point=1.0`,
+persisting it (the writer accepts it — that is the premise), and replaying.
+
+Fixed with the handler `response_model_for` already had one line above:
+`except ForecastSchemaError as exc: raise ForecastRecordError(str(exc)) from None`.
+
+**What generalised.** `parse._parse` carried a comment claiming it "cannot raise, on any of its
+paths". Every clause of that claim rested on `generate_forecast`'s preflight, so it was never true
+of a caller without one — the comment asserted a property of the *function* that was really a
+property of one *call site*. It now says so and names replay as the caller that owes its own
+handler. A caller added later owes the same.
+
+### Round 1 — mutations, including the findings themselves
+
+Both findings are pinned as mutations of their own, so a regression reintroducing either fails:
+
+| Mutation | Killed by |
+| --- | --- |
+| finding 1: `lower_bound` rendered again | `test_no_message_renders_a_question_field_value` |
+| finding 1: `upper_bound` rendered again | `test_one_ulp_outside_a_closed_bound_is_refused` |
+| finding 1: `zero_point` rendered again | `test_no_message_renders_a_question_field_value` |
+| finding 2: replay stops translating | `test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error` |
+| the five messages collapse to one | `test_the_messages_still_distinguish_the_rule_they_report` |
+| levels renderer `repr` → `.1f` | `test_the_rendered_levels_round_trip_back_to_the_levels_exactly` |
+
+**One mutation survives and it is equivalent, not a gap.** `repr` → `f"{v:.2f}"` on the declared
+levels: all nine have at most two decimals, so `.2f` round-trips exactly and is a *correct*
+renderer. The genuinely truncating `.1f` (`0.01` → `"0.0"`) is killed. After finding 1's fix the only
+rendered values are that fixed constant, so the renderer choice is a convention here rather than a
+load-bearing one — recorded rather than papered over with a test contrived to kill a correct
+mutation. Round 1's version of this entry claimed the `repr` decision was load-bearing for the
+bounds; it was, and those bounds are gone.
+
+**The leak property had to be re-aimed, and its companion with it.** The old companion asserted the
+message *varied* with the question's bounds — that is exactly what must no longer be true. What
+replaces it is `test_a_percentile_problem_never_varies_with_the_question_it_was_checked_against`
+(scale the bounds by any factor; identical text for a response violating the same rules) plus
+`test_the_percentile_messages_still_distinguish_the_rule_they_report`, which is the real
+anti-vacuity guard: a checker whose every message was one constant would satisfy every invariance
+property here and tell a reader nothing.
+
+**A process note on the mutation harness.** The round-1 harness snapshotted the source to `/tmp`
+and restored from that snapshot; one snapshot was taken inside a previous mutation's window, so a
+mutation survived into the working tree and was only caught because the suite went red on clean
+code. The round-2 harness restores with `git checkout --` and asserts `git diff --quiet` after every
+restore. A harness that can silently leave a mutation behind is worse than no harness, because its
+"killed" results are then attributed to the wrong change.
+
+### M1-405 — the merge with M1-404, and the seam the two items converged on
+
+M1-404 merged first (PR #47, `f8577eb`). Both items had widened the same seam, independently and
+incompatibly, and each had written into its own notes that the *other* would be the easy one-line
+case. Both were wrong, and neither could have learned it from `docs/TRACKS.md`, which records deps
+and migration numbers and nothing about which signatures an item will touch.
+
+| | `_TypeChecker` | `output_problems` / `validate_output` |
+| --- | --- | --- |
+| M1-404 as merged | `Protocol`, keyword-only `options: Sequence[str] \| None` | kept `question_id: int`, **added** `options` |
+| M1-405 as reviewed | `Callable[[Any, ForecastConfig, Any], list[str]]`, positional `question` | **replaced** `question_id` with `question: CanonicalQuestion` |
+
+### Decision — the converged seam is `question`-only, and `options` is gone (owner decision)
+
+`forecast/inputs.py` builds the packet field as `list(question.options)`, so the option list and
+the question are the same fact reached two ways. Carrying both inside one entry point is the
+second-source-of-truth shape M2-703's round-1 review filed a lesson about — and the same lesson
+M1-405 had already invoked, and a reviewer approved, to remove `question_id`. Applying it once more
+was the consistent move rather than a new judgement.
+
+`multiple_choice_output_problems` therefore takes `CanonicalMultipleChoiceQuestion` and reads
+`question.options`. Three things fell out of that rather than being designed:
+
+- **M1-404's biconditional option/type pairing gate is retired.** It existed to catch a
+  multiple-choice response validated against no option list, and an option list handed to another
+  type. Neither is expressible once the list comes from the question that `output_problems`' `qtype`
+  gate already pairs with the response. `test_the_option_list_and_the_question_type_are_paired_in_both_directions`
+  went with it; `test_a_question_of_another_type_is_refused_before_any_checker_runs` is the
+  surviving statement.
+- **M1-404's standing risk is retired.** It recorded that nothing verified `ModelInput.packet.options`
+  against the labels the request rendered. There is no copy to verify.
+- **M1-404's round-1 finding is dissolved rather than carried.** That review found `_supplied_options`
+  mirroring five of `CanonicalMultipleChoiceQuestion`'s six invariants by hand, missing
+  `min_length=2`. The mirror is gone: `_require_question` gates the type and restates nothing the
+  model guarantees, which is exactly what `numeric._require_question` already did (it re-checks
+  `zero_point`, which the model does not guarantee, and deliberately does not restate
+  `lower_bound < upper_bound`, which it does).
+
+### Deviation — a module docstring claimed more than the constraint needed
+
+`multiple_choice.py` said it imports "no provider SDK **and no question model**", and took
+primitives on that basis. The first half is the real constraint (M1-406's replay path). The second
+was wrong about where the SDK enters: `questions/model.py` imports only stdlib, pydantic and
+`config`. It is `forecast.inputs` that reaches a provider. Both checkers are now in the
+import-graph probe in `test_forecast_generate.py`, so the claim is enforced rather than asserted.
+
+### Deviation — two pinned-absence tests, one restored and one deleted
+
+The merge initially re-reverted `test_a_multiple_choice_response_is_option_checked_here` back to
+M1-404's pre-inversion `test_a_non_binary_response_is_not_bound_checked_here`, which is precisely
+the "re-reverted as a tidy-up" that test's docstring warns about. Restored from master.
+`test_a_numeric_response_is_not_percentile_checked_here` went the other way: it survives on master
+because M1-404 kept the numeric half of the pin, and M1-405 deleted it when numeric got a checker.
+The deletion is correct and the test is gone; the section below it is the same statement from the
+other side.
+
+### Where the tests moved, and why none were simply dropped
+
+`test_an_option_list_that_would_make_a_rule_lie_is_a_caller_mistake` tested `_supplied_options`,
+which no longer exists. Its cases are kept and pointed at their real enforcement point —
+`CanonicalMultipleChoiceQuestion` refuses each shape at the input contract — because losing them is
+what would let the guarantee quietly weaken. The property `test_an_option_list_of_fewer_than_two_always_raises_rather_than_returning`
+followed the same guarantee to the same place, asserting the `too_short` error type specifically so
+a blank or duplicate label cannot make it green for the wrong reason.
+
+`composed_cases()`' fifth element became the paired question rather than a loose option list, and
+`_type_specific_half` dispatches through `_TYPE_CHECKERS` rather than an if/else over two types, so
+a third registration cannot leave the anti-vacuity guard silently checking two.
+
+### Also closed here — M1-405's round-2 non-blocking observation
+
+`numeric._require_question` still carried a comment saying its two question numbers "are rendered
+elsewhere in this module", which round 1's remediation had made false. Corrected.
+
+### M1-405 round 3 — APPROVE, and the one observation is a false claim of mine
+
+`GPT_REVIEW_RESPONSE_M1-405_r3.md`, reviewed `ac73229`. **APPROVE. No blocking findings.** All
+three prior findings confirmed closed, including round 2's stale-comment observation.
+
+The one non-blocking observation falsifies **risk 15 of the round-3 request**, which I wrote and
+which was wrong. I claimed that dispatching `_type_specific_half` through `_TYPE_CHECKERS` meant
+"a third registration cannot leave the guard checking two". The dispatch is registry-driven; the
+**strategy feeding it is not**. Verified by execution over 300 draws:
+
+| type | registered | drawn |
+| --- | --- | --- |
+| `binary` | yes | 110 |
+| `multiple_choice` | yes | 190 |
+| `numeric` | yes | **0** |
+
+So `numeric_output_problems` is never reached through the composed entry point by any property.
+No product defect follows — section 5b covers that checker directly, and the reviewer said so in
+declining to block — but this is the project's most expensive defect class reappearing one level
+up. The recorded forms are "the strategy cannot reach the branch the assertion is about" (M1-305,
+M1-501) and, from M1-404 round 1, "the strategy reaches it and the assertion is not about it".
+This is a third: **the assertion is registry-complete and the strategy is not**, so the guard whose
+entire job is anti-vacuity is itself partly vacuous, and silently worsens with each registration.
+
+Filed as **M1-510** rather than fixed here: widening the strategy needs a numeric arm that reaches
+both a biting and a silent verdict, which is a substantive property change on an approved branch and
+would earn a round 4 for a test-only gap the reviewer declined to block.
+
+Two comments were corrected in place, because leaving them is the stale-pointer failure that cost
+M1-501 a round: `_type_specific_half`'s docstring now says the *helper* cannot fall behind a
+registration while the strategy currently does, and `composed_cases()` no longer says "both
+registered types" now that there are three.
+
+**The generalizable rule.** Registry-driven dispatch behind a hand-written strategy is not
+registry-complete coverage, and the two are easy to conflate precisely because the dispatch half
+looks rigorous. When a guard claims completeness against a table, assert the *draws* against that
+table, not just the lookup.

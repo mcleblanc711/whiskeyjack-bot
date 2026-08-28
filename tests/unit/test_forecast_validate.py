@@ -48,12 +48,19 @@ import whiskeyjack_bot.forecast as forecast_package
 from whiskeyjack_bot.config import ForecastConfig, SupportedQuestionType, validate_config_data
 from whiskeyjack_bot.forecast.attribution import AttributionFieldError, attribution_problems
 from whiskeyjack_bot.forecast.binary import BinaryOutputError, binary_output_problems
+from whiskeyjack_bot.forecast.numeric import NumericOutputError, numeric_output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastResponse,
     ForecastSchemaError,
     response_model_for,
     validate_forecast_response,
+)
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalMultipleChoiceQuestion,
+    CanonicalNumericQuestion,
+    CanonicalQuestion,
 )
 from whiskeyjack_bot.forecast.validate import (
     _TYPE_CHECKERS,
@@ -122,15 +129,60 @@ def _response(question_type: str = "binary", **overrides: Any) -> ForecastRespon
     return validate_forecast_response(payload, response_model_for(payload["question_type"]))
 
 
+def _question(question_type: str = "binary", **overrides: Any) -> CanonicalQuestion:
+    """The canonical question the entry point takes in place of a bare ``question_id``.
+
+    M1-405 replaced the primitive with the object it was a field of: carrying both would be
+    two sources of truth for one fact inside one entry point. Built per type here because
+    the entry point now checks the pairing, so a binary question with a numeric response is
+    a caller mistake rather than a silently accepted argument.
+
+    The numeric bounds are wide enough that the prompt's own percentile example (10..50)
+    passes; ``test_forecast_numeric.py`` is where those rules are tested, not here.
+    """
+    common: dict[str, Any] = {
+        "question_id": QUESTION_ID,
+        "post_id": 456,
+        "title": "Will the thing happen?",
+        "resolution_criteria": "Resolves YES if the thing happens.",
+    }
+    common.update(overrides)
+    if question_type == "binary":
+        return CanonicalBinaryQuestion(**common)
+    if question_type == "multiple_choice":
+        # The prompt's own labels by default, so the question and the reply that answers it
+        # are a matched pair by construction -- but overridable, because a caller testing
+        # the option rules needs labels the reply does *not* answer.
+        common.setdefault(
+            "options",
+            [
+                option["option"]
+                for option in json.loads("{" + _json_block(HEADINGS["multiple_choice"]) + "}")[
+                    "final_prediction"
+                ]["options"]
+            ],
+        )
+        return CanonicalMultipleChoiceQuestion(**common)
+    return CanonicalNumericQuestion(
+        lower_bound=0.0,
+        upper_bound=100.0,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        cdf_size=201,
+        **common,
+    )
+
+
 def _problems(
     forecast: ForecastResponse,
     config: ForecastConfig | None = None,
     sources: tuple[str, ...] = PROMPT_SOURCES,
+    question: CanonicalQuestion | None = None,
 ) -> list[str]:
     return output_problems(
         forecast,
         config if config is not None else _committed_forecast_config(),
-        question_id=QUESTION_ID,
+        question=question if question is not None else _question(forecast.question_type),
         source_ids=sources,
     )
 
@@ -147,8 +199,8 @@ def test_every_supported_type_has_an_explicit_registry_entry() -> None:
     here rather than reaching the forecaster with the type-specific layer silently empty.
 
     ``None`` is a legitimate entry and says so -- "supported, and no type-specific checks
-    yet" is a decision M1-404 and M1-405 will each change one line of. What is refused is
-    the *absence* of a decision.
+    yet" is a decision M1-404 will change one line of, as M1-405 did for ``numeric``. What
+    is refused is the *absence* of a decision.
     """
     assert set(_TYPE_CHECKERS) == set(get_args(SupportedQuestionType))
     # Both directions, the ``test_lifecycle.py`` argument: an entry for a type config does
@@ -215,6 +267,12 @@ def test_the_discovery_walk_would_notice_a_checker() -> None:
     assert defined["whiskeyjack_bot.forecast.binary.binary_output_problems"] is (
         binary_output_problems
     )
+    # M1-405's, named for the same reason: the walk has to be seen finding each one, or
+    # ``test_no_output_checker_in_the_package_is_unreachable`` could be green over a set
+    # that lost a member.
+    assert defined["whiskeyjack_bot.forecast.numeric.numeric_output_problems"] is (
+        numeric_output_problems
+    )
     # And the entry point is not itself discovered as a checker -- ``output_problems``
     # does not end in ``_output_problems``. That is what keeps the test above from
     # needing a special case, so it is asserted rather than assumed.
@@ -235,11 +293,12 @@ def test_the_parse_path_has_no_second_composition() -> None:
     assert parse_module.output_problems is output_problems
     # And nothing else in the package composes the members behind the entry point's back.
     for info in pkgutil.iter_modules(forecast_package.__path__):
-        if info.name in {"validate", "attribution", "binary"}:
+        if info.name in {"validate", "attribution", "binary", "numeric"}:
             continue
         module = import_module(f"{forecast_package.__name__}.{info.name}")
         assert attribution_problems not in vars(module).values(), info.name
         assert binary_output_problems not in vars(module).values(), info.name
+        assert numeric_output_problems not in vars(module).values(), info.name
 
 
 # --- the entry point, per question type --------------------------------------------
@@ -259,6 +318,7 @@ def test_the_cross_type_rules_reach_every_supported_type(question_type: str) -> 
     layer were reached only via that table, those two would validate nothing at all.
     """
     bad = _response(question_type, failure_modes=[], question_id=QUESTION_ID + 1)
+    # The question keeps ``QUESTION_ID``; the *response* is the one that names another.
     assert sorted(_problems(bad)) == sorted(
         [
             "question_id: must be the question this forecast was requested for "
@@ -280,6 +340,93 @@ def test_the_type_specific_rules_reach_binary() -> None:
     ]
 
 
+def test_the_type_specific_rules_reach_multiple_choice() -> None:
+    """M1-404's option-set rule, through the composed entry point rather than directly.
+
+    The sibling of ``test_the_type_specific_rules_reach_binary``, and the reason it exists
+    is that ``multiple_choice`` was the registry's ``None`` entry until M1-404: a
+    composition that reached only the entry it already had would have been green for the
+    whole of M1-506 and green again after.
+
+    **Converted at the M1-404/M1-405 merge.** It used to pass a separate
+    ``options=("Some other option", "Yet another option")`` beside a bare ``question_id``.
+    The option list now comes from the question, so the two unanswered labels are the
+    *question's* labels; the rules that bite and the problems asserted are unchanged.
+    """
+    forecast = _response("multiple_choice")
+    problems = _problems(
+        forecast,
+        # Labels the prompt's example never answers, so *missing* bites; the labels it does
+        # answer are then unknown, so *unknown* bites too. Two of them, not one: a
+        # one-option question cannot exist (``min_length=2``), and M1-404's round 1 found
+        # that a singleton makes the sum and bounds rules cover the line between them.
+        question=_question("multiple_choice", options=["Some other option", "Yet another"]),
+    )
+    assert problems == [
+        "final_prediction.options: must name only options the question supplied "
+        "(offending labels withheld)",
+        "final_prediction.options: must name every option the question supplied "
+        "(offending labels withheld)",
+    ]
+
+
+def test_the_type_specific_rules_reach_numeric() -> None:
+    """M1-405's percentile rules, through the composed entry point rather than directly.
+
+    The registration is the acceptance criterion's third clause seen from the caller's
+    side: before this item the ``numeric`` entry was ``None`` and a response with the wrong
+    levels reached ``forecast_records`` unremarked.
+    """
+    forecast = _response(
+        "numeric",
+        final_prediction={"percentiles": [{"percentile": 0.5, "value": 24.0}]},
+    )
+    problems = _problems(forecast)
+    assert len(problems) == 1
+    assert problems[0].startswith("final_prediction.percentiles: must be exactly the 9 ")
+
+
+def test_a_question_of_another_type_is_refused_before_any_checker_runs() -> None:
+    """The pairing check the entry point makes once so no checker has to make it twice.
+
+    A numeric response with a binary question is a caller mistake on any reading, and it is
+    the one mistake a per-checker gate would report as the *question* being wrong when the
+    response is equally suspect. Refused here, with neither type named -- both are already
+    in the vocabulary the unregistered-type message prints.
+    """
+    with pytest.raises(ForecastOutputError) as caught:
+        _problems(_response("numeric"), question=_question("binary"))
+    assert caught.value.problems == [
+        "question: must be a question of the same type as the response"
+    ]
+    # And it is this module's error, not a member's: neither checker was reached.
+    assert type(caught.value) is ForecastOutputError
+
+
+@pytest.mark.parametrize(
+    "bad", [None, 123, "binary", {"qtype": "binary"}], ids=["none", "int", "str", "dict"]
+)
+def test_a_question_that_is_not_a_canonical_question_cannot_escape_as_a_raw_error(
+    bad: Any,
+) -> None:
+    """``question.question_id`` is read on the first line of the entry point.
+
+    Without the gate a ``None`` question would leave here as a raw ``AttributeError`` --
+    the defect this project has taken as a review finding twice, and the reason the gate
+    runs before ``attribution_problems`` rather than after it.
+    """
+    # ``output_problems`` directly rather than through ``_problems``, whose ``None``
+    # default would substitute a real question for the very argument under test.
+    with pytest.raises(ForecastOutputError) as caught:
+        output_problems(
+            _response("binary"),
+            _committed_forecast_config(),
+            question=bad,
+            source_ids=PROMPT_SOURCES,
+        )
+    assert caught.value.problems == ["question: must be a canonical question"]
+
+
 def test_the_composition_runs_attribution_first_then_the_type_specific_layer() -> None:
     """The order is part of the contract: it is what a repair turn renders, and it is the
     order the two layers are documented in.
@@ -295,7 +442,7 @@ def test_the_composition_runs_attribution_first_then_the_type_specific_layer() -
     attribution_half = attribution_problems(
         forecast, question_id=QUESTION_ID, source_ids=PROMPT_SOURCES
     )
-    binary_half = binary_output_problems(forecast, config)
+    binary_half = binary_output_problems(forecast, config, _question("binary"))
     assert attribution_half and binary_half, "both halves must bite for this to discriminate"
     assert _problems(forecast, config) == attribution_half + binary_half
 
@@ -327,7 +474,7 @@ def test_validate_output_returns_a_clean_response_unchanged(question_type: str) 
     returned = validate_output(
         forecast,
         _committed_forecast_config(),
-        question_id=QUESTION_ID,
+        question=_question(question_type),
         source_ids=PROMPT_SOURCES,
     )
     assert returned is forecast
@@ -348,7 +495,7 @@ def test_validate_output_raises_with_exactly_the_problems_the_other_half_returns
     assert len(expected) > 1, "one problem from each layer, or this proves nothing"
 
     with pytest.raises(ForecastOutputError) as caught:
-        validate_output(forecast, config, question_id=QUESTION_ID, source_ids=PROMPT_SOURCES)
+        validate_output(forecast, config, question=_question("binary"), source_ids=PROMPT_SOURCES)
     assert caught.value.problems == expected
     # Catchable as the package's one response-failure type, BinaryOutputError's argument.
     assert isinstance(caught.value, ForecastSchemaError)
@@ -399,18 +546,26 @@ def test_a_caller_mistake_arrives_as_a_member_modules_error_not_a_raw_one() -> N
         output_problems(
             "not a response",  # type: ignore[arg-type]
             _committed_forecast_config(),
-            question_id=QUESTION_ID,
+            question=_question("binary"),
             source_ids=PROMPT_SOURCES,
         )
     with pytest.raises(BinaryOutputError):
         output_problems(
             _response("binary"),
             None,  # type: ignore[arg-type]
-            question_id=QUESTION_ID,
+            question=_question("binary"),
+            source_ids=PROMPT_SOURCES,
+        )
+    with pytest.raises(NumericOutputError):
+        output_problems(
+            _response("numeric"),
+            None,  # type: ignore[arg-type]
+            question=_question("numeric"),
             source_ids=PROMPT_SOURCES,
         )
     assert issubclass(AttributionFieldError, ForecastSchemaError)
     assert issubclass(BinaryOutputError, ForecastSchemaError)
+    assert issubclass(NumericOutputError, ForecastSchemaError)
     assert issubclass(ForecastOutputError, ForecastSchemaError)
 
 
@@ -432,7 +587,7 @@ def test_no_problem_string_and_no_traceback_echoes_the_response() -> None:
         validate_output(
             forecast,
             _committed_forecast_config(),
-            question_id=QUESTION_ID,
+            question=_question("binary"),
             source_ids=PROMPT_SOURCES,
         )
     exc = caught.value

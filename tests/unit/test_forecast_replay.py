@@ -49,6 +49,7 @@ from whiskeyjack_bot.forecast.record import (
     build_forecast_record_draft,
     record_sha256,
 )
+from whiskeyjack_bot.forecast.numeric import NumericOutputError
 from whiskeyjack_bot.forecast.replay import ForecastReplay, replay_forecast
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
@@ -57,8 +58,13 @@ from whiskeyjack_bot.forecast.schema import (
 )
 from whiskeyjack_bot.forecast.store import ModelCall, read_forecast_record, read_model_call
 from whiskeyjack_bot.ledger import connect, initialize_ledger
+from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
 from whiskeyjack_bot.lifecycle import transaction
-from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalMultipleChoiceQuestion,
+    CanonicalQuestion,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_TEXT = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
@@ -171,9 +177,13 @@ def _generation(**overrides: Any) -> ForecastGeneration:
     return ForecastGeneration(**fields)
 
 
-def _draft(generation: ForecastGeneration, attempt_id: str = ATTEMPT) -> ForecastRecordDraft:
+def _draft(
+    generation: ForecastGeneration,
+    attempt_id: str = ATTEMPT,
+    question: CanonicalQuestion | None = None,
+) -> ForecastRecordDraft:
     return build_forecast_record_draft(
-        question=_question(),
+        question=question if question is not None else _question(),
         generation=generation,
         tournament_id=TOURNAMENT,
         attempt_id=attempt_id,
@@ -231,13 +241,16 @@ def _config(tmp_path: Path, artifact_root: Path, **overrides: object) -> AppConf
 
 
 def _persist(
-    conn: sqlite3.Connection, config: AppConfig, generation: ForecastGeneration | None = None
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    generation: ForecastGeneration | None = None,
+    question: CanonicalQuestion | None = None,
 ) -> GenerationPersistence:
     generation = generation if generation is not None else _generation()
     return persist_generation(
         conn,
         config,
-        draft=_draft(generation),
+        draft=_draft(generation, question=question),
         generation=generation,
         written_at=WRITTEN_AT,
     )
@@ -274,6 +287,98 @@ def test_replay_reproduces_the_stored_forecast_hash(
     )
 
 
+MC_OPTIONS = ("Option one", "Option two")
+
+
+def _mc_overrides() -> dict[str, Any]:
+    """``_payload`` overrides that retype the prompt's shared fields as multiple choice."""
+    base = json.loads(_json_block("Shared fields"))["base_rate"]
+    return {
+        "question_type": "multiple_choice",
+        # The prompt's own rule, which ``schema.py`` enforces on this response type.
+        "model_prior": None,
+        "base_rate": {**base, "prior_probability": None},
+        "final_prediction": {
+            "options": [
+                {"option": MC_OPTIONS[0], "probability": 0.6},
+                {"option": MC_OPTIONS[1], "probability": 0.4},
+            ]
+        },
+    }
+
+
+def _mc_question() -> CanonicalMultipleChoiceQuestion:
+    return CanonicalMultipleChoiceQuestion(
+        question_id=QUESTION_ID,
+        post_id=POST_ID,
+        title="Which thing happens?",
+        options=list(MC_OPTIONS),
+    )
+
+
+def test_a_multiple_choice_record_replays_against_its_stored_option_list(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """M1-404 gave this module a branch, and nothing here reached it.
+
+    Every record built in this file is binary, so ``options`` was ``None`` on every replay
+    and the side of the branch that reads the stored question's option list was dead under
+    test. This is the happy path across it: a stored multiple-choice record must still
+    replay to its own hash.
+    """
+    config = _config(tmp_path, artifacts)
+    overrides = _mc_overrides()
+    generation = _generation(forecast=_response(**overrides), raw_responses=(_reply(**overrides),))
+    stored = _persist(conn, config, generation, question=_mc_question())
+    assert stored.record is not None
+    assert stored.record.question_type == "multiple_choice"
+
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+
+    assert result.matches, result.problems
+    assert result.problems == ()
+    assert result.replayed_sha256 == result.stored_sha256
+
+
+def test_a_replayed_multiple_choice_reply_is_checked_against_the_stored_options(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """The load-bearing negative for that branch.
+
+    Editing the stored reply to name an option the question never supplied must be caught
+    *by the option rules*, not merely produce a different hash -- which is what proves the
+    replay is running M1-404's checker with the record's own option list rather than
+    passing ``None`` and skipping it. A replay that skipped the check would re-parse this
+    reply cleanly and report a hash mismatch instead, so the two outcomes are
+    distinguishable and this asserts the right one.
+    """
+    config = _config(tmp_path, artifacts)
+    overrides = _mc_overrides()
+    generation = _generation(forecast=_response(**overrides), raw_responses=(_reply(**overrides),))
+    stored = _persist(conn, config, generation, question=_mc_question())
+    assert stored.record is not None
+    assert stored.raw_output_path is not None
+
+    path = artifacts / stored.raw_output_path
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    edited = json.loads(envelope["raw_responses"][0])
+    edited["final_prediction"]["options"][1]["option"] = "An option nobody offered"
+    envelope["raw_responses"] = [json.dumps(edited)]
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+
+    assert not result.matches
+    assert result.replayed_sha256 is None
+    assert list(result.problems) == [
+        "final_prediction.options: must name only options the question supplied "
+        "(offending labels withheld)",
+        "final_prediction.options: must name every option the question supplied "
+        "(offending labels withheld)",
+    ]
+    assert not any("An option nobody offered" in problem for problem in result.problems)
+
+
 def test_replay_re_derives_rather_than_reading_the_stored_answer_back(
     conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
 ) -> None:
@@ -307,6 +412,103 @@ def test_replay_re_derives_rather_than_reading_the_stored_answer_back(
     assert record_sha256(read_forecast_record(conn, stored.record.record_id)) == (
         result.stored_sha256
     )
+
+
+def _numeric_generation() -> ForecastGeneration:
+    """A numeric generation whose stored reply parses cleanly against a valid question."""
+    payload = {
+        **json.loads(_json_block("Shared fields")),
+        **json.loads("{" + _json_block("Numeric schema") + "}"),
+    }
+    payload["question_id"] = QUESTION_ID
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    forecast = validate_forecast_response(payload, response_model_for("numeric"))
+    return _generation(forecast=forecast, raw_responses=(json.dumps(payload),))
+
+
+def _numeric_question(**overrides: Any) -> CanonicalNumericQuestion:
+    fields: dict[str, Any] = {
+        "question_id": QUESTION_ID,
+        "post_id": POST_ID,
+        "title": "How many things?",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "cdf_size": 201,
+    }
+    fields.update(overrides)
+    return CanonicalNumericQuestion(**fields)
+
+
+def test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """M1-405 round 1, finding 2: a member checker's error must not escape this boundary.
+
+    ``CanonicalNumericQuestion`` accepts ``zero_point == lower_bound``, so does
+    ``ForecastRecordDraft``, and so did every writer before M1-405 registered a numeric
+    checker -- there was nothing to refuse it. The pinned SDK refuses such a question
+    outright, so ``numeric._require_question`` raises rather than reporting a repairable
+    problem, and ``forecast.generate`` refuses it in a preflight before anything is spent.
+
+    Replay has no preflight: it is reading a row that already exists. So the row is
+    ordinary, already in the ledger, and reaches ``_parse`` -- and this module's own
+    docstring says a raw ``ForecastSchemaError`` out of a public boundary is a review
+    finding here (it has been, three times now). It arrives as ``ForecastRecordError``,
+    the same translation ``response_model_for`` already had one line above.
+    """
+    config = _config(tmp_path, artifacts)
+    generation = _numeric_generation()
+    draft = build_forecast_record_draft(
+        question=_numeric_question(zero_point=0.0),
+        generation=generation,
+        tournament_id=TOURNAMENT,
+        attempt_id=ATTEMPT,
+        retrieval_run_id=RUN_ID,
+        research_packet_sha256="d" * 64,
+        generated_at=GENERATED_AT,
+    )
+    stored = persist_generation(
+        conn, config, draft=draft, generation=generation, written_at=WRITTEN_AT
+    )
+    assert stored.record is not None, "the writer accepts this question; that is the premise"
+
+    with pytest.raises(ForecastRecordError) as caught:
+        replay_forecast(conn, config, record_id=stored.record.record_id)
+    # Exact type, not isinstance: NumericOutputError also subclasses ForecastSchemaError,
+    # so an isinstance assertion here would pass on the unfixed code.
+    assert type(caught.value) is ForecastRecordError
+    assert not isinstance(caught.value, NumericOutputError)
+    # ``from None``: the chained cause would re-render the member's problem list.
+    assert caught.value.__cause__ is None
+
+
+def test_the_same_stored_row_replays_when_its_zero_point_is_satisfiable(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """The companion: the refusal above must be about the unsatisfiable pair and nothing
+    else, or every log-scaled numeric record would be unreplayable."""
+    config = _config(tmp_path, artifacts)
+    generation = _numeric_generation()
+    draft = build_forecast_record_draft(
+        question=_numeric_question(lower_bound=1.0, zero_point=0.5),
+        generation=generation,
+        tournament_id=TOURNAMENT,
+        attempt_id=ATTEMPT,
+        retrieval_run_id=RUN_ID,
+        research_packet_sha256="d" * 64,
+        generated_at=GENERATED_AT,
+    )
+    stored = persist_generation(
+        conn, config, draft=draft, generation=generation, written_at=WRITTEN_AT
+    )
+    assert stored.record is not None
+
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+    assert result.matches
+    assert result.problems == ()
 
 
 def test_a_reply_that_no_longer_parses_is_reported_and_not_raised(
