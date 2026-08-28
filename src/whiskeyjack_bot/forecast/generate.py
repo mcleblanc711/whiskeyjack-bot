@@ -405,6 +405,17 @@ def generate_forecast(
         forecast_config=config.forecast,
         settings=settings,
         sources=model_input.sources,
+        # From the *packet*, not from ``question.options``. ``build_model_input`` is what
+        # rendered these labels into the request under ``options``, so the checker
+        # compares the reply against the list the model was actually shown rather than
+        # against a second read of the same source. M1-501 records the converse as a
+        # standing risk for ``source_ids`` -- that this module is handed the mapping
+        # rather than the request -- and there is no reason to reproduce it here. It is
+        # ``None`` for every non-multiple-choice question, which is what
+        # ``validate.output_problems`` pairs against the response type.
+        options=(
+            tuple(model_input.packet.options) if model_input.packet.options is not None else None
+        ),
         question_id=question.question_id,
         request=request,
     )
@@ -446,6 +457,7 @@ def _run_attempts(
     forecast_config: ForecastConfig,
     settings: ModelSettings,
     sources: tuple[SourceReference, ...],
+    options: tuple[str, ...] | None,
     question_id: int,
     request: str,
 ) -> ForecastGeneration:
@@ -490,6 +502,7 @@ def _run_attempts(
             forecast_config,
             question_id=question_id,
             source_ids=source_ids,
+            options=options,
         )
         if forecast is not None:
             return _result(

@@ -122,6 +122,28 @@ def _response(question_type: str = "binary", **overrides: Any) -> ForecastRespon
     return validate_forecast_response(payload, response_model_for(payload["question_type"]))
 
 
+# The two labels the prompt's own multiple-choice example answers. Read back out of the
+# prompt rather than restated, so the question's option list and the reply that names it
+# are a matched pair by construction -- a hand-written fixture could drift away from the
+# prompt and turn every M1-404 test here green against a reply no model would send.
+PROMPT_OPTIONS: tuple[str, ...] = tuple(
+    entry["option"]
+    for entry in json.loads("{" + _json_block(HEADINGS["multiple_choice"]) + "}")[
+        "final_prediction"
+    ]["options"]
+)
+
+
+def _options_for(question_type: Any) -> tuple[str, ...] | None:
+    """What ``output_problems`` pairs with a response of this type (M1-404).
+
+    The entry point requires the argument and refuses a mismatch in both directions, so
+    every caller has to make this decision; this is the one a real caller makes, which is
+    why the helper derives it from the response rather than taking it as a parameter.
+    """
+    return PROMPT_OPTIONS if question_type == "multiple_choice" else None
+
+
 def _problems(
     forecast: ForecastResponse,
     config: ForecastConfig | None = None,
@@ -132,6 +154,7 @@ def _problems(
         config if config is not None else _committed_forecast_config(),
         question_id=QUESTION_ID,
         source_ids=sources,
+        options=_options_for(forecast.question_type),
     )
 
 
@@ -280,6 +303,98 @@ def test_the_type_specific_rules_reach_binary() -> None:
     ]
 
 
+def test_the_type_specific_rules_reach_multiple_choice() -> None:
+    """M1-404's option-set rule, through the composed entry point rather than directly.
+
+    The sibling of ``test_the_type_specific_rules_reach_binary``, and the reason it exists
+    is that ``multiple_choice`` was the registry's ``None`` entry until this item: a
+    composition that reached only the entry it already had would have been green for the
+    whole of M1-506 and green again now.
+    """
+    forecast = _response("multiple_choice")
+    problems = output_problems(
+        forecast,
+        _committed_forecast_config(),
+        question_id=QUESTION_ID,
+        source_ids=PROMPT_SOURCES,
+        # Labels the prompt's example never answers, so *missing* bites; the labels it
+        # does answer are then unknown, so *unknown* bites too. Two of them rather than
+        # one because a singleton supplied list is a caller mistake (M1-404 round 1): the
+        # sum and bounds rules cover the line between them, so no reply could satisfy it.
+        options=("Some other option", "Yet another option"),
+    )
+    assert problems == [
+        "final_prediction.options: must name only options the question supplied "
+        "(offending labels withheld)",
+        "final_prediction.options: must name every option the question supplied "
+        "(offending labels withheld)",
+    ]
+
+
+def test_the_option_list_and_the_question_type_are_paired_in_both_directions() -> None:
+    """M1-404's pairing gate, which is a caller mistake rather than a repair turn.
+
+    Both directions, for ``test_every_supported_type_has_an_explicit_registry_entry``'s
+    reason: a one-directional gate is green for one of the two defects. Supplying nothing
+    for a multiple-choice response would let it pass the only type-specific check that
+    type has; supplying a list for a binary one means the caller has paired a question
+    with another question's answer.
+    """
+    config = _committed_forecast_config()
+    expected = [
+        "options: must be supplied for a multiple-choice question and null for every "
+        "other question type"
+    ]
+
+    with pytest.raises(ForecastOutputError) as missing:
+        output_problems(
+            _response("multiple_choice"),
+            config,
+            question_id=QUESTION_ID,
+            source_ids=PROMPT_SOURCES,
+            options=None,
+        )
+    assert missing.value.problems == expected
+
+    for question_type in ("binary", "numeric"):
+        with pytest.raises(ForecastOutputError) as spurious:
+            output_problems(
+                _response(question_type),
+                config,
+                question_id=QUESTION_ID,
+                source_ids=PROMPT_SOURCES,
+                options=PROMPT_OPTIONS,
+            )
+        assert spurious.value.problems == expected, question_type
+
+    # And the paired calls do not raise -- without this the property above is satisfied by
+    # a gate that refuses everything.
+    assert _problems(_response("multiple_choice")) == []
+    assert _problems(_response("binary")) == []
+
+
+def test_the_pairing_gate_runs_after_the_question_type_gate() -> None:
+    """An unregistered type reports *that*, not a missing option list.
+
+    Order matters here: the pairing rule is stated in terms of the question type, so a
+    response whose type this table does not cover has no pairing to check, and reporting
+    the option list would send a caller looking in the wrong place.
+    """
+    forecast = _response("binary")
+    object.__setattr__(forecast, "question_type", "date")
+    with pytest.raises(ForecastOutputError) as caught:
+        output_problems(
+            forecast,
+            _committed_forecast_config(),
+            question_id=QUESTION_ID,
+            source_ids=PROMPT_SOURCES,
+            options=PROMPT_OPTIONS,
+        )
+    assert caught.value.problems == [
+        "question_type: must be one of binary, multiple_choice, numeric (offending input withheld)"
+    ]
+
+
 def test_the_composition_runs_attribution_first_then_the_type_specific_layer() -> None:
     """The order is part of the contract: it is what a repair turn renders, and it is the
     order the two layers are documented in.
@@ -329,6 +444,7 @@ def test_validate_output_returns_a_clean_response_unchanged(question_type: str) 
         _committed_forecast_config(),
         question_id=QUESTION_ID,
         source_ids=PROMPT_SOURCES,
+        options=_options_for(question_type),
     )
     assert returned is forecast
 
@@ -348,7 +464,13 @@ def test_validate_output_raises_with_exactly_the_problems_the_other_half_returns
     assert len(expected) > 1, "one problem from each layer, or this proves nothing"
 
     with pytest.raises(ForecastOutputError) as caught:
-        validate_output(forecast, config, question_id=QUESTION_ID, source_ids=PROMPT_SOURCES)
+        validate_output(
+            forecast,
+            config,
+            question_id=QUESTION_ID,
+            source_ids=PROMPT_SOURCES,
+            options=None,
+        )
     assert caught.value.problems == expected
     # Catchable as the package's one response-failure type, BinaryOutputError's argument.
     assert isinstance(caught.value, ForecastSchemaError)
@@ -401,6 +523,7 @@ def test_a_caller_mistake_arrives_as_a_member_modules_error_not_a_raw_one() -> N
             _committed_forecast_config(),
             question_id=QUESTION_ID,
             source_ids=PROMPT_SOURCES,
+            options=None,
         )
     with pytest.raises(BinaryOutputError):
         output_problems(
@@ -408,6 +531,7 @@ def test_a_caller_mistake_arrives_as_a_member_modules_error_not_a_raw_one() -> N
             None,  # type: ignore[arg-type]
             question_id=QUESTION_ID,
             source_ids=PROMPT_SOURCES,
+            options=None,
         )
     assert issubclass(AttributionFieldError, ForecastSchemaError)
     assert issubclass(BinaryOutputError, ForecastSchemaError)
@@ -434,6 +558,7 @@ def test_no_problem_string_and_no_traceback_echoes_the_response() -> None:
             _committed_forecast_config(),
             question_id=QUESTION_ID,
             source_ids=PROMPT_SOURCES,
+            options=None,
         )
     exc = caught.value
     rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))

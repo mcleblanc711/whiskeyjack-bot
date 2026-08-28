@@ -28,7 +28,8 @@ Scope, settled with the owner before any code. This module owns everything that 
 and the one cross-field rule the prompt states outright (a non-binary question has no
 ``prior_probability`` and no ``model_prior``). It deliberately does not read the
 question's option list, its numeric bounds, or ``forecast.min_probability`` /
-``forecast.max_probability`` -- those are M1-404, M1-405 and M1-403 respectively, and
+``forecast.max_probability`` -- those are ``forecast/multiple_choice.py`` (M1-404),
+M1-405 and ``forecast/binary.py`` (M1-403) respectively, and
 each is that row's stated acceptance criterion.
 
 Models are strict (``extra="forbid"``, reusing ``config._StrictModel``). Use
@@ -186,7 +187,10 @@ class MultipleChoicePrediction(_ResponsePart):
 
     That every *supplied* option appears exactly once and that the probabilities sum
     to 1 within 1e-6 is M1-404's acceptance criterion: both need the question's option
-    list, which this module does not read.
+    list, which this module does not read. **That rule now exists**, in
+    ``forecast/multiple_choice.py``, reached through ``forecast.validate``; this
+    docstring used to stop at "which this module does not read", and a pointer that says
+    only where a rule is *not* is how M1-501 lost a round.
     """
 
     options: list[OptionProbability] = Field(min_length=1)

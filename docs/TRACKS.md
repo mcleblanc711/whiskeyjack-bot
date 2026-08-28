@@ -41,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-609 | feat/m1-609-verify-foreign-keys | whiskeyjack-m1-609 | no | none | 2026-08-25 |
+| M1-404 | feat/m1-404-multiple-choice-output | whiskeyjack-m1-404 | no | none | 2026-08-26 |
 *(rows above; each lands on its own branch as it starts — see the planned wave below)*
 
 ## Planned next wave
@@ -67,7 +68,7 @@ they would otherwise both edit (lesson 1 — a seam that changes underneath an o
 
 | Lane | Items, in order | Notes |
 | --- | --- | --- |
-| 1 — critical path | **`M1-506`** → then `M1-405` ∥ `M1-404` **in parallel** | `M1-506` exposes one public composed output-validation entry point as a **table keyed on the `question_type` literal** with an explicit entry per supported type. That shape is what reduces `M1-404` and `M1-405` to one changed line each in the shared file, so the two can run concurrently instead of serially. `M1-405` (Critical) unblocks `M1-503` → `T-904`; `M1-404` unblocks `M1-502`; `M2-707` needs both. |
+| 1 — critical path | **`M1-506`** → then `M1-405` ∥ `M1-404` **in parallel** | `M1-506` exposes one public composed output-validation entry point as a **table keyed on the `question_type` literal** with an explicit entry per supported type. That shape is what lets `M1-404` and `M1-405` run concurrently instead of serially. **Corrected 2026-08-26, after `M1-404` shipped:** this used to say the shape reduced both to "one changed line each", and for `M1-404` it did not. Registering a checker is one line, but the multiple-choice rule needs the question's option list, which neither the response nor the config carries — so the entry point, the table's callable type, `parse._parse`, `generate._run_attempts` and `replay.replay_forecast` all grew an `options` argument. `M1-405` may still be the one-line case; it should not assume so. `M1-405` (Critical) unblocks `M1-503` → `T-904`; `M1-404` unblocks `M1-502`; `M2-707` needs both. |
 | 2 — M2 path | **`M2-711`** | Records a submission whose outcome no refetch established — the `(False, False)` cell that today reads as terminal `submission_failed`, which is more than the ledger knows. Needs a lifecycle vocabulary member and therefore **migration `009`**, claimed above. No `forecast/` overlap with lane 1. |
 | 3 — debt queue | **`M1-609`** → `M2-710` → `M1-608` → `M1-314` → `M2-709` | One branch each, sequentially. Every one closes a deferral already filed off a previous review, which is `docs/LESSONS.md` checklist item 4 paid down rather than re-reported as a finding next round. All sized S. |
 

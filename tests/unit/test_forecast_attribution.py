@@ -454,6 +454,9 @@ def test_the_two_checkers_compose_so_a_priorless_binary_forecast_is_refused() ->
         _committed_forecast_config(),
         question_id=QUESTION_ID,
         source_ids=PROMPT_SOURCES,
+        # Required since M1-404, and ``None`` is the answer for a binary question: the
+        # entry point pairs the option list with the response type in both directions.
+        options=None,
     )
     assert composed == [
         "base_rate.prior_probability: must be supplied for a binary question",

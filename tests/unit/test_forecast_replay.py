@@ -58,7 +58,11 @@ from whiskeyjack_bot.forecast.schema import (
 from whiskeyjack_bot.forecast.store import ModelCall, read_forecast_record, read_model_call
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import transaction
-from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalMultipleChoiceQuestion,
+    CanonicalQuestion,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_TEXT = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
@@ -171,9 +175,13 @@ def _generation(**overrides: Any) -> ForecastGeneration:
     return ForecastGeneration(**fields)
 
 
-def _draft(generation: ForecastGeneration, attempt_id: str = ATTEMPT) -> ForecastRecordDraft:
+def _draft(
+    generation: ForecastGeneration,
+    attempt_id: str = ATTEMPT,
+    question: CanonicalQuestion | None = None,
+) -> ForecastRecordDraft:
     return build_forecast_record_draft(
-        question=_question(),
+        question=question if question is not None else _question(),
         generation=generation,
         tournament_id=TOURNAMENT,
         attempt_id=attempt_id,
@@ -231,13 +239,16 @@ def _config(tmp_path: Path, artifact_root: Path, **overrides: object) -> AppConf
 
 
 def _persist(
-    conn: sqlite3.Connection, config: AppConfig, generation: ForecastGeneration | None = None
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    generation: ForecastGeneration | None = None,
+    question: CanonicalQuestion | None = None,
 ) -> GenerationPersistence:
     generation = generation if generation is not None else _generation()
     return persist_generation(
         conn,
         config,
-        draft=_draft(generation),
+        draft=_draft(generation, question=question),
         generation=generation,
         written_at=WRITTEN_AT,
     )
@@ -272,6 +283,98 @@ def test_replay_reproduces_the_stored_forecast_hash(
         cost_usd=0.25,
         model_invocations=1,
     )
+
+
+MC_OPTIONS = ("Option one", "Option two")
+
+
+def _mc_overrides() -> dict[str, Any]:
+    """``_payload`` overrides that retype the prompt's shared fields as multiple choice."""
+    base = json.loads(_json_block("Shared fields"))["base_rate"]
+    return {
+        "question_type": "multiple_choice",
+        # The prompt's own rule, which ``schema.py`` enforces on this response type.
+        "model_prior": None,
+        "base_rate": {**base, "prior_probability": None},
+        "final_prediction": {
+            "options": [
+                {"option": MC_OPTIONS[0], "probability": 0.6},
+                {"option": MC_OPTIONS[1], "probability": 0.4},
+            ]
+        },
+    }
+
+
+def _mc_question() -> CanonicalMultipleChoiceQuestion:
+    return CanonicalMultipleChoiceQuestion(
+        question_id=QUESTION_ID,
+        post_id=POST_ID,
+        title="Which thing happens?",
+        options=list(MC_OPTIONS),
+    )
+
+
+def test_a_multiple_choice_record_replays_against_its_stored_option_list(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """M1-404 gave this module a branch, and nothing here reached it.
+
+    Every record built in this file is binary, so ``options`` was ``None`` on every replay
+    and the side of the branch that reads the stored question's option list was dead under
+    test. This is the happy path across it: a stored multiple-choice record must still
+    replay to its own hash.
+    """
+    config = _config(tmp_path, artifacts)
+    overrides = _mc_overrides()
+    generation = _generation(forecast=_response(**overrides), raw_responses=(_reply(**overrides),))
+    stored = _persist(conn, config, generation, question=_mc_question())
+    assert stored.record is not None
+    assert stored.record.question_type == "multiple_choice"
+
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+
+    assert result.matches, result.problems
+    assert result.problems == ()
+    assert result.replayed_sha256 == result.stored_sha256
+
+
+def test_a_replayed_multiple_choice_reply_is_checked_against_the_stored_options(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """The load-bearing negative for that branch.
+
+    Editing the stored reply to name an option the question never supplied must be caught
+    *by the option rules*, not merely produce a different hash -- which is what proves the
+    replay is running M1-404's checker with the record's own option list rather than
+    passing ``None`` and skipping it. A replay that skipped the check would re-parse this
+    reply cleanly and report a hash mismatch instead, so the two outcomes are
+    distinguishable and this asserts the right one.
+    """
+    config = _config(tmp_path, artifacts)
+    overrides = _mc_overrides()
+    generation = _generation(forecast=_response(**overrides), raw_responses=(_reply(**overrides),))
+    stored = _persist(conn, config, generation, question=_mc_question())
+    assert stored.record is not None
+    assert stored.raw_output_path is not None
+
+    path = artifacts / stored.raw_output_path
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    edited = json.loads(envelope["raw_responses"][0])
+    edited["final_prediction"]["options"][1]["option"] = "An option nobody offered"
+    envelope["raw_responses"] = [json.dumps(edited)]
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+
+    assert not result.matches
+    assert result.replayed_sha256 is None
+    assert list(result.problems) == [
+        "final_prediction.options: must name only options the question supplied "
+        "(offending labels withheld)",
+        "final_prediction.options: must name every option the question supplied "
+        "(offending labels withheld)",
+    ]
+    assert not any("An option nobody offered" in problem for problem in result.problems)
 
 
 def test_replay_re_derives_rather_than_reading_the_stored_answer_back(
