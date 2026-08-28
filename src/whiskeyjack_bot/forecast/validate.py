@@ -3,9 +3,9 @@
 The checks a valid response must pass are split across modules **on purpose**, and that
 split is not what this item changes. ``forecast/attribution.py`` owns the cross-type
 rules (M1-501); ``forecast/binary.py`` owns the binary-specific ones (M1-403);
-``forecast/multiple_choice.py`` owns the option set and its distribution (M1-404); M1-405
-will own the numeric percentile levels. Each rule lives with the type it is a rule about,
-and each module states why.
+``forecast/numeric.py`` owns the percentile levels, ordering and bound compatibility
+(M1-405); ``forecast/multiple_choice.py`` owns the option set and its distribution
+(M1-404). Each rule lives with the type it is a rule about, and each module states why.
 
 What was wrong was the **seam**. ``parse._output_problems`` composed them, but it was
 private with a single caller, so every other caller -- ``forecast/store.py`` validating a
@@ -31,34 +31,69 @@ gotcha ``questions/normalize.py`` carries the regression test for. Every support
 holds an **explicit** entry, ``None`` where the checker is not written yet, so
 "decided, and there is nothing" is distinguishable from "forgotten".
 
-**M1-404 widened the checker signature, and the note that it would be "one changed line"
-was wrong.** Registering a checker *is* one line, but the multiple-choice rule needs the
-question's option list -- neither the response nor the config carries it -- so the entry
-point, this table's callable type and both call sites above it grew an ``options``
-argument. It is a required keyword rather than a defaulted one, the same "``None`` is a
-decision, not a gap" rule this table applies to its own entries: a caller must say which
-it means, because a multiple-choice response validated against no option list would pass
-the only type-specific check that type has.
+**Both M1-404 and M1-405 widened the checker signature, and the prediction they
+falsified is worth keeping.** This paragraph used to end "and M1-404/M1-405 each become one
+changed line", and ``docs/TRACKS.md`` planned the wave around that. It held for the
+*registration* and not for the signature: M1-405's criterion is "percentile levels are
+exact; values are finite, ordered and **compatible with question bounds**" and M1-404's is
+"every exact option once", and nothing on this path carried a question. So every checker now
+takes ``(response, ForecastConfig, CanonicalQuestion)``.
 
-Imports no provider SDK and no question model, like ``schema``, ``binary``, ``attribution``
+**The two items reached that conclusion independently and by different routes, and this is
+where they converged.** M1-404 merged first, carrying a keyword-only ``options: Sequence[str]
+| None`` threaded from ``ModelInput.packet`` beside a bare ``question_id: int``; M1-405
+replaced the id with the question itself. Carrying both would have been the same data reached
+two ways inside one entry point -- ``inputs.py`` builds the packet field as
+``list(question.options)``, so they cannot differ -- which is the second-source-of-truth shape
+M2-703's round-1 review filed a lesson about, and the same lesson that removed ``question_id``
+here. So the option list is now read from the question like every other question fact, the
+separate argument is gone, and ``multiple_choice_output_problems`` takes the question.
+
+Two things fell out of that rather than being designed. M1-404's **biconditional option/type
+pairing gate is retired**: it existed to catch a multiple-choice response validated against no
+option list, or an option list handed to another type, and neither is expressible once the
+list comes from the question the ``qtype`` gate below already pairs. And M1-404's standing
+risk -- that nothing verified the packet copy against the labels the request rendered -- is
+retired with it, because there is no copy.
+
+The alternative was a per-type adapter narrowing the third argument, which the note on
+``_TypeChecker`` below rejects for the same reason it rejected one for the first: an
+adapter is a second place per type to edit, and this table exists so there is one.
+Widening every checker instead means the type that needs the question and the type that
+does not are registered identically, and a checker spends the argument it does not need on
+an exact-type gate (``binary.py``). M1-404 inherits the widened signature and does get its
+one changed line.
+
+**``question_id`` is gone from this signature, replaced by the question it was a copy of.**
+Carrying both would make one entry point hold two sources of truth for the same fact and
+then cross-check them, which is precisely what M2-703's review said to remove rather than
+guard. ``attribution_problems`` still takes the primitive -- that module's independence
+from the question model is a property of its own interface, and it says so -- and this
+function passes ``question.question_id`` to it.
+
+Imports no provider SDK and no HTTP client, like ``schema``, ``binary``, ``attribution``
 and ``parse``: a replay path (M1-406) and the persist path (M1-507) must both reach this
-with the provider client not importable at all.
+with the provider client not importable at all. ``questions/model.py`` is on the clean side
+of that line and has been imported by ``forecast/inputs.py`` since M1-402, with the
+import-graph probe pinning both.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, Protocol, TypeVar
+from collections.abc import Callable, Sequence
+from typing import Any, TypeVar
 
 from whiskeyjack_bot.config import ForecastConfig
 from whiskeyjack_bot.forecast.attribution import attribution_problems
 from whiskeyjack_bot.forecast.binary import binary_output_problems
 from whiskeyjack_bot.forecast.multiple_choice import multiple_choice_output_problems
+from whiskeyjack_bot.forecast.numeric import numeric_output_problems
 from whiskeyjack_bot.forecast.schema import (
     SUPPORTED_RESPONSE_TYPES,
     ForecastResponse,
     ForecastSchemaError,
 )
+from whiskeyjack_bot.questions.model import CanonicalQuestion, _CanonicalQuestionBase
 
 # Bound to the *union*, not to ``schema.ForecastResponseT``'s broader
 # ``_ForecastResponseBase``: ``validate_output`` returns the response it was handed, and a
@@ -67,35 +102,26 @@ from whiskeyjack_bot.forecast.schema import (
 # :func:`output_problems` without a cast.
 _ResponseT = TypeVar("_ResponseT", bound=ForecastResponse)
 
-
-class _TypeChecker(Protocol):
-    """One type-specific checker: a response, the config and the question's options.
-
-    A ``Protocol`` rather than a ``Callable`` alias because ``options`` is keyword-only
-    and ``Callable`` cannot spell that. Keyword-only is what keeps the table uniform
-    without every checker having to accept the argument positionally in an order it does
-    not care about: ``binary_output_problems`` declares ``options`` and never reads it.
-
-    ``Any`` for the response, deliberately and narrowly. ``binary_output_problems`` takes
-    a ``BinaryForecastResponse``, so it is not assignable to a signature declared over the
-    ``ForecastResponse`` union -- parameters are contravariant, and mypy --strict is right
-    to say so. The narrowing this table relies on is a *runtime* fact it cannot express:
-    the lookup is keyed on ``question_type``, and every checker exact-type gates its own
-    argument anyway (``binary.py`` raises ``BinaryOutputError`` for a response of another
-    type), so a mis-keyed entry surfaces as that module's own error rather than as a wrong
-    answer. The alternative -- a per-type adapter with a narrowing ``isinstance`` -- would
-    put a second place per type for M1-405 to edit, which is the cost this shape exists to
-    avoid.
-    """
-
-    def __call__(
-        self,
-        forecast: Any,
-        forecast_config: ForecastConfig,
-        *,
-        options: Sequence[str] | None,
-    ) -> list[str]: ...
-
+# One type-specific checker: a response and the config, returning sanitized problems.
+#
+# ``Any`` for the response, deliberately and narrowly. ``binary_output_problems`` takes a
+# ``BinaryForecastResponse``, so it is not assignable to a ``Callable`` declared over the
+# ``ForecastResponse`` union -- parameters are contravariant, and mypy --strict is right to
+# say so. The narrowing this table relies on is a *runtime* fact it cannot express: the
+# lookup is keyed on ``question_type``, and every checker exact-type gates its own argument
+# anyway (``binary.py`` raises ``BinaryOutputError`` for a response of another type), so a
+# mis-keyed entry surfaces as that module's own error rather than as a wrong answer. The
+# alternative -- a per-type adapter with a narrowing ``isinstance`` -- would put a second
+# place per type for M1-404 and M1-405 to edit, which is the cost this shape exists to
+# avoid.
+#
+# ``Any`` for the question, for the same reason and one more: the checkers disagree about
+# which canonical subclass they want (``binary_output_problems`` gates a
+# ``CanonicalBinaryQuestion``, ``numeric_output_problems`` a ``CanonicalNumericQuestion``),
+# and no single ``Callable`` type covers both without an adapter. The pairing is a runtime
+# fact this table cannot express either -- so ``output_problems`` checks it once, centrally,
+# before the lookup, and each checker still gates its own argument.
+_TypeChecker = Callable[[Any, ForecastConfig, Any], list[str]]
 
 # Keyed on the question-type literal, never on isinstance (see the module docstring).
 # ``None`` is a decision, not a gap: the type is supported, and it has no type-specific
@@ -104,8 +130,7 @@ class _TypeChecker(Protocol):
 _TYPE_CHECKERS: dict[str, _TypeChecker | None] = {
     "binary": binary_output_problems,
     "multiple_choice": multiple_choice_output_problems,
-    # M1-405 registers the percentile-level checker here.
-    "numeric": None,
+    "numeric": numeric_output_problems,
 }
 
 # The vocabulary the message below names is ``schema``'s, reused rather than recomputed
@@ -133,9 +158,8 @@ def output_problems(
     forecast: ForecastResponse,
     forecast_config: ForecastConfig,
     *,
-    question_id: int,
+    question: CanonicalQuestion,
     source_ids: Sequence[str],
-    options: Sequence[str] | None,
 ) -> list[str]:
     """Every output problem with one response, of any supported question type.
 
@@ -153,17 +177,27 @@ def output_problems(
     to log, to store, and to send back to the model as a repair turn. The order is stable:
     attribution problems, then type-specific ones.
 
-    ``options`` is the question's own option list for a multiple-choice question and
-    ``None`` for every other type, and it is **required** rather than defaulted: see the
-    module header. The two are paired in one direction and the other, below.
+    ``question`` is the canonical question this response is a forecast *of*. It replaced a
+    bare ``question_id`` when M1-405 needed the numeric bounds: the id is a field of the
+    question, and holding both would be two sources of truth inside one entry point.
+    ``attribution_problems`` is handed ``question.question_id``, keeping that module free of
+    the question model as its own docstring requires.
 
     Raises only for a caller mistake, never for a problem with the model's output: the
-    member checkers raise their own ``ForecastSchemaError`` subclasses for a response or a
-    config of the wrong type, and this function raises :class:`ForecastOutputError` for a
-    response whose ``question_type`` no entry covers, or for an ``options`` argument that
-    does not match the response's type. Those must never become a repair turn.
+    member checkers raise their own ``ForecastSchemaError`` subclasses for a response, a
+    config or a question of the wrong type, and this function raises
+    :class:`ForecastOutputError` for a response whose ``question_type`` no entry covers, or
+    for a question that is not one about this response's type. Those must never become a
+    repair turn.
     """
-    problems = attribution_problems(forecast, question_id=question_id, source_ids=source_ids)
+    if not isinstance(question, _CanonicalQuestionBase):
+        # Before anything else, because ``question.question_id`` is read on the next line
+        # and a raw AttributeError escaping this package is the defect it has taken as a
+        # review finding twice.
+        raise ForecastOutputError(["question: must be a canonical question"])
+    problems = attribution_problems(
+        forecast, question_id=question.question_id, source_ids=source_ids
+    )
 
     # Exact-type gate before the lookup, ``schema.response_model_for``'s rule: a str
     # subclass is unvetted and an unhashable value makes ``dict.get`` raise a raw
@@ -185,28 +219,17 @@ def output_problems(
                 + " (offending input withheld)"
             ]
         )
-    # The option list and the question type are paired, in **both** directions, and the
-    # rule lives here rather than in the member checkers because this is the only layer
-    # that sees both for *every* supported type -- including the ones whose entry is still
-    # ``None``, which have no checker to hold a rule of their own. A one-directional gate
-    # would be green for one of the two defects, which is the argument
-    # ``test_every_supported_type_has_an_explicit_registry_entry`` makes for asserting set
-    # equality both ways.
-    #
-    # It is a caller mistake, not a repair turn: a multiple-choice response validated
-    # against no option list would silently pass the only type-specific check that type
-    # has, and an option list handed to a binary response means the caller has paired a
-    # question with another question's answer.
-    if (question_type == "multiple_choice") is not (options is not None):
-        raise ForecastOutputError(
-            [
-                "options: must be supplied for a multiple-choice question and null for "
-                "every other question type"
-            ]
-        )
+    if question.qtype != question_type:
+        # The pairing check, made once and centrally so each checker can gate only its own
+        # argument rather than the relationship between two of them. A question of one type
+        # with a response of another is a caller mistake on any reading, and it is the one
+        # mistake a per-checker gate would report as the *question* being wrong when the
+        # response may be what is wrong. Neither type is named: both are already in the
+        # vocabulary the message above prints.
+        raise ForecastOutputError(["question: must be a question of the same type as the response"])
     checker = _TYPE_CHECKERS[question_type]
     if checker is not None:
-        problems.extend(checker(forecast, forecast_config, options=options))
+        problems.extend(checker(forecast, forecast_config, question))
     return problems
 
 
@@ -214,9 +237,8 @@ def validate_output(
     forecast: _ResponseT,
     forecast_config: ForecastConfig,
     *,
-    question_id: int,
+    question: CanonicalQuestion,
     source_ids: Sequence[str],
-    options: Sequence[str] | None,
 ) -> _ResponseT:
     """Return the response unchanged, or raise with every sanitized problem.
 
@@ -236,13 +258,7 @@ def validate_output(
     quietly edited, or whose probability was silently pulled inside the configured bounds,
     is precisely the record the ledger could not stand behind.
     """
-    problems = output_problems(
-        forecast,
-        forecast_config,
-        question_id=question_id,
-        source_ids=source_ids,
-        options=options,
-    )
+    problems = output_problems(forecast, forecast_config, question=question, source_ids=source_ids)
     if problems:
         raise ForecastOutputError(problems)
     return forecast

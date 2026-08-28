@@ -206,25 +206,29 @@ def replay_forecast(
         raise ForecastRecordError(str(exc)) from None
 
     source_ids = tuple(source.source_id for source in record.sources)
-    # M1-404's option set, from the **stored question** rather than from anywhere else.
-    # A replay that re-ran the parse against a different option list would verify a
-    # different function than the one that produced the record, which is the whole reason
-    # this path re-runs ``_parse`` instead of reimplementing it. The record carries the
-    # canonical question it was forecast for, and ``build_model_input`` copied that same
-    # list into the request at generation time, so the two provably agree.
-    #
-    # Dispatch on the ``qtype`` literal, never ``isinstance``: ``DiscreteQuestion``
-    # subclasses ``NumericQuestion`` in the pinned SDK and this project's canonical models
-    # mirror its vocabulary, so an ``isinstance`` ladder is the project's stated gotcha.
-    options = tuple(record.question.options) if record.question.qtype == "multiple_choice" else None
-    forecast, problems = _parse(
-        stored.raw_responses[-1],
-        model,
-        config.forecast,
-        question_id=record.question_id,
-        source_ids=source_ids,
-        options=options,
-    )
+    try:
+        forecast, problems = _parse(
+            stored.raw_responses[-1],
+            model,
+            config.forecast,
+            question=record.question,
+            source_ids=source_ids,
+        )
+    except ForecastSchemaError as exc:
+        # The same translation as ``response_model_for`` above, for the same reason, and
+        # round 1 found the path: ``_parse`` reaches the type-specific checkers, and those
+        # refuse a *question* they cannot check a forecast against -- ``numeric``'s is a
+        # ``zero_point`` at or above ``lower_bound``, which ``CanonicalNumericQuestion``
+        # and ``ForecastRecordDraft`` both accept and which every writer accepted before
+        # M1-405 registered a numeric checker at all. So the state is ordinary, already in
+        # the ledger, and not something a replay may crash on with another module's
+        # exception type.
+        #
+        # The generating path needs no such handler: ``generate_forecast`` refuses that
+        # question in its preflight before anything is spent. Replay has no preflight --
+        # it is reading a row that already exists -- which is exactly why the boundary is
+        # here. ``from None`` because the chained cause would re-render the problem list.
+        raise ForecastRecordError(str(exc)) from None
     if forecast is None:
         return ForecastReplay(
             record_id=record.record_id,

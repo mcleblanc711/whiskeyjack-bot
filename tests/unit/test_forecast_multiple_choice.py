@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 import yaml
 
 from whiskeyjack_bot.config import ForecastConfig, validate_config_data
@@ -33,6 +34,10 @@ from whiskeyjack_bot.forecast.multiple_choice import (
     MultipleChoiceOutputError,
     multiple_choice_output_problems,
     validate_multiple_choice_output,
+)
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalMultipleChoiceQuestion,
 )
 from whiskeyjack_bot.forecast.schema import (
     ForecastSchemaError,
@@ -128,6 +133,22 @@ def _answers(*pairs: tuple[str, float]) -> list[dict[str, Any]]:
     return [{"option": option, "probability": probability} for option, probability in pairs]
 
 
+def _question(options: Any = PROMPT_OPTIONS) -> CanonicalMultipleChoiceQuestion:
+    """The canonical question this checker reads its option list from.
+
+    It used to be handed the labels as bare primitives. At the M1-404/M1-405 merge the
+    checker took the validated question instead, so the option list a test wants is now
+    expressed by building the question that carries it -- and every shape the old
+    primitive guard refused is refused here, by the model, at the input contract.
+    """
+    return CanonicalMultipleChoiceQuestion(
+        question_id=123,
+        post_id=456,
+        title="Which option?",
+        options=list(options),
+    )
+
+
 def _problems(
     forecast: MultipleChoiceForecastResponse,
     options: Any = PROMPT_OPTIONS,
@@ -136,7 +157,7 @@ def _problems(
     return multiple_choice_output_problems(
         forecast,
         config if config is not None else _committed_forecast_config(),
-        options=options,
+        _question(options),
     )
 
 
@@ -157,9 +178,7 @@ def test_the_prompts_own_example_validates_against_its_own_option_list() -> None
     forecast = _response()
     assert _problems(forecast) == []
     assert (
-        validate_multiple_choice_output(
-            forecast, _committed_forecast_config(), options=PROMPT_OPTIONS
-        )
+        validate_multiple_choice_output(forecast, _committed_forecast_config(), _question())
         is forecast
     )
 
@@ -265,9 +284,7 @@ def test_nothing_is_clamped_dropped_or_renormalized() -> None:
     assert forecast.model_dump(mode="json") == before
 
     good = _response()
-    returned = validate_multiple_choice_output(
-        good, _committed_forecast_config(), options=PROMPT_OPTIONS
-    )
+    returned = validate_multiple_choice_output(good, _committed_forecast_config(), _question())
     assert returned is good
     assert [entry.probability for entry in returned.final_prediction.options] == [0.55, 0.45]
 
@@ -277,9 +294,7 @@ def test_the_raising_entry_point_carries_the_same_problems() -> None:
     expected = _problems(forecast)
     assert len(expected) > 1, "more than one problem, or this proves nothing"
     with pytest.raises(MultipleChoiceOutputError) as caught:
-        validate_multiple_choice_output(
-            forecast, _committed_forecast_config(), options=PROMPT_OPTIONS
-        )
+        validate_multiple_choice_output(forecast, _committed_forecast_config(), _question())
     assert caught.value.problems == expected
     # Catchable as the package's one response-failure type, BinaryOutputError's argument.
     assert isinstance(caught.value, ForecastSchemaError)
@@ -335,7 +350,7 @@ def test_no_problem_string_or_traceback_echoes_a_label() -> None:
         validate_multiple_choice_output(
             forecast,
             _committed_forecast_config(),
-            options=(f"{SECRET}-supplied", f"{SECRET}-supplied-2"),
+            _question((f"{SECRET}-supplied", f"{SECRET}-supplied-2")),
         )
     exc = caught.value
     rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -371,7 +386,7 @@ def test_a_response_of_another_question_type_is_a_caller_mistake() -> None:
             multiple_choice_output_problems(
                 response,  # type: ignore[arg-type]
                 _committed_forecast_config(),
-                options=PROMPT_OPTIONS,
+                _question(),
             )
         assert caught.value.problems == ["forecast: must be a multiple-choice forecast response"]
 
@@ -379,87 +394,90 @@ def test_a_response_of_another_question_type_is_a_caller_mistake() -> None:
         multiple_choice_output_problems(
             "not a response",  # type: ignore[arg-type]
             _committed_forecast_config(),
-            options=PROMPT_OPTIONS,
+            _question(),
         )
 
 
 @pytest.mark.parametrize(
-    ("options", "expected"),
+    ("options", "error_type"),
     [
-        (None, "options: must be supplied for a multiple-choice question"),
-        # A bare str satisfies Sequence[str] and would silently mean its characters -- the
-        # M1-303 round-4 defect that cost six billable calls in its own module.
-        ("AB", "options: must be a sequence of strings"),
-        (b"AB", "options: must be a sequence of strings"),
-        (123, "options: must be a sequence of strings"),
-        ({"A": 1}, "options: must be a sequence of strings"),
-        (("A", 2), "options: must be a sequence of strings"),
-        ((), "options: must not be empty"),
-        # Round-1 review, 2026-08-28. The empty case above was the only arity guard, and
-        # it mirrors ``min_length=1``; the model's field is ``min_length=2``. A singleton
-        # is the case that *looks* answerable and is not -- see the test below.
-        (("A",), "options: must supply at least two options for a multiple-choice question"),
-        (("A", "A"), "options: must not repeat a label"),
-        (("A", "  "), "options: must not contain a blank label"),
+        ([], "too_short"),
+        (["A"], "too_short"),
+        (["A", "A"], "value_error"),
+        (["A", "  "], "value_error"),
+        (["A", 2], "string_type"),
     ],
-    ids=[
-        "none",
-        "bare-str",
-        "bytes",
-        "int",
-        "mapping",
-        "non-str-member",
-        "empty",
-        "singleton",
-        "repeated",
-        "blank",
-    ],
+    ids=["empty", "singleton", "repeated", "blank", "non-str-member"],
 )
-def test_an_option_list_that_would_make_a_rule_lie_is_a_caller_mistake(
-    options: Any, expected: str
+def test_the_option_shapes_that_would_make_a_rule_lie_are_refused_by_the_question(
+    options: Any, error_type: str
 ) -> None:
-    """Each of these mirrors an invariant ``CanonicalMultipleChoiceQuestion`` enforces, and
-    each would otherwise turn into an *unsatisfiable* rule -- two billed calls per question
-    to reject something no model could have supplied."""
-    with pytest.raises(MultipleChoiceOutputError) as caught:
-        _problems(_response(), options=options)
-    assert caught.value.problems == [expected]
+    """Where the guarantee lives now, and why this test moved rather than vanished.
+
+    Until the M1-404/M1-405 merge this checker was handed the option list as bare
+    primitives with no validator behind them, so it re-checked each of these itself and
+    this test asserted its own ``MultipleChoiceOutputError`` for each. **M1-404's round-1
+    review found a hole in exactly that arrangement**: five of the model's six invariants
+    were mirrored by hand and the sixth, ``min_length=2``, was not, which left a singleton
+    option list producing a rule set no reply could satisfy.
+
+    The checker now takes the validated question, so the mirror is gone and the model is
+    the single place these hold. The cases are kept, pointed at their real enforcement
+    point -- a shape that reaches ``CanonicalMultipleChoiceQuestion`` is refused there, and
+    the checker can no longer be handed one. Losing these cases entirely is what would let
+    the guarantee quietly weaken.
+    """
+    with pytest.raises(ValidationError) as caught:
+        CanonicalMultipleChoiceQuestion(
+            question_id=123, post_id=456, title="Which option?", options=options
+        )
+    # The error *type*, not a substring of pydantic's prose: the wording is the library's
+    # to change and the type is the contract.
+    assert [error["type"] for error in caught.value.errors()] == [error_type]
 
 
-def test_no_reply_to_a_singleton_option_list_could_ever_have_passed() -> None:
-    """Why the arity guard above is a *caller mistake* and not a returnable problem.
+def test_a_question_of_another_type_is_a_caller_mistake() -> None:
+    """The one gate ``_require_question`` still makes for itself.
 
-    Round-1 review found the missing guard; this pins the reason it is blocking rather
-    than cosmetic. For a one-option list the *sum* rule and the *bounds* rule cover the
-    whole line between them and leave no gap: summing to 1 within ``_SUM_TOLERANCE``
-    forces the sole probability to at least ``1 - _SUM_TOLERANCE``, which is already
-    above ``max_probability``. So the old behaviour -- returning a bounds problem --
-    asked for a repair no model could perform, which is the failure ``_require_config``
-    refuses for an inverted bounds pair at two billed calls per question.
+    ``numeric._require_question``'s shape: refuse the argument this module cannot read,
+    as this module's own error type rather than as a raw ``AttributeError`` reaching a
+    caller. Everything about the *contents* of the option list is the model's job now.
+    """
+    for question in (
+        None,
+        "not a question",
+        123,
+        CanonicalBinaryQuestion(question_id=123, post_id=456, title="Will it?"),
+    ):
+        with pytest.raises(MultipleChoiceOutputError) as caught:
+            multiple_choice_output_problems(
+                _response(),
+                _committed_forecast_config(),
+                question,  # type: ignore[arg-type]
+            )
+        assert caught.value.problems == ["question: must be a canonical multiple-choice question"]
 
-    Stated against the *committed* bounds rather than hand-built ones, for
-    ``_committed_forecast_config``'s reason: if a future config narrowed the gap the two
-    rules would stop covering the line, and this assertion is what would notice.
+
+def test_no_reply_to_a_one_option_question_could_ever_have_passed() -> None:
+    """Why a singleton option list is refused at the contract rather than returned.
+
+    M1-404's round 1 found the missing arity guard; this pins the *reason* it mattered, and
+    it survives the merge because the reason is about this module's rules rather than about
+    where the list comes from. For a one-option list the *sum* and *bounds* rules cover the
+    whole line between them and leave no gap: summing to 1 within ``_SUM_TOLERANCE`` forces
+    the sole probability to at least ``1 - _SUM_TOLERANCE``, already above
+    ``max_probability``. So a returned problem would have asked for a repair no model could
+    perform -- the failure ``_require_config`` refuses for an inverted bounds pair.
+
+    Stated against the *committed* bounds, for ``_committed_forecast_config``'s reason: if a
+    future config narrowed the gap the two rules would stop covering the line, and this
+    assertion is what would notice.
     """
     config = _committed_forecast_config()
     assert config.max_probability < 1.0 - _SUM_TOLERANCE, (
-        "the sum and bounds rules no longer cover the line between them, so a singleton "
-        "option list may have become satisfiable -- re-derive the guard before relaxing it"
+        "the sum and bounds rules no longer cover the line between them, so a one-option "
+        "question may have become answerable -- re-derive the argument before relying on it"
     )
-
-    # And the boundary refuses to reach those rules at all, rather than returning either.
-    with pytest.raises(MultipleChoiceOutputError) as caught:
-        _problems(_response(_answers(("A", 1.0))), options=("A",))
-    assert caught.value.problems == [
-        "options: must supply at least two options for a multiple-choice question"
-    ]
-
-
-def test_a_generator_is_refused_rather_than_silently_exhausted() -> None:
-    """It satisfies no ``Sequence``, and one that did would be consumed by the first
-    membership test -- ``attribution._supplied_ids``' quieter half of the same defect."""
-    with pytest.raises(MultipleChoiceOutputError):
-        _problems(_response(), options=(label for label in PROMPT_OPTIONS))
 
 
 @pytest.mark.parametrize(
@@ -474,7 +492,7 @@ def test_a_config_of_the_wrong_type_is_a_caller_mistake(config: Any, expected: s
     # Not through ``_problems``: its ``config is None`` default would substitute the real
     # one and quietly turn the ``None`` case into a test of nothing.
     with pytest.raises(MultipleChoiceOutputError) as caught:
-        multiple_choice_output_problems(_response(), config, options=PROMPT_OPTIONS)
+        multiple_choice_output_problems(_response(), config, _question())
     assert caught.value.problems == [expected]
 
 
@@ -507,7 +525,11 @@ def test_this_module_and_binary_refuse_the_same_inverted_config() -> None:
     }
     binary = validate_forecast_response(binary_payload, BinaryForecastResponse)
     with pytest.raises(BinaryOutputError) as theirs:
-        binary_output_problems(binary, inverted)  # type: ignore[arg-type]
+        binary_output_problems(
+            binary,
+            inverted,  # type: ignore[arg-type]
+            CanonicalBinaryQuestion(question_id=123, post_id=456, title="Will it?"),
+        )
     assert theirs.value.problems == [message]
 
     # And the two render a bound the same way, which is the other half of the copy.
@@ -516,6 +538,10 @@ def test_this_module_and_binary_refuse_the_same_inverted_config() -> None:
         "between 0.2 and 0.8 inclusive (offending input withheld)"
     )
     mine_problems = _problems(_response(_answers((A, 0.9), (B, 0.1))), config=narrowed)
-    theirs_problems = binary_output_problems(binary, narrowed)  # type: ignore[arg-type]
+    theirs_problems = binary_output_problems(
+        binary,
+        narrowed,
+        CanonicalBinaryQuestion(question_id=123, post_id=456, title="Will it?"),
+    )
     assert any("between 0.2 and 0.8 inclusive" in problem for problem in mine_problems)
     assert any("between 0.2 and 0.8 inclusive" in problem for problem in theirs_problems)

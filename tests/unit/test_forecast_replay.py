@@ -49,6 +49,7 @@ from whiskeyjack_bot.forecast.record import (
     build_forecast_record_draft,
     record_sha256,
 )
+from whiskeyjack_bot.forecast.numeric import NumericOutputError
 from whiskeyjack_bot.forecast.replay import ForecastReplay, replay_forecast
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
@@ -57,6 +58,7 @@ from whiskeyjack_bot.forecast.schema import (
 )
 from whiskeyjack_bot.forecast.store import ModelCall, read_forecast_record, read_model_call
 from whiskeyjack_bot.ledger import connect, initialize_ledger
+from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
 from whiskeyjack_bot.lifecycle import transaction
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
@@ -410,6 +412,103 @@ def test_replay_re_derives_rather_than_reading_the_stored_answer_back(
     assert record_sha256(read_forecast_record(conn, stored.record.record_id)) == (
         result.stored_sha256
     )
+
+
+def _numeric_generation() -> ForecastGeneration:
+    """A numeric generation whose stored reply parses cleanly against a valid question."""
+    payload = {
+        **json.loads(_json_block("Shared fields")),
+        **json.loads("{" + _json_block("Numeric schema") + "}"),
+    }
+    payload["question_id"] = QUESTION_ID
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    forecast = validate_forecast_response(payload, response_model_for("numeric"))
+    return _generation(forecast=forecast, raw_responses=(json.dumps(payload),))
+
+
+def _numeric_question(**overrides: Any) -> CanonicalNumericQuestion:
+    fields: dict[str, Any] = {
+        "question_id": QUESTION_ID,
+        "post_id": POST_ID,
+        "title": "How many things?",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "cdf_size": 201,
+    }
+    fields.update(overrides)
+    return CanonicalNumericQuestion(**fields)
+
+
+def test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """M1-405 round 1, finding 2: a member checker's error must not escape this boundary.
+
+    ``CanonicalNumericQuestion`` accepts ``zero_point == lower_bound``, so does
+    ``ForecastRecordDraft``, and so did every writer before M1-405 registered a numeric
+    checker -- there was nothing to refuse it. The pinned SDK refuses such a question
+    outright, so ``numeric._require_question`` raises rather than reporting a repairable
+    problem, and ``forecast.generate`` refuses it in a preflight before anything is spent.
+
+    Replay has no preflight: it is reading a row that already exists. So the row is
+    ordinary, already in the ledger, and reaches ``_parse`` -- and this module's own
+    docstring says a raw ``ForecastSchemaError`` out of a public boundary is a review
+    finding here (it has been, three times now). It arrives as ``ForecastRecordError``,
+    the same translation ``response_model_for`` already had one line above.
+    """
+    config = _config(tmp_path, artifacts)
+    generation = _numeric_generation()
+    draft = build_forecast_record_draft(
+        question=_numeric_question(zero_point=0.0),
+        generation=generation,
+        tournament_id=TOURNAMENT,
+        attempt_id=ATTEMPT,
+        retrieval_run_id=RUN_ID,
+        research_packet_sha256="d" * 64,
+        generated_at=GENERATED_AT,
+    )
+    stored = persist_generation(
+        conn, config, draft=draft, generation=generation, written_at=WRITTEN_AT
+    )
+    assert stored.record is not None, "the writer accepts this question; that is the premise"
+
+    with pytest.raises(ForecastRecordError) as caught:
+        replay_forecast(conn, config, record_id=stored.record.record_id)
+    # Exact type, not isinstance: NumericOutputError also subclasses ForecastSchemaError,
+    # so an isinstance assertion here would pass on the unfixed code.
+    assert type(caught.value) is ForecastRecordError
+    assert not isinstance(caught.value, NumericOutputError)
+    # ``from None``: the chained cause would re-render the member's problem list.
+    assert caught.value.__cause__ is None
+
+
+def test_the_same_stored_row_replays_when_its_zero_point_is_satisfiable(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """The companion: the refusal above must be about the unsatisfiable pair and nothing
+    else, or every log-scaled numeric record would be unreplayable."""
+    config = _config(tmp_path, artifacts)
+    generation = _numeric_generation()
+    draft = build_forecast_record_draft(
+        question=_numeric_question(lower_bound=1.0, zero_point=0.5),
+        generation=generation,
+        tournament_id=TOURNAMENT,
+        attempt_id=ATTEMPT,
+        retrieval_run_id=RUN_ID,
+        research_packet_sha256="d" * 64,
+        generated_at=GENERATED_AT,
+    )
+    stored = persist_generation(
+        conn, config, draft=draft, generation=generation, written_at=WRITTEN_AT
+    )
+    assert stored.record is not None
+
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+    assert result.matches
+    assert result.problems == ()
 
 
 def test_a_reply_that_no_longer_parses_is_reported_and_not_raised(

@@ -46,22 +46,31 @@ Like ``forecast/binary.py`` this **returns** problems rather than raising, so
 module owns :class:`MultipleChoiceOutputError` for the caller mistakes that must never
 become a repair turn.
 
-Imports no provider SDK and no question model -- the option list arrives as primitives
-for the reason ``forecast/attribution.py`` takes primitives: a replay path (M1-406) and
-the persist path (M1-507) must both reach this with the provider client not importable
-at all, and ``forecast.inputs`` reaches ``questions.model`` and through it the SDK.
+**Imports no provider SDK.** That is the constraint, and it is the one M1-406's replay
+path and the persist path (M1-507) rest on: both must reach this module with the provider
+client not importable at all.
+
+This used to read "no provider SDK **and no question model**", and took the option list as
+bare primitives on that basis. The second half was a stronger claim than the constraint
+needs and it was wrong about where the SDK actually enters: ``questions/model.py`` imports
+only stdlib, pydantic and ``config``, so it is SDK-free -- it is ``forecast.inputs`` that
+reaches a provider, and this module does not import that. M1-405 established the point when
+``forecast/numeric.py`` took a ``CanonicalNumericQuestion`` and was added to the
+import-graph probe; ``forecast/multiple_choice.py`` is in that probe for the same reason.
+Taking the validated question rather than a copy of one of its fields is what retires the
+hand-maintained mirror of its invariants -- see :func:`_require_question`.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
 
 from whiskeyjack_bot.config import ForecastConfig
 from whiskeyjack_bot.forecast.schema import (
     ForecastSchemaError,
     MultipleChoiceForecastResponse,
 )
+from whiskeyjack_bot.questions.model import CanonicalMultipleChoiceQuestion
 
 # The field path these problems are reported against, spelled as ``schema._sanitize``
 # would spell it. Every rule reports against the list rather than an element: an index
@@ -137,93 +146,63 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
     return low, high
 
 
-def _supplied_options(options: Sequence[str] | None) -> tuple[str, ...]:
-    """The question's option list, refusing every shape that would make the rules lie.
+def _require_question(question: CanonicalMultipleChoiceQuestion) -> None:
+    """Refuse a question this checker's rules could not be stated against.
 
-    Each refusal is a caller mistake rather than a problem with the model's output, and
-    each mirrors an invariant ``CanonicalMultipleChoiceQuestion`` already enforces. They
-    are re-checked here because this function is handed primitives, not that model, and
-    because every one of them would otherwise turn into an *unsatisfiable* rule -- the
-    failure mode ``_require_config`` refuses for an inverted bounds pair, at two billed
-    calls per question:
+    ``numeric._require_question``'s precedent, and its rule about what to restate.
+    That function gates the type and re-checks ``zero_point``, which the canonical model
+    does *not* guarantee -- and deliberately does **not** restate
+    ``lower_bound < upper_bound``, which it does. The same division applies here, and it
+    leaves only the type gate: ``CanonicalMultipleChoiceQuestion`` already enforces every
+    property these rules need, at the input contract and for this row's sake --
+    ``options: list[str] = Field(min_length=2)`` plus a validator refusing a blank or
+    repeated label.
 
-    - a bare ``str`` satisfies ``Sequence[str]``, so ``options="Yes"`` type-checks and
-      would silently mean the three options ``"Y"``, ``"e"``, ``"s"`` -- the M1-303
-      round-4 defect, and ``attribution._supplied_ids`` refuses it for the same reason;
-    - an empty list would make *every* answer an unknown option;
-    - **fewer than two options cannot be answered at all** -- see below;
-    - a repeated label makes "exactly once" unstatable, which is why
-      ``questions/model.py`` rejects it at the input contract;
-    - a blank label can never be matched, because ``schema.NonBlankStr`` refuses one on
-      the response side -- so it is a rule no reply could satisfy.
-
-    The arity refusal was **missed in the first draft and found by round-1 review**, and
-    the miss is worth recording because the rest of this list was derived correctly. Five
-    of ``CanonicalMultipleChoiceQuestion``'s six invariants were mirrored here; the sixth
-    is ``options: list[str] = Field(min_length=2)``, and it was the only one about *how
-    many* rather than about what each element is. Arity is the constraint that makes a
-    rule set unsatisfiable rather than merely wrong: against the committed
-    ``0.001``/``0.999`` bounds no one-option reply can pass any rule set at all -- ``1.0``
-    and anything above ``0.999`` fail *bounds*, ``0.999`` and anything below fail *sum* --
-    so a singleton list produces a repair turn no model can satisfy, at two billed calls
-    per question. That is the exact failure :func:`_require_config` refuses for an
-    inverted bounds pair, reached through the other argument.
+    **That is a change in kind, not a relaxation, and it is worth being explicit about.**
+    Until M1-405 merged this module was handed the option list as bare primitives with no
+    validator behind them, so it re-checked each of those properties by hand: a bare
+    ``str`` (which would silently mean its characters -- the M1-303 round-4 defect), a
+    non-``str`` member, an empty list, a list of one, a repeated label, a blank label.
+    Hand-mirroring another model's invariants is exactly what M1-404's round-1 review
+    found a hole in -- five of six were mirrored and the sixth, ``min_length=2``, was not,
+    which made the rule set unsatisfiable for a one-option list. Taking the validated
+    question instead dissolves that whole class: there is no second list to disagree with
+    the first, and no hand-maintained mirror to fall behind the model.
     """
-    if options is None:
-        raise MultipleChoiceOutputError(
-            ["options: must be supplied for a multiple-choice question"]
-        )
-    if isinstance(options, (str, bytes)) or not isinstance(options, Sequence):
-        raise MultipleChoiceOutputError(["options: must be a sequence of strings"])
-    for value in options:
-        # Exact type, not isinstance: a str subclass is unvetted (questions/normalize.py).
-        if type(value) is not str:
-            raise MultipleChoiceOutputError(["options: must be a sequence of strings"])
-    supplied = tuple(options)
-    if not supplied:
-        raise MultipleChoiceOutputError(["options: must not be empty"])
-    if len(supplied) < 2:
-        raise MultipleChoiceOutputError(
-            ["options: must supply at least two options for a multiple-choice question"]
-        )
-    if len(set(supplied)) != len(supplied):
-        raise MultipleChoiceOutputError(["options: must not repeat a label"])
-    if any(not value.strip() for value in supplied):
-        raise MultipleChoiceOutputError(["options: must not contain a blank label"])
-    return supplied
+    if not isinstance(question, CanonicalMultipleChoiceQuestion):
+        raise MultipleChoiceOutputError(["question: must be a canonical multiple-choice question"])
 
 
 def multiple_choice_output_problems(
     forecast: MultipleChoiceForecastResponse,
     forecast_config: ForecastConfig,
-    *,
-    options: Sequence[str] | None,
+    question: CanonicalMultipleChoiceQuestion,
 ) -> list[str]:
     """Every option-set and distribution problem with one multiple-choice response.
 
-    An empty list means the response is usable as a multiple-choice forecast: it names
-    every supplied option exactly once, names nothing else, and its probabilities are a
-    distribution inside the configured bounds. Each string is a schema-authored field
-    path, a colon, and a value-free message -- safe to log, to store, and to send back to
-    the model as a repair turn.
+        An empty list means the response is usable as a multiple-choice forecast: it names
+        every supplied option exactly once, names nothing else, and its probabilities are a
+        distribution inside the configured bounds. Each string is a schema-authored field
+        path, a colon, and a value-free message -- safe to log, to store, and to send back to
+        the model as a repair turn.
 
-    ``options`` is the question's own option list, in its own order, as primitives. Order
-    is irrelevant to every rule here (the response may answer in any order), but it is
-    accepted as a sequence rather than a set because that is the shape the caller holds
-    and because a set could not carry the "must not repeat a label" caller check above.
+    ``question.options`` is the option list, in the question's own order. Order is
+        irrelevant to every rule here -- the response may answer in any order, and
+        ``test_the_option_verdict_does_not_depend_on_the_order_answered`` states that as a
+        property -- so it is read as a set below.
 
-    Raises :class:`MultipleChoiceOutputError` only for a caller mistake -- a response or
-    a config of the wrong type, a config admitting no probability, or an option list that
-    would make a rule unsatisfiable. Those are not problems with the model's output and
-    must never become a repair turn.
+        Raises :class:`MultipleChoiceOutputError` only for a caller mistake -- a response, a
+        config or a question of the wrong type, or a config admitting no probability. Those
+        are not problems with the model's output and must never become a repair turn.
     """
     if not isinstance(forecast, MultipleChoiceForecastResponse):
         # Exact category, not a duck-typed read: a response of another question type has
         # no option list at all, and a non-response has no fields. Both are caller
         # mistakes, and neither is something to ask the model to fix.
         raise MultipleChoiceOutputError(["forecast: must be a multiple-choice forecast response"])
+    _require_question(question)
     low, high = _require_config(forecast_config)
-    supplied = frozenset(_supplied_options(options))
+    supplied = frozenset(question.options)
 
     entries = forecast.final_prediction.options
     answered = [entry.option for entry in entries]
@@ -260,8 +239,7 @@ def multiple_choice_output_problems(
 def validate_multiple_choice_output(
     forecast: MultipleChoiceForecastResponse,
     forecast_config: ForecastConfig,
-    *,
-    options: Sequence[str] | None,
+    question: CanonicalMultipleChoiceQuestion,
 ) -> MultipleChoiceForecastResponse:
     """Return the response unchanged, or raise with the sanitized problems.
 
@@ -273,7 +251,7 @@ def validate_multiple_choice_output(
     Nothing is clamped, dropped, re-ordered or renormalized. See the module header: a
     rescaled vector is a distribution the model did not produce.
     """
-    problems = multiple_choice_output_problems(forecast, forecast_config, options=options)
+    problems = multiple_choice_output_problems(forecast, forecast_config, question)
     if problems:
         raise MultipleChoiceOutputError(problems)
     return forecast

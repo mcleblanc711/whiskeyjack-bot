@@ -35,6 +35,7 @@ from whiskeyjack_bot.forecast.attribution import (
     validate_attribution_fields,
 )
 from whiskeyjack_bot.forecast.binary import binary_output_problems
+from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastResponse,
@@ -396,6 +397,19 @@ def test_the_rules_are_cross_type(heading: str, model: type[ForecastResponse]) -
 # --- the boundary with M1-403, pinned from this side (review round 1) ------------
 
 
+def _binary_question() -> CanonicalBinaryQuestion:
+    """The question M1-405 put on the checker signatures.
+
+    This module's own entry points still take a bare ``question_id`` -- their independence
+    from the question model is a property of their interface and is argued for in
+    ``attribution.py`` -- so the object is needed only by the two tests below that reach
+    ``binary.py`` and the composed entry point.
+    """
+    return CanonicalBinaryQuestion(
+        question_id=QUESTION_ID, post_id=456, title="Will the thing happen?"
+    )
+
+
 def test_the_binary_prior_rule_belongs_to_binary_py() -> None:
     """A binary response must supply both priors -- and that rule is **M1-403's**.
 
@@ -422,7 +436,7 @@ def test_the_binary_prior_rule_belongs_to_binary_py() -> None:
     assert _problems(forecast) == []
 
     # M1-403's checker is not, and it names both spellings.
-    problems = binary_output_problems(forecast, _committed_forecast_config())
+    problems = binary_output_problems(forecast, _committed_forecast_config(), _binary_question())
     assert problems == [
         "base_rate.prior_probability: must be supplied for a binary question",
         "model_prior: must be supplied for a binary question",
@@ -452,11 +466,10 @@ def test_the_two_checkers_compose_so_a_priorless_binary_forecast_is_refused() ->
     composed = output_problems(
         forecast,
         _committed_forecast_config(),
-        question_id=QUESTION_ID,
+        question=_binary_question(),
         source_ids=PROMPT_SOURCES,
         # Required since M1-404, and ``None`` is the answer for a binary question: the
         # entry point pairs the option list with the response type in both directions.
-        options=None,
     )
     assert composed == [
         "base_rate.prior_probability: must be supplied for a binary question",

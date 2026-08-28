@@ -51,20 +51,32 @@ still catches every one, ``generate._parse`` is unchanged, and this module nonet
 has an error boundary a caller can name without importing ``forecast.schema``. The
 tension the first cut accepted was not there to accept.
 
-Imports no provider SDK and no question model: like ``forecast/schema.py``, this has to
-stay reachable from a replay path (M1-406) with the provider client not importable at
-all.
+**The canonical question is accepted and not read, and M1-405 is why.** Every checker
+registered in ``forecast/validate.py``'s table takes the same three arguments -- the
+response, the config and the question -- so the table stays one flat mapping with no
+per-type adapter, which is the shape M1-506 chose it for. Numeric needs the question for
+three of its four rules; binary has no rule a question decides, so the parameter is spent
+on the same exact-type gate this module already applies to its other two arguments. That
+is not decoration: a caller handing this function a numeric question and a binary response
+has made a mistake worth naming, and naming it here is what lets
+``validate.output_problems`` trust the pairing after one central check.
+
+Imports no provider SDK and no HTTP client: like ``forecast/schema.py``, this has to stay
+reachable from a replay path (M1-406) with the provider client not importable at all.
+``questions/model.py`` is on the clean side of that line -- ``forecast/inputs.py`` has
+imported it since M1-402 and the import-graph probe pins it -- so reading the canonical
+question costs nothing there.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 
 from whiskeyjack_bot.config import ForecastConfig
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
     ForecastSchemaError,
 )
+from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 
 # The field paths these problems are reported against, spelled as ``schema._sanitize``
 # would spell them so the two are indistinguishable in a repair turn. Every one is a
@@ -130,8 +142,7 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
 def binary_output_problems(
     forecast: BinaryForecastResponse,
     forecast_config: ForecastConfig,
-    *,
-    options: Sequence[str] | None = None,
+    question: CanonicalBinaryQuestion,
 ) -> list[str]:
     """Every configured-bounds and binary-prior problem with one binary response.
 
@@ -139,17 +150,11 @@ def binary_output_problems(
     schema-authored field path, a colon, and a value-free message -- safe to log, to
     store, and to send back to the model as a repair turn.
 
-    ``options`` is **accepted and never read**. It exists so this function satisfies
-    ``validate._TypeChecker``, the uniform signature M1-404 gave the type-specific
-    dispatch table when the multiple-choice rule turned out to need the question's option
-    list. A binary question has no option list, and ``validate.output_problems`` pairs the
-    argument with the question type in both directions, so the only value that reaches
-    this parameter through the entry point is ``None``. It is not validated here for that
-    reason: a rule about an argument this function has no opinion on belongs to the layer
-    that does.
+    ``question`` is accepted and not read; see the module docstring for why every checker
+    takes it and why binary spends it on a gate rather than on a rule.
 
-    Raises :class:`BinaryOutputError` only for a caller mistake (a response or a config
-    of the wrong type, or a config admitting no probability at all). Those are not
+    Raises :class:`BinaryOutputError` only for a caller mistake (a response, a config or a
+    question of the wrong type, or a config admitting no probability at all). Those are not
     problems with the model's output and must never become a repair turn.
     """
     if not isinstance(forecast, BinaryForecastResponse):
@@ -157,6 +162,8 @@ def binary_output_problems(
         # no probability_yes, and a non-response has no fields at all. Both are caller
         # mistakes, and neither is something to ask the model to fix.
         raise BinaryOutputError(["forecast: must be a binary forecast response"])
+    if not isinstance(question, CanonicalBinaryQuestion):
+        raise BinaryOutputError(["question: must be a canonical binary question"])
     low, high = _require_config(forecast_config)
 
     problems: list[str] = []
@@ -177,7 +184,9 @@ def binary_output_problems(
 
 
 def validate_binary_output(
-    forecast: BinaryForecastResponse, forecast_config: ForecastConfig
+    forecast: BinaryForecastResponse,
+    forecast_config: ForecastConfig,
+    question: CanonicalBinaryQuestion,
 ) -> BinaryForecastResponse:
     """Return the response unchanged, or raise with the sanitized problems.
 
@@ -190,7 +199,7 @@ def validate_binary_output(
     M1-502's criterion is that "no arbitrary post-hoc renormalization is hidden"; a
     coerced probability is a number the ledger cannot attribute to the model.
     """
-    problems = binary_output_problems(forecast, forecast_config)
+    problems = binary_output_problems(forecast, forecast_config, question)
     if problems:
         raise BinaryOutputError(problems)
     return forecast

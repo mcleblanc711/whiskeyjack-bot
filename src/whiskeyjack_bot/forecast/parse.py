@@ -14,8 +14,10 @@ process. Splitting the file is what lets both be true at once.
 
 So the rule for this module is one line: **nothing here may import a provider SDK, an HTTP
 client, or anything that reaches one.** ``forecast.schema``, ``forecast.binary``,
-``forecast.attribution`` and ``forecast.inputs`` are all clean today and the import-graph
-test pins this module alongside them.
+``forecast.numeric``, ``forecast.attribution`` and ``forecast.inputs`` are all clean today
+and the import-graph test pins this module alongside them -- as is
+``whiskeyjack_bot.questions.model``, which M1-405 put on this module's signature in place
+of a bare ``question_id`` so the numeric checker could reach the question's bounds.
 
 :class:`ModelSettings` and :class:`ForecastGeneration` moved for the same reason: replay
 reconstructs a ``ForecastGeneration`` from a stored artifact and hands it to
@@ -46,6 +48,7 @@ from whiskeyjack_bot.forecast.schema import (
 )
 from whiskeyjack_bot.forecast.validate import output_problems
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
+from whiskeyjack_bot.questions.model import CanonicalQuestion
 
 
 # Used when the previous reply was not one JSON object at all. Deliberately a
@@ -115,18 +118,19 @@ def _parse(
     model: type[ForecastResponse],
     forecast_config: ForecastConfig,
     *,
-    question_id: int,
+    question: CanonicalQuestion,
     source_ids: Sequence[str],
-    options: Sequence[str] | None,
 ) -> tuple[ForecastResponse | None, list[str]]:
     """Parse and validate one response; returns the forecast or the problems.
 
     An empty problem list with a ``None`` forecast is impossible: every failure path
     supplies at least one sanitized problem string.
 
-    ``options`` is the question's option list for a multiple-choice question and
-    ``None`` for every other type; see ``forecast.validate.output_problems``, which pairs
-    the two and refuses a mismatch.
+    ``question`` carries every question fact the type-specific checkers need -- the
+    numeric bounds and the multiple-choice option list alike. It replaced a bare
+    ``question_id`` (M1-405) and then absorbed a separate ``options`` argument (M1-404's
+    original shape) at the merge of the two: the packet field it came from is built as
+    ``list(question.options)``, so carrying both was one fact reached two ways.
 
     The configured-bounds and attribution checks run *here*, inside the attempt loop,
     rather than on the returned result. That is what makes an out-of-bounds probability
@@ -147,23 +151,22 @@ def _parse(
         forecast = validate_forecast_response(payload, model)
     except ForecastSchemaError as exc:
         return None, list(exc.problems)
-    # Cannot raise, on any of its paths: the response is provably the model this
-    # dispatch selected, so its ``question_type`` is a validated Literal the registry
-    # covers and the member checkers cannot meet a response of the wrong category;
-    # ``generate_forecast`` refuses an inverted bounds pair before anything is spent; and
-    # it exact-type gates ``question_id`` there too. The fourth path is M1-404's pairing
-    # gate, and it closes the same way: ``options`` is
-    # ``ModelInput.packet.options``, which ``forecast.inputs`` populates for exactly the
-    # multiple-choice questions and leaves ``None`` for every other type -- the same
-    # dispatch on ``qtype`` that chose ``model`` here. Those are the caller mistakes
-    # ``validate.output_problems`` and its members refuse, and none is reachable here.
-    problems = output_problems(
-        forecast,
-        forecast_config,
-        question_id=question_id,
-        source_ids=source_ids,
-        options=options,
-    )
+    # Cannot raise **when the caller is ``generate_forecast``**, and that qualifier is the
+    # correction round 1 forced. The response is provably the model this dispatch selected,
+    # so its ``question_type`` is a validated Literal the registry covers and it agrees with
+    # ``question.qtype`` because the model was selected *from* that field; the member
+    # checkers cannot meet a response of the wrong category; and the inverted bounds pair
+    # and the unsatisfiable ``zero_point`` are both refused in that function's preflight,
+    # before anything is spent.
+    #
+    # Every one of those rests on the preflight, so the claim does not extend to a caller
+    # that has none. ``forecast.replay`` reads a row that already exists and can hold a
+    # question no preflight ever saw -- a ``zero_point`` at or above ``lower_bound`` is
+    # accepted by ``CanonicalNumericQuestion`` and by ``ForecastRecordDraft``, and was
+    # written by every version of the writer that predates M1-405's checker. It therefore
+    # wraps this call and translates into its own ``ForecastRecordError``. A caller added
+    # later owes the same handler or the same preflight; this function promises neither.
+    problems = output_problems(forecast, forecast_config, question=question, source_ids=source_ids)
     if problems:
         return None, problems
     return forecast, []
