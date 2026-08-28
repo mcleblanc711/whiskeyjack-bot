@@ -60,15 +60,19 @@ that spike was waiting for. The SDK's own exception *message* embeds the full re
 and URL and is never stored: ``error_message`` is this module's constant text plus the
 exception's type name.
 
-**One state this module cannot record honestly, and it is filed.**
-:func:`lifecycle.record_submission_attempt` derives its event from ``(success,
-verified_by_refetch)``, and the pair has no member meaning "the post raised *and* the
-refetch could not be performed, so the platform state is unknown". ``(False, False)`` is
-``submission_failed`` and is terminal, which overclaims. The refetch is retried to make
-that cell rare, and when it is still reached the row says so in ``error_message``; **M2-711**
-is the filed item for the missing ledger state. It is named here rather than papered over,
-because the alternative was writing ``verified_by_refetch=True`` for a refetch that never
-happened.
+**The state this module could not record honestly is closed (M2-711).**
+:func:`lifecycle.record_submission_attempt` used to derive its event from ``(success,
+verified_by_refetch)``, and that pair had no member meaning "the post raised *and* the
+refetch could not be performed, so the platform state is unknown": it fell into ``(False,
+False)`` and became terminal ``submission_failed``, which overclaimed. This module already
+knew the difference -- :func:`classify_refetch` has returned a four-valued
+:data:`~lifecycle.RefetchOutcome` since M2-704 -- and the seam into the ledger was what
+threw it away. The ledger now takes the outcome itself, and a post whose refetch was
+``unreadable`` lands ``submission_uncertain``: the record stays ``approved``,
+``unresolved_uncertainties`` names it, :func:`post_approved_forecast`'s gate stays shut
+against a blind retry, and :func:`verify_uncertain_attempt` can still resolve it. The
+retries below are no longer what stands between a lost connection and a wrong permanent
+record; they are audit fidelity, which is a better thing for them to be.
 
 **What this module does not do.** It does not build the payload -- M1-502/M1-503 own that,
 and the payload is an input, supplied by ``--payload-file`` until they exist. It does not
@@ -105,6 +109,7 @@ from whiskeyjack_bot.lifecycle import (
     FailureCode,
     LifecycleError,
     LifecycleEvent,
+    RefetchOutcome,
     SubmissionVerification,
     record_submission_verification,
     unresolved_uncertainties,
@@ -212,8 +217,11 @@ _ALLOWED_RESPONSE_HEADERS: frozenset[str] = frozenset(
 )
 
 # The refetch is a read and reads may retry -- which is the whole line this module draws
-# against the SDK's retry: writes must not, reads may. Retrying it is what makes the
-# unrecordable cell M2-711 names rare rather than routine.
+# against the SDK's retry: writes must not, reads may. Before M2-711 this was load-bearing:
+# it made an unrecordable cell rare rather than routine. It is worth keeping now for what
+# it always also did -- a transient read failure that resolves on the second try records
+# what the platform actually shows, instead of an honest `unreadable` an operator then has
+# to chase by hand.
 _REFETCH_ATTEMPTS = 3
 _REFETCH_PAUSE_SECONDS = 2.0
 
@@ -265,12 +273,16 @@ _DETAIL_FOR_ERROR: dict[str, FailureCode] = {
     "internal_error": "internal_error",
 }
 
-# What a refetch established. Three-valued, unlike `lifecycle.VerificationOutcome`, and the
-# third member is the point: "the refetch could not be performed" is not "the forecast is
+# What a refetch established. Four-valued, unlike `lifecycle.VerificationOutcome`, and the
+# extra members are the point: "the refetch could not be performed" is not "the forecast is
 # absent". Collapsing them is how a lost network connection becomes a permanent claim that
 # a live forecast does not exist.
-RefetchOutcome = Literal["confirmed", "absent", "mismatched", "unreadable"]
-
+#
+# **Defined in `lifecycle`, not here, since M2-711.** These four members are now a stored
+# column (`submission_attempts.refetch_outcome`) and therefore a ledger vocabulary, and the
+# ledger owns its own vocabularies -- the rule `FailureCode` and `LiveErrorType` already
+# split on. Re-exported under this name because it was this module's before it was the
+# ledger's, and because `classify_refetch` is still the only thing that decides one.
 _REFETCH_OUTCOMES: frozenset[str] = frozenset(get_args(RefetchOutcome))
 
 
@@ -1273,14 +1285,6 @@ _MESSAGE_FOR_ERROR: dict[str, str] = {
     "internal_error": "the post failed for a reason this gateway does not classify",
 }
 
-# Appended when the post failed *and* the refetch could not be performed. That pair has no
-# honest encoding in `lifecycle`'s `(success, verified_by_refetch)` -- `(False, False)` is
-# `submission_failed`, which is terminal and claims more than is known. **M2-711** is the
-# filed item; until it lands the row says so in words.
-_UNESTABLISHED_NOTE = (
-    " the refetch could not be performed either, so the platform state was not established"
-)
-
 
 @dataclass(frozen=True)
 class LiveSubmissionOutcome:
@@ -1579,11 +1583,13 @@ class MetaculusSubmissionGateway:
     ) -> LiveSubmissionOutcome:
         """Assemble the receipt. Everything in it is already storable -- see below.
 
-        ``success`` is "the post call returned without raising" and
-        ``verified_by_refetch`` is "a refetch confirmed the forecast is there". Both are
+        ``success`` is "the post call returned without raising" and ``refetch_outcome`` is
+        what :func:`classify_refetch` established, carried through verbatim. Both are
         observations, and neither is a judgement about the platform that this module is not
         entitled to make. :func:`lifecycle.record_submission_attempt` turns the pair into
-        the event, which is why the event type is never chosen here.
+        the event, which is why the event type is never chosen here -- and since M2-711 it
+        is handed all four members rather than the one bit
+        ``verified_by_refetch`` reduced them to.
 
         Every string is passed through :func:`storable_text` and every number through the
         ledger's own bounds *before* the receipt exists, so ``record_receipt`` cannot refuse
@@ -1611,9 +1617,11 @@ class MetaculusSubmissionGateway:
             classified = classify_error(error)
             error_type = classified
             detail_code = _DETAIL_FOR_ERROR[classified]
+            # M2-711 removed a sentence appended here when the refetch was also
+            # unreadable. It existed because the ledger had no way to say so and this
+            # column was the only place left; `refetch_outcome` says it now, in a
+            # queryable field rather than in prose an auditor has to read to find.
             message = _MESSAGE_FOR_ERROR[classified] + f" ({type(error).__name__})"
-            if result.outcome == "unreadable":
-                message += _UNESTABLISHED_NOTE
             error_message = storable_text(message, _MAX_BODY)
             status, body, headers = http_details(error)
         elif not verified:
@@ -1634,7 +1642,7 @@ class MetaculusSubmissionGateway:
             completed_at_utc=completed,
             request_payload_sha256=digest,
             success=success,
-            verified_by_refetch=verified,
+            refetch_outcome=result.outcome,
             http_status=status,
             response_body=body,
             response_headers=headers,
@@ -1925,6 +1933,16 @@ def verify_uncertain_attempt(
       standing -- which keeps the post gate closed, the conservative direction.
     - **unreadable** -- nothing was established. Recording anything here would be inventing
       an observation.
+
+    **M2-711 did not change either refusal, and the asymmetry with the attempt path is the
+    point.** An *attempt* now stores its own ``refetch_outcome``, all four members, because
+    the question it answers is "what did we see when we posted" and "nothing" is a real
+    answer to it. A *verification* exists to decide an open uncertainty, and only
+    ``confirmed`` and ``absent`` decide anything -- so ``lifecycle.VerificationOutcome``
+    stays two-valued and these two outcomes leave the uncertainty standing, which keeps the
+    post gate closed. Widening ``submission_verifications`` to record a refetch that
+    resolved nothing would add rows that assert no conclusion, on the table whose rows are
+    the conclusions.
     """
     identifier = _require_identifier(record_id, "record_id")
     attempt = _require_identifier(attempt_id, "attempt_id")

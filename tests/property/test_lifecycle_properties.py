@@ -50,6 +50,7 @@ from whiskeyjack_bot.lifecycle import (
 STATUSES: tuple[str, ...] = get_args(LifecycleStatus)
 EVENT_TYPES: tuple[str, ...] = get_args(LifecycleEventType)
 FAILURE_CODES: tuple[str, ...] = get_args(lifecycle.FailureCode)
+REFETCH_OUTCOMES: tuple[str, ...] = get_args(lifecycle.RefetchOutcome)
 
 # Canonical UTC form: 003 pins it on the columns it orders (see test_lifecycle.py).
 TS = "2026-07-27T00:00:00.000000+00:00"
@@ -198,7 +199,9 @@ def test_the_approval_writer_raises_only_lifecycle_error(
     key=ANYTHING,
     payload_sha=ANYTHING,
     success=ANYTHING,
-    verified=ANYTHING,
+    # The vocabulary members as well as arbitrary junk: a fuzz that only ever sends junk
+    # exercises the type gate and never the derivation the gate stands in front of.
+    refetch=st.sampled_from(REFETCH_OUTCOMES) | ANYTHING,
     body=st.none() | ANYTHING,
     # Both ends of what SQLite can hold plus the HTTP range's own edges: a status outside
     # 100..599 is not a status, and one outside the signed 64-bit range raises
@@ -216,7 +219,7 @@ def test_the_submission_writer_raises_only_lifecycle_error(
     key: object,
     payload_sha: object,
     success: object,
-    verified: object,
+    refetch: object,
     body: object,
     http_status: object,
     requested_at: object,
@@ -231,7 +234,7 @@ def test_the_submission_writer_raises_only_lifecycle_error(
             completed_at_utc=completed_at,  # type: ignore[arg-type]
             request_payload_sha256=payload_sha,  # type: ignore[arg-type]
             success=success,  # type: ignore[arg-type]
-            verified_by_refetch=verified,  # type: ignore[arg-type]
+            refetch_outcome=refetch,  # type: ignore[arg-type]
             response_body=body,  # type: ignore[arg-type]
             http_status=http_status,  # type: ignore[arg-type]
         )
@@ -245,6 +248,72 @@ def test_the_submission_writer_raises_only_lifecycle_error(
             )
         except LifecycleError:
             pass
+        assert not conn.in_transaction
+
+
+@given(
+    success=st.booleans(),
+    refetch=st.sampled_from(REFETCH_OUTCOMES),
+)
+@settings(max_examples=40, deadline=None)
+def test_every_attempt_shape_has_exactly_one_recordable_outcome(
+    success: bool, refetch: str
+) -> None:
+    """M2-711's core property: the partition is total, and the ledger agrees with it.
+
+    For every ``(success, refetch_outcome)`` pair there is: the writer produces exactly one
+    event type, the database accepts that one, and it is `submitted` only for a
+    refetch-confirmed success. Totality is the half that matters here -- a pair with no
+    legal event is an outcome that *happened* and cannot be recorded, and the defect this
+    item closes was the dual of it: a pair recorded as an outcome it was not.
+
+    Driven through the real writer against the real schema rather than against
+    ``_DESTINATIONS``, so it fails if either layer drifts. The record is left `approved` by
+    ``_approved``, which is the only status any of these events is legal from.
+
+    **Mutation-checked**, per docs/LESSONS.md: inverting the `outcome == "absent"` arm of
+    the derivation makes it fail on `(False, "absent")` and `(False, "unreadable")`; making
+    `verified` unconditional makes it fail on the database's `submitted` probe. Neither is
+    caught by the type-gate fuzzers above, which never reach the derivation with a valid
+    vocabulary member and a valid record.
+    """
+    with _ledger() as (conn, valid_id):
+        lifecycle.record_approval(
+            conn,
+            record_id=valid_id,
+            decision="approved",
+            actor="chris",
+            forecast_sha256=SHA,
+            occurred_at=WHEN,
+        )
+        verified = refetch == "confirmed"
+        event = lifecycle.record_submission_attempt(
+            conn,
+            record_id=valid_id,
+            attempt=SubmissionAttempt(
+                attempt_id=f"att-{valid_id}",
+                idempotency_key=f"idem-{valid_id}",
+                requested_at_utc=WHEN,
+                completed_at_utc=WHEN,
+                request_payload_sha256="d" * 64,
+                success=success,
+                refetch_outcome=refetch,  # type: ignore[arg-type]
+            ),
+            occurred_at=WHEN,
+            detail_code=None if (success and verified) else "refetch_missing",
+        )
+        # Exactly one, and the database stored it: the row is read back rather than the
+        # return value trusted, because the return value is assembled from the stored row
+        # only if the insert the trigger guards actually happened.
+        assert event.event_type in EVENT_TYPES
+        assert (event.event_type == "submitted") == (success and verified)
+        assert event.event_type != "submission_failed" or refetch == "absent"
+        assert lifecycle.current_status(conn, valid_id) == event.to_status
+        assert lifecycle.read_history(conn, valid_id)[-1] == event
+        # ... and it is resolvable exactly when it left the record where a refetch can
+        # still reach it, which is the acceptance criterion's second clause.
+        outstanding = lifecycle.unresolved_uncertainties(conn, valid_id)
+        assert bool(outstanding) == (event.event_type == "submission_uncertain")
         assert not conn.in_transaction
 
 
@@ -276,7 +345,7 @@ def test_a_hostile_attempt_subclass_raises_only_lifecycle_error(
             completed_at_utc=field_values[3],  # type: ignore[arg-type]
             request_payload_sha256=field_values[4],  # type: ignore[arg-type]
             success=field_values[5],  # type: ignore[arg-type]
-            verified_by_refetch=field_values[6],  # type: ignore[arg-type]
+            refetch_outcome=field_values[6],  # type: ignore[arg-type]
         )
         try:
             lifecycle.record_submission_attempt(
@@ -791,13 +860,29 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
         "att_unsure": f"att-unsure-{record_id}",
         "att_bad": f"att-bad-{record_id}",
     }
-    for key, success, verified in (("att_ok", 1, 1), ("att_unsure", 1, 0), ("att_bad", 0, 0)):
+    for key, success, verified, refetch in (
+        ("att_ok", 1, 1, "confirmed"),
+        ("att_unsure", 1, 0, "absent"),
+        ("att_bad", 0, 0, "absent"),
+    ):
         attempt_id = attempts[key]
         conn.execute(
             "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
             "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
-            "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (attempt_id, record_id, f"idem-{attempt_id}", TS, TS, "d" * 64, success, verified, TS),
+            "verified_by_refetch, refetch_outcome, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt_id,
+                record_id,
+                f"idem-{attempt_id}",
+                TS,
+                TS,
+                "d" * 64,
+                success,
+                verified,
+                refetch,
+                TS,
+            ),
         )
     # The resolution must name this record's own question, not a constant: a row may point
     # at the right record and still resolve a different question.
@@ -840,7 +925,12 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
 
 
 def _uncited_attempt(
-    conn: sqlite3.Connection, record_id: str, attempt_id: object, success: int, verified: int
+    conn: sqlite3.Connection,
+    record_id: str,
+    attempt_id: object,
+    success: int,
+    verified: int,
+    refetch: str,
 ) -> object:
     """The fixture's attempt while nothing cites it, then fresh ones shaped like it.
 
@@ -864,8 +954,9 @@ def _uncited_attempt(
     conn.execute(
         "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
         "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
-        "verified_by_refetch, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (fresh, record_id, f"idem-{fresh}", TS, TS, "d" * 64, success, verified, TS),
+        "verified_by_refetch, refetch_outcome, created_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fresh, record_id, f"idem-{fresh}", TS, TS, "d" * 64, success, verified, refetch, TS),
     )
     return fresh
 
@@ -897,13 +988,17 @@ def _insert_event(
             (record_id, event_type, SHA, TS),
         ).lastrowid
     elif event_type == "submitted":
-        links["submission_attempt_id"] = _uncited_attempt(conn, record_id, detail["att_ok"], 1, 1)
+        links["submission_attempt_id"] = _uncited_attempt(
+            conn, record_id, detail["att_ok"], 1, 1, "confirmed"
+        )
     elif event_type == "submission_uncertain":
         links["submission_attempt_id"] = _uncited_attempt(
-            conn, record_id, detail["att_unsure"], 1, 0
+            conn, record_id, detail["att_unsure"], 1, 0, "absent"
         )
     elif event_type == "submission_failed":
-        links["submission_attempt_id"] = _uncited_attempt(conn, record_id, detail["att_bad"], 0, 0)
+        links["submission_attempt_id"] = _uncited_attempt(
+            conn, record_id, detail["att_bad"], 0, 0, "absent"
+        )
     elif event_type == "submission_confirmed":
         links["submission_verification_id"] = detail["verified_confirmed"]
     elif event_type == "submission_disconfirmed":

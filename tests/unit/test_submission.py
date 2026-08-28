@@ -145,7 +145,7 @@ def _uncertain_attempt(key: str, *, attempt_id: str) -> SubmissionAttempt:
         completed_at_utc=OCCURRED,
         request_payload_sha256=PAYLOAD_SHA,
         success=True,
-        verified_by_refetch=False,
+        refetch_outcome="absent",
     )
 
 
@@ -322,6 +322,7 @@ def test_a_spent_key_is_read_back_and_then_refused(
         request_payload_sha256=PAYLOAD_SHA,
         success=True,
         verified_by_refetch=False,
+        refetch_outcome="absent",
         created_at_utc=summary.created_at_utc if summary else "",
     )
     with pytest.raises(SubmissionError, match="already been used"):
@@ -463,8 +464,8 @@ def test_the_schema_is_what_refuses_a_flag_outside_zero_and_one(
         conn.execute(
             "INSERT INTO submission_attempts (attempt_id, forecast_record_id, "
             "idempotency_key, requested_at_utc, completed_at_utc, request_payload_sha256, "
-            "success, verified_by_refetch, created_at_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'yes', 1, ?)",
+            "success, verified_by_refetch, refetch_outcome, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'yes', 1, 'confirmed', ?)",
             ("att-raw", record_id, "raw-key", TS, TS, PAYLOAD_SHA, TS),
         )
 
@@ -488,7 +489,8 @@ def test_text_affinity_is_why_the_stored_text_gate_is_defense_in_depth(
     conn.execute(
         "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
         "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
-        "verified_by_refetch, created_at_utc) VALUES (7, ?, ?, ?, ?, ?, 1, 1, ?)",
+        "verified_by_refetch, refetch_outcome, created_at_utc) "
+        "VALUES (7, ?, ?, ?, ?, ?, 1, 1, 'confirmed', ?)",
         (record_id, "raw-key", TS, TS, PAYLOAD_SHA, TS),
     )
     summary = attempt_for_key(conn, "raw-key")
@@ -755,7 +757,7 @@ def test_the_documented_gap_is_real_and_is_asserted(
 # --- the gate is about the status now, not only the history --------------------------
 
 
-def _attempt(key: str, *, attempt_id: str, success: bool, verified: bool) -> SubmissionAttempt:
+def _attempt(key: str, *, attempt_id: str, success: bool, refetch: str) -> SubmissionAttempt:
     return SubmissionAttempt(
         attempt_id=attempt_id,
         idempotency_key=key,
@@ -763,21 +765,21 @@ def _attempt(key: str, *, attempt_id: str, success: bool, verified: bool) -> Sub
         completed_at_utc=OCCURRED,
         request_payload_sha256=PAYLOAD_SHA,
         success=success,
-        verified_by_refetch=verified,
+        refetch_outcome=refetch,
     )
 
 
 @pytest.mark.parametrize(
-    ("success", "verified", "detail_code", "expected_status"),
+    ("success", "refetch", "detail_code", "expected_status"),
     [
-        (False, False, "http_error", "failed"),
-        (True, True, None, "submitted"),
+        (False, "absent", "http_error", "failed"),
+        (True, "confirmed", None, "submitted"),
     ],
 )
 def test_the_gated_seam_refuses_a_record_that_left_approved(
     approved: tuple[sqlite3.Connection, str],
     success: bool,
-    verified: bool,
+    refetch: str,
     detail_code: str | None,
     expected_status: str,
 ) -> None:
@@ -792,7 +794,7 @@ def test_the_gated_seam_refuses_a_record_that_left_approved(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt("k-1", attempt_id="att-1", success=success, verified=verified),
+        attempt=_attempt("k-1", attempt_id="att-1", success=success, refetch=refetch),
         occurred_at=OCCURRED,
         detail_code=detail_code,  # type: ignore[arg-type]
     )
@@ -821,7 +823,7 @@ def test_an_unresolved_uncertain_attempt_still_passes_the_gate(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt("k-1", attempt_id="att-1", success=True, verified=False),
+        attempt=_attempt("k-1", attempt_id="att-1", success=True, refetch="absent"),
         occurred_at=OCCURRED,
         detail_code="timeout",
     )
@@ -843,7 +845,7 @@ def test_the_ungated_seam_still_serves_a_terminal_record(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt("k-1", attempt_id="att-1", success=False, verified=False),
+        attempt=_attempt("k-1", attempt_id="att-1", success=False, refetch="absent"),
         occurred_at=OCCURRED,
         detail_code="http_error",
     )
@@ -862,7 +864,7 @@ def test_the_status_refusal_names_only_the_closed_vocabulary(
     record_submission_attempt(
         conn,
         record_id=record_id,
-        attempt=_attempt("k-1", attempt_id="att-1", success=False, verified=False),
+        attempt=_attempt("k-1", attempt_id="att-1", success=False, refetch="absent"),
         occurred_at=OCCURRED,
         detail_code="http_error",
     )

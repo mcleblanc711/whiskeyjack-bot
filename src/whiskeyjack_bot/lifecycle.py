@@ -99,6 +99,16 @@ LifecycleStatus = Literal[
 # "an uncertain timeout blocks blind retry until a refetch resolves the state". It leaves
 # the record `approved`. (GPT review round 2, finding 3.)
 #
+# **M2-711 widened what reaches it, and deliberately added no member of its own.** A post
+# that raised and whose refetch could not be performed is the same lifecycle state as any
+# other unconfirmed post -- approved, resolvable by a later refetch, closed against blind
+# retry -- so it wanted this event and not a twelfth one. A twelfth would have meant
+# widening this Literal's CHECK in `003_lifecycle_events.sql`, which SQLite can only do by
+# rebuilding a table whose append-only block triggers would have to be dropped to do it:
+# the operation the ledger exists to make impossible. The vocabulary member that case
+# genuinely needed went on `submission_attempts.refetch_outcome`, where ADD COLUMN reaches
+# it. See :data:`RefetchOutcome` and :func:`record_submission_attempt`. (Owner decision.)
+#
 # `submission_confirmed` and `submission_disconfirmed` are the two ways back out of that
 # state, and they belong to the *refetch* rather than to another attempt. Without them the
 # only route to `submitted` ran through a second `submission_attempts` row, which needs a
@@ -127,6 +137,26 @@ LifecycleEventType = Literal[
 # submission failure is not here -- it has an attempt row and is written by
 # :func:`record_submission_attempt`.
 PipelineFailureEvent = Literal["validation_failed"]
+
+# What the refetch that accompanied a *post* established (M2-711). Four-valued, and it is
+# `submission_live.classify_refetch`'s own vocabulary carried across the seam rather than
+# spelled again: that function has returned these four members since M2-704, and the ledger
+# collapsed them into `verified_by_refetch` alone, which is one bit and loses which.
+#
+# The two extra members are the ones the pair had nowhere to put. `mismatched` is "something
+# newer than the baseline is on the platform and it is not what was sent"; `unreadable` is
+# "no observation was made at all". Both used to arrive as `verified_by_refetch=False` and,
+# when the post had also raised, as terminal `submission_failed` -- a permanent claim that
+# the post did not go through, made on no observation. See
+# :func:`record_submission_attempt` for the partition this now decides, and
+# `009_submission_refetch_outcome.sql` for the schema half.
+#
+# Deliberately distinct from :data:`VerificationOutcome` below, which is two-valued and
+# stays that way. They answer different questions: this is what an *attempt's own* refetch
+# saw, and that is what a *later, standalone* refetch concluded -- and only `confirmed` and
+# `absent` are conclusions, which is why `submission_live.verify_uncertain_attempt` refuses
+# to record the other two and leaves the uncertainty standing instead.
+RefetchOutcome = Literal["confirmed", "absent", "mismatched", "unreadable"]
 
 # What a refetch saw. Two-valued for the reason the migration gives: a refetch that could
 # not be *performed* observed nothing and changes no state, so it has no lifecycle event
@@ -198,6 +228,7 @@ _STATUSES: frozenset[str] = frozenset(get_args(LifecycleStatus))
 _EVENT_TYPES: frozenset[str] = frozenset(get_args(LifecycleEventType))
 _FAILURE_CODES: frozenset[str] = frozenset(get_args(FailureCode))
 _APPROVAL_DECISIONS: frozenset[str] = frozenset(get_args(ApprovalDecision))
+_REFETCH_OUTCOMES: frozenset[str] = frozenset(get_args(RefetchOutcome))
 _VERIFICATION_OUTCOMES: frozenset[str] = frozenset(get_args(VerificationOutcome))
 _PIPELINE_FAILURE_EVENTS: frozenset[str] = frozenset(get_args(PipelineFailureEvent))
 _PRE_FORECAST_EVENT_TYPES: frozenset[str] = frozenset(get_args(PreForecastEventType))
@@ -217,8 +248,10 @@ _PRE_FORECAST_FAILURE_CODES: frozenset[str] = frozenset(get_args(PreForecastFail
 # at its vocabulary member: an unresolved submission must stay somewhere a later refetch
 # can still move it, and `approved` is where the record was. The refetch is what moves it
 # from there -- `submission_confirmed` to `submitted`, `submission_disconfirmed` to
-# terminal `failed`, the same destination a (0, 0) attempt reaches and for the same
-# reason: the post is not there, and the retry is a new forecast version.
+# terminal `failed`, the same destination a failed post whose refetch *saw* nothing
+# reaches and for the same reason: the post is not there, and the retry is a new forecast
+# version. (Since M2-711 that is the failed post whose `refetch_outcome` is `absent`; one
+# whose refetch was unreadable observed nothing and lands uncertain instead.)
 #
 # This table is the whole rule again, as of round 4. Round 3 added a history-dependent
 # guard on top of it -- no further attempt while an uncertainty stood -- which is not a
@@ -329,6 +362,16 @@ class SubmissionAttempt:
     only hears about an attempt once it is over -- there is no in-flight row to leave open
     -- and ``submission_attempts`` is append-only, so a receipt written without a
     completion time could never acquire one. (GPT review round 2, finding 5.)
+
+    ``refetch_outcome`` replaced a ``verified_by_refetch: bool`` **field** in M2-711, and
+    the replacement is the item rather than a refactor alongside it. The boolean could not
+    distinguish "the refetch looked and the forecast is not there" from "the refetch could
+    not be performed", so an attempt that raised and could not be checked was recorded as
+    terminal ``submission_failed``. The column is still written -- ``001`` declares it NOT
+    NULL -- but it is **derived** here, so this class holds one fact once and no caller can
+    hand the writer two that disagree. The schema enforces the same equivalence against raw
+    SQL (``009_submission_refetch_outcome.sql``), which is what makes the derivation a
+    single source of truth rather than a convention.
     """
 
     attempt_id: str
@@ -337,13 +380,25 @@ class SubmissionAttempt:
     completed_at_utc: datetime
     request_payload_sha256: str
     success: bool
-    verified_by_refetch: bool
+    refetch_outcome: RefetchOutcome
     http_status: int | None = None
     response_body: str | None = None
     response_headers: str | None = None
     error_type: str | None = None
     error_message: str | None = None
     refetched_forecast_snapshot: str | None = None
+
+    @property
+    def verified_by_refetch(self) -> bool:
+        """Whether a refetch confirmed the post -- derived, never supplied.
+
+        Kept as a public name because it is the column, the receipt field every existing
+        reader asks for, and the word the acceptance criterion uses. Kept as a *property*
+        because it is not independent information: exactly one member of
+        :data:`RefetchOutcome` is a confirmation, and a second stored copy of that fact is
+        a second thing that can be wrong.
+        """
+        return self.refetch_outcome == "confirmed"
 
 
 @dataclass(frozen=True)
@@ -508,11 +563,11 @@ def _require_sha256(value: object, field: str) -> str:
 def _require_bool(value: object, field: str) -> int:
     """Return 0/1 for the ``CHECK (... IN (0, 1))`` integer columns.
 
-    ``bool`` exactly, not "anything truthy" and not ``int``. ``success`` and
-    ``verified_by_refetch`` decide whether a submission becomes ``submitted`` or
-    ``submission_failed``, so a stray ``1`` arriving where a ``bool`` was meant would
-    silently promote an unverified post to a verified one -- an unearned claim rather
-    than a type error.
+    ``bool`` exactly, not "anything truthy" and not ``int``. ``success`` -- with
+    ``refetch_outcome`` -- decides whether a submission becomes ``submitted``,
+    ``submission_uncertain`` or ``submission_failed``, so a stray ``1`` arriving where a
+    ``bool`` was meant would silently promote an unverified post to a verified one -- an
+    unearned claim rather than a type error.
     """
     if type(value) is not bool:
         raise LifecycleError(f"{field} must be True or False")
@@ -934,21 +989,38 @@ def record_submission_attempt(
 ) -> LifecycleEvent:
     """Append a submission attempt and its lifecycle event, atomically.
 
-    The event type is **derived from the attempt**, not chosen by the caller, and the
-    ``(success, verified_by_refetch)`` pair partitions into three outcomes rather than
-    two::
+    The event type is **derived from the attempt**, not chosen by the caller, and
+    ``(success, refetch_outcome)`` partitions into three outcomes rather than two::
 
-        (True,  True)   submitted             the post went through, a refetch confirmed it
-        (True,  False)  submission_uncertain  it went through; the refetch did not confirm
-        (False, True)   submission_uncertain  it errored; the refetch says something is there
-        (False, False)  submission_failed     it did not go through and nothing is there
+        success  refetch_outcome  event
+        -------  ---------------  --------------------
+        True     confirmed        submitted
+        True     absent           submission_uncertain
+        True     mismatched       submission_uncertain
+        True     unreadable       submission_uncertain
+        False    confirmed        submission_uncertain
+        False    absent           submission_failed
+        False    mismatched       submission_uncertain
+        False    unreadable       submission_uncertain
 
-    ``submitted`` is M2-704's "success requires refetch confirmation". The middle two are
-    the handoff's uncertain timeout: the two signals disagree, which is a third outcome
-    and not a failure. Recording those as ``submission_failed`` moved the record to
-    terminal ``failed``, so a later confirming refetch had nowhere to land and blind retry
-    was the only thing left -- exactly what the handoff says the ledger must prevent
-    (GPT review round 2, finding 3). An uncertain attempt leaves the record ``approved``.
+    ``submitted`` is M2-704's "success requires refetch confirmation". Everything that is
+    neither a confirmed success nor an observed absence is the handoff's uncertain timeout:
+    the post and the platform do not agree, or the platform was never read, and neither is
+    a failure. Recording those as ``submission_failed`` moved the record to terminal
+    ``failed``, so a later confirming refetch had nowhere to land and blind retry was the
+    only thing left -- exactly what the handoff says the ledger must prevent (GPT review
+    round 2, finding 3). An uncertain attempt leaves the record ``approved``.
+
+    **M2-711 split the last row of the old table.** 003 read ``(success,
+    verified_by_refetch)``, and that pair had no member meaning "the post raised *and* the
+    refetch could not be performed"; it landed in ``(False, False)`` with the genuinely
+    failed attempt and became terminal ``failed`` -- a permanent claim that the post did
+    not go through, made on no observation at all. ``unreadable`` is that case.
+    ``mismatched`` moves with it and for the same reason: ``submission_live.
+    classify_refetch`` returns it only when an entry *newer than the baseline* is on the
+    platform and does not match what was sent, so "nothing is there" is false of it too.
+    Which of the two it is is a human judgement, and an uncertain record is where a human
+    can still make it.
 
     A second attempt made while an earlier one is still uncertain **is recorded**, not
     refused. Round 3 refused it here and in the trigger; round 4 withdrew that, because
@@ -976,7 +1048,11 @@ def record_submission_attempt(
 
     attempt_id = _require_identifier(attempt.attempt_id, "attempt.attempt_id")
     success = _require_bool(attempt.success, "attempt.success")
-    verified = _require_bool(attempt.verified_by_refetch, "attempt.verified_by_refetch")
+    outcome = _require_member(attempt.refetch_outcome, _REFETCH_OUTCOMES, "attempt.refetch_outcome")
+    # The column, derived from the one field that carries the fact. Not read off the
+    # dataclass's property: a property is an attribute read like any other, and deriving it
+    # here keeps the value bound in this function to the vocabulary member just validated.
+    verified = 1 if outcome == "confirmed" else 0
 
     event_type: LifecycleEventType
     if success == 1 and verified == 1:
@@ -984,8 +1060,11 @@ def record_submission_attempt(
         if detail_code is not None:
             raise LifecycleError("detail_code is not applicable to a verified submission")
     else:
-        # The two signals disagreeing is the uncertain case; both saying no is the failure.
-        event_type = "submission_uncertain" if success != verified else "submission_failed"
+        # An observed absence after a post that raised is the only failure: everything else
+        # is the platform and the post disagreeing, or the platform never being read.
+        event_type = (
+            "submission_failed" if success == 0 and outcome == "absent" else "submission_uncertain"
+        )
         if detail_code is None:
             raise LifecycleError(
                 "detail_code is required for an attempt that is not a refetch-verified success"
@@ -1028,6 +1107,7 @@ def record_submission_attempt(
             "attempt.refetched_forecast_snapshot",
             max_length=_MAX_BODY,
         ),
+        outcome,
         _utc_text(_utcnow()),
     )
 
@@ -1038,8 +1118,8 @@ def record_submission_attempt(
             "(attempt_id, forecast_record_id, idempotency_key, requested_at_utc, "
             "completed_at_utc, request_payload_sha256, http_status, response_body, "
             "response_headers, success, error_type, error_message, verified_by_refetch, "
-            "refetched_forecast_snapshot, created_at_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "refetched_forecast_snapshot, refetch_outcome, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )
         return _append_event(

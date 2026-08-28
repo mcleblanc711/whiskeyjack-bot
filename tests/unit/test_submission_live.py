@@ -43,7 +43,12 @@ from whiskeyjack_bot.forecast.schema import (
 )
 from whiskeyjack_bot.forecast.store import append_forecast_version
 from whiskeyjack_bot.ledger import connect, initialize_ledger
-from whiskeyjack_bot.lifecycle import current_status, record_validation, transaction
+from whiskeyjack_bot.lifecycle import (
+    current_status,
+    record_validation,
+    transaction,
+    unresolved_uncertainties,
+)
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
 from whiskeyjack_bot.submission_gateway import SubmissionRequest, read_live_artifact
 from whiskeyjack_bot.submission_live import (
@@ -533,15 +538,20 @@ def test_a_failed_post_with_nothing_on_the_platform_is_terminal(
     assert current_status(ledger, record_id) == "failed"
 
 
-def test_a_failed_post_and_an_unreadable_refetch_says_so_in_the_row(
+def test_a_failed_post_and_an_unreadable_refetch_is_unknown_not_failed(
     approved: tuple[sqlite3.Connection, str], live_config: AppConfig
 ) -> None:
-    """The one cell `(success, verified_by_refetch)` cannot express -- see M2-711.
+    """M2-711's acceptance criterion, end to end through the live gateway.
 
-    `(False, False)` is `submission_failed`, which claims the post did not go through; here
-    it is not known either way. The event is what the vocabulary allows and the row says
-    what actually happened, which is the most this can do until the ledger has a state for
-    it. Pinned so the behaviour cannot drift silently while the item is open.
+    *"A post whose outcome no refetch established is recorded as neither submitted nor
+    failed; the record stays somewhere a later refetch can still resolve it."* The post
+    raises and the refetch comes back unreadable, so nothing is known either way -- and
+    before this item that was `submission_failed`, terminal, claiming the post did not go
+    through on the strength of no observation at all.
+
+    The four assertions are the criterion's four clauses: not submitted, not failed, still
+    `approved`, and still named as outstanding so the next post is refused and a refetch
+    can still decide it. The test below carries it the rest of the way, to `submitted`.
     """
     ledger, record_id = approved
     poster = FakePoster(
@@ -550,9 +560,47 @@ def test_a_failed_post_and_an_unreadable_refetch_says_so_in_the_row(
     )
     poster._after = FakeQuestion(api_json="not a dict")  # noqa: SLF001 - scripting the fake
     recorded = _post(ledger, record_id, poster, live_config)
-    assert recorded.event.event_type == "submission_failed"
+    assert recorded.event.event_type == "submission_uncertain"
+    assert recorded.receipt.refetch_outcome == "unreadable"
+    assert current_status(ledger, record_id) == "approved"
+    assert unresolved_uncertainties(ledger, record_id) == (recorded.receipt.attempt_id,)
+    # The prose note the row used to carry in place of a ledger state is gone with the
+    # state that replaced it; what is left is the classified cause of the *post*.
     assert recorded.receipt.error_message is not None
-    assert "platform state was not established" in recorded.receipt.error_message
+    assert "platform state was not established" not in recorded.receipt.error_message
+    assert recorded.receipt.error_type is not None
+
+
+def test_an_unknown_outcome_can_still_be_carried_to_submitted_by_a_later_refetch(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """The other half of M2-711: *"a later refetch can still resolve it"*.
+
+    The same unreadable-refetch post as above, then a refetch that does read the platform
+    and finds the forecast. Before this item the record was terminal `failed` at the end of
+    the first step and there was no legal event to carry it anywhere -- a ledger permanently
+    disagreeing with the platform about a live forecast, which is the failure the whole
+    uncertain-state machinery exists to prevent.
+    """
+    ledger, record_id = approved
+    poster = FakePoster(post_error=_Timeout("boom"), fetch_errors=[])
+    poster._after = FakeQuestion(api_json="not a dict")  # noqa: SLF001 - scripting the fake
+    recorded = _post(ledger, record_id, poster, live_config)
+    attempt_id = recorded.receipt.attempt_id
+
+    later = FakePoster(after=FakeQuestion(history=[_entry(NEW_START, _binary_values(PROBABILITY))]))
+    later.posts = 1  # so the fake serves its "after" question to the refetch
+    event = verify_uncertain_attempt(
+        ledger,
+        record_id=record_id,
+        attempt_id=attempt_id,
+        poster=later,
+        occurred_at=OCCURRED,
+        sleep=lambda _: None,
+    )
+    assert event.event_type == "submission_confirmed"
+    assert current_status(ledger, record_id) == "submitted"
+    assert unresolved_uncertainties(ledger, record_id) == ()
 
 
 # ── "uncertain timeout blocks blind retry" ───────────────────────────────────

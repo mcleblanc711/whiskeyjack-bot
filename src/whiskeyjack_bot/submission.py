@@ -82,15 +82,19 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from typing import cast
+from typing import cast, get_args
 
 from whiskeyjack_bot.approval import ApprovalError, effective_approval
-from whiskeyjack_bot.lifecycle import LifecycleError, current_status
+from whiskeyjack_bot.lifecycle import LifecycleError, RefetchOutcome, current_status
 
 # Bumping this changes every key, which is the point: a rule change must be visible as a
 # different key rather than silently reinterpreting stored ones. It is part of the hashed
 # payload *and* of the prefix, so the rule and its declared version cannot drift apart.
 KEY_SCHEMA_VERSION = "1.0.0"
+
+# `lifecycle`'s vocabulary, resolved once. Derived with `get_args` rather than restated as
+# a literal, so this reader cannot come to accept a member the writer does not emit.
+_REFETCH_OUTCOMES: frozenset[str] = frozenset(get_args(RefetchOutcome))
 
 # The visible scheme tag. Written as a literal rather than derived from the version so
 # that _assert_prefix_matches_version has something to check; a computed prefix would
@@ -172,6 +176,15 @@ class AttemptSummary:
     :func:`lifecycle.record_submission_attempt` requires it (M1-603 round 2, finding 5), so
     every row this package writes has one; a ``None`` here means the row came from
     somewhere else.
+
+    ``refetch_outcome`` is ``RefetchOutcome | None`` for the neighbouring reason and a
+    different one. ``009`` added the column, so a row written before it holds ``NULL`` and
+    no value can be invented for it; and unlike ``completed_at_utc`` that ``None`` is
+    *expected* of any attempt this ledger recorded under M2-704. Both it and
+    ``verified_by_refetch`` are read here rather than one being derived from the other:
+    these are two stored columns, and reporting what the ledger holds is this reader's
+    whole job -- the derivation belongs to the writer, where there is one fact to derive
+    from.
     """
 
     attempt_id: str
@@ -182,6 +195,7 @@ class AttemptSummary:
     request_payload_sha256: str
     success: bool
     verified_by_refetch: bool
+    refetch_outcome: RefetchOutcome | None
     created_at_utc: str
 
 
@@ -368,7 +382,7 @@ def attempt_for_key(conn: sqlite3.Connection, idempotency_key: str) -> AttemptSu
         conn,
         "SELECT attempt_id, forecast_record_id, idempotency_key, requested_at_utc, "
         "completed_at_utc, request_payload_sha256, success, verified_by_refetch, "
-        "created_at_utc FROM submission_attempts WHERE idempotency_key = ?",
+        "refetch_outcome, created_at_utc FROM submission_attempts WHERE idempotency_key = ?",
         (key,),
     )
     if row is None:
@@ -382,7 +396,8 @@ def attempt_for_key(conn: sqlite3.Connection, idempotency_key: str) -> AttemptSu
         request_payload_sha256=_stored_text(row[5], "request_payload_sha256"),
         success=_stored_flag(row[6], "success"),
         verified_by_refetch=_stored_flag(row[7], "verified_by_refetch"),
-        created_at_utc=_stored_text(row[8], "created_at_utc"),
+        refetch_outcome=_stored_refetch_outcome(row[8]),
+        created_at_utc=_stored_text(row[9], "created_at_utc"),
     )
 
 
@@ -499,6 +514,25 @@ def _stored_int(value: object, field: str) -> int:
             f"stored {field} is not an integer (detail withheld: it can echo stored values)"
         )
     return value
+
+
+def _stored_refetch_outcome(value: object) -> RefetchOutcome | None:
+    """Gate a stored ``refetch_outcome``, which may legitimately be absent (M2-711).
+
+    ``None`` for a row written before ``009`` added the column; otherwise a member of the
+    vocabulary, checked rather than trusted -- values read back out of the ledger are
+    untrusted per CLAUDE.md's threat boundary, and a value only becomes safe to name in a
+    message once it has been proven to belong to a vocabulary this package defines. This
+    one is never named either way, because the refusal cannot know which it is looking at.
+    """
+    if value is None:
+        return None
+    if type(value) is not str or value not in _REFETCH_OUTCOMES:
+        raise SubmissionError(
+            "stored refetch_outcome is not one of the recognized values "
+            "(detail withheld: it can echo stored values)"
+        )
+    return cast(RefetchOutcome, value)
 
 
 def _stored_flag(value: object, field: str) -> bool:
