@@ -5086,3 +5086,80 @@ change lands at a wave boundary (lesson 1), and two other lanes are open.
   a reply told *"must name every option the question supplied"* has everything it needs — the list
   is in its own request. Whether it re-answers rather than dropping the claim is not something an
   offline suite can answer.
+
+### Round 1 — one blocking finding, and the shape of the miss
+
+`GPT_REVIEW_RESPONSE_M1-404_r1.md`, reviewed commit `a6ab19e`. **CHANGES REQUESTED, one blocking
+finding, zero non-blocking observations.** Eight of the nine declared risk areas came back *safe*;
+risk 4 — "every caller-mistake path raises `MultipleChoiceOutputError`, never a raw error" — did
+not, and it was wrong in a way the section above did not anticipate.
+
+**The finding.** `_supplied_options` refused `None`, a bare `str`, a non-`str` member, an empty
+list, a repeated label and a blank label, and its docstring said each *"mirrors an invariant
+`CanonicalMultipleChoiceQuestion` already enforces"*. It did not refuse a **one-element** list, and
+that model's field is `options: list[str] = Field(min_length=2)`. So the guard set mirrored
+`min_length=1`.
+
+**Reproduced by execution before any fix was written**, per the standing rule, and the reproduction
+went further than the review did. The review showed one case; the question worth answering was
+whether *any* singleton reply could pass. Against the committed `0.001`/`0.999` bounds, none can:
+
+| sole probability | verdict before the fix |
+| --- | --- |
+| `1.0` | *bounds* |
+| `0.999` | *sum* |
+| `0.9999995` | *bounds* |
+
+The two rules cover the line between them and leave no gap — summing to 1 within `1e-6` forces the
+sole probability to at least `1 - 1e-6 = 0.999999`, which is already above `max_probability`. So
+the pre-fix behaviour returned a *repairable problem* for a response no model could ever repair,
+which is exactly the failure `_require_config` refuses for an inverted bounds pair, reached through
+the other argument, at two billed calls per question. That is what makes it blocking rather than
+cosmetic, and it is the argument the fix is justified by.
+
+**The fix.** `len(supplied) < 2` raises `MultipleChoiceOutputError`, beside the empty-list check it
+generalizes. Three tests, each killed by removing the guard (mutation run with `__pycache__` swept,
+`PYTHONDONTWRITEBYTECODE` set, and the restore read back and asserted byte-identical):
+
+- the `[singleton]` case in `test_an_option_list_that_would_make_a_rule_lie_is_a_caller_mistake`;
+- `test_no_reply_to_a_singleton_option_list_could_ever_have_passed`, which pins the *reason* as an
+  assertion on the committed config — `max_probability < 1 - _SUM_TOLERANCE` — so a future config
+  that narrowed the gap and made a singleton satisfiable would fail here rather than silently
+  invalidate the guard's rationale;
+- `test_an_option_list_of_fewer_than_two_always_raises_rather_than_returning` in
+  `tests/property/`.
+
+### Why the existing property did not catch it — the vacuity trap, one layer up
+
+Worth writing down, because the strategy was **not** the problem. `HOSTILE_OPTIONS` already drew
+`st.tuples(HOSTILE_TEXT)` and `st.lists(HOSTILE_TEXT, max_size=3)`, both of which produce
+one-element lists. The singleton branch was reachable, and was reached, on a large fraction of
+draws.
+
+`test_multiple_choice_never_raises_outside_its_own_error_type` passed anyway — before the fix and
+after it — because its assertion is only that nothing escapes `MultipleChoiceOutputError`, and it
+`continue`s on that exception. A *returned* list of problems satisfies it exactly as well as a
+raise. The property was true of both behaviours, so it could not distinguish them.
+
+This is the vacuous-property class the project already tracks, with the usual diagnosis inverted.
+The recorded form is *"the strategy cannot reach the branch the assertion is about"*; this one is
+**the strategy reaches the branch and the assertion is not about it**. Widening the strategy would
+have done nothing. The fix is a second property whose assertion is arity itself, and the mutation
+check is what tells the two cases apart — a property that survives removing the code it is named
+for is not evidence, whichever of the two reasons it survived for.
+
+### The generalization worth carrying to M1-405
+
+The nineteen mutations, the eight properties and the leak-invariance work above were all sound, and
+the miss was upstream of all of it: the guard list was derived from another model's invariants
+**by reading them off rather than enumerating them**. Five of six were mirrored. The sixth was the
+only constraint about *how many* rather than about what each element is — and arity is precisely
+the constraint whose absence makes a rule set unsatisfiable rather than merely wrong, because the
+other rules keep answering and their answers look repairable.
+
+Same shape as M1-308's round-7 lesson (when a finding names one exception type from a third-party
+parser, enumerate the siblings by execution): the escape is a class, not an instance. Here the
+class is "every constraint on the model this guard claims to mirror", and the cheap discipline is
+to list that model's fields and check them off one by one. `M1-405` takes an option list's
+counterpart in the question bounds and should do exactly that against
+`CanonicalNumericQuestion` before its own round 1.

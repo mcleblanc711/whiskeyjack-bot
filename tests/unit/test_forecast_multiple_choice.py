@@ -395,6 +395,10 @@ def test_a_response_of_another_question_type_is_a_caller_mistake() -> None:
         ({"A": 1}, "options: must be a sequence of strings"),
         (("A", 2), "options: must be a sequence of strings"),
         ((), "options: must not be empty"),
+        # Round-1 review, 2026-08-28. The empty case above was the only arity guard, and
+        # it mirrors ``min_length=1``; the model's field is ``min_length=2``. A singleton
+        # is the case that *looks* answerable and is not -- see the test below.
+        (("A",), "options: must supply at least two options for a multiple-choice question"),
         (("A", "A"), "options: must not repeat a label"),
         (("A", "  "), "options: must not contain a blank label"),
     ],
@@ -406,6 +410,7 @@ def test_a_response_of_another_question_type_is_a_caller_mistake() -> None:
         "mapping",
         "non-str-member",
         "empty",
+        "singleton",
         "repeated",
         "blank",
     ],
@@ -419,6 +424,35 @@ def test_an_option_list_that_would_make_a_rule_lie_is_a_caller_mistake(
     with pytest.raises(MultipleChoiceOutputError) as caught:
         _problems(_response(), options=options)
     assert caught.value.problems == [expected]
+
+
+def test_no_reply_to_a_singleton_option_list_could_ever_have_passed() -> None:
+    """Why the arity guard above is a *caller mistake* and not a returnable problem.
+
+    Round-1 review found the missing guard; this pins the reason it is blocking rather
+    than cosmetic. For a one-option list the *sum* rule and the *bounds* rule cover the
+    whole line between them and leave no gap: summing to 1 within ``_SUM_TOLERANCE``
+    forces the sole probability to at least ``1 - _SUM_TOLERANCE``, which is already
+    above ``max_probability``. So the old behaviour -- returning a bounds problem --
+    asked for a repair no model could perform, which is the failure ``_require_config``
+    refuses for an inverted bounds pair at two billed calls per question.
+
+    Stated against the *committed* bounds rather than hand-built ones, for
+    ``_committed_forecast_config``'s reason: if a future config narrowed the gap the two
+    rules would stop covering the line, and this assertion is what would notice.
+    """
+    config = _committed_forecast_config()
+    assert config.max_probability < 1.0 - _SUM_TOLERANCE, (
+        "the sum and bounds rules no longer cover the line between them, so a singleton "
+        "option list may have become satisfiable -- re-derive the guard before relaxing it"
+    )
+
+    # And the boundary refuses to reach those rules at all, rather than returning either.
+    with pytest.raises(MultipleChoiceOutputError) as caught:
+        _problems(_response(_answers(("A", 1.0))), options=("A",))
+    assert caught.value.problems == [
+        "options: must supply at least two options for a multiple-choice question"
+    ]
 
 
 def test_a_generator_is_refused_rather_than_silently_exhausted() -> None:

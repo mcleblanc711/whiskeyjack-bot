@@ -317,9 +317,11 @@ def test_the_type_specific_rules_reach_multiple_choice() -> None:
         _committed_forecast_config(),
         question_id=QUESTION_ID,
         source_ids=PROMPT_SOURCES,
-        # One label the prompt's example never answers, so *missing* bites; the labels it
-        # does answer are then unknown, so *unknown* bites too.
-        options=("Some other option",),
+        # Labels the prompt's example never answers, so *missing* bites; the labels it
+        # does answer are then unknown, so *unknown* bites too. Two of them rather than
+        # one because a singleton supplied list is a caller mistake (M1-404 round 1): the
+        # sum and bounds rules cover the line between them, so no reply could satisfy it.
+        options=("Some other option", "Yet another option"),
     )
     assert problems == [
         "final_prediction.options: must name only options the question supplied "

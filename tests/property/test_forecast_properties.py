@@ -1157,6 +1157,47 @@ def test_multiple_choice_never_raises_outside_its_own_error_type(
         assert all(isinstance(problem, str) for problem in problems)
 
 
+@given(
+    option_cases(),
+    st.one_of(
+        st.none(),
+        st.just(()),
+        st.tuples(HOSTILE_TEXT),
+        st.lists(HOSTILE_TEXT, min_size=1, max_size=1),
+    ),
+)
+def test_an_option_list_of_fewer_than_two_always_raises_rather_than_returning(
+    case: tuple[tuple[str, ...], list[tuple[str, float]], ForecastConfig],
+    options: Any,
+) -> None:
+    """Arity is a caller mistake, never a repairable problem. Round-1 review, 2026-08-28.
+
+    ``HOSTILE_OPTIONS`` above could already *draw* a one-element list, and the property it
+    feeds passed before this branch's fix and after it -- because that property asserts
+    only that nothing escapes ``MultipleChoiceOutputError``, and a returned list of
+    problems satisfies it just as well as a raise. The strategy reached the branch; the
+    assertion was not about it. That is this project's top recurring defect class, so the
+    fix is a property whose assertion *is* about arity rather than a wider strategy.
+
+    Fewer than two supplied options cannot be answered at all -- the sum and bounds rules
+    cover the line between them -- so returning a problem would ask for an unsatisfiable
+    repair at two billed calls per question.
+    """
+    _, answers, config = case
+    response = _mc_response(answers)
+    with pytest.raises(MultipleChoiceOutputError) as caught:
+        multiple_choice_output_problems(response, config, options=options)
+    # When the shape is otherwise well-formed, arity is the reason given -- not a rule
+    # problem wearing an exception, and not a message that names the drawn label.
+    if isinstance(options, (list, tuple)) and all(type(v) is str for v in options):
+        expected = (
+            "options: must not be empty"
+            if not options
+            else "options: must supply at least two options for a multiple-choice question"
+        )
+        assert caught.value.problems == [expected]
+
+
 @given(st.lists(st.sampled_from(_MC_LABELS), min_size=2, max_size=3, unique=True))
 def test_an_option_problem_never_varies_with_the_label_that_failed(supplied: list[str]) -> None:
     """The leak property as **invariance**, not as a substring check.

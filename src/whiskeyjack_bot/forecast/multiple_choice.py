@@ -151,10 +151,23 @@ def _supplied_options(options: Sequence[str] | None) -> tuple[str, ...]:
       would silently mean the three options ``"Y"``, ``"e"``, ``"s"`` -- the M1-303
       round-4 defect, and ``attribution._supplied_ids`` refuses it for the same reason;
     - an empty list would make *every* answer an unknown option;
+    - **fewer than two options cannot be answered at all** -- see below;
     - a repeated label makes "exactly once" unstatable, which is why
       ``questions/model.py`` rejects it at the input contract;
     - a blank label can never be matched, because ``schema.NonBlankStr`` refuses one on
       the response side -- so it is a rule no reply could satisfy.
+
+    The arity refusal was **missed in the first draft and found by round-1 review**, and
+    the miss is worth recording because the rest of this list was derived correctly. Five
+    of ``CanonicalMultipleChoiceQuestion``'s six invariants were mirrored here; the sixth
+    is ``options: list[str] = Field(min_length=2)``, and it was the only one about *how
+    many* rather than about what each element is. Arity is the constraint that makes a
+    rule set unsatisfiable rather than merely wrong: against the committed
+    ``0.001``/``0.999`` bounds no one-option reply can pass any rule set at all -- ``1.0``
+    and anything above ``0.999`` fail *bounds*, ``0.999`` and anything below fail *sum* --
+    so a singleton list produces a repair turn no model can satisfy, at two billed calls
+    per question. That is the exact failure :func:`_require_config` refuses for an
+    inverted bounds pair, reached through the other argument.
     """
     if options is None:
         raise MultipleChoiceOutputError(
@@ -169,6 +182,10 @@ def _supplied_options(options: Sequence[str] | None) -> tuple[str, ...]:
     supplied = tuple(options)
     if not supplied:
         raise MultipleChoiceOutputError(["options: must not be empty"])
+    if len(supplied) < 2:
+        raise MultipleChoiceOutputError(
+            ["options: must supply at least two options for a multiple-choice question"]
+        )
     if len(set(supplied)) != len(supplied):
         raise MultipleChoiceOutputError(["options: must not repeat a label"])
     if any(not value.strip() for value in supplied):
