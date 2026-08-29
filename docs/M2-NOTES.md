@@ -1744,3 +1744,283 @@ junk for the same reason.
 `test_the_partition_covers_every_pair_exactly_once` is the cheap companion in the unit
 suite: the parametrized test drives every row it is given and would pass just as well with a
 row missing, so the table is asserted total and single-valued against `get_args`.
+
+## M2-708 — Reserve an idempotency key atomically before any post
+
+M2-702's own filed defect, closed. `require_key_unused()` is a **read**, and until this
+item it was the entire guard standing in front of a live post. Two commands could both read
+one derived key as unused, both post, and `001`'s `idempotency_key TEXT NOT NULL UNIQUE`
+would then refuse the second **row** — after its call had already been made. The constraint
+protected the shape of the ledger and not the platform, and the acceptance criterion asks
+for the platform: *two concurrent commands for the same derived key durably select one
+poster before any network I/O; the loser posts nothing, and every completed call remains
+recordable.*
+
+It was filed as a backlog candidate rather than a blocker because nothing was reachable at
+the time — no gateway existed. M2-704 shipped one, so this must land before M2-706 ever
+fires.
+
+Delivered:
+
+- `src/whiskeyjack_bot/migrations/010_submission_key_reservations.sql` — two new tables,
+  `submission_key_reservations` (the claim) and `submission_key_releases` (its resolution),
+  with sixteen validation clauses and the four D25 block triggers.
+- `src/whiskeyjack_bot/submission.py` — `KeyReservation`; `reserve_submission_key`,
+  `release_submission_key`; the readers `live_reservation_for_key` and
+  `live_reservations_for_record`; `require_key_unused` widened to see a reservation.
+- `src/whiskeyjack_bot/submission_live.py` — `MetaculusSubmissionGateway.post_attempted`;
+  the claim moved ahead of the submit in `post_approved_forecast`, and `_release_unspent`.
+- `src/whiskeyjack_bot/cli.py` — the `release-key` command, and `submit` printing the way
+  out when it leaves a reservation standing.
+- `src/whiskeyjack_bot/ledger.py` — `LEDGER_SCHEMA_VERSION` 9 → 10.
+- Tests: 35 new in `test_submission.py`, 8 in `test_submission_live.py`, 9 in
+  `test_cli_submit.py`, 6 new properties, and `010`'s two tables folded into
+  `test_lifecycle.py`'s append-only probes and `test_ledger.py`'s table set.
+
+Migration `010`, claimed in `docs/TRACKS.md` before the `.sql` was written. No new
+dependency.
+
+### Decision — two new tables, not a column
+
+Neither existing table can hold a claim that must exist *before* the call:
+
+- `submission_attempts` is written once, after the call has finished. `003`'s
+  `submission_attempts_require_receipt_on_insert` requires `completed_at_utc`, and `003`'s
+  block triggers forbid the UPDATE that filling it in later would need. A row inserted
+  before the post could never be completed.
+- `lifecycle_events.event_type` is a column `CHECK`, and SQLite cannot widen one without
+  rebuilding the table — the rebuild `009` refused, for the same reason. A reservation is
+  not a change in a record's status anyway.
+
+So a claim table and a resolution table. That pairing is not new here: it is the shape
+`submission_attempts` and `submission_verifications` already have, and it is what lets both
+tables stay strictly append-only (D25) while the *state* of a key still changes. The state
+is **derived, never stored** — `spent` (an attempt row exists; terminal), `reserved` (a
+reservation with no release and no attempt), `released` (every reservation for it carries a
+release), `free` (no reservation at all).
+
+`010` is also the first migration since `003` that rewrites **no** existing trigger body.
+`004`, `006`, `007` and `008` each rewrote `forecast_records_require_draft_on_insert` and
+`009` rewrote two more; everything this one constrains is new. There is no upgrade
+precondition scan either, and it is *not needed* rather than skipped: both tables are
+created by this migration inside the one `BEGIN`/`COMMIT` `ledger._apply_migration` wraps it
+in, so no row can exist before the triggers do.
+
+### Decision — the claim is a row, not a lock file and not a held transaction
+
+The failure this prevents is durable, so the claim has to be. A lock file is released by
+the kernel on crash — which reopens the window in exactly the case that matters, the
+process that died mid-post. And holding a write transaction across the post would serialize
+the entire database behind a multi-second HTTP call.
+
+Three layers, and which one does what matters:
+
+- `lifecycle.transaction` is `BEGIN IMMEDIATE`, so the write lock is taken **before** the
+  read and the read-then-write cannot interleave with another writer's. That makes the
+  ordinary contended case a clean typed refusal rather than a lock upgrade that cannot be
+  retried from inside an open transaction.
+- `010`'s validation trigger refuses a second live reservation, a spent key, and a sequence
+  number that is not the next one. **This is the enforcement** — the layer that cannot be
+  raced.
+- `UNIQUE (idempotency_key, reservation_seq)` turns any race that does occur into a loud
+  failure rather than a silently duplicated claim.
+
+Exactly the division `lifecycle_events.event_seq` already documents. The Python checks are
+not the guarantee; they are what turn the guarantee into a message an operator can act on.
+**That claim was untested until a mutation pass said so** — see "On the mutation pass".
+
+### Decision — `post_attempted` is a flag, not the type of the exception
+
+Whether releasing a key is honest turns on one question: did the post happen? The obvious
+implementation reads the exception — `except LiveSubmissionError` before the post, anything
+else after. It is wrong. `submit_with_detail` refuses *before* the post for a failed
+baseline fetch, a mismatched identity, a closed question and an unreadable history — and it
+can **also** raise after the post, from an injected clock returning a naive datetime. A
+release written on that second case would free a key whose post may have landed, and invite
+exactly the blind retry this item exists to close.
+
+So the gateway carries state. `_post_attempted` is set as the first statement of `_post`,
+**before** the poster is touched, and never cleared: setting it after a successful call
+would leave unmarked the one case that matters, a post that raised, which is precisely when
+nobody knows whether it landed. The `except BaseException` in `post_approved_forecast`
+releases only `if not gateway.post_attempted`, and re-raises either way.
+
+A gateway is constructed per call on the live path, so the flag is never stale. Reading it
+after a *successful* submit is meaningless rather than wrong: the attempt row spends the
+key, and nothing consults the flag on that path.
+
+The gateway is also constructed **before** the key is claimed, so a bad argument to it
+refuses without leaving a reservation behind. Nothing between the claim and the submit can
+fail.
+
+### Decision — two release reasons, and they are not the same claim
+
+An atomic reservation creates a state that did not exist before: reserved, with no attempt
+row. A key is a pure function of `(tournament, question, forecast version, payload hash)`,
+so a claim with no exit does not block a *retry* — it blocks that forecast, permanently, on
+an append-only table. Hence a release. Two ways out (owner decision, 2026-08-28):
+
+- **`not_posted`** — the gateway *proved* no post was made (`post_attempted` is false).
+  Written by the program, and `released_by` is **refused**: there is no person to name, and
+  accepting one would put a name against a conclusion no person reached.
+- **`operator_abandoned`** — a human checked the platform and asserts nothing landed. This
+  is the crash-mid-post case, where the program knows nothing. `released_by` is **required**,
+  for `approve`'s reason: an attribution claim about a person is never inferred from the
+  machine.
+
+`reason` is deliberately **not** a column `CHECK`. `009` established what a closed column
+vocabulary costs on an append-only table — widening one is a full rebuild — and this
+vocabulary is the kind that grows. The schema enforces the column's *shape* (non-blank text,
+no NUL, bounded); `submission.ReservationReason` owns its *membership*, the layer that can
+change without a migration.
+
+`release_submission_key` reads only `reservation.reservation_id` off the value object.
+Nothing else on it reaches the row, so there is no second source of truth for a caller to
+get wrong — M2-703 round 1's finding, applied by construction rather than checked
+afterwards. The key the "already spent" test runs against is read back **from the stored
+row**, not taken from the object.
+
+### Decision — one declared instant, reused
+
+`post_approved_forecast` resolves `stamped` once, before anything is claimed, and the
+reservation, its release and the ledger event all use it. `010` requires that a release not
+precede its reservation; reusing the value makes that ordering true **by construction**
+rather than by two clock reads happening to agree. The wall-clock record is `created_at_utc`,
+which the ledger writes itself for every row.
+
+Relatedly, `reserved_at_utc` is pinned to the fixed-width UTC form `003` pins its ordered
+columns to, because `released_at_utc` is compared against it and a lexicographic comparison
+against an unknown format is a coin toss that reads like a check. `created_at_utc` is not
+pinned: nothing orders it.
+
+### Decision — `release-key` never guesses which reservation
+
+The CLI lists standing reservations and refuses when a record holds more than one without
+`--reservation-id`. Two live reservations means two payloads, and only the operator knows
+which submission they went and checked. `--released-by` is required with no default, same
+rule as `approve`.
+
+### Deviation — `require_key_unused` now refuses a reserved key
+
+M2-702 shipped it meaning "no attempt row exists". It now also refuses a key with a live
+reservation, which widens a contract another item published. The cheap reader is what the
+dry-run path and the CLI consult, and leaving it blind to reservations would have let a
+command report a key as available that `reserve_submission_key` would immediately refuse.
+`test_require_key_unused_now_refuses_a_reserved_key` and
+`test_a_reserved_key_is_free_again_to_the_cheap_reader_after_release` pin both directions.
+
+### Rejected — a lock file, or a transaction held across the post
+
+Covered above: the first is released by the kernel on the crash it is supposed to cover, the
+second serializes the database behind a network call. Neither is a smaller change than a
+table once the claim has to survive a process death.
+
+### Rejected — a `released` flag on the reservation row
+
+The obvious shape — one table, `UPDATE ... SET released = 1` — is what D25 forbids, and
+forbids for a reason this item makes concrete. If a reservation could be edited, an
+abandoned key could be made to look spent and a spent one made to look free; the release
+table is a *record* precisely because it cannot be rewound. `test_lifecycle.py`'s
+append-only probes now walk both new tables for that reason.
+
+### Rejected — a `CHECK` constraint on `reason`
+
+See above: `009` paid for that lesson already.
+
+### Rejected — deriving the key inside `reserve_submission_key`
+
+It would let the writer verify that `idempotency_key` is the one `submission_key_for_record`
+would derive for `record_id`. It cannot: the derivation needs the payload hash, which is the
+caller's and is stored nowhere the writer could read. `010` catches the consequence that
+actually matters — one key reserved against two different records — and
+`post_approved_forecast` derives both values from the same row in the same breath.
+
+### Deferred (do not read the absence as an omission)
+
+- **A reservation timeout / automatic expiry.** A claim that expires on a timer is a claim
+  that can expire *while the post it guards is in flight*, which is the failure this item
+  exists to prevent wearing a clock. The exit is a human or a proof, never an elapsed
+  interval.
+- **Cross-process testing of the race itself.** The suite is offline and single-process, so
+  the concurrent case is argued from `BEGIN IMMEDIATE` plus the trigger, and tested by
+  driving the trigger directly with raw SQL. A genuine two-process test is a T-90x-shaped
+  acceptance item, not a unit test.
+- **M2-706 stays owner-gated.** Nothing here fires live; `submission.enabled: false` and
+  `dry_run: true` remain the committed defaults.
+
+### Standing risk — the one case where releasing is wrong
+
+A reservation left standing because the ledger refused to record a post that **succeeded**.
+There the post really did land, and releasing the key invites a duplicate. The program
+cannot distinguish it from the crash case — that is the whole reason `operator_abandoned`
+requires a person — so `submit` says so at the time, and `release-key`'s preamble repeats
+it, because the command is reached long after that message scrolled by. It is a real hole
+and it is closed by a human reading Metaculus, not by code.
+
+### Standing risk — the platform's own idempotency behaviour is not verifiable offline
+
+Everything here serializes *this program*. Whether Metaculus itself deduplicates a repeated
+post is not something the suite can establish, and no claim in this item depends on it.
+
+### On the mutation pass
+
+Run against `010`'s six substantive clauses and nine Python branches. **The first run found
+a real gap**, and it is worth recording because the code was already documented as if the
+gap were not there.
+
+| Mutation | Caught by (before) | Caught by (after) |
+| --- | --- | --- |
+| `010`: `reservation_seq` must be the next one → `WHERE 0` | **0** | 4 |
+| `010`: key already reserved → `WHERE 0` | **0** | 1 |
+| `010`: key already spent by an attempt → `WHERE 0` | **0** | 1 |
+| `010`: key reserved against a different record → `WHERE 0` | 2 | 2 |
+| `010`: release earlier than its reservation → `WHERE 0` | **0** | 1 |
+| `010`: reservation consumed by an attempt → `WHERE 0` | **0** | 1 |
+
+Five of six survived. Not because the clauses were wrong, but because nothing could reach
+them: `reserve_submission_key` refuses every one of those cases a layer earlier, so each
+test proved the Python guard and stopped. `docs/LESSONS.md`'s vacuous-property class in a
+different coat — the assertion named the trigger and the strategy could not get to it, and
+here the docstring asserting *"this is the enforcement, the layer that cannot be raced"*
+made the omission invisible by describing the intended design instead of the tested one.
+
+The fix is five probes that `INSERT` raw, bypassing the writer. That is also the only shape
+resembling what the trigger is *for*: a second process whose read and write really did
+interleave, which no test driving the writer can construct. The sequence-number probe is
+parametrized across `0`, `1`, `3` and `-1` rather than one wrong value — `1` is the number
+already taken, `3` skips one, both others are under the floor — because a single sample
+passes just as well against an inequality pointing the wrong way.
+
+The nine Python mutations were all caught first time:
+
+| Mutation | Caught by |
+| --- | --- |
+| writer's spent-key check → `if False` | 1 |
+| writer's live-reservation check → `if False` | 4, across all three layers and a property |
+| release's consumed-by-attempt check → `if False` | 2 |
+| release's already-released check → `if False` | 1 |
+| `not_posted` may name an actor / other reasons may omit one | 1 each |
+| `if not gateway.post_attempted` → `if True` | 1 |
+| `if not gateway.post_attempted` → `if False` | 3 |
+| `self._post_attempted = True` never set | 2 |
+
+The `post_attempted` rows are the ones that matter: both directions fall, to **different**
+tests. A one-sided test — only "a refusal hands the key back" — would pass against a branch
+that always releases, which is the mutation that reopens the blind retry.
+
+### On the property pass
+
+Six new properties. Four fuzz the two writers for the project's standing rules (raises only
+`SubmissionError`; a refused reservation writes nothing; a refused reservation never leaks
+the key or the value). Two are about the item itself:
+
+`test_reservation_sequence_numbers_are_dense_and_ordered` drives reserve/release cycles and
+asserts the sequence is `1..n` with no gaps — the invariant `010`'s next-sequence clause and
+`UNIQUE (idempotency_key, reservation_seq)` jointly maintain, and the one a naive
+`MAX(seq)+1` would break after a deletion the block triggers happen to forbid.
+
+`test_a_held_key_is_refused_whatever_it_was_derived_from` is the guard against the vacuity
+class: it draws real tournaments and digests so the key is *derived* rather than handed in,
+which is what makes the refusal it asserts a refusal of the real key rather than of a string
+the test invented. It is also one of the four tests that caught the live-reservation
+mutation.
