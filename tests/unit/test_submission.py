@@ -915,7 +915,10 @@ def test_every_status_reachable_from_approved_is_accounted_for() -> None:
 
 def _reserved(conn: sqlite3.Connection, record_id: str, key: str) -> KeyReservation:
     return reserve_submission_key(
-        conn, record_id=record_id, idempotency_key=key, reserved_at=OCCURRED
+        conn,
+        record_id=record_id,
+        idempotency_key=key,
+        reserved_at=OCCURRED,
     )
 
 
@@ -1312,7 +1315,10 @@ def test_a_reservation_against_an_unknown_record_is_refused(
     key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
     with pytest.raises(SubmissionError):
         reserve_submission_key(
-            conn, record_id="rec-missing", idempotency_key=key, reserved_at=OCCURRED
+            conn,
+            record_id="rec-missing",
+            idempotency_key=key,
+            reserved_at=OCCURRED,
         )
     assert _reservation_counts(conn) == (0, 0)
 

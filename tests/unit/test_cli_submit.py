@@ -454,7 +454,10 @@ def _hold_key(config_file: Path, record_id: str, payload: Any = None) -> str:
         digest = payload_sha256(dict(BINARY_PAYLOAD) if payload is None else payload)
         key = submission_key_for_record(conn, record_id, request_payload_sha256=digest)
         reservation = reserve_submission_key(
-            conn, record_id=record_id, idempotency_key=key, reserved_at=OCCURRED
+            conn,
+            record_id=record_id,
+            idempotency_key=key,
+            reserved_at=OCCURRED,
         )
         return reservation.reservation_id
     finally:
