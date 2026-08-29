@@ -1750,8 +1750,13 @@ def post_approved_forecast(
     5. **Approval, and still awaiting submission.** :func:`submission.
        submission_key_for_approved_record` refuses a record that holds no approval *or* has
        since moved off ``approved`` -- the second check being M2-702 round 2's fix.
-    6. **The key is unspent.** :func:`submission.require_key_unused`. It is a read and says
-       so; **M2-708** is the item for reserving one atomically.
+    6. **The key is claimed, not merely read.** :func:`submission.reserve_submission_key`
+       (M2-708) takes a durable row before any network I/O, so two concurrent commands for
+       one derived key select a single poster. It replaced :func:`submission.
+       require_key_unused` here, which was a read and said so.
+    7. **The connection owns its own transaction.** Checked first, above: a reservation
+       taken inside a caller's transaction is not durable, and neither is the attempt row
+       that records the call.
 
     After the post, nothing refuses. The artifact is written first and every failure of it
     degrades to a note on the result (M1-312: an artifact failure must never cost a
@@ -1759,6 +1764,22 @@ def post_approved_forecast(
     names the artifact path, because at that point a live post exists and the operator
     needs the payload that produced it.
     """
+    if conn.in_transaction:
+        # Ahead of every other gate, because it is the one that decides whether any of
+        # them can mean anything. `lifecycle.transaction` nests as a SAVEPOINT, and
+        # RELEASE does not commit -- so inside a caller's transaction the reservation
+        # this path takes before posting, *and* the attempt row it writes afterwards,
+        # both remain erasable by a ROLLBACK the caller has not made yet. Round 1
+        # reproduced it: one forecast posted twice, the first call unrecorded.
+        #
+        # Refused rather than absorbed. Committing the caller's transaction is not this
+        # function's to do, and opening a second connection behind their back would put
+        # two writers on one ledger to work around a caller mistake.
+        raise LiveSubmissionError(
+            "a live post cannot be made inside a caller's open transaction: the key "
+            "reservation that selects one poster, and the attempt row that records the "
+            "call, would both stay erasable by a rollback. Commit or roll back first"
+        )
     require_live_submission_enabled(config)
     identifier = _require_identifier(record_id, "record_id")
 

@@ -641,6 +641,21 @@ def reserve_submission_key(
     derived state of the key becomes ``spent`` -- which is why nothing here has to be
     undone on the happy path, and why the writer of the attempt row is unchanged.
     """
+    if conn.in_transaction:
+        # A reservation that is not durable the moment it is made is not a reservation.
+        # `lifecycle.transaction` nests as a SAVEPOINT when the caller already holds a
+        # transaction, and RELEASE does not commit -- so inside one, this would return a
+        # KeyReservation the caller could still erase with a ROLLBACK, after a post it
+        # had already authorized. Round 1 reproduced exactly that: one forecast posted
+        # twice, with no ledger row for the first call.
+        #
+        # Refusing is the only honest answer, because the durability is the whole point
+        # of the row. It cannot be fixed by committing here either: the enclosing
+        # transaction is the caller's, and this is not the layer that may end it.
+        raise SubmissionError(
+            "a key reservation must be durable the moment it is taken, so it cannot be "
+            "made inside a caller's open transaction; commit or roll back first"
+        )
     identifier = _require_text(record_id, "record_id")
     key = _require_text(idempotency_key, "idempotency_key")
     reserved = _require_utc(reserved_at, "reserved_at")

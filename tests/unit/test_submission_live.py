@@ -1879,3 +1879,55 @@ def test_a_failing_release_never_displaces_the_refusal_that_caused_it(
     assert poster.posts == 0
     # The release never happened, and the original refusal is what surfaced.
     assert _reservations(ledger) == (1, 0)
+
+
+def test_a_live_post_is_refused_inside_a_callers_transaction(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """Round 1's blocking finding, reproduced and then closed at the live boundary.
+
+    Before the fix this test's `_post` returned `submitted`, and the ROLLBACK below then
+    erased the reservation *and* the attempt row, leaving the platform holding a forecast
+    the ledger had no record of and the key free for a second command to claim. The retry
+    posted again: `poster.posts == 2` for one forecast.
+
+    The guard is checked ahead of every other gate, so nothing is fetched and nothing is
+    posted -- an ordinary caller mistake must not cost a live call.
+    """
+    ledger, record_id = approved
+    poster = FakePoster()
+    ledger.execute("BEGIN")
+    try:
+        with pytest.raises(LiveSubmissionError, match="open transaction"):
+            _post(ledger, record_id, poster, live_config)
+        assert poster.posts == 0
+        assert poster.fetches == 0
+        assert _reservations(ledger) == (0, 0)
+    finally:
+        ledger.execute("ROLLBACK")
+
+
+def test_the_open_transaction_refusal_precedes_every_other_gate(
+    approved: tuple[sqlite3.Connection, str], tmp_path: Path
+) -> None:
+    """What the boundary guard adds over the one in `reserve_submission_key`.
+
+    `reserve_submission_key` refuses an enclosing transaction itself, and that refusal is
+    what makes the live path *safe* -- a mutation removing this guard alone still posts
+    nothing. So this test pins the thing only this guard can do: refuse **before every
+    other gate**, including the outermost one.
+
+    The config here has `submission.enabled: false`, which `require_live_submission_
+    enabled` refuses on the very next line. If the transaction check were anywhere later,
+    the config message would win. Without it, a caller whose real mistake is an open
+    transaction is told about their config instead, and fixes the wrong thing -- by
+    turning off the flag that is the last safety rail in front of a live post.
+    """
+    ledger, record_id = approved
+    disabled = _config(tmp_path, enabled=False)
+    ledger.execute("BEGIN")
+    try:
+        with pytest.raises(LiveSubmissionError, match="open transaction"):
+            _post(ledger, record_id, FakePoster(), disabled)
+    finally:
+        ledger.execute("ROLLBACK")

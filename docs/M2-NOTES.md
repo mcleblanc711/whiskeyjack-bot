@@ -2024,3 +2024,62 @@ class: it draws real tournaments and digests so the key is *derived* rather than
 which is what makes the refusal it asserts a refusal of the real key rather than of a string
 the test invented. It is also one of the four tests that caught the live-reservation
 mutation.
+
+### Round 1 — one blocking finding, and it was a good one
+
+`GPT_REVIEW_RESPONSE_M2-708_r1.md`, against `8d8483c`. All eight risk claims came back
+**Safe**; one blocker, which reproduced on the first attempt.
+
+**The finding.** `post_approved_forecast` accepts a connection whose caller has already
+opened a transaction. `reserve_submission_key` goes through `lifecycle.transaction`, which
+nests as a `SAVEPOINT` when `conn.in_transaction` — and `RELEASE` does not commit. So the
+reservation this item exists to make durable was **not durable**: it lived inside the
+caller's transaction, and so did the `submission_attempts` row written after the post.
+
+Reproduced by execution before any fix was written, per the workflow rule:
+
+```
+BEGIN → post_approved_forecast(...) → returns `submitted`, poster.posts == 1
+        reservations/releases == (1, 0), attempts == 1, in_transaction still True
+ROLLBACK
+        reservations/releases == (0, 0), attempts == 0
+retry → poster.posts == 2
+```
+
+One forecast, **posted twice**, with no ledger row for the first call. That is both halves
+of the acceptance criterion failing at once: two commands did not select one poster, and a
+completed call did not remain recordable.
+
+**Why it was invisible from inside.** Every layer was individually right.
+`lifecycle.transaction`'s savepoint nesting is correct and deliberate — it is what lets a
+caller compose several writers into one atomic unit, and `research/store.py` relies on the
+same property for read snapshots. The bug is that *this* writer's contract is different:
+composability and durability are in direct conflict here, and the reservation's whole
+purpose is the second. Nothing in the diff was wrong; the composition was.
+
+**The fix, in two places.** `reserve_submission_key` refuses an enclosing transaction — the
+primitive owns the claim it makes, and it cannot commit its way out, because the enclosing
+transaction is the caller's and not this layer's to end. And `post_approved_forecast`
+refuses ahead of **every** other gate, so an ordinary caller mistake costs no fetch and no
+post.
+
+**The second guard nearly went in untested**, which is worth recording because it is the
+same mistake as the trigger gap above, one commit later. Mutating the boundary guard away
+left the suite green: the writer's guard still fires, and its message happens to contain the
+phrase the regression test matched on. A guard no test can distinguish is exactly the shape
+this section already criticized. What the boundary guard *uniquely* does is refuse **before
+the outermost gate**, so `test_the_open_transaction_refusal_precedes_every_other_gate` runs
+it against a config with `submission.enabled: false` — if the check sat anywhere later, the
+config message would win, and a caller whose real mistake is an open transaction would be
+told to look at their config, and might "fix" it by disabling the last safety rail in front
+of a live post. With that test the mutation is caught.
+
+**Also corrected:** `post_approved_forecast`'s docstring still listed gate 6 as
+`require_key_unused`, describing M2-708 as a future item — stale as of this branch's own
+second commit. It now names `reserve_submission_key` and carries the new precondition as
+gate 7.
+
+**Not changed: `release_submission_key` has no such guard.** A release rolled back leaves
+the key `reserved`, which is the safe direction — the operator simply releases again, and
+no duplicate post becomes possible. The asymmetry is deliberate: the reservation guard
+exists because losing a claim is unsafe, not because transactions are untidy.

@@ -1610,3 +1610,29 @@ def test_the_by_record_reader_refuses_a_malformed_identifier(
     conn, _record_id = approved
     with pytest.raises(SubmissionError):
         live_reservations_for_record(conn, value)  # type: ignore[arg-type]
+
+
+def test_a_reservation_is_refused_inside_a_callers_transaction(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """Round 1's blocking finding, at the primitive that makes the durability claim.
+
+    `lifecycle.transaction` nests as a SAVEPOINT when the caller already holds a
+    transaction, and RELEASE does not commit. A reservation taken there would be handed
+    back as a `KeyReservation` the caller could still erase, which is not a reservation --
+    the row is the claim precisely because it survives the process.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    conn.execute("BEGIN")
+    try:
+        with pytest.raises(SubmissionError, match="durable the moment it is taken"):
+            _reserved(conn, record_id, key)
+        # Nothing written, so the refusal costs the caller's transaction nothing either.
+        assert _reservation_counts(conn) == (0, 0)
+    finally:
+        conn.execute("ROLLBACK")
+
+    # And the same call succeeds once the caller's transaction is closed, which is what
+    # makes the refusal a precondition rather than a permanent refusal of this key.
+    assert _reserved(conn, record_id, key).reservation_seq == 1
