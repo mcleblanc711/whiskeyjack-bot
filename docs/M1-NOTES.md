@@ -5613,3 +5613,527 @@ registered types" now that there are three.
 registry-complete coverage, and the two are easy to conflate precisely because the dispatch half
 looks rigorous. When a guard claims completeness against a table, assert the *draws* against that
 table, not just the lookup.
+
+## M1-502 — Validate categorical forecasts
+
+*"Apply binary bounds and exact multiple-choice normalization. Boundary and sum tests pass; no
+arbitrary post-hoc renormalization is hidden."*
+
+### Decision — this row is a pin, not a build, and the evidence is why
+
+**There is no `src/` diff, and that is the finding rather than an omission.** M1-502's two
+dependencies shipped its mechanism before its own row opened:
+
+- **M1-403** → `forecast/binary.py:174` bounds `probability_yes` inside
+  `forecast.min_probability`/`max_probability`, inclusive. `validate_binary_output`'s docstring
+  already cites this row by name — *"Nothing is clamped … M1-502's criterion is that 'no arbitrary
+  post-hoc renormalization is hidden'"*.
+- **M1-404** → `forecast/multiple_choice.py` holds exact string equality against the question's
+  option list, per-option bounds, and `math.fsum` against `_SUM_TOLERANCE = 1e-6`. Its own notes
+  above (`### Decision — exact string equality, and nothing is renormalized`) quote this row's
+  criterion as the reason a bad sum is refused rather than rescaled.
+- **M1-506** → `forecast/validate.py:130-134` composes them, and `_TYPE_CHECKERS` has no `None`
+  entry left for this row to fill.
+
+Two more facts close the gap structurally rather than by inspection. `schema.Probability` is
+`Field(ge=0.0, le=1.0, allow_inf_nan=False)` (`schema.py:137`), so no NaN or infinity reaches a
+checker and every comparison below is over an ordered domain. `config.py:192-193` pins both bounds
+into `[0.001, 0.999]`, so a configured pair can only ever *narrow* the range
+`submission_live._require_probability` enforces at post time — the two gates cannot disagree in the
+direction that would matter, which is generation accepting what a post refuses.
+
+A repo-wide sweep for rescaling, clamping or division by a total finds nothing anywhere on the
+forecast path. So the criterion's second sentence is the deliverable: make the boundary and sum
+behaviour, and the *absence* of renormalization, hold as pinned facts across the whole path rather
+than at each module's own edge.
+
+### Decision — "normalization" in the row title is implemented as refusal
+
+The title says *exact multiple-choice normalization*; the code refuses a non-normalized vector and
+never produces one. The criterion's own second clause is the argument, and M1-404 made it first: a
+scaled vector is a distribution the model did not produce, and the ledger would record a forecast
+nobody made, with nothing in the record to show it had been altered. `submission_live`
+`_require_categories` reaches the same conclusion from the other end and records it as a stricter
+reading — the platform's behaviour for a non-normalized vector is not knowable offline, and neither
+silent renormalization nor rejection is something an attribution record should have to explain after
+the fact.
+
+### Delivered
+
+Tests, notes and backlog only.
+
+- **`tests/unit/test_forecast_generate.py`** — an M1-502 section: the sum rule end to end. It was
+  the one categorical rule with no test of its own on this path. M1-404's
+  `test_a_multiple_choice_response_is_option_checked_here` reaches it *incidentally* — its two
+  0.9995 options trip the bounds rule as well and its assertion is about both — so nothing said what
+  a bad sum alone costs. Four tests: one repair and a successful correction; a sum that stays wrong
+  costing exactly two calls with a one-element `failure_problems`; the `1e-6` straddle through
+  `generate` rather than at the checker; and the repair turn naming the tolerance and no probability.
+- **`tests/unit/test_forecast_multiple_choice.py`** — `test_the_configured_bounds_are_inclusive_to
+  _one_ulp`, `test_nothing_at_a_bound_is_nudged_onto_it`, and
+  `test_the_verdict_cannot_depend_on_the_order_the_model_answered_in`.
+- **`tests/unit/test_forecast_record.py`** — an M1-502 section pinning that the numbers the ledger
+  stores are the numbers the model produced.
+- **`tests/property/test_forecast_properties.py`** — `_MC_BOUND_NEIGHBOURS`: the strategy now draws
+  both float neighbours of every bound in `_MC_BOUNDS`.
+- **`tests/unit/test_forecast_validate.py`** — `multiple_choice_output_problems` named in
+  `test_the_discovery_walk_would_notice_a_checker`.
+
+### Decision — the boundary work went into the property strategy, not a new property
+
+Section 8 already holds a full independent oracle (`_expected_option_problems`, with the sum
+predicate computed in `Fraction`) and an event-tagged anti-vacuity guard. A new "bounds iff" property
+beside it would have restated a truth table that was already asserted, so the gap had to be somewhere
+else — and it was in the **draws**, not the assertions. `_MC_PROBABILITIES` was ten round values plus
+the bounds themselves: it reaches every boundary and can never cross one by the smallest step that
+exists. Section 5's `bounds_and_probability` records what that costs in this exact codebase — an
+off-by-one-ulp boundary error survived the mutation harness there until the neighbours were drawn
+explicitly, "the single earlier catch being hypothesis's boundary heuristics being lucky".
+
+**The strengthening is measured, not asserted.** With the bound comparison mutated to a tolerant
+`low - 1e-12 <= p <= high + 1e-12` — the sloppy-epsilon defect one ulp exists to catch — the
+truth-table property `test_the_option_rules_accept_exactly_the_valid_set` **fails with the
+neighbours in the pool and passes without them**. That is the direct evidence that this is coverage
+the section did not have, rather than a strategy edit that looks thorough.
+
+### Decision — `math.fsum` is defensive here, and the surviving mutation is provably equivalent
+
+`fsum` → `sum` survives the harness, and this is the account rather than a gap. The two cannot reach
+different verdicts on any admissible vector, and the arithmetic says so: the per-option minimum and
+the sum rule together cap the option count at `1 / min_probability` — 1000 at the committed default —
+and naive accumulation of n values totalling 1 carries an error of order `n · 2⁻⁵³`, about 1e-13 at
+n = 1000. That is seven orders of magnitude inside `_SUM_TOLERANCE`, and a 1000-option vector at
+0.001 was executed in three orderings to confirm the two routes agree to the last bit.
+
+`fsum` stays, because the bound depends on `min_probability` remaining non-trivial and that is
+config; the cost is zero. `test_the_verdict_cannot_depend_on_the_order_the_model_answered_in` records
+the measurement so the survivor is explained where a reader meets it.
+
+**The sum comparison's `>` → `>=` also survives, and is equivalent for a reason already written
+down**: `test_the_tolerance_is_applied_where_the_criterion_says` states that no probability vector's
+distance from 1 is *exactly* `1e-6`, because neither `1.0 + 1e-6` nor `1.0 - 1e-6` round-trips to
+that difference. With the boundary case unreachable, the two operators cannot be told apart.
+
+### Deviation — the criterion was satisfied before its own row opened
+
+M1-404 could not state its criterion ("every exact option once, tolerance `1e-6`") without building
+the sum rule, so it built it while M1-502 read `Not Started`. Nothing went wrong; it is worth
+recording because a reviewer meeting a `Done` flip with no `src/` diff will otherwise read it as a
+row closed without work, and because the same shape is coming for **M1-503** — M1-508 already sits
+against it, filed by M1-405.
+
+### Rejected — options weighed and not taken
+
+- **Threading the composed check into `store.py`.** That is **M1-507**, filed by M1-506 before this
+  branch existed and widened by M1-404 and M1-405 in turn. A record whose options are unknown,
+  missing, duplicated or out of bounds is still persistable by a direct caller of the public writer.
+  Taking it here would be scope theft from a row that already names its own signature change.
+- **Capping the option count at generation** to match `submission_live._MAX_CATEGORIES = 64`. The
+  ordering argument is the one M1-404 used for per-option bounds: a payload with 65 options is
+  refused at *post* time, after the forecast is recorded and approved, where a repair turn at
+  generation would have cost one call against a live post that cannot happen. M1-404 rejected it
+  anyway — *"a cap this row invented would refuse a question Metaculus accepted"* — and that
+  argument is unchanged. **Filed as a backlog row** rather than decided twice in notes.
+- **A guard for jointly unsatisfiable rules.** With `min_probability = 0.001`, a question carrying
+  more than 1000 options makes the per-option bound and the sum rule unsatisfiable together, so
+  every reply burns two calls and fails. Real, and unreachable: Metaculus multiple-choice questions
+  carry a few dozen, and `submission_live` says so at `_MAX_CATEGORIES`. Filed, not built.
+- **Unifying `multiple_choice._SUM_TOLERANCE` with `submission_live._CATEGORY_SUM_TOLERANCE`.** Same
+  number, two owners, deliberately independent — `multiple_choice.py:86` says so, and the submission
+  package does not import the forecast package.
+- **A new "bounds iff" property.** Above: the truth table was already asserted, and the gap was in
+  the draws.
+- **Renormalizing anything.** The criterion forbids it.
+
+### Deferred (do not read the absence as an omission)
+
+- **The persist path → M1-507.** Unchanged and not widened here; this row adds no rule.
+- **The `validated` lifecycle event → M1-504.** M1-603's notes deferred it until the output-validation
+  gate existed. With this row closed, **M1-503 is the last of the four it named** (M1-404, M1-405,
+  M1-502, M1-503) still outstanding, so M1-504 becomes reachable immediately after it.
+- **The submission payload built from a validated categorical forecast → M2-707.** This row decides
+  nothing about `final_prediction_json`'s use at post time or the option order a post carries.
+- **The comprehensive valid/invalid golden set → Codex's T-901.** No fixture ships here: every reply
+  in the new tests is built from `prompts/forecaster.md`'s own JSON blocks, so the reply and the
+  option list are a matched pair by construction and cannot drift from the prompt.
+
+### Standing risk — not verifiable offline
+
+- **What Metaculus does with a vector that sums to 1 only within `1e-6`.** This project accepts it
+  and stores it unscaled; the platform may renormalize it silently. If it does, the ledger and the
+  platform will disagree in the last few bits of a recorded forecast. M2-711's refetch vocabulary is
+  where that would surface, not here.
+- **The per-option bound is this project's, not the platform's.** `prompts/forecaster.md:130` prints
+  0.001–0.999 and `submission_live` enforces the same pair, but neither is read from Metaculus. A
+  platform that widened its accepted range would leave this project refusing forecasts it would have
+  taken.
+
+### Round 1 — CHANGES REQUESTED, one blocking finding, and it falsified a risk claim I wrote
+
+The request's risk claim 6 said `config.py:192-193` made it impossible for a configured bound
+pair to be wider than the one `submission_live._require_probability` enforces. **That claim is
+false, and the review falsified it exactly as intended.** `ForecastConfig.model_copy(update=...)`
+builds a config *without* running its field validators — a public pydantic API this repo's own
+test helpers use (`test_forecast_binary.py::_bounds`, `test_forecast_multiple_choice.py::_narrowed`,
+`test_forecast_generate.py::_narrowed`) — and both `_require_config`s re-checked only `low < high`.
+
+Reproduced by execution at the reviewed commit before any fix was written:
+
+- `ForecastConfig(...)` **refuses** `0.0`/`1.0` with a `ValidationError`; `model_copy` on the
+  committed config **produces** it.
+- `multiple_choice_output_problems` returns `[]` for a `0.0`/`1.0` two-option vector under that
+  config, while `submission_live._require_categories` raises `LiveSubmissionError` on the same
+  numbers.
+
+The cost is not a repair loop, which is what makes it worse than the `min < max` check sitting
+beside it: nothing fails at generation, so a forecast is **billed, recorded and approved** for a
+post that deterministically cannot happen.
+
+**Scope.** Pre-existing at the base — but the branch depends on it, documents it as proven, and
+closed the row on that basis, which is the "depends on it" arm of the non-blocking test. Fixed
+rather than rebutted.
+
+### Decision — the envelope lives in `config.py`, and the checkers read it from there
+
+The obvious fix was to write `0.001` and `0.999` into both `_require_config`s. That would have
+made a **fourth** copy of the literals (`config.py`, `prompts/forecaster.md`, `submission_live`,
+and now two checkers), which is precisely the silent-drift shape M1-509 already exists for. So
+`config.py` names `PROBABILITY_BOUND_FLOOR`/`PROBABILITY_BOUND_CEILING`, its own `Field(ge=…, le=…)`
+is expressed in them, and `forecast/binary.py`, `forecast/multiple_choice.py` and
+`forecast/generate.py` re-check against the same two constants. The envelope is the spec's
+(`CODEX_HANDOFF.md § Configuration schema`: `0.001 <= min < max <= 0.999`), so enforcing it is
+faithful rather than a bound this project invented — the distinction M1-511 turns on.
+
+The preflight in `generate.py` is widened alongside the checkers so the refusal happens **before
+any billable call**, matching the two preflights already there.
+
+The message names the envelope's two ends and withholds the configured pair. The ends are spec
+constants, not values read off this config; `submission_live` words its own the same way. That is
+deliberately *stricter* than the surrounding module, which does render the configured pair — see
+the M1-509 note below.
+
+### Deviation — this row now has a `src/` diff after all
+
+The round-1 section above supersedes "Decision — this row is a pin, not a build" to this extent:
+the pin was right about the mechanism (nothing renormalizes, and that is still true and still
+untouched) and wrong about one structural premise it leaned on. Three source files change:
+`config.py`, `forecast/binary.py`, `forecast/multiple_choice.py`, plus the `generate.py` preflight.
+
+### Non-blocking observations — what was accepted and what was corrected
+
+- **Risk claim 4 was overstated.** `test_the_repair_turn_for_a_bad_sum_names_the_tolerance_and_no_probability`
+  carries no exact invocation-count assertion; the sibling persistent-bad-sum test pins that path
+  with both `result.invocations == 2` and `len(client.calls) == 2`. Accepted as stated, no product
+  gap, no change.
+- **Risk claim 5 was false, and M1-509 is widened.** The new one-ulp boundary tests compare exact
+  problem lists built by `_bounds_problem(low, high)`, so they *do* assert messages containing
+  configured bounds. The rendering is pre-existing (M1-404 built it), so it is not blocking — but
+  the row's framing of `binary.py` as the lone outlier was wrong: `multiple_choice.py` renders the
+  same pair. M1-509's description, dependencies and acceptance criteria are widened to cover both
+  categorical checkers.
+- **The order-independence test really tested one ordering.** With all 1000 entries equal to
+  `min_probability`, `reversed()` and `sorted()` return the same list. The reviewer judged the
+  analytic argument sufficient and asked for no backlog row; the test is fixed anyway, because a
+  test that names ordering and cannot vary it is this project's top recurring defect class wearing
+  a different hat. The n = 1000 vector is *forced* — 1000 × 0.001 is exactly 1, so every entry is
+  pinned to the minimum — so it stays as the worst case for the accumulation bound, and a
+  heterogeneous 500-option vector (each entry distinct, all ≥ the minimum, summing to 1) carries
+  the ordering claim across four genuinely distinct orderings, asserted distinct.
+
+### Round 2 — APPROVE, prior finding closed, one row filed
+
+The round-1 blocker is closed at its own reproduction: the `0.0`/`1.0` copied config now raises
+from both categorical checkers and is refused by `generate_forecast` before client construction or
+any billable call.
+
+One non-blocking observation, and it is a fair correction to **risk claim 4**, which I wrote as
+"there is exactly one source for the two literals in `src/`". That was true only of the *forecast*
+package: `submission_live.py` still declares its own executable `0.001`/`0.999`, and the new
+diagnostics embed the endpoints as literal strings in their messages rather than deriving them
+from the constants. Two sources for one spec number, with nothing failing if they drift.
+
+Filed as **M1-513** with the reviewer's acceptance wording. It is deliberately *not* M1-509:
+M1-509 asks whether a **configured** pair may be rendered at all, and M1-513 asks who owns the
+**spec** endpoints. Non-blocking here because the submission declarations predate both this branch
+and the pinned base, and the two sources agree today.
+
+**Two rounds, and the reason is worth recording.** M1-502's round-1 request stated nine falsifiable
+risk claims; the review falsified two of them (6 blocking, 4 non-blocking) and confirmed the other
+seven. That is the mechanism `docs/LESSONS.md` describes working as intended — the blocking finding
+was *found by my own claim being specific enough to check*. A vaguer claim 6 ("config validates the
+bounds") would have passed unexamined and shipped the defect.
+
+## T-903 — one saved question, one command, one validated record
+
+The first end-to-end proof the project has. Every stage it needs shipped in an earlier item
+and none of them was reachable: `generate_forecast`, `persist_generation`,
+`normalize_questions` and `lifecycle.record_validation` had, between them, no caller a
+command could reach. M1-406's own notes recorded the gap — "the `run` / `replay --record-id`
+CLI wiring" was deferred and "this slice is library-only". The backlog criterion is a
+sentence about a command, so this item is the wiring plus the suite that holds it to the
+sentence.
+
+`whiskeyjack_bot/pipeline.py` composes it; `run` is the command; `forecast/replay.py` grows
+`replay_generation`, a `(question_id, attempt_id)`-keyed artifact reader, because
+`replay_forecast` starts from a `record_id` and verifies a row that already exists — the
+wrong direction for a run that has no record yet.
+
+### Decision — the record is stamped with a freshly minted attempt id, not the replayed one
+
+`--attempt-id` names the *saved* attempt whose reply is replayed. The record gets a new id.
+Reusing the saved one is the obvious alternative and it does not survive contact with the
+schema: `idx_forecast_records_attempt_id` is a partial unique index and `004`'s trigger
+cross-checks `pipeline_failure_events`, so reuse collides the moment that attempt also has a
+record — which is the ordinary case, since the artifact usually came from a run that produced
+one. The cost is that `persist_generation` writes a second copy of the reply under the new
+id. That copy is honest: this is a new attempt, and what it consumed is what it stores.
+`ReplayRun.replayed_attempt_id` records where it came from.
+
+The consequence is pinned by a test rather than left implicit
+(`test_two_runs_of_the_same_seed_write_two_records_with_different_hashes`): two runs of one
+seed produce two records with two hashes. That reads like a defect if you expect a replay to
+be idempotent, so the test says why it is not, and stops anyone "fixing" it by reusing the
+saved id. The reproducible hash the criterion asks for is `replay --record-id` re-deriving
+**one** record's hash, which is a different claim and is asserted separately.
+
+### Decision — the rebuilt request is compared byte-for-byte, with `as_of_utc` recovered
+
+A saved reply is an answer to a specific reasoning packet. Replaying it against research it
+never saw would write an attribution claim the reply does not support — documents cited in a
+record the model was never shown. So the packet is rebuilt from the replayed research,
+rendered through the same `render_model_input` the generating call used, and required to
+equal the stored request exactly.
+
+Exact equality needs `as_of_utc`, which cannot be re-derived from the clock, so it is
+recovered from the stored request. The alternative — comparing with `as_of_utc` excluded — is
+strictly worse: it turns an equality into a hand-maintained list of fields allowed to differ,
+and every future field on `ForecastModelInput` joins that list by default rather than by
+decision. Recovering the one value that provably cannot be re-derived keeps the comparison
+total. `_as_of_from_request` is the function that does it, and it is the one new pure
+function here, so it gets the property pass.
+
+### Decision — `--dry-run` and `--no-submit` assert the configuration, they do not override it
+
+A flag that silently forced the safe value would let a config with `dry_run: false` pass a
+command line that reads as safe, and the operator would have been told the wrong thing about
+their own file. Each refuses when the setting it names is not set; omitting it asserts
+nothing, because the committed defaults are already safe and this command cannot post either
+way. Both directions are tested.
+
+### Deviation — `run`'s signature is not the one `CODEX_HANDOFF.md:274` writes
+
+The handoff writes `run --config PATH [--limit N] [--question-id ID] [--dry-run]
+[--no-submit]`. This one makes `--question-id`, `--snapshot` and `--attempt-id` required and
+has no `--limit`.
+
+The reason is that this `run` is replay-only, and a replay is addressed by the
+`(question_id, attempt_id)` pair the artifact layout is keyed on — there is nothing for
+`--limit` to iterate that would not also need per-question failure isolation, which is a
+different item's risk. Composing paid calls is a different risk from composing free ones,
+which is the same split M1-312 made against M1-306. Filed as **M1-315**, which owns
+`--limit`, the batch loop and the live path. Taken to the owner and confirmed rather than
+assumed.
+
+### Rejected — seeding the acceptance scenario through `persist_generation`
+
+It is the shortest way to produce an artifact, and `tests/unit/test_cli_replay.py` does
+exactly that. It cannot be used here: it writes a forecast record, and "`run` produces
+**exactly one** validated record" is then unfalsifiable, because the row is already there
+before the command runs. The seed writes the artifact with `write_raw_model_output` alone, so
+the ledger holds research and nothing else when `run` starts.
+
+### Rejected — copying `test_research_store.py`'s forbidden-package set
+
+That test proves "zero provider calls" by asserting `asknews_sdk`, `httpx`,
+`forecasting_tools`, `requests`, `urllib.request` and `ssl` are absent from the import graph.
+Copying it here would have been wrong in both directions, and the measurement is worth
+recording: importing `whiskeyjack_bot.pipeline` **does** pull in all six. `metaculus/
+snapshots.py` and `questions/normalize.py` both import `forecasting_tools`, because a saved
+snapshot holds serialized SDK question objects and normalization dispatches on their types,
+and the SDK drags `httpx`, `openai`, `litellm` and `asknews_sdk` transitively.
+
+So a copied test would fail for a reason unrelated to whether a call can happen, and a test
+weakened until it passed would assert nothing. The check that bites is the whiskeyjack-layer
+one: none of this project's own paid or posting adapters — `research.asknews`,
+`research.exa`, `forecast.generate`, `metaculus.client`, `metaculus.poster`, `submission.*`,
+`approval` — is reachable. If none is on the graph there is no code here to make a call with.
+The module docstring now says this instead of the stronger, false thing it said before.
+
+### Deviation — a defect found while writing the test that the test was written to catch
+
+`_select_question` reached the snapshot through
+`metaculus.fetch.fetch_open_questions_fixture`, which is `load_snapshot` plus one log line
+but lives beside the live fetcher and so imports `whiskeyjack_bot.metaculus.client`. It was a
+**deferred, function-local import**, and that is the part worth recording: the module-level
+import graph looked clean while the executed path pulled the live Metaculus API client in.
+
+Measured, with the defect reintroduced deliberately:
+
+| test | with the defect |
+| --- | --- |
+| `test_the_pipeline_cannot_reach_a_paid_or_posting_module` (module-level graph) | **passed** |
+| `test_the_guard_is_not_vacuous` | **passed** |
+| `test_the_command_path_imports_no_more_than_the_module_does` (AST walk) | **failed** |
+
+This is the project's most expensive defect class — an assertion that cannot fail for the
+thing it names — arriving in the test written to prevent it. The module-level test is the
+obvious one to write and it is blind to exactly the import style that most easily sneaks a
+client onto a path. The fix was to call `load_snapshot` directly and log the line here; the
+guard that catches a regression is an `ast.walk` over the whole module, which reaches an
+import statement inside a function body, and it asserts that importing *everything*
+`pipeline.py` names still reaches no paid or posting module.
+
+**The generalizable rule: an import-graph guarantee must be measured over the imports the
+code can execute, not over the ones at the top of the file.** A module-level `sys.modules`
+delta is a proxy for reachability, and a deferred import is precisely where the proxy and the
+property come apart.
+
+### Deferred (do not read the absence as an omission)
+
+- **The live paid run — M1-315.** `--limit`, the batch loop, live retrieval and a live model
+  call. Filed with this item; see the Deviation above.
+- **`retrieval_run_id` on the record is the packet's first run.** The column is a single FK
+  while a packet may carry many runs. What pins the whole packet is `research_packet_sha256`,
+  which is a record field and therefore inside `forecast_sha256`, so nothing is unattributed
+  — but the column is narrower than the thing it points at. Widening a merged, reviewed
+  schema is not this item's job and the tension is left visible here rather than fixed
+  sideways.
+- **No numeric or multiple-choice acceptance scenario.** The committed snapshot holds all
+  three types (91001 binary, 91002 numeric, 91003 multiple-choice) and `_select_question`
+  picks one out of the normalized batch, so the *selection* is exercised across types. The
+  end-to-end scenario is binary only, because the reply it replays is the forecaster prompt's
+  own example and the prompt ships one worked example. M1-503 and T-904 own the numeric path.
+
+### Standing risk — not verifiable offline
+
+- **The command has never run against a real snapshot fetched from Metaculus.** Every
+  scenario here starts from the committed fixture snapshot, which was itself built from
+  committed API-post fixtures. If a live snapshot carries a shape the fixture does not, the
+  first place it appears is `normalize_questions`, not this module — but this module is where
+  an operator would see it.
+- **`_require_settings_agree` compares four fields and deliberately not the other four.**
+  `provider`, `name`, `prompt_version` and `prompt_sha256` become NOT NULL columns and are
+  the attribution claim, so they must agree. `temperature`, `max_output_tokens`,
+  `timeout_seconds` and `allowed_tries` shaped the reply when it was made and cannot change
+  what it says now that it exists, so requiring them to agree would refuse a replay for a
+  reason that provably cannot affect the answer. The record still stores the artifact's
+  values for all eight. If that reasoning is wrong, it is wrong in the direction of accepting
+  a replay that should have been refused.
+
+### Observation — the suite is no longer the ~85s `CLAUDE.md` claims
+
+Measured on this branch: `tests/` minus this item's additions is **250s**; this item adds
+**31s**, of which 28s is four clean-interpreter subprocess launches for the import-graph
+guards (each pays `forecasting_tools`' import cost, the same price
+`test_research_store.py`'s equivalent already pays). The tmpfs temp root is active — pytest's
+basetemp is under `/dev/shm` — so this is growth across waves rather than the regression that
+fix addressed. `CLAUDE.md`'s "~85s total" and `scripts/gate.sh`'s per-gate figures are now
+stale by roughly 3x. Not corrected here: `CLAUDE.md` is shared by every active branch and
+editing it mid-wave is lesson 1 at triple cost. Flagged for the owner to land at a wave
+boundary.
+
+### Round-1 remediation — two blocking findings, both reproduced before any fix was written
+
+Round 1 returned CHANGES REQUESTED with two blocking findings and no non-blocking ones. The
+review named `6e3f3d3`, which was `HEAD`, so nothing was stale; both were still reproduced by
+execution first, per the standing rule. Both reproduced exactly as described.
+
+**Finding 1 — the record and its validation event were not atomic.** `persist_generation`
+committed the row, then `record_validation` opened a second transaction. Monkeypatching
+`record_validation` to raise `LifecycleError` — an ordinary busy timeout or full disk between
+the two writes — left `forecast_records` holding one `draft` row with no `validated` event,
+and a retry appended v2 beside it rather than completing v1.
+
+The code carried an explicit argument for this, and the argument was wrong: it said the row
+was "already appended and `003` blocks UPDATE and DELETE on it", so rolling back would be the
+append-only violation the project exists to prevent. **That conflates two different things.**
+Append-only forbids *mutating a row that exists*. An insert that never commits is not a
+mutation — there is no row to mutate, and no history to destroy. `forecast/store.py` had
+already said so in its own docstring: `lifecycle.transaction` nests as a `SAVEPOINT`
+"so a caller that wants the record and its first event in one unit can have it without this
+module deciding that on its behalf". This pipeline is that caller and did not take the offer.
+
+Worth recording as a defect class: **a wrong invariant defended in a comment is more durable
+than one left undefended.** The comment is why the gap survived writing the module, writing
+459 lines of refusal tests, and writing the deliberate-choices section — three passes that
+each read it and accepted it.
+
+**Finding 2 — an accepted configuration produced an incomplete record while `run` reported
+success.** `storage.retain_raw_model_output` defaults to `True` and the validator accepts
+`False`. With it off, `persist_generation` returns `artifact_outcome="retention_disabled"`
+and appends the row with a NULL `raw_output_path`; `run_replay` then validated it and the CLI
+printed `artifact: (none: retention_disabled)` beside `status: validated`. The record cannot
+be re-derived by `replay --record-id`, which is the one thing this item's own completeness
+test requires.
+
+#### Decision — the strictness lives in the pipeline, not in `persist_generation`
+
+The obvious fix is to make `persist_generation` refuse a non-`written` outcome. That would be
+wrong, and the reason is M1-312: for a **paid** attempt, the cost and the invocation count are
+facts whether or not the evidence survived, so the row is written regardless — the inversion
+of M1-303's refuse-before-billing rule, which only holds *before* the spend. M1-315's live run
+needs exactly that behaviour. This command spends nothing, so it can hold itself to the
+stricter bar without taking M1-312's decision away from the path that needs it.
+
+So the fix is two checks in `pipeline.py`, not one in the writer:
+
+- `_require_retained_output` refuses up front when the configuration disables retention —
+  `_require_replay_enabled`'s reason, that a refusal an operator can act on arrives before the
+  work rather than after a row was nearly appended.
+- A non-`written` outcome raises **inside** the new transaction, so the row rolls back. This
+  covers the case the preflight cannot see: retention permitted, write attempted, write
+  failed. What survives is at worst an orphaned file, harmless under
+  `forecast/persist.py`'s convention; what must not survive is the inverse.
+
+The CLI's `(none: {artifact_outcome})` fallback is gone with it: it printed a state the
+pipeline can no longer return, and a fallback for an unreachable state only teaches a reader
+that this command can produce a record without its evidence.
+
+#### The three regression tests were mutation-tested before they were trusted
+
+Each new assertion was checked against a deliberately broken tree, since a test that cannot
+fail for the thing it names is this project's most expensive recurring defect:
+
+| mutation | test | result |
+| --- | --- | --- |
+| outer `transaction(conn)` removed | `test_a_failed_validation_event_leaves_no_forecast_record` | **failed** |
+| `_require_retained_output` call removed | `test_disabled_raw_output_retention_refuses_before_anything_is_read` | **failed** |
+| `artifact_outcome != "written"` check removed | `test_an_artifact_that_could_not_be_written_appends_no_record` | **failed** |
+
+#### What round 1 got right that is worth naming
+
+Both findings landed on risk claim 7 ("`run` writes exactly one forecast record"), which the
+request stated as falsifiable and the review falsified in two independent ways. The other nine
+claims came back safe. That is the same mechanism M1-502 recorded one wave earlier: the
+blocking findings were found *because* the claim was specific enough to check. Neither
+finding's failure mode was covered by the 37 acceptance tests written before the review — both
+needed a monkeypatched local I/O failure, which is a reachable reliability condition rather
+than a hostile one, and the suite had no such simulation in it at all.
+
+### Round 2 — APPROVE, both blockers closed, and one of my own claims falsified
+
+Round 2 (`d7a5976`, baseline `6e3f3d3`) closed both round-1 findings by execution and returned
+no blocking findings. One non-blocking observation, and it is the entry worth keeping:
+
+**Risk claim 7 was overstated and the review was right.** I claimed
+`_require_retained_output` "cannot be satisfied by a non-`AppConfig`". It can:
+`SimpleNamespace(storage=SimpleNamespace(retain_raw_model_output=True))` passes it, because the
+guard reads the attribute and then checks the *value's* type — never the object's. Non-blocking
+for the stated reasons (the guard is private, the CLI always supplies `load_config`'s
+`AppConfig`, and the shape predates this branch), and filed as **M1-316**.
+
+What makes it worth a row rather than a shrug: `_require_replay_enabled` has the identical
+shape and was written first, so this is a pattern, not a slip. Every `AttributeError` →
+`PipelineError` guard in `pipeline.py` prints "config must be an AppConfig" while checking
+something strictly weaker. **The message is the part that is wrong** — either the check matches
+its claim or it stops making it. That is the same defect class as the vacuous-property findings
+this project keeps paying for, one layer over: a guard whose stated claim is stronger than
+anything it can fail on. I copied the shape from a sibling module without asking what it
+actually verified, which is exactly how the class propagates.
+
+**Two rounds, and the mechanism worked the way `docs/LESSONS.md` describes.** Round 1's ten
+risk claims were stated as things a reviewer could falsify; claim 7 in round 1 was falsified in
+two independent ways and became both blockers, and claim 7 in round 2 was falsified again. A
+vaguer request would have produced neither finding, and the incomplete-record path would have
+merged. The cost of writing falsifiable claims is that some of them turn out to be false in
+public — which is the point of writing them.

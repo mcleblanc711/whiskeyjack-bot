@@ -1431,8 +1431,26 @@ def test_attribution_is_stable_across_the_storage_boundary(
 _MC_LABELS = ["Option A", "Option B", "Option C", "Option D"]
 # A label the strategy may answer that no draw can supply, so *unknown* is reachable.
 _MC_INTRUDER = "Option Z"
-_MC_PROBABILITIES = [0.0, 0.001, 0.1, 0.2, 0.25, 0.3, 0.5, 0.7, 0.9, 0.999, 1.0]
 _MC_BOUNDS = [(0.001, 0.999), (0.1, 0.9), (0.2, 0.5)]
+# Every bound in ``_MC_BOUNDS`` and both of its float neighbours, added by **M1-502**.
+# The pool was the ten round values below plus the bounds themselves, which reaches the
+# boundary but never crosses it by the smallest step that exists -- and section 5's
+# ``bounds_and_probability`` records what that costs: an off-by-one-ulp boundary error
+# survived the mutation harness there until the neighbours were drawn explicitly, because
+# landing on a boundary is measure-zero over a continuous strategy and one ulp past it is
+# unreachable from a hand-written list. The same argument holds here per *option*, and
+# M1-502's criterion is the boundary one, so the neighbours are drawn rather than hoped for.
+_MC_BOUND_NEIGHBOURS = sorted(
+    {
+        neighbour
+        for low, high in _MC_BOUNDS
+        for bound, outward in ((low, 0.0), (high, 1.0))
+        for neighbour in (bound, nextafter(bound, outward), nextafter(bound, 1.0 - outward))
+    }
+)
+_MC_PROBABILITIES = sorted(
+    {0.0, 0.001, 0.1, 0.2, 0.25, 0.3, 0.5, 0.7, 0.9, 0.999, 1.0, *_MC_BOUND_NEIGHBOURS}
+)
 
 
 def _even_shares(supplied: tuple[str, ...]) -> list[tuple[str, float]]:
