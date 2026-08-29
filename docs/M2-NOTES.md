@@ -2083,3 +2083,31 @@ gate 7.
 the key `reserved`, which is the safe direction — the operator simply releases again, and
 no duplicate post becomes possible. The asymmetry is deliberate: the reservation guard
 exists because losing a claim is unsafe, not because transactions are untidy.
+
+### Round 2 — approved, and the delta was 40 lines
+
+`GPT_REVIEW_RESPONSE_M2-708_r2.md`, against `7017881`. **APPROVE**, round 1's blocker marked
+CLOSED, no new blocking findings and no non-blocking observations. All five remediation risk
+claims came back **Safe**, and the reviewer verified the guards by running the two affected
+unit files rather than reading them.
+
+The item closed in two rounds, which is what the notes above were for: the request carried
+round 1's five headings forward verbatim — they had drawn no findings — and rewrote only the
+delta. Round 1's eight risk claims were not restated, since the reviewer had already answered
+Safe to all eight and none of that code changed; the r2 claims are about the fix alone.
+
+Two things stated in the request that are worth keeping, because both are the kind of thing a
+reviewer would otherwise have to find:
+
+- **The delta exceeds the review's own "minimal in-scope fix", by one guard, deliberately.**
+  Round 1 asked only that `post_approved_forecast` refuse an open transaction. The guard in
+  `reserve_submission_key` was added on top, because the primitive is the layer that
+  publishes the durability claim and is reachable without the live boundary at all — the CLI
+  holds connections `post_approved_forecast` never sees. Saying so up front made it an
+  argued choice rather than unexplained scope.
+- **The property fixtures had to be checked, not assumed.** The new guard is checked *before*
+  `_require_text`. Had the four `ANYTHING` fuzzers held a connection with an open
+  transaction, they would all have collapsed into asserting the new refusal and stopped
+  proving anything about the validators — a fresh instance of this project's most expensive
+  recurring defect, introduced by a fix rather than by a test. They hold a connection with
+  none, so the validators are still reached and all six properties pass unchanged.
