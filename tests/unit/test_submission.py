@@ -33,10 +33,14 @@ from whiskeyjack_bot.submission import (
     KEY_LENGTH,
     KEY_SCHEMA_VERSION,
     AttemptSummary,
+    KeyReservation,
     SubmissionError,
     attempt_for_key,
     canonical_key_json,
+    live_reservation_for_key,
+    release_submission_key,
     require_key_unused,
+    reserve_submission_key,
     submission_key,
     submission_key_for_approved_record,
     submission_key_for_record,
@@ -894,3 +898,489 @@ def test_every_status_reachable_from_approved_is_accounted_for() -> None:
     # The gate admits exactly one of them. If a future migration adds a transition out of
     # `approved`, this fails until someone decides which side of the gate it belongs on.
     assert reachable == {"approved", "submitted", "failed"}
+
+
+# --- M2-708: the reservation, which is the claim the read never was ------------------
+#
+# Everything above this line tests a *read*. `require_key_unused` answers "has this key
+# been spent", and two commands could both get "no" from it, both post, and only then
+# discover that `001`'s UNIQUE refuses the second row -- after its call had been made.
+# These drive the layer where the check and the claim are one act.
+#
+# The unit of behaviour here is the Python seam; `tests/unit/test_lifecycle.py` drives
+# `010`'s triggers with raw SQL, because the writer agreeing with itself is not the
+# guarantee.
+
+
+def _reserved(conn: sqlite3.Connection, record_id: str, key: str) -> KeyReservation:
+    return reserve_submission_key(
+        conn, record_id=record_id, idempotency_key=key, reserved_at=OCCURRED
+    )
+
+
+def _abandon(conn: sqlite3.Connection, reservation: KeyReservation) -> None:
+    """Release by the operator route, the only one a person can take."""
+    release_submission_key(
+        conn,
+        reservation,
+        reason="operator_abandoned",
+        released_at=OCCURRED,
+        released_by="chris",
+    )
+
+
+def _reservation_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    return (
+        conn.execute("SELECT count(*) FROM submission_key_reservations").fetchone()[0],
+        conn.execute("SELECT count(*) FROM submission_key_releases").fetchone()[0],
+    )
+
+
+def test_a_reservation_is_minted_and_reads_back(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+
+    assert reservation.idempotency_key == key
+    assert reservation.forecast_record_id == record_id
+    assert reservation.reservation_seq == 1
+    assert reservation.reserved_at_utc == OCCURRED.isoformat(timespec="microseconds")
+    assert reservation.reservation_id.startswith("wjres-")
+    # The reader agrees with what the writer returned. Asserting only the return value
+    # would pass against a writer that never committed.
+    assert live_reservation_for_key(conn, key) == reservation
+
+
+def test_a_second_command_cannot_reserve_a_held_key(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The item, in one test: the loser is refused before it can decide to post."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    _reserved(conn, record_id, key)
+
+    with pytest.raises(SubmissionError, match="reserved by a submission that has not finished"):
+        _reserved(conn, record_id, key)
+    # Both halves: the refusal happened *and* nothing was written by the loser.
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_a_spent_key_cannot_be_reserved(approved: tuple[sqlite3.Connection, str]) -> None:
+    """Terminal beats free. An attempt row is a call that was made."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_uncertain_attempt(key, attempt_id="att-1"),
+        occurred_at=OCCURRED,
+        detail_code="timeout",
+    )
+    with pytest.raises(SubmissionError, match="already been used by a recorded submission"):
+        _reserved(conn, record_id, key)
+    assert _reservation_counts(conn) == (0, 0)
+
+
+def test_a_released_key_can_be_claimed_again_under_the_next_sequence_number(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """Why a release exists at all.
+
+    A key is a pure function of the tournament, question, forecast version and payload
+    hash, so the same work derives the same key forever. Without a second sequence number
+    a single transient pre-post failure would wedge that forecast permanently, on an
+    append-only table.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    first = _reserved(conn, record_id, key)
+    _abandon(conn, first)
+
+    assert live_reservation_for_key(conn, key) is None
+    second = _reserved(conn, record_id, key)
+    assert second.reservation_seq == 2
+    assert second.reservation_id != first.reservation_id
+    assert _reservation_counts(conn) == (2, 1)
+
+
+def test_require_key_unused_now_refuses_a_reserved_key(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """One question, one answer.
+
+    A caller asking "may I claim this key" is asking one thing, and spent and reserved are
+    both "no". A second guard for the second condition would be two spellings of one bound
+    with nothing keeping them in agreement.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    require_key_unused(conn, key)  # free: returns silently
+
+    _reserved(conn, record_id, key)
+    with pytest.raises(SubmissionError, match="reserved by a submission that has not finished"):
+        require_key_unused(conn, key)
+
+
+def test_a_reserved_key_is_free_again_to_the_cheap_reader_after_release(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    _abandon(conn, _reserved(conn, record_id, key))
+    require_key_unused(conn, key)
+
+
+# --- the two release reasons are not the same claim ----------------------------------
+
+
+def test_not_posted_refuses_an_actor(approved: tuple[sqlite3.Connection, str]) -> None:
+    """The program proved no post was made; there is no person to name.
+
+    Accepting one would put a name against a conclusion no person reached.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    with pytest.raises(SubmissionError, match="omit released_by"):
+        release_submission_key(
+            conn,
+            reservation,
+            reason="not_posted",
+            released_at=OCCURRED,
+            released_by="chris",
+        )
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_operator_abandoned_requires_an_actor(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """`approve`'s rule: an attribution claim about a person is never inferred."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    with pytest.raises(SubmissionError, match="released_by is required"):
+        release_submission_key(conn, reservation, reason="operator_abandoned", released_at=OCCURRED)
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_the_program_route_writes_no_actor(approved: tuple[sqlite3.Connection, str]) -> None:
+    """The control for the two refusals above: each reason's legal form is accepted."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    release_submission_key(conn, reservation, reason="not_posted", released_at=OCCURRED)
+    stored = conn.execute(
+        "SELECT reason, released_by FROM submission_key_releases WHERE reservation_id = ?",
+        (reservation.reservation_id,),
+    ).fetchone()
+    assert tuple(stored) == ("not_posted", None)
+
+
+@pytest.mark.parametrize("value", ["", "spent", "NOT_POSTED", " not_posted ", 0, None, b"x"])
+def test_a_reason_outside_the_vocabulary_is_refused(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    with pytest.raises(SubmissionError, match="reason must be one of"):
+        release_submission_key(
+            conn,
+            reservation,
+            reason=value,  # type: ignore[arg-type]
+            released_at=OCCURRED,
+            released_by="chris",
+        )
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_a_reservation_is_released_once(approved: tuple[sqlite3.Connection, str]) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    _abandon(conn, reservation)
+    with pytest.raises(SubmissionError, match="already been released"):
+        _abandon(conn, reservation)
+    assert _reservation_counts(conn) == (1, 1)
+
+
+def test_a_consumed_reservation_is_not_abandoned(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """A release is not a way to un-spend a key.
+
+    Recording a consumed reservation as abandoned would assert something false about an
+    irreversible call -- and would give the derived-state table two answers for one key.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_uncertain_attempt(key, attempt_id="att-1"),
+        occurred_at=OCCURRED,
+        detail_code="timeout",
+    )
+    with pytest.raises(SubmissionError, match="consumed by a recorded submission attempt"):
+        _abandon(conn, reservation)
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_the_spent_test_reads_the_key_from_the_stored_row_not_the_object(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """M2-703 round 1, applied by construction: one source of truth.
+
+    Only `reservation_id` reaches the row. A caller handing back an object whose other
+    fields have been altered cannot steer the decision, because the key the "already
+    spent" test runs against is read back from the database.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_uncertain_attempt(key, attempt_id="att-1"),
+        occurred_at=OCCURRED,
+        detail_code="timeout",
+    )
+    # A lie about the key, which would make the spent test pass if the object were trusted.
+    lying = replace_reservation(reservation, idempotency_key="wjsub-1-" + "f" * 64)
+    with pytest.raises(SubmissionError, match="consumed by a recorded submission attempt"):
+        _abandon(conn, lying)
+
+
+def replace_reservation(reservation: KeyReservation, **changes: object) -> KeyReservation:
+    from dataclasses import replace
+
+    return replace(reservation, **changes)  # type: ignore[arg-type]
+
+
+def test_a_reservation_subclass_is_refused(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """Exact type, not isinstance: a subclass can shadow a field with a property, turning
+    the read of `reservation_id` into caller code that can raise anything."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+
+    class Sneaky(KeyReservation):
+        pass
+
+    impostor = Sneaky(**asdict(reservation))
+    with pytest.raises(SubmissionError, match="must be a KeyReservation"):
+        _abandon(conn, impostor)
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_an_unknown_reservation_is_refused(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    ghost = replace_reservation(reservation, reservation_id="wjres-" + "0" * 32)
+    with pytest.raises(SubmissionError, match="does not name a stored key reservation"):
+        _abandon(conn, ghost)
+    assert _reservation_counts(conn) == (1, 0)
+
+
+# --- the reservation's accepted domain -----------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, "", 0, b"rec-1", "x" * 201, "\ud800", ["rec-1"]])
+def test_a_malformed_record_id_is_refused_before_the_ledger_is_touched(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    """M1-303 round 4: refuse a caller mistake before the spend."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    with pytest.raises(SubmissionError):
+        reserve_submission_key(
+            conn,
+            record_id=value,  # type: ignore[arg-type]
+            idempotency_key=key,
+            reserved_at=OCCURRED,
+        )
+    assert _reservation_counts(conn) == (0, 0)
+
+
+@pytest.mark.parametrize("value", [None, "", 0, b"k", "x" * 201, "\ud800", {"k": 1}])
+def test_a_malformed_key_is_refused_by_the_reservation_writer(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    conn, record_id = approved
+    with pytest.raises(SubmissionError):
+        reserve_submission_key(
+            conn,
+            record_id=record_id,
+            idempotency_key=value,  # type: ignore[arg-type]
+            reserved_at=OCCURRED,
+        )
+    assert _reservation_counts(conn) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "2026-08-20T12:00:00+00:00",
+        datetime(2026, 8, 20, 12, 0),  # naive
+        0,
+    ],
+)
+def test_a_reserved_at_that_is_not_an_aware_datetime_is_refused(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    with pytest.raises(SubmissionError):
+        reserve_submission_key(
+            conn,
+            record_id=record_id,
+            idempotency_key=key,
+            reserved_at=value,  # type: ignore[arg-type]
+        )
+    assert _reservation_counts(conn) == (0, 0)
+
+
+def test_a_non_utc_reserved_at_is_converted_rather_than_refused(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The control for the refusals above, and the reason `010` can compare two columns.
+
+    An aware datetime in another zone is legal and is *converted*, so the stored text is
+    the one fixed-width UTC form `submission_key_releases.released_at_utc` is compared
+    against lexicographically. Asserting only the shape would pass against a writer that
+    rendered the local wall clock and appended `+00:00` -- which is the same instant
+    written as a different, and later, string.
+    """
+    from datetime import timedelta
+
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    elsewhere = OCCURRED.astimezone(timezone(timedelta(hours=-5)))
+    assert elsewhere.isoformat().startswith("2026-08-20T07:00:00")  # same instant, 07:00 local
+
+    reservation = reserve_submission_key(
+        conn, record_id=record_id, idempotency_key=key, reserved_at=elsewhere
+    )
+    assert reservation.reserved_at_utc == "2026-08-20T12:00:00.000000+00:00"
+    assert len(reservation.reserved_at_utc) == 32
+    # And the database holds what the value object reported.
+    stored = conn.execute(
+        "SELECT reserved_at_utc FROM submission_key_reservations WHERE reservation_id = ?",
+        (reservation.reservation_id,),
+    ).fetchone()[0]
+    assert stored == reservation.reserved_at_utc
+
+
+def test_one_key_cannot_be_reserved_against_two_records(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """A key is a function of (tournament, question, version, payload), and `001` declares
+    UNIQUE (question_id, tournament_id, forecast_version) -- so key -> record is a
+    function. Two records claiming one key means a derivation is wrong, and the
+    reservation is the last place that is cheap to notice.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    other = _seed_draft(conn, record_id="rec-2", question_id=200)
+    reservation = _reserved(conn, record_id, key)
+    _abandon(conn, reservation)  # released, so the "already reserved" clause cannot fire
+
+    # `010`'s trigger is what refuses this, so it arrives as the wrapped ledger refusal:
+    # every case the Python layer can name has its own message, and this is not one of
+    # them -- the payload hash the key is derived from is the caller's and is stored
+    # nowhere this could read.
+    with pytest.raises(SubmissionError, match="the ledger rejected this write"):
+        _reserved(conn, other, key)
+    assert _reservation_counts(conn) == (1, 1)
+
+
+def test_a_reservation_against_an_unknown_record_is_refused(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    with pytest.raises(SubmissionError):
+        reserve_submission_key(
+            conn, record_id="rec-missing", idempotency_key=key, reserved_at=OCCURRED
+        )
+    assert _reservation_counts(conn) == (0, 0)
+
+
+def test_the_reservation_refusals_never_echo_the_key(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """Same rule as every other refusal here: the key is derived from a payload hash, and
+    echoing it would let a caller confirm a guess about stored content."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    _reserved(conn, record_id, key)
+    with pytest.raises(SubmissionError) as excinfo:
+        _reserved(conn, record_id, key)
+    rendered = "".join(
+        traceback.format_exception(type(excinfo.value), excinfo.value, excinfo.value.__traceback__)
+    )
+    assert key not in str(excinfo.value)
+    assert key not in rendered
+
+
+def test_a_refusal_raised_by_the_trigger_never_echoes_a_stored_value(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The one refusal path the property tests cannot reach.
+
+    Every value `LEAKY_REFUSED` draws is turned away by a Python validator before the
+    ledger is touched, so `_execute`'s wrap -- the `from None` that keeps a database
+    message and its traceback out of the refusal -- is only reachable with values that
+    are *individually* well-formed and collectively refused by `010`. This is that case:
+    a key already reserved against another record, re-reserved against a record whose
+    identifier carries the planted secret.
+    """
+    secret = "privateFAKE123456"
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    other = _seed_draft(conn, record_id=f"rec-{secret}", question_id=200)
+    _abandon(conn, _reserved(conn, record_id, key))
+
+    with pytest.raises(SubmissionError) as excinfo:
+        _reserved(conn, other, key)
+    rendered = "".join(
+        traceback.format_exception(type(excinfo.value), excinfo.value, excinfo.value.__traceback__)
+    )
+    assert secret not in str(excinfo.value)
+    assert secret not in rendered
+    assert key not in rendered
+
+
+def test_the_reader_is_total_against_a_ledger_holding_two_live_reservations(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """`010` allows at most one, so this is a ledger some other program wrote.
+
+    A reader that raised on it would refuse to report the very state an operator needs to
+    see. The trigger is dropped to reach the row, which simulates a reachable condition on
+    this test's own connection rather than inventing an attacker.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    first = _reserved(conn, record_id, key)
+    conn.execute("DROP TRIGGER submission_key_reservations_validate_on_insert")
+    conn.execute(
+        "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+        "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+        "VALUES (?, ?, ?, 2, ?, ?)",
+        ("wjres-" + "a" * 32, key, record_id, TS, TS),
+    )
+    live = live_reservation_for_key(conn, key)
+    assert live is not None
+    # The highest sequence number wins, deterministically -- not an arbitrary row.
+    assert live.reservation_seq == 2 and live.reservation_id != first.reservation_id

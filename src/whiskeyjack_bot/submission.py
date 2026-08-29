@@ -44,10 +44,31 @@ keys already stored keep their old spelling, and a re-derivation that disagreed 
 stored key would claim a second post for work already done.
 
 The readers are the other half. :func:`attempt_for_key` answers "has this key already been
-used?" positively, and :func:`require_key_unused` is what M2-703/M2-704 call before
-minting an attempt -- so "same payload/key cannot create two attempts" is a typed refusal
-that names the collision, rather than a ``sqlite3.IntegrityError`` surfacing from the
-UNIQUE constraint after the caller has already decided to post.
+used?" positively, and :func:`require_key_unused` is the cheap look before minting an
+attempt -- so "same payload/key cannot create two attempts" is a typed refusal that names
+the collision, rather than a ``sqlite3.IntegrityError`` surfacing from the UNIQUE
+constraint after the caller has already decided to post.
+
+**A read is not a claim, and M2-708 is the difference.** ``require_key_unused`` was, until
+migration ``010``, the whole guard in front of a live post: two commands could both read
+one key as unused, both post, and ``001``'s UNIQUE would refuse the second *row* -- after
+its call had been made. The constraint protected the shape of the ledger and not the
+platform. :func:`reserve_submission_key` performs the check and the claim as one act,
+inside ``lifecycle.transaction``'s ``BEGIN IMMEDIATE``, writing a
+``submission_key_reservations`` row that ``010``'s trigger will not duplicate. A key's
+state is therefore **derived, never stored**:
+
+    spent     -- a ``submission_attempts`` row exists for it. Terminal.
+    reserved  -- a reservation exists with no release row and no attempt row.
+    released  -- every reservation for it carries a release row; the key is free again.
+    free      -- no reservation at all.
+
+:func:`release_submission_key` is the exit, and it exists because the reservation creates a
+state that did not exist before. A key is a pure function of its four inputs, so a claim
+with no way out does not block a retry -- it blocks that forecast, permanently, on an
+append-only table. ``not_posted`` is the program reporting that it *proved* no post was
+made; ``operator_abandoned`` is a person asserting it after checking the platform. Nothing
+is released on the happy path: the attempt row spends the reservation.
 
 **Two derivation seams, not one.** :func:`submission_key_for_record` will mint a key for
 any stored record including a ``draft``, because that is what a dry run needs -- a dry run
@@ -81,11 +102,18 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
-from typing import cast, get_args
+from datetime import datetime, timezone
+from typing import Literal, cast, get_args
 
 from whiskeyjack_bot.approval import ApprovalError, effective_approval
-from whiskeyjack_bot.lifecycle import LifecycleError, RefetchOutcome, current_status
+from whiskeyjack_bot.lifecycle import (
+    LifecycleError,
+    RefetchOutcome,
+    current_status,
+    transaction,
+)
 
 # Bumping this changes every key, which is the point: a rule change must be visible as a
 # different key rather than silently reinterpreting stored ones. It is part of the hashed
@@ -115,6 +143,49 @@ _INT64_MAX = 2**63 - 1
 
 # 8-character prefix + 64 hex characters. Well inside the writer's 200-character bound.
 KEY_LENGTH = len(_KEY_PREFIX) + 64
+
+# Matches `lifecycle._MAX_ACTOR` / `_MAX_NOTE`. Same standing as `_MAX_IDENTIFIER` above:
+# here to keep a hostile value away from sqlite3's binding, not to restate a writer's
+# rules, and M1-608 is the item that pins the family together.
+_MAX_ACTOR = 200
+_MAX_NOTE = 4000
+
+# Why a key reservation may have been given up. **The membership lives here and not in a
+# column CHECK**, deliberately: M2-711 established what a closed column vocabulary costs on
+# an append-only table (widening one is a full rebuild), and this is the kind that grows.
+# `010` enforces the column's *shape* -- non-blank text, no NUL, bounded -- and this owns
+# what the values may be.
+#
+# The two are not the same claim, which is why `release_submission_key` pairs each with a
+# different rule about `released_by`:
+#
+# - `not_posted`         the program proved no post was made (`MetaculusSubmissionGateway.
+#                        post_attempted` is still false when the refusal arrives). There is
+#                        no person to name, so naming one is refused.
+# - `operator_abandoned` a human checked the platform and asserts nothing landed. This is
+#                        the crash-mid-post case, where the program knows nothing at all,
+#                        so `released_by` is required -- `approve`'s rule, that an
+#                        attribution claim about a person is never inferred.
+ReservationReason = Literal["not_posted", "operator_abandoned"]
+_RESERVATION_REASONS: frozenset[str] = frozenset(get_args(ReservationReason))
+
+# Visible tags on the two reservation-side identifiers. Written as literals for
+# `_KEY_PREFIX`'s reason. Neither can be confused with an idempotency key or an attempt id:
+# those are `<tag>-<64 hex>` and these are `<tag><32 hex>` under different tags, which
+# `submission_live._assert_identity_spaces_are_distinct` is the standing check on.
+_RESERVATION_PREFIX = "wjres-"
+_RELEASE_PREFIX = "wjrel-"
+
+# One spelling each, shared by the reader and the writer. Two texts for one refusal is how
+# the reader and the claim come to disagree about what "used" means (M1-608, M2-710).
+_SPENT_KEY_REFUSAL = (
+    "this idempotency key has already been used by a recorded submission attempt; "
+    "a second attempt under it would claim a second live post"
+)
+_RESERVED_KEY_REFUSAL = (
+    "this idempotency key is reserved by a submission that has not finished; the "
+    "reservation must be released or spent before another may claim it"
+)
 
 
 class SubmissionError(Exception):
@@ -197,6 +268,38 @@ class AttemptSummary:
     verified_by_refetch: bool
     refetch_outcome: RefetchOutcome | None
     created_at_utc: str
+
+
+@dataclass(frozen=True)
+class KeyReservation:
+    """One durable claim on an idempotency key, held while a submission is in flight.
+
+    Minted by :func:`reserve_submission_key`, read back by
+    :func:`live_reservation_for_key`. Same contract as :class:`AttemptSummary`: constructed
+    only by this module, from values the database has already accepted, and re-gated on the
+    way out anyway. Every field is JSON-native, so the persisted form used for replay
+    comparison is the one that class documents -- ``json.dumps(dataclasses.asdict(...),
+    ensure_ascii=True, sort_keys=True)``.
+
+    **A reservation is not an attempt and never becomes one.** It says *this key is spoken
+    for*; it says nothing about whether a post happened, which is
+    ``submission_attempts``' answer. The two tables are the claim and the call, the same
+    way ``submission_attempts`` and ``submission_verifications`` are the call and its
+    verification -- and keeping them apart is what lets both stay strictly append-only
+    while the state of a key still changes.
+
+    ``reservation_seq`` numbers one key's reservations from 1. A key normally has exactly
+    one. It has more when an earlier claim was released without being spent, which is what
+    makes a transient pre-post failure recoverable rather than permanent: without a second
+    sequence number, a key -- being a pure function of the tournament, question, forecast
+    version and payload hash -- could never be claimed again by the work that derived it.
+    """
+
+    reservation_id: str
+    idempotency_key: str
+    forecast_record_id: str
+    reservation_seq: int
+    reserved_at_utc: str
 
 
 def canonical_key_json(
@@ -402,26 +505,256 @@ def attempt_for_key(conn: sqlite3.Connection, idempotency_key: str) -> AttemptSu
 
 
 def require_key_unused(conn: sqlite3.Connection, idempotency_key: str) -> None:
-    """Refuse if this key has already been spent; return silently otherwise.
+    """Refuse if this key is spent **or reserved**; return silently otherwise.
 
-    This is the guard M2-703 and M2-704 call *before* deciding to post. ``001``'s UNIQUE
-    constraint is what actually makes a second attempt impossible, and it stays the
-    enforcement -- but it fires as a ``sqlite3.IntegrityError`` at the write, which is
-    after a gateway has already made its decision and, on the live path, possibly its
-    call. This says the same thing beforehand, as this module's own error.
+    Two conditions, one answer, because a caller asking "may I claim this key" is asking
+    one question. A key is unavailable if a :func:`attempt_for_key` row records a call
+    already made under it, and equally if a live :func:`live_reservation_for_key` says a
+    submission is in flight holding it. A second guard for the second condition would be
+    two spellings of one bound with nothing keeping them in agreement -- the defect this
+    project has now filed twice (M1-608, M2-710).
 
-    It is a **read**, so it is not by itself a race-free claim: two processes could both
-    see an unused key. That is deliberate and it is the honest division -- the UNIQUE
-    constraint is the one that cannot be raced, and callers must still let it decide. The
-    guard exists to turn the ordinary case into an explanation rather than a stack trace.
+    It is still a **read**, and that is still the honest division. ``001``'s ``UNIQUE`` and
+    ``010``'s reservation trigger are what cannot be raced; this says the same thing
+    beforehand, as this module's own error, so the ordinary case is an explanation rather
+    than a stack trace. What changed with M2-708 is what stands behind it:
+    :func:`reserve_submission_key` now performs this check and the claim as one act, so the
+    live path no longer *depends* on a read. This remains the cheap look for a caller that
+    only wants to know.
     """
-    if attempt_for_key(conn, idempotency_key) is not None:
-        # Names no value: the key is derived from a payload hash and a tournament, and
-        # echoing it back would let a caller confirm a guess about stored content.
+    key = _require_text(idempotency_key, "idempotency_key")
+    # Names no value: the key is derived from a payload hash and a tournament, and echoing
+    # it back would let a caller confirm a guess about stored content.
+    if attempt_for_key(conn, key) is not None:
+        raise SubmissionError(_SPENT_KEY_REFUSAL)
+    if live_reservation_for_key(conn, key) is not None:
+        raise SubmissionError(_RESERVED_KEY_REFUSAL)
+
+
+def live_reservation_for_key(
+    conn: sqlite3.Connection, idempotency_key: str
+) -> KeyReservation | None:
+    """Return the reservation currently holding this key, or ``None``.
+
+    "Currently holding" means a ``submission_key_reservations`` row with no
+    ``submission_key_releases`` row pointing at it. ``010``'s trigger allows at most one
+    such row per key, so the ``ORDER BY``/``LIMIT`` below is not how the answer is decided
+    -- it is what keeps this reader **total** against a ledger some other program wrote,
+    where the invariant was never enforced. A reader that raised on a ledger holding two
+    live reservations would refuse to report the very state an operator needs to see.
+
+    Validates the key as *storable text* only, for :func:`attempt_for_key`'s reason: a
+    ledger may hold keys minted under an earlier schema version, and a reader that refused
+    to look at them would report a free key for one that is held.
+    """
+    key = _require_text(idempotency_key, "idempotency_key")
+    row = _fetch_one(
+        conn,
+        "SELECT reservation_id, idempotency_key, forecast_record_id, reservation_seq, "
+        "reserved_at_utc FROM submission_key_reservations r WHERE r.idempotency_key = ? "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM submission_key_releases x WHERE x.reservation_id = r.reservation_id"
+        ") ORDER BY r.reservation_seq DESC LIMIT 1",
+        (key,),
+    )
+    return None if row is None else _reservation_from_row(row)
+
+
+def reserve_submission_key(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str,
+    idempotency_key: str,
+    reserved_at: datetime,
+) -> KeyReservation:
+    """Claim this key durably. **The check and the claim are one act** (M2-708).
+
+    :func:`require_key_unused` is a read, and until this existed it was the whole guard in
+    front of a live post. Two commands could both read one key as unused, both post, and
+    ``001``'s ``UNIQUE`` would then refuse the second *row* -- after its call had already
+    been made. The constraint protected the shape of the ledger and not the platform, and
+    the acceptance criterion asks for the platform: *two concurrent commands for the same
+    derived key durably select one poster before any network I/O*.
+
+    Three layers, and it is worth being precise about which one does what:
+
+    - :func:`lifecycle.transaction` is ``BEGIN IMMEDIATE``, so the write lock is taken
+      **before** the read below and the read-then-write cannot interleave with another
+      writer's. That is what makes the ordinary contended case a clean typed refusal
+      rather than a lock upgrade that cannot be retried from inside an open transaction.
+    - ``010``'s ``submission_key_reservations_validate_on_insert`` refuses a second live
+      reservation, a spent key, and a sequence number that is not the next one. **This is
+      the enforcement**, and it is the layer that cannot be raced.
+    - ``UNIQUE (idempotency_key, reservation_seq)`` turns any race that does occur into a
+      loud failure rather than a silently duplicated claim.
+
+    Exactly the division :func:`lifecycle.transaction` documents for ``event_seq``, and the
+    reason the Python checks below are not the guarantee: they are what turn the guarantee
+    into a message an operator can act on.
+
+    Every input is validated before the ledger is touched (M1-303 round 4: refuse a caller
+    mistake before the spend), and ``reservation_id`` is minted here rather than accepted,
+    so no caller can supply one that collides with a row it cannot see.
+
+    **What it does not check** is that ``idempotency_key`` is the key
+    :func:`submission_key_for_record` would derive for ``record_id`` -- that needs the
+    payload hash, which is the caller's and not stored anywhere this could read. ``010``
+    catches the consequence that matters, one key reserved against two different records,
+    and :func:`submission_live.post_approved_forecast` derives both values from the same
+    row in the same breath.
+
+    A reservation is **not** released on success. The attempt row spends it, and the
+    derived state of the key becomes ``spent`` -- which is why nothing here has to be
+    undone on the happy path, and why the writer of the attempt row is unchanged.
+    """
+    identifier = _require_text(record_id, "record_id")
+    key = _require_text(idempotency_key, "idempotency_key")
+    reserved = _require_utc(reserved_at, "reserved_at")
+    reservation_id = _RESERVATION_PREFIX + uuid.uuid4().hex
+    try:
+        with transaction(conn):
+            if attempt_for_key(conn, key) is not None:
+                raise SubmissionError(_SPENT_KEY_REFUSAL)
+            if live_reservation_for_key(conn, key) is not None:
+                raise SubmissionError(_RESERVED_KEY_REFUSAL)
+            sequence = _next_reservation_seq(conn, key)
+            _execute(
+                conn,
+                "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+                "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (reservation_id, key, identifier, sequence, reserved, _utc_text(_utcnow())),
+            )
+            return KeyReservation(
+                reservation_id=reservation_id,
+                idempotency_key=key,
+                forecast_record_id=identifier,
+                reservation_seq=sequence,
+                reserved_at_utc=reserved,
+            )
+    except LifecycleError as exc:
+        # Includes the losing side of a contended `BEGIN IMMEDIATE` whose busy timeout
+        # expires. That is a refusal like any other here, and it means the same thing:
+        # this caller did not get the key, so this caller posts nothing.
+        raise _wrap_lifecycle(exc) from None
+
+
+def release_submission_key(
+    conn: sqlite3.Connection,
+    reservation: KeyReservation,
+    *,
+    reason: ReservationReason,
+    released_at: datetime,
+    released_by: str | None = None,
+    note: str | None = None,
+) -> None:
+    """Give up a reservation that was never spent, so the key can be claimed again.
+
+    **Why this exists.** An atomic reservation creates a state that did not exist before:
+    reserved, but with no attempt row. An idempotency key is a pure function of the
+    tournament, question, forecast version and payload hash, so a claim with no exit does
+    not block a retry -- it blocks that forecast, permanently, on an append-only table.
+    Two ways out, and they are different claims (see :data:`ReservationReason`):
+    ``not_posted`` is the program reporting that it proved no post was made;
+    ``operator_abandoned`` is a person asserting it after checking the platform.
+
+    ``released_by`` is required for the second and refused for the first. Requiring one the
+    program would have to invent is ``approve``'s rule -- an attribution claim about a
+    person is never inferred from the machine -- and accepting one for ``not_posted`` would
+    put a name against a conclusion no person reached.
+
+    Only ``reservation.reservation_id`` is read. Nothing else on the value object reaches
+    the row, so there is no second source of truth for the caller to get wrong -- M2-703
+    round 1's finding, applied by construction rather than checked afterwards. The key the
+    "already spent" test runs against is read back **from the stored row**, not taken from
+    the object.
+
+    Refuses, rather than silently doing nothing, when the reservation was consumed by a
+    recorded attempt: that reservation was not abandoned, and recording it as abandoned
+    would assert something false about an irreversible call. ``010`` refuses it too.
+    """
+    if type(reservation) is not KeyReservation:
+        # Exact type, not isinstance, for `record_submission_attempt`'s reason: a subclass
+        # can shadow a field with a property, turning the read below into caller code.
+        raise SubmissionError("reservation must be a KeyReservation")
+    reservation_id = _require_text(reservation.reservation_id, "reservation.reservation_id")
+    reason_text = _require_reason(reason)
+    released = _require_utc(released_at, "released_at")
+    actor = _require_optional_text(released_by, "released_by", max_length=_MAX_ACTOR)
+    note_text = _require_optional_text(note, "note", max_length=_MAX_NOTE)
+    if reason_text == "not_posted" and actor is not None:
         raise SubmissionError(
-            "this idempotency key has already been used by a recorded submission attempt; "
-            "a second attempt under it would claim a second live post"
+            "a not_posted release records that the program proved no post was made, so it "
+            "names no person; omit released_by"
         )
+    if reason_text != "not_posted" and actor is None:
+        raise SubmissionError(
+            f"a release with reason {reason_text} is an assertion by a person about what "
+            "is on the platform, so released_by is required"
+        )
+    release_id = _RELEASE_PREFIX + uuid.uuid4().hex
+    try:
+        with transaction(conn):
+            row = _fetch_one(
+                conn,
+                "SELECT idempotency_key FROM submission_key_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+            if row is None:
+                raise SubmissionError("reservation_id does not name a stored key reservation")
+            stored_key = _stored_text(row[0], "idempotency_key")
+            if attempt_for_key(conn, stored_key) is not None:
+                raise SubmissionError(
+                    "this reservation was consumed by a recorded submission attempt and so "
+                    "was not abandoned; there is nothing to release"
+                )
+            if live_reservation_for_key(conn, stored_key) is None:
+                raise SubmissionError("this key reservation has already been released")
+            _execute(
+                conn,
+                "INSERT INTO submission_key_releases (release_id, reservation_id, reason, "
+                "released_by, note, released_at_utc, created_at_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    release_id,
+                    reservation_id,
+                    reason_text,
+                    actor,
+                    note_text,
+                    released,
+                    _utc_text(_utcnow()),
+                ),
+            )
+    except LifecycleError as exc:
+        raise _wrap_lifecycle(exc) from None
+
+
+def _next_reservation_seq(conn: sqlite3.Connection, idempotency_key: str) -> int:
+    """The sequence number ``010``'s trigger will accept for this key's next reservation.
+
+    Read inside the caller's ``BEGIN IMMEDIATE``, which is what makes "the next one" still
+    true by the time the insert runs -- ``forecast.store``'s argument for reading a version
+    head inside the transaction that writes against it.
+    """
+    row = _fetch_one(
+        conn,
+        "SELECT max(reservation_seq) FROM submission_key_reservations WHERE idempotency_key = ?",
+        (idempotency_key,),
+    )
+    if row is None or row[0] is None:
+        return 1
+    return _stored_int(row[0], "reservation_seq") + 1
+
+
+def _reservation_from_row(row: sqlite3.Row) -> KeyReservation:
+    """Gate a stored reservation on the way out; see :class:`AttemptSummary`."""
+    return KeyReservation(
+        reservation_id=_stored_text(row[0], "reservation_id"),
+        idempotency_key=_stored_text(row[1], "idempotency_key"),
+        forecast_record_id=_stored_text(row[2], "forecast_record_id"),
+        reservation_seq=_stored_int(row[3], "reservation_seq"),
+        reserved_at_utc=_stored_text(row[4], "reserved_at_utc"),
+    )
 
 
 def _wrap_lifecycle(exc: LifecycleError) -> SubmissionError:
@@ -441,8 +774,12 @@ def _wrap_approval(exc: ApprovalError) -> SubmissionError:
     return SubmissionError(str(exc) or "the ledger refused to report this record's approval")
 
 
-def _require_text(value: object, field: str) -> str:
+def _require_text(value: object, field: str, *, max_length: int = _MAX_IDENTIFIER) -> str:
     """Return ``value`` as storable text, or raise naming only the *field*.
+
+    ``max_length`` defaults to the identifier bound every caller here wants; the free-text
+    fields a release carries (``released_by``, ``note``) pass their own, so there is one
+    text validator rather than one per bound.
 
     The type gate is exact (``type(x) is str``) rather than ``isinstance``, and the encode
     probe is the load-bearing one: ``sqlite3`` encodes text parameters as UTF-8, so a lone
@@ -452,8 +789,8 @@ def _require_text(value: object, field: str) -> str:
     """
     if type(value) is not str or not value:
         raise SubmissionError(f"{field} must be a non-empty string")
-    if len(value) > _MAX_IDENTIFIER:
-        raise SubmissionError(f"{field} is longer than the {_MAX_IDENTIFIER}-character limit")
+    if len(value) > max_length:
+        raise SubmissionError(f"{field} is longer than the {max_length}-character limit")
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -498,6 +835,23 @@ def _require_sha256(value: object, field: str) -> str:
     if len(text) != 64 or not _HEX_DIGITS.issuperset(text):
         raise SubmissionError(f"{field} must be 64 lowercase hexadecimal characters")
     return text
+
+
+def _require_optional_text(value: object, field: str, *, max_length: int) -> str | None:
+    """``None`` passes through; anything else must be storable text. ``lifecycle``'s."""
+    return None if value is None else _require_text(value, field, max_length=max_length)
+
+
+def _require_reason(value: object) -> str:
+    """Gate a value against :data:`ReservationReason`, this module's closed vocabulary.
+
+    The members are named in the refusal. They are this module's own literals, not caller
+    or stored content, and naming them is the only thing that makes the failure fixable --
+    the same carve-out ``_assert_prefix_matches_version`` makes for its constants.
+    """
+    if type(value) is not str or value not in _RESERVATION_REASONS:
+        raise SubmissionError("reason must be one of " + ", ".join(sorted(_RESERVATION_REASONS)))
+    return value
 
 
 def _stored_text(value: object, field: str) -> str:
@@ -559,3 +913,85 @@ def _fetch_one(
             "stored values)"
         ) from None
     return cast("sqlite3.Row | None", row)
+
+
+def _execute(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...]) -> None:
+    """Run one INSERT, wrapping every database failure as this module's own error.
+
+    ``lifecycle._insert``'s contract and its reasoning: callers only handle
+    :class:`SubmissionError`, so a raw ``sqlite3.Error`` -- including the
+    ``IntegrityError`` one of ``010``'s triggers raises -- must not escape, and the
+    database's own text is not forwarded, because SQLite naming tables rather than values
+    is a property of its formatting today and not a contract this module may rest on.
+
+    Every actionable case is refused with its own message before the statement runs. What
+    reaches here is the race the trigger exists to catch, and a caller that loses it has
+    still posted nothing.
+    """
+    try:
+        conn.execute(sql, parameters)
+    except (sqlite3.Error, OverflowError, UnicodeEncodeError):
+        # from None: the underlying error's text and traceback can carry stored values.
+        raise SubmissionError(
+            "the ledger rejected this write (detail withheld: a database message can echo "
+            "stored values)"
+        ) from None
+
+
+def _utcnow() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+def _utc_text(value: datetime) -> str:
+    """Render an already-validated aware datetime in ``lifecycle``'s canonical stored form."""
+    return _require_aware_utc(value, "timestamp").isoformat(timespec="microseconds")
+
+
+def _require_aware_utc(value: object, field: str) -> datetime:
+    """Return an aware datetime converted to UTC, or raise. Mirrors ``lifecycle``'s.
+
+    Exact type rather than ``isinstance``: a ``datetime`` subclass can override
+    ``isoformat()`` and write arbitrary text into a pinned timestamp column.
+
+    The conversion is guarded, and broadly, for the reason ``lifecycle._require_aware_utc``
+    gives: ``tzinfo`` is an abstract base class, so ``utcoffset()`` and ``astimezone()`` run
+    caller-supplied code on a value that has passed every type gate above. ``except
+    Exception`` is the right width precisely because what arbitrary code can raise is not
+    enumerable.
+    """
+    if type(value) is not datetime:
+        raise SubmissionError(f"{field} must be a datetime")
+    try:
+        aware = value.tzinfo is not None and value.utcoffset() is not None
+    except Exception:
+        raise SubmissionError(
+            f"{field} has a timezone that could not be read "
+            "(detail withheld: it can echo the value)"
+        ) from None
+    if not aware:
+        raise SubmissionError(f"{field} must be timezone-aware")
+    try:
+        return value.astimezone(timezone.utc)
+    except Exception:
+        raise SubmissionError(
+            f"{field} could not be converted to UTC (detail withheld: it can echo the value)"
+        ) from None
+
+
+def _require_utc(value: object, field: str) -> str:
+    """Return an aware datetime as the canonical stored UTC string, or raise.
+
+    ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00``: fixed width 32, always UTC, microseconds always
+    present. ``010`` pins that exact form on ``reserved_at_utc`` and ``released_at_utc``
+    because it compares the two, and a lexicographic comparison against an unknown format
+    is a coin toss that reads like a check (003's round-4 finding, on the same columns one
+    table over).
+
+    This is the third spelling of one rule -- ``lifecycle._require_utc`` and
+    ``submission_gateway._require_aware_utc`` are the others -- and the duplication is the
+    error-hygiene rule's price: each module owns the exception type its callers handle.
+    What keeps them from drifting is a test that drives all three over the same datetimes
+    and asserts the rendered text is equal, which is M2-710's rule (compare the layers over
+    one input set) applied to a bound rather than to a validator.
+    """
+    return _utc_text(_require_aware_utc(value, field))
