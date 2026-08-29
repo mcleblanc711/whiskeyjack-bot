@@ -6109,3 +6109,31 @@ blocking findings were found *because* the claim was specific enough to check. N
 finding's failure mode was covered by the 37 acceptance tests written before the review — both
 needed a monkeypatched local I/O failure, which is a reachable reliability condition rather
 than a hostile one, and the suite had no such simulation in it at all.
+
+### Round 2 — APPROVE, both blockers closed, and one of my own claims falsified
+
+Round 2 (`d7a5976`, baseline `6e3f3d3`) closed both round-1 findings by execution and returned
+no blocking findings. One non-blocking observation, and it is the entry worth keeping:
+
+**Risk claim 7 was overstated and the review was right.** I claimed
+`_require_retained_output` "cannot be satisfied by a non-`AppConfig`". It can:
+`SimpleNamespace(storage=SimpleNamespace(retain_raw_model_output=True))` passes it, because the
+guard reads the attribute and then checks the *value's* type — never the object's. Non-blocking
+for the stated reasons (the guard is private, the CLI always supplies `load_config`'s
+`AppConfig`, and the shape predates this branch), and filed as **M1-316**.
+
+What makes it worth a row rather than a shrug: `_require_replay_enabled` has the identical
+shape and was written first, so this is a pattern, not a slip. Every `AttributeError` →
+`PipelineError` guard in `pipeline.py` prints "config must be an AppConfig" while checking
+something strictly weaker. **The message is the part that is wrong** — either the check matches
+its claim or it stops making it. That is the same defect class as the vacuous-property findings
+this project keeps paying for, one layer over: a guard whose stated claim is stronger than
+anything it can fail on. I copied the shape from a sibling module without asking what it
+actually verified, which is exactly how the class propagates.
+
+**Two rounds, and the mechanism worked the way `docs/LESSONS.md` describes.** Round 1's ten
+risk claims were stated as things a reviewer could falsify; claim 7 in round 1 was falsified in
+two independent ways and became both blockers, and claim 7 in round 2 was falsified again. A
+vaguer request would have produced neither finding, and the incomplete-record path would have
+merged. The cost of writing falsifiable claims is that some of them turn out to be false in
+public — which is the point of writing them.
