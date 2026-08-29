@@ -124,6 +124,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="the uncertain attempt to resolve; submit prints it when it leaves one open",
     )
 
+    run = subparsers.add_parser(
+        "run",
+        help=(
+            "forecast one saved question from replayed research and a saved model reply; "
+            "makes no provider call and never submits"
+        ),
+    )
+    run.add_argument("--config", default="config.yaml", type=Path)
+    run.add_argument(
+        "--question-id", required=True, type=int, help="the question in the snapshot to forecast"
+    )
+    run.add_argument(
+        "--snapshot", required=True, type=Path, help="the saved question snapshot to load from"
+    )
+    run.add_argument(
+        "--attempt-id",
+        required=True,
+        help=(
+            "the saved attempt whose model reply to replay; the record this writes is "
+            "stamped with a freshly minted attempt id of its own"
+        ),
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="assert submission.dry_run is set; refuses if it is not",
+    )
+    run.add_argument(
+        "--no-submit",
+        action="store_true",
+        help="assert submission.no_submit is set; refuses if it is not",
+    )
+
     replay = subparsers.add_parser(
         "replay",
         help="re-derive a stored forecast from its saved model output; makes no API call",
@@ -520,12 +553,113 @@ def _read_payload_file(path: Path) -> dict[str, object] | None:
     return payload
 
 
+def _run_run(args: argparse.Namespace) -> int:
+    """Forecast one saved question from replayed research and a saved reply (T-903).
+
+    The command T-903's criterion is about: *"one command, one saved question, research +
+    model replay -> one complete validated ledger record, zero provider calls, zero
+    submission calls, reproducible forecast hash."* The last clause is ``replay
+    --record-id`` run afterwards on the record this prints.
+
+    **This command cannot submit**, and that is structural rather than a check: no
+    submission module is on ``whiskeyjack_bot.pipeline``'s import path, so there is nothing
+    here to call. ``CODEX_HANDOFF.md`` § "Required CLI entry points" asks that ``run`` never
+    submit implicitly; a module that has no submission code is the strongest available form
+    of that. Approval and submission stay separate commands (D23).
+
+    ``--dry-run`` and ``--no-submit`` come from that same spec line. They are **assertions
+    about the configuration, not overrides of it**: a flag that silently forced the safe
+    value would let a config with ``dry_run: false`` pass a command line that reads as safe,
+    and the operator would have been told the wrong thing about their own file. So each one
+    refuses when the setting it names is not set, and omitting it asserts nothing -- the
+    committed defaults are already the safe ones and this command cannot post either way.
+
+    Prints the record's identity and hashes before exiting, for ``_run_approval``'s reason:
+    the next command an operator runs is ``approve --forecast-sha256 <hash>``, and a hash
+    they never saw printed is one they cannot bind an approval to.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.pipeline import ForecastRejected, PipelineError, run_replay
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    if args.dry_run and not config.submission.dry_run:
+        print("refused: --dry-run was passed but submission.dry_run is not set")
+        return EXIT_REFUSED
+    if args.no_submit and not config.submission.no_submit:
+        print("refused: --no-submit was passed but submission.no_submit is not set")
+        return EXIT_REFUSED
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            result = run_replay(
+                connection,
+                config,
+                question_id=args.question_id,
+                attempt_id=args.attempt_id,
+                snapshot=args.snapshot,
+                now=datetime.now(tz=timezone.utc),
+            )
+        except ForecastRejected as exc:
+            # Ordered before PipelineError, which it subclasses. The problems are
+            # forecast.schema's sanitized list -- field paths and validator messages, never
+            # the offending value -- and they are the whole account of why the reply was
+            # rejected, so they are printed rather than summarized.
+            print(f"rejected: {exc}")
+            print(f"attempt:   {exc.attempt_id}")
+            for problem in exc.problems:
+                print(f"  - {problem}")
+            return EXIT_REFUSED
+        except PipelineError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"record:    {result.record_id}")
+        print(
+            f"question:  {result.question_id}  tournament: {result.tournament_id}  "
+            f"version: {result.forecast_version}"
+        )
+        print(f"attempt:   {result.attempt_id} (replayed from {result.replayed_attempt_id})")
+        print(f"research:  {len(result.retrieval_run_ids)} run(s), {result.source_count} source(s)")
+        print(f"packet:    {result.research_packet_sha256}")
+        # No `(none: ...)` fallback any more. `run_replay` refuses a run whose artifact was
+        # not written -- round-1 finding 2 -- so reaching here means the path is set, and a
+        # fallback for a state the pipeline cannot return would only ever mislead a reader
+        # into thinking this command can produce a record without its evidence.
+        print(f"artifact:  {result.raw_output_path}")
+        print(f"hash:      {result.forecast_sha256}")
+        print("status:    validated")
+        print("submitted: no -- `run` never submits; approve and submit are separate commands")
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
 def _run_replay(args: argparse.Namespace) -> int:
     """Re-derive one stored forecast from its saved model output (M1-406).
 
-    The command form of the acceptance criterion, and the entry point Codex's T-903 dry-run
-    acceptance test needs: *"one command produces one validated record, zero provider calls
-    and zero submission calls."*
+    **Corrected by T-903.** This docstring used to call itself "the entry point Codex's
+    T-903 dry-run acceptance test needs: one command produces one validated record". It is
+    half of that at most: this command *verifies* a record and writes nothing, so it cannot
+    produce one. ``run`` is the half that produces it, and ``replay`` is what proves the
+    hash reproduces afterwards. Left as written, the sentence would have told the next
+    reader the gap was closed -- the failure mode a stale pointer in ``schema.py`` already
+    cost M1-501 a blocking finding and a review round.
 
     Both hashes are printed whatever the verdict, and in that order, for
     ``_run_approval``'s reason: an operator acting on a replay needs to see the values it
@@ -634,6 +768,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_submit(args)
     if args.command == "verify-submission":
         return _run_verify_submission(args)
+    if args.command == "run":
+        return _run_run(args)
     if args.command == "replay":
         return _run_replay(args)
     raise AssertionError(f"unhandled command: {args.command}")
