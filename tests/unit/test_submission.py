@@ -1362,6 +1362,154 @@ def test_a_refusal_raised_by_the_trigger_never_echoes_a_stored_value(
     assert key not in rendered
 
 
+# ---------------------------------------------------------------------------
+# `010`'s triggers, driven directly.
+# ---------------------------------------------------------------------------
+#
+# The writer above is documented as *not* being the guarantee: `reserve_submission_key`'s
+# own checks turn the guarantee into a message an operator can act on, and the trigger is
+# "the enforcement, the layer that cannot be raced". A mutation pass proved that claim was
+# untested -- neutering the seq, already-reserved, already-spent, release-ordering and
+# consumed-reservation clauses to `WHERE 0` left the whole suite green, because every test
+# that could reach them is refused one layer earlier by Python.
+#
+# That is the vacuous-property class in `docs/LESSONS.md` wearing a different coat: the
+# assertion was about the trigger, and nothing could reach it. So these probes bypass the
+# writer entirely and INSERT raw, which is also the only shape that resembles the case the
+# trigger exists for -- a second process whose read and write did interleave.
+
+# `reserved_at_utc` is pinned by `010` to the fixed-width UTC form, so the probes below
+# spell it the way the writer does rather than reusing `TS`, whose only job is an unordered
+# `created_at_utc`.
+OCCURRED_TEXT = OCCURRED.isoformat(timespec="microseconds")
+
+_RAW_RESERVATION = (
+    "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+    "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+    "VALUES (?, ?, ?, ?, ?, ?)"
+)
+_RAW_RELEASE = (
+    "INSERT INTO submission_key_releases (release_id, reservation_id, reason, "
+    "released_by, note, released_at_utc, created_at_utc) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def test_the_trigger_refuses_a_second_live_reservation(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The clause the whole item rests on: one key, one live claim.
+
+    Reached only by raw SQL -- `reserve_submission_key` refuses this itself, one layer up.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    _reserved(conn, record_id, key)
+    with pytest.raises(sqlite3.IntegrityError, match="already reserved"):
+        conn.execute(_RAW_RESERVATION, ("wjres-raw", key, record_id, 2, OCCURRED_TEXT, TS))
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_the_trigger_refuses_a_key_a_recorded_attempt_already_spent(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """Terminal beats free at the schema, not only at the writer."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_uncertain_attempt(key, attempt_id="att-1"),
+        occurred_at=OCCURRED,
+        detail_code="timeout",
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="already been used"):
+        conn.execute(_RAW_RESERVATION, ("wjres-raw", key, record_id, 1, OCCURRED_TEXT, TS))
+    assert _reservation_counts(conn) == (0, 0)
+
+
+@pytest.mark.parametrize("sequence", [0, 1, 3, -1])
+def test_the_trigger_refuses_a_sequence_number_that_is_not_the_next_one(
+    approved: tuple[sqlite3.Connection, str], sequence: int
+) -> None:
+    """`_next_reservation_seq` always computes the right one, so only raw SQL gets here.
+
+    The parameters straddle the boundary rather than sitting on one side of it: `1` is the
+    number already taken, `3` skips one, `0` and `-1` are below the floor. A clause tested
+    with a single wrong value passes just as well when it is an inequality pointing the
+    wrong way.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    _abandon(conn, reservation)  # released, so the "already reserved" clause cannot fire
+    with pytest.raises(sqlite3.IntegrityError, match="next sequence number"):
+        conn.execute(_RAW_RESERVATION, ("wjres-raw", key, record_id, sequence, OCCURRED_TEXT, TS))
+    assert _reservation_counts(conn) == (1, 1)
+
+
+def test_the_trigger_refuses_a_release_earlier_than_the_reservation_it_releases(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """`post_approved_forecast` reuses one instant for both, so this needs raw SQL.
+
+    A release that predates its own claim is not an ordering nicety: `released_at_utc` is
+    what an audit reads to decide when the key became free again, and a value before the
+    reservation says the key was free while it was held.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    earlier = "2020-01-01T00:00:00.000000+00:00"
+    with pytest.raises(sqlite3.IntegrityError, match="earlier than the reservation"):
+        conn.execute(
+            _RAW_RELEASE,
+            (
+                "wjrel-raw",
+                reservation.reservation_id,
+                "operator_abandoned",
+                "chris",
+                None,
+                earlier,
+                TS,
+            ),
+        )
+    assert _reservation_counts(conn) == (1, 0)
+
+
+def test_the_trigger_refuses_releasing_a_reservation_an_attempt_consumed(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """A spent reservation was not abandoned, and recording it as abandoned asserts
+    something false about a call that was really made. The writer refuses it; so does
+    `010`, which is the copy that survives a second program.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_uncertain_attempt(key, attempt_id="att-1"),
+        occurred_at=OCCURRED,
+        detail_code="timeout",
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="was not abandoned"):
+        conn.execute(
+            _RAW_RELEASE,
+            (
+                "wjrel-raw",
+                reservation.reservation_id,
+                "operator_abandoned",
+                "chris",
+                None,
+                OCCURRED_TEXT,
+                TS,
+            ),
+        )
+    assert _reservation_counts(conn) == (1, 0)
+
+
 def test_the_reader_is_total_against_a_ledger_holding_two_live_reservations(
     approved: tuple[sqlite3.Connection, str],
 ) -> None:
