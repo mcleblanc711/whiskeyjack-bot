@@ -39,3 +39,28 @@
 
 # Round 2 hoisted the fixture to a module constant; renamed one commit later.
 4fa86811d5e720e999e8585047fcd0f46c899cf0:tests/unit/test_research.py:generic-api-key:242
+
+# ---------------------------------------------------------------------------
+# M2-708: three false positives, and a different class from everything above.
+#
+# Not a planted secret. `generic-api-key` matched the literal text
+# `reserved_at=OCCURRED` -- a keyword-argument name and a module-level test constant --
+# because `idempotency_key=` appears earlier on the same line and puts the rule's
+# keyword within range. Entropy 3.784, which clears the default threshold.
+#
+# The trigger is line *shape*, not content, and it was reproduced with gitleaks 8.30.1:
+# the rule fires only when the line ENDS immediately after `reserved_at=OCCURRED`. The
+# same arguments on a line with a trailing `)`, or split one-per-line with a trailing
+# comma, do not match -- which is why only 3 of the 26 `idempotency_key=key` call sites
+# in this branch were flagged. They were the three that ruff had wrapped that way.
+#
+# The three sites have since been split one-argument-per-line, matching the other 23 and
+# the surrounding style, so no new commit carries the shape. That does not retire these
+# entries and cannot: the commits below stay reachable forever, exactly as the M1-301
+# lesson above records. Suppressing by commit-pinned fingerprint keeps the narrowness --
+# a real secret at any other line, file or commit still fails the gate.
+
+# `reserve_submission_key(...)` wrapped so the line ends at the constant.
+afb71b5d01ae7a89a58daa26872570e42d7f87b7:tests/unit/test_cli_submit.py:generic-api-key:457
+37c1ecaf373b35b3e6417b80c707e80c83077b9e:tests/unit/test_submission.py:generic-api-key:917
+37c1ecaf373b35b3e6417b80c707e80c83077b9e:tests/unit/test_submission.py:generic-api-key:1314

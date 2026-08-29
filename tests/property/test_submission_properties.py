@@ -38,10 +38,14 @@ from strategies import ENCODABLE_TEXT, HOSTILE_TEXT
 
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.submission import (
+    KeyReservation,
     SubmissionError,
     attempt_for_key,
     canonical_key_json,
+    live_reservation_for_key,
+    release_submission_key,
     require_key_unused,
+    reserve_submission_key,
     submission_key,
     submission_key_for_approved_record,
     submission_key_for_record,
@@ -246,7 +250,15 @@ def _row_counts() -> tuple[int, ...]:
     conn = _conn()
     return tuple(
         int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-        for table in ("forecast_records", "submission_attempts", "lifecycle_events")
+        for table in (
+            "forecast_records",
+            "submission_attempts",
+            "lifecycle_events",
+            # M2-708. Invariant 4 is "the readers never write", and a reader that began
+            # reserving would be invisible to a count that stopped at the older tables.
+            "submission_key_reservations",
+            "submission_key_releases",
+        )
     )
 
 
@@ -540,3 +552,183 @@ def test_the_gated_seam_never_mints_a_key_for_an_unapproved_record(
     record_id, _ = _seed(tournament_id, 1)
     with pytest.raises(SubmissionError, match="holds no approval in force"):
         submission_key_for_approved_record(_conn(), record_id, request_payload_sha256=digest)
+
+
+# --------------------------------------------------------------------------------------
+# Invariant 6: the reservation is a *writer*, and a refused one writes nothing (M2-708).
+#
+# Invariants 1-5 are about a derivation and two readers. `reserve_submission_key` and
+# `release_submission_key` are the first things in this module that write, so "a refused
+# call leaves the ledger where it was" is a property about them rather than a restatement
+# of invariant 4 -- for a writer it is the claim that a refusal is atomic, which is what
+# `lifecycle.transaction` is there to make true.
+# --------------------------------------------------------------------------------------
+
+
+def _fresh_key(tournament_id: str, digest: str) -> tuple[str, str]:
+    """A record and a key nothing has claimed yet.
+
+    `_seed` appends a new version to the chain every call, and `forecast_version` is one
+    of the four hashed inputs, so two examples drawing the same tournament and digest
+    still derive different keys. Without that this file's own reuse of shrunk draws would
+    make half these examples assert against a key a previous example had already spent.
+    """
+    record_id, _ = _seed(tournament_id, 1)
+    return record_id, submission_key_for_record(_conn(), record_id, request_payload_sha256=digest)
+
+
+@given(value=ANYTHING, position=st.integers(min_value=0, max_value=2))
+def test_the_reservation_writer_raises_only_submission_error(value: object, position: int) -> None:
+    """Every argument position, over the same hostile pool the derivation gets.
+
+    A raw `AttributeError`, `sqlite3.IntegrityError` or `UnicodeEncodeError` escaping here
+    is a review finding by this project's error-hygiene rule: callers only handle this
+    module's own type.
+    """
+    arguments: list[Any] = ["rec-0", "wjsub-1-" + "a" * 64, WHEN]
+    arguments[position] = value
+    try:
+        reserve_submission_key(
+            _conn(),
+            record_id=arguments[0],
+            idempotency_key=arguments[1],
+            reserved_at=arguments[2],
+        )
+    except SubmissionError:
+        pass
+
+
+@given(value=ANYTHING, position=st.integers(min_value=0, max_value=3))
+def test_the_release_writer_raises_only_submission_error(value: object, position: int) -> None:
+    arguments: list[Any] = [
+        KeyReservation(
+            reservation_id="wjres-" + "a" * 32,
+            idempotency_key="wjsub-1-" + "a" * 64,
+            forecast_record_id="rec-0",
+            reservation_seq=1,
+            reserved_at_utc=TS,
+        ),
+        "operator_abandoned",
+        WHEN,
+        "chris",
+    ]
+    arguments[position] = value
+    try:
+        release_submission_key(
+            _conn(),
+            arguments[0],
+            reason=arguments[1],
+            released_at=arguments[2],
+            released_by=arguments[3],
+        )
+    except SubmissionError:
+        pass
+
+
+@given(value=ANYTHING, position=st.integers(min_value=0, max_value=2))
+@settings(max_examples=120)
+def test_a_refused_reservation_writes_nothing(value: object, position: int) -> None:
+    """The property a writer has that a reader does not: its refusal is atomic.
+
+    `reserve_submission_key` reads the spent and reserved state and then inserts, all
+    inside one `BEGIN IMMEDIATE`. A refusal that had already written its row -- or that
+    left a half-open transaction behind -- would be invisible to the unit tests, which
+    only look at the cases their author thought of.
+    """
+    before = _row_counts()
+    arguments: list[Any] = ["rec-0", "wjsub-1-" + "b" * 64, WHEN]
+    arguments[position] = value
+    try:
+        reserve_submission_key(
+            _conn(),
+            record_id=arguments[0],
+            idempotency_key=arguments[1],
+            reserved_at=arguments[2],
+        )
+    except SubmissionError:
+        assert _row_counts() == before
+        assert not _conn().in_transaction
+        return
+    # The one accepted shape: it wrote exactly one reservation and nothing else.
+    after = _row_counts()
+    assert after[3] == before[3] + 1
+    assert after[:3] == before[:3] and after[4] == before[4]
+
+
+@given(value=LEAKY_REFUSED, position=st.integers(min_value=0, max_value=2))
+def test_a_refused_reservation_never_leaks_the_value(value: object, position: int) -> None:
+    """`str(exc)` is not enough -- a chained cause reprints the value through the rendered
+    traceback, which is why every sanitizing raise in the module uses `from None`."""
+    arguments: list[Any] = ["rec-0", "wjsub-1-" + "c" * 64, WHEN]
+    arguments[position] = value
+    with pytest.raises(SubmissionError) as excinfo:
+        reserve_submission_key(
+            _conn(),
+            record_id=arguments[0],
+            idempotency_key=arguments[1],
+            reserved_at=arguments[2],
+        )
+    assert PLANTED_SECRET not in str(excinfo.value)
+    assert PLANTED_SECRET not in _rendered(excinfo.value)
+
+
+@given(tournament_id=SEEDABLE_TOURNAMENTS, digest=DIGESTS, cycles=st.integers(1, 4))
+@settings(max_examples=60)
+def test_reservation_sequence_numbers_are_dense_and_ordered(
+    tournament_id: str, digest: str, cycles: int
+) -> None:
+    """n reserve/release cycles on one key yield exactly the sequence 1..n.
+
+    Two claims in one, and they are not the same claim. **Dense** is what makes a released
+    key reclaimable at all: `010` accepts only `max + 1`, so a gap would mean the next
+    honest reservation is refused forever. **Ordered** is what makes "the live one" a
+    determinate row rather than whichever the reader happened to see first.
+
+    At most one is live at any point, checked *between* the cycles rather than only at the
+    end -- a run that reserved twice and released twice would finish with a correct count
+    and a state the schema forbids.
+    """
+    record_id, key = _fresh_key(tournament_id, digest)
+    seen: list[int] = []
+    for _ in range(cycles):
+        assert live_reservation_for_key(_conn(), key) is None
+        reservation = reserve_submission_key(
+            _conn(), record_id=record_id, idempotency_key=key, reserved_at=WHEN
+        )
+        seen.append(reservation.reservation_seq)
+        live = live_reservation_for_key(_conn(), key)
+        assert live == reservation
+        release_submission_key(
+            _conn(),
+            reservation,
+            reason="operator_abandoned",
+            released_at=WHEN,
+            released_by="chris",
+        )
+    assert seen == list(range(1, cycles + 1))
+    assert live_reservation_for_key(_conn(), key) is None
+
+
+@given(tournament_id=SEEDABLE_TOURNAMENTS, digest=DIGESTS)
+@settings(max_examples=60)
+def test_a_held_key_is_refused_whatever_it_was_derived_from(
+    tournament_id: str, digest: str
+) -> None:
+    """The item's guarantee, over the accepted domain rather than one hand-picked key.
+
+    Whatever tournament and payload the key came from, the second claim on it is refused
+    and leaves no row -- so the loser of a race has nothing to post under.
+    """
+    record_id, key = _fresh_key(tournament_id, digest)
+    reserve_submission_key(_conn(), record_id=record_id, idempotency_key=key, reserved_at=WHEN)
+    before = _row_counts()
+    # The message is matched, not just the type. `010`'s trigger also refuses this, so a
+    # bare `raises(SubmissionError)` stays green with the Python check deleted -- it would
+    # be asserting the schema's guarantee while reading as a test of this function. The
+    # unit tests prove the trigger is there underneath; this pins which layer answered.
+    with pytest.raises(SubmissionError, match="reserved by a submission that has not finished"):
+        reserve_submission_key(_conn(), record_id=record_id, idempotency_key=key, reserved_at=WHEN)
+    assert _row_counts() == before
+    # And the cheap reader agrees with the claim, so the two cannot drift.
+    with pytest.raises(SubmissionError):
+        require_key_unused(_conn(), key)

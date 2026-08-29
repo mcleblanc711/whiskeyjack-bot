@@ -50,6 +50,7 @@ from whiskeyjack_bot.lifecycle import (
     unresolved_uncertainties,
 )
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
+from whiskeyjack_bot.submission import SubmissionError
 from whiskeyjack_bot.submission_gateway import SubmissionRequest, read_live_artifact
 from whiskeyjack_bot.submission_live import (
     _MAX_BODY,
@@ -1642,3 +1643,291 @@ def test_storable_text_never_raises_and_always_fits() -> None:
     for value in ("\x00", "\ud800", "x" * 100, "   ", "", 1, None, object()):
         result = storable_text(value, 16)
         assert result is None or (len(result) <= 16 and result.strip())
+
+
+# ── M2-708: the key is claimed before the post, and handed back only if none was made ──
+#
+# `require_key_unused` was a read, and until `010` it was the whole guard in front of a
+# live post: two commands could both pass it, both post, and `001`'s UNIQUE would refuse
+# the second *row* after its call had been made. These drive the orchestrator's half --
+# that the claim happens before any network I/O, and that it is released exactly when the
+# gateway can prove nothing reached Metaculus.
+
+
+def _reservations(conn: sqlite3.Connection) -> tuple[int, int]:
+    return (
+        conn.execute("SELECT count(*) FROM submission_key_reservations").fetchone()[0],
+        conn.execute("SELECT count(*) FROM submission_key_releases").fetchone()[0],
+    )
+
+
+def _release_rows(conn: sqlite3.Connection) -> list[tuple[Any, ...]]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT reason, released_by FROM submission_key_releases ORDER BY rowid"
+        )
+    ]
+
+
+def test_a_refusal_before_the_post_hands_the_key_back(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """A transient pre-post failure must not wedge the forecast.
+
+    The key is a pure function of the tournament, question, forecast version and payload
+    hash, so the same work derives the same key forever. Without the release, one closed
+    question -- or one unreadable history -- would block that forecast permanently, on an
+    append-only table.
+    """
+    ledger, record_id = approved
+    poster = FakePoster(before=FakeQuestion(state="closed"))
+    with pytest.raises(LiveSubmissionError, match="not open"):
+        _post(ledger, record_id, poster, live_config)
+
+    assert poster.posts == 0
+    # Claimed, then handed back -- and by the program's route, which names no person.
+    assert _reservations(ledger) == (1, 1)
+    assert _release_rows(ledger) == [("not_posted", None)]
+
+
+def test_a_released_key_lets_the_next_command_through(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """The point of the release, stated as the retry it makes possible.
+
+    The first command hits a closed question; the second finds the platform open and
+    posts. If the release were missing, the second would be refused as `reserved` and
+    `posts` would stay 0 -- so this fails for the right reason if the exit disappears.
+    """
+    ledger, record_id = approved
+    with pytest.raises(LiveSubmissionError, match="not open"):
+        _post(ledger, record_id, FakePoster(before=FakeQuestion(state="closed")), live_config)
+
+    poster = FakePoster()
+    recorded = _post(ledger, record_id, poster, live_config)
+    assert poster.posts == 1
+    assert recorded.event.event_type == "submitted"
+    # The second claim took the next sequence number rather than reusing the first.
+    assert _reservations(ledger) == (2, 1)
+
+
+def test_a_successful_post_leaves_its_reservation_standing(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """Nothing is released on the happy path: the attempt row spends the reservation.
+
+    The derived state of the key becomes `spent`, which is terminal -- so there is nothing
+    to undo, and a release written here would assert the post never happened.
+    """
+    ledger, record_id = approved
+    poster = FakePoster()
+    _post(ledger, record_id, poster, live_config)
+
+    assert poster.posts == 1
+    assert _reservations(ledger) == (1, 0)
+
+
+def test_a_failure_after_the_post_keeps_the_key_claimed(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """**The flag, not the exception type.** This is the test the whole design turns on.
+
+    `submit_with_detail` reads the clock twice -- once before the post and once after --
+    so a clock that goes naive on its second call raises *after* the post has been made,
+    as a `LiveSubmissionError`: the same type every pre-post refusal raises. An
+    `except LiveSubmissionError` that released on sight would hand back a key whose post
+    may well have landed, and the next command would post again. That is precisely the
+    blind retry M2-708 exists to close.
+    """
+    ledger, record_id = approved
+    poster = FakePoster()
+    calls: list[int] = []
+
+    def failing_clock() -> datetime:
+        calls.append(1)
+        # Aware first (before the post), naive second (after it).
+        return OCCURRED if len(calls) == 1 else datetime(2026, 8, 20, 12, 0)  # noqa: DTZ001
+
+    with pytest.raises(LiveSubmissionError):
+        post_approved_forecast(
+            ledger,
+            record_id=record_id,
+            payload=dict(BINARY_PAYLOAD),
+            poster=poster,
+            config=live_config,
+            occurred_at=OCCURRED,
+            clock=failing_clock,
+            sleep=lambda _seconds: None,
+        )
+
+    # The post was made ...
+    assert poster.posts == 1
+    # ... so the key stays claimed. No release row at all.
+    assert _reservations(ledger) == (1, 0)
+    assert _release_rows(ledger) == []
+
+
+def test_the_post_attempted_flag_is_set_before_the_poster_is_reached(
+    live_config: AppConfig,
+) -> None:
+    """Set as `_post`'s first statement, so the case that matters is not the unmarked one.
+
+    A post that *raised* is exactly when nobody knows whether it landed, and a flag set
+    after a successful call would leave that case reading as "no post was made".
+    """
+    poster = FakePoster(post_error=_Timeout("boom"))
+    gateway = MetaculusSubmissionGateway(
+        poster=poster,
+        expected_cdf_points=live_config.numeric_calibration.expected_cdf_points,
+        clock=lambda: OCCURRED,
+        sleep=lambda _seconds: None,
+    )
+    assert gateway.post_attempted is False
+    gateway.submit_with_detail(
+        SubmissionRequest(
+            forecast_record_id="rec-1",
+            question_id=QUESTION_ID,
+            idempotency_key="wjsub-1-" + "a" * 64,
+            payload=dict(BINARY_PAYLOAD),
+            post_id=POST_ID,
+        )
+    )
+    # The poster raised, so `posts` counted the call and the receipt carries the error --
+    # and the flag is true either way, which is what the release path reads.
+    assert poster.posts == 1
+    assert gateway.post_attempted is True
+
+
+def test_a_gate_that_refuses_before_the_post_leaves_the_flag_false(
+    live_config: AppConfig,
+) -> None:
+    """The control for the test above: without both halves, a flag that was always true
+    would pass one and a flag that was always false would pass the other."""
+    poster = FakePoster(before=FakeQuestion(state="closed"))
+    gateway = MetaculusSubmissionGateway(
+        poster=poster,
+        expected_cdf_points=live_config.numeric_calibration.expected_cdf_points,
+        clock=lambda: OCCURRED,
+        sleep=lambda _seconds: None,
+    )
+    with pytest.raises(LiveSubmissionError, match="not open"):
+        gateway.submit_with_detail(
+            SubmissionRequest(
+                forecast_record_id="rec-1",
+                question_id=QUESTION_ID,
+                idempotency_key="wjsub-1-" + "a" * 64,
+                payload=dict(BINARY_PAYLOAD),
+                post_id=POST_ID,
+            )
+        )
+    assert poster.posts == 0
+    assert gateway.post_attempted is False
+
+
+def test_a_standing_reservation_refuses_the_next_command_before_any_fetch(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """The crash-mid-post state, from the next command's point of view.
+
+    A reservation with no attempt row is what a killed process leaves behind. The next
+    command must not post under that key -- and must not even reach the platform, which
+    `fetches == 0` is what proves.
+    """
+    from whiskeyjack_bot.submission import reserve_submission_key, submission_key_for_record
+    from whiskeyjack_bot.submission_gateway import payload_sha256
+
+    ledger, record_id = approved
+    digest = payload_sha256(dict(BINARY_PAYLOAD))
+    key = submission_key_for_record(ledger, record_id, request_payload_sha256=digest)
+    reserve_submission_key(ledger, record_id=record_id, idempotency_key=key, reserved_at=OCCURRED)
+
+    poster = FakePoster()
+    with pytest.raises(LiveSubmissionError, match="reserved by a submission that has not finished"):
+        _post(ledger, record_id, poster, live_config)
+    assert poster.posts == 0
+    assert poster.fetches == 0
+    # The loser wrote nothing: still one reservation, still unreleased.
+    assert _reservations(ledger) == (1, 0)
+
+
+def test_a_failing_release_never_displaces_the_refusal_that_caused_it(
+    approved: tuple[sqlite3.Connection, str],
+    live_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`lifecycle._unwind`'s contract, on the cleanup path.
+
+    The caller is already being told that nothing was posted. A reservation that outlives
+    its command is a recoverable state -- `release-key` is the way out -- whereas
+    surfacing a failed release instead of the refusal would hide why the command stopped.
+    The monkeypatch simulates an ordinary ledger failure on the cleanup write, which is a
+    reachable condition, not an invented one.
+    """
+    import whiskeyjack_bot.submission_live as live
+
+    def exploding_release(*_args: Any, **_kwargs: Any) -> None:
+        raise SubmissionError("the ledger refused the release")
+
+    monkeypatch.setattr(live, "release_submission_key", exploding_release)
+
+    ledger, record_id = approved
+    poster = FakePoster(before=FakeQuestion(state="closed"))
+    with pytest.raises(LiveSubmissionError, match="not open"):
+        _post(ledger, record_id, poster, live_config)
+
+    assert poster.posts == 0
+    # The release never happened, and the original refusal is what surfaced.
+    assert _reservations(ledger) == (1, 0)
+
+
+def test_a_live_post_is_refused_inside_a_callers_transaction(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    """Round 1's blocking finding, reproduced and then closed at the live boundary.
+
+    Before the fix this test's `_post` returned `submitted`, and the ROLLBACK below then
+    erased the reservation *and* the attempt row, leaving the platform holding a forecast
+    the ledger had no record of and the key free for a second command to claim. The retry
+    posted again: `poster.posts == 2` for one forecast.
+
+    The guard is checked ahead of every other gate, so nothing is fetched and nothing is
+    posted -- an ordinary caller mistake must not cost a live call.
+    """
+    ledger, record_id = approved
+    poster = FakePoster()
+    ledger.execute("BEGIN")
+    try:
+        with pytest.raises(LiveSubmissionError, match="open transaction"):
+            _post(ledger, record_id, poster, live_config)
+        assert poster.posts == 0
+        assert poster.fetches == 0
+        assert _reservations(ledger) == (0, 0)
+    finally:
+        ledger.execute("ROLLBACK")
+
+
+def test_the_open_transaction_refusal_precedes_every_other_gate(
+    approved: tuple[sqlite3.Connection, str], tmp_path: Path
+) -> None:
+    """What the boundary guard adds over the one in `reserve_submission_key`.
+
+    `reserve_submission_key` refuses an enclosing transaction itself, and that refusal is
+    what makes the live path *safe* -- a mutation removing this guard alone still posts
+    nothing. So this test pins the thing only this guard can do: refuse **before every
+    other gate**, including the outermost one.
+
+    The config here has `submission.enabled: false`, which `require_live_submission_
+    enabled` refuses on the very next line. If the transaction check were anywhere later,
+    the config message would win. Without it, a caller whose real mistake is an open
+    transaction is told about their config instead, and fixes the wrong thing -- by
+    turning off the flag that is the last safety rail in front of a live post.
+    """
+    ledger, record_id = approved
+    disabled = _config(tmp_path, enabled=False)
+    ledger.execute("BEGIN")
+    try:
+        with pytest.raises(LiveSubmissionError, match="open transaction"):
+            _post(ledger, record_id, FakePoster(), disabled)
+    finally:
+        ledger.execute("ROLLBACK")
