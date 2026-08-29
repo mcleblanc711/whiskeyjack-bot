@@ -5862,3 +5862,278 @@ risk claims; the review falsified two of them (6 blocking, 4 non-blocking) and c
 seven. That is the mechanism `docs/LESSONS.md` describes working as intended — the blocking finding
 was *found by my own claim being specific enough to check*. A vaguer claim 6 ("config validates the
 bounds") would have passed unexamined and shipped the defect.
+
+## T-903 — one saved question, one command, one validated record
+
+The first end-to-end proof the project has. Every stage it needs shipped in an earlier item
+and none of them was reachable: `generate_forecast`, `persist_generation`,
+`normalize_questions` and `lifecycle.record_validation` had, between them, no caller a
+command could reach. M1-406's own notes recorded the gap — "the `run` / `replay --record-id`
+CLI wiring" was deferred and "this slice is library-only". The backlog criterion is a
+sentence about a command, so this item is the wiring plus the suite that holds it to the
+sentence.
+
+`whiskeyjack_bot/pipeline.py` composes it; `run` is the command; `forecast/replay.py` grows
+`replay_generation`, a `(question_id, attempt_id)`-keyed artifact reader, because
+`replay_forecast` starts from a `record_id` and verifies a row that already exists — the
+wrong direction for a run that has no record yet.
+
+### Decision — the record is stamped with a freshly minted attempt id, not the replayed one
+
+`--attempt-id` names the *saved* attempt whose reply is replayed. The record gets a new id.
+Reusing the saved one is the obvious alternative and it does not survive contact with the
+schema: `idx_forecast_records_attempt_id` is a partial unique index and `004`'s trigger
+cross-checks `pipeline_failure_events`, so reuse collides the moment that attempt also has a
+record — which is the ordinary case, since the artifact usually came from a run that produced
+one. The cost is that `persist_generation` writes a second copy of the reply under the new
+id. That copy is honest: this is a new attempt, and what it consumed is what it stores.
+`ReplayRun.replayed_attempt_id` records where it came from.
+
+The consequence is pinned by a test rather than left implicit
+(`test_two_runs_of_the_same_seed_write_two_records_with_different_hashes`): two runs of one
+seed produce two records with two hashes. That reads like a defect if you expect a replay to
+be idempotent, so the test says why it is not, and stops anyone "fixing" it by reusing the
+saved id. The reproducible hash the criterion asks for is `replay --record-id` re-deriving
+**one** record's hash, which is a different claim and is asserted separately.
+
+### Decision — the rebuilt request is compared byte-for-byte, with `as_of_utc` recovered
+
+A saved reply is an answer to a specific reasoning packet. Replaying it against research it
+never saw would write an attribution claim the reply does not support — documents cited in a
+record the model was never shown. So the packet is rebuilt from the replayed research,
+rendered through the same `render_model_input` the generating call used, and required to
+equal the stored request exactly.
+
+Exact equality needs `as_of_utc`, which cannot be re-derived from the clock, so it is
+recovered from the stored request. The alternative — comparing with `as_of_utc` excluded — is
+strictly worse: it turns an equality into a hand-maintained list of fields allowed to differ,
+and every future field on `ForecastModelInput` joins that list by default rather than by
+decision. Recovering the one value that provably cannot be re-derived keeps the comparison
+total. `_as_of_from_request` is the function that does it, and it is the one new pure
+function here, so it gets the property pass.
+
+### Decision — `--dry-run` and `--no-submit` assert the configuration, they do not override it
+
+A flag that silently forced the safe value would let a config with `dry_run: false` pass a
+command line that reads as safe, and the operator would have been told the wrong thing about
+their own file. Each refuses when the setting it names is not set; omitting it asserts
+nothing, because the committed defaults are already safe and this command cannot post either
+way. Both directions are tested.
+
+### Deviation — `run`'s signature is not the one `CODEX_HANDOFF.md:274` writes
+
+The handoff writes `run --config PATH [--limit N] [--question-id ID] [--dry-run]
+[--no-submit]`. This one makes `--question-id`, `--snapshot` and `--attempt-id` required and
+has no `--limit`.
+
+The reason is that this `run` is replay-only, and a replay is addressed by the
+`(question_id, attempt_id)` pair the artifact layout is keyed on — there is nothing for
+`--limit` to iterate that would not also need per-question failure isolation, which is a
+different item's risk. Composing paid calls is a different risk from composing free ones,
+which is the same split M1-312 made against M1-306. Filed as **M1-315**, which owns
+`--limit`, the batch loop and the live path. Taken to the owner and confirmed rather than
+assumed.
+
+### Rejected — seeding the acceptance scenario through `persist_generation`
+
+It is the shortest way to produce an artifact, and `tests/unit/test_cli_replay.py` does
+exactly that. It cannot be used here: it writes a forecast record, and "`run` produces
+**exactly one** validated record" is then unfalsifiable, because the row is already there
+before the command runs. The seed writes the artifact with `write_raw_model_output` alone, so
+the ledger holds research and nothing else when `run` starts.
+
+### Rejected — copying `test_research_store.py`'s forbidden-package set
+
+That test proves "zero provider calls" by asserting `asknews_sdk`, `httpx`,
+`forecasting_tools`, `requests`, `urllib.request` and `ssl` are absent from the import graph.
+Copying it here would have been wrong in both directions, and the measurement is worth
+recording: importing `whiskeyjack_bot.pipeline` **does** pull in all six. `metaculus/
+snapshots.py` and `questions/normalize.py` both import `forecasting_tools`, because a saved
+snapshot holds serialized SDK question objects and normalization dispatches on their types,
+and the SDK drags `httpx`, `openai`, `litellm` and `asknews_sdk` transitively.
+
+So a copied test would fail for a reason unrelated to whether a call can happen, and a test
+weakened until it passed would assert nothing. The check that bites is the whiskeyjack-layer
+one: none of this project's own paid or posting adapters — `research.asknews`,
+`research.exa`, `forecast.generate`, `metaculus.client`, `metaculus.poster`, `submission.*`,
+`approval` — is reachable. If none is on the graph there is no code here to make a call with.
+The module docstring now says this instead of the stronger, false thing it said before.
+
+### Deviation — a defect found while writing the test that the test was written to catch
+
+`_select_question` reached the snapshot through
+`metaculus.fetch.fetch_open_questions_fixture`, which is `load_snapshot` plus one log line
+but lives beside the live fetcher and so imports `whiskeyjack_bot.metaculus.client`. It was a
+**deferred, function-local import**, and that is the part worth recording: the module-level
+import graph looked clean while the executed path pulled the live Metaculus API client in.
+
+Measured, with the defect reintroduced deliberately:
+
+| test | with the defect |
+| --- | --- |
+| `test_the_pipeline_cannot_reach_a_paid_or_posting_module` (module-level graph) | **passed** |
+| `test_the_guard_is_not_vacuous` | **passed** |
+| `test_the_command_path_imports_no_more_than_the_module_does` (AST walk) | **failed** |
+
+This is the project's most expensive defect class — an assertion that cannot fail for the
+thing it names — arriving in the test written to prevent it. The module-level test is the
+obvious one to write and it is blind to exactly the import style that most easily sneaks a
+client onto a path. The fix was to call `load_snapshot` directly and log the line here; the
+guard that catches a regression is an `ast.walk` over the whole module, which reaches an
+import statement inside a function body, and it asserts that importing *everything*
+`pipeline.py` names still reaches no paid or posting module.
+
+**The generalizable rule: an import-graph guarantee must be measured over the imports the
+code can execute, not over the ones at the top of the file.** A module-level `sys.modules`
+delta is a proxy for reachability, and a deferred import is precisely where the proxy and the
+property come apart.
+
+### Deferred (do not read the absence as an omission)
+
+- **The live paid run — M1-315.** `--limit`, the batch loop, live retrieval and a live model
+  call. Filed with this item; see the Deviation above.
+- **`retrieval_run_id` on the record is the packet's first run.** The column is a single FK
+  while a packet may carry many runs. What pins the whole packet is `research_packet_sha256`,
+  which is a record field and therefore inside `forecast_sha256`, so nothing is unattributed
+  — but the column is narrower than the thing it points at. Widening a merged, reviewed
+  schema is not this item's job and the tension is left visible here rather than fixed
+  sideways.
+- **No numeric or multiple-choice acceptance scenario.** The committed snapshot holds all
+  three types (91001 binary, 91002 numeric, 91003 multiple-choice) and `_select_question`
+  picks one out of the normalized batch, so the *selection* is exercised across types. The
+  end-to-end scenario is binary only, because the reply it replays is the forecaster prompt's
+  own example and the prompt ships one worked example. M1-503 and T-904 own the numeric path.
+
+### Standing risk — not verifiable offline
+
+- **The command has never run against a real snapshot fetched from Metaculus.** Every
+  scenario here starts from the committed fixture snapshot, which was itself built from
+  committed API-post fixtures. If a live snapshot carries a shape the fixture does not, the
+  first place it appears is `normalize_questions`, not this module — but this module is where
+  an operator would see it.
+- **`_require_settings_agree` compares four fields and deliberately not the other four.**
+  `provider`, `name`, `prompt_version` and `prompt_sha256` become NOT NULL columns and are
+  the attribution claim, so they must agree. `temperature`, `max_output_tokens`,
+  `timeout_seconds` and `allowed_tries` shaped the reply when it was made and cannot change
+  what it says now that it exists, so requiring them to agree would refuse a replay for a
+  reason that provably cannot affect the answer. The record still stores the artifact's
+  values for all eight. If that reasoning is wrong, it is wrong in the direction of accepting
+  a replay that should have been refused.
+
+### Observation — the suite is no longer the ~85s `CLAUDE.md` claims
+
+Measured on this branch: `tests/` minus this item's additions is **250s**; this item adds
+**31s**, of which 28s is four clean-interpreter subprocess launches for the import-graph
+guards (each pays `forecasting_tools`' import cost, the same price
+`test_research_store.py`'s equivalent already pays). The tmpfs temp root is active — pytest's
+basetemp is under `/dev/shm` — so this is growth across waves rather than the regression that
+fix addressed. `CLAUDE.md`'s "~85s total" and `scripts/gate.sh`'s per-gate figures are now
+stale by roughly 3x. Not corrected here: `CLAUDE.md` is shared by every active branch and
+editing it mid-wave is lesson 1 at triple cost. Flagged for the owner to land at a wave
+boundary.
+
+### Round-1 remediation — two blocking findings, both reproduced before any fix was written
+
+Round 1 returned CHANGES REQUESTED with two blocking findings and no non-blocking ones. The
+review named `6e3f3d3`, which was `HEAD`, so nothing was stale; both were still reproduced by
+execution first, per the standing rule. Both reproduced exactly as described.
+
+**Finding 1 — the record and its validation event were not atomic.** `persist_generation`
+committed the row, then `record_validation` opened a second transaction. Monkeypatching
+`record_validation` to raise `LifecycleError` — an ordinary busy timeout or full disk between
+the two writes — left `forecast_records` holding one `draft` row with no `validated` event,
+and a retry appended v2 beside it rather than completing v1.
+
+The code carried an explicit argument for this, and the argument was wrong: it said the row
+was "already appended and `003` blocks UPDATE and DELETE on it", so rolling back would be the
+append-only violation the project exists to prevent. **That conflates two different things.**
+Append-only forbids *mutating a row that exists*. An insert that never commits is not a
+mutation — there is no row to mutate, and no history to destroy. `forecast/store.py` had
+already said so in its own docstring: `lifecycle.transaction` nests as a `SAVEPOINT`
+"so a caller that wants the record and its first event in one unit can have it without this
+module deciding that on its behalf". This pipeline is that caller and did not take the offer.
+
+Worth recording as a defect class: **a wrong invariant defended in a comment is more durable
+than one left undefended.** The comment is why the gap survived writing the module, writing
+459 lines of refusal tests, and writing the deliberate-choices section — three passes that
+each read it and accepted it.
+
+**Finding 2 — an accepted configuration produced an incomplete record while `run` reported
+success.** `storage.retain_raw_model_output` defaults to `True` and the validator accepts
+`False`. With it off, `persist_generation` returns `artifact_outcome="retention_disabled"`
+and appends the row with a NULL `raw_output_path`; `run_replay` then validated it and the CLI
+printed `artifact: (none: retention_disabled)` beside `status: validated`. The record cannot
+be re-derived by `replay --record-id`, which is the one thing this item's own completeness
+test requires.
+
+#### Decision — the strictness lives in the pipeline, not in `persist_generation`
+
+The obvious fix is to make `persist_generation` refuse a non-`written` outcome. That would be
+wrong, and the reason is M1-312: for a **paid** attempt, the cost and the invocation count are
+facts whether or not the evidence survived, so the row is written regardless — the inversion
+of M1-303's refuse-before-billing rule, which only holds *before* the spend. M1-315's live run
+needs exactly that behaviour. This command spends nothing, so it can hold itself to the
+stricter bar without taking M1-312's decision away from the path that needs it.
+
+So the fix is two checks in `pipeline.py`, not one in the writer:
+
+- `_require_retained_output` refuses up front when the configuration disables retention —
+  `_require_replay_enabled`'s reason, that a refusal an operator can act on arrives before the
+  work rather than after a row was nearly appended.
+- A non-`written` outcome raises **inside** the new transaction, so the row rolls back. This
+  covers the case the preflight cannot see: retention permitted, write attempted, write
+  failed. What survives is at worst an orphaned file, harmless under
+  `forecast/persist.py`'s convention; what must not survive is the inverse.
+
+The CLI's `(none: {artifact_outcome})` fallback is gone with it: it printed a state the
+pipeline can no longer return, and a fallback for an unreachable state only teaches a reader
+that this command can produce a record without its evidence.
+
+#### The three regression tests were mutation-tested before they were trusted
+
+Each new assertion was checked against a deliberately broken tree, since a test that cannot
+fail for the thing it names is this project's most expensive recurring defect:
+
+| mutation | test | result |
+| --- | --- | --- |
+| outer `transaction(conn)` removed | `test_a_failed_validation_event_leaves_no_forecast_record` | **failed** |
+| `_require_retained_output` call removed | `test_disabled_raw_output_retention_refuses_before_anything_is_read` | **failed** |
+| `artifact_outcome != "written"` check removed | `test_an_artifact_that_could_not_be_written_appends_no_record` | **failed** |
+
+#### What round 1 got right that is worth naming
+
+Both findings landed on risk claim 7 ("`run` writes exactly one forecast record"), which the
+request stated as falsifiable and the review falsified in two independent ways. The other nine
+claims came back safe. That is the same mechanism M1-502 recorded one wave earlier: the
+blocking findings were found *because* the claim was specific enough to check. Neither
+finding's failure mode was covered by the 37 acceptance tests written before the review — both
+needed a monkeypatched local I/O failure, which is a reachable reliability condition rather
+than a hostile one, and the suite had no such simulation in it at all.
+
+### Round 2 — APPROVE, both blockers closed, and one of my own claims falsified
+
+Round 2 (`d7a5976`, baseline `6e3f3d3`) closed both round-1 findings by execution and returned
+no blocking findings. One non-blocking observation, and it is the entry worth keeping:
+
+**Risk claim 7 was overstated and the review was right.** I claimed
+`_require_retained_output` "cannot be satisfied by a non-`AppConfig`". It can:
+`SimpleNamespace(storage=SimpleNamespace(retain_raw_model_output=True))` passes it, because the
+guard reads the attribute and then checks the *value's* type — never the object's. Non-blocking
+for the stated reasons (the guard is private, the CLI always supplies `load_config`'s
+`AppConfig`, and the shape predates this branch), and filed as **M1-316**.
+
+What makes it worth a row rather than a shrug: `_require_replay_enabled` has the identical
+shape and was written first, so this is a pattern, not a slip. Every `AttributeError` →
+`PipelineError` guard in `pipeline.py` prints "config must be an AppConfig" while checking
+something strictly weaker. **The message is the part that is wrong** — either the check matches
+its claim or it stops making it. That is the same defect class as the vacuous-property findings
+this project keeps paying for, one layer over: a guard whose stated claim is stronger than
+anything it can fail on. I copied the shape from a sibling module without asking what it
+actually verified, which is exactly how the class propagates.
+
+**Two rounds, and the mechanism worked the way `docs/LESSONS.md` describes.** Round 1's ten
+risk claims were stated as things a reviewer could falsify; claim 7 in round 1 was falsified in
+two independent ways and became both blockers, and claim 7 in round 2 was falsified again. A
+vaguer request would have produced neither finding, and the incomplete-record path would have
+merged. The cost of writing falsifiable claims is that some of them turn out to be false in
+public — which is the point of writing them.

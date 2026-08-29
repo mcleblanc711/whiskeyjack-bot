@@ -61,7 +61,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from whiskeyjack_bot.artifacts import ArtifactError
-from whiskeyjack_bot.forecast.artifacts import StoredModelOutput, read_raw_model_output
+from whiskeyjack_bot.forecast.artifacts import (
+    StoredModelOutput,
+    artifact_relative_path,
+    read_raw_model_output,
+)
 from whiskeyjack_bot.forecast.inputs import SourceReference
 from whiskeyjack_bot.forecast.parse import ForecastGeneration, _parse
 from whiskeyjack_bot.forecast.record import (
@@ -292,3 +296,75 @@ def replay_forecast(
         call=call,
         raw_response_count=len(stored.raw_responses),
     )
+
+
+def replay_generation(config: AppConfig, *, question_id: int, attempt_id: str) -> StoredModelOutput:
+    """Read one saved model reply back as an *input* to a run. Makes no API call.
+
+    :func:`replay_forecast`'s sibling, and the difference is which direction it faces.
+    ``replay_forecast`` verifies a record that already exists: it starts from a
+    ``record_id``, and the artifact it reads is the one that record's row names.  This one
+    is for the pipeline that has no record yet -- T-903's ``run`` -- so it addresses the
+    artifact the only way that is available before a row exists, by the
+    ``(question_id, attempt_id)`` pair the layout is keyed on.
+
+    That is the spec's own framing: ``CODEX_HANDOFF.md`` § "Pipeline and failure boundaries"
+    writes the stage as ``retrieve/replay -> forecast/replay -> validate -> persist draft``,
+    so a saved reply is an input to a run in exactly the way a saved research packet is, and
+    :func:`whiskeyjack_bot.research.store.replay_research` addresses that by question id for
+    the same reason.
+
+    **No ledger connection, deliberately.** Nothing here reads or writes a row: the artifact
+    is a file, and coupling this to a database would make the one stage that provably needs
+    no ledger take one anyway.
+
+    Three refusals beyond the reader's own, all for the same reason -- "we could not look"
+    and "we looked and it differs" are different findings:
+
+    - ``forecast.replay_saved_model_output`` must be enabled, :func:`replay_forecast`'s gate
+      and its reason: the committed default is ``false`` and honouring it is what keeps "we
+      replayed" from being something a caller drifted into.
+    - **An envelope disagreeing with the pair it was addressed by is refused.** The path is
+      *derived* from ``question_id`` and ``attempt_id``, so a mismatch means the file under
+      that name is not the one the layout says it is -- a copied or hand-moved artifact.
+      Replaying it would attribute one attempt's reply to another, which is the single worst
+      thing this function could do, and it is ``_require_matching_artifact``'s check applied
+      one stage earlier.
+    - **An artifact recording a failed attempt is refused**, and so is one carrying no
+      reply. Neither has a forecast to re-derive, and returning one would let a caller build
+      a record out of a reply that never produced a forecast the first time.
+    """
+    root = _require_enabled(config)
+    if type(question_id) is not int:
+        raise ForecastRecordError("question_id must be an int")
+    if type(attempt_id) is not str:
+        raise ForecastRecordError("attempt_id must be a string")
+
+    try:
+        # Both arguments are re-validated inside (`require_int`, `require_safe_component`);
+        # an ArtifactError from here is a caller mistake, and it is translated with every
+        # other one below rather than given a second, near-identical handler.
+        relative = artifact_relative_path(question_id=question_id, attempt_id=attempt_id)
+        stored = read_raw_model_output(root, relative)
+    except ArtifactError as exc:
+        # Message preserved rather than replaced, for `replay_forecast`'s rule: an
+        # ArtifactError names no content, and the path it does name is the one thing that
+        # makes an unreadable artifact actionable (the settled M1-401 carve-out).
+        raise ForecastRecordError(str(exc)) from None
+
+    if stored.question_id != question_id or stored.attempt_id != attempt_id:
+        raise ForecastRecordError(
+            "the artifact stored under that question and attempt records a different "
+            "attempt or question; refusing to replay it (offending values withheld)"
+        )
+    if stored.failure_code is not None:
+        raise ForecastRecordError(
+            "that attempt recorded a failure and produced no forecast; there is nothing "
+            "to replay, which is not the same as a replay that did not match"
+        )
+    if not stored.raw_responses:
+        raise ForecastRecordError(
+            "the artifact carries no model reply; there is nothing to replay, which is "
+            "not the same as a replay that did not match"
+        )
+    return stored
