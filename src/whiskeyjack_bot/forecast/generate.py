@@ -109,7 +109,13 @@ from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import 
     MonetaryCostManager,
 )
 
-from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS, AppConfig, ForecastConfig
+from whiskeyjack_bot.config import (
+    MAX_MODEL_INVOCATIONS,
+    PROBABILITY_BOUND_CEILING,
+    PROBABILITY_BOUND_FLOOR,
+    AppConfig,
+    ForecastConfig,
+)
 from whiskeyjack_bot.forecast.inputs import (
     ForecastInputError,
     ModelInput,
@@ -374,6 +380,20 @@ def generate_forecast(
         raise ForecastGenerationError(
             "forecast.min_probability is not strictly below forecast.max_probability; "
             "no probability could satisfy the configured bounds"
+        )
+    if (
+        not PROBABILITY_BOUND_FLOOR <= config.forecast.min_probability
+        or not config.forecast.max_probability <= PROBABILITY_BOUND_CEILING
+    ):
+        # M1-502 round 1, and the same reason as the check directly above -- except that
+        # this pair fails *later* rather than every time, which is worse. A pair outside
+        # the spec's envelope lets generation accept a probability that
+        # ``submission_live._require_probability`` deterministically refuses, so the cost
+        # is not a repair loop but a forecast billed, recorded and approved for a post
+        # that cannot happen. Refused here, before any billable call.
+        raise ForecastGenerationError(
+            "forecast.min_probability and forecast.max_probability are not within the "
+            "0.001 to 0.999 envelope the submission path requires"
         )
 
     response_model = _response_model_or_refuse(question.qtype)

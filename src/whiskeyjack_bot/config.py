@@ -186,11 +186,27 @@ class RetrievalConfig(_StrictModel):
     social: SocialRetrievalConfig
 
 
+# Spec (CODEX_HANDOFF.md § Configuration schema): 0.001 <= min < max <= 0.999. Named
+# here because this is the single source -- ``forecast.binary``, ``forecast.multiple_choice``
+# and ``forecast.generate`` all re-check the envelope against these, and a fourth copy of
+# the literals is exactly the drift M1-502 was reviewed for.
+PROBABILITY_BOUND_FLOOR = 0.001
+PROBABILITY_BOUND_CEILING = 0.999
+
+
 class ForecastConfig(_StrictModel):
     supported_question_types: list[SupportedQuestionType] = Field(min_length=1)
     # Spec (CODEX_HANDOFF.md § Configuration schema): 0.001 <= min < max <= 0.999.
-    min_probability: float = Field(0.001, ge=0.001, le=0.999)
-    max_probability: float = Field(0.999, ge=0.001, le=0.999)
+    # The two ends are module constants rather than repeated literals because the
+    # forecast checkers and the generation preflight re-derive the same envelope
+    # (M1-502): ``model_copy(update=...)`` builds a ForecastConfig without running
+    # these validators, so the envelope has to be checkable away from this class.
+    min_probability: float = Field(
+        PROBABILITY_BOUND_FLOOR, ge=PROBABILITY_BOUND_FLOOR, le=PROBABILITY_BOUND_CEILING
+    )
+    max_probability: float = Field(
+        PROBABILITY_BOUND_CEILING, ge=PROBABILITY_BOUND_FLOOR, le=PROBABILITY_BOUND_CEILING
+    )
     # D22: the only legal v1 policy. Community prediction is never a forecaster
     # input; changing this requires a code change, deliberately.
     community_prediction_policy: Literal["log_after_forecast_do_not_use_as_input"]

@@ -65,7 +65,11 @@ from __future__ import annotations
 
 import math
 
-from whiskeyjack_bot.config import ForecastConfig
+from whiskeyjack_bot.config import (
+    PROBABILITY_BOUND_CEILING,
+    PROBABILITY_BOUND_FLOOR,
+    ForecastConfig,
+)
 from whiskeyjack_bot.forecast.schema import (
     ForecastSchemaError,
     MultipleChoiceForecastResponse,
@@ -139,6 +143,21 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
         raise MultipleChoiceOutputError(["forecast_config: must be a ForecastConfig"])
     low = forecast_config.min_probability
     high = forecast_config.max_probability
+    if not PROBABILITY_BOUND_FLOOR <= low or not high <= PROBABILITY_BOUND_CEILING:
+        # M1-502 round 1. ``ForecastConfig`` refuses a pair outside the spec's envelope at
+        # load, but ``model_copy(update=...)`` builds one without running the validators --
+        # a public pydantic API this project's own tests use. Left unchecked, generation
+        # accepts a probability ``submission_live._require_probability`` deterministically
+        # refuses, so a forecast is billed, recorded and approved for a post that cannot
+        # happen. The envelope's two ends are the spec's, not a value read off this config,
+        # so naming them is what makes the failure actionable; the configured pair is not
+        # rendered here.
+        raise MultipleChoiceOutputError(
+            [
+                "forecast_config: min_probability and max_probability must lie within "
+                "0.001 and 0.999 inclusive (configured pair withheld)"
+            ]
+        )
     if not low < high:
         raise MultipleChoiceOutputError(
             ["forecast_config: min_probability must be strictly below max_probability"]
