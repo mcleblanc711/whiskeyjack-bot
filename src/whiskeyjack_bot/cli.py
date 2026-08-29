@@ -124,6 +124,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="the uncertain attempt to resolve; submit prints it when it leaves one open",
     )
 
+    release = subparsers.add_parser(
+        "release-key",
+        help="give up a standing idempotency-key reservation left by an interrupted submit",
+    )
+    release.add_argument("--config", default="config.yaml", type=Path)
+    release.add_argument(
+        "--record-id", required=True, help="the forecast record whose reservation to release"
+    )
+    release.add_argument(
+        "--released-by",
+        required=True,
+        help=(
+            "who is asserting that nothing was posted; recorded verbatim. Required and "
+            "with no default, for `approve`'s reason: this is a claim about what a person "
+            "checked, and the program cannot make it"
+        ),
+    )
+    release.add_argument("--note", help="optional free-text note, stored with the release")
+    release.add_argument(
+        "--reservation-id",
+        help=(
+            "which reservation to release; needed only when the record holds more than "
+            "one, which the command lists rather than guessing between"
+        ),
+    )
+
     replay = subparsers.add_parser(
         "replay",
         help="re-derive a stored forecast from its saved model output; makes no API call",
@@ -413,6 +439,12 @@ def _run_submit(args: argparse.Namespace) -> int:
             )
         except LiveSubmissionError as exc:
             print(f"refused: {exc}")
+            # A refusal can leave the key claimed -- either because this command lost the
+            # race for it, or because an earlier one was interrupted holding it. Say how
+            # to get out, with the identifiers filled in: the library refusal deliberately
+            # names no key (it is derived from a payload hash), so without this the
+            # operator is told they are blocked and not what to do about it.
+            _print_standing_reservations(connection, args.record_id)
             return EXIT_REFUSED
         receipt = recorded.receipt
         print(f"attempt:   {receipt.attempt_id}")
@@ -491,6 +523,154 @@ def _run_verify_submission(args: argparse.Namespace) -> int:
         return EXIT_OK
     finally:
         connection.close()
+
+
+def _run_release_key(args: argparse.Namespace) -> int:
+    """Give up a standing key reservation, so an interrupted forecast can be retried.
+
+    **The state this exists for.** M2-708 makes `submit` claim its idempotency key before
+    any network I/O, and the claim is a row because the failure it prevents is durable. A
+    process killed between the claim and the attempt row therefore leaves a reservation
+    with no attempt -- and a key is a pure function of the tournament, question, forecast
+    version and payload hash, so the same work derives the same key forever. Without a way
+    out, one interrupted command would block that forecast permanently, on an append-only
+    table.
+
+    **What the operator is asserting**, and why `--released-by` has no default: that they
+    checked Metaculus and nothing landed. The program cannot make that claim -- when it
+    *can* prove no post was made it releases the key itself, under `not_posted`, with no
+    person named. This command is the other case, where the program knows nothing, so the
+    release is an attribution claim about a human and is recorded as one. `approve`'s rule.
+
+    **The one case where releasing is wrong** is a reservation left standing because the
+    ledger refused to record a post that succeeded. There the post *did* land, and
+    releasing would invite a duplicate. `submit` says so when it happens; the preamble
+    below repeats it, because this command is reached long after that message scrolled by.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.submission import (
+        SubmissionError,
+        live_reservations_for_record,
+        release_submission_key,
+    )
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            standing = live_reservations_for_record(connection, args.record_id)
+        except SubmissionError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+
+        if not standing:
+            print(f"record:    {args.record_id}")
+            print(
+                "refused: no key reservation is standing for this record; there is "
+                "nothing to release"
+            )
+            return EXIT_REFUSED
+
+        if args.reservation_id is None and len(standing) > 1:
+            # Never guess. Two live reservations means two payloads, and only the operator
+            # knows which submission they went and checked.
+            print(f"record:    {args.record_id}")
+            print(
+                f"refused: this record holds {len(standing)} standing reservations; "
+                "re-run with --reservation-id naming the one you checked"
+            )
+            for held in standing:
+                print(
+                    f"  {held.reservation_id}  (seq {held.reservation_seq}, "
+                    f"reserved {held.reserved_at_utc})"
+                )
+            return EXIT_REFUSED
+
+        if args.reservation_id is None:
+            reservation = standing[0]
+        else:
+            matched = [r for r in standing if r.reservation_id == args.reservation_id]
+            if not matched:
+                print(f"record:    {args.record_id}")
+                print(
+                    "refused: --reservation-id does not name a standing reservation for this record"
+                )
+                return EXIT_REFUSED
+            reservation = matched[0]
+
+        print(f"record:      {reservation.forecast_record_id}")
+        print(
+            f"reservation: {reservation.reservation_id}  (seq {reservation.reservation_seq}, "
+            f"reserved {reservation.reserved_at_utc})"
+        )
+        print(
+            "releasing records that you checked Metaculus and this forecast is NOT there. "
+            "If submit told you a post was made and the ledger refused to record it, the "
+            "post did land -- do not release; resolve that attempt instead."
+        )
+        try:
+            release_submission_key(
+                connection,
+                reservation,
+                reason="operator_abandoned",
+                released_at=datetime.now(tz=timezone.utc),
+                released_by=args.released_by,
+                note=args.note,
+            )
+        except SubmissionError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(
+            f"released {reservation.reservation_id} (operator_abandoned, "
+            f"by {args.released_by}); the key may be claimed again"
+        )
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _print_standing_reservations(connection: object, record_id: str) -> None:
+    """Tell the operator how to release a key reservation, if one is standing.
+
+    Read-only and best-effort: it runs while a refusal is already being reported, so a
+    ledger that cannot answer must not turn that refusal into a traceback. Silence is the
+    right failure -- the refusal itself has already been printed.
+    """
+    import sqlite3
+
+    from whiskeyjack_bot.submission import SubmissionError, live_reservations_for_record
+
+    if not isinstance(connection, sqlite3.Connection):  # pragma: no cover - defensive
+        return
+    try:
+        standing = live_reservations_for_record(connection, record_id)
+    except SubmissionError:
+        return
+    if not standing:
+        return
+    print(
+        f"a key reservation is standing for this record ({len(standing)}); if you have "
+        "confirmed nothing was posted, run"
+    )
+    for held in standing:
+        suffix = f" --reservation-id {held.reservation_id}" if len(standing) > 1 else ""
+        print(f"  whiskeyjack-bot release-key --record-id {record_id} --released-by <you>{suffix}")
 
 
 def _read_payload_file(path: Path) -> dict[str, object] | None:
@@ -634,6 +814,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_submit(args)
     if args.command == "verify-submission":
         return _run_verify_submission(args)
+    if args.command == "release-key":
+        return _run_release_key(args)
     if args.command == "replay":
         return _run_replay(args)
     raise AssertionError(f"unhandled command: {args.command}")

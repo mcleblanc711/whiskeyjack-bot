@@ -422,8 +422,293 @@ def test_submit_against_a_missing_ledger_refuses(
     assert "no ledger database at" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["submit", "verify-submission"])
+@pytest.mark.parametrize("command", ["submit", "verify-submission", "release-key"])
 def test_the_commands_require_their_arguments(command: str) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([command])
     assert excinfo.value.code == 2
+
+
+# ── M2-708: the `release-key` command, and the way out `submit` now prints ────
+
+
+def _ledger_at(config_file: Path) -> Any:
+    database = Path(
+        yaml.safe_load(config_file.read_text(encoding="utf-8"))["storage"]["sqlite_path"]
+    )
+    return connect(database)
+
+
+def _hold_key(config_file: Path, record_id: str, payload: Any = None) -> str:
+    """Leave a reservation standing, the way a killed process would.
+
+    Written through the real writer rather than by raw SQL: what the command has to cope
+    with is the state `submit` actually leaves, and a hand-built row could differ from it
+    in a way no test would notice.
+    """
+    from whiskeyjack_bot.submission import reserve_submission_key, submission_key_for_record
+    from whiskeyjack_bot.submission_gateway import payload_sha256
+
+    conn = _ledger_at(config_file)
+    try:
+        digest = payload_sha256(dict(BINARY_PAYLOAD) if payload is None else payload)
+        key = submission_key_for_record(conn, record_id, request_payload_sha256=digest)
+        reservation = reserve_submission_key(
+            conn, record_id=record_id, idempotency_key=key, reserved_at=OCCURRED
+        )
+        return reservation.reservation_id
+    finally:
+        conn.close()
+
+
+def _live_reservations(config_file: Path, record_id: str) -> int:
+    conn = _ledger_at(config_file)
+    try:
+        return int(
+            conn.execute(
+                "SELECT count(*) FROM submission_key_reservations r WHERE "
+                "r.forecast_record_id = ? AND NOT EXISTS (SELECT 1 FROM "
+                "submission_key_releases x WHERE x.reservation_id = r.reservation_id)",
+                (record_id,),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def test_release_key_frees_a_standing_reservation(
+    config_file: Path, record_id: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    reservation_id = _hold_key(config_file, record_id)
+    assert _live_reservations(config_file, record_id) == 1
+
+    exit_code = main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--released-by",
+            "chris",
+            "--note",
+            "checked the platform; nothing there",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_OK
+    assert reservation_id in out
+    assert "operator_abandoned" in out
+    # The warning is printed *before* the write, because this command is reached long
+    # after the message that explains when releasing is the wrong thing to do.
+    assert "do not release" in out
+    assert _live_reservations(config_file, record_id) == 0
+
+
+def test_release_key_records_the_person_and_the_note(config_file: Path, record_id: str) -> None:
+    """The release is an attribution claim, so it has to be stored as one."""
+    _hold_key(config_file, record_id)
+    main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--released-by",
+            "chris",
+            "--note",
+            "checked the platform",
+        ]
+    )
+    conn = _ledger_at(config_file)
+    try:
+        row = conn.execute(
+            "SELECT reason, released_by, note FROM submission_key_releases"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert tuple(row) == ("operator_abandoned", "chris", "checked the platform")
+
+
+def test_release_key_refuses_when_nothing_is_standing(
+    config_file: Path, record_id: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A no-op that reported success would tell an operator their key was freed."""
+    exit_code = main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--released-by",
+            "chris",
+        ]
+    )
+    assert exit_code == EXIT_REFUSED
+    assert "nothing to release" in capsys.readouterr().out
+
+
+def test_release_key_lists_rather_than_guesses_between_two_reservations(
+    config_file: Path, record_id: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`010` constrains one *key* to one live reservation, not one record.
+
+    Two payloads for one record are two keys and so two live claims, and only the operator
+    knows which submission they went and checked. Picking one would be an invisible guess
+    about which post may have landed.
+    """
+    first = _hold_key(config_file, record_id)
+    second = _hold_key(config_file, record_id, payload={**BINARY_PAYLOAD, "probability_yes": 0.42})
+    assert first != second
+    assert _live_reservations(config_file, record_id) == 2
+
+    exit_code = main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--released-by",
+            "chris",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_REFUSED
+    assert "--reservation-id" in out
+    assert first in out and second in out
+    # Nothing was released: a refusal that had picked one would be the defect.
+    assert _live_reservations(config_file, record_id) == 2
+
+
+def test_release_key_releases_the_named_one_of_two(
+    config_file: Path, record_id: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above: with the ambiguity resolved, it acts."""
+    first = _hold_key(config_file, record_id)
+    _hold_key(config_file, record_id, payload={**BINARY_PAYLOAD, "probability_yes": 0.42})
+
+    exit_code = main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--released-by",
+            "chris",
+            "--reservation-id",
+            first,
+        ]
+    )
+    assert exit_code == EXIT_OK
+    assert first in capsys.readouterr().out
+    assert _live_reservations(config_file, record_id) == 1
+
+
+def test_release_key_refuses_a_reservation_id_that_is_not_standing(
+    config_file: Path, record_id: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _hold_key(config_file, record_id)
+    exit_code = main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--released-by",
+            "chris",
+            "--reservation-id",
+            "wjres-" + "0" * 32,
+        ]
+    )
+    assert exit_code == EXIT_REFUSED
+    assert "does not name a standing reservation" in capsys.readouterr().out
+    assert _live_reservations(config_file, record_id) == 1
+
+
+def test_release_key_needs_a_ledger(config_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """No `record_id` fixture, so no database was ever created."""
+    exit_code = main(
+        [
+            "release-key",
+            "--config",
+            str(config_file),
+            "--record-id",
+            "rec-nothing",
+            "--released-by",
+            "chris",
+        ]
+    )
+    assert exit_code == EXIT_REFUSED
+    assert "no ledger database at" in capsys.readouterr().out
+
+
+def test_submit_prints_the_way_out_when_a_reservation_is_standing(
+    config_file: Path,
+    record_id: str,
+    payload_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other half of the promise: a blocked operator is told what to do.
+
+    The library refusal deliberately names no key -- it is derived from a payload hash,
+    and echoing it would let a caller confirm a guess about stored content -- so without
+    this the operator learns they are blocked and nothing else.
+    """
+    _hold_key(config_file, record_id)
+    poster = FakePoster()
+    _install(monkeypatch, poster)
+
+    exit_code = main(
+        [
+            "submit",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--payload-file",
+            str(payload_file),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_REFUSED
+    assert poster.posts == 0
+    assert "reserved by a submission that has not finished" in out
+    assert f"release-key --record-id {record_id}" in out
+
+
+def test_submit_prints_no_release_hint_when_it_refuses_for_another_reason(
+    config_file: Path,
+    record_id: str,
+    payload_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The control: a closed question releases its own key on the way out, so there is
+    nothing standing and the hint must not appear. Printing it unconditionally would send
+    an operator to release a reservation that does not exist."""
+    _install(monkeypatch, FakePoster(before=FakeQuestion(state="closed")))
+    exit_code = main(
+        [
+            "submit",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--payload-file",
+            str(payload_file),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_REFUSED
+    assert "not open" in out
+    assert "release-key" not in out
+    # The header too, not just the command line. Without the emptiness guard the helper
+    # still prints "a key reservation is standing ... (0)" and then loops over nothing --
+    # no `release-key` line, and an operator told to release a claim that does not exist.
+    assert "key reservation is standing" not in out

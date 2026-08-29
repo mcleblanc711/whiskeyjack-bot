@@ -560,6 +560,40 @@ def live_reservation_for_key(
     return None if row is None else _reservation_from_row(row)
 
 
+def live_reservations_for_record(
+    conn: sqlite3.Connection, record_id: str
+) -> tuple[KeyReservation, ...]:
+    """Every reservation currently held against this forecast record, oldest first.
+
+    :func:`live_reservation_for_key` is keyed by the idempotency key, and the key is a
+    pure function of the tournament, question, forecast version and payload hash -- so an
+    operator recovering from a crash would have to reproduce the payload byte for byte
+    before they could name the thing they are trying to release. ``forecast_record_id`` is
+    a column, so this asks the question they can actually answer.
+
+    **Returns a tuple, not one row, deliberately.** ``010``'s trigger constrains one *key*
+    to one live reservation; it does not stop one record from holding two under two
+    different payload hashes, which is what a second command with a changed payload
+    leaves behind. A reader that returned a single row would have to pick, and the picking
+    would be invisible to the operator deciding what to release.
+
+    Validates the identifier as *storable text* only, for :func:`attempt_for_key`'s
+    reason: a ledger may hold rows written under an earlier schema version, and a reader
+    that refused to look at them would report a free record for one that is held.
+    """
+    identifier = _require_text(record_id, "record_id")
+    rows = _fetch_all(
+        conn,
+        "SELECT reservation_id, idempotency_key, forecast_record_id, reservation_seq, "
+        "reserved_at_utc FROM submission_key_reservations r WHERE r.forecast_record_id = ? "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM submission_key_releases x WHERE x.reservation_id = r.reservation_id"
+        ") ORDER BY r.reservation_seq ASC",
+        (identifier,),
+    )
+    return tuple(_reservation_from_row(row) for row in rows)
+
+
 def reserve_submission_key(
     conn: sqlite3.Connection,
     *,
@@ -913,6 +947,26 @@ def _fetch_one(
             "stored values)"
         ) from None
     return cast("sqlite3.Row | None", row)
+
+
+def _fetch_all(
+    conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...]
+) -> list[sqlite3.Row]:
+    """:func:`_fetch_one` for a whole result set, and the same refusal for the same reasons.
+
+    The fetch is inside the ``try`` rather than after it because ``sqlite3`` decodes TEXT
+    at fetch time, not at execute (M1-306), so a row holding undecodable bytes raises
+    here and not from the statement above it.
+    """
+    try:
+        rows = conn.execute(sql, parameters).fetchall()
+    except (sqlite3.Error, OverflowError, UnicodeEncodeError, UnicodeDecodeError):
+        # from None: the underlying error's text and traceback can carry stored values.
+        raise SubmissionError(
+            "the ledger could not be read (detail withheld: a database message can echo "
+            "stored values)"
+        ) from None
+    return cast("list[sqlite3.Row]", rows)
 
 
 def _execute(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...]) -> None:

@@ -38,6 +38,7 @@ from whiskeyjack_bot.submission import (
     attempt_for_key,
     canonical_key_json,
     live_reservation_for_key,
+    live_reservations_for_record,
     release_submission_key,
     require_key_unused,
     reserve_submission_key,
@@ -1384,3 +1385,80 @@ def test_the_reader_is_total_against_a_ledger_holding_two_live_reservations(
     assert live is not None
     # The highest sequence number wins, deterministically -- not an arbitrary row.
     assert live.reservation_seq == 2 and live.reservation_id != first.reservation_id
+
+
+# --- the by-record reader, which is what an operator can actually ask ------------------
+
+
+def test_the_by_record_reader_returns_nothing_when_no_key_is_held(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    assert live_reservations_for_record(conn, record_id) == ()
+
+
+def test_the_by_record_reader_finds_the_held_key(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    assert live_reservations_for_record(conn, record_id) == (reservation,)
+
+
+def test_the_by_record_reader_returns_every_live_claim_in_sequence_order(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """One record can hold two live reservations, and that is why this returns a tuple.
+
+    `010` constrains one *key* to one live reservation. Two payloads for one record derive
+    two keys, so both claims stand at once -- and a reader that returned a single row
+    would have to pick between them, invisibly, in front of an operator deciding which
+    submission they went and checked.
+    """
+    conn, record_id = approved
+    first = _reserved(
+        conn,
+        record_id,
+        submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA),
+    )
+    second = _reserved(
+        conn,
+        record_id,
+        submission_key_for_record(conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA),
+    )
+    assert live_reservations_for_record(conn, record_id) == (first, second)
+
+
+def test_the_by_record_reader_drops_a_released_claim(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """ "Live" is the whole contract: a released claim is history, not current state."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    kept = _reserved(
+        conn,
+        record_id,
+        submission_key_for_record(conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA),
+    )
+    _abandon(conn, _reserved(conn, record_id, key))
+    assert live_reservations_for_record(conn, record_id) == (kept,)
+
+
+def test_the_by_record_reader_does_not_answer_for_another_record(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = approved
+    other = _seed_draft(conn, record_id="rec-2", question_id=200)
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    _reserved(conn, record_id, key)
+    assert live_reservations_for_record(conn, other) == ()
+
+
+@pytest.mark.parametrize("value", [None, "", 0, b"rec-1", "x" * 201, "\ud800"])
+def test_the_by_record_reader_refuses_a_malformed_identifier(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    conn, _record_id = approved
+    with pytest.raises(SubmissionError):
+        live_reservations_for_record(conn, value)  # type: ignore[arg-type]
