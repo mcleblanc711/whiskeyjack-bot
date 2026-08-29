@@ -40,15 +40,15 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-609 | feat/m1-609-verify-foreign-keys | whiskeyjack-m1-609 | no | none | 2026-08-25 |
-| M1-405 | feat/m1-405-numeric-percentile-path | whiskeyjack-m1-405 | no | none | 2026-08-26 |
-| M2-711 | feat/m2-711-submission-outcome-unknown | whiskeyjack-m2-711 | no | 009 (spent) | 2026-08-25 |
+| M1-502 | feat/m1-502-categorical-validation | whiskeyjack-m1-502 | no | none | 2026-08-28 |
+| M1-503 | feat/m1-503-numeric-cdf | whiskeyjack-m1-503 | no | none | 2026-08-28 |
 | M2-708 | feat/m2-708-atomic-idempotency-reservation | whiskeyjack-m2-708 | no | 010 (spent) | 2026-08-28 |
-*(rows above; each lands on its own branch as it starts — see the planned wave below. The
-three rows above this one are Wave 9's, now merged — `feat/m1-502-categorical-validation`
-sweeps them; take that version at the next `sync-worktrees.sh --merge` rather than
-re-sweeping here. If the idempotency reservation ends up needing a schema change, claim
-migration `010` here and in the standing-claims table before writing the `.sql` file.)*
+| T-903 | feat/t-903-dry-run-acceptance | whiskeyjack-t-903 | no | none | 2026-08-28 |
+*(rows above; each lands on its own branch as it starts — see the planned wave below. Swept
+the stale `M1-609`/`M1-405`/`M2-711` rows here: all three merged — `M1-609` PR untracked in
+this file but backlog-Done, `M1-405` PR #45, `M2-711` PR #46 — and `origin` carries none of
+their branches any more, per `finish-item.sh`'s documented convention of leaving the row for
+the next branch to sweep.)*
 
 ## Planned next wave
 
@@ -66,6 +66,18 @@ row. The validator refuses it anyway, and it is right to: a row whose branch doe
 exist cannot be distinguished from a stale row whose branch was deleted, and the whole
 registry rests on being able to tell those apart. **The three-line collision is the
 cheaper problem.** Take it.
+
+**Wave 9 closed 2026-08-28 — all three lane heads merged.** `M1-506` (PR #43, r1 approve),
+`M1-404` (PR #47, r2) then `M1-405` (PR #45, r3) on lane 1; `M2-711` (PR #46) on lane 2;
+`M1-609` (merged, backlog-Done) opening lane 3's debt queue. The board was clear again
+before this section was rewritten — zero open PRs, zero worktrees — the same state Wave
+Eight described at its own boundary.
+
+Lane 3's debt queue is **not** finished: only its head, `M1-609`, ran. `M2-710` →
+`M1-608` → `M1-314` → `M2-709` are still queued, sequentially, one branch each, all size S,
+all Low priority. Pull the next one (`M2-710`) into whichever pane frees first below,
+rather than opening a fifth worktree — `wj-layout`'s `max_panes` is 4 for a reason (see
+below).
 
 Wave 9, three lanes, run concurrently. **Lane 1 is two stages**: `M1-506` must be *on
 master* before `M1-404`/`M1-405` start, because both of those register a checker into the
@@ -106,8 +118,52 @@ dispatch table.
 | 2 — M2 path | **`M2-711`** | Records a submission whose outcome no refetch established — the `(False, False)` cell that today reads as terminal `submission_failed`, which is more than the ledger knows. Needs a lifecycle vocabulary member and therefore **migration `009`**, claimed above. No `forecast/` overlap with lane 1. |
 | 3 — debt queue | **`M1-609`** → `M2-710` → `M1-608` → `M1-314` → `M2-709` | One branch each, sequentially. Every one closes a deferral already filed off a previous review, which is `docs/LESSONS.md` checklist item 4 paid down rather than re-reported as a finding next round. All sized S. |
 
-As of 2026-08-25 all three lane heads are live: `M1-506`, `M2-711`, `M1-609`. Stage B takes
-the wave to four concurrent worktrees, which is `wj-layout`'s `max_panes` exactly.
+As of 2026-08-25 all three lane heads went live: `M1-506`, `M2-711`, `M1-609`. Stage B took
+the wave to four concurrent worktrees, which is `wj-layout`'s `max_panes` exactly. All are
+now merged; see "Wave 9 closed" above.
+
+## Wave 10
+
+Four heads, one per pane, started 2026-08-28 off a clean `origin/master` (0 open PRs, 0
+worktrees). Guidance below draws on the Wave Eight write-up (published as an Artifact,
+"Whiskeyjack Wave Eight"), which planned this pairing before `M1-506`/`M1-404`/`M1-405`
+existed and turned out right about which items are safe to run concurrently and which
+are not.
+
+| Lane | Item | Worktree | Notes |
+| --- | --- | --- | --- |
+| 1 — critical path, fan-out | `M1-502` | `whiskeyjack-m1-502` | Categorical validation (binary + multiple-choice), feeding on `M1-404`. Deps (`M1-403`, `M1-404`) both merged. Unlike the `M1-404`/`M1-405` collision, this and `M1-503` are expected to land in **different files** — `binary.py`/`multiple_choice.py` versus `numeric.py` — so Wave Eight's own chain diagram runs them side by side rather than serially. Verify that assumption early rather than at round 1: if both end up widening one shared entry point the way `M1-404`/`M1-405` widened `parse.py`, stop and serialize. |
+| 1 — critical path, fan-out | `M1-503` | `whiskeyjack-m1-503` | Numeric CDF via `NumericDistribution.from_question`/`get_cdf` on the pinned 0.2.92 SDK — 201 monotone values, PMF-constrained. `T-904` (contract tests) depends on this and stays queued behind it. Highest-subtlety item in the wave; Wave Eight rated it `xhigh`. |
+| 2 — submission safety | `M2-708` | `whiskeyjack-m2-708` | Atomic idempotency-key reservation before any network I/O — closes the read-then-post race `require_key_unused()` leaves open. Deps (`M2-702`, `M2-704`) both merged. Must land **before `M2-706`** (the first live-network smoke test) ever fires; this is the project's own "when a shortcut would weaken the ledger, don't take it" rule applied to submission rather than the ledger schema. Evaluate whether the reservation needs a schema change — if so, claim migration `010` in the standing-claims table above *before* writing the `.sql` file, not after. |
+| 3 — acceptance evidence | `T-903` | `whiskeyjack-t-903` | Dry-run acceptance test: one command, one validated record, zero provider/submission calls. All three deps (`M1-306`, `M1-406`, `M1-602`) closed within the last few days. No `forecast/` or `submission` overlap with the other three lanes — genuinely independent, which is why it took the fourth pane instead of a fifth debt-queue branch. |
+
+**Queued behind these four, not yet started — pull into the next pane that frees:**
+
+- Lane 3 debt queue, in order: `M2-710` → `M1-608` → `M1-314` → `M2-709` (all size S, all
+  Low priority, all closing a deferral already filed off a previous review). This is the
+  order `M1-609` was queued in front of and it predates this rewrite; no dependency in
+  `backlog.csv` forces it (each depends only on items already on master), so re-check it
+  is still the right order before pulling the next one rather than assuming the sequencing
+  reasoning survived the rewrite.
+- Lane 2 continuation: `M2-710` also refuses an identifier the ledger cannot store when
+  deriving a submission key, so it touches `submission.py` — check it against `M2-708`'s
+  diff before starting in case the two touch the same validator.
+- Test queue continuation, after `T-903`: `T-902` (mock Metaculus — needs `T-903`'s
+  fixtures to be worth writing against), then `T-901` / `M1-605` / `M2-705` in parallel.
+- Lane 4, owner-only, still `Blocked`: `A-1101`–`A-1104`. Nothing here substitutes for
+  them; `D-1001` (operator runbook) is unblocked and owner-facing but not owner-only —
+  worth writing before `M2-706` is anywhere close, per Wave Eight's argument that the
+  runbook belongs before the first live post, not after it.
+
+**Why `M1-502`/`M1-503` are treated as parallel-safe where `M1-404`/`M1-405` were not.**
+The latter pair collided because both widened the *same* private dispatch function,
+`parse._output_problems`, before `M1-506` gave each a separate registration slot in a
+shared table. `M1-502` and `M1-503` register into that same table too (per `M1-506`'s
+design, exactly as intended) but the type-specific logic each adds lives in the file that
+already owns its type — there is no shared function body left to widen. This is a
+prediction, not a settled fact; if it is wrong, it will be wrong the same way the last one
+was, in one file, discovered independently by both branches. Watch for it at each daily
+`sync-worktrees.sh --merge`.
 
 **Why `M1-506` leads rather than follows `M1-404`/`M1-405`.** The opposite order is the
 tempting one — its criterion is *"a test fails if a supported question type has a checker the

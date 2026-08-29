@@ -48,6 +48,7 @@ import whiskeyjack_bot.forecast as forecast_package
 from whiskeyjack_bot.config import ForecastConfig, SupportedQuestionType, validate_config_data
 from whiskeyjack_bot.forecast.attribution import AttributionFieldError, attribution_problems
 from whiskeyjack_bot.forecast.binary import BinaryOutputError, binary_output_problems
+from whiskeyjack_bot.forecast.multiple_choice import multiple_choice_output_problems
 from whiskeyjack_bot.forecast.numeric import NumericOutputError, numeric_output_problems
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
@@ -272,6 +273,12 @@ def test_the_discovery_walk_would_notice_a_checker() -> None:
     # that lost a member.
     assert defined["whiskeyjack_bot.forecast.numeric.numeric_output_problems"] is (
         numeric_output_problems
+    )
+    # M1-404's, named here by M1-502. It was the one registered checker the walk was never
+    # seen finding, which left this guard covering two of the three types it exists to
+    # cover -- and the categorical checker is the one M1-502's criterion is about.
+    assert defined["whiskeyjack_bot.forecast.multiple_choice.multiple_choice_output_problems"] is (
+        multiple_choice_output_problems
     )
     # And the entry point is not itself discovered as a checker -- ``output_problems``
     # does not end in ``_output_problems``. That is what keeps the test above from
