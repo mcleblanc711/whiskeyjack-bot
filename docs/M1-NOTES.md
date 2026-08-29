@@ -6031,3 +6031,81 @@ fix addressed. `CLAUDE.md`'s "~85s total" and `scripts/gate.sh`'s per-gate figur
 stale by roughly 3x. Not corrected here: `CLAUDE.md` is shared by every active branch and
 editing it mid-wave is lesson 1 at triple cost. Flagged for the owner to land at a wave
 boundary.
+
+### Round-1 remediation — two blocking findings, both reproduced before any fix was written
+
+Round 1 returned CHANGES REQUESTED with two blocking findings and no non-blocking ones. The
+review named `6e3f3d3`, which was `HEAD`, so nothing was stale; both were still reproduced by
+execution first, per the standing rule. Both reproduced exactly as described.
+
+**Finding 1 — the record and its validation event were not atomic.** `persist_generation`
+committed the row, then `record_validation` opened a second transaction. Monkeypatching
+`record_validation` to raise `LifecycleError` — an ordinary busy timeout or full disk between
+the two writes — left `forecast_records` holding one `draft` row with no `validated` event,
+and a retry appended v2 beside it rather than completing v1.
+
+The code carried an explicit argument for this, and the argument was wrong: it said the row
+was "already appended and `003` blocks UPDATE and DELETE on it", so rolling back would be the
+append-only violation the project exists to prevent. **That conflates two different things.**
+Append-only forbids *mutating a row that exists*. An insert that never commits is not a
+mutation — there is no row to mutate, and no history to destroy. `forecast/store.py` had
+already said so in its own docstring: `lifecycle.transaction` nests as a `SAVEPOINT`
+"so a caller that wants the record and its first event in one unit can have it without this
+module deciding that on its behalf". This pipeline is that caller and did not take the offer.
+
+Worth recording as a defect class: **a wrong invariant defended in a comment is more durable
+than one left undefended.** The comment is why the gap survived writing the module, writing
+459 lines of refusal tests, and writing the deliberate-choices section — three passes that
+each read it and accepted it.
+
+**Finding 2 — an accepted configuration produced an incomplete record while `run` reported
+success.** `storage.retain_raw_model_output` defaults to `True` and the validator accepts
+`False`. With it off, `persist_generation` returns `artifact_outcome="retention_disabled"`
+and appends the row with a NULL `raw_output_path`; `run_replay` then validated it and the CLI
+printed `artifact: (none: retention_disabled)` beside `status: validated`. The record cannot
+be re-derived by `replay --record-id`, which is the one thing this item's own completeness
+test requires.
+
+#### Decision — the strictness lives in the pipeline, not in `persist_generation`
+
+The obvious fix is to make `persist_generation` refuse a non-`written` outcome. That would be
+wrong, and the reason is M1-312: for a **paid** attempt, the cost and the invocation count are
+facts whether or not the evidence survived, so the row is written regardless — the inversion
+of M1-303's refuse-before-billing rule, which only holds *before* the spend. M1-315's live run
+needs exactly that behaviour. This command spends nothing, so it can hold itself to the
+stricter bar without taking M1-312's decision away from the path that needs it.
+
+So the fix is two checks in `pipeline.py`, not one in the writer:
+
+- `_require_retained_output` refuses up front when the configuration disables retention —
+  `_require_replay_enabled`'s reason, that a refusal an operator can act on arrives before the
+  work rather than after a row was nearly appended.
+- A non-`written` outcome raises **inside** the new transaction, so the row rolls back. This
+  covers the case the preflight cannot see: retention permitted, write attempted, write
+  failed. What survives is at worst an orphaned file, harmless under
+  `forecast/persist.py`'s convention; what must not survive is the inverse.
+
+The CLI's `(none: {artifact_outcome})` fallback is gone with it: it printed a state the
+pipeline can no longer return, and a fallback for an unreachable state only teaches a reader
+that this command can produce a record without its evidence.
+
+#### The three regression tests were mutation-tested before they were trusted
+
+Each new assertion was checked against a deliberately broken tree, since a test that cannot
+fail for the thing it names is this project's most expensive recurring defect:
+
+| mutation | test | result |
+| --- | --- | --- |
+| outer `transaction(conn)` removed | `test_a_failed_validation_event_leaves_no_forecast_record` | **failed** |
+| `_require_retained_output` call removed | `test_disabled_raw_output_retention_refuses_before_anything_is_read` | **failed** |
+| `artifact_outcome != "written"` check removed | `test_an_artifact_that_could_not_be_written_appends_no_record` | **failed** |
+
+#### What round 1 got right that is worth naming
+
+Both findings landed on risk claim 7 ("`run` writes exactly one forecast record"), which the
+request stated as falsifiable and the review falsified in two independent ways. The other nine
+claims came back safe. That is the same mechanism M1-502 recorded one wave earlier: the
+blocking findings were found *because* the claim was specific enough to check. Neither
+finding's failure mode was covered by the 37 acceptance tests written before the review — both
+needed a monkeypatched local I/O failure, which is a reachable reliability condition rather
+than a hostile one, and the suite had no such simulation in it at all.

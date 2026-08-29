@@ -37,9 +37,11 @@ from scenario import (
     seed_scenario,
     write_config,
 )
+from whiskeyjack_bot.artifacts import ArtifactError
 from whiskeyjack_bot.config import load_config
 from whiskeyjack_bot.forecast.parse import ModelSettings
 from whiskeyjack_bot.ledger import connect, initialize_ledger
+from whiskeyjack_bot.lifecycle import LifecycleError
 from whiskeyjack_bot.pipeline import ForecastRejected, PipelineError, run_replay
 from whiskeyjack_bot.research.store import open_run
 
@@ -112,6 +114,26 @@ def test_a_disabled_replay_switch_refuses_before_anything_is_read(
     data = config_data(tmp_path)
     data[section][key] = False
     refused(seed, message, config_path=write_config(tmp_path, data, name="off.yaml"))
+
+
+def test_disabled_raw_output_retention_refuses_before_anything_is_read(tmp_path: Path) -> None:
+    """Round-1 finding 2, as a refusal instead of an incomplete record.
+
+    ``storage.retain_raw_model_output`` defaults to ``True`` and the validator accepts
+    ``False``. With it off, ``persist_generation`` appends the row with a NULL
+    ``raw_output_path`` -- correct there, because M1-312's rule is that a *paid* attempt's
+    cost is a fact whether or not the evidence survived. This command spends nothing and
+    exists to produce a record ``replay --record-id`` can re-derive, so it refuses instead,
+    and the strictness lives in the pipeline rather than in the writer M1-315 will need.
+    """
+    seed = seed_scenario(write_config(tmp_path, config_data(tmp_path)))
+    data = config_data(tmp_path)
+    data["storage"]["retain_raw_model_output"] = False
+    refused(
+        seed,
+        "retain_raw_model_output is disabled",
+        config_path=write_config(tmp_path, data, name="no-retention.yaml"),
+    )
 
 
 # --- the question, and the research --------------------------------------------
@@ -445,6 +467,49 @@ def test_an_unreadable_snapshot_arrives_as_the_modules_error(seed: Seed, tmp_pat
     with pytest.raises(PipelineError) as caught:
         attempt_run(seed, snapshot=empty)
     assert str(empty) in str(caught.value)
+
+
+# --- the row, its artifact and its event are one unit ---------------------------
+
+
+def test_a_failed_validation_event_leaves_no_forecast_record(
+    seed: Seed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-1 finding 1. The row and its first lifecycle event commit together or not at all.
+
+    The monkeypatch simulates an ordinary local failure between the two writes -- a busy
+    timeout or a full disk on the second transaction -- which is a reachable reliability
+    condition, not a hostile one. Before the fix this left a permanent orphan ``draft`` row
+    with no ``validated`` event, and a retry appended v2 beside it rather than completing v1.
+
+    Append-only is not in tension with this: it forbids *mutating a row that exists*, and an
+    insert that never commits is not a mutation.
+    """
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise LifecycleError("the validation event could not be written")
+
+    monkeypatch.setattr("whiskeyjack_bot.pipeline.record_validation", boom)
+    refused(seed, "the validation event could not be written")
+
+
+def test_an_artifact_that_could_not_be_written_appends_no_record(
+    seed: Seed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of finding 2: retention permitted, and the write failed anyway.
+
+    ``_require_retained_output`` catches the *configured* case up front and never sees this
+    one. ``persist_generation`` degrades rather than raising -- deliberately, and M1-312's
+    decision to keep -- so the refusal is the pipeline's, raised inside the transaction so
+    the row rolls back. What survives is at worst an orphaned file, which is harmless; what
+    must not survive is a record claiming a forecast whose evidence is not on disk.
+    """
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ArtifactError("the artifact could not be written")
+
+    monkeypatch.setattr("whiskeyjack_bot.forecast.persist.write_raw_model_output", boom)
+    refused(seed, "artifact was not written")
 
 
 def test_yaml_config_still_loads_after_every_edit_in_this_file(tmp_path: Path) -> None:

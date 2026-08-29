@@ -102,6 +102,7 @@ from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     record_pre_forecast_failure,
     record_validation,
+    transaction,
 )
 from whiskeyjack_bot.metaculus.snapshots import SnapshotError, load_snapshot
 from whiskeyjack_bot.prompt import PromptError, load_prompt
@@ -159,6 +160,14 @@ class ReplayRun:
     them into a boolean here would re-create exactly the ambiguity that item added the
     outcome to remove -- "the operator asked us not to keep it" is not "we tried and lost
     it". The constructor refuses any pairing that would misreport which happened.
+
+    **A returned ``ReplayRun`` always carries ``"written"``**, because :func:`run_replay`
+    refuses the other two rather than appending a record whose evidence is not on disk
+    (round-1 finding 2). The field and the ``__post_init__`` pairing check stay anyway: the
+    vocabulary is the persist layer's and this type reports it rather than re-deriving it,
+    and a check that is currently unfalsifiable from outside is what makes the refusal above
+    provable rather than assumed. M1-315's paid run is the caller that will legitimately see
+    the other members.
     """
 
     record_id: str
@@ -206,6 +215,40 @@ def _require_replay_enabled(config: AppConfig) -> None:
     if not model_output:
         raise PipelineError(
             "forecast.replay_saved_model_output is disabled; refusing to replay saved model output"
+        )
+
+
+def _require_retained_output(config: AppConfig) -> None:
+    """Refuse a replay whose record could not be replayed in turn (round-1 finding 2).
+
+    ``storage.retain_raw_model_output`` defaults to ``True`` and the validator accepts
+    ``False``. With it off, :func:`persist_generation` returns ``artifact_outcome=
+    "retention_disabled"`` and appends the row with a NULL ``raw_output_path`` -- which is
+    the right behaviour *there*, and deliberately so: that is M1-312's rule, and it is the
+    inversion of the refuse-before-billing rule, which only holds before the spend. A paid
+    attempt's cost and invocation count are facts whether or not the evidence survived, so
+    the row is written regardless and M1-315 will want exactly that.
+
+    This command is the other case. Nothing has been spent, and the record it exists to
+    produce is one that ``replay --record-id`` can re-derive a hash from -- which it cannot
+    do without the artifact the record's own completeness test requires. So the strictness
+    lives here rather than in the writer: refusing in ``persist_generation`` would take
+    M1-312's decision away from the paid path that needs it.
+
+    Checked up front, before the snapshot is loaded, for :func:`_require_replay_enabled`'s
+    reason: a refusal an operator can act on is one that arrives before the work, not one
+    that arrives after a row was nearly appended.
+    """
+    try:
+        retain = config.storage.retain_raw_model_output
+    except AttributeError:
+        raise PipelineError("config must be an AppConfig") from None
+    if type(retain) is not bool:
+        raise PipelineError("config must be an AppConfig")
+    if not retain:
+        raise PipelineError(
+            "storage.retain_raw_model_output is disabled; this command would append a "
+            "record no replay could re-derive, so it refuses instead"
         )
 
 
@@ -444,6 +487,7 @@ def run_replay(
     Raises :class:`PipelineError`, or :class:`ForecastRejected` for that one recorded case.
     """
     _require_replay_enabled(config)
+    _require_retained_output(config)
     if type(attempt_id) is not str:
         raise PipelineError("attempt_id must be a string")
     if not isinstance(now, datetime) or now.tzinfo is None:
@@ -535,22 +579,44 @@ def run_replay(
             research_packet_sha256=packet_sha256(packet),
             generated_at=now,
         )
-        persisted = persist_generation(
-            conn, config, draft=draft, generation=generation, written_at=now
-        )
     except ForecastRecordError as exc:
         raise PipelineError(str(exc)) from None
-    record = persisted.record
-    if record is None:  # pragma: no cover - persist_generation raises rather than returning None
-        raise PipelineError("the forecast version was not appended")
 
+    # One unit: the row, its artifact and its validation event, or none of them (round-1
+    # finding 1). The first draft of this committed the row and then opened a second
+    # transaction for the event, and argued that a draft with no validation event was a
+    # legible state the ledger could hold because `003` blocks UPDATE and DELETE on an
+    # appended row. That argument conflated two different things. Append-only forbids
+    # *mutating a row that exists*; it says nothing about whether a row should have been
+    # appended in the first place, and an insert that never commits is not a mutation. So an
+    # ordinary local failure -- a busy timeout, a full disk -- between the two writes left a
+    # permanent orphan draft, and the retry appended v2 beside it rather than completing v1.
+    # `forecast/store.py` says so itself: `lifecycle.transaction` nests as a SAVEPOINT
+    # precisely "so a caller that wants the record and its first event in one unit can have
+    # it without this module deciding that on its behalf". This is that caller.
     try:
-        record_validation(conn, record_id=record.record_id, occurred_at=now)
-    except LifecycleError as exc:
-        # The row is already appended and `003` blocks UPDATE and DELETE on it, so this is
-        # reported rather than rolled back: a draft with no validation event is a legible
-        # state the ledger can hold, and destroying the record to tidy up the history would
-        # be the append-only violation this project exists to prevent.
+        with transaction(conn):
+            persisted = persist_generation(
+                conn, config, draft=draft, generation=generation, written_at=now
+            )
+            record = persisted.record
+            if record is None:  # pragma: no cover - persist_generation raises instead
+                raise PipelineError("the forecast version was not appended")
+            if persisted.artifact_outcome != "written":
+                # Inside the transaction on purpose: raising here rolls the row back. The
+                # artifact write happens before the insert, so what survives is at worst an
+                # orphaned file, which is harmless under `forecast/persist.py`'s convention
+                # and is the trace that the attempt happened. What must not survive is the
+                # inverse -- a record claiming a replayable forecast whose evidence is not
+                # on disk. `_require_retained_output` catches the configured case up front;
+                # this catches a write that was permitted and then failed.
+                why = persisted.artifact_error
+                raise PipelineError(
+                    "the raw model output artifact was not written, so this record could "
+                    "not be replayed; nothing was appended" + (f" ({why})" if why else "")
+                )
+            record_validation(conn, record_id=record.record_id, occurred_at=now)
+    except (ForecastRecordError, LifecycleError) as exc:
         raise PipelineError(str(exc)) from None
 
     return ReplayRun(

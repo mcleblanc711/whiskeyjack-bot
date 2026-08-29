@@ -637,7 +637,11 @@ def _run_run(args: argparse.Namespace) -> int:
         print(f"attempt:   {result.attempt_id} (replayed from {result.replayed_attempt_id})")
         print(f"research:  {len(result.retrieval_run_ids)} run(s), {result.source_count} source(s)")
         print(f"packet:    {result.research_packet_sha256}")
-        print(f"artifact:  {result.raw_output_path or f'(none: {result.artifact_outcome})'}")
+        # No `(none: ...)` fallback any more. `run_replay` refuses a run whose artifact was
+        # not written -- round-1 finding 2 -- so reaching here means the path is set, and a
+        # fallback for a state the pipeline cannot return would only ever mislead a reader
+        # into thinking this command can produce a record without its evidence.
+        print(f"artifact:  {result.raw_output_path}")
         print(f"hash:      {result.forecast_sha256}")
         print("status:    validated")
         print("submitted: no -- `run` never submits; approve and submit are separate commands")
