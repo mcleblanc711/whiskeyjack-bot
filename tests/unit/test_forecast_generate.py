@@ -695,6 +695,22 @@ def test_the_probe_would_notice_a_regression() -> None:
     assert "litellm" in added
 
 
+def test_the_cdf_module_is_deliberately_outside_the_clean_list() -> None:
+    """``forecast.cdf`` reaches the SDK, and its absence above is a decision (M1-503).
+
+    The conversion is ``NumericDistribution``, so this module cannot be on the list -- and
+    a module that is merely *missing* from a parametrize list looks identical to one that
+    was forgotten. Asserted as a positive fact so the placement is pinned from the other
+    side: if the CDF build were ever moved onto the clean path, this fails and points at
+    the reason rather than leaving the parametrize list silently short.
+
+    Its callers are gated instead. ``forecast.generate`` already reached the SDK before
+    this item, and the eleven modules above still do not -- which is what keeps M1-406's
+    replay guarantee intact.
+    """
+    assert "forecasting_tools" in _added_modules("whiskeyjack_bot.forecast.cdf")
+
+
 # --- DEBUG logging (review round 1, finding 2) -----------------------------------
 
 
@@ -1279,6 +1295,140 @@ def test_a_satisfiable_zero_point_is_not_refused(config: AppConfig, prompt: Load
         question=_numeric_question(lower_bound=5.0, zero_point=1.0),
     )
     assert result.forecast is not None
+
+
+# --- M1-503: the numeric CDF conversion, inside the same repair loop --------------
+
+
+def test_a_cdf_size_the_config_does_not_expect_is_refused_before_any_billable_call(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The second numeric preflight, beside the ``zero_point`` one and for its reason.
+
+    ``get_cdf`` returns ``cdf_size`` points, so a question declaring another resolution
+    converts to an array ``submission_live._require_cdf`` deterministically refuses. Unlike
+    the repair-loop failures above, that refusal lands *after* the forecast has been billed,
+    recorded and approved -- the M1-502 round-1 shape, which is worse than a wasted call.
+    """
+    # Bound to names rather than written as literals at the call site: ``_leaks`` renders
+    # the traceback, which quotes the source line that raised (M1-308 round 5's trap).
+    declared = 101
+    client = _Model(numeric_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(client, config, prompt, question=_numeric_question(cdf_size=declared))
+    assert client.calls == []
+    assert not _leaks(caught.value, "101")
+
+
+def test_the_configured_cdf_size_is_not_refused(config: AppConfig, prompt: LoadedPrompt) -> None:
+    """The companion: the preflight must refuse the mismatch and nothing else."""
+    client = _Model(numeric_reply())
+    result = _generate(
+        client,
+        config,
+        prompt,
+        question=_numeric_question(cdf_size=config.numeric_calibration.expected_cdf_points),
+    )
+    assert result.forecast is not None
+
+
+def test_a_reply_that_cannot_convert_gets_exactly_one_repair_and_it_can_succeed(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The whole reason this gate is inside the loop rather than at the submission boundary.
+
+    Nine equal values are non-decreasing, inside the bounds and exactly the declared
+    levels, so ``forecast.numeric`` accepts them: the reply followed
+    ``prompts/forecaster.md`` to the letter. The conversion refuses it. Left to the
+    submission path that reply is billed, parsed, hashed, recorded and *approved*, and
+    fails inside the SDK past the approval boundary; here it costs the one repair call
+    M1-402 already budgets.
+    """
+    flat = numeric_reply(
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": 24.0}
+                for level in (0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+            ]
+        }
+    )
+    client = _Model(flat, numeric_reply())
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert result.invocations == 2
+    assert result.repair_attempted is True
+    assert result.failure_code is None
+    assert result.forecast is not None
+
+
+def test_a_conversion_problem_that_persists_costs_two_calls_and_stays_schema_invalid(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The failure classification needs no special case, which is why the problems are
+    shaped like the schema's: a field path, a colon and a value-free message."""
+    flat = numeric_reply(
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": 24.0}
+                for level in (0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+            ]
+        }
+    )
+    client = _Model(flat, flat)
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert result.invocations == 2
+    assert len(client.calls) == 2
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"
+    assert all(p.startswith("final_prediction.percentiles: ") for p in result.failure_problems)
+
+
+def test_the_conversion_repair_turn_names_neither_a_bound_nor_the_models_values(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-405's round-1 finding, applied to the strings this item adds.
+
+    These reach ``ForecastGeneration.failure_problems`` after a second failure, and
+    ``forecast/artifacts.py`` writes that into the persisted raw-output envelope. The SDK's
+    own refusals quote the whole declared percentile list, the bounds and the zero point,
+    so the translation has to drop all of it rather than forward any of it.
+    """
+    value, upper = 24.0, 100.0
+    flat = numeric_reply(
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": value}
+                for level in (0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+            ]
+        }
+    )
+    client = _Model(flat, flat)
+    _generate(client, config, prompt, question=_numeric_question(upper_bound=upper))
+
+    turn = client.calls[1][-1]
+    assert turn["role"] == "user"
+    # Actionable without naming anything: the rule says what to change.
+    assert "percentile" in turn["content"]
+    assert "24.0" not in turn["content"]
+    assert "100.0" not in turn["content"]
+
+
+def test_a_binary_reply_is_not_put_through_the_numeric_conversion(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The gate dispatches on the ``question_type`` literal, and this is what says so.
+
+    ``numeric_cdf_or_problems`` exact-type gates its own arguments and raises
+    ``NumericCdfError`` for a response of another category, so a gate that ran for every
+    type would not quietly mis-validate a binary forecast -- it would break this
+    generation outright. That is what makes a passing binary run evidence rather than
+    decoration.
+    """
+    client = _Model(good_reply())
+    result = _generate(client, config, prompt)
+    assert result.invocations == 1
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "binary"
 
 
 # --- M1-501: the attribution fields and the citations ----------------------------

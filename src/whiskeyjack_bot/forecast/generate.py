@@ -115,7 +115,9 @@ from whiskeyjack_bot.config import (
     PROBABILITY_BOUND_FLOOR,
     AppConfig,
     ForecastConfig,
+    NumericCalibrationConfig,
 )
+from whiskeyjack_bot.forecast.cdf import numeric_cdf_or_problems
 from whiskeyjack_bot.forecast.inputs import (
     ForecastInputError,
     ModelInput,
@@ -138,6 +140,7 @@ from whiskeyjack_bot.forecast.parse import (
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
     ForecastSchemaError,
+    NumericForecastResponse,
     response_model_for,
 )
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
@@ -372,6 +375,23 @@ def generate_forecast(
             "the question's zero_point is not strictly below its lower_bound; no "
             "percentile set could satisfy it"
         )
+    if (
+        isinstance(question, CanonicalNumericQuestion)
+        and question.cdf_size != config.numeric_calibration.expected_cdf_points
+    ):
+        # M1-503, and the same shape as the check directly above: ``cdf.
+        # _require_question`` refuses it too, and it is repeated here because it is
+        # unsatisfiable by any reply. ``get_cdf`` returns ``cdf_size`` points, so a
+        # question declaring another resolution converts to an array
+        # ``submission_live._require_cdf`` deterministically refuses -- and that refusal
+        # lands after the forecast has been billed, recorded and approved, which is the
+        # M1-502 round-1 shape rather than a repair loop. ``cdf_size`` reaches
+        # ``CanonicalNumericQuestion`` from a Metaculus payload as a plain ``int``, and
+        # that model defers the check to this item by name.
+        raise ForecastGenerationError(
+            "the question's cdf_size does not match numeric_calibration."
+            "expected_cdf_points; no percentile set could convert to a submittable CDF"
+        )
     if not config.forecast.min_probability < config.forecast.max_probability:
         # ForecastConfig refuses this at load, so reaching here means an AppConfig
         # assembled some other way -- the same reason the bound above is repeated.
@@ -443,6 +463,7 @@ def generate_forecast(
         response_model=response_model,
         allowed_tries=config.model.allowed_tries,
         forecast_config=config.forecast,
+        numeric_calibration=config.numeric_calibration,
         settings=settings,
         sources=model_input.sources,
         question=question,
@@ -477,6 +498,61 @@ def _model_input_or_refuse(
         ) from None
 
 
+def _conversion_problems(
+    forecast: ForecastResponse,
+    numeric_calibration: NumericCalibrationConfig,
+    question: CanonicalQuestion,
+) -> list[str]:
+    """The numeric CDF conversion, run while a repair turn is still free (M1-503).
+
+    **Why this is a second gate rather than another ``validate._TYPE_CHECKERS`` entry**, in
+    two independent sentences, because a reviewer reading ``forecast/validate.py`` alone
+    would otherwise see a rule that looks absent -- the seam defect M1-506 exists to close.
+    First, the conversion imports ``forecasting_tools``, and the composed entry point and
+    everything it reaches must not: ``test_the_response_schema_reaches_no_provider_client``
+    is M1-406's acceptance criterion, and a replay that could reach an SDK has a call to
+    make. Second, the rules are keyed on ``numeric_calibration``, which is a *sibling* of
+    ``ForecastConfig`` on ``AppConfig`` and never reaches a registered checker.
+
+    **Why inside the loop rather than at the submission boundary.** A percentile set that
+    ``forecast.numeric`` accepts can still be unconvertible -- nine equal values are
+    non-decreasing, inside the bounds and exactly the declared levels, so the reply
+    followed ``prompts/forecaster.md`` to the letter, and ``get_cdf`` refuses it. Left to
+    the submission path that reply is billed, parsed, hashed, recorded and *approved*, and
+    fails inside the SDK past the approval boundary. Here it costs the one repair call this
+    module already budgets. M1-405's notes named this cost before the conversion existed.
+
+    Returns the same sanitized shape as ``_parse``'s problems -- a schema-authored field
+    path, a colon and a value-free message -- so ``_repair_turn`` renders them and
+    ``_classify`` reads them as ``schema_invalid`` with no change on either side.
+
+    Every other question type returns no problems, and that is a statement rather than a
+    fallthrough: binary and multiple-choice forecasts post a probability and a vector, and
+    neither is converted through the package. Dispatch is on the ``question_type`` literal,
+    never ``isinstance`` -- ``DiscreteQuestion`` subclasses ``NumericQuestion`` in the
+    pinned SDK, and this project's own leaf models mirror the shape deliberately.
+    """
+    if forecast.question_type != "numeric":
+        return []
+    if not isinstance(forecast, NumericForecastResponse) or not isinstance(
+        question, CanonicalNumericQuestion
+    ):
+        # Unreachable from ``_run_attempts``: the response is the model
+        # ``_response_model_or_refuse`` selected from ``question.qtype``, and
+        # ``output_problems`` has already refused a question whose ``qtype`` disagrees with
+        # the response. It is a raise rather than an early ``return []`` because the two
+        # differ in the only way that matters -- a silent skip would let a numeric forecast
+        # through with no conversion check at all, which is the failure this gate exists to
+        # prevent, and the narrowing ``mypy --strict`` needs here should not be spent on a
+        # branch that fails open.
+        raise ForecastGenerationError(
+            "the response and the question disagree about the numeric type "
+            "(offending input withheld)"
+        )
+    _, problems = numeric_cdf_or_problems(forecast, numeric_calibration, question)
+    return problems
+
+
 def _run_attempts(
     *,
     client: Forecaster,
@@ -484,6 +560,7 @@ def _run_attempts(
     response_model: type[ForecastResponse],
     allowed_tries: int,
     forecast_config: ForecastConfig,
+    numeric_calibration: NumericCalibrationConfig,
     settings: ModelSettings,
     sources: tuple[SourceReference, ...],
     question: CanonicalQuestion,
@@ -531,6 +608,10 @@ def _run_attempts(
             question=question,
             source_ids=source_ids,
         )
+        if forecast is not None:
+            problems = _conversion_problems(forecast, numeric_calibration, question)
+            if problems:
+                forecast = None
         if forecast is not None:
             return _result(
                 forecast=forecast,

@@ -34,7 +34,20 @@ from whiskeyjack_bot.forecast.inputs import (
     build_model_input,
     render_model_input,
 )
-from whiskeyjack_bot.config import ForecastConfig
+from whiskeyjack_bot.config import ForecastConfig, NumericCalibrationConfig
+from whiskeyjack_bot.forecast.cdf import (
+    _NOT_CONVERTIBLE,
+    _NOT_WELL_FORMED,
+    _NOT_IN_UNIT_INTERVAL,
+    _NOT_MONOTONE,
+    _STEP_TOO_TALL,
+    _WRONG_LENGTH,
+    _LOWER_ENDPOINT,
+    _UPPER_ENDPOINT,
+    NumericCdfError,
+    build_numeric_cdf,
+    numeric_cdf_or_problems,
+)
 from whiskeyjack_bot.forecast.attribution import (
     AttributionFieldError,
     attribution_problems,
@@ -67,6 +80,7 @@ from whiskeyjack_bot.forecast.validate import (
     output_problems,
     validate_output,
 )
+from whiskeyjack_bot.submission_live import _require_cdf
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
@@ -1111,6 +1125,208 @@ def test_nothing_is_clamped_by_the_percentile_check(
         return
     assert returned is response
     assert response.model_dump(mode="json") == before
+
+
+# --- 5c. the numeric CDF conversion (M1-503) --------------------------------------
+
+# The committed calibration, not a hand-built one. ``expected_cdf_points`` is a
+# ``Literal[201]`` so there is nothing to draw, and the other four are pinned by
+# ``config.example.yaml`` -- a property that built its own would stop noticing the
+# committed defaults drifting away from what the conversion is actually run with.
+_CALIBRATION = NumericCalibrationConfig(
+    use_forecasting_tools_standardization=True,
+    expected_cdf_points=201,
+    max_adjacent_pmf=0.2,
+    strict_validation=True,
+    calibration_profile="identity",
+)
+
+# Every message ``forecast/cdf.py`` can emit. The no-leak property below is written as
+# membership of this closed set rather than as ``hostile not in message``: the substring
+# form is the draft this project has had to correct three times, and it is wrong in both
+# directions -- it fails on a value that is innocently a substring of the text, and it
+# passes for a message that leaks a transformed copy. A finite vocabulary cannot leak
+# anything, whatever is drawn.
+_CDF_MESSAGES = frozenset(
+    {
+        _NOT_CONVERTIBLE,
+        _NOT_WELL_FORMED,
+        _WRONG_LENGTH,
+        _NOT_IN_UNIT_INTERVAL,
+        _NOT_MONOTONE,
+        _STEP_TOO_TALL,
+        _LOWER_ENDPOINT,
+        _UPPER_ENDPOINT,
+    }
+)
+
+
+def _conversion(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> tuple[Any, list[str]]:
+    response, question = case
+    return numeric_cdf_or_problems(response, _CALIBRATION, question)
+
+
+@given(accepted_numeric_cases())
+def test_every_conversion_outcome_is_reached(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The anti-vacuity guard for every property in this section.
+
+    ``accepted_numeric_cases()`` builds percentile sets ``forecast/numeric.py`` accepts,
+    which is the population this section is about -- a conversion problem only matters for
+    a reply that got past M1-405. What it does *not* guarantee is that both conversion
+    outcomes are drawn, and a section whose properties all ran on converted cases would be
+    green without ever exercising a refusal.
+
+    This project has recorded three forms of that failure: the strategy cannot reach the
+    branch the assertion is about; the strategy reaches it and the assertion is not about
+    it; and the assertion is registry-complete while the strategy is not. All three are
+    measured the same way -- tag the outcomes and assert the tags, rather than assume them.
+    """
+    cdf, problems = _conversion(case)
+    event(f"converted={cdf is not None}")
+    if cdf is not None:
+        event(f"adjusted={cdf.adjusted}")
+    for problem in problems:
+        event(f"problem={problem.split(': ', 1)[1][:30]}")
+    _, question = case
+    event(f"open_lower={question.open_lower_bound} open_upper={question.open_upper_bound}")
+    # The two outcomes are the ones every property below splits on, so the strategy has to
+    # produce both. Asserted per-example against the accumulated tags is not possible in
+    # hypothesis, so this is the weaker but honest form: the case is one or the other, and
+    # the ``event`` tags above are what ``--hypothesis-show-statistics`` reports.
+    assert (cdf is None) is bool(problems)
+
+
+@given(accepted_numeric_cases())
+def test_a_converted_cdf_is_one_the_submission_path_accepts(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The acceptance criterion, stated as agreement between the two ends of the wire.
+
+    ``submission_live._require_cdf`` is the consumer: it refuses an array that is not a
+    list, is not ``expected_cdf_points`` long, holds a non-number or a value outside
+    ``[0, 1]``, or decreases anywhere. It runs *after* a human has approved the forecast,
+    so anything it would refuse must not be producible here.
+
+    Written as a call into that function rather than as a restatement of its rules,
+    because a restatement drifts. ``M1-513`` is the open row about exactly that kind of
+    drift on the same module.
+    """
+    cdf, problems = _conversion(case)
+    if cdf is None:
+        assert problems
+        return
+    accepted = _require_cdf(
+        list(cdf.values),
+        "continuous_cdf",
+        expected_cdf_points=_CALIBRATION.expected_cdf_points,
+    )
+    assert accepted == cdf.values
+    # The two rules the submission path does *not* check, and this item does.
+    assert max(second - first for first, second in pairwise(cdf.values)) <= (
+        _CALIBRATION.max_adjacent_pmf
+    )
+    _, question = case
+    if not question.open_lower_bound:
+        assert cdf.values[0] == 0.0
+    if not question.open_upper_bound:
+        assert cdf.values[-1] == 1.0
+
+
+@given(numeric_cases())
+def test_the_conversion_never_raises_outside_its_own_error_type(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """Drawn from the *hostile* strategy, not the accepted one.
+
+    ``numeric_cases()`` produces short, long, reordered and duplicated level tuples and
+    values on both sides of both bounds -- percentile sets ``forecast/numeric.py`` mostly
+    refuses. A caller that reached this module without running the composed validation
+    would hand it exactly those, and a raw ``ValueError``, ``TypeError`` or
+    ``pydantic.ValidationError`` escaping is the defect this project has taken as a review
+    finding twice. The SDK raises all three.
+    """
+    response, question = case
+    try:
+        cdf, problems = numeric_cdf_or_problems(response, _CALIBRATION, question)
+    except NumericCdfError:
+        return
+    assert (cdf is None) is bool(problems)
+
+
+@given(numeric_cases())
+def test_no_conversion_message_is_outside_this_modules_own_vocabulary(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """No value reaches a message, whatever is drawn -- the closed-vocabulary form.
+
+    The SDK's own refusals interpolate the whole declared percentile list, both bounds and
+    the ``zero_point``; ``pydantic.ValidationError`` adds ``input_value`` on top. These
+    strings reach ``ForecastGeneration.failure_problems`` and from there the persisted
+    raw-output envelope, and question fields come from Metaculus payloads, which CLAUDE.md
+    classes as untrusted. M1-405 took a rendered bound as a round-1 blocking finding.
+    """
+    response, question = case
+    try:
+        _, problems = numeric_cdf_or_problems(response, _CALIBRATION, question)
+    except NumericCdfError as exc:
+        problems = exc.problems
+    for problem in problems:
+        location, _, message = problem.partition(": ")
+        assert location in {"final_prediction.percentiles", "question"}
+        assert message in _CDF_MESSAGES or message.startswith(
+            ("cdf_size must equal", "zero_point must be", "must be a canonical")
+        ), problem
+
+
+@given(accepted_numeric_cases())
+def test_the_conversion_is_stable_across_the_persisted_form(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """Replay stability: the stored bytes convert to the same array the live object did.
+
+    ``model_dump(mode="json")`` -> ``json.dumps(ensure_ascii=True, sort_keys=True)`` ->
+    load, which is the project's rule for any pure function whose result a later run has
+    to reproduce. A CDF that depended on object identity rather than on the recorded values
+    would be one a replay could not rebuild.
+    """
+    response, question = case
+    persisted = json.dumps(
+        response.model_dump(mode="json"), ensure_ascii=True, sort_keys=True, allow_nan=False
+    )
+    reloaded = validate_forecast_response(json.loads(persisted), NumericForecastResponse)
+    before, problems_before = numeric_cdf_or_problems(response, _CALIBRATION, question)
+    after, problems_after = numeric_cdf_or_problems(reloaded, _CALIBRATION, question)
+    assert problems_before == problems_after
+    assert before == after
+
+
+@given(accepted_numeric_cases())
+def test_nothing_is_clamped_by_the_conversion(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """The response is never sorted, padded, truncated or pulled inside a bound.
+
+    The pinned SDK *does* rewrite repeated values, and it does so on a list of its own --
+    the caller's response is untouched, which is the correction this branch makes to two
+    prose claims that said "in place". ``NumericCdf.adjusted`` is where the rewrite becomes
+    visible; this is where its not touching the record is pinned.
+    """
+    response, question = case
+    before = response.model_dump(mode="json")
+    try:
+        cdf = build_numeric_cdf(response, _CALIBRATION, question)
+    except (NumericCdfError, ForecastSchemaError):
+        assert response.model_dump(mode="json") == before
+        return
+    assert response.model_dump(mode="json") == before
+    assert cdf.adjusted is (
+        cdf.percentiles_used
+        != tuple((p.percentile, p.value) for p in response.final_prediction.percentiles)
+    )
 
 
 # --- 6. the attribution fields and their citations (M1-501) -----------------------
