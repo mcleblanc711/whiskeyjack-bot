@@ -100,6 +100,13 @@ APPEND_ONLY_TABLES = (
     "resolution_events",
     "score_events",
     "pipeline_failure_events",
+    # M2-708's 010. Both are append-only for D25's reason and by the same pair of block
+    # triggers, so what they need is this coverage rather than a second probe written from
+    # scratch. They are also the pair that makes the release table a *record* instead of a
+    # way to rewind a claim: a reservation cannot be edited into a different key, and a
+    # release cannot be deleted to make an abandoned key look spent.
+    "submission_key_reservations",
+    "submission_key_releases",
 )
 
 # One existing, nullable column per table, so the UPDATE probe below is a well-formed
@@ -113,6 +120,12 @@ UPDATABLE_COLUMN = {
     "resolution_events": "outcome",
     "score_events": "comparison_baseline",
     "pipeline_failure_events": "retrieval_run_id",
+    # No nullable column on the reservation table -- every one of its columns is NOT NULL
+    # -- so this names a NOT NULL one instead. What the probe needs is a *well-formed*
+    # UPDATE that only the block trigger can be refusing, and `created_at_utc` accepts the
+    # text the probe writes; nullability was never the requirement, only well-formedness.
+    "submission_key_reservations": "created_at_utc",
+    "submission_key_releases": "note",
 }
 
 
@@ -383,6 +396,10 @@ def test_ledger_rows_can_be_neither_updated_nor_deleted(
     # in a successful lifecycle writes one. Without this the count assertion below would
     # be the only thing standing between an empty table and a DELETE that "passes".
     _seed_failure(conn)
+    # And nothing in a successful lifecycle writes 010's pair either: a reservation is
+    # spent by the attempt row, never released, so the release table stays empty on the
+    # happy path.
+    _seed_reservations(conn, record_id)
     assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] > 0
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(f"DELETE FROM {table}")
@@ -513,6 +530,43 @@ def test_an_event_must_name_a_forecast_record(draft: tuple[sqlite3.Connection, s
         )
 
 
+RESERVATION_KEY = "idem-reservation-probe"
+RELEASED_KEY = "idem-reservation-probe-released"
+
+
+def _seed_reservations(conn: sqlite3.Connection, record_id: str) -> None:
+    """Put a row in each of `010`'s two tables, for the append-only probes to fire on.
+
+    Two reservations under *different* keys, one of them released. Different keys because
+    `010` refuses a second live reservation for one key, and because a walk to `scored`
+    has already written a `submission_attempts` row -- so reusing that attempt's key
+    would be refused as spent, and the probe would be seeding nothing while reading as a
+    passing test of a trigger that never ran.
+
+    The released one is first by rowid, which is what `_replace_row`'s `LIMIT 1` picks up:
+    a release row is exactly the thing that must not be deletable, since deleting it would
+    make an abandoned key look spent.
+    """
+    conn.execute(
+        "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+        "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+        "VALUES ('wjres-released', ?, ?, 1, ?, ?)",
+        (RELEASED_KEY, record_id, TS, TS),
+    )
+    conn.execute(
+        "INSERT INTO submission_key_releases (release_id, reservation_id, reason, "
+        "released_by, note, released_at_utc, created_at_utc) "
+        "VALUES ('wjrel-1', 'wjres-released', 'operator_abandoned', 'chris', NULL, ?, ?)",
+        (TS, TS),
+    )
+    conn.execute(
+        "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+        "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+        "VALUES ('wjres-live', ?, ?, 1, ?, ?)",
+        (RESERVATION_KEY, record_id, TS, TS),
+    )
+
+
 def _replace_row(conn: sqlite3.Connection, table: str, **changes: object) -> None:
     """Re-insert an existing row through ``INSERT OR REPLACE``, optionally altered.
 
@@ -553,6 +607,7 @@ def test_replace_cannot_overwrite_a_row_through_its_primary_key(
     record_id = _seed_draft(conn)
     _walk_to(conn, record_id, "scored")
     _seed_failure(conn)  # see the sibling test: a walk writes no failure row
+    _seed_reservations(conn, record_id)  # 010's pair, for the same reason
     before = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
     assert before
     with pytest.raises(sqlite3.IntegrityError):
@@ -729,6 +784,11 @@ def test_update_or_replace_is_refused_before_it_can_delete(
     record_id = _seed_draft(conn)
     _walk_to(conn, record_id, "scored")
     _seed_failure(conn)  # a walk writes no failure row; see the DELETE probe above
+    _seed_reservations(conn, record_id)
+    # An UPDATE against an empty table changes nothing and raises nothing, so an unseeded
+    # table would fail here rather than pass -- which is the right way round, but only
+    # because the seed above exists.
+    assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(f"UPDATE OR REPLACE {table} SET {UPDATABLE_COLUMN[table]} = ?", ("changed",))
 
@@ -3738,7 +3798,12 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # 008 (M1-406) adds three NULLable columns and appends clauses to the same insert
     # trigger, with no upgrade probe of its own, so a v2 ledger reaching 8 is the same
     # statement it was when it reached 7.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
+    #
+    # 010 (M2-708) creates two new tables and rewrites no existing trigger body -- the
+    # first migration since 003 to touch none of them -- and has no upgrade precondition
+    # scan, because nothing can predate tables the same migration creates. So a v2 ledger
+    # reaching 10 is again the same statement it was when it reached 9.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
 
     conn = connect(db)
     try:
@@ -4328,7 +4393,7 @@ def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
     """
     db = tmp_path / "ledger.sqlite3"
     attempt_id = _seed_v8_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
 
     conn = connect(db)
     try:
@@ -4420,10 +4485,12 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # and `initialize_ledger` applies every unrecorded migration, so it now runs 007
     # (M1-602) and 008 (M1-406) as well. Neither adds an upgrade probe of its own -- each
     # redefines the one insert trigger, and 008's added columns are NULLable -- so a clean
-    # v5 ledger reaching 8 is the same statement it was when it reached 6.
+    # v5 ledger reaching 8 is the same statement it was when it reached 6. 009 (M2-711)
+    # and 010 (M2-708) extend that: 009's added column is NULLable and read through a
+    # COALESCE, and 010 only creates tables, so neither probes the rows a v5 ledger holds.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
 
 
 @pytest.mark.parametrize(
@@ -4528,7 +4595,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 9
+    assert initialize_ledger(db) == 10
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"

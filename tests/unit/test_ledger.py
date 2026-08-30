@@ -28,6 +28,11 @@ LEDGER_TABLES = {
     "score_events",
     "lifecycle_events",
     "pipeline_failure_events",
+    # M2-708's 010_submission_key_reservations.sql: the claim on an idempotency key and
+    # its resolution. Two tables rather than one column because neither existing table
+    # could hold the claim -- `submission_attempts` is written once, after the call.
+    "submission_key_reservations",
+    "submission_key_releases",
     "schema_migrations",
 }
 

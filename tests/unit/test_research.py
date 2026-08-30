@@ -544,11 +544,11 @@ def test_migration_002_makes_the_document_storable(tmp_path: Path) -> None:
     # 4 from M1-606's 004_pipeline_failure_events.sql, 5 from M1-306's
     # 005_research_run_counters.sql, 6 from M1-607's 006_non_blank_identifiers.sql,
     # 7 from M1-602's 007_forecast_version_chain.sql, 8 from M1-406's
-    # 008_forecast_raw_output.sql, 9 from M2-711's 009_submission_refetch_outcome.sql. The
-    # literal is kept rather than dropped: it is the pin that says LEDGER_SCHEMA_VERSION
-    # tracks the migrations actually on disk, and a constant compared only against itself
-    # pins nothing.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 9
+    # 008_forecast_raw_output.sql, 9 from M2-711's 009_submission_refetch_outcome.sql,
+    # 10 from M2-708's 010_submission_key_reservations.sql. The literal is kept rather
+    # than dropped: it is the pin that says LEDGER_SCHEMA_VERSION tracks the migrations
+    # actually on disk, and a constant compared only against itself pins nothing.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
 
     doc = validate_document(_document(document_id="doc-1"))
     run = validate_run(_run())

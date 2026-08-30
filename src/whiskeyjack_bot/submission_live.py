@@ -115,8 +115,10 @@ from whiskeyjack_bot.lifecycle import (
     unresolved_uncertainties,
 )
 from whiskeyjack_bot.submission import (
+    KeyReservation,
     SubmissionError,
-    require_key_unused,
+    release_submission_key,
+    reserve_submission_key,
     submission_key_for_approved_record,
 )
 from whiskeyjack_bot.submission_gateway import (
@@ -1349,6 +1351,25 @@ class MetaculusSubmissionGateway:
         self._sleep: Callable[[float], None] = time.sleep if sleep is None else sleep
         self._refetch_attempts = refetch_attempts
         self._refetch_pause_seconds = float(refetch_pause_seconds)
+        self._post_attempted = False
+
+    @property
+    def post_attempted(self) -> bool:
+        """Whether this gateway has reached its one ``post`` call. **A fact, not a guess.**
+
+        Set as the first statement of :meth:`_post`, before the poster is touched, and never
+        cleared. It is what :func:`post_approved_forecast` reads to decide whether releasing
+        the key reservation is honest, and it has to be *state* rather than the type of the
+        exception that arrived: :meth:`submit_with_detail` can raise after the post as well
+        as before it -- an injected ``clock`` returning a naive datetime is the reachable
+        case -- so ``except LiveSubmissionError`` would release a key whose post may have
+        landed and reopen exactly the blind retry M2-708 exists to close.
+
+        A gateway is constructed per call on the live path, so this is never stale. Reading
+        it after a *successful* submit is meaningless rather than wrong: the attempt row is
+        what spends the key, and nothing consults this on that path.
+        """
+        return self._post_attempted
 
     def submit(self, request: SubmissionRequest) -> SubmissionReceipt:
         """Post once, verify by refetch, and return the sanitized receipt."""
@@ -1424,7 +1445,13 @@ class MetaculusSubmissionGateway:
         )
 
     def _post(self, plan: PostPlan, question_id: int) -> None:
-        """Make the one post this gateway is allowed to make, dispatching on the literal."""
+        """Make the one post this gateway is allowed to make, dispatching on the literal.
+
+        ``_post_attempted`` is set **first**, before the poster is reached. Setting it after
+        a successful call would leave the one case that matters unmarked -- a post that
+        raised, which is precisely when nobody knows whether it landed.
+        """
+        self._post_attempted = True
         if plan.question_type == "binary":
             self._poster.post_binary_question_prediction(question_id, plan.probability_yes)
             return
@@ -1723,8 +1750,13 @@ def post_approved_forecast(
     5. **Approval, and still awaiting submission.** :func:`submission.
        submission_key_for_approved_record` refuses a record that holds no approval *or* has
        since moved off ``approved`` -- the second check being M2-702 round 2's fix.
-    6. **The key is unspent.** :func:`submission.require_key_unused`. It is a read and says
-       so; **M2-708** is the item for reserving one atomically.
+    6. **The key is claimed, not merely read.** :func:`submission.reserve_submission_key`
+       (M2-708) takes a durable row before any network I/O, so two concurrent commands for
+       one derived key select a single poster. It replaced :func:`submission.
+       require_key_unused` here, which was a read and said so.
+    7. **The connection owns its own transaction.** Checked first, above: a reservation
+       taken inside a caller's transaction is not durable, and neither is the attempt row
+       that records the call.
 
     After the post, nothing refuses. The artifact is written first and every failure of it
     degrades to a note on the result (M1-312: an artifact failure must never cost a
@@ -1732,6 +1764,22 @@ def post_approved_forecast(
     names the artifact path, because at that point a live post exists and the operator
     needs the payload that produced it.
     """
+    if conn.in_transaction:
+        # Ahead of every other gate, because it is the one that decides whether any of
+        # them can mean anything. `lifecycle.transaction` nests as a SAVEPOINT, and
+        # RELEASE does not commit -- so inside a caller's transaction the reservation
+        # this path takes before posting, *and* the attempt row it writes afterwards,
+        # both remain erasable by a ROLLBACK the caller has not made yet. Round 1
+        # reproduced it: one forecast posted twice, the first call unrecorded.
+        #
+        # Refused rather than absorbed. Committing the caller's transaction is not this
+        # function's to do, and opening a second connection behind their back would put
+        # two writers on one ledger to work around a caller mistake.
+        raise LiveSubmissionError(
+            "a live post cannot be made inside a caller's open transaction: the key "
+            "reservation that selects one poster, and the attempt row that records the "
+            "call, would both stay erasable by a rollback. Commit or roll back first"
+        )
     require_live_submission_enabled(config)
     identifier = _require_identifier(record_id, "record_id")
 
@@ -1770,29 +1818,49 @@ def post_approved_forecast(
             f"{record.question_type}; nothing was posted"
         )
 
-    try:
-        key = submission_key_for_approved_record(conn, identifier, request_payload_sha256=digest)
-        require_key_unused(conn, key)
-    except SubmissionError as exc:
-        raise LiveSubmissionError(
-            str(exc) or "this record cannot be submitted in its current state"
-        ) from None
-
     gateway = MetaculusSubmissionGateway(
         poster=poster,
         expected_cdf_points=config.numeric_calibration.expected_cdf_points,
         clock=clock,
         sleep=sleep,
     )
-    outcome = gateway.submit_with_detail(
-        SubmissionRequest(
-            forecast_record_id=identifier,
-            question_id=record.question_id,
-            idempotency_key=key,
-            payload=payload,
-            post_id=record.post_id,
+    # One declared instant for this command, resolved before anything is claimed and reused
+    # by the reservation, its release and the ledger event. `010` requires a release not to
+    # precede its reservation, and reusing the value makes that ordering true by
+    # construction rather than by two clock reads happening to agree -- the wall-clock
+    # record is `created_at_utc`, which the ledger writes itself for every row.
+    stamped = _utcnow() if occurred_at is None else occurred_at
+    # The gateway is constructed before the key is claimed so a bad argument to it refuses
+    # without leaving a reservation behind. Nothing between here and the submit can fail.
+    try:
+        key = submission_key_for_approved_record(conn, identifier, request_payload_sha256=digest)
+        reservation = reserve_submission_key(
+            conn, record_id=identifier, idempotency_key=key, reserved_at=stamped
         )
-    )
+    except SubmissionError as exc:
+        raise LiveSubmissionError(
+            str(exc) or "this record cannot be submitted in its current state"
+        ) from None
+
+    try:
+        outcome = gateway.submit_with_detail(
+            SubmissionRequest(
+                forecast_record_id=identifier,
+                question_id=record.question_id,
+                idempotency_key=key,
+                payload=payload,
+                post_id=record.post_id,
+            )
+        )
+    except BaseException:
+        # The flag, never the exception type. `submit_with_detail` refuses before the post
+        # for a failed baseline fetch, a mismatched identity, a closed question and an
+        # unreadable history -- and can *also* raise after it, from an injected clock. A
+        # release written on the second of those would free a key whose post may have
+        # landed, which is the blind retry this item exists to prevent.
+        if not gateway.post_attempted:
+            _release_unspent(conn, reservation, released_at=stamped)
+        raise
 
     # ---- past this line a post has been made; nothing below may refuse it a record ----
     artifact_path, artifact_error = _write_receipt_artifact(
@@ -1809,7 +1877,6 @@ def post_approved_forecast(
         },
     )
     receipt = replace(outcome.receipt, artifact_path=artifact_path)
-    stamped = _utcnow() if occurred_at is None else occurred_at
     try:
         event = record_receipt(
             conn, receipt=receipt, occurred_at=stamped, detail_code=outcome.detail_code
@@ -1832,6 +1899,37 @@ def post_approved_forecast(
         artifact_path=artifact_path,
         artifact_error=artifact_error,
     )
+
+
+def _release_unspent(
+    conn: sqlite3.Connection, reservation: KeyReservation, *, released_at: datetime
+) -> None:
+    """Hand a key reservation back when the gateway proved no post was made.
+
+    Called only while another exception is propagating, and only when
+    :attr:`MetaculusSubmissionGateway.post_attempted` is still false -- so this runs exactly
+    when it is *known* that nothing reached Metaculus. Everything
+    :meth:`~MetaculusSubmissionGateway.submit_with_detail` refuses before its single ``post``
+    call lands here: an unfetchable question, a question whose ids do not match this record,
+    a closed question, a history that could not be read. Those are ordinary transient
+    conditions, and without this a single one of them would wedge that forecast for good,
+    because an idempotency key is a pure function of its four inputs and the same work
+    derives the same key forever.
+
+    **It never replaces the exception being propagated.** ``lifecycle._unwind``'s contract:
+    the caller is already being told that nothing was posted, and a reservation that
+    outlives its command is a recoverable state -- ``release-key`` is the way out, and
+    ``submit`` prints that command when it finds one standing. Surfacing a failed release
+    instead of the refusal that caused it would hide why the command stopped.
+
+    ``except Exception`` is the right width here for :func:`_write_receipt_artifact`'s
+    reason: this is a cleanup path running under an in-flight exception, and what an
+    arbitrary ledger failure can raise is not enumerable.
+    """
+    try:
+        release_submission_key(conn, reservation, reason="not_posted", released_at=released_at)
+    except Exception:  # noqa: BLE001 - must never displace the exception being raised
+        return
 
 
 def _write_receipt_artifact(
