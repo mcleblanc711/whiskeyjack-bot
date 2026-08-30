@@ -6137,3 +6137,338 @@ two independent ways and became both blockers, and claim 7 in round 2 was falsif
 vaguer request would have produced neither finding, and the incomplete-record path would have
 merged. The cost of writing falsifiable claims is that some of them turn out to be false in
 public — which is the point of writing them.
+
+## M1-503 — The numeric CDF conversion
+
+*"Use NumericDistribution.from_question and get_cdf to produce the submission array. Exactly 201
+monotone values for normal numeric questions; maintained PMF constraint passes."*
+
+### What the criterion is actually guarding against
+
+Two things, and they fail at different distances from the model.
+
+The first is the one M1-405 named before this module existed: a percentile set that no conversion
+accepts. M1-405 closed the half that needs no configuration — exact levels, non-decreasing values,
+closed bounds, `zero_point` — and stopped at the config boundary. What it could not close is the
+half `config.numeric_calibration` decides, because `NumericCalibrationConfig` is a **sibling** of
+`ForecastConfig` on `AppConfig` and a registered `_TYPE_CHECKERS` entry is handed only the latter.
+So until this row, `numeric_calibration` had no consumer in `src/` outside `submission_live.py`'s
+length check, and a reply that M1-405 accepted could still be unconvertible.
+
+That is not hypothetical, and the concrete case is worth stating because it is the whole argument
+for where this gate runs. **Nine equal values** are non-decreasing, inside the bounds and exactly
+the declared levels — `prompts/forecaster.md` says "non-decreasing" twice, so such a reply followed
+the prompt to the letter, and `numeric_output_problems` returns `[]`. `get_cdf` refuses it: the
+resulting CDF is flat over most of its range and the SDK's own re-validation raises
+`Percentiles must be in strictly increasing order`. Without a gate in the loop, that reply is
+billed, parsed, hashed, recorded and **approved**, and fails inside the dependency at submission
+time — past the approval boundary, which is worse than a wasted call.
+
+The second is the PMF cap, and it is the clause that reading the SDK casually gets wrong.
+`_check_distribution_too_tall` is the package's cap and it does exactly what the criterion asks
+for. It is **not applied to the array `get_cdf` returns.** `get_cdf` re-validates its output by
+constructing a `NumericDistribution` from it *without* `cdf_size`, and the cap is gated on
+`len(percentiles) == self.cdf_size`, which is false for every length once that field is `None`. So
+"maintained PMF constraint passes" is genuinely this row's to assert. Verified by execution, not by
+reading — `test_the_sdk_does_not_check_the_pmf_cap_on_its_own_output` hands the SDK an array over
+the cap and watches it accept it, so a pin move that starts enforcing it fails there rather than
+leaving a redundant check that looks load-bearing.
+
+### Delivered
+
+- **`src/whiskeyjack_bot/forecast/cdf.py`** — `NumericCdfError`, `NumericCdf`,
+  `numeric_cdf_or_problems`, `build_numeric_cdf`. `numeric.py`'s shape (a returner and a raiser, a
+  module-owned `ForecastSchemaError` subclass, value-free messages), with `parse._parse`'s
+  `tuple[value | None, problems]` signature because the caller needs the array and the problems
+  from one pass rather than converting twice.
+- **The four calibration knobs get their first consumer.** `expected_cdf_points` is the length
+  rule and the `cdf_size` preflight; `max_adjacent_pmf` is the step cap; `strict_validation` and
+  `use_forecasting_tools_standardization` are passed to the SDK. `calibration_profile` is **not**
+  read and this module applies no post-hoc transform, which `cdf.py`'s docstring states rather
+  than leaving as an absence — a knob with no reader looks identical to a knob someone forgot,
+  and "nothing is clamped" is only checkable if an operator can tell which is which.
+- **A second numeric preflight in `generate_forecast`** — a question whose `cdf_size` disagrees
+  with `expected_cdf_points`, refused before any billable call, beside M1-405's `zero_point` one.
+- **The conversion gate in `_run_attempts`** — `_conversion_problems`, run after `_parse` succeeds
+  and dispatching on the `question_type` literal. `numeric_calibration` is threaded into
+  `_run_attempts` for it.
+- **Tests** — `tests/unit/test_forecast_cdf.py` (35), an M1-503 section in
+  `test_forecast_generate.py` (6) plus a negative import probe, and a `5c.` section in
+  `tests/property/test_forecast_properties.py`.
+
+### Decision — a second gate, not a `_TYPE_CHECKERS` entry
+
+M1-506 built one composed output-validation entry point precisely so a caller would not have to
+know which modules the rules live in, and this row does not register with it. Two independent
+reasons, and both are written into `cdf.py`'s docstring and `generate._conversion_problems`'
+docstring rather than left to be inferred — a reviewer reading `validate.py` alone would otherwise
+see a rule that looks absent, which is the seam defect M1-506 exists to close and the exact shape
+of M1-501's round-1 blocking finding.
+
+1. **The import graph.** The conversion is `NumericDistribution`, which lives in
+   `forecasting_tools`. `test_the_response_schema_reaches_no_provider_client` forbids that import
+   from `forecast.validate` and the ten modules around it, and that probe **is** M1-406's
+   acceptance criterion: a replay reproduces a stored forecast with zero provider calls, asserted
+   as a property of the import graph rather than of a mock count. A checker that could reach an SDK
+   would end that guarantee for `parse`, `replay` and `store` at once.
+2. **The config boundary.** A registered checker receives `(response, ForecastConfig, question)`.
+   Every rule here is keyed on `numeric_calibration`. Widening the registry signature to `AppConfig`
+   would hand every checker the whole configuration to reach one section, and it would not help
+   with (1) anyway.
+
+So `forecast.validate` remains the complete account of everything a response must satisfy that is
+**SDK-free and `ForecastConfig`-keyed**, and the conversion is a second, SDK-bound gate that only
+`forecast.generate` runs. Stated that way in both places, because "complete" was true before this
+row and is now true only with a qualifier.
+
+**A naming consequence, and it is load-bearing.** Nothing in `cdf.py` is called
+`*_output_problems`. `test_no_output_checker_in_the_package_is_unreachable` walks this package for
+that suffix and requires every match to be registered, so a conversion gate that *cannot* be
+registered must not answer to the convention that means "registered". The alternative — registering
+it and letting the probe fail — is not available, and a suffix exemption would make the discovery
+walk skip silently, which is the failure `.github/scripts/check_backlog.py` was rewritten to avoid.
+
+### Decision — inside the attempt loop, while a repair turn is still free
+
+`_conversion_problems` runs in `_run_attempts` immediately after `_parse` returns a response, and a
+non-empty result sets `forecast = None` so the existing repair path handles it unchanged. Its
+strings are the shape `schema._sanitize` produces, so `_repair_turn` renders them and `_classify`
+reads them as `schema_invalid` with **no change on either side** — the same property M1-405's
+problems have, and the reason neither function needed touching.
+
+The alternative was the submission boundary, where the payload is built. It is cheaper in diff and
+strictly worse in outcome: a conversion failure there lands after the forecast has been billed,
+recorded, hashed and approved. M1-502's round-1 finding drew this distinction for the probability
+envelope — "the cost is not a repair loop but a forecast billed, recorded and approved for a post
+that cannot happen" — and the numeric case is the same shape with a larger class of triggering
+replies.
+
+### Deviation — `NumericDistribution` is constructed directly, not through `from_question`
+
+The row says to use `NumericDistribution.from_question`. It is not used, and the reason is a
+boundary this project drew two milestones ago rather than a preference.
+
+`from_question` takes an SDK `NumericQuestion | DateQuestion` and reads six fields off it. That
+object does not survive `questions/normalize.py`: the canonical model is what reaches the
+forecaster, what the ledger stores, and what any later conversion from a stored record has. So
+calling `from_question` would mean **fabricating** an SDK question from the canonical one purely to
+have its fields read straight back out — a second source of truth for six values, built and
+discarded inside one call, which is exactly the shape M2-703's round-1 review said to remove rather
+than guard and the shape M1-405 removed `question_id` for.
+
+Two further reasons found by reading the pinned source: `from_question` never passes
+`strict_validation`, so it cannot honour `numeric_calibration.strict_validation` — the knob would
+be silently inert; and it branches on `isinstance(question, DateQuestion)`, the
+`isinstance`-on-an-SDK-type shape `DiscreteQuestion` subclassing `NumericQuestion` makes a standing
+gotcha here.
+
+**The mapping is therefore ours, and it is pinned rather than asserted.**
+`test_the_field_mapping_is_the_one_from_question_would_have_made` builds a real SDK
+`NumericQuestion`, calls `from_question`, and compares both the seven mapped fields and **the
+resulting 201-value array**. A pin move that renamed a field, changed a default or derived one
+differently fails there. Only `strict_validation` (the deliberate difference) and `is_date` (no
+date questions in v1) are excluded, and both are named in the test.
+
+### Decision — `use_forecasting_tools_standardization: false` is honoured, and the array is still checked
+
+The knob is a plain `bool` with a `true` default, unlike `expected_cdf_points`, which is a
+`Literal[201]` with a comment saying any other value is a hard error rather than a tunable. The
+config author distinguished the two, so this one is settable and it is passed straight through as
+`standardize_cdf`.
+
+What makes that safe is that the array is checked afterwards either way. Standardization is what
+caps the inbound PMF at `0.2 * 0.95 = 0.19`; with it off nothing does, and
+`test_standardization_off_is_honoured_and_an_uncapped_array_is_refused` shows a concentrated reply
+coming back over the configured `0.2` and being refused — the same reply that converts cleanly with
+the committed default. The operator may turn the dependency's normalization off; they cannot
+thereby post an array this project's own cap refuses.
+
+Rejected: preflight-refusing `false` as unsupported in v1. It is the stricter reading, and the
+argument for it is real — standardization is the only path verified against 0.2.92. It was not
+taken because refusing a configuration the schema deliberately admits is a change to the config
+contract, which belongs to the config owner and not to a conversion row, and because the check that
+would make it safe already exists.
+
+### Decision — `-0.0` is normalized in the producer, never in the hash rule
+
+`docs/M2-NOTES.md` records this as a standing risk that "becomes reachable when M1-503's CDF arrays
+exist": `0.0` and `-0.0` compare equal but render differently, so they hash differently, so two
+arrays an operator would call equal derive two idempotency keys and two submissions. M2-NOTES
+declined to normalize floats *inside* the replay-critical hash rule, and rightly — that changes what
+every future key means.
+
+`_values` adds `0.0` to each point instead, which maps `-0.0` to `0.0` and is the identity on every
+other float. That is a change of spelling and never of value. It is not reachable through 0.2.92 —
+`_standardize_cdf` pins a closed lower bound to a positive `0.0` — so the test simulates the
+condition at the seam and says so, and a second test asserts the rule itself over ordinary floats.
+The claim the pair supports is "the normalization is applied", never "the SDK emits this today".
+
+### Correction — the SDK does not nudge "in place"
+
+`docs/M1-NOTES.md` (M1-405) and `forecast/numeric.py` both said
+`_check_and_update_repeating_values` "mutates `declared_percentiles` in place". It does not. It
+builds fresh `Percentile` objects into a fresh list and rebinds the attribute; the caller's list and
+the caller's objects are untouched. Verified by execution and corrected in both places on this
+branch.
+
+The distinction is not pedantry — it is what makes M1-508 cheap. "Compare what we handed in against
+what the distribution holds" is a sound way to detect the nudge only because our copy survives it.
+Under the in-place reading there would be nothing left to compare against, and recording the
+divergence would have needed a defensive copy nobody had written.
+
+### Decision — M1-508's divergence is made observable, and the policy is left to M1-508
+
+`NumericCdf.percentiles_used` is what the conversion actually built from, and `.adjusted` says
+whether it differs from what the model returned. An INFO log names the **count** of adjusted points
+and never the values: a tie is not an error, and putting model output into an operator's logs for a
+non-error is the wrong trade.
+
+That is the precondition M1-508's criterion needs — *"the difference between the declared
+percentiles and the ones the submitted CDF was built from is recorded rather than silent"* — and it
+is deliberately not the whole of it. Refusing ties at the conversion boundary was rejected here for
+M1-405's reason, restated: the prompt says "non-decreasing" twice, so a tie is a compliant reply,
+and refusing one spends the single budgeted repair call on this project's own inconsistency.
+Persisting the adjusted set, and bumping the prompt to demand strictly increasing values, are both
+still open on that row. **One backlog item per branch**, and M1-508 is a row with its own
+acceptance criterion.
+
+### Rejected — re-checking the SDK's minimum step
+
+`_check_percentile_spacing` enforces `5e-05` between adjacent points and `get_cdf` runs it against
+its own output, so a violation already arrives as an SDK refusal this module translates. Restating
+`5e-05` would copy a pinned constant into this repository, and M1-405 refused to duplicate the 0.25
+wiggle factor and the 2x buffer for exactly that reason: *"there is nothing in this module for a
+pin move to invalidate."* The cap is a different case and the difference is the point —
+`max_adjacent_pmf` is **our** configured value, not a transcription of theirs.
+
+### Rejected — building the submission payload
+
+The wire shape is settled (`{"question_type": "numeric", "continuous_cdf": [...]}`,
+`submission_live.plan_from_payload`), and emitting it from here is one line. Not taken: M1-502
+shipped validation without a payload builder, `cli.py`, `submission.py` and `submission_gateway.py`
+all say "M1-502/M1-503 own that", and a builder covering one of three types is a half-seam that
+leaves those three statements exactly as wrong as they were. The array is the row's deliverable;
+**M2-707** is where the mapping and the approval binding land together.
+
+### Deferred (do not read the absence as an omission)
+
+- **The persisted CDF → still absent, and still `record.py`'s stated gap.** `forecast_records` has
+  no column for it, and adding one is a migration, a `RECORD_SCHEMA_VERSION` bump and a store/replay
+  change. The array is deterministic in `(percentiles, question, calibration)`, so it is
+  re-derivable rather than lost; what is *not* re-derivable is the adjusted percentile set if the
+  pin moves, which is the half M1-508 owns. `docs/TRACKS.md` claims no migration for this row.
+- **The payload builder and the approval binding → M2-707 / D33.** Above.
+- **The `validated` lifecycle event → M1-504.** This row closes the last of the four M1-603
+  named when it declined to append the event — *"that gate is M1-504, and M1-404, M1-405,
+  M1-502 and M1-503 are all `Not Started`"* (M1-603's notes, and M1-502's repeated the
+  count). `store.py` still appends nothing, and that is M1-504's to change.
+
+  **Two records disagree here and it is worth naming which is which**, because a reviewer
+  checking one will find the other wrong. The four-item chain is the *notes'*, and it is
+  the substantive precondition: an append-only `validated` event should not claim a gate
+  that does not exist. `backlog.csv` gives M1-504's formal Dependency as `M1-305; M1-501`
+  and names none of the four. Neither is a defect in this row — the CSV records what
+  M1-504 was scoped against, the notes record what its event would be asserting — but the
+  divergence is real and this is the row where it becomes visible, so it is written down
+  rather than left for M1-504 to rediscover.
+- **`T-904`, the contract tests, is Codex's.** Deliberately not pre-written — the unit tests here
+  are the minimum to keep this branch honest, and the golden set and drift guard are authored from
+  spec without reading this implementation.
+- **`M1-510` is untouched.** The composed entry point's property strategy still draws no numeric
+  responses. Section 5c draws numeric directly and does not go through `output_problems`, so it
+  neither closes nor worsens that row.
+
+### The finding — `get_cdf` does not always return, and both hanging knobs are the committed defaults
+
+This is the most important thing on the branch, and it was not in the row's scope.
+
+`forecasting-tools==0.2.92`'s `NumericDistribution._standardize_cdf` finds its scale factor with
+
+```python
+lo = hi = scale = 1.0
+while capped_sum(hi) < 1.0:
+    hi *= 1.2
+```
+
+where `capped_sum(scale)` sums `min(cap, scale * pmf)` over the interior points. If any interior
+PMF entry is **negative**, that sum falls without bound as `scale` grows instead of rising. `hi`
+reaches `inf`, `inf * 1.2` is still `inf`, and `capped_sum(inf)` is `-inf` — still below `1.0`. The
+loop has no exit. Measured on the captured case: `capped_sum(1) = 0.99999…`,
+`capped_sum(1e12) = -9.4e11`, `capped_sum(inf) = -inf`.
+
+**It does not raise and it is not slow. It never returns.** There is no deadline anywhere on the
+forecast path, so `generate_forecast` stops inside the attempt loop with no error, no pipeline
+failure event, and no billing bound.
+
+**How it was found, and why not earlier.** The `5c.` property section appeared to be "slow" — a
+31-minute run that seemed to pass. It had not passed: the exit code belonged to a `tail` in the
+pipeline, not to pytest. Timing each property at 25 examples (~3s) against 200 (>600s) gave a
+200× cost for 8× the work, which is not a cost curve. `faulthandler.dump_traceback_later` with
+pytest's capture disabled put the process inside `while capped_sum(hi) < 1.0` and settled it.
+
+**Two unrelated inputs reach it**, both from replies `numeric_output_problems` returns `[]` for —
+asserted in the regression test rather than assumed — and both compliant with
+`prompts/forecaster.md`, which says "non-decreasing" and therefore permits a tie:
+
+1. **A repeated value at or beyond a bound.** `_check_and_update_repeating_values` rewrites it
+   **onto** the bound (plus ~1e-10) while leaving an *unrepeated* value further out untouched. A
+   reply ending `…, 101.43, 148.15, 148.15` against `upper_bound=100.0` becomes
+   `…, 101.43, 100.0000000001, 100.0000000001` — the SDK's own tie repair makes the set decrease.
+2. **A log-scaled question spanning many orders of magnitude** (`zero_point=-1.0`, values from
+   `-4e-181` to `63`), where the interpolation loses order with no rewrite involved at all.
+
+The second was found only *after* the first was closed, which is the whole argument for guarding
+the mechanism rather than a list of triggers.
+
+### Decision — guard the mechanism, on the SDK's own pre-standardization curve
+
+`_standardization_can_converge` evaluates `distribution._get_cdf_at` over `get_cdf`'s own
+evaluation grid — the first of the three things `get_cdf` does, on the distribution the conversion
+will actually use, so the tie rewrite has already happened and the log scaling is the SDK's. It
+refuses a curve that is not non-decreasing, or whose span is not strictly positive (`_standardize_cdf`
+divides by that span). Both known inputs are refused; the committed prompt example and all four
+bound-flag combinations still convert.
+
+Why a survivor is safe, stated because it is what makes this a guard rather than a guess:
+`apply_minimum` is affine and increasing in the height plus a strictly increasing term in position,
+so an already-increasing curve stays increasing and every interior PMF entry is non-negative;
+`capped_sum` is then non-decreasing in `scale` and tends to
+`pmf[0] + pmf[-1] + cap * (interior points with mass)` with `cap = 0.19`, which clears `1.0` unless
+nearly every interior step is zero — and a curve that flat is what `_check_percentile_spacing`'s
+`5e-05` minimum already refuses.
+
+**Rejected — probing with `standardize_cdf=False`.** Tried first and reverted. An unstandardized
+curve legitimately has flat regions, so `get_cdf`'s own `5e-05` re-validation raises on it, and the
+probe refused ordinary open-bounded forecasts — `test_the_endpoints_follow_the_bound_flags` caught
+it on two of its four combinations. A liveness fix bought by rejecting good forecasts is not a fix.
+
+**Rejected — enumerating the triggers.** The first version checked that the rewritten percentile set
+was still non-decreasing. It closed input 1 and the properties still hung, on input 2. Recorded
+because the failure is the argument: a trigger list is only as good as the fuzzing behind it.
+
+**Deferred — the general bound is M1-514.** The guard is keyed on the mechanism it has evidence for,
+not on a proof that no other input diverges, and it reaches into a private SDK method. A wall-clock
+bound on the conversion, so that an unknown non-terminating input degrades to a recorded failure
+rather than a stopped run, is that row. `M0-002` pins `0.2.92` with CI failing on drift, so
+upgrading past the defect is itself a decision rather than an action.
+
+**M1-508 was tightened rather than left.** It owned the tie question as an *attribution* problem —
+its own text says the rewrite happens "before `get_cdf` is ever called", so it never reached this.
+Its acceptance criterion was a disjunction whose second branch ("the difference is recorded") could
+have closed the row with the hang still in place. It now requires the liveness guard to survive or
+be replaced.
+
+**The suite cost is the incidental win.** The `5c.` section went from non-terminating to 25 seconds.
+
+### Standing risk — not verifiable offline
+
+Whether **Metaculus** accepts an array this module produces is not knowable without a live call.
+What is established is agreement with the two things that are checkable here: the pinned SDK's own
+re-validation, and `submission_live._require_cdf`, which is asserted directly rather than restated
+—`test_a_converted_cdf_is_one_the_submission_path_accepts` calls the consumer. M1-405's version of
+this note said the same about its own boundary and pointed here; this is where the pointer stops
+being able to go further offline.
+
+The `0.19` margin the concentrated case lands on is the SDK's wiggle room (`0.2 * 0.95`), not a
+number this project chose. A pin move that removed the wiggle would put a legitimate concentrated
+forecast exactly on the committed `max_adjacent_pmf: 0.2` boundary.

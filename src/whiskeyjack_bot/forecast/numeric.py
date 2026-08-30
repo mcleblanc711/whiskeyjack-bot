@@ -23,7 +23,7 @@ Four rules, and every one is numeric-specific by construction:
   false. An **open** bound constrains nothing here; the prompt says the tails "may extend
   beyond the displayed bound only when the question model and application validation
   permit it", and that permission is measured against ``numeric_calibration``, which this
-  module cannot see -- M1-503 owns it.
+  module cannot see -- ``forecast/cdf.py`` owns it (M1-503).
 - When the question carries a ``zero_point``, no value may fall below it. That is the
   SDK's ``_check_log_scaled_fields``, and it is here rather than in M1-503 because it is
   one of the two checks ``NumericDistribution`` runs **unconditionally** -- with
@@ -33,10 +33,14 @@ Four rules, and every one is numeric-specific by construction:
 percentile set for *any* configuration; M1-503 enforces what depends on
 ``numeric_calibration`` -- the 25%-wiggle and 2x-range tail rules
 (``_check_too_far_from_bounds``), the adjacent-level spacing, the 201-point count and the
-PMF step cap. ``NumericCalibrationConfig`` is a sibling of ``ForecastConfig`` on
-``AppConfig``, not a member of it, so a rule keyed on it cannot be applied from a checker
-that is handed only the latter -- applying it anyway would refuse a forecast a permissive
-config accepts. The split is the config boundary, not a guess about scope.
+PMF step cap. **That module now exists**: ``forecast/cdf.py``, reached from
+``forecast.generate``'s attempt loop rather than from ``forecast.validate``, because the
+conversion imports the provider SDK and the composed entry point may not. A pointer that
+says only where a rule is *not* is how M1-501 lost a round, so this one names the module.
+``NumericCalibrationConfig`` is a sibling of ``ForecastConfig`` on ``AppConfig``, not a
+member of it, so a rule keyed on it cannot be applied from a checker that is handed only
+the latter -- applying it anyway would refuse a forecast a permissive config accepts. The
+split is the config boundary, not a guess about scope.
 
 **The rules live on the output path rather than in the schema**, M1-403's placement
 decision applied to a third item and for its three reasons: it leaves
@@ -201,9 +205,18 @@ def _ordering_problem(forecast: NumericForecastResponse) -> str | None:
 
     The pinned SDK agrees: ``NumericDistribution._check_percentiles_increasing`` raises only
     on ``value[i] > value[i + 1]``, whatever its message says. What it then does with a tie
-    -- ``_check_and_update_repeating_values`` nudges repeated values by 1e-6 in place -- sits
-    against this project's "nothing is clamped" rule and is filed for M1-503, which owns the
-    conversion where it happens.
+    -- ``_check_and_update_repeating_values`` nudges each repeated value by 1e-6 -- sits
+    against this project's "nothing is clamped" rule and is filed as M1-508 against M1-503,
+    which owns the conversion where it happens. ``forecast/cdf.py`` is that conversion, and
+    it makes the difference readable on ``NumericCdf.percentiles_used``.
+
+    **Corrected on the M1-503 branch:** this paragraph used to say the nudge happens "in
+    place". It does not. The validator builds fresh ``Percentile`` objects into a fresh list
+    and rebinds ``declared_percentiles``; the caller's list and the caller's objects are
+    untouched, which is why comparing what was handed in against what the distribution holds
+    is a sound way to detect it at all. Verified by execution, and pinned by
+    ``test_a_tie_is_converted_and_the_adjustment_is_recorded_not_hidden`` in
+    ``tests/unit/test_forecast_cdf.py``.
     """
     values = [point.value for point in forecast.final_prediction.percentiles]
     if all(first <= second for first, second in pairwise(values)):
