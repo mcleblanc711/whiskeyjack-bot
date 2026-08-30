@@ -1,0 +1,22 @@
+{
+  "qtype": "binary",
+  "question_id": 30412,
+  "post_id": 30412,
+  "url": "https://www.metaculus.com/questions/30412/",
+  "title": "Will the Federal Reserve cut rates at the September 2026 FOMC meeting?",
+  "background_info": "The Federal Open Market Committee meets eight times per year to set the target range for the federal funds rate.",
+  "resolution_criteria": "This question resolves YES if the FOMC lowers the target range for the federal funds rate at the meeting concluding 17 September 2026.",
+  "fine_print": "A change to an administered rate (IOER, ON RRP) without a change to the target range does not resolve this question YES.",
+  "unit_of_measure": null,
+  "open_time": "2026-06-01T00:00:00Z",
+  "close_time": "2026-09-17T18:00:00Z",
+  "scheduled_resolution_time": "2026-09-17T18:30:00Z",
+  "tournament_slugs": ["minibench"],
+  "question_weight": 1.0,
+  "source_categories": [
+    {"id": 17, "name": "Economics", "slug": "economy"}
+  ],
+  "group_question_option": null,
+  "question_ids_of_group": null,
+  "group_parent_title": null
+}

@@ -6472,3 +6472,73 @@ being able to go further offline.
 The `0.19` margin the concentrated case lands on is the SDK's wiggle room (`0.2 * 0.95`), not a
 number this project chose. A pin move that removed the wiggle would put a legitimate concentrated
 forecast exactly on the committed `max_adjacent_pmf: 0.2` boundary.
+
+## T-901 — golden schema fixtures
+
+`CLAUDE.md` and `CLAUDE_CODE_PROMPT.md` assign T-901–T-904 to Codex as independent,
+implementation-blind acceptance-test authorship. `docs/TRACKS.md` Wave 11 records an owner
+override for this item: worked by Claude Code, but still drafted blind — from
+`CODEX_HANDOFF.md`'s test-requirements section and the M1-201/M1-501 schemas, not from reading
+`forecast/`'s current implementation — to preserve the independent-test intent even though the
+author changed. Every module that was going to need this item's fixtures said so while it
+shipped: `test_questions.py`, `test_forecast_binary.py`, `test_forecast_multiple_choice.py` and
+`test_forecast_numeric.py` each defer "the comprehensive valid/invalid golden set" to T-901 by
+name.
+
+`CODEX_HANDOFF.md`'s "Schema tests" bullets are the spec: valid golden records for binary,
+multiple-choice and numeric; malformed model outputs rejected; unknown fields rejected or
+versioned; and DB migration determinism.
+
+### Decision — authored blind, and the boundary is enforced in the test file itself
+
+Built only from `CODEX_HANDOFF.md`'s test requirements, `prompts/forecaster.md` (the contract
+`forecast/schema.py` is transcribed from), `questions/model.py` (M1-201), `forecast/schema.py`
+and `forecast/attribution.py` (M1-402/M1-501), and `forecast/validate.py`'s public
+`output_problems` signature. Deliberately not read: `forecast/binary.py`, `forecast/numeric.py`,
+`forecast/multiple_choice.py`, or their test files — those own the type-specific bound rules
+(percentile-level exactness, option-set matching, the binary prior requirement). Where this
+suite needs to exercise one of those rules, it reaches it only through the composed
+`output_problems` entry point and asserts the returned list is non-empty, never the exact
+wording — so a round of review reading this file cannot mistake it for evidence about what those
+modules' messages say.
+
+### Decision — malformed fixtures are generated from the golden fixture, not shipped as files
+
+The alternative — one JSON fixture file per malformed case — was raised and rejected for this
+branch (owner-confirmed direction): it does not scale past a handful of cases per type and gives
+no structural guarantee that every field got one. Instead, `test_golden_schema_fixtures.py`
+introspects each pydantic model's own `model_fields` for required-ness against the golden
+fixture's real shape, and mutates a deep copy per field. A field added to a schema later is
+covered automatically; a field removed disappears from the walk rather than leaving a stale
+fixture file behind. The walk descends into a nested model's first list item only — every item
+shares one schema, so descending into the rest would multiply the case count without adding
+coverage — and `test_the_required_field_walk_is_not_vacuous` pins the load-bearing paths the walk
+must keep finding, per `docs/LESSONS.md`'s vacuous-property guard.
+
+### Decision — canonical-question fixtures get their own directory
+
+`tests/fixtures/questions/{binary,multiple_choice,numeric}_golden.json`, parallel to the
+existing `tests/fixtures/forecasts/`. No canonical-question fixture file existed before this
+item; `test_questions.py` built its records ad hoc. The three question fixtures and the three
+response fixtures are paired by construction — the multiple-choice question's `options` are
+exactly the labels the response fixture answers, the numeric question's bounds contain the
+response's percentile values — so the golden pair also serves as the single node this suite
+threads through the composed `forecast.validate.output_problems()` entry point, not only through
+the two schemas separately.
+
+### Deferred — DB migration determinism is not duplicated here
+
+`CODEX_HANDOFF.md`'s fourth schema-test bullet, "database migration from empty file is
+deterministic," is already fully covered by `tests/unit/test_ledger.py`
+(`test_schema_is_deterministic`, `test_migration_is_idempotent`, M1-601). Repeating it here would
+be a second copy of the same assertion with no additional coverage; the module docstring says so
+explicitly rather than leaving the omission to look like an oversight.
+
+### Rejected — asserting the type-specific bound messages verbatim
+
+Tempting, since the exact strings are visible in the sibling modules' own docstrings and in
+`test_forecast_validate.py`. Rejected because asserting them would make this suite's pass/fail
+outcome depend on wording owned by modules it was told not to read for this item — the opposite
+of what "authored blind" is for. `output_problems() != []` is the claim this suite can make
+independently; the exact wording is `binary.py`/`numeric.py`/`multiple_choice.py`'s own tests to
+own.

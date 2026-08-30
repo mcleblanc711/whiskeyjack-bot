@@ -1,0 +1,24 @@
+{
+  "qtype": "multiple_choice",
+  "question_id": 41201,
+  "post_id": 41201,
+  "url": "https://www.metaculus.com/questions/41201/",
+  "title": "Which team will win the 2026 regional championship?",
+  "background_info": "Three teams remain in contention after the semifinal round.",
+  "resolution_criteria": "This question resolves to whichever of the listed options wins the championship match, or Neither if the match is cancelled and not rescheduled before the season ends.",
+  "fine_print": "A forfeit counts as a win for the opposing listed team, not for Neither.",
+  "unit_of_measure": null,
+  "open_time": "2026-05-01T00:00:00Z",
+  "close_time": "2026-10-01T00:00:00Z",
+  "scheduled_resolution_time": "2026-10-02T00:00:00Z",
+  "tournament_slugs": ["minibench"],
+  "question_weight": 1.0,
+  "source_categories": [
+    {"id": 22, "name": "Sports", "slug": "sports"}
+  ],
+  "group_question_option": null,
+  "question_ids_of_group": null,
+  "group_parent_title": null,
+  "options": ["Falcons", "Herons", "Neither"],
+  "option_is_instance_of": null
+}

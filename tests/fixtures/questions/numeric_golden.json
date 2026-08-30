@@ -1,0 +1,30 @@
+{
+  "qtype": "numeric",
+  "question_id": 52078,
+  "post_id": 52078,
+  "url": "https://www.metaculus.com/questions/52078/",
+  "title": "How many named Atlantic storms will form in the 2026 season?",
+  "background_info": "The National Hurricane Center names storms once they reach tropical storm strength.",
+  "resolution_criteria": "This question resolves as the total count of named Atlantic storms in the 2026 season, per the National Hurricane Center's final seasonal summary.",
+  "fine_print": "Subtropical storms that receive a name count toward the total.",
+  "unit_of_measure": "storms",
+  "open_time": "2026-05-15T00:00:00Z",
+  "close_time": "2026-11-30T00:00:00Z",
+  "scheduled_resolution_time": "2026-12-15T00:00:00Z",
+  "tournament_slugs": ["minibench"],
+  "question_weight": 1.0,
+  "source_categories": [
+    {"id": 31, "name": "Environment & Climate", "slug": "environment-climate"}
+  ],
+  "group_question_option": null,
+  "question_ids_of_group": null,
+  "group_parent_title": null,
+  "lower_bound": 0.0,
+  "upper_bound": 60.0,
+  "open_lower_bound": false,
+  "open_upper_bound": false,
+  "zero_point": null,
+  "cdf_size": 201,
+  "nominal_lower_bound": null,
+  "nominal_upper_bound": null
+}
