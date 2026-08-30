@@ -40,15 +40,12 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-503 | feat/m1-503-numeric-cdf | whiskeyjack-m1-503 | no | none | 2026-08-28 |
-*(rows above; each lands on its own branch as it starts — see the planned wave below.
-Swept `M2-708` (merged, PR #51, migration `010` now immutable on master) and `T-903`
-(merged, PR #50) — `git ls-remote --heads origin` carries neither branch any more, and
-`finish-item.sh` leaves the row for the next branch to sweep rather than deleting it
-itself. Master's version of this table still carried both, plus master's own sweep of
-`M1-609`/`M1-405`/`M2-711`; taking master's sweep and dropping those two rows is the whole
-resolution. `M1-503` is the only live claim, which is what the Wave-10 tail should look
-like.)*
+| M1-315 | feat/m1-315-live-paid-run | whiskeyjack-m1-315 | no | none | 2026-08-30 |
+| M2-710 | feat/m2-710-identifier-guard-key | whiskeyjack-m2-710 | no | none | 2026-08-30 |
+| T-901 | feat/t-901-golden-schema-fixtures | whiskeyjack-t-901 | no | none | 2026-08-30 |
+*(rows above; each lands on its own branch as it starts — see Wave 11 below. Swept
+`M1-503` (merged, PR #52, 2026-08-30) — the row this table carried into Wave 10's tail is
+now on master and its branch is gone from `origin`. Three new claims replace it.)*
 
 ## Planned next wave
 
@@ -197,6 +194,31 @@ numeric one either, and the two departures are why:
 to add; `scripts/finish-item.sh <ITEM>` removes it after the PR merges. One worktree per
 item, named for its branch, created fresh and never reused — a worktree called
 `whiskeyjack-m1-401` that actually held the `m1-305` branch cost an evening.
+
+**Wave 10 closed 2026-08-30 — all four lane heads merged** (`M1-502` PR, `M1-503` PR #52,
+`M2-708` PR #51, `T-903` PR #50), board clean at `origin/master` `84d0856` before Wave 11
+started.
+
+## Wave 11
+
+Three heads, one per pane, started 2026-08-30 off a clean `origin/master` (0 open PRs, 0
+worktrees). `M2-707` is deliberately **not** a fourth pane this wave — see below.
+
+| Lane | Item | Worktree | Notes |
+| --- | --- | --- | --- |
+| 1 — pipeline | `M1-315` | `whiskeyjack-m1-315` | Compose the live paid forecast run. Deps (`M1-312`, `T-903`) both merged. Its own acceptance criteria require either moving the paid composition outside `whiskeyjack_bot.pipeline` or restating that module's zero-provider-call import-graph test — a design decision to write down before round 1, not discover during it. No overlap with the other two lanes. |
+| 2 — submission | `M2-710` | `whiskeyjack-m2-710` | Debt-queue continuation from Wave 9/10 (`M1-609` → `M2-710` → `M1-608` → `M1-314` → `M2-709`). Deps (`M1-607`, `M2-702`) both merged. S/Low, mechanical: align `submission._require_text` with `006_non_blank_identifiers.sql`'s trigger, restore the property strategy narrowed on the M2-703 branch. No schema change. |
+| 3 — testing | `T-901` | `whiskeyjack-t-901` | Golden schema fixtures. Deps (`M1-201`, `M1-501`) both merged. **Owner-split note:** CLAUDE.md assigns T-901–T-904 to Codex — independent acceptance-test authorship, written from spec without reading the implementation. Started here as Claude Code work by owner decision (2026-08-30); whoever works this branch should draft from `CODEX_HANDOFF.md`'s test-requirements section and the `M1-201`/`M1-501` schemas, not from reading `forecast/`'s current implementation, to preserve the independent-test intent. |
+
+**`M2-707` is queued behind `M2-710`, not started.** Both touch `submission.py`'s
+validators — `M2-710` refuses a bad identifier when deriving a key, `M2-707` binds an
+approval to the payload the key was derived from (decision `D33`) — the same shape of
+collision this file already documents for `M1-404`/`M1-405` (two items widening one shared
+function before a review round catches it). Deps (`M2-702`, `M1-502`, `M1-503`) are all
+merged, so it is otherwise ready; pull it into the pane `M2-710` frees. It will also need
+**migration `011`** (claim it in the standing-claims table above before writing the `.sql`
+file) — `D33` names the shape: "Bind approval to a payload hash now (migration + a changed
+M2-701 command...)".
 
 ## Rules that fall out of this
 
