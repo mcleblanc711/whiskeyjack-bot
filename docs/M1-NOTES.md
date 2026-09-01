@@ -6502,6 +6502,13 @@ suite needs to exercise one of those rules, it reaches it only through the compo
 wording — so a round of review reading this file cannot mistake it for evidence about what those
 modules' messages say.
 
+**The boundary held through the M1-201 fix below, and it is worth saying why rather than letting
+a reviewer find the tension.** Closing the blank-title defect required reading `questions/model.py`
+and `forecast/schema.py`'s guard — both already on this item's declared-readable list, because the
+fixtures are written against those two schemas. `forecast/binary.py`, `forecast/numeric.py` and
+`forecast/multiple_choice.py` were still not read, and the suite still reaches their rules only
+through `output_problems`. What changed is the *shape* of the deliverable, not the reading list.
+
 ### Decision — malformed fixtures are generated from the golden fixture, not shipped as files
 
 The alternative — one JSON fixture file per malformed case — was raised and rejected for this
@@ -6542,3 +6549,97 @@ outcome depend on wording owned by modules it was told not to read for this item
 of what "authored blind" is for. `output_problems() != []` is the claim this suite can make
 independently; the exact wording is `binary.py`/`numeric.py`/`multiple_choice.py`'s own tests to
 own.
+
+### Deviation — this test-authoring item changed `src/`, and that is the headline
+
+T-901's row is a testing item, so a reviewer should expect a tests-only diff. It is not one.
+Writing the suite surfaced a defect in M1-201 and the owner's decision was to fix it here rather
+than file it, so three source files changed:
+
+- `src/whiskeyjack_bot/config.py` — now owns `_require_non_blank` and `NonBlankStr`, **moved**
+  from `forecast/schema.py`. Not copied: `forecast/*` imports `questions/model.py` and never the
+  reverse, so `config.py` is the only module both layers already depend on. A second definition
+  would have been the two-sources-of-truth failure M2-703's review was about.
+- `src/whiskeyjack_bot/forecast/schema.py` — imports the two names instead of defining them.
+  **No semantic change**: `NonBlankStr` still sits on a bare `str`.
+- `src/whiskeyjack_bot/questions/model.py` — `_CanonicalQuestionBase.title` and
+  `SourceCategory.name` change from `Field(min_length=1)` to the new `NonBlankQuestionStr`.
+
+The defect, reproduced against the golden fixtures before any fix was written:
+
+```
+CanonicalBinaryQuestion(**{**binary_golden, "title": "   "})  -> ACCEPTED
+SourceCategory(id=17, name="   ")                             -> ACCEPTED
+```
+
+`min_length` counts characters, so whitespace-only satisfies a constraint whose whole purpose is
+to require content. Same defect class as the M1-603 round-5 `trim()` finding and the M1-316 row:
+**a guard whose stated claim is stronger than what it can fail on.**
+
+### Decision — compose both constraints rather than swap one for the other
+
+The obvious fix is to replace `Field(min_length=1)` with the `NonBlankStr` the response schema
+already uses. Checked by execution first, and it would have been wrong — the two guards refuse
+*different* things:
+
+| | surrogate pair | whitespace-only |
+|---|---|---|
+| `Field(min_length=1)` (a pydantic *constrained* string) | refuses | **accepts** |
+| `NonBlankStr` (bare `str` + `AfterValidator`) | **accepts** | refuses |
+
+A swap would have closed the blank hole and opened a surrogate hole on question text — text that
+does not survive this project's persisted form, and the subject of CLAUDE.md's standing
+`content_sha256` gotcha. `tests/unit/test_forecast_record.py:410` is explicit that
+`question.title` is *not* a way in for a surrogate pair precisely because it is a constrained
+string, so the swap would also have silently falsified a comment another suite reasons from.
+
+`NonBlankQuestionStr` is therefore `Annotated[str, Field(min_length=1), AfterValidator(...)]` —
+both. `config.NonBlankStr` is deliberately left alone: the response schema *wants* a surrogate to
+reach `forecast/attribution.py`'s record guard, which refuses it with a better message, and
+`test_forecast_record.py` asserts that path.
+
+### Decision — every constraint walk is generated from one traversal
+
+The first pass generated required-field coverage by introspection but hand-listed the blank and
+bounds cases, and the hand-list named four paths. The asymmetry was the bug: the suite's own
+docstring argues for generation, and the four-path list reached no nested field and no
+`list[NonBlankStr]` item. All walks now run off one `_iter_field_paths`, keyed on each field's
+own metadata — non-blank strings, `allow_inf_nan=False` numbers, `MinLen` sequences. Response
+blank coverage went from 4 paths to 12 per type. `PercentilePoint.value` carries no `ge`/`le`, so
+the non-finite walk is the only thing in the file that reaches it at all.
+
+### Standing risk — not verifiable offline
+
+- **The walks are keyed on pydantic's metadata representation**, not on a public API.
+  `_rejects_non_finite` reads `allow_inf_nan` off a `_PydanticGeneralMetadata` object whose name
+  is private to pydantic. A pin bump that changed how constraints are recorded would empty a walk
+  rather than break it, and every loop over it would pass over nothing.
+  `test_the_constraint_walks_are_not_vacuous` exists exactly for that: it pins the load-bearing
+  paths each walk must keep finding, so the failure mode is a red suite rather than silent
+  vacuity. It cannot be verified against a pydantic version that does not exist yet.
+- **The golden fixtures are hand-authored, not captured from Metaculus.** They are structurally
+  valid against the schemas and mutually consistent (the multiple-choice question's `options` are
+  exactly the labels its response answers; the numeric question's bounds contain its response's
+  percentile values), but nothing offline proves a real MiniBench post normalizes to a record of
+  this shape. That is T-902's mocked-integration surface, not this item's.
+- **The blank-title fix changes what the pipeline accepts from the live API.** Offline, no
+  fixture in the repo carries a whitespace-only title, and the full suite is green. A real
+  Metaculus post whose title is whitespace-only would now raise `NormalizationError` where it
+  previously normalized. That is the intended stricter reading — a question with no title is not
+  forecastable — but it is a live-behaviour change this branch cannot exercise offline.
+
+### Deferred — the suite proves its own discrimination by a mutation run, not by a committed harness
+
+Each constraint this suite claims to guard was neutered in `src/` and the suite confirmed red:
+16 mutations, 16 caught. Two are worth recording because they are what the run *bought*:
+
+- dropping `Field(min_length=1)` while keeping the validator **survived** the first run — nothing
+  asserted that question text refuses a surrogate, so half the composed guard was an unbacked
+  claim. `test_content_requiring_question_strings_reject_unencodable_text` closes it, and both
+  single-constraint mutants now die.
+- the first run also destroyed its own evidence: the harness restored with `git checkout -- src/`
+  while the fix was still uncommitted, so mutations after the first ran against unmodified
+  source and reported anchor misses rather than results. **Commit before mutating.**
+
+The harness itself is not committed — it is scaffolding, and a mutation harness that lives in the
+repo becomes a thing to maintain rather than a thing to run. The result is recorded here.
