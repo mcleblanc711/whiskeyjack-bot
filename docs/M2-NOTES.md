@@ -2111,3 +2111,174 @@ reviewer would otherwise have to find:
   proving anything about the validators — a fresh instance of this project's most expensive
   recurring defect, introduced by a fix rather than by a test. They hold a connection with
   none, so the validators are still reached and all six properties pass unchanged.
+
+## M2-710 — Refuse an identifier the ledger cannot store when deriving a key
+
+`submission._require_text` treated any non-empty string as valid identifier text: a
+whitespace-only value is truthy, and a NUL-bearing one encodes to UTF-8 cleanly, so neither
+tripped the surrogate-catching `encode()` probe. `006_non_blank_identifiers.sql`'s triggers
+on `forecast_records.{record_id,tournament_id}` and `submission_attempts.{attempt_id,
+idempotency_key}` refuse both. `submission_key()`/`canonical_key_json()` would therefore
+mint a key for a `tournament_id` no `forecast_records` row could ever hold — not reachable
+today (`config.py` refuses a blank slug first, and `submission_key_for_record` reads a value
+006 already vetted back out of storage), which is why it surfaced only as a flaky property
+test rather than a failure: `ENCODABLE_TEXT` can draw `" "`, and
+`test_a_key_survives_the_store_and_load_round_trip`'s strategy was narrowed on the M2-703
+branch to keep the gate deterministic.
+
+### Decision — a separate `_require_identifier`, mirroring `lifecycle.py`'s
+
+`lifecycle._require_identifier` (M1-606/M1-607) already solved this exact problem for its
+own writers, and for the same reason it stayed split from `_require_text` there: blank
+prose (`released_by`, `note`) and blank identity mean different things, and only identity
+columns take the stricter `str.strip() != "" and "\x00" not in text` check. `submission.py`
+now carries the identical function, used everywhere it derives a key from or looks a row up
+by `tournament_id`, `record_id`, `idempotency_key`, or `reservation_id` — exactly the
+columns `006` and `010` guard with the matching trigger clause. `note` stays on
+`_require_optional_text`, unchanged — see the deviation below for `released_by`, which did
+not.
+
+### Deviation — `released_by` is narrowed too, and it is not an identifier
+
+The backlog row scopes this item to the identifiers a key is derived from or a row is looked
+up by. While checking that scope was complete I found the same defect one column further on,
+and closed it here on an owner decision rather than filing it.
+
+`010_submission_key_reservations.sql` guards `submission_key_releases.released_by` with the
+same clause it puts on `reservation_id` — non-blank by the 29-codepoint `trim()` set, no
+NUL, at most 200 characters — and says why in its own comment: *"Nullable, because the
+program releases its own reservation and has no person to name. Present means a claim about
+a human, and a blank one is worse than none."* The writer validated it with
+`_require_optional_text`, which accepts both.
+
+Reproduced end to end before any fix was written, on a real reservation:
+`release_submission_key(..., reason="operator_abandoned", released_by="   ")` and the same
+call with `"a\x00b"` each reached the INSERT and came back as
+
+> the ledger rejected this write (detail withheld: a database message can echo stored values)
+
+which is `_execute`'s message, and `_execute`'s docstring says of it: *"Every actionable
+case is refused with its own message before the statement runs. What reaches here is the
+race the trigger exists to catch."* A blank actor name is an actionable case and there is no
+race, so that claim was false for exactly these inputs — the same shape of defect as T-903's
+wrong invariant defended in a comment.
+
+So the split is **not** identifier-versus-prose after all. An actor name is prose; `010`
+guards it anyway. The writer now follows the schema **column by column**: `released_by` takes
+`_require_optional_identifier`, and `note` does not, because `010` asks only that `note` be
+text and a stricter writer would refuse input the ledger accepts — M2-710's own
+two-spellings-of-one-bound defect, pointed the other way. `_require_optional_identifier`
+delegates to `_require_identifier` with the actor bound rather than restating the blank rule;
+a second copy is what this whole family of guards descends from.
+
+`lifecycle`'s own actor columns are deliberately untouched — see the deferral below.
+
+### Rejected — widening `_require_text` instead
+
+One validator with the strict check would have been fewer lines and would have caught
+`released_by` for free. It also refuses input the ledger accepts: `010` asks only that `note`
+be text, and `003`/`004` put no blank clause on `lifecycle`'s actor or body columns at all.
+A writer stricter than its schema is the same defect as one looser than it — a value the
+operator can store through one path and not another — so the two functions stay split and
+each column is matched to the trigger that actually guards it.
+
+### Rejected — leaving the readers loose
+
+`attempt_for_key`, `require_key_unused`, `live_reservation_for_key` and
+`live_reservations_for_record` deliberately validated their argument as *storable text*
+rather than against `submission_key`'s format, and their docstrings give the reason: a ledger
+may hold keys minted under an earlier schema version, and a reader that refused to look at
+them would report an unused key for one that is spent — the exact answer that costs a second
+live post. This branch tightens them, so the question is whether it has re-opened that.
+
+It has not, and the argument is `006`'s, not this branch's. `006` has refused a blank or
+NUL-bearing `idempotency_key` since it landed, and it does not only bind new rows: its
+upgrade **precondition table** refuses to apply over a database already holding a violating
+one, so the ledger stays at version 5 rather than acquiring a rule with a grandfathered
+exception. There is therefore no reachable ledger at this schema version holding a key the
+narrowed reader would now skip. What the readers still decline to do — and what the
+docstrings are actually about — is check the `wjsub-1-` prefix or the derivation, which is
+where a future `KEY_SCHEMA_VERSION` bump would break them.
+
+### Deferred (do not read the absence as an omission)
+
+`lifecycle.py`'s `actor` and body columns keep `_require_text`/`_require_optional_text`.
+That is not the same gap left half-closed: `003_lifecycle_events.sql` and
+`004_pipeline_failure_events.sql` carry **no** blank clause on those columns, so there is no
+disagreement between the two layers to close, and inventing one would be the
+stricter-than-the-schema mistake rejected above. `010` is the outlier among the migrations in
+guarding an actor column, which is why `submission.py` is the module that had to follow it.
+
+### Standing risk — the whitespace set is pinned at 29 codepoints
+
+The parity test asserts `len([cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()])
+== 29` before it uses that set. The assertion is the point: `006` and `010` enumerate those
+29 codepoints literally in their `trim()` calls, so a future CPython Unicode update that
+made `str.isspace()` true for a thirtieth would silently make the schema the *narrower* of
+the two layers — a value Python calls blank and refuses, that the trigger would accept.
+Nothing in the migrations can notice that, because a migration already applied is immutable
+by checksum. The guard-on-the-guard turns it into a test failure naming the count instead.
+
+### On the mutation pass
+
+Three mutants, each restored from a pristine copy and each run with `__pycache__` cleared
+first, because a same-size same-second edit is served back stale by the path loader:
+
+| Mutant | Killed by |
+| --- | --- |
+| `if not text.strip():` → `if False and ...` | the parity test, plus 8 named cases across `tournament_id`, `idempotency_key`, `record_id` and `released_by` |
+| `if "\x00" in text:` → `if False and ...` | the parity test, plus 5 named cases including the message-text assertion on `tournament_id` |
+| `released_by` back on `_require_optional_text` | `test_a_blank_released_by_is_refused_before_the_ledger_is_touched` only — **the parity test survives it** |
+
+That third row is the finding worth keeping. The parity test drives
+`_require_optional_identifier` directly, so it proves the *validators* agree with the schema
+and says nothing about which validator the *writer* calls. Two tests are load-bearing here,
+not one: the parity test for the rule, the writer test for the wiring. A suite with only the
+first would have gone green on a `released_by` that still reached the INSERT.
+
+The writer test asserts the message names `released_by` **and** does not contain `detail
+withheld`. A bare `pytest.raises(SubmissionError)` passes against the pre-fix behaviour —
+the ledger did raise, through `_execute` — and would have proved nothing. Confirmed in that
+order: all four parameters failed on the unfixed tree with the generic message quoted above,
+then passed.
+
+The parity test's `None` case is likewise not decoration. `released_by` is nullable on both
+layers and the loop never draws `None`, so without it the whole third layer would be
+satisfied by a validator that refused everything — which would have killed the `not_posted`
+release route with no case in the file saying so.
+
+### Verification
+
+`tests/unit/test_submission.py::test_every_identifier_field_agrees_with_the_schema_on_what_blank_means`
+is the acceptance criterion executed rather than asserted in a comment: it drives
+`submission._require_identifier` and a real INSERT into the two 006-guarded columns this
+module writes through (`forecast_records.tournament_id`, `submission_attempts.idempotency_key`)
+over the whole 29-codepoint Python whitespace set plus a NUL-bearing string, an ordinary
+value, and U+200B (not whitespace, the control case), and asserts the accept/reject decision
+agrees for every one. The existing malformed-identifier parametrizations across the file
+(`tournament_id`, `record_id`, `idempotency_key`, `reservation_id`) each gained a
+whitespace-only and a NUL-bearing case.
+
+The parity test gained a third layer for `released_by`: `_require_optional_identifier`
+against a real INSERT into `submission_key_releases.released_by`, over the same candidate
+list, plus the `None` case on both layers. `tests/unit/test_submission.py::
+test_a_blank_released_by_is_refused_before_the_ledger_is_touched` covers the writer, over
+`"   "`, `"\t\n "`, `"a\x00b"` and U+00A0 — the last deliberately, because `str.strip()`
+and the migrations' enumerated `trim()` set both call it whitespace and a one-argument SQL
+`trim()` would not, which is M1-603's round 5 on this module's columns.
+
+### On the property pass
+
+`tests/property/test_submission_properties.py`'s `TOURNAMENTS` strategy is narrowed the same
+way (`str.strip() != "" and "\x00" not in text`, on top of the length bound) now that the
+validator matches the schema — folding the old `SEEDABLE_TOURNAMENTS` split back into one
+domain, since derivation-accepted and storage-accepted are the same set again. That split
+existed only to record the gap this item closes, and the comment it carried is replaced by a
+pointer to the parity test, so the equivalence rests on something executable rather than on
+prose.
+
+No property was added. The narrowing makes four existing properties *stricter*, not weaker —
+they seed rows and previously could only do so from the narrow domain — and the new
+behaviour is an equivalence between a Python function and a SQL trigger over a set of 32
+enumerated inputs, which is a table, not a distribution. A `hypothesis` strategy over the
+same 32 values would draw the same values with less of the file saying which ones and why.

@@ -75,25 +75,19 @@ ANYTHING = st.one_of(
 
 # The accepted domain, spelled as strategies rather than as a filter, so that what the
 # module promises about it is visible here.
-TOURNAMENTS = ENCODABLE_TEXT.filter(lambda text: 0 < len(text) <= 200)
-# The subset a `forecast_records` row can actually hold. `submission_key` accepts any
-# non-blank-by-length tournament and derives a key from it in memory, but
-# `006_non_blank_identifiers.sql` refuses a whitespace-only `forecast_records.tournament_id`
-# at INSERT -- so a property that *seeds a row* (via `_seed()`, below) has a narrower domain
-# than one that only derives. `submission._require_text` also accepts a NUL-bearing
-# tournament id that no product path currently reaches (`config.py` already refuses a blank
-# one first); excluded here too so the seed helper's INSERT stays deterministic rather than
-# depending on what a given draw does to JSON/hash canonicalization downstream. Both gaps
-# are **pre-existing hardening items, not this branch's** -- filed as **M2-710**, narrowed
-# here so the gate is deterministic rather than a coin flip.
 #
-# Latent since 006 rather than new: `ENCODABLE_TEXT` has always been able to produce " ",
-# and this suite only stopped drawing one by luck. Surfaced while adding M1-602's
-# `007_forecast_version_chain.sql`, which changed nothing about this clause. `str.strip()`
-# is the right comparison because 006's trim() set is exactly the codepoints Python calls
-# whitespace -- that correspondence is what 004's header spells out and why it enumerates
-# them instead of calling one-argument trim().
-SEEDABLE_TOURNAMENTS = TOURNAMENTS.filter(lambda text: text.strip() != "" and "\x00" not in text)
+# Narrowed to `str.strip() != "" and "\x00" not in text`, on top of the length bound, by
+# **M2-710**: `submission._require_identifier` now refuses a whitespace-only or
+# NUL-bearing identifier the same way `006_non_blank_identifiers.sql`'s trigger on
+# `forecast_records.tournament_id` does, so what `submission_key`/`canonical_key_json`
+# accept in memory and what a `forecast_records` row can actually hold are one domain
+# again -- there is no longer a wider "derives but cannot be stored" set to track
+# separately (the old `SEEDABLE_TOURNAMENTS` split). See
+# `test_submission.py::test_every_identifier_field_agrees_with_the_schema_on_what_blank_means`
+# for the equivalence this narrowing now rests on, rather than a comment here.
+TOURNAMENTS = ENCODABLE_TEXT.filter(
+    lambda text: 0 < len(text) <= 200 and text.strip() != "" and "\x00" not in text
+)
 IDENTIFIER_INTS = st.integers(min_value=1, max_value=2**63 - 1)
 DIGESTS = st.text(alphabet="0123456789abcdef", min_size=64, max_size=64)
 
@@ -391,7 +385,7 @@ def test_a_changed_payload_hash_always_changes_the_key(
 # --------------------------------------------------------------------------------------
 
 
-@given(tournament_id=SEEDABLE_TOURNAMENTS, question_id=IDENTIFIER_INTS, digest=DIGESTS)
+@given(tournament_id=TOURNAMENTS, question_id=IDENTIFIER_INTS, digest=DIGESTS)
 @settings(max_examples=100)
 def test_a_key_survives_the_store_and_load_round_trip(
     tournament_id: str, question_id: int, digest: str
@@ -539,7 +533,7 @@ def test_the_leaky_shapes_are_all_actually_refused(value: object, position: int)
         )
 
 
-@given(tournament_id=SEEDABLE_TOURNAMENTS, digest=DIGESTS)
+@given(tournament_id=TOURNAMENTS, digest=DIGESTS)
 def test_the_gated_seam_never_mints_a_key_for_an_unapproved_record(
     tournament_id: str, digest: str
 ) -> None:
@@ -672,7 +666,7 @@ def test_a_refused_reservation_never_leaks_the_value(value: object, position: in
     assert PLANTED_SECRET not in _rendered(excinfo.value)
 
 
-@given(tournament_id=SEEDABLE_TOURNAMENTS, digest=DIGESTS, cycles=st.integers(1, 4))
+@given(tournament_id=TOURNAMENTS, digest=DIGESTS, cycles=st.integers(1, 4))
 @settings(max_examples=60)
 def test_reservation_sequence_numbers_are_dense_and_ordered(
     tournament_id: str, digest: str, cycles: int
@@ -709,7 +703,7 @@ def test_reservation_sequence_numbers_are_dense_and_ordered(
     assert live_reservation_for_key(_conn(), key) is None
 
 
-@given(tournament_id=SEEDABLE_TOURNAMENTS, digest=DIGESTS)
+@given(tournament_id=TOURNAMENTS, digest=DIGESTS)
 @settings(max_examples=60)
 def test_a_held_key_is_refused_whatever_it_was_derived_from(
     tournament_id: str, digest: str
