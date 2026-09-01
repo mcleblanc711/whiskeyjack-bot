@@ -1,0 +1,4 @@
+{
+  "note": "The source_ids forecast.inputs would have minted for the packet multiple_choice_golden.json was forecast from. Kept beside the golden output rather than derived in the test, so the assertion is golden-against-fixture and not golden-against-the-implementation's own id template (M1-303's lesson).",
+  "source_ids": ["src-001", "src-002"]
+}

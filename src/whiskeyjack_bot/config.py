@@ -19,10 +19,18 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 # prompt.py imports only stdlib, so this stays acyclic. The semver rule lives
 # there because M1-401 owns it; duplicating it here is what let the two drift.
@@ -46,6 +54,33 @@ GroupQuestionMode = Literal["exclude", "unpack_subquestions"]
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _require_non_blank(value: str) -> str:
+    """Reject a string that is present but empty.
+
+    A blank required field is an absent answer wearing a field name. Model output is the
+    place this is routinely tested, but it is not the only one: ``questions/model.py``
+    applies the same rule to the two canonical-question fields that declare a content
+    requirement. Whitespace-only counts as blank: ``str.strip()`` removes the full Unicode
+    whitespace set, and there is no SQL layer under this rule for a narrower ``trim()`` to
+    disagree with (the two-layer failure M1-603 round 5 was about).
+
+    Lives here rather than in ``forecast/schema.py`` because ``forecast/*`` imports
+    ``questions/model.py`` and never the reverse, so this module is the only place both
+    layers can share one definition of the predicate (T-901).
+    """
+    if not value.strip():
+        # No value in the message: the caller's input may be untrusted.
+        raise ValueError("must not be blank")
+    return value
+
+
+# Blank-refusing, but a *bare* ``str`` underneath: a surrogate pair validates here and is
+# caught further down with a better message (``forecast/attribution.py``'s record guard).
+# ``questions/model.py`` composes this with ``Field(min_length=1)`` instead -- see the
+# note there for why neither constraint alone is sufficient.
+NonBlankStr = Annotated[str, AfterValidator(_require_non_blank)]
 
 
 def _require_env_var_name(value: str, field_name: str) -> str:
