@@ -6472,3 +6472,297 @@ being able to go further offline.
 The `0.19` margin the concentrated case lands on is the SDK's wiggle room (`0.2 * 0.95`), not a
 number this project chose. A pin move that removed the wiggle would put a legitimate concentrated
 forecast exactly on the committed `max_adjacent_pmf: 0.2` boundary.
+
+## M1-315 — The live paid run
+
+The first code in this project that can spend money on purpose. Every paid primitive it uses
+has been merged and reviewed for weeks with **no production caller**: nothing in `src/` called
+`retrieve_news`, `retrieve_web`, `decide_fallback`, `persist_paid_run`, `build_forecaster_client`
+or `generate_forecast`. T-903 wired the free path and said so; this is the other half, and it
+also picks up the cross-provider orchestration M1-306 deferred as "a follow-up row, not this
+branch" and nobody ever filed.
+
+Two new modules. `research/orchestrate.py` is the paid-retrieval policy — mint a run id, open
+the row, AskNews, `decide_fallback`, maybe Exa, `persist_paid_run` for each. `pipeline_live.py`
+composes that with `generate_forecast` and the record writers, and owns the batch loop, the
+per-question failure isolation and the two `run_limits` caps. `pipeline.py` is **not edited**.
+
+### Decision — two commands, and the money boundary is the subcommand name
+
+`run` is now the live paid command with `CODEX_HANDOFF.md:274`'s signature; T-903's replay
+command is `run-replay`, argv and behaviour otherwise unchanged. The alternative — one `run`
+where `--attempt-id` selects replay and its absence selects live — is the one the handoff's
+single entry point suggests, and it was rejected on a single property: **under it, a command
+line becomes a paid run by leaving something out.** Today `run` with the committed defaults
+refuses; under that design the same argv would spend. A difference that large should not be an
+omitted flag, and this project's own rule for the Exa fallback ("never as an unannounced
+substitute") is the same rule one layer up.
+
+The cost is honest and worth naming: a command that shipped under one name now means something
+else. That is why `run-replay`'s help text, its docstring and `test_dry_run_acceptance.py`'s
+`run_argv` all say what happened, and why T-903's criterion is restated there as still being
+about exactly that command.
+
+### Decision — the paid composition lives outside `pipeline.py`, rather than restating its test
+
+The criterion offers both: *"the paid composition [must] live outside `whiskeyjack_bot.pipeline`
+or that module's import-graph test [must] be restated."* Restating a guarantee is strictly worse
+than keeping one, so `pipeline.py` is untouched, its three guards in
+`test_dry_run_acceptance.py` are untouched, and the import direction may only run
+`pipeline_live -> pipeline`.
+
+What replaces it for the new module is a **different and weaker claim, stated as such**:
+`pipeline_live` reaches the paid adapters — it must — and reaches no `submission*` and no
+`approval` module, so "this command cannot post" is structural in exactly the way T-903's is.
+One caveat is asserted rather than hidden: `metaculus.client` **is** on the paid graph, because
+`research/exa.py` takes `MissingCredentialError` from the module that also holds `build_poster`.
+`test_the_poster_coupling_is_named_rather_than_hidden` pins that and says why; it is filed as
+**M1-320**. A forbidden-set that quietly omits what it cannot exclude is the vacuity this
+project keeps paying for, so the omission is a test instead of a silence.
+
+`test_the_replay_command_handler_names_no_paid_module` closes a hole T-903's own notes flagged:
+those guards are anchored to `whiskeyjack_bot.pipeline` and never to `whiskeyjack_bot.cli`, and
+every CLI handler imports function-locally — so paid code added to the replay handler would trip
+none of them. An `ast.walk` over that one function reaches an import anywhere inside it.
+
+### Decision — reuse is not replay, and it goes through the ungated reader
+
+Research already completed for a question is reused by default; `--refresh-research` pays again.
+That is `CODEX_HANDOFF.md:295` verbatim — *"retrying a later phase must not repeat an earlier
+paid call unless explicitly requested"* — and the ordinary case it exists for is a rerun after a
+malformed reply, which without it costs the whole retrieval a second time.
+
+It deliberately does **not** call `replay_research`. That function is gated on
+`retrieval.replay_saved_research`, whose meaning is *this run never spends at all* — which a live
+run has already contradicted by existing. Reuse means something different: **this phase is
+already complete.** So it goes through `store.load_packet`, which is ungated, reads SQLite and
+nothing else, and is the function `list_retrieval_run_ids` was separated from precisely so a
+caller could name the runs it used. Both are zero-provider-call by construction; only one of them
+also asserts a mode this command is not in. The reuse is logged, named in the result
+(`research_reused`) and printed by the CLI, so it is never a silent saving.
+
+Saved *model output* is not reused here at all: a live run mints a fresh attempt id, so there is
+nothing to address a saved reply by. Replaying one is `run-replay --attempt-id`, which is a
+different command — which is the point of the split.
+
+### Decision — `research_failed` gets its first writer, and a persistence failure gets none
+
+Three per-question failure shapes, three different ledger consequences, and the differences are
+the substance of `_attempt_question`:
+
+- **Research found nothing, or the provider failed** → `research_failed` (M1-606). This is that
+  event type's **first production writer**; `pipeline.py` writes only `generation_failed`. A
+  refusal raised before any provider call is recorded with `retrieval_run_id=None`, which is the
+  shape `record_pre_forecast_failure` documents for a failure preceding any `research_runs` row.
+  "Found nothing" is `no_evidence` and "the call raised" is `provider_error` — the same
+  distinction `decide_fallback` refuses to blur, because a provider that answered with zero
+  documents has not failed.
+- **The reply was unusable** → the raw text is written to disk *first* (`persist_raw_output`:
+  the money bought that text and the artifact is the only trace of what it bought), then
+  `generation_failed` carrying `generation.failure_code`, which is already a
+  `PreForecastFailureCode` so nothing is re-derived.
+- **The forecast was good and the ledger refused the row** → **nothing is written.**
+  `PreForecastEventType` has two members and neither is true: the generation did not fail.
+  Recording one anyway would put a false claim in the ledger, which T-903 already settled. What
+  survives is the artifact on disk and `status="not_recorded"` with the sanitized reason on the
+  batch result. Widening the vocabulary is a `CHECK` rebuild of an append-only table — the cost
+  `009` refused — so it is **M1-317**, not a sideways fix. The tension is real and is left
+  visible: the one failure mode that implies a sick ledger is the one the ledger does not see.
+
+### Decision — the paid path writes the row even when the artifact is lost
+
+The single behavioural difference from `run_replay`, and it is M1-312's rule rather than an
+oversight. `run_replay` refuses a record whose artifact was not written because it spends nothing
+and can hold itself to that bar; `_require_retained_output`'s own docstring names this caller as
+the one that legitimately needs the other behaviour. For a **paid** attempt the cost and the
+invocation count are facts whether or not the evidence survived, so the row is written regardless
+and `QuestionOutcome.artifact_outcome` carries all three members of the vocabulary for real.
+Rolling back here would trade a lost artifact for a lost record of a real spend.
+
+The transaction is still one unit — `persist_generation` and `record_validation` inside one
+`lifecycle.transaction`, T-903's round-1 finding 1 — and what is deliberately absent from it is
+only the artifact refusal.
+
+### Decision — queries are derived minimally, and that is a cost decision not a stub
+
+`derive_queries` returns the question title, plus the group parent title joined to it when the
+question is an M1-202 sibling whose own title can be a bare option label. One or two queries.
+`retrieval.max_queries_per_question` is 6 and AskNews bills two calls per query, so the committed
+ceiling is 12 billable calls per question and this produces 2 or 4.
+
+The alternatives were rejected for reasons, not for effort: asking the model to expand the
+question into search queries spends a billable call to decide how to spend billable calls, and
+keyword heuristics over a title are guesses nothing in this project can evaluate offline. Filed
+as **M1-318**, which is where the empirical question belongs.
+
+### Deviation — `max_cost_usd` bounds known spend and cannot bound unknown spend
+
+Both `run_limits` caps are enforced and neither had ever had a reader anywhere in `src/`.
+`max_questions` is the ceiling on `--limit`, which may only lower it — so the committed default
+of 1 means an operator who has not thought about it gets one question. `max_parallel_questions`
+is refused unless it is 1, rather than ignored: a configuration asking for parallelism that
+silently does not happen is a claim the operator cannot check.
+
+`max_cost_usd` is checked against accumulated **known** cost before each question after the
+first. The plan for this item said something stricter — that a call reporting an unknown cost
+should stop the batch, since `cost_usd is None` means unknown and never free (M1-303 round 3).
+**That rule is unimplementable here, and the evidence is structural rather than a matter of
+taste:** `research/asknews.py` records `cost_usd: None` on *every* run by design ("AskNews
+reports usage in credits, not currency, and no credit->USD rate is configured"), and
+`forecast/generate.py` publishes `None` for any model LiteLLM cannot price — the pinned SDK
+prints exactly that warning for the config's own example model. Under the strict rule every
+batch would stop after its first question and `--limit` would be dead on arrival.
+
+So the rule is: known cost accumulates and bites; unknown cost is **counted in `unpriced_calls`
+and never summed as zero**; and the claim is stated plainly in `run_live`'s docstring, in the
+`BatchRun` docstring and in the CLI's two-figure `spend:` line rather than implied. The cap
+bounds the spend it can see. Owner decision to widen it — pricing AskNews credits, or refusing to
+run against an unpriced model — belongs with the operator, not with this composition.
+
+### Deviation — this row ran L, not the M it was estimated at
+
+Absorbing the retrieval orchestrator was an owner decision taken before any code (2026-08-30),
+because the criterion requires live retrieval and no orchestrator existed. The row is updated to
+`L`. Worth recording for the next wave's planning: the backlog's estimate was made when the
+orchestrator was assumed to exist, and `docs/TRACKS.md` has no column that would have caught it.
+
+### Two of my own claims were false, and the same technique found both
+
+The entry most worth keeping, because it is the project's recurring defect class arriving twice
+in one branch, in code I had already reviewed while writing it.
+
+1. **`_require_storable` is not a live defence.** Its first docstring said a lone surrogate
+   reaches a question title from a snapshot file, since `"\ud800"` is valid JSON and decodes to
+   one. The premise is true and the conclusion is false: **pydantic's `str` refuses a lone
+   surrogate outright** (`string_unicode`), so a validated `CanonicalQuestion` cannot hold one.
+   Found because the property strategy builds questions through the real model rather than a
+   stub — every property failed *inside the strategy*. The guard is kept, because
+   `derive_queries` is public and promises that only `OrchestrationError` escapes it and
+   `model_construct` bypasses the validator, but it is now labelled a totality backstop and
+   `test_the_validated_model_already_refuses_a_lone_surrogate_title` pins the thing that
+   actually protects it.
+2. **The "one clock" argument was wrong.** I wrote that normalizing `now` once matters because
+   `store.complete_run` matches on `started_at_utc` and a second normalization inside the adapter
+   would store a different text, so the completion would match no row *after* the calls were
+   billed. It cannot happen: `ResearchRun.started_at_utc` is `UtcDatetime`, an `AwareDatetime`
+   with `AfterValidator(_to_utc)`, so every spelling of one instant validates to the same value.
+   Found by a mutation that handed the adapter the caller's raw `now` and **survived the whole
+   suite** — which also means the test I wrote for the claim was vacuous. Both were rewritten:
+   the real reason to call `require_run_metadata` there is that it is the *preflight*, which must
+   run before the run id reaches a billable call, and
+   `test_the_run_model_is_what_makes_the_two_timestamps_agree` pins the dependency that would
+   have to break for the ordering question to reopen.
+
+The generalizable rule, and it is one layer past the vacuous-property lesson already in
+`docs/LESSONS.md`: **a guard whose stated reason is a hazard the schema already closed reads as
+load-bearing to every future reader, and neither the tests nor the review round will notice,
+because it passes.** What noticed both here was writing the property strategy against the real
+model, and mutating the line the claim was about. Neither is expensive; both were done before
+round 1 rather than after round 5.
+
+### Rejected — options weighed and not taken
+
+- **Restating `pipeline.py`'s import-graph test.** Offered by the criterion; strictly worse.
+- **Reusing `PipelineError` in `pipeline_live`.** It would make the replay module a dependency of
+  the paid one for a class name, and the two commands fail for different reasons.
+- **`--attempt-id` as the implicit live/replay switch.** See the first decision.
+- **Copying `_require_retained_output` onto the paid path.** It would take M1-312's decision away
+  from the path that needs it — the docstring of the function being copied says so.
+- **Collapsing duplicate documents across runs.** `dedup_key` carries the `retrieval_run_id`, so
+  cross-run collapse is impossible by construction, and dropping one would make a run's row claim
+  evidence the packet does not carry. The consequence — one article shown to the model as two
+  source ids — is real and is filed as **M1-321**.
+- **Inventing an `official_source_required` trigger.** Half of D18's fallback policy is currently
+  unreachable because no config field expresses it. Passing `False` and filing **M1-319** is
+  better than putting a paid-call trigger in a module that cannot say where it came from.
+- **Building the Exa client up front and refusing when its key is missing.** The fallback is
+  optional; an operator may reasonably have no Exa account. Its absence is probed once, logged
+  once, and turns a failed primary into a recorded research failure.
+
+### Deferred (do not read the absence as an omission)
+
+- **M1-317** — a ledger identity for a post-generation persistence failure.
+- **M1-318** — query construction chosen against measured retrieval quality.
+- **M1-319** — a source for `official_source_required`.
+- **M1-320** — `MissingCredentialError` out of the module that holds the poster.
+- **M1-321** — what a cross-provider duplicate document means to the forecaster.
+- **No concurrency.** `max_parallel_questions != 1` is refused rather than implemented. The
+  ledger's write path has never been exercised under concurrency and this is not the item to
+  find out in.
+- **No budget enforcement inside `generate_forecast`.** `MonetaryCostManager` is still entered
+  with `hard_limit=0`; the cap lives in the batch loop, where the accumulated figure is.
+- **`M1-507`'s gap is untouched.** `append_forecast_version` still runs attribution validation
+  only. This path reaches it through `_parse` → `persist_generation`, so the type-specific checks
+  do run — but by route, not by the writer's own contract.
+
+### Standing risk — not verifiable offline
+
+- **Nothing here has ever made a real provider call.** Every scenario uses recording doubles
+  installed at `pipeline_live`'s construction seam, under three network guards. The first live
+  run is where a real AskNews response shape, a real LiteLLM cost figure and a real model reply
+  meet this code for the first time.
+- **`max_cost_usd` cannot bound what nobody prices** — see the Deviation. With the committed
+  primary provider, *every* retrieval call is unpriced, so the cap constrains the model calls
+  only. An operator reading `spend:` must read both figures.
+- **The batch shares one `now`.** One invocation is one run and its rows share its instant, which
+  keeps the batch reproducible and every `started_at_utc` comparable. A long batch therefore
+  stamps its last question with the time the first one started — immaterial against a freshness
+  window measured in days, and stated rather than hidden.
+- **A reused packet may be arbitrarily old.** Reuse asks "is there completed research for this
+  question", not "is it still fresh". `forecast.fail_on_stale_research` /
+  `flag_on_stale_research` have no consumer yet (M1-504), so an operator rerunning weeks later
+  gets the old evidence unless they pass `--refresh-research`. The record still names the runs it
+  used, so this is visible in the ledger rather than lost.
+
+### Verification
+
+`tests/unit/test_research_orchestrate.py` (27), `tests/unit/test_pipeline_live.py` (28),
+`tests/acceptance/test_live_run_acceptance.py` (13, of which 6 are import-graph guards) and
+`tests/property/test_orchestrate_properties.py` (6 properties over `derive_queries`).
+
+Two of the acceptance tests are a matched pair over one configuration, and they are the clearest
+statement of the item's central asymmetry: under `storage.retain_raw_model_output: false`,
+`run-replay` **refuses before reading anything** and `run` **appends the row and prints
+`artifact: (none: retention_disabled)`**. Both are asserted, so neither docstring's reasoning can
+go quietly false. It is also why the `(none: ...)` fallback T-903 deleted from its own command as
+unreachable is present in this one: here the state is reachable, and printing it is the only way
+an operator learns the record cannot be replayed.
+
+Three claims are asserted by **counting provider calls** rather than by reading a log line — that
+a refusal happened before any spend, that reuse costs nothing, and that `--refresh-research`
+really pays again. The ordering claim that `open_run` precedes the first billable call is
+asserted from *inside* the call: the fake provider opens its own connection to the ledger during
+`search_news` and records that the row is present and still open. Asserting it afterwards would
+prove nothing, because the row is completed by then.
+
+The acceptance batch forecasts all three supported question types in one run, which also pays off
+T-903's "no numeric or multiple-choice acceptance scenario" deferral.
+
+**Mutation check.** Every assertion above was checked against a deliberately broken tree before
+it was trusted, with the harness restoring from a pristine copy taken once outside the loop and
+verifying byte-equality afterwards (M1-312's lesson: a mutation harness that can silently fail to
+restore is indistinguishable from a suite that does not catch the mutation).
+
+**Two of the first fourteen survived, and both were findings rather than nuisances.** One was the
+vacuous clock test above. The other was a per-question refusal escaping `_attempt_question` and
+aborting the batch, with **no test reaching that path at all** — every other failure arrives as a
+value on the outcome, so nothing exercised the one that arrives as an exception, which is the
+criterion's own isolation clause going unchecked.
+`test_a_refusal_raised_mid_batch_is_isolated_like_any_other_failure` closes it. After both
+corrections, **15 of 15 discriminate**, including two added to replace the mutation that had
+proved nothing:
+
+| mutation | test that turns red |
+| --- | --- |
+| `open_run` moved after the calls | the ledger probed from inside `search_news` |
+| `official_source_required=True` | a zero-document primary does not authorize a paid fallback |
+| reuse disabled / reuse forced | the two call-count tests |
+| the cost ceiling check dropped | known spend reaches the budget |
+| `--limit` allowed past `max_questions`; the ceiling ignored | the two limit tests |
+| `run_replay`'s artifact refusal copied onto the paid path | a lost artifact still appends |
+| a mid-batch refusal allowed to escape | the isolation test above |
+| a run id cited on a failure that preceded every run row | the same test |
+| the `now` preflight skipped | a naive `now` is refused before any call |
+| a replay configuration allowed to drive `run` | the parametrized switch refusal |
+| a submission import added to the replay handler | the `ast.walk` over that handler |
+| whitespace collapse dropped; the storability backstop dropped | two properties |

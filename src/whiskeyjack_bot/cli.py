@@ -124,26 +124,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="the uncertain attempt to resolve; submit prints it when it leaves one open",
     )
 
+    # Two commands, and the split is the safety property: `run` spends money and
+    # `run-replay` cannot. T-903 shipped the replay path under the name `run` because it was
+    # the only one that existed; `CODEX_HANDOFF.md` line 274 always meant the live one. With
+    # both present, the difference between billing a provider and not billing one is a
+    # different word on the command line rather than an omitted flag -- so a command line
+    # cannot become a paid run by leaving something out.
     run = subparsers.add_parser(
         "run",
         help=(
-            "forecast one saved question from replayed research and a saved model reply; "
-            "makes no provider call and never submits"
+            "forecast one or more saved questions through LIVE retrieval and a LIVE model "
+            "call; this command spends money and never submits"
         ),
     )
     run.add_argument("--config", default="config.yaml", type=Path)
     run.add_argument(
-        "--question-id", required=True, type=int, help="the question in the snapshot to forecast"
-    )
-    run.add_argument(
         "--snapshot", required=True, type=Path, help="the saved question snapshot to load from"
     )
-    run.add_argument(
-        "--attempt-id",
-        required=True,
+    selection = run.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--question-id", type=int, help="forecast exactly this question from the snapshot"
+    )
+    selection.add_argument(
+        "--limit",
+        type=int,
         help=(
-            "the saved attempt whose model reply to replay; the record this writes is "
-            "stamped with a freshly minted attempt id of its own"
+            "how many of the snapshot's supported questions to forecast, in order; may "
+            "only lower run_limits.max_questions, never raise it"
+        ),
+    )
+    run.add_argument(
+        "--refresh-research",
+        action="store_true",
+        help=(
+            "retrieve again even when the ledger already holds completed research for the "
+            "question; without it a rerun repeats no paid retrieval call"
         ),
     )
     run.add_argument(
@@ -152,6 +167,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="assert submission.dry_run is set; refuses if it is not",
     )
     run.add_argument(
+        "--no-submit",
+        action="store_true",
+        help="assert submission.no_submit is set; refuses if it is not",
+    )
+
+    run_replay = subparsers.add_parser(
+        "run-replay",
+        help=(
+            "forecast one saved question from replayed research and a saved model reply; "
+            "makes no provider call and never submits"
+        ),
+    )
+    run_replay.add_argument("--config", default="config.yaml", type=Path)
+    run_replay.add_argument(
+        "--question-id", required=True, type=int, help="the question in the snapshot to forecast"
+    )
+    run_replay.add_argument(
+        "--snapshot", required=True, type=Path, help="the saved question snapshot to load from"
+    )
+    run_replay.add_argument(
+        "--attempt-id",
+        required=True,
+        help=(
+            "the saved attempt whose model reply to replay; the record this writes is "
+            "stamped with a freshly minted attempt id of its own"
+        ),
+    )
+    run_replay.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="assert submission.dry_run is set; refuses if it is not",
+    )
+    run_replay.add_argument(
         "--no-submit",
         action="store_true",
         help="assert submission.no_submit is set; refuses if it is not",
@@ -733,13 +781,131 @@ def _read_payload_file(path: Path) -> dict[str, object] | None:
     return payload
 
 
+def _print_question_outcome(outcome: object) -> None:
+    """One question's block. Values only; every string here came back sanitized."""
+    from whiskeyjack_bot.pipeline_live import QuestionOutcome
+
+    if not isinstance(outcome, QuestionOutcome):  # pragma: no cover - defensive
+        return
+    print(f"question:  {outcome.question_id}")
+    print(f"  attempt:  {outcome.attempt_id}")
+    reused = " (reused, no provider call)" if outcome.research_reused else ""
+    print(
+        f"  research: {len(outcome.retrieval_run_ids)} run(s), "
+        f"{outcome.document_count} source(s){reused}"
+    )
+    if outcome.status == "recorded":
+        print(f"  record:   {outcome.record_id}  version: {outcome.forecast_version}")
+        print(f"  packet:   {outcome.research_packet_sha256}")
+        # The `(none: ...)` fallback that `run-replay` does **not** have, and the asymmetry
+        # is M1-312's rule rather than an inconsistency: `run_replay` refuses a record whose
+        # artifact was not written, so printing that state would describe something it
+        # cannot produce. A paid attempt's row is written regardless -- the cost is a fact
+        # even when the evidence copy is not -- so here the state is reachable and printing
+        # it is the only way an operator learns the record cannot be replayed.
+        print(f"  artifact: {outcome.raw_output_path or f'(none: {outcome.artifact_outcome})'}")
+        print(f"  hash:     {outcome.forecast_sha256}")
+        print("  status:   validated")
+    else:
+        detail = f" ({outcome.detail_code})" if outcome.detail_code else ""
+        print(f"  status:   {outcome.status}{detail}")
+        for problem in outcome.problems:
+            print(f"    - {problem}")
+        if outcome.note:
+            print(f"    note: {outcome.note}")
+
+
 def _run_run(args: argparse.Namespace) -> int:
+    """Forecast one or more saved questions live, through paid retrieval and a paid call.
+
+    **This command spends money**, which is why it is a different word from ``run-replay``
+    rather than the same word with a flag. ``CODEX_HANDOFF.md`` line 274 always described
+    the live command; T-903 shipped the replay path under this name because it was the only
+    one that existed, and recorded the deviation and this item as its owner.
+
+    It still **cannot submit**, and structurally rather than by a check: no submission and no
+    approval module is on ``whiskeyjack_bot.pipeline_live``'s import path. ``--dry-run`` and
+    ``--no-submit`` keep T-903's treatment exactly -- they *assert* the configuration and
+    never override it, because a flag that silently forced the safe value would let a config
+    with ``dry_run: false`` pass a command line that reads as safe.
+
+    Every question gets its own block and the batch gets a summary, printed even when
+    questions failed: a partial batch is the ordinary outcome of per-question isolation, and
+    an operator needs the identity and hash of the records that *were* written -- their next
+    command is ``approve --forecast-sha256 <hash>``. The exit code is ``EXIT_OK`` only when
+    no question failed.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.pipeline_live import LiveRunError, run_live
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    if args.dry_run and not config.submission.dry_run:
+        print("refused: --dry-run was passed but submission.dry_run is not set")
+        return EXIT_REFUSED
+    if args.no_submit and not config.submission.no_submit:
+        print("refused: --no-submit was passed but submission.no_submit is not set")
+        return EXIT_REFUSED
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            batch = run_live(
+                connection,
+                config,
+                snapshot=args.snapshot,
+                now=datetime.now(tz=timezone.utc),
+                question_id=args.question_id,
+                limit=args.limit,
+                refresh_research=args.refresh_research,
+            )
+        except LiveRunError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        for outcome in batch.outcomes:
+            _print_question_outcome(outcome)
+        print(f"records:   {batch.records_written} of {len(batch.outcomes)} question(s)")
+        # Two figures, never one. `cost_usd is None` means unknown, never free, so a single
+        # total would have to invent a zero for every unpriced call -- and AskNews prices
+        # none of its calls at all. Saying both is the only honest summary available.
+        print(
+            f"spend:     {batch.known_cost_usd:.4f} USD known, "
+            f"{batch.unpriced_calls} unpriced call(s)"
+        )
+        print(f"stopped:   {batch.stop_reason}")
+        print("submitted: no -- `run` never submits; approve and submit are separate commands")
+        return EXIT_OK if batch.failures == 0 and batch.outcomes else EXIT_REFUSED
+    finally:
+        connection.close()
+
+
+def _run_run_replay(args: argparse.Namespace) -> int:
     """Forecast one saved question from replayed research and a saved reply (T-903).
 
     The command T-903's criterion is about: *"one command, one saved question, research +
     model replay -> one complete validated ledger record, zero provider calls, zero
     submission calls, reproducible forecast hash."* The last clause is ``replay
     --record-id`` run afterwards on the record this prints.
+
+    **Named ``run-replay`` since M1-315**, which gave ``run`` to the live paid composition
+    that ``CODEX_HANDOFF.md`` line 274 always described. Nothing else about this command
+    changed -- same flags, same refusals, same zeroes -- and the rename is what makes those
+    zeroes legible from the command line rather than from the configuration file.
 
     **This command cannot submit**, and that is structural rather than a check: no
     submission module is on ``whiskeyjack_bot.pipeline``'s import path, so there is nothing
@@ -950,6 +1116,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_verify_submission(args)
     if args.command == "run":
         return _run_run(args)
+    if args.command == "run-replay":
+        return _run_run_replay(args)
     if args.command == "release-key":
         return _run_release_key(args)
     if args.command == "replay":

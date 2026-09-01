@@ -36,8 +36,13 @@ from scenario import (
 
 
 def run_argv(seed: Seed, *extra: str) -> list[str]:
+    # `run-replay`, not `run`. M1-315 gave the live paid composition the name
+    # `CODEX_HANDOFF.md` line 274 always meant by it and moved this one alongside; the
+    # command, its flags and every claim below are otherwise unchanged. T-903's criterion is
+    # a sentence about *a* command producing one validated record with zero provider calls,
+    # and it is still exactly this one.
     return [
-        "run",
+        "run-replay",
         "--config",
         str(seed.config_file),
         "--question-id",
