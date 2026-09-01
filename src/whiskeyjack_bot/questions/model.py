@@ -26,14 +26,31 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import AfterValidator, Field, TypeAdapter, model_validator
 
-from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
+from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel, _require_non_blank
 
 # Pydantic accepts NaN and +/-infinity for a bare ``float``, but ``model_dump_json``
 # serializes them as JSON ``null`` -- which then fails to validate back, breaking the
 # round-trip the discriminated union promises. Every canonical float is finite.
 _Finite = Annotated[float, Field(allow_inf_nan=False)]
+
+
+# A string that must carry content, spelled with *both* constraints because neither is
+# sufficient alone (T-901 found the gap by execution):
+#
+# * ``Field(min_length=1)`` makes this a pydantic *constrained* string, which refuses a
+#   lone surrogate or a surrogate pair -- text that cannot survive this project's
+#   persisted form (``json.dumps(ensure_ascii=True)`` round-trips a pair into a different
+#   string; see ``hashing.py`` and CLAUDE.md's standing gotcha). But ``min_length``
+#   counts characters, so ``"   "`` satisfies it.
+# * ``_require_non_blank`` strips before testing, so it refuses ``"   "`` -- but it sits
+#   on a bare ``str``, which accepts a surrogate pair.
+#
+# Question text arrives from the Metaculus API (untrusted), so both are reachable. This
+# is deliberately stricter than ``config.NonBlankStr``, which the *response* schema uses:
+# there a surrogate is allowed through to be caught downstream with a better message.
+NonBlankQuestionStr = Annotated[str, Field(min_length=1), AfterValidator(_require_non_blank)]
 
 
 class SourceCategory(_StrictModel):
@@ -52,7 +69,7 @@ class SourceCategory(_StrictModel):
     """
 
     id: int
-    name: str = Field(min_length=1)
+    name: NonBlankQuestionStr
     slug: str | None = None
 
 
@@ -67,7 +84,7 @@ class _CanonicalQuestionBase(_StrictModel):
     question_id: int
     post_id: int
     url: str | None = None
-    title: str = Field(min_length=1)
+    title: NonBlankQuestionStr
     background_info: str | None = None
     # The resolution fine print is the headline retention target of M1-201.
     resolution_criteria: str | None = None

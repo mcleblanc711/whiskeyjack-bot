@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0.0",
+  "question_id": 41201,
+  "question_type": "multiple_choice",
+  "as_of_utc": "2026-09-01T12:00:00Z",
+  "base_rate": {
+    "reference_class": "Regular-season head-to-head results between the three remaining teams this year",
+    "prior_probability": null,
+    "basis": "The Falcons won 5 of 8 meetings against the Herons and both playoff meetings against teams that later reached the final; a Neither outcome (cancellation, no reschedule) has occurred once in the last ten seasons.",
+    "source_ids": ["src-001"]
+  },
+  "model_prior": null,
+  "status_quo": "The semifinal seeding holds and the championship is played on schedule between the Falcons and the Herons, with no material injury news before kickoff.",
+  "evidence_adjustments": [
+    {
+      "claim": "The Falcons' starting forward was ruled out for the semifinal with a minor injury but is listed as probable for the final.",
+      "direction": "down",
+      "magnitude": "small",
+      "source_ids": ["src-002"],
+      "load_bearing": true
+    },
+    {
+      "claim": "The Herons have won four straight matches on the scheduled venue's surface, their best run there in a decade.",
+      "direction": "up",
+      "magnitude": "medium",
+      "source_ids": ["src-001"],
+      "load_bearing": true
+    }
+  ],
+  "load_bearing_facts": [
+    {
+      "claim": "The championship is scheduled for a neutral venue whose surface has historically favoured the Herons.",
+      "source_ids": ["src-001"]
+    }
+  ],
+  "source_disagreements": [],
+  "failure_modes": [
+    "A weather postponement past the season window would force a Neither resolution regardless of form.",
+    "The forward's injury status could change again before kickoff, which would move the Falcons' odds either direction."
+  ],
+  "reasoning_strategy_tags": ["base_rate", "trend", "inside_view"],
+  "rationale_summary": "The Falcons hold the better head-to-head record, but the Herons' recent form at the scheduled venue is the strongest signal available and the Falcons' forward is an open question. Weighing venue history above the longer-run head-to-head gives the Herons a modest edge, with the Falcons close behind and a small residual on Neither for schedule risk.",
+  "process_confidence": 0.58,
+  "uncertainty_notes": [
+    "The forward's final injury status was not confirmed as of the cutoff."
+  ],
+  "final_prediction": {
+    "options": [
+      {"option": "Falcons", "probability": 0.45},
+      {"option": "Herons", "probability": 0.5},
+      {"option": "Neither", "probability": 0.05}
+    ]
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0.0",
+  "question_id": 52078,
+  "question_type": "numeric",
+  "as_of_utc": "2026-08-01T12:00:00Z",
+  "base_rate": {
+    "reference_class": "Named Atlantic storm counts for the 1991-2020 climatological period",
+    "prior_probability": null,
+    "basis": "The 30-year mean is about 14 named storms per season, with a right-skewed distribution and a small number of hyperactive years well above 20.",
+    "source_ids": ["src-001"]
+  },
+  "model_prior": null,
+  "status_quo": "Sea-surface temperatures and the current ENSO outlook resemble the last several above-average seasons, so the count lands somewhat above the 30-year mean.",
+  "evidence_adjustments": [
+    {
+      "claim": "Pre-season sea-surface temperatures across the main development region are running about 1C above the 1991-2020 average.",
+      "direction": "up",
+      "magnitude": "medium",
+      "source_ids": ["src-001"],
+      "load_bearing": true
+    },
+    {
+      "claim": "The seasonal outlook gives roughly even odds of a weak La Nina developing, which historically favours more storm formation than a neutral or El Nino state.",
+      "direction": "up",
+      "magnitude": "small",
+      "source_ids": ["src-002"],
+      "load_bearing": true
+    }
+  ],
+  "load_bearing_facts": [
+    {
+      "claim": "The 30-year climatological mean is the anchor the adjustments move away from.",
+      "source_ids": ["src-001"]
+    }
+  ],
+  "source_disagreements": [],
+  "failure_modes": [
+    "Saharan dust outbreaks early in the season can suppress formation well below what sea-surface temperatures alone would predict.",
+    "A late-developing La Nina would have less effect on the season than a La Nina already established by June."
+  ],
+  "reasoning_strategy_tags": ["base_rate", "trend", "measurement_model"],
+  "rationale_summary": "The climatological mean of about 14 storms is the starting point. Warmer than average sea-surface temperatures and favourable wind shear conditions this year both push the count upward, and a possible La Nina adds a further small push in the same direction. Uncertainty is wide because a single suppressing factor, such as a Saharan dust outbreak, has cut otherwise favourable seasons well below their preseason outlook before.",
+  "process_confidence": 0.55,
+  "uncertainty_notes": [
+    "Wind shear forecasts beyond two months carry limited skill and were not a strong independent input here."
+  ],
+  "final_prediction": {
+    "percentiles": [
+      {"percentile": 0.01, "value": 8.0},
+      {"percentile": 0.05, "value": 10.0},
+      {"percentile": 0.10, "value": 12.0},
+      {"percentile": 0.25, "value": 15.0},
+      {"percentile": 0.50, "value": 18.0},
+      {"percentile": 0.75, "value": 22.0},
+      {"percentile": 0.90, "value": 26.0},
+      {"percentile": 0.95, "value": 29.0},
+      {"percentile": 0.99, "value": 34.0}
+    ]
+  }
+}

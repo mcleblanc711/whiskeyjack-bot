@@ -58,7 +58,9 @@ from pydantic import (
     model_validator,
 )
 
-from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
+# ``NonBlankStr`` lives in config.py because questions/model.py needs the same
+# predicate and forecast/* imports questions/* rather than the reverse (T-901).
+from whiskeyjack_bot.config import NonBlankStr, SupportedQuestionType, _StrictModel
 
 # The version of the *output record* contract, which is not the prompt's version.
 # ``prompts/forecaster.md`` carries both: its H1 reads v1.1.0 (the prompt, M1-401)
@@ -101,24 +103,6 @@ REASONING_STRATEGY_TAGS: frozenset[str] = frozenset(get_args(ReasoningStrategyTa
 # ("rationale_summary must be no more than 120 words"). D24 is the reason it has a
 # cap at all: the record stores a concise auditable rationale, never deliberation.
 MAX_RATIONALE_WORDS = 120
-
-
-def _require_non_blank(value: str) -> str:
-    """Reject a string that is present but empty.
-
-    A blank required field is an absent answer wearing a field name, and the model
-    output is the one place in this pipeline where that distinction is routinely
-    tested. Whitespace-only counts as blank: ``str.strip()`` removes the full Unicode
-    whitespace set, and there is no SQL layer under this module for a narrower
-    ``trim()`` to disagree with (the two-layer failure M1-603 round 5 was about).
-    """
-    if not value.strip():
-        # No value in the message: this is model output.
-        raise ValueError("must not be blank")
-    return value
-
-
-NonBlankStr = Annotated[str, AfterValidator(_require_non_blank)]
 
 
 def _to_utc(value: datetime) -> datetime:
