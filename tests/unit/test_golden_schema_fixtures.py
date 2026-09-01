@@ -583,6 +583,36 @@ def test_every_content_requiring_question_string_rejects_a_blank(qtype: str) -> 
 
 
 @pytest.mark.parametrize("qtype", QUESTION_TYPES)
+def test_content_requiring_question_strings_reject_unencodable_text(qtype: str) -> None:
+    """The other half of the composed guard, and the half a mutation test found unbacked.
+
+    ``NonBlankQuestionStr`` is ``Field(min_length=1)`` *and* ``_require_non_blank``, and
+    the two refuse different things: only the constrained-string half refuses a surrogate,
+    which is text that cannot survive this project's persisted form
+    (``json.dumps(ensure_ascii=True)`` round-trips a pair into a different string, so the
+    record would be accepted, stored, and read back as something else -- see
+    ``hashing.py`` and CLAUDE.md's standing gotcha).
+
+    Without this test, dropping ``min_length=1`` and keeping the validator is a mutation the
+    suite does not notice. Asserted on the same walk the blank case uses, so a field that
+    gains the guard later is covered by both halves at once.
+
+    This is deliberately *stricter* than the response schema, where ``config.NonBlankStr``
+    lets a surrogate through to be refused downstream with a better message
+    (``tests/unit/test_forecast_record.py`` owns that path).
+    """
+    golden = _question_golden(qtype)
+    paths = _blank_paths(QUESTION_MODELS[qtype], golden)
+    assert paths, "the blank walk must find at least one guarded string"
+    surrogate_pair = "\ud83d" + "\ude00"
+    assert len(surrogate_pair) == 2
+    for path in paths:
+        for bad in (surrogate_pair, "\ud83d", f"ok {surrogate_pair} ok"):
+            with pytest.raises(ValidationError):
+                QUESTION_MODELS[qtype](**_set_path(golden, path, bad))
+
+
+@pytest.mark.parametrize("qtype", QUESTION_TYPES)
 def test_every_finite_only_response_number_rejects_nan_and_infinity(qtype: str) -> None:
     """``allow_inf_nan=False`` is declared on more fields than the bound tests below reach.
 
