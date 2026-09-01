@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import sys
 import traceback
 from collections.abc import Iterator
 from dataclasses import asdict
@@ -526,6 +527,13 @@ def test_a_stored_forecast_record_column_of_the_wrong_type_is_refused(
         ("tournament_id", b"minibench", "tournament_id must be a non-empty string"),
         ("tournament_id", "x" * 201, "longer than the 200-character limit"),
         ("tournament_id", "\ud800", "cannot be stored"),
+        # M2-710: whitespace-only and NUL-bearing text are truthy and encode cleanly, so
+        # they passed `_require_text` unnoticed -- but `006_non_blank_identifiers.sql`'s
+        # trigger on `forecast_records.tournament_id` refuses both at INSERT. Minting a
+        # key for either is minting a key for a tournament no row could ever hold.
+        ("tournament_id", "   ", "tournament_id must not be blank"),
+        ("tournament_id", "\t\n ", "tournament_id must not be blank"),
+        ("tournament_id", "a\x00b", "tournament_id must not contain a NUL character"),
         ("question_id", "100", "question_id must be an integer"),
         ("question_id", True, "question_id must be an integer"),
         ("question_id", 1.0, "question_id must be an integer"),
@@ -555,7 +563,7 @@ def test_an_uppercase_digest_is_refused_rather_than_normalized() -> None:
         submission_key(**{**BASE, "request_payload_sha256": PAYLOAD_SHA.upper()})
 
 
-@pytest.mark.parametrize("value", [None, "", 7, b"key", "x" * 201])
+@pytest.mark.parametrize("value", [None, "", 7, b"key", "x" * 201, "   ", "a\x00b"])
 def test_a_malformed_key_is_refused_by_both_readers(
     ledger: sqlite3.Connection, value: object
 ) -> None:
@@ -565,7 +573,7 @@ def test_a_malformed_key_is_refused_by_both_readers(
         require_key_unused(ledger, value)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("value", [None, "", 7, b"rec", "x" * 201])
+@pytest.mark.parametrize("value", [None, "", 7, b"rec", "x" * 201, "   ", "a\x00b"])
 def test_a_malformed_record_id_is_refused(ledger: sqlite3.Connection, value: object) -> None:
     with pytest.raises(SubmissionError):
         submission_key_for_record(
@@ -573,6 +581,144 @@ def test_a_malformed_record_id_is_refused(ledger: sqlite3.Connection, value: obj
             value,  # type: ignore[arg-type]
             request_payload_sha256=PAYLOAD_SHA,
         )
+
+
+def test_every_identifier_field_agrees_with_the_schema_on_what_blank_means(
+    ledger: sqlite3.Connection,
+) -> None:
+    """M2-710's acceptance criterion, executed rather than asserted in a comment:
+    ``submission._require_identifier`` refuses exactly what ``006_non_blank_identifiers.sql``'s
+    triggers refuse, over the whole whitespace set plus the NUL case.
+
+    Drives both layers over the same candidate strings -- the Python validator, and a real
+    INSERT into the two 006-guarded columns this module writes through
+    (``forecast_records.tournament_id`` and ``submission_attempts.idempotency_key``) -- and
+    asserts the accept/reject decision agrees for every one. Hand-picked parameters would
+    not have caught the original gap either: a space is blank under both layers, which is
+    exactly what made it easy to miss (M1-603's round 5, the same class of bug).
+    """
+    from whiskeyjack_bot import submission
+
+    whitespace = [cp for cp in range(sys.maxunicode + 1) if chr(cp).isspace()]
+    # A guard on the guard: an empty list would make the loop below assert nothing.
+    assert len(whitespace) == 29
+
+    # The whole whitespace set, blank strings built from it, a NUL-bearing string, an
+    # ordinary value, and U+200B -- which is *not* whitespace to Python, so the pinned set
+    # cannot silently widen into refusing a real identifier.
+    candidates = [chr(cp) * 3 for cp in whitespace] + ["a\x00b", "ok", chr(0x200B)]
+
+    for n, candidate in enumerate(candidates):
+        record_id = f"rec-parity-{n}"
+        attempt_id = f"att-parity-{n}"
+
+        try:
+            submission._require_identifier(candidate, "field")
+            python_accepts = True
+        except SubmissionError:
+            python_accepts = False
+
+        try:
+            ledger.execute(
+                "INSERT INTO forecast_records ("
+                "record_id, question_id, tournament_id, forecast_version, parent_record_id, "
+                "question_type, status, model_provider, model_name, prompt_version, "
+                "prompt_sha256, retrieval_run_id, generated_at_utc, final_prediction_json, "
+                "record_json, created_at_utc, forecast_sha256, attempt_id) "
+                "VALUES (?, 100, ?, 1, NULL, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
+                "'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
+                (record_id, candidate, TS, TS, SHA, attempt_id),
+            )
+            schema_accepts_tournament = True
+        except sqlite3.IntegrityError:
+            schema_accepts_tournament = False
+
+        assert python_accepts == schema_accepts_tournament, (
+            f"tournament_id={candidate!r}: python accepts={python_accepts}, "
+            f"forecast_records trigger accepts={schema_accepts_tournament}"
+        )
+
+        # A valid, unrelated record to hang the idempotency_key attempt off -- the trigger
+        # under test here is `submission_attempts_require_receipt_on_insert`, not the
+        # foreign-key relationship to `forecast_records`.
+        host_record_id = f"rec-parity-host-{n}"
+        ledger.execute(
+            "INSERT INTO forecast_records ("
+            "record_id, question_id, tournament_id, forecast_version, parent_record_id, "
+            "question_type, status, model_provider, model_name, prompt_version, "
+            "prompt_sha256, retrieval_run_id, generated_at_utc, final_prediction_json, "
+            "record_json, created_at_utc, forecast_sha256, attempt_id) "
+            "VALUES (?, ?, 'minibench', 1, NULL, 'binary', 'draft', 'anthropic', 'claude', "
+            "'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
+            (host_record_id, 1000 + n, TS, TS, SHA, f"att-host-{n}"),
+        )
+        try:
+            ledger.execute(
+                "INSERT INTO submission_attempts (attempt_id, forecast_record_id, "
+                "idempotency_key, requested_at_utc, completed_at_utc, "
+                "request_payload_sha256, success, verified_by_refetch, refetch_outcome, "
+                "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'confirmed', ?)",
+                (f"att-key-{n}", host_record_id, candidate, TS, TS, PAYLOAD_SHA, TS),
+            )
+            schema_accepts_key = True
+        except sqlite3.IntegrityError:
+            schema_accepts_key = False
+
+        assert python_accepts == schema_accepts_key, (
+            f"idempotency_key={candidate!r}: python accepts={python_accepts}, "
+            f"submission_attempts trigger accepts={schema_accepts_key}"
+        )
+
+        # Third layer: `released_by`, guarded by `010` rather than `006`. Not an
+        # identifier -- an actor name is prose -- but `010` carries the same clause on it
+        # ("a blank one is worse than none") and does not carry one on `note`, so the
+        # writer follows the schema column by column and this parity check is what says so.
+        try:
+            submission._require_optional_identifier(candidate, "released_by", max_length=200)
+            python_accepts_actor = True
+        except SubmissionError:
+            python_accepts_actor = False
+        assert python_accepts_actor == python_accepts
+
+        reservation_id = f"wjres-parity-{n}"
+        ledger.execute(
+            "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+            "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+            "VALUES (?, ?, ?, 1, ?, ?)",
+            (reservation_id, f"res-key-parity-{n}", host_record_id, TS, TS),
+        )
+        try:
+            ledger.execute(
+                "INSERT INTO submission_key_releases (release_id, reservation_id, reason, "
+                "released_by, note, released_at_utc, created_at_utc) "
+                "VALUES (?, ?, 'operator_abandoned', ?, NULL, ?, ?)",
+                (f"wjrel-parity-{n}", reservation_id, candidate, TS, TS),
+            )
+            schema_accepts_actor = True
+        except sqlite3.IntegrityError:
+            schema_accepts_actor = False
+
+        assert python_accepts_actor == schema_accepts_actor, (
+            f"released_by={candidate!r}: python accepts={python_accepts_actor}, "
+            f"submission_key_releases trigger accepts={schema_accepts_actor}"
+        )
+
+    # `released_by` is nullable on both layers, and the loop above never draws `None`.
+    # Without this the whole third layer could be satisfied by a validator that refused
+    # everything -- the `not_posted` release route would be dead and no case above says so.
+    assert submission._require_optional_identifier(None, "released_by", max_length=200) is None
+    ledger.execute(
+        "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
+        "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
+        "VALUES ('wjres-parity-null', 'res-key-parity-null', ?, 1, ?, ?)",
+        (host_record_id, TS, TS),
+    )
+    ledger.execute(
+        "INSERT INTO submission_key_releases (release_id, reservation_id, reason, "
+        "released_by, note, released_at_utc, created_at_utc) "
+        "VALUES ('wjrel-parity-null', 'wjres-parity-null', 'not_posted', NULL, NULL, ?, ?)",
+        (TS, TS),
+    )
 
 
 # --- no value reaches a message or a rendered traceback ------------------------------
@@ -1083,6 +1229,43 @@ def test_the_program_route_writes_no_actor(approved: tuple[sqlite3.Connection, s
     assert tuple(stored) == ("not_posted", None)
 
 
+@pytest.mark.parametrize("value", ["   ", "\t\n ", "a\x00b", "\u00a0"])
+def test_a_blank_released_by_is_refused_before_the_ledger_is_touched(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    """M2-710: `010`'s trigger refuses a blank or NUL-bearing `released_by`, so the writer
+    must too -- and must say so itself.
+
+    Asserting the *message* is the whole test. `_require_optional_text` accepted every one
+    of these, so the value reached the INSERT and came back as `_execute`'s generic "the
+    ledger rejected this write (detail withheld ...)" -- which that function's own
+    docstring claims can only ever be the race its trigger exists to catch. A bare
+    `pytest.raises(SubmissionError)` passes against that broken behaviour and proves
+    nothing, which is why the refusal is pinned to the field name and the "detail
+    withheld" text is explicitly excluded.
+
+    U+00A0 is in the parameters deliberately: `str.strip()` and `006`/`010`'s enumerated
+    `trim()` set both call it whitespace, and a one-argument SQL `trim()` would not --
+    M1-603's round 5, on this module's columns.
+    """
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    with pytest.raises(SubmissionError) as excinfo:
+        release_submission_key(
+            conn,
+            reservation,
+            reason="operator_abandoned",
+            released_at=OCCURRED,
+            released_by=value,  # type: ignore[arg-type]
+        )
+    assert "released_by" in str(excinfo.value)
+    assert "detail withheld" not in str(excinfo.value)
+    # Nothing was written and the reservation is still live: refused before the statement.
+    assert _reservation_counts(conn) == (1, 0)
+    assert live_reservation_for_key(conn, key) is not None
+
+
 @pytest.mark.parametrize("value", ["", "spent", "NOT_POSTED", " not_posted ", 0, None, b"x"])
 def test_a_reason_outside_the_vocabulary_is_refused(
     approved: tuple[sqlite3.Connection, str], value: object
@@ -1195,10 +1378,28 @@ def test_an_unknown_reservation_is_refused(
     assert _reservation_counts(conn) == (1, 0)
 
 
+@pytest.mark.parametrize("value", [None, "", 0, b"wjres-x", "x" * 201, "\ud800", "   ", "a\x00b"])
+def test_a_malformed_reservation_id_is_refused_before_the_ledger_is_touched(
+    approved: tuple[sqlite3.Connection, str], value: object
+) -> None:
+    """M2-710: whitespace-only and NUL-bearing reservation ids reach the same check as
+    ``record_id``/``idempotency_key``, matching ``010``'s trigger on
+    ``submission_key_reservations.reservation_id``."""
+    conn, record_id = approved
+    key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    reservation = _reserved(conn, record_id, key)
+    malformed = replace_reservation(reservation, reservation_id=value)
+    with pytest.raises(SubmissionError):
+        _abandon(conn, malformed)
+    assert _reservation_counts(conn) == (1, 0)
+
+
 # --- the reservation's accepted domain -----------------------------------------------
 
 
-@pytest.mark.parametrize("value", [None, "", 0, b"rec-1", "x" * 201, "\ud800", ["rec-1"]])
+@pytest.mark.parametrize(
+    "value", [None, "", 0, b"rec-1", "x" * 201, "\ud800", ["rec-1"], "   ", "a\x00b"]
+)
 def test_a_malformed_record_id_is_refused_before_the_ledger_is_touched(
     approved: tuple[sqlite3.Connection, str], value: object
 ) -> None:
@@ -1215,7 +1416,9 @@ def test_a_malformed_record_id_is_refused_before_the_ledger_is_touched(
     assert _reservation_counts(conn) == (0, 0)
 
 
-@pytest.mark.parametrize("value", [None, "", 0, b"k", "x" * 201, "\ud800", {"k": 1}])
+@pytest.mark.parametrize(
+    "value", [None, "", 0, b"k", "x" * 201, "\ud800", {"k": 1}, "   ", "a\x00b"]
+)
 def test_a_malformed_key_is_refused_by_the_reservation_writer(
     approved: tuple[sqlite3.Connection, str], value: object
 ) -> None:
@@ -1609,7 +1812,7 @@ def test_the_by_record_reader_does_not_answer_for_another_record(
     assert live_reservations_for_record(conn, other) == ()
 
 
-@pytest.mark.parametrize("value", [None, "", 0, b"rec-1", "x" * 201, "\ud800"])
+@pytest.mark.parametrize("value", [None, "", 0, b"rec-1", "x" * 201, "\ud800", "   ", "a\x00b"])
 def test_the_by_record_reader_refuses_a_malformed_identifier(
     approved: tuple[sqlite3.Connection, str], value: object
 ) -> None:
