@@ -88,7 +88,11 @@ from whiskeyjack_bot.prompt import PromptError, load_prompt
 from whiskeyjack_bot.questions.normalize import NormalizationError, normalize_questions
 from whiskeyjack_bot.research.asknews import AskNewsRetrievalError, build_asknews_client
 from whiskeyjack_bot.research.exa import ExaFallbackError, build_exa_client
-from whiskeyjack_bot.research.orchestrate import OrchestrationError, retrieve_for_question
+from whiskeyjack_bot.research.orchestrate import (
+    OrchestrationError,
+    PaidRetrievalError,
+    retrieve_for_question,
+)
 from whiskeyjack_bot.research.packet import packet_sha256
 from whiskeyjack_bot.research.store import StoreError, list_retrieval_run_ids, load_packet
 
@@ -464,13 +468,27 @@ def _attempt_question(
     ``ForecastSchemaError``, ``ForecastRecordError``, ``StoreError`` and ``LifecycleError``
     means "this question did not finish", and none of them means "stop the run".
 
+    **That sentence was true of the persistence boundary and false of the research one until
+    round 1 said so**, and the correction is worth keeping visible because the shape recurs:
+    ``StoreError`` is caught by name where it is *raised* by name (the record/validation
+    block below), while the research phase reaches it through another module -- so listing it
+    here read as a guarantee that the ``except`` clause did not provide. Research failures now
+    arrive as this composer can handle them: ``PaidRetrievalError`` for a ledger write that
+    failed after the provider was billed, its parent ``OrchestrationError`` for a refusal that
+    cost nothing. A raw ``StoreError`` from that phase would now be a bug in
+    ``retrieve_for_question``'s boundary rather than a hole here.
+
     **Three failure shapes, three different ledger consequences**, and the differences are the
     substance of this function:
 
-    - *Research found nothing, or the provider failed.* A ``research_failed`` event
-      (M1-606). This is that event type's **first production writer** -- ``pipeline.py``
-      writes only ``generation_failed`` -- and ``retrieval_run_id`` is optional on it for
-      exactly the case where the refusal happened before any ``research_runs`` row existed.
+    - *Research found nothing, the provider failed, or the ledger refused a write.* A
+      ``research_failed`` event (M1-606). This is that event type's **first production
+      writer** -- ``pipeline.py`` writes only ``generation_failed`` -- and
+      ``retrieval_run_id`` is optional on it for exactly the case where the refusal happened
+      before any ``research_runs`` row existed. When the failure came *after* the spend the
+      run id is not optional and is cited: ``PaidRetrievalError`` carries the row
+      ``open_run`` put there, and the spend it carries is added to the batch's total, so a
+      question that failed after paying is not free in the accounting.
     - *The model answered and the answer was unusable, or the call could not be made.* The
       raw text is written to disk first (``persist_raw_output``: the money bought that text,
       and the artifact is the only trace of what it bought), then a ``generation_failed``
@@ -497,6 +515,36 @@ def _attempt_question(
             refresh=refresh,
             news_client=news_client,
             web_client=web_client,
+        )
+    except PaidRetrievalError as exc:
+        # The ledger refused a write *after* the provider was billed. Caught before its
+        # parent class because the two cases differ in everything the ledger and the budget
+        # care about: this one names the run row that says money was spent on this question,
+        # and carries the spend forward so `run_live`'s accumulated figure is not understated
+        # by a question that failed after paying. Round 1 found this shape escaping the batch
+        # entirely, which lost the event *and* the remaining questions.
+        note = _record_pre_forecast(
+            conn,
+            attempt_id=attempt_id,
+            question_id=question_id,
+            tournament_id=tournament_id,
+            event_type="research_failed",
+            detail_code="internal_error",
+            retrieval_run_id=exc.retrieval_run_ids[0],
+            occurred_at=now,
+        )
+        return QuestionOutcome(
+            question_id=question_id,
+            status="research_failed",
+            attempt_id=attempt_id,
+            retrieval_run_ids=exc.retrieval_run_ids,
+            document_count=0,
+            research_reused=False,
+            detail_code="internal_error",
+            problems=(str(exc),),
+            cost_usd=exc.cost_usd,
+            unpriced_calls=exc.unpriced_calls,
+            note=note,
         )
     except OrchestrationError as exc:
         # Refused before any provider call, so nothing was spent -- but the research phase

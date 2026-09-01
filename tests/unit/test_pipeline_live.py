@@ -482,6 +482,58 @@ def test_a_refusal_raised_mid_batch_is_isolated_like_any_other_failure(
     assert events == [("research_failed", "internal_error", None)]
 
 
+def test_a_ledger_failure_after_the_spend_is_isolated_and_records_what_it_paid_for(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1's blocking finding, at the level the criterion is written about.
+
+    The criterion's isolation clause is *"a per-question failure records its pipeline event
+    and does not abort the batch"*, and this is the shape that did neither: a transient
+    SQLite write failure after AskNews had returned left ``retrieve_for_question`` as a raw
+    ``StoreError``, which the composer did not catch, so the batch stopped and no event was
+    written. The test above it covers the *pre*-spend refusal, and the pair is the point --
+    every other failure in this file arrives as a value, so a path that arrives as an
+    exception needs its own reach or nothing exercises it.
+
+    Three things are asserted, and the second is why the fix is a conversion at the
+    orchestrator's boundary rather than a wider ``except`` here: the batch finishes its
+    remaining questions, the failure event **cites the run row the money was spent on**
+    rather than the ``NULL`` a pre-spend refusal records, and the cited row is really in
+    ``research_runs`` -- which ``004``'s ownership trigger would otherwise have refused.
+    """
+    from whiskeyjack_bot.research import orchestrate
+    from whiskeyjack_bot.research.store import StoreError
+
+    real = orchestrate._record
+
+    def failing(conn: Any, cfg: Any, **kwargs: Any) -> Any:
+        if kwargs["run"].question_id == MULTIPLE_CHOICE:
+            raise StoreError("could not complete the retrieval run")
+        return real(conn, cfg, **kwargs)
+
+    monkeypatch.setattr(orchestrate, "_record", failing)
+    batch = live(ledger, config, limit=3)
+
+    assert batch.records_written == 2
+    failed = [o for o in batch.outcomes if o.status != "recorded"]
+    assert [o.question_id for o in failed] == [MULTIPLE_CHOICE]
+    assert failed[0].status == "research_failed"
+    assert failed[0].problems == ("could not complete the retrieval run",)
+
+    cited = failed[0].retrieval_run_ids
+    assert len(cited) == 1, "the run the spend is on the books under must be named"
+    events = rows(
+        ledger,
+        "SELECT event_type, retrieval_run_id FROM pipeline_failure_events "
+        f"WHERE question_id = {MULTIPLE_CHOICE}",
+    )
+    assert events == [("research_failed", cited[0])]
+    assert rows(
+        ledger,
+        f"SELECT question_id FROM research_runs WHERE retrieval_run_id = '{cited[0]}'",
+    ) == [(MULTIPLE_CHOICE,)]
+
+
 def test_a_failed_question_does_not_consume_another_questions_attempt_id(
     config: AppConfig, ledger: Any
 ) -> None:

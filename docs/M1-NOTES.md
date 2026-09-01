@@ -6681,6 +6681,12 @@ round 1 rather than after round 5.
 
 ### Deferred (do not read the absence as an omission)
 
+- **T-905** — `scripts/gate.sh` exits 0 when a gate fails. Found while remediating round 1 and
+  filed rather than fixed here: a workflow change is its own track and lands at a wave boundary.
+  Its human-readable output is correct (it prints `FAIL` and the failing gate's output), so every
+  green reading recorded in these notes was read from the printed `All four gates pass.` line
+  rather than from the exit code, and `review-request.py` runs the four gates itself and tests
+  `returncode`, so no gate claim in this item's review requests depends on the defect.
 - **M1-317** — a ledger identity for a post-generation persistence failure.
 - **M1-318** — query construction chosen against measured retrieval quality.
 - **M1-319** — a source for `official_source_required`.
@@ -6714,9 +6720,47 @@ round 1 rather than after round 5.
   gets the old evidence unless they pass `--refresh-research`. The record still names the runs it
   used, so this is visible in the ledger rather than lost.
 
+### Round 1 — one blocking finding, and it landed on risk claim 1
+
+The request's first falsifiable claim was *"`run_live` raises only before the first billable
+call; once the loop starts, nothing raises."* It was false, and the reviewer produced the
+reachable path: `_record` propagates a `StoreError` by design, `retrieve_for_question` did not
+convert it, and `_attempt_question` caught only `OrchestrationError` around the research phase.
+So an ordinary transient SQLite write failure *after* AskNews had returned aborted the whole
+batch and wrote no failure event — the criterion's isolation clause broken by the one path no
+test reached. Reproduced by execution before any fix: a two-question batch with `_record`
+raising for the second question stopped at question two.
+
+**What makes it worth writing down is that three docstrings asserted the correct behaviour
+while the code did not.** `_record`'s said "the caller turns it into a per-question failure
+without aborting the batch". `orchestrate`'s module docstring listed `StoreError` among the
+types that "arrive as one" at its boundaries. `_attempt_question`'s listed `StoreError` among
+what it catches — true of the persistence boundary, where `StoreError` is both raised and
+caught by name, and false of the research one, where it arrives through another module. Each
+was written while looking at the code it describes. This is the same class as the two false
+claims below, arriving a third time: **a prose guarantee is not a mechanism, and a docstring
+that names an exception type is not an `except` clause.**
+
+The fix is a conversion at `retrieve_for_question`'s boundary rather than a wider `except` in
+the composer, for three reasons. It is what the project's error-hygiene rule asks for — a
+caller handles the module's own error type. It is the only frame that still knows *which* runs
+were opened and what they cost, and both matter: the failure event has to cite a run row (004's
+ownership trigger refuses one that does not name the event's question) and the batch's budget
+total would otherwise understate a question that failed after paying. And a wider `except`
+around the primary would have missed the second instance of the same hole — `_fallback_pass`
+opens its own row, also after the primary has been billed.
+
+`PaidRetrievalError` is a subclass of `OrchestrationError` rather than a flag on it, so a caller
+that only needs "the batch must not abort" catches the parent and is already correct, while a
+caller that needs the spend figures can tell the two apart. Three tests were added at the
+boundary that owns it (post-spend conversion naming the paid run; pre-spend refusal still the
+plain type with zero provider calls; the fallback's own `open_run` inside the region) and one at
+the composer, asserting the batch finishes, the event cites the paid run rather than `NULL`, and
+the cited row really exists in `research_runs`.
+
 ### Verification
 
-`tests/unit/test_research_orchestrate.py` (27), `tests/unit/test_pipeline_live.py` (28),
+`tests/unit/test_research_orchestrate.py` (30), `tests/unit/test_pipeline_live.py` (29),
 `tests/acceptance/test_live_run_acceptance.py` (13, of which 6 are import-graph guards) and
 `tests/property/test_orchestrate_properties.py` (6 properties over `derive_queries`).
 

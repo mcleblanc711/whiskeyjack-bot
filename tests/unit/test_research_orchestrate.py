@@ -41,11 +41,13 @@ from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot.research.model import validate_run
 from whiskeyjack_bot.research.orchestrate import (
     OrchestrationError,
+    PaidRetrievalError,
     ProviderRun,
     RetrievalOutcome,
     derive_queries,
     retrieve_for_question,
 )
+from whiskeyjack_bot.research.store import StoreError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SNAPSHOT = REPO_ROOT / "tests" / "fixtures" / "snapshots" / "minibench_sample_snapshot.json"
@@ -173,6 +175,20 @@ def _web_client(exchange: _Exchange) -> httpx.Client:
 
 def _rows(conn: sqlite3.Connection, sql: str, *params: Any) -> list[tuple[Any, ...]]:
     return [tuple(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def _raise_store_error(message: str) -> Any:
+    """A ledger call that fails. Stands in for a transient SQLite write failure.
+
+    A monkeypatch is valid evidence here under this project's own rule -- it simulates a
+    reachable condition rather than inventing one. An unwritable ledger needs no hostile
+    operator: a full disk, a lock timeout or a permission change produces it.
+    """
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        raise StoreError(message)
+
+    return failing
 
 
 # --- derive_queries: pure, and refuses before anything can be paid for ----------------
@@ -344,6 +360,102 @@ def test_a_provider_that_raises_still_leaves_the_run_recorded(
     completed = _rows(ledger, "SELECT completed_at_utc, error_summary FROM research_runs")
     assert completed and completed[0][0] is not None
     assert SECRET not in json.dumps(completed)
+
+
+def test_a_ledger_write_that_fails_after_the_spend_names_the_run_it_paid_for(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1's blocking finding, at the boundary that owns it.
+
+    A transient SQLite write failure while persisting a completed, already-billed retrieval
+    is ordinary local I/O within the stated threat model. Before the fix it left this
+    function as a raw ``StoreError`` -- a type the composer above neither catches nor is
+    supposed to know -- and aborted the whole batch.
+
+    What is asserted is the pair that makes the conversion worth having over a wider
+    ``except`` one layer up: the error is **this module's** type, and it still names the run
+    row ``open_run`` put in the ledger before the call. That row is the only durable
+    statement that this question cost money, and citing it is what lets the composer write a
+    failure event at all -- ``004``'s ownership trigger refuses a run id that does not name
+    the event's question.
+    """
+    from whiskeyjack_bot.research import orchestrate as module
+
+    monkeypatch.setattr(
+        module, "_record", _raise_store_error("could not complete the retrieval run")
+    )
+    with pytest.raises(PaidRetrievalError) as caught:
+        retrieve_for_question(ledger, config, question=question(), now=NOW, news_client=_SDK())
+
+    assert isinstance(caught.value, OrchestrationError), (
+        "a caller catching the parent must catch it"
+    )
+    opened = _rows(ledger, "SELECT retrieval_run_id, question_id FROM research_runs")
+    assert len(opened) == 1, opened
+    assert caught.value.retrieval_run_ids == (opened[0][0],)
+    assert opened[0][1] == QUESTION_ID
+
+
+def test_a_ledger_that_refuses_before_the_spend_is_still_the_plain_refusal(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half, and the reason the post-spend case is a subclass rather than a flag.
+
+    A ledger that will not open the run fails *before* ``retrieve_news``, so nothing was
+    bought and no row exists to cite. If both arrived as the same type the composer would
+    have to report one of them wrongly -- either a spend that did not happen, or a failure
+    event citing a run row that is not there. The call count is asserted rather than
+    inferred: this path must reach no provider at all.
+    """
+    from whiskeyjack_bot.research import orchestrate as module
+
+    sdk = _SDK()
+    monkeypatch.setattr(module, "open_run", _raise_store_error("the ledger refused the run"))
+    with pytest.raises(OrchestrationError) as caught:
+        retrieve_for_question(ledger, config, question=question(), now=NOW, news_client=sdk)
+
+    assert not isinstance(caught.value, PaidRetrievalError)
+    assert sdk.news.calls == [], "a pre-spend refusal must not have reached the provider"
+    assert _rows(ledger, "SELECT retrieval_run_id FROM research_runs") == []
+
+
+def test_the_fallbacks_own_open_run_is_inside_the_post_spend_region(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_fallback_pass`` opens a row too, and by then the primary has already been billed.
+
+    It is the second instance of the same hole and it would not have been closed by widening
+    the composer's ``except`` around the primary alone, which is the other reason the
+    conversion sits at this function's boundary rather than one layer up. The primary's run
+    is recorded by the time this fires, so the error names *it* -- the completed run, not the
+    one that could not be opened.
+    """
+    from whiskeyjack_bot.research import orchestrate as module
+
+    monkeypatch.setenv(config.retrieval.fallback.api_key_env, "fakeEXAkey1234567")
+    real = module.open_run
+    calls: list[int] = []
+
+    def refusing_second(conn: Any, run: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 2:
+            raise StoreError("the ledger refused the fallback run")
+        return real(conn, run)
+
+    monkeypatch.setattr(module, "open_run", refusing_second)
+    with pytest.raises(PaidRetrievalError) as caught:
+        retrieve_for_question(
+            ledger,
+            config,
+            question=question(),
+            now=NOW,
+            news_client=_SDK(raises=RuntimeError("upstream said no")),
+            web_client=_web_client(_Exchange()),
+        )
+
+    assert len(calls) == 2, "the fallback never attempted its own run row"
+    completed = _rows(ledger, "SELECT retrieval_run_id FROM research_runs")
+    assert caught.value.retrieval_run_ids == (completed[0][0],)
 
 
 # --- the fallback: authorized only by decide_fallback ----------------------------------

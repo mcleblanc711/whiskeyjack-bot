@@ -100,13 +100,62 @@ _RUN_ID_PREFIX = "run-"
 class OrchestrationError(Exception):
     """Paid retrieval this module refused to attempt.
 
-    Raised **only before any billable call**. Once a provider has been invoked every
-    failure is reported on :class:`RetrievalOutcome` instead, because the money is spent
-    either way and an exception would discard the record of it.
+    Raised **before any billable call**, with one named exception: its subclass
+    :class:`PaidRetrievalError`, which reports a ledger write that failed after the money
+    was gone. Apart from that, once a provider has been invoked every failure is reported
+    on :class:`RetrievalOutcome` instead, because the money is spent either way and an
+    exception would discard the record of it.
+
+    A caller that catches this type catches both, which is the point of the subclass: the
+    batch must not abort either way, and only a caller that wants the spend figures needs
+    to tell them apart.
 
     Messages are constants or name a filesystem path; no question text, query, document or
     provider body reaches one.
     """
+
+
+class PaidRetrievalError(OrchestrationError):
+    """A ledger failure that happened **after** the calls were billed (M1-315 round 1).
+
+    A subclass rather than a flag, because the composer above must be able to tell two
+    things apart that :class:`OrchestrationError` alone collapses:
+
+    - *a caller mistake, refused before the first billable call* -- nothing was spent, no
+      ``research_runs`` row exists, and the question's failure event cites no run; and
+    - *a ledger that refused a write after the money was gone* -- a row was opened, a
+      provider was billed, and both facts have to survive into the batch's accounting or
+      the run's cost is understated and the failure event cites nothing.
+
+    Round 1 of this item's review found the second case escaping the batch entirely: the
+    composer caught only ``OrchestrationError`` around the research phase while
+    :func:`_record` propagated a raw ``StoreError``, so an ordinary transient SQLite write
+    failure after AskNews had returned aborted the whole run and wrote no event. Converting
+    here rather than widening the caller's ``except`` is what this project's error-hygiene
+    rule asks for -- a caller handles the module's own error type -- and it is also the only
+    place that still knows which runs were opened and what they cost.
+
+    ``retrieval_run_ids`` is never empty: the primary run row is opened before the first
+    billable call, so there is always at least one row that names this question and says
+    money was spent on it. ``cost_usd`` and ``unpriced_calls`` keep M1-303 round 3's
+    distinction -- ``None`` is *unknown, never free*. A fallback pass whose own recording
+    failed contributes no figure, because its cost never reached this frame; that is stated
+    rather than guessed at, and with both committed providers reporting no currency figure
+    at all it costs nothing today.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retrieval_run_ids: tuple[str, ...],
+        cost_usd: float | None,
+        unpriced_calls: int,
+    ) -> None:
+        super().__init__(message)
+        self.retrieval_run_ids = retrieval_run_ids
+        self.cost_usd = cost_usd
+        self.unpriced_calls = unpriced_calls
 
 
 @dataclass(frozen=True)
@@ -290,8 +339,13 @@ def _record(
     loss costs the evidence copy while the run stays recorded, whereas a ledger refusal
     means the run was never recorded at all. The first degrades because M1-312 says the
     spend must stay on the books; the second cannot degrade, because there is nothing left
-    to degrade *onto*. The caller turns it into a per-question failure without aborting the
-    batch.
+    to degrade *onto*.
+
+    It propagates only as far as :func:`retrieve_for_question`, which is this module's
+    public boundary and converts it to :class:`PaidRetrievalError`. That conversion is what
+    makes "the caller turns it into a per-question failure without aborting the batch" true;
+    before round 1 this docstring asserted that outcome while the raw ``StoreError`` escaped
+    a caller that could not catch it.
     """
     counted = with_retrieval_counts(
         run, documents_dropped=documents_dropped, duplicates_collapsed=duplicates_collapsed
@@ -434,8 +488,12 @@ def retrieve_for_question(
     reaches a billable call, not inside the adapter after this function has already opened a
     row. Reusing its return value is then simply not throwing away a value already computed.
 
-    Raises :class:`OrchestrationError` only for a caller mistake, always before the first
-    billable call. After that everything is reported on the result.
+    Raises :class:`OrchestrationError` for a caller mistake, always before the first
+    billable call. After that the only thing that still raises is the ledger, as
+    :class:`PaidRetrievalError` carrying the runs opened and the spend known -- everything
+    else is reported on the result. Round 1 of this item found that region propagating a
+    raw ``StoreError``, which aborted the composer's batch; the conversion is here rather
+    than in the caller because this is the frame that still knows what was bought.
     """
     if not isinstance(config, AppConfig):
         raise OrchestrationError("config must be an AppConfig")
@@ -483,52 +541,75 @@ def retrieve_for_question(
         retrieval_run_id=primary_run_id,
         now=now_utc,
     )
-    runs = [
-        _record(
-            conn,
-            config,
-            run=primary.run,
-            documents=primary.documents,
-            raw_responses=primary.raw_responses,
-            documents_dropped=primary.documents_dropped,
-            duplicates_collapsed=primary.duplicates_collapsed,
-            provider_failed=primary.provider_failed,
-            fallback_reasons=(),
-            written_at=now_utc,
+    # The money is gone from here on, so the only remaining failure is the ledger's, and it
+    # arrives as this module's own type carrying what was spent -- never as a raw
+    # `StoreError` escaping into the composer, which is what round 1 found aborting the
+    # batch. `_fallback_pass`'s own `open_run` is inside this region for the same reason:
+    # it, too, runs after the primary has been billed.
+    runs: list[ProviderRun] = []
+    try:
+        runs.append(
+            _record(
+                conn,
+                config,
+                run=primary.run,
+                documents=primary.documents,
+                raw_responses=primary.raw_responses,
+                documents_dropped=primary.documents_dropped,
+                duplicates_collapsed=primary.duplicates_collapsed,
+                provider_failed=primary.provider_failed,
+                fallback_reasons=(),
+                written_at=now_utc,
+            )
         )
-    ]
 
-    decision = decide_fallback(
-        primary_failed=primary.provider_failed,
-        primary_documents=len(primary.documents),
-        # No config field expresses this and this module will not invent one; see the
-        # module docstring. M1-304's router is where it belongs.
-        official_source_required=False,
-    )
-    if decision.should_run:
-        _LOGGER.info(
-            "falling back to the secondary provider for question %d: %s",
-            question_id,
-            ", ".join(decision.reasons),
+        decision = decide_fallback(
+            primary_failed=primary.provider_failed,
+            primary_documents=len(primary.documents),
+            # No config field expresses this and this module will not invent one; see the
+            # module docstring. M1-304's router is where it belongs.
+            official_source_required=False,
         )
-        fallback = _fallback_pass(
-            conn,
-            config,
-            question_id=question_id,
-            queries=queries,
-            reasons=decision.reasons,
-            now_utc=now_utc,
-            injected=web_client,
-        )
-        if fallback is not None:
-            runs.append(fallback)
+        if decision.should_run:
+            _LOGGER.info(
+                "falling back to the secondary provider for question %d: %s",
+                question_id,
+                ", ".join(decision.reasons),
+            )
+            fallback = _fallback_pass(
+                conn,
+                config,
+                question_id=question_id,
+                queries=queries,
+                reasons=decision.reasons,
+                now_utc=now_utc,
+                injected=web_client,
+            )
+            if fallback is not None:
+                runs.append(fallback)
 
-    run_ids = tuple(entry.retrieval_run_id for entry in runs)
-    documents = sum(entry.documents_retained for entry in runs)
-    priced = [entry.cost_usd for entry in runs if entry.cost_usd is not None]
-    packet = (
-        load_packet(conn, question_id=question_id, retrieval_run_ids=run_ids) if documents else None
-    )
+        run_ids = tuple(entry.retrieval_run_id for entry in runs)
+        documents = sum(entry.documents_retained for entry in runs)
+        priced = [entry.cost_usd for entry in runs if entry.cost_usd is not None]
+        packet = (
+            load_packet(conn, question_id=question_id, retrieval_run_ids=run_ids)
+            if documents
+            else None
+        )
+    except StoreError as exc:
+        # `or (primary_run_id,)`: when the primary's own recording is what failed there is
+        # no completed run to name, but `open_run` above already put that row in the ledger
+        # and it names this question -- which is exactly what `004`'s ownership trigger
+        # requires of a cited run, and the only durable statement that this question cost
+        # money.
+        billed = [entry.cost_usd for entry in runs if entry.cost_usd is not None]
+        billed.extend(value for value in (primary.run.cost_usd,) if not runs and value is not None)
+        raise PaidRetrievalError(
+            str(exc),
+            retrieval_run_ids=tuple(entry.retrieval_run_id for entry in runs) or (primary_run_id,),
+            cost_usd=sum(billed) if billed else None,
+            unpriced_calls=(len(runs) or 1) - len(billed),
+        ) from None
     return RetrievalOutcome(
         question_id=question_id,
         packet=packet,
