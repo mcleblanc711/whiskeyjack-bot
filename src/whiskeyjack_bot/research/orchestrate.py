@@ -279,7 +279,15 @@ def derive_queries(question: CanonicalQuestion) -> tuple[str, ...]:
         raise OrchestrationError("question must be a canonical question")
     title = " ".join(question.title.split())
     if not title:
-        # `CanonicalQuestion.title` is `min_length=1`, which a lone space satisfies.
+        # **A backstop, not a live defence, as of T-901.** This comment used to read
+        # "`min_length=1`, which a lone space satisfies", and that was true when it was
+        # written: `min_length` counts characters. T-901 replaced the bound with
+        # `NonBlankQuestionStr`, which composes it with a strip check, so a *validated*
+        # question can no longer carry a blank title and this branch joins
+        # `_require_storable` on the far side of the validator -- reachable only through
+        # `model_construct`/`model_copy`, which is where its test now lives. Kept for the
+        # same reason: `derive_queries` is public and promises that only
+        # `OrchestrationError` escapes it.
         raise OrchestrationError("the question has no title to search on")
     _require_storable(title, "the question title cannot be stored (offending value withheld)")
 

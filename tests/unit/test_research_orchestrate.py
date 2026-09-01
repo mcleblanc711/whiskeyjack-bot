@@ -31,7 +31,7 @@ import pytest
 import yaml
 from asknews_sdk.dto.base import Author, Entities
 from asknews_sdk.dto.news import SearchResponse, SearchResponseDictItem
-from pydantic import AnyUrl
+from pydantic import AnyUrl, ValidationError
 
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.ledger import connect, initialize_ledger
@@ -223,10 +223,42 @@ def test_a_non_question_is_refused_as_this_modules_error(value: object) -> None:
 
 
 def test_a_whitespace_only_title_is_refused() -> None:
-    """``min_length=1`` accepts a lone space, and a lone space is not a query."""
+    """The totality half, and it **became** that rather than being written as it.
+
+    The original docstring here read "``min_length=1`` accepts a lone space, and a lone space
+    is not a query", which was true of the schema this branch was written against. T-901
+    replaced that bound with ``NonBlankQuestionStr``, so the condition moved to the far side
+    of the validator and this test now asserts the same thing the surrogate one below does:
+    the public promise that only ``OrchestrationError`` escapes, for an input that skipped
+    validation. ``model_copy`` is doing that skipping and is the reason the test still passes.
+    """
     blank = question().model_copy(update={"title": "   "})
     with pytest.raises(OrchestrationError, match="no title to search on"):
         derive_queries(blank)
+
+
+def test_the_validated_model_already_refuses_a_blank_title() -> None:
+    """What actually protects the paid path, pinned beside the backstop that does not.
+
+    The pair matters more than either half: with only the test above, a future reader would
+    read ``derive_queries``' blank-title branch as the live defence it stopped being, which is
+    the exact misreading this branch has now corrected three times. If T-901's constraint is
+    ever relaxed this turns red and the branch above becomes load-bearing again.
+    """
+    with pytest.raises(ValidationError):
+        CanonicalBinaryQuestion(question_id=1, post_id=1, title="   ")
+
+
+def test_a_blank_group_parent_title_is_still_reachable_and_contributes_no_query() -> None:
+    """T-901 tightened ``title`` and left ``group_parent_title`` a plain ``str | None``.
+
+    So unlike the title case this one is a **live** defence: a validated question really can
+    carry a blank parent, and joining it would bill a query with a leading space for no added
+    meaning. Asserted here rather than left to the property file because the asymmetry between
+    the two fields is easy to read as an oversight and is not one.
+    """
+    blank_parent = question().model_copy(update={"group_parent_title": "   "})
+    assert derive_queries(blank_parent) == (blank_parent.title,)
 
 
 def test_a_title_carrying_a_lone_surrogate_is_refused_before_any_call() -> None:

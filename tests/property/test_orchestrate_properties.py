@@ -35,22 +35,30 @@ from whiskeyjack_bot.research.orchestrate import OrchestrationError, derive_quer
 
 MARKER = "Qz7leakcanaryZq"
 
-# `min_length=1` on the schema, so a title strategy has to produce something. Blank and
-# whitespace-only titles are generated deliberately, because the schema accepts a lone space
-# and a lone space is not a query.
+# **Two title classes are absent, and both absences are findings.** This strategy builds
+# through the real model, so anything the schema refuses fails *inside* it -- which is how
+# both were caught, and why it is built that way.
 #
-# **Lone surrogates are absent, and their absence is the finding.** The first version of this
-# strategy drew from `HOSTILE_TEXT`, which includes them, and every property failed *inside
-# the strategy*: pydantic's `str` refuses a lone surrogate (`string_unicode`), so a validated
-# `CanonicalQuestion` cannot carry one. Building through the real model rather than a stub is
-# what surfaced that, and it demoted `_require_storable` from a live defence to a totality
-# backstop. The backstop still has a property below -- reached the only way it can be, past
-# the validator.
-TITLES = st.one_of(
-    ENCODABLE_TEXT.filter(lambda value: value != ""),
-    st.sampled_from(["   ", "\t\n", "a", "Will X happen?", "  spaced \n out  ", "😀 emoji"]),
-)
-PARENTS = st.none() | TITLES
+# 1. **Lone surrogates.** The first version drew from `HOSTILE_TEXT`, which includes them,
+#    and every property failed in the strategy: pydantic's `str` refuses a lone surrogate
+#    (`string_unicode`), so a validated `CanonicalQuestion` cannot carry one. That demoted
+#    `_require_storable` from a live defence to a totality backstop.
+# 2. **Blank and whitespace-only titles.** These *were* generated here, and the comment that
+#    stood in their place said the schema accepts a lone space because `min_length=1` counts
+#    characters. That was true when this file was written and **T-901 made it false**:
+#    `title` is now `NonBlankQuestionStr`, which composes the length bound with a strip check.
+#    The daily master merge is what surfaced it -- four properties went red in the strategy,
+#    not in an assertion. `derive_queries`' own blank-title refusal joins the surrogate guard
+#    as a backstop, and the test that pins the *reachable* protection now lives beside the
+#    surrogate one.
+#
+# `group_parent_title` is deliberately **not** narrowed the same way: T-901 tightened `title`
+# and `SourceCategory.name` and left the parent a plain `str | None`, so a blank parent is
+# still a state a validated question can hold -- which makes `derive_queries`' `if collapsed:`
+# branch a live defence rather than a backstop, and it is generated here on purpose.
+NON_BLANK = st.sampled_from(["a", "Will X happen?", "  spaced \n out  ", "😀 emoji"])
+TITLES = st.one_of(ENCODABLE_TEXT.filter(lambda value: value.strip() != ""), NON_BLANK)
+PARENTS = st.none() | TITLES | st.sampled_from(["   ", "\t\n"])
 
 
 @st.composite
@@ -80,12 +88,20 @@ def storable(text: str) -> bool:
 @settings(suppress_health_check=[HealthCheck.too_slow])
 @given(question=questions())
 def test_only_the_modules_own_error_escapes(question: CanonicalBinaryQuestion) -> None:
-    """(1) and (3), together: it either returns storable queries or raises its own type."""
+    """(1) and (3), together, plus the stronger claim T-901 made available.
+
+    The stronger claim is ``pytest.fail`` rather than an ``event``: **no validated question
+    reaches either refusal branch.** Until T-901 tightened ``title`` to
+    ``NonBlankQuestionStr`` a whitespace-only title did reach one, so this was genuinely a
+    two-armed property. It is now one-armed, and saying so as an assertion is the difference
+    between a property that records the fact and one that would go quiet if the schema were
+    ever loosened again -- which is exactly how this branch found the surrogate premise, one
+    layer earlier.
+    """
     try:
         queries = derive_queries(question)
-    except OrchestrationError:
-        event("refused")
-        return
+    except OrchestrationError as exc:  # pragma: no cover - the assertion below is the point
+        pytest.fail(f"a schema-valid question was refused: {type(exc).__name__}")
     event("derived")
     assert queries
     for query in queries:
@@ -176,6 +192,19 @@ def test_the_strategy_reaches_both_arms() -> None:
 
     If this fails, every property above has been passing on a single arm, which is the defect
     class this project keeps paying for rather than a nuisance.
+
+    **The two arms are the two query counts, and they were not always.** Until T-901 this
+    searched for a question ``derive_queries`` *refuses*, and found one: a whitespace-only
+    title. ``title`` is now ``NonBlankQuestionStr``, so that arm is unreachable through the
+    model rather than merely unvisited -- and an anti-vacuity check whose arm has ceased to
+    exist is the failure it is meant to catch, wearing the other hat. It failed for exactly
+    that reason on the master merge, which is the check working.
+
+    What is still reachable is the branch that decides what a run is billed for: a group
+    sibling contributes the parent-joined query as well as its own, everything else derives
+    one. The refusals are pinned past the validator in the unit suite, where a backstop can
+    honestly be reached.
     """
-    assert _refuses(find(questions(), _refuses))
     assert not _refuses(find(questions(), lambda question: not _refuses(question)))
+    assert len(derive_queries(find(questions(), lambda q: len(derive_queries(q)) == 2))) == 2
+    assert len(derive_queries(find(questions(), lambda q: len(derive_queries(q)) == 1))) == 1

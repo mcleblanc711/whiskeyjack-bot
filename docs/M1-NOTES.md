@@ -6929,9 +6929,45 @@ plain type with zero provider calls; the fallback's own `open_run` inside the re
 the composer, asserting the batch finishes, the event cites the paid run rather than `NULL`, and
 the cited row really exists in `research_runs`.
 
+### A sibling branch made a third claim false, and the properties caught it
+
+T-901 merged into master mid-review and the daily merge brought it here. Four of this item's
+six properties went red **inside the strategy**, which is the same signal that found the
+surrogate premise before round 1 and the same reason the strategy is built through the real
+model rather than a stub.
+
+The cause: `derive_queries`' blank-title refusal was a live defence when it was written,
+because `_CanonicalQuestionBase.title` was `Field(min_length=1)` and `min_length` counts
+characters, so `"   "` satisfied it. T-901 replaced that with `NonBlankQuestionStr`, which
+composes the length bound with a strip check. So the branch moved to the far side of the
+validator and joined `_require_storable` as a backstop — and three comments that described it
+as live became false, none of them by anything this branch did.
+
+Two things came out of it that are worth more than the fix.
+
+1. **The anti-vacuity test failed for the right reason, and the reason is not the one it was
+   written for.** `test_the_strategy_reaches_both_arms` searched for a question
+   `derive_queries` refuses. It could no longer find one — not because the strategy stopped
+   reaching an arm, but because *the arm ceased to exist*. An anti-vacuity check whose arm has
+   been removed is the failure it exists to catch wearing the other hat, and it is only
+   distinguishable from the ordinary kind by asking why. The two arms are now the two query
+   counts, which is what actually decides what a run is billed for; the refusals are pinned
+   past the validator in the unit suite, where a backstop can honestly be reached.
+2. **The one-armed property is now an assertion rather than an `event`.**
+   `test_only_the_modules_own_error_escapes` calls `pytest.fail` if a schema-valid question is
+   ever refused. That is a strictly stronger claim than the two-armed version it replaced, and
+   it turns red if the schema is ever loosened again instead of quietly going back to being
+   two-armed.
+
+`group_parent_title` is deliberately **not** covered by T-901's constraint — it tightened
+`title` and `SourceCategory.name` and left the parent a plain `str | None`. So a blank parent
+really is reachable through a validated question, `derive_queries`' `if collapsed:` branch
+really is a live defence, and the asymmetry between the two fields is now asserted rather than
+left to read as an oversight.
+
 ### Verification
 
-`tests/unit/test_research_orchestrate.py` (30), `tests/unit/test_pipeline_live.py` (29),
+`tests/unit/test_research_orchestrate.py` (32), `tests/unit/test_pipeline_live.py` (29),
 `tests/acceptance/test_live_run_acceptance.py` (13, of which 6 are import-graph guards) and
 `tests/property/test_orchestrate_properties.py` (6 properties over `derive_queries`).
 
