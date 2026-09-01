@@ -318,7 +318,7 @@ def canonical_key_json(
     """
     payload: dict[str, object] = {
         "key_schema_version": KEY_SCHEMA_VERSION,
-        "tournament_id": _require_text(tournament_id, "tournament_id"),
+        "tournament_id": _require_identifier(tournament_id, "tournament_id"),
         "question_id": _require_identifier_int(question_id, "question_id"),
         "forecast_version": _require_identifier_int(forecast_version, "forecast_version"),
         "request_payload_sha256": _require_sha256(request_payload_sha256, "request_payload_sha256"),
@@ -392,7 +392,7 @@ def submission_key_for_record(
     could not tell "no such record" from "nothing recorded yet" would report the wrong one.
     """
     payload_sha = _require_sha256(request_payload_sha256, "request_payload_sha256")
-    identifier = _require_text(record_id, "record_id")
+    identifier = _require_identifier(record_id, "record_id")
     row = _fetch_one(
         conn,
         "SELECT tournament_id, question_id, forecast_version FROM forecast_records "
@@ -448,7 +448,7 @@ def submission_key_for_approved_record(
     item and M2-704 is where the check lands. See ``docs/M2-NOTES.md`` and decision D33.
     """
     payload_sha = _require_sha256(request_payload_sha256, "request_payload_sha256")
-    identifier = _require_text(record_id, "record_id")
+    identifier = _require_identifier(record_id, "record_id")
     try:
         approval = effective_approval(conn, identifier)
         status = current_status(conn, identifier)
@@ -475,12 +475,12 @@ def submission_key_for_approved_record(
 def attempt_for_key(conn: sqlite3.Connection, idempotency_key: str) -> AttemptSummary | None:
     """Return the attempt already recorded under this key, or ``None``.
 
-    The key is validated as *storable text* only, not against
-    :func:`submission_key`'s own format. A ledger may hold keys minted under an earlier
-    schema version, and a reader that refused to look at them would report an unused key
-    for one that is spent -- the exact answer that costs a second live post.
+    The key is validated as a non-blank storable identifier only (:func:`_require_identifier`),
+    not against :func:`submission_key`'s own format. A ledger may hold keys minted under an
+    earlier schema version, and a reader that refused to look at them would report an unused
+    key for one that is spent -- the exact answer that costs a second live post.
     """
-    key = _require_text(idempotency_key, "idempotency_key")
+    key = _require_identifier(idempotency_key, "idempotency_key")
     row = _fetch_one(
         conn,
         "SELECT attempt_id, forecast_record_id, idempotency_key, requested_at_utc, "
@@ -522,7 +522,7 @@ def require_key_unused(conn: sqlite3.Connection, idempotency_key: str) -> None:
     live path no longer *depends* on a read. This remains the cheap look for a caller that
     only wants to know.
     """
-    key = _require_text(idempotency_key, "idempotency_key")
+    key = _require_identifier(idempotency_key, "idempotency_key")
     # Names no value: the key is derived from a payload hash and a tournament, and echoing
     # it back would let a caller confirm a guess about stored content.
     if attempt_for_key(conn, key) is not None:
@@ -543,11 +543,11 @@ def live_reservation_for_key(
     where the invariant was never enforced. A reader that raised on a ledger holding two
     live reservations would refuse to report the very state an operator needs to see.
 
-    Validates the key as *storable text* only, for :func:`attempt_for_key`'s reason: a
-    ledger may hold keys minted under an earlier schema version, and a reader that refused
-    to look at them would report a free key for one that is held.
+    Validates the key as a non-blank storable identifier only, for :func:`attempt_for_key`'s
+    reason: a ledger may hold keys minted under an earlier schema version, and a reader that
+    refused to look at them would report a free key for one that is held.
     """
-    key = _require_text(idempotency_key, "idempotency_key")
+    key = _require_identifier(idempotency_key, "idempotency_key")
     row = _fetch_one(
         conn,
         "SELECT reservation_id, idempotency_key, forecast_record_id, reservation_seq, "
@@ -577,11 +577,12 @@ def live_reservations_for_record(
     leaves behind. A reader that returned a single row would have to pick, and the picking
     would be invisible to the operator deciding what to release.
 
-    Validates the identifier as *storable text* only, for :func:`attempt_for_key`'s
-    reason: a ledger may hold rows written under an earlier schema version, and a reader
-    that refused to look at them would report a free record for one that is held.
+    Validates the identifier as a non-blank storable identifier only, for
+    :func:`attempt_for_key`'s reason: a ledger may hold rows written under an earlier schema
+    version, and a reader that refused to look at them would report a free record for one
+    that is held.
     """
-    identifier = _require_text(record_id, "record_id")
+    identifier = _require_identifier(record_id, "record_id")
     rows = _fetch_all(
         conn,
         "SELECT reservation_id, idempotency_key, forecast_record_id, reservation_seq, "
@@ -656,8 +657,8 @@ def reserve_submission_key(
             "a key reservation must be durable the moment it is taken, so it cannot be "
             "made inside a caller's open transaction; commit or roll back first"
         )
-    identifier = _require_text(record_id, "record_id")
-    key = _require_text(idempotency_key, "idempotency_key")
+    identifier = _require_identifier(record_id, "record_id")
+    key = _require_identifier(idempotency_key, "idempotency_key")
     reserved = _require_utc(reserved_at, "reserved_at")
     reservation_id = _RESERVATION_PREFIX + uuid.uuid4().hex
     try:
@@ -726,10 +727,10 @@ def release_submission_key(
         # Exact type, not isinstance, for `record_submission_attempt`'s reason: a subclass
         # can shadow a field with a property, turning the read below into caller code.
         raise SubmissionError("reservation must be a KeyReservation")
-    reservation_id = _require_text(reservation.reservation_id, "reservation.reservation_id")
+    reservation_id = _require_identifier(reservation.reservation_id, "reservation.reservation_id")
     reason_text = _require_reason(reason)
     released = _require_utc(released_at, "released_at")
-    actor = _require_optional_text(released_by, "released_by", max_length=_MAX_ACTOR)
+    actor = _require_optional_identifier(released_by, "released_by", max_length=_MAX_ACTOR)
     note_text = _require_optional_text(note, "note", max_length=_MAX_NOTE)
     if reason_text == "not_posted" and actor is not None:
         raise SubmissionError(
@@ -851,6 +852,46 @@ def _require_text(value: object, field: str, *, max_length: int = _MAX_IDENTIFIE
     return value
 
 
+def _require_identifier(value: object, field: str, *, max_length: int = _MAX_IDENTIFIER) -> str:
+    """Return ``value`` as non-blank, NUL-free storable text, or raise (M2-710).
+
+    :func:`_require_text` already refuses ``''``, but ``'\\n\\t'`` is truthy and would
+    reach ``submission_key``/``canonical_key_json`` through it -- minting a key for a
+    ``tournament_id`` no ``forecast_records`` row can ever hold, since
+    ``006_non_blank_identifiers.sql`` refuses a whitespace-only value at INSERT.
+    ``lifecycle._require_identifier`` solved the identical problem for its own writers;
+    this mirrors it rather than widening ``_require_text``, for the same reason that
+    function stays split there -- blank prose (``released_by``, ``note``) and blank
+    identity mean different things, and only identity columns take the stricter check.
+
+    The blank test is ``str.strip()``, matching the character set
+    ``006_non_blank_identifiers.sql`` and ``010_submission_key_reservations.sql`` spell out
+    in their triggers' ``trim()`` calls.
+
+    **U+0000 is refused outright**, for the same reason ``lifecycle._require_identifier``
+    refuses it: SQLite's ``length()`` stops counting at an embedded NUL, so a
+    200-character-limit check in a trigger cannot see past one -- a NUL-bearing identifier
+    could pass the schema's ceiling and still fail Python's ``len()`` on read-back. Refusing
+    the character here removes the one input the two counting functions disagree about.
+
+    Used for every identifier this module derives a key from or looks a row up by --
+    ``tournament_id``, ``record_id``, ``idempotency_key``, ``reservation_id`` -- which are
+    exactly the columns 006 and 010 guard with the matching trigger clause.
+
+    ``max_length`` exists only so :func:`_require_optional_identifier` can delegate here
+    with the actor bound instead of restating the blank rule. It is one spelling of that
+    rule on purpose: two definitions of "blank" that nobody compared is the defect this
+    whole family of guards descends from, and a second copy would reopen it one refactor
+    later.
+    """
+    text = _require_text(value, field, max_length=max_length)
+    if not text.strip():
+        raise SubmissionError(f"{field} must not be blank")
+    if "\x00" in text:
+        raise SubmissionError(f"{field} must not contain a NUL character")
+    return text
+
+
 def _require_identifier_int(value: object, field: str) -> int:
     """Return a positive, storable integer.
 
@@ -889,6 +930,28 @@ def _require_sha256(value: object, field: str) -> str:
 def _require_optional_text(value: object, field: str, *, max_length: int) -> str | None:
     """``None`` passes through; anything else must be storable text. ``lifecycle``'s."""
     return None if value is None else _require_text(value, field, max_length=max_length)
+
+
+def _require_optional_identifier(value: object, field: str, *, max_length: int) -> str | None:
+    """``None`` passes through; anything else must be non-blank, NUL-free text (M2-710).
+
+    For ``released_by``, and the reason it is not on :func:`_require_optional_text` is not
+    the identifier/prose split :func:`_require_identifier` describes -- an actor name is
+    prose. It is that ``010_submission_key_reservations.sql`` guards this column and does
+    not guard ``note``, in as many words: "Nullable, because the program releases its own
+    reservation and has no person to name. Present means a claim about a human, and a
+    blank one is worse than none."
+
+    So the writer follows the schema column by column rather than by category. ``note``
+    stays on :func:`_require_optional_text`, because ``010`` asks only that it be text and
+    a stricter writer would refuse input the ledger accepts -- the same two-spellings-of-
+    one-bound defect as M2-710 itself, pointed the other way.
+
+    Until this, ``released_by='   '`` passed the writer, reached the INSERT, and came back
+    as :func:`_execute`'s "the ledger rejected this write (detail withheld ...)" -- which
+    that function's docstring says is only ever the race its trigger exists to catch.
+    """
+    return None if value is None else _require_identifier(value, field, max_length=max_length)
 
 
 def _require_reason(value: object) -> str:
