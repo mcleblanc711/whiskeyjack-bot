@@ -35,11 +35,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, get_args
 
+import annotated_types
 import pytest
 import yaml
-from pydantic import BaseModel, ValidationError
+from pydantic import AfterValidator, BaseModel, ValidationError
+from pydantic.fields import FieldInfo
 
-from whiskeyjack_bot.config import ForecastConfig, validate_config_data
+from whiskeyjack_bot.config import ForecastConfig, _require_non_blank, validate_config_data
 from whiskeyjack_bot.forecast.attribution import AttributionFieldError
 from whiskeyjack_bot.forecast.schema import (
     MAX_RATIONALE_WORDS,
@@ -125,27 +127,134 @@ def _model_of(annotation: Any) -> type[BaseModel] | None:
     return None
 
 
-def _iter_required_paths(model: type[BaseModel], data: Any, prefix: str = "") -> Iterator[str]:
-    """Every required-field JSON path this model declares, checked against real fixture data.
+def _iter_field_paths(
+    model: type[BaseModel], data: Any, prefix: str = ""
+) -> Iterator[tuple[str, FieldInfo]]:
+    """Every field this model declares, as a JSON path paired with its ``FieldInfo``.
 
     Recurses into a nested model reached through a bare field, an ``Optional`` or a ``list`` --
     but only into a list's first item, since every item shares the same item schema and walking
     the rest would only multiply the case count, not the coverage.
+
+    Every walk below is expressed against this one traversal, so a field added to a schema
+    later is reached by all of them at once rather than by whichever ones were remembered.
     """
     if not isinstance(data, dict):
         return
     for name, field in model.model_fields.items():
         path = f"{prefix}{name}"
-        if field.is_required():
-            yield path
+        yield path, field
         nested_model = _model_of(field.annotation)
         if nested_model is None:
             continue
         value = data.get(name)
         if isinstance(value, dict):
-            yield from _iter_required_paths(nested_model, value, prefix=f"{path}.")
+            yield from _iter_field_paths(nested_model, value, prefix=f"{path}.")
         elif isinstance(value, list) and value:
-            yield from _iter_required_paths(nested_model, value[0], prefix=f"{path}.0.")
+            yield from _iter_field_paths(nested_model, value[0], prefix=f"{path}.0.")
+
+
+def _iter_required_paths(model: type[BaseModel], data: Any, prefix: str = "") -> Iterator[str]:
+    """Every required-field JSON path this model declares, checked against real fixture data."""
+    for path, field in _iter_field_paths(model, data, prefix):
+        if field.is_required():
+            yield path
+
+
+def _is_non_blank_guarded(field: FieldInfo) -> bool:
+    """Does this field declare that its string must carry content?
+
+    Either spelling counts: the ``AfterValidator(_require_non_blank)`` the response schema
+    uses, or the ``MinLen`` a pydantic constrained string carries. ``questions/model.py``
+    declares both on one field; this suite does not care which one does the refusing, only
+    that the field claims to require content.
+    """
+    return any(
+        (isinstance(meta, AfterValidator) and meta.func is _require_non_blank)
+        or isinstance(meta, annotated_types.MinLen)
+        for meta in field.metadata
+    )
+
+
+def _rejects_non_finite(field: FieldInfo) -> bool:
+    """Does this field declare ``allow_inf_nan=False``?"""
+    return any(getattr(meta, "allow_inf_nan", None) is False for meta in field.metadata)
+
+
+def _min_length(field: FieldInfo) -> int | None:
+    """The declared ``MinLen``, if the field carries one."""
+    for meta in field.metadata:
+        if isinstance(meta, annotated_types.MinLen):
+            return meta.min_length
+    return None
+
+
+def _blank_paths(model: type[BaseModel], data: Any) -> list[str]:
+    """Paths of content-requiring *string* fields, and of blank-guarded string list items.
+
+    A ``list[NonBlankStr]`` carries its guard on the item annotation rather than on the
+    field, so the item case is reached by appending ``.0`` and is generated here rather
+    than hand-listed -- ``base_rate.source_ids`` and friends would otherwise escape.
+    """
+    paths: list[str] = []
+    for path, field in _iter_field_paths(model, data):
+        value = _peek(data, path)
+        if isinstance(value, str) and _is_non_blank_guarded(field):
+            paths.append(path)
+        for arg in get_args(field.annotation):
+            if _is_blank_guarded_str_annotation(arg) and isinstance(value, list) and value:
+                paths.append(f"{path}.0")
+    return sorted(set(paths))
+
+
+def _is_blank_guarded_str_annotation(annotation: Any) -> bool:
+    """Is this annotation a ``str`` carrying the non-blank guard (i.e. a ``NonBlankStr``)?"""
+    metadata = getattr(annotation, "__metadata__", ())
+    return any(
+        (isinstance(meta, AfterValidator) and meta.func is _require_non_blank)
+        or isinstance(meta, annotated_types.MinLen)
+        for meta in metadata
+    )
+
+
+def _non_finite_paths(model: type[BaseModel], data: Any) -> list[str]:
+    """Paths of float fields that declare ``allow_inf_nan=False``."""
+    return sorted(
+        {
+            path
+            for path, field in _iter_field_paths(model, data)
+            if _rejects_non_finite(field) and isinstance(_peek(data, path), (int, float))
+        }
+    )
+
+
+def _min_length_sequence_paths(model: type[BaseModel], data: Any) -> list[str]:
+    """Paths of list fields that declare a ``MinLen`` -- i.e. that refuse being emptied."""
+    return sorted(
+        {
+            path
+            for path, field in _iter_field_paths(model, data)
+            if (_min_length(field) or 0) > 0 and isinstance(_peek(data, path), list)
+        }
+    )
+
+
+def _peek(data: Any, path: str) -> Any:
+    """The fixture value at one dotted path, or ``None`` if the path is absent."""
+    node = data
+    for part in path.split("."):
+        if isinstance(node, list):
+            index = int(part)
+            if index >= len(node):
+                return None
+            node = node[index]
+        elif isinstance(node, dict):
+            if part not in node:
+                return None
+            node = node[part]
+        else:
+            return None
+    return node
 
 
 def _question_required_paths(qtype: str) -> list[str]:
@@ -257,6 +366,65 @@ def test_the_required_field_walk_is_not_vacuous() -> None:
         "final_prediction.percentiles.0.percentile",
         "final_prediction.percentiles.0.value",
     } <= numeric_response_paths
+
+
+def test_the_constraint_walks_are_not_vacuous() -> None:
+    """The same guard as above, for the three metadata-keyed walks.
+
+    Each walk keys on field metadata, so a pydantic change to how constraints are recorded
+    -- or a refactor that drops one -- would empty a walk silently and turn every loop below
+    it into a pass over nothing. These pins are what makes such a change fail loudly. They
+    name the paths the walks were *written* to reach, including the nested and list-item
+    cases the hand-listed version of these tests missed.
+    """
+    for qtype in QUESTION_TYPES:
+        response_blanks = set(_blank_paths(RESPONSE_MODELS[qtype], _response_golden(qtype)))
+        assert {
+            "status_quo",
+            "rationale_summary",
+            "base_rate.reference_class",
+            "base_rate.basis",
+            # The nested and list-item cases: absent from the hand-listed predecessor.
+            "base_rate.source_ids.0",
+            "evidence_adjustments.0.claim",
+            "evidence_adjustments.0.source_ids.0",
+            "load_bearing_facts.0.claim",
+        } <= response_blanks
+
+        # The two question fields T-901 found accepting a blank, now guarded.
+        question_blanks = set(_blank_paths(QUESTION_MODELS[qtype], _question_golden(qtype)))
+        assert {"title", "source_categories.0.name"} <= question_blanks
+
+        response_non_finite = set(
+            _non_finite_paths(RESPONSE_MODELS[qtype], _response_golden(qtype))
+        )
+        assert "process_confidence" in response_non_finite
+
+    assert "final_prediction.probability_yes" in set(
+        _non_finite_paths(RESPONSE_MODELS["binary"], _response_golden("binary"))
+    )
+    numeric_non_finite = set(
+        _non_finite_paths(RESPONSE_MODELS["numeric"], _response_golden("numeric"))
+    )
+    # ``.value`` carries no ge/le, so this walk is the only thing that reaches it.
+    assert {
+        "final_prediction.percentiles.0.percentile",
+        "final_prediction.percentiles.0.value",
+    } <= numeric_non_finite
+    assert set(_non_finite_paths(QUESTION_MODELS["numeric"], _question_golden("numeric"))) == {
+        "lower_bound",
+        "upper_bound",
+    }
+
+    assert _min_length_sequence_paths(
+        QUESTION_MODELS["multiple_choice"], _question_golden("multiple_choice")
+    ) == ["options"]
+    assert _min_length_sequence_paths(
+        RESPONSE_MODELS["multiple_choice"], _response_golden("multiple_choice")
+    ) == ["final_prediction.options"]
+    assert _min_length_sequence_paths(RESPONSE_MODELS["numeric"], _response_golden("numeric")) == [
+        "final_prediction.percentiles"
+    ]
 
 
 @pytest.mark.parametrize("qtype", QUESTION_TYPES)
@@ -380,14 +548,103 @@ def test_rationale_summary_word_cap_is_enforced(qtype: str) -> None:
 
 
 @pytest.mark.parametrize("qtype", QUESTION_TYPES)
-@pytest.mark.parametrize(
-    "path", ["status_quo", "rationale_summary", "base_rate.reference_class", "base_rate.basis"]
-)
-def test_shared_nonblank_fields_reject_a_blank_value(qtype: str, path: str) -> None:
+def test_every_content_requiring_response_string_rejects_a_blank(qtype: str) -> None:
+    """Generated, not hand-listed.
+
+    The hand-picked version of this test named four paths and so never reached the nested
+    ``evidence_adjustments.0.claim`` / ``load_bearing_facts.0.claim`` fields or any
+    ``list[NonBlankStr]`` item, all of which the schema does in fact guard.
+    """
     golden = _response_golden(qtype)
-    mutated = _set_path(golden, path, "   ")
+    paths = _blank_paths(RESPONSE_MODELS[qtype], golden)
+    assert paths, "the blank walk must find at least one guarded string"
+    for path in paths:
+        mutated = _set_path(golden, path, "   ")
+        with pytest.raises(ForecastSchemaError):
+            validate_forecast_response(mutated, RESPONSE_MODELS[qtype])
+
+
+@pytest.mark.parametrize("qtype", QUESTION_TYPES)
+def test_every_content_requiring_question_string_rejects_a_blank(qtype: str) -> None:
+    """The question side of the same walk.
+
+    T-901 found this open: ``title`` and ``SourceCategory.name`` both declared
+    ``Field(min_length=1)``, which counts characters, so ``"   "`` satisfied it. Closed by
+    composing the constrained string with ``_require_non_blank`` -- see the note on
+    ``questions.model.NonBlankQuestionStr`` for why neither constraint alone is enough.
+    """
+    golden = _question_golden(qtype)
+    paths = _blank_paths(QUESTION_MODELS[qtype], golden)
+    assert paths, "the blank walk must find at least one guarded string"
+    for path in paths:
+        mutated = _set_path(golden, path, "   ")
+        with pytest.raises(ValidationError):
+            QUESTION_MODELS[qtype](**mutated)
+
+
+@pytest.mark.parametrize("qtype", QUESTION_TYPES)
+def test_every_finite_only_response_number_rejects_nan_and_infinity(qtype: str) -> None:
+    """``allow_inf_nan=False`` is declared on more fields than the bound tests below reach.
+
+    ``PercentilePoint.value`` in particular carries no ``ge``/``le`` -- it is the unbounded
+    magnitude -- so a NaN there is caught by nothing else in this file. JSON has no NaN
+    literal, but ``json.loads`` accepts the ``NaN``/``Infinity`` tokens by default, so model
+    output really can carry one.
+    """
+    golden = _response_golden(qtype)
+    paths = _non_finite_paths(RESPONSE_MODELS[qtype], golden)
+    assert paths, "the non-finite walk must find at least one finite-only number"
+    for path in paths:
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            mutated = _set_path(golden, path, bad)
+            with pytest.raises(ForecastSchemaError):
+                validate_forecast_response(mutated, RESPONSE_MODELS[qtype])
+
+
+def test_every_finite_only_question_number_rejects_nan_and_infinity() -> None:
+    """Only the numeric question declares finite-only bounds; the walk finds them there."""
+    golden = _question_golden("numeric")
+    paths = _non_finite_paths(QUESTION_MODELS["numeric"], golden)
+    assert set(paths) == {"lower_bound", "upper_bound"}
+    for path in paths:
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            mutated = _set_path(golden, path, bad)
+            with pytest.raises(ValidationError):
+                QUESTION_MODELS["numeric"](**mutated)
+
+
+@pytest.mark.parametrize("qtype", QUESTION_TYPES)
+def test_every_min_length_sequence_rejects_being_emptied(qtype: str) -> None:
+    """Deleting the key is the required-field case; emptying the list is a different one.
+
+    A model that returned ``"percentiles": []`` would have answered with the field present
+    and no forecast in it -- the sequence form of the blank-string case above.
+    """
+    for model, golden, error in (
+        (QUESTION_MODELS[qtype], _question_golden(qtype), ValidationError),
+        (RESPONSE_MODELS[qtype], _response_golden(qtype), ForecastSchemaError),
+    ):
+        for path in _min_length_sequence_paths(model, golden):
+            mutated = _set_path(golden, path, [])
+            with pytest.raises(error):
+                if error is ValidationError:
+                    model(**mutated)
+                else:
+                    validate_forecast_response(mutated, model)
+
+
+@pytest.mark.parametrize("qtype", QUESTION_TYPES)
+def test_as_of_utc_must_be_timezone_aware(qtype: str) -> None:
+    """``as_of_utc`` is the prompt's hard information cutoff, so a naive value is not one.
+
+    Its guard is ``AwareDatetime`` plus an ``AfterValidator``, which no metadata-keyed walk
+    above reaches -- one field, one targeted case.
+    """
+    golden = _response_golden(qtype)
     with pytest.raises(ForecastSchemaError):
-        validate_forecast_response(mutated, RESPONSE_MODELS[qtype])
+        validate_forecast_response(
+            _set_path(golden, "as_of_utc", "2026-08-30T12:00:00"), RESPONSE_MODELS[qtype]
+        )
 
 
 # --- malformed outputs beyond missing/extra/bounds -----------------------------------------
