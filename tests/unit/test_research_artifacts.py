@@ -117,6 +117,22 @@ def test_a_missing_artifact_names_its_path(tmp_path: Path) -> None:
     assert "absent.json" in str(caught.value)
 
 
+def test_a_lone_surrogate_in_the_path_is_refused_without_a_raw_encode_error(
+    tmp_path: Path,
+) -> None:
+    """`Path.read_bytes()` raises `UnicodeEncodeError` (a `ValueError`) encoding a lone
+    surrogate for the syscall, before any I/O -- an `except OSError` alone lets it
+    escape raw (M1-314; found by the analogous defect in `forecast/artifacts.py`).
+
+    Reachable without a hostile operator: `raw_response_path` is an unconstrained TEXT
+    column read back by a public entry point.
+    """
+    relative = "research/42/run-\udc00-1.json"
+    with pytest.raises(ArtifactError, match="path withheld") as caught:
+        read_raw_responses(tmp_path, relative)
+    assert "\udc00" not in str(caught.value)
+
+
 def test_a_corrupt_artifact_is_refused_without_echoing_its_contents(
     tmp_path: Path,
 ) -> None:
