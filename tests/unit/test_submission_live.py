@@ -52,8 +52,8 @@ from whiskeyjack_bot.lifecycle import (
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
 from whiskeyjack_bot.submission import SubmissionError
 from whiskeyjack_bot.submission_gateway import SubmissionRequest, read_live_artifact
+from whiskeyjack_bot.bounds import MAX_BODY_LENGTH
 from whiskeyjack_bot.submission_live import (
-    _MAX_BODY,
     _MAX_CATEGORIES,
     _MAX_OPTION_LABEL,
     _MAX_SNAPSHOT_VALUES,
@@ -1407,7 +1407,7 @@ def test_a_maximal_multiple_choice_snapshot_still_carries_its_evidence() -> None
     """The bound is measured here, not asserted in a comment.
 
     `_MAX_OPTION_LABEL` exists so the worst accepted multiple-choice snapshot fits
-    `_MAX_BODY` **by construction**. This renders that worst case -- `_MAX_CATEGORIES`
+    `MAX_BODY_LENGTH` **by construction**. This renders that worst case -- `_MAX_CATEGORIES`
     labels at the full length, every character one that `ensure_ascii=True` escapes to six
     bytes, values that render long, and the platform reporting them in reverse order -- and
     asserts the envelope still holds its evidence. If someone raises either constant, this
@@ -1448,7 +1448,7 @@ def test_a_maximal_multiple_choice_snapshot_still_carries_its_evidence() -> None
         result=result,
         expected_labels=expected_option_labels(plan),
     )
-    assert len(rendered) <= _MAX_BODY
+    assert len(rendered) <= MAX_BODY_LENGTH
     snapshot = json.loads(rendered)
     assert "values_omitted" not in snapshot
     assert snapshot["observed"]["label_order"] is not None
@@ -1515,7 +1515,7 @@ def test_a_binary_snapshot_keeps_its_evidence_whatever_options_the_provider_send
         expected_labels=None,
     )
     snapshot = json.loads(rendered)
-    assert len(rendered) <= _MAX_BODY
+    assert len(rendered) <= MAX_BODY_LENGTH
     assert "values_omitted" not in snapshot
     assert snapshot["observed"]["label_order"] is None
     assert snapshot["observed"]["latest_values"] == [0.4, 0.6]
@@ -1566,7 +1566,7 @@ def test_an_oversized_observed_vector_does_not_cost_the_row_its_evidence(
 
     Found while writing the round-4 request rather than by review: it is the same class as
     round 3 -- unbounded provider data rendered into a fixed-size envelope -- one field
-    over. A 50,000-element vector used to push the snapshot past `_MAX_BODY` and collapse
+    over. A 50,000-element vector used to push the snapshot past `MAX_BODY_LENGTH` and collapse
     it to the form that names no values at all.
 
     A *confirmed* row could never reach it, because every path to `confirmed` has already
@@ -1591,7 +1591,7 @@ def test_an_oversized_observed_vector_does_not_cost_the_row_its_evidence(
         expected_labels=None,
     )
     snapshot = json.loads(rendered)
-    assert len(rendered) <= _MAX_BODY
+    assert len(rendered) <= MAX_BODY_LENGTH
     assert "values_omitted" not in snapshot
     # The sample is capped; the true length is recorded beside it, so the truncation is
     # visible and the row never implies it saw fewer values than it did.

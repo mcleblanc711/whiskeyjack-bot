@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
+from whiskeyjack_bot.bounds import MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
@@ -76,7 +77,6 @@ if TYPE_CHECKING:
 RECORD_SCHEMA_VERSION = "1.0.0"
 
 _SHA256_LENGTH = 64
-_MAX_IDENTIFIER = 200
 
 # Discriminated so a serialized record round-trips back to the right response subclass.
 # ``schema.ForecastResponse`` is a bare union -- the discriminator is added here rather
@@ -184,7 +184,7 @@ class ForecastRecordDraft(_StrictModel):
     record_schema_version: str
     question_id: int
     post_id: int
-    tournament_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER)
+    tournament_id: str = Field(min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
     question_type: SupportedQuestionType
     # Free-form and caller-supplied, never derived from ``question.source_categories``.
     # ``docs/M1-NOTES.md`` (M1-201) records that no mechanical mapping exists from
@@ -193,9 +193,9 @@ class ForecastRecordDraft(_StrictModel):
     # taxonomy mapping under an item whose acceptance criterion is about version chains.
     question_domain: str | None = None
     question: CanonicalQuestion
-    attempt_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER)
+    attempt_id: str = Field(min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
     model_settings: RecordedModelSettings
-    retrieval_run_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER)
+    retrieval_run_id: str = Field(min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
     # The packet the forecast *saw*, stamped rather than stored. M1-306 decided against a
     # ``research_packets`` table because a stored hash that no longer matches the rows it
     # summarizes is an attribution claim the evidence contradicts; the truth lives in the
@@ -268,7 +268,7 @@ class ForecastRecord(ForecastRecordDraft):
     record would otherwise be undetectable.
     """
 
-    record_id: str = Field(min_length=1, max_length=_MAX_IDENTIFIER)
+    record_id: str = Field(min_length=1, max_length=MAX_IDENTIFIER_LENGTH)
     forecast_version: int = Field(ge=1)
     parent_record_id: str | None = None
 

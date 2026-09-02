@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import cast, get_args
 
+from whiskeyjack_bot.bounds import MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.lifecycle import (
     ApprovalDecision,
     LifecycleError,
@@ -65,11 +66,6 @@ from whiskeyjack_bot.lifecycle import (
 _DECISIONS: frozenset[str] = frozenset(get_args(ApprovalDecision))
 
 _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
-
-# Matches `lifecycle._MAX_IDENTIFIER`. This module validates only the inputs it owns --
-# see `_record_decision` -- so this bound exists to keep a hostile `record_id` away from
-# sqlite3's parameter binding, not to restate the writer's field rules.
-_MAX_IDENTIFIER = 200
 
 
 class ApprovalError(Exception):
@@ -442,11 +438,18 @@ def _require_identifier(value: object, field: str) -> str:
     and the migration's pinned character set still agree over every codepoint Python calls
     whitespace.
 
+    The *length* is no longer duplicated (M1-608). It comes from
+    :data:`whiskeyjack_bot.bounds.MAX_IDENTIFIER_LENGTH`, which every other layer and the
+    migrations' ``length(...) > 200`` clauses are held to by the same test -- a constant
+    carries no error type, so nothing about the exception-ownership argument above applied
+    to it, and while it was respelled here the two entry points could have drifted apart
+    silently.
+
     The NUL check is 004's finding B1: SQLite's ``length()`` stops counting at an embedded
     NUL, so the schema's ``length(...) > 200`` guard cannot see past one while this
     function's ``len()`` can -- a record the reader refuses and the schema accepted.
     """
-    text = _require_text(value, field, max_length=_MAX_IDENTIFIER)
+    text = _require_text(value, field, max_length=MAX_IDENTIFIER_LENGTH)
     if not text.strip():
         raise ApprovalError(f"{field} must not be blank")
     if "\x00" in text:

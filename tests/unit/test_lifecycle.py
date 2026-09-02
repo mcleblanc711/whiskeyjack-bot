@@ -4094,7 +4094,7 @@ GUARDED_COLUMNS = [
     "retrieval_run_id",
 ]
 
-# The four whose readers cap at `_MAX_IDENTIFIER`, and which therefore take the ceiling.
+# The four whose readers cap at `bounds.MAX_IDENTIFIER_LENGTH`, and which therefore take the ceiling.
 # `retrieval_run_id` is deliberately absent -- see
 # `test_the_run_id_column_has_no_length_ceiling_and_that_is_deliberate`.
 CAPPED_COLUMNS = GUARDED_COLUMNS[:-1]
@@ -4166,7 +4166,7 @@ def test_the_schema_refuses_an_identifier_over_200_characters(
     """The readers' ceiling, mirrored into the schema (004's finding B1, on new columns).
 
     Every public entry point in `lifecycle.py` and `approval.py` caps an identifier at
-    `_MAX_IDENTIFIER`, so a longer one written through raw SQL would be a row that is
+    `bounds.MAX_IDENTIFIER_LENGTH`, so a longer one written through raw SQL would be a row that is
     append-only and permanently unlookupable. 200 itself stays accepted: a ceiling that
     refused the boundary would be a different rule from the one the writers apply, which
     is the same disagreement in the other direction.

@@ -96,6 +96,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol, get_args
 
+from whiskeyjack_bot.bounds import MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.lifecycle import (
     FailureCode,
     LifecycleError,
@@ -146,13 +147,6 @@ _LIVE_SUBDIR = "live"
 # (CLAUDE.md's threat boundary). Every key `submission.submission_key` mints passes it.
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-# Matches `lifecycle._MAX_IDENTIFIER`, `approval._MAX_IDENTIFIER` and
-# `submission._MAX_IDENTIFIER`. Re-spelled rather than imported for the reason those three
-# already are -- a private constant imported to assert against tests the constant, not the
-# writer that enforces it (M1-303) -- and **M1-608 is the filed item that pins them
-# together.** A test puts a receipt through `lifecycle.record_submission_attempt` rather
-# than comparing the numbers.
-_MAX_IDENTIFIER = 200
 
 # SQLite stores signed 64-bit integers, and `question_id` reaches `forecast_records`
 # through every caller of this seam. Same reasoning as `submission._INT64_MAX`.
@@ -214,10 +208,13 @@ def _assert_prefix_is_distinct() -> None:
             f"the dry-run attempt prefix {_DRY_RUN_ATTEMPT_PREFIX!r} is not distinct from "
             "the idempotency-key prefix; the two identity spaces must not overlap"
         )
-    if len(_DRY_RUN_ATTEMPT_PREFIX) + 64 > _MAX_IDENTIFIER or KEY_LENGTH > _MAX_IDENTIFIER:
+    if (
+        len(_DRY_RUN_ATTEMPT_PREFIX) + 64 > MAX_IDENTIFIER_LENGTH
+        or KEY_LENGTH > MAX_IDENTIFIER_LENGTH
+    ):
         raise GatewayError(
             "a derived identifier is longer than the "
-            f"{_MAX_IDENTIFIER}-character ledger identifier limit"
+            f"{MAX_IDENTIFIER_LENGTH}-character ledger identifier limit"
         )
 
 
@@ -1100,8 +1097,8 @@ def _require_identifier(value: object, field: str) -> str:
     """
     if type(value) is not str or not value:
         raise GatewayError(f"{field} must be a non-empty string")
-    if len(value) > _MAX_IDENTIFIER:
-        raise GatewayError(f"{field} is longer than the {_MAX_IDENTIFIER}-character limit")
+    if len(value) > MAX_IDENTIFIER_LENGTH:
+        raise GatewayError(f"{field} is longer than the {MAX_IDENTIFIER_LENGTH}-character limit")
     if not value.strip():
         raise GatewayError(f"{field} must not be blank")
     if "\x00" in value:

@@ -41,11 +41,14 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-315 | feat/m1-315-live-paid-run | whiskeyjack-m1-315 | no | none | 2026-08-30 |
-| M2-710 | feat/m2-710-identifier-guard-key | whiskeyjack-m2-710 | no | none | 2026-08-30 |
-| T-901 | feat/t-901-golden-schema-fixtures | whiskeyjack-t-901 | no | none | 2026-08-30 |
+| M1-608 | feat/m1-608-shared-identifier-bound | whiskeyjack-m1-608 | no | none | 2026-09-01 |
 *(rows above; each lands on its own branch as it starts — see Wave 11 below. Swept
 `M1-503` (merged, PR #52, 2026-08-30) — the row this table carried into Wave 10's tail is
-now on master and its branch is gone from `origin`. Three new claims replace it.)*
+now on master and its branch is gone from `origin`. Three new claims replaced it, and two
+of those three are now swept in turn: `M2-710` (merged, PR #54, 2026-09-01, round-1
+approval) and `T-901` (merged, PR #56, 2026-09-01). `M1-315` is still live with PR #55
+open. `M1-608` is the next item off Lane 3's debt queue, taking the pane `M2-710` freed —
+which is where that queue said it should go.)*
 
 ## Planned next wave
 
@@ -70,11 +73,11 @@ cheaper problem.** Take it.
 before this section was rewritten — zero open PRs, zero worktrees — the same state Wave
 Eight described at its own boundary.
 
-Lane 3's debt queue is **not** finished: only its head, `M1-609`, ran. `M2-710` →
-`M1-608` → `M1-314` → `M2-709` are still queued, sequentially, one branch each, all size S,
-all Low priority. Pull the next one (`M2-710`) into whichever pane frees first below,
-rather than opening a fifth worktree — `wj-layout`'s `max_panes` is 4 for a reason (see
-below).
+Lane 3's debt queue is **not** finished. `M1-609` ran first, and `M2-710` merged
+2026-09-01 (PR #54, round-1 approval). `M1-608` → `M1-314` → `M2-709` remain, sequentially,
+one branch each, all size S, all Low priority. **`M1-608` is live as of 2026-09-01** in the
+pane `M2-710` freed. Pull the next one into whichever pane frees first below, rather than
+opening a fifth worktree — `wj-layout`'s `max_panes` is 4 for a reason (see below).
 
 Wave 9, three lanes, run concurrently. **Lane 1 is two stages**: `M1-506` must be *on
 master* before `M1-404`/`M1-405` start, because both of those register a checker into the
