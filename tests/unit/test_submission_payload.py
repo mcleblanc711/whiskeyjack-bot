@@ -621,14 +621,19 @@ def test_only_the_payload_the_record_derives_can_reach_a_submission_key(tmp_path
         )
         assert unauthorized.sha256 != authorized.sha256
 
-        recorded = approve(
+        approved = approve(
             connection,
             record_id=stored.record_id,
             actor="chris",
             occurred_at=OCCURRED,
-            payload_sha256=authorized.sha256,
+            calibration=CALIBRATION,
         )
-        assert recorded.payload_sha256 == authorized.sha256
+        # M2-707 round 1: `approve` derived this itself. `authorized` is the independent
+        # derivation -- built here, from the record object this test holds, rather than from
+        # the row `approve` read back -- so the equality is a claim about the writer's
+        # wiring and not a restatement of one call.
+        assert approved.decision.payload_sha256 == authorized.sha256
+        assert approved.authorized.sha256 == authorized.sha256
 
         key = submission_key_for_approved_record(
             connection, stored.record_id, request_payload_sha256=authorized.sha256

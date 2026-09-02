@@ -2310,9 +2310,11 @@ D33.
 
 What now happens, in the order it happens:
 
-1. `wj approve` reads the record, derives the payload it authorizes, **prints the payload and
-   its digest**, and writes the decision bound to that digest. A record that derives no
-   payload cannot be approved — the command refuses and writes nothing.
+1. `wj approve` records the decision through `approval.approve`, which reads the record,
+   derives the payload it authorizes and writes the decision bound to that digest, all in
+   one transaction; the command then **prints the payload and its digest**. A record that
+   derives no payload cannot be approved — the transaction rolls back and nothing is
+   written. (The derivation moved into `approve` at round 1; see the section at the end.)
 2. `wj reject` does none of that. A rejection authorizes nothing, and `011` forbids it a
    payload hash.
 3. `wj submit` posts the payload the record derives when `--payload-file` is omitted, or
@@ -2584,8 +2586,101 @@ the same reason it lists the other four: it is one more place a planted value co
 reprinted.
 
 `tests/property/test_approval_properties.py` gained the new field: the decider and the field to
-fuzz are now drawn together, because `payload_sha256` is `approve`'s alone and drawing them
-independently would spend half the examples on a `TypeError` that proves nothing. It also gained
-`test_only_a_well_formed_digest_ever_binds_a_payload`, the sibling of the existing
-`test_only_the_stored_hash_is_ever_bound`: either the decision is refused and nothing was
-written, or the stored digest is exactly what was passed and is 64 lowercase hex characters.
+fuzz are drawn together, because the extra parameter is `approve`'s alone and drawing them
+independently would spend half the examples on a `TypeError` that proves nothing. **Round 1
+changed which parameter that is** — `calibration`, not `payload_sha256` — and with it what the
+sibling property can claim; see the round-1 section below.
+
+### Round 1 — `approve` derives the digest; it does not accept one
+
+The review found one blocking defect, and it was the item's own acceptance criterion:
+
+> `approval.approve` can bind an approval to an arbitrary payload digest, allowing a
+> non-derived payload to post.
+
+The first cut took `payload_sha256` as a parameter, on the argument that `approve` could not
+reach `submission_payload` without closing an import cycle (`submission` imports `approval`),
+and that a wrong value was harmless because it would fail closed downstream — at
+`submission_key_for_approved_record` and again at `post_approved_forecast`'s derivation gate.
+
+**The second half of that argument was wrong.** Both gates compare *the payload being
+submitted* against *the stored digest*. Nothing compared the stored digest against the record.
+So a caller who passed the digest of some other payload and then submitted that same payload
+satisfied every gate, and the column recorded an arbitrary asserted binding rather than the
+payload the record derives. A criterion about what a record *derives* cannot be established by
+a value the caller chooses; the comparison is only ever as strong as the derivation that
+produced the value it compares against.
+
+The fix is that `approve` reads the record and derives the payload itself, **inside the same
+transaction that writes the decision** — the same reason the stored-hash read is in there: a
+payload derived outside it would be built from a record another writer could have appended a
+version to before the decision landed. `payload_sha256` is gone from the signature and
+`calibration` takes its place, which is the one input the derivation needs beyond the record.
+
+Three consequences worth recording:
+
+- **The import cycle is real and is broken by deferral, not by architecture.** Both imports in
+  `_derive_authorized_payload` are function-local. `from __future__ import annotations` makes
+  the two type-only imports free as well. The second effect is worth as much as the first: the
+  pinned SDK and the forecasting stack stay off the import path of `approval_history` and
+  `effective_approval`, which are reporting calls with no business loading a forecasting
+  package.
+- **`approve` returns `RecordedApproval` — the decision *and* what it authorized.** A caller
+  that re-derived in order to print would be showing the operator a second run of a function
+  and calling its agreement with the stored value a guarantee. `reject` keeps returning a bare
+  `ApprovalRecord`, and the asymmetry is the design: a rejection authorizes nothing, so it has
+  nothing to carry.
+- **A record that cannot be read, or that derives no payload, cannot be approved.** Both
+  arrive as `ApprovalError`, both with `from None`. That is the intended reading rather than a
+  side effect — an approval authorizes exactly one payload, so a record that derives none has
+  nothing to authorize — and it leaves `reject` untouched, which is what keeps an unsubmittable
+  record decidable.
+
+#### What the tests now pin, and the mutant that proved it
+
+The properties that fuzzed `payload_sha256` were properties about an argument that no longer
+exists. `test_only_a_well_formed_digest_ever_binds_a_payload` became
+**`test_the_digest_bound_is_the_one_the_record_derives`**: whatever the caller passes for the
+one input that is still theirs, an accepted approval stores the digest the record derives, read
+back through the public builder against the record read back out of the ledger.
+`tests/unit/test_approval.py` gained the unit-level counterpart with the second half the
+property cannot state cheaply — a *different* forecast derives a *different* digest, so "the
+record's own" is not a property every digest happens to satisfy.
+
+The strategy needed the same correction M2-707's first pass needed for `payload_sha256`: the
+legal value for `calibration` is a `NumericCalibrationConfig` and nothing else, so a strategy
+that could never draw one would leave every calibration example refused — and "refused" is not
+a claim about the accepted path. `CALIBRATION` is now a member of `ANYTHING`.
+
+Mutating the writer to store a constant digest instead of `authorized.sha256` is refused by
+five tests across three files (two unit, two property, one payload-module integration). The
+mutation was run against a pristine copy restored afterwards, with `__pycache__` cleared first.
+
+#### The test-fixture change this forced, and why it is not scope creep
+
+`approve` now reads the record back, so **a fixture that seeded the `'{}'` placeholder row can
+no longer approve anything**. Four test modules seeded exactly that, past `forecast.store`,
+from before M1-602's writer existed. They now write a real `ForecastRecord` through a new
+shared helper, `tests/unit/records.py`, whose columns come from `store._projection` — imported
+rather than transcribed, so a column added to `forecast_records` cannot leave the helper
+writing a row `read_forecast_record` then refuses.
+
+Two seeders survive as raw inserts, in `tests/unit/test_submission.py`, and deliberately: they
+write `forecast_records` rows holding a value of the wrong *storage class*, which is reachable
+only on a ledger written before the migration that started refusing it and upgraded afterwards.
+A validated record can never carry one, so those rows cannot come from the record writer.
+
+The knock-on is that a test can no longer *choose* a record's `forecast_sha256` or its payload
+digest: both are derived from the record's content, so the modules compute them from the same
+builder (`record_sha256(build_record(...))`, `payload_sha256_for_record(...)`) instead of
+declaring `"b" * 64`. Where a constant survives — `OTHER_SHA`, `OTHER_PAYLOAD_SHA` — its job is
+to be a well-formed digest that is *not* the record's, and that job is unchanged.
+
+#### Non-blocking observation, not taken
+
+The review noted that a stateful custom `Mapping` could render differently between the binding
+gate and the gateway call, and scoped it out itself: it requires a hostile or deliberately
+stateful caller-supplied mapping, which is outside CLAUDE.md's threat boundary (the operator
+and their machine are non-malicious). `AuthorizedPayload` already carries the mapping, its
+exact canonical bytes and their digest together, so every path that derives a payload here
+hashes the bytes it posts. No change.

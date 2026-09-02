@@ -211,8 +211,10 @@ def test_approve_records_the_decision_and_prints_what_it_bound_to(
     assert _stored_hash(seeded) in out
     assert "approved rec-1" in out
     assert _status(seeded) == "approved"
-    # M2-707: what the decision authorized, printed in full before it was written. The
-    # digest alone would say two payloads differ; the JSON is what says how.
+    # M2-707: what the decision authorized, printed in full. It comes *after* the write
+    # since round 1 -- `approve` derives the payload inside the transaction that records the
+    # decision, so this line is the derivation that was stored rather than a second run of
+    # the same function. The digest alone would say two payloads differ; the JSON says how.
     assert "payload:   sha256 " in out
     assert json.dumps(BINARY_PAYLOAD, ensure_ascii=True, sort_keys=True, separators=(",", ":")) in (
         out
@@ -225,11 +227,12 @@ def test_a_record_with_no_buildable_payload_cannot_be_approved_but_can_be_reject
     """The asymmetry `011` encodes, driven from the command line (M2-707).
 
     An approval authorizes one payload, so a record that derives none cannot be approved --
-    and the refusal has to arrive *before* the decision, not after it, which is the whole
-    reason the derivation happens in this command. A rejection authorizes nothing, so it
-    must still be available: a record nobody can submit is exactly the record an operator
-    most needs to be able to reject, and requiring a payload hash for both decisions would
-    have made it permanently undecidable.
+    and no decision may survive the refusal. Since round 1 the derivation runs inside
+    `approve`'s own transaction rather than in this command, so what makes that true is the
+    rollback, and the approval count below is what asserts it. A rejection authorizes
+    nothing, so it must still be available: a record nobody can submit is exactly the record
+    an operator most needs to be able to reject, and requiring a payload hash for both
+    decisions would have made it permanently undecidable.
 
     The record is a real one: the response schema admits a probability of 0.0 and Metaculus
     does not, so this is a forecast the pipeline can legitimately store and no approval can

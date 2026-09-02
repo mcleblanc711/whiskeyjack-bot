@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from whiskeyjack_bot.approval import approve, effective_approval, reject
+from whiskeyjack_bot.forecast.record import record_sha256
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
@@ -47,11 +48,20 @@ from whiskeyjack_bot.submission import (
     submission_key_for_approved_record,
     submission_key_for_record,
 )
+from whiskeyjack_bot.submission_payload import payload_sha256_for_record
+
+from tests.unit.records import CALIBRATION, build_record, seed_record
 
 TS = "2026-08-20T00:00:00.000000+00:00"
 OCCURRED = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
-SHA = "b" * 64
-PAYLOAD_SHA = "d" * 64
+# Both derived from the record `_seed_draft` writes, not picked (M2-707 round 1). `approve`
+# reads the record back and derives the payload it authorizes, so the fixture's approval
+# carries *this* digest and a constant would only be right by coincidence.
+# `OTHER_PAYLOAD_SHA` stays arbitrary: its whole job is to be a well-formed digest that no
+# approval here authorized.
+_DEFAULT_RECORD = build_record(record_id="rec-1")
+SHA = record_sha256(_DEFAULT_RECORD)
+PAYLOAD_SHA = payload_sha256_for_record(_DEFAULT_RECORD, calibration=CALIBRATION)
 OTHER_PAYLOAD_SHA = "e" * 64
 
 KEY_RE = re.compile(r"^wjsub-1-[0-9a-f]{64}\Z")
@@ -86,11 +96,43 @@ def _seed_draft(
     """Insert a draft directly, past `forecast.store`, to exercise the reader alone.
 
     The same shape `tests/unit/test_approval.py` uses, including the per-record
-    `attempt_id` migration 004 indexes UNIQUE.
+    `attempt_id` migration 004 indexes UNIQUE. **It writes a real `ForecastRecord` since
+    M2-707 round 1**: `approve` derives the payload it authorizes from `record_json`, so
+    the `'{}'` placeholder this seeder used to write refuses every approval.
 
     `parent_record_id` is required for any version above 1: migration 007 (M1-602) makes
     version 1 the root of a chain and every later version name the record it supersedes,
     so a fixture that seeded a bare v2 would be seeding a chain with a hole in it.
+    """
+    seed_record(
+        conn,
+        record_id=record_id,
+        question_id=question_id,
+        tournament_id=tournament_id,
+        forecast_version=forecast_version,
+        parent_record_id=parent_record_id,
+        created_at_utc=TS,
+    )
+    return record_id
+
+
+def _seed_raw_draft(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str = "rec-1",
+    question_id: object = 100,
+    tournament_id: object = "minibench",
+    forecast_version: object = 1,
+) -> str:
+    """Insert a row the record *writer* cannot produce, column by column.
+
+    The sibling above builds a real `ForecastRecord`, which is what every ordinary test
+    wants and what `approve` now requires. Two tests want the opposite: a `forecast_records`
+    row holding a value of the wrong storage class, which is reachable only on a ledger
+    written before the migration that started refusing it and upgraded afterwards. A
+    validated record can never carry one, so those rows are written here, straight into the
+    columns, with the placeholder `record_json` -- nothing in either test reads the record
+    back as a record.
     """
     conn.execute(
         "INSERT INTO forecast_records ("
@@ -99,14 +141,13 @@ def _seed_draft(
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, ?, ?, ?, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
+        "VALUES (?, ?, ?, ?, NULL, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
         "'run-1', ?, '{}', '{}', ?, ?, ?)",
         (
             record_id,
             question_id,
             tournament_id,
             forecast_version,
-            parent_record_id,
             TS,
             TS,
             SHA,
@@ -145,7 +186,7 @@ def approved(ledger: sqlite3.Connection) -> tuple[sqlite3.Connection, str]:
         record_id=record_id,
         actor="chris",
         occurred_at=OCCURRED,
-        payload_sha256=PAYLOAD_SHA,
+        calibration=CALIBRATION,
     )
     return ledger, record_id
 
@@ -524,7 +565,7 @@ def test_a_stored_forecast_record_column_of_the_wrong_type_is_refused(
     # INTEGER affinity leaves a non-numeric string as TEXT, and no trigger types this
     # column -- so this row is reachable, and the key derived from it would be a fact
     # about a value the ledger cannot hold.
-    _seed_draft(ledger, question_id="many")  # type: ignore[arg-type]
+    _seed_raw_draft(ledger, question_id="many")
     with pytest.raises(SubmissionError, match="stored question_id is not an integer"):
         submission_key_for_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
 
@@ -775,10 +816,10 @@ def test_a_refusal_from_the_ledger_never_echoes_a_stored_value(
     the connection is this test's own.
     """
     ledger.execute("DROP TRIGGER forecast_records_require_draft_on_insert")
-    _seed_draft(
+    _seed_raw_draft(
         ledger,
         tournament_id="s3cr3t-tournament",
-        forecast_version="two",  # type: ignore[arg-type]
+        forecast_version="two",
     )
     with pytest.raises(SubmissionError) as excinfo:
         submission_key_for_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
@@ -967,7 +1008,7 @@ def test_an_approval_written_before_the_binding_existed_is_refused(
         record_id=record_id,
         actor="chris",
         occurred_at=OCCURRED,
-        payload_sha256=PAYLOAD_SHA,
+        calibration=CALIBRATION,
     )
     # `approval_events` is append-only, so the pre-011 shape is made by clearing the column
     # with the block triggers dropped -- the same technique the migration tests use, and

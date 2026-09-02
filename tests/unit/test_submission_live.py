@@ -81,6 +81,8 @@ from whiskeyjack_bot.submission_live import (
     verify_uncertain_attempt,
 )
 
+from tests.unit.records import CALIBRATION
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_TEXT = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
 
@@ -97,7 +99,10 @@ BINARY_PAYLOAD: dict[str, Any] = {"question_type": "binary", "probability_yes": 
 # M2-707: what the `approved` fixture's approval authorizes. Computed from the payload
 # rather than written as a literal, because since `011` the two have to agree -- a
 # hand-typed digest here would make every post in this module fail at the key seam, and
-# the one that is *supposed* to fail there would prove nothing.
+# the one that is *supposed* to fail there would prove nothing. Since round 1 `approve`
+# derives its own digest from the record, so this value is now also an *independent*
+# witness: it is built from `BINARY_PAYLOAD` here and from `record_json` there, and the
+# tests below assert the two agree.
 PAYLOAD_SHA = payload_sha256(BINARY_PAYLOAD)
 BASELINE_START = 1_000_000.0
 NEW_START = 1_000_100.0
@@ -328,7 +333,7 @@ def approved(ledger: sqlite3.Connection) -> tuple[sqlite3.Connection, str]:
         record_id=record.record_id,
         actor="chris",
         occurred_at=OCCURRED,
-        payload_sha256=PAYLOAD_SHA,
+        calibration=CALIBRATION,
     )
     return ledger, record.record_id
 

@@ -25,10 +25,20 @@ before it. It costs one canonical rendering and no I/O.
 
 **Where this module may not be imported from**, and both directions are load-bearing:
 
-* **Not from ``approval.py``.** ``submission.py`` imports ``approval``, so an approval
-  module that reached a builder importing ``submission`` would close an import cycle. That
-  is why :func:`approval.approve` takes ``payload_sha256`` as a parameter rather than
-  computing it, and why the two gates that make a wrong value harmless live downstream.
+* **Not from ``approval.py`` at module scope.** ``submission.py`` imports ``approval``, so
+  an approval module that reached a builder importing ``submission`` would close an import
+  cycle. :func:`approval.approve` therefore imports :func:`authorized_payload` *inside the
+  function that needs it*, by which time every module is loaded -- and the forecasting
+  stack stays off the import path of ``approval_history`` and ``effective_approval``,
+  which are reporting calls.
+
+  The first cut of M2-707 instead had ``approve`` take a caller-supplied
+  ``payload_sha256``, and argued that a wrong value would fail closed downstream. **That
+  argument was wrong and round 1 reproduced it:** a caller who passes the digest of some
+  other payload and then submits that same payload satisfies every downstream comparison,
+  because each one checks the payload against the stored digest and nothing checked the
+  stored digest against the record. A criterion about what a record *derives* cannot be
+  established by a value the caller chooses.
 * **Not from ``submission_live.py``.** That module states, and rests design on, *"Nothing
   here imports ``forecasting_tools``"* -- four-method-wide :class:`MetaculusPoster` protocol,
   no transport, no SDK import cost on the one live path. The numeric branch below **is**

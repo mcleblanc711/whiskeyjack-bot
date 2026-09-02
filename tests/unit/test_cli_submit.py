@@ -27,6 +27,7 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import current_status, record_validation
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 
+from tests.unit.records import CALIBRATION
 from tests.unit.test_submission_live import (  # noqa: F401 - fixtures reused deliberately
     BINARY_PAYLOAD,
     PAYLOAD_SHA,
@@ -103,7 +104,7 @@ def record_id(config_file: Path) -> str:
             record_id=record.record_id,
             actor="chris",
             occurred_at=OCCURRED,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
         return record.record_id
     finally:

@@ -475,12 +475,21 @@ def submission_key_for_approved_record(
     this project has no live approvals to strand: ``submission.enabled`` is committed false
     and M2-706 has never run.
 
-    **What it still does not establish** is that the stored digest is the payload the record
-    *derives* -- that is a question about canonical JSON, the pinned SDK's CDF conversion
-    and ``numeric_calibration``, none of which this module or the ledger can see.
-    :func:`whiskeyjack_bot.submission_payload.payload_sha256_for_record` establishes it, at
-    approve time, and the digest carries it forward. A wrong digest therefore fails closed
-    -- the payload an operator submits will not match it -- rather than opening a path.
+    **What establishes that the stored digest is the payload the record derives** is
+    :func:`approval.approve`, which derives it there rather than accepting one, inside the
+    transaction that writes the decision. This module cannot check it: that is a question
+    about canonical JSON, the pinned SDK's CDF conversion and ``numeric_calibration``, none
+    of which this module or the ledger can see, and reaching them from here would put the
+    forecasting stack on the dry-run path.
+
+    That division is load-bearing and the first cut of M2-707 got it wrong. ``approve``
+    took a caller-supplied digest, and the argument was that a wrong one would fail closed
+    here -- "the payload an operator submits will not match it". Round 1 reproduced the
+    hole: a caller who supplies the digest of some *other* payload and then submits that
+    same payload passes this comparison, because it checks the payload against the stored
+    digest and nothing here checks the stored digest against the record. The comparison
+    below is exactly as strong as the derivation that produced the stored value, which is
+    why that derivation is no longer something a caller provides.
     """
     payload_sha = _require_sha256(request_payload_sha256, "request_payload_sha256")
     identifier = _require_identifier(record_id, "record_id")

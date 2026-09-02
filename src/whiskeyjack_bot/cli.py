@@ -361,23 +361,26 @@ def _run_questions_fetch(args: argparse.Namespace) -> int:
 def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
     """Record one approval decision against a stored forecast record (M2-701).
 
-    Prints what is being decided on -- identity, derived status, the content hash and,
-    since M2-707, **the payload the decision authorizes and its digest** -- *before*
-    writing, because an approval that binds to a value the operator never saw is an
-    attribution claim with nothing behind it. That is the acceptance criterion's "an
-    operator can see what a decision authorized", and it is printed in full rather than
-    summarized: the digest alone says two payloads differ, and the JSON says how.
+    Prints identity, derived status and the content hash before writing, and -- since
+    M2-707 -- **the payload the decision authorized and its digest** immediately after,
+    which is the acceptance criterion's "an operator can see what a decision authorized".
+    It is printed in full rather than summarized: the digest alone says two payloads
+    differ, and the JSON says how.
 
-    **The payload is built here rather than inside ``approval.py``**, which cannot reach
-    :mod:`whiskeyjack_bot.submission_payload` without closing an import cycle
-    (``submission`` imports ``approval``). This command is where the SDK is already
-    reachable, so it is where the derivation happens. A build failure refuses the whole
-    command and writes nothing -- a numeric record whose percentiles no longer convert has
-    no payload for an approval to bind to, and saying so before the decision is the point.
+    **The payload line comes after the write, and that is the M2-707 round-1 fix showing
+    through.** :func:`approval.approve` now derives the payload itself, inside the
+    transaction that writes the decision, because a digest the *caller* chose cannot
+    establish a claim about what the record derives. So this command has nothing to print
+    until the decision exists -- and what it prints is the derivation that was stored,
+    rather than a second run of the same function whose agreement with the stored one it
+    would then be asserting. A build failure refuses the whole command and writes nothing
+    (the transaction rolls back), so a numeric record whose percentiles no longer convert
+    still cannot be approved.
 
     ``reject`` skips every line of that. A rejection authorizes nothing, and a record whose
     payload cannot be built must still be rejectable -- which is why ``011`` requires the
-    digest for one decision and forbids it for the other.
+    digest for one decision and forbids it for the other, and why ``reject`` takes no
+    ``calibration``.
 
     Nothing here contacts Metaculus. Approval and submission are separate commands (D23),
     and the gateway is M2-703/M2-704.
@@ -419,20 +422,23 @@ def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
 
         try:
             if decision == "approved":
-                authorized = _derive_payload(connection, args.record_id, config)
-                if authorized is None:
-                    return EXIT_REFUSED
-                print(f"payload:   sha256 {authorized.sha256}")
-                print(f"           {authorized.canonical}")
-                recorded = approve(
+                # `approve` derives the payload itself, inside the transaction that writes
+                # the decision (M2-707 round 1), so what is printed below is the derivation
+                # that was *stored* rather than a second run of the same function. The
+                # command no longer derives one to show first: it could only have shown a
+                # value it then asked another function to reproduce.
+                approved = approve(
                     connection,
                     record_id=args.record_id,
                     actor=args.actor,
                     occurred_at=datetime.now(tz=timezone.utc),
-                    payload_sha256=authorized.sha256,
+                    calibration=config.numeric_calibration,
                     note=args.note,
                     expected_sha256=args.forecast_sha256,
                 )
+                recorded = approved.decision
+                print(f"payload:   sha256 {approved.authorized.sha256}")
+                print(f"           {approved.authorized.canonical}")
             else:
                 recorded = reject(
                     connection,
@@ -459,15 +465,19 @@ def _derive_payload(
 ) -> AuthorizedPayload | None:
     """Return the payload a record derives -- mapping, bytes and digest -- or ``None``.
 
-    The M2-707 seam, shared by ``approve`` (which binds a decision to the digest) and
-    ``submit`` (which posts the payload when no ``--payload-file`` is given), so the two
-    commands cannot disagree about what a record authorizes -- one derivation, one
-    rendering, one digest.
+    Used by ``submit`` alone, to fill in an omitted ``--payload-file``. ``approve`` used to
+    share it and no longer does: :func:`approval.approve` derives its own payload inside
+    the transaction that writes the decision (M2-707 round 1), because a digest a caller
+    chose cannot establish what a record derives. The two paths therefore call the same
+    ``authorized_payload`` on the same record and cannot disagree -- the function is
+    deterministic in ``(record, calibration)`` -- but ``submit``'s result is a *proposal*
+    checked against the stored digest at the key seam, while ``approve``'s is the stored
+    digest.
 
-    All three travel together because the printed JSON, the stored digest and the posted
-    mapping have to be the same payload; :class:`~submission_payload.AuthorizedPayload`
-    renders once and digests that rendering, so they are the same bytes rather than three
-    dumps of one object.
+    All three fields travel together because the printed JSON, the compared digest and the
+    posted mapping have to be the same payload;
+    :class:`~submission_payload.AuthorizedPayload` renders once and digests that rendering,
+    so they are the same bytes rather than three dumps of one object.
 
     Refusals print and return ``None`` rather than raising, matching every other refusal in
     this module. Nothing about the payload's *content* is echoed: ``PayloadBuildError``'s

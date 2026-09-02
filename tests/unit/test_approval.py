@@ -25,12 +25,27 @@ from whiskeyjack_bot.approval import (
     read_forecast_summary,
     reject,
 )
+from whiskeyjack_bot.forecast.record import record_sha256
+from whiskeyjack_bot.forecast.store import read_forecast_record
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import LifecycleError, current_status, record_validation
+from whiskeyjack_bot.submission_payload import payload_sha256_for_record
+
+from tests.unit.records import (
+    CALIBRATION,
+    GENERATED_AT_TEXT,
+    binary_response,
+    build_record,
+    seed_record,
+)
 
 TS = "2026-08-19T00:00:00.000000+00:00"
 OCCURRED = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
-SHA = "b" * 64
+# The hash the default seeded record actually stores. It is `record_sha256` of the record
+# `_seed_draft` writes, not a hand-picked constant: since M2-707 round 1 `approve` reads the
+# record back and derives a payload from it, so the row has to be a real one and its hash is
+# whatever its content says. `OTHER_SHA` stays arbitrary -- it exists to be *not* this value.
+SHA = record_sha256(build_record(record_id="rec-1"))
 OTHER_SHA = "c" * 64
 # M2-707: the digest of the payload an approval authorizes. Shape-only here --
 # `approval.py` never derives a payload, so any well-formed digest exercises the same
@@ -54,20 +69,24 @@ def _seed_draft(
     record_id: str = "rec-1",
     question_id: int = 100,
 ) -> str:
-    """Insert a draft directly: M1-602's record writer does not exist yet.
+    """Insert a real draft record under a fixed identifier.
 
-    The same shape `tests/unit/test_lifecycle.py` uses, including the per-record
-    `attempt_id` migration 004 indexes UNIQUE.
+    **It writes a genuine `ForecastRecord` now, and M2-707 round 1 is why.** `approve`
+    derives the payload the decision authorizes from `record_json`, so the `'{}'`
+    placeholder this seeder used to write refuses every approval -- correctly, since a
+    record nothing can read is a record nothing can be approved to submit. The identifier
+    is fixed rather than minted because these tests address the record by name.
+
+    Returns the `record_id`, as it always did. The record's *hash* is no longer a constant
+    this module picks -- it is derived from the record's content -- so `SHA` is computed
+    from the same builder rather than declared, and a seeder under a non-default identity
+    hashes to something else.
     """
-    conn.execute(
-        "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
-        "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
-        "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
-        "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
-        "'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (record_id, question_id, TS, TS, SHA, f"att-{record_id}"),
+    seed_record(
+        conn,
+        record_id=record_id,
+        question_id=question_id,
+        created_at_utc=TS,
     )
     return record_id
 
@@ -114,7 +133,7 @@ def test_summary_reports_the_derived_status_not_the_stored_one(
         question_type="binary",
         status="validated",
         forecast_sha256=SHA,
-        generated_at_utc=TS,
+        generated_at_utc=GENERATED_AT_TEXT,
     )
     # `forecast_records.status` is status-at-creation and is pinned to 'draft' by 003, so
     # a summary reading that column would report 'draft' for the record above.
@@ -148,14 +167,19 @@ def test_approval_moves_the_record_and_retains_actor_timestamp_and_note(
     validated: tuple[sqlite3.Connection, str],
 ) -> None:
     conn, record_id = validated
-    recorded = approve(
+    approved = approve(
         conn,
         record_id=record_id,
         actor="chris",
         occurred_at=OCCURRED,
         note="reviewed the packet",
-        payload_sha256=PAYLOAD_SHA,
+        calibration=CALIBRATION,
     )
+    recorded = approved.decision
+    # M2-707 round 1: the digest on the row is the one `approve` derived from the record,
+    # and `RecordedApproval` hands back that same derivation rather than leaving a caller to
+    # rebuild it. Asserting they agree is asserting the two are one derivation, not two.
+    assert recorded.payload_sha256 == approved.authorized.sha256
     assert recorded.decision == "approved"
     assert recorded.actor == "chris"
     assert recorded.note == "reviewed the packet"
@@ -163,6 +187,41 @@ def test_approval_moves_the_record_and_retains_actor_timestamp_and_note(
     assert recorded.occurred_at_utc == "2026-08-19T12:00:00.000000+00:00"
     assert recorded.created_at_utc  # writer-owned; distinct field, always present
     assert current_status(conn, record_id) == "approved"
+
+
+def test_the_digest_bound_is_the_records_own_and_not_a_callers(
+    validated: tuple[sqlite3.Connection, str],
+) -> None:
+    """M2-707 round 1: the finding, as the test that would have caught it.
+
+    The first cut took a `payload_sha256` argument and argued a wrong value failed closed
+    downstream. It did not: every gate compares a submitted payload against the *stored*
+    digest, and nothing compared the stored digest against the record -- so a caller who
+    passed another payload's digest and then submitted that same payload passed all of them.
+
+    What closes it is that the value is derived from the record, and the two assertions
+    below are the two halves of that. The first is the wiring: the digest on the row is the
+    one the public builder derives from the record read back out of the ledger -- a mutant
+    that stored anything else fails here. The second is that the claim has content: a
+    different forecast derives a different digest, so "the record's own" is not a property
+    every digest happens to satisfy.
+    """
+    conn, record_id = validated
+    approved = approve(
+        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION
+    )
+    stored_record = read_forecast_record(conn, record_id)
+    assert approved.decision.payload_sha256 == payload_sha256_for_record(
+        stored_record, calibration=CALIBRATION
+    )
+    other_forecast = build_record(
+        record_id=record_id,
+        forecast=binary_response(100, final_prediction={"probability_yes": 0.75}),
+    )
+    assert (
+        payload_sha256_for_record(other_forecast, calibration=CALIBRATION)
+        != approved.decision.payload_sha256
+    )
 
 
 def test_rejection_records_a_decision_without_moving_the_record(
@@ -181,9 +240,7 @@ def test_a_record_may_be_rejected_repeatedly_and_then_approved(
     conn, record_id = validated
     reject(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, note="stale evidence")
     reject(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, note="still stale")
-    approve(
-        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
 
     history = approval_history(conn, record_id)
     assert [record.decision for record in history] == ["rejected", "rejected", "approved"]
@@ -194,16 +251,14 @@ def test_a_record_may_be_rejected_repeatedly_and_then_approved(
 def test_a_record_holds_at_most_one_approval(validated: tuple[sqlite3.Connection, str]) -> None:
     """`approved` is reachable only from `validated`, and nothing returns there."""
     conn, record_id = validated
-    approve(
-        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
     with pytest.raises(ApprovalError) as excinfo:
         approve(
             conn,
             record_id=record_id,
             actor="chris",
             occurred_at=OCCURRED,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
     assert "not a legal transition" in str(excinfo.value)
     assert len(approval_history(conn, record_id)) == 1
@@ -217,7 +272,7 @@ def test_a_draft_cannot_be_approved(ledger: sqlite3.Connection) -> None:
             record_id=record_id,
             actor="chris",
             occurred_at=OCCURRED,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
     assert _counts(ledger) == (0, 0)
 
@@ -239,7 +294,7 @@ def test_a_record_with_no_stored_hash_cannot_be_decided_on(ledger: sqlite3.Conne
             record_id=record_id,
             actor="chris",
             occurred_at=OCCURRED,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
     assert "stores no content hash" in str(excinfo.value)
     assert _counts(ledger) == (0, 0)
@@ -252,7 +307,7 @@ def test_an_unknown_record_is_refused_as_this_modules_error(ledger: sqlite3.Conn
             record_id="no-such-record",
             actor="chris",
             occurred_at=OCCURRED,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
 
 
@@ -269,8 +324,8 @@ def test_a_supplied_hash_that_matches_is_accepted(
         actor="chris",
         occurred_at=OCCURRED,
         expected_sha256=SHA,
-        payload_sha256=PAYLOAD_SHA,
-    )
+        calibration=CALIBRATION,
+    ).decision
     assert recorded.forecast_sha256 == SHA
 
 
@@ -285,7 +340,7 @@ def test_a_supplied_hash_that_does_not_match_writes_nothing(
             actor="chris",
             occurred_at=OCCURRED,
             expected_sha256=OTHER_SHA,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
     assert "the forecast changed and any prior approval no longer binds" in str(excinfo.value)
     assert _counts(conn) == (0, 1)  # the `validated` event only
@@ -303,7 +358,7 @@ def test_a_mismatch_message_prints_neither_hash(
             actor="chris",
             occurred_at=OCCURRED,
             expected_sha256=OTHER_SHA,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
     message = str(excinfo.value)
     assert SHA not in message
@@ -331,9 +386,7 @@ def test_a_changed_forecast_is_a_new_record_with_no_approval(
 ) -> None:
     """The structural half of "changed forecast invalidates prior approval"."""
     conn, record_id = validated
-    approve(
-        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
     assert effective_approval(conn, record_id) is not None
 
     # A changed forecast is a new version, which is a new record with its own hash.
@@ -398,9 +451,7 @@ def test_effective_approval_refuses_an_inconsistent_history(
     dropping the validating trigger, which is the only way this state exists at all.
     """
     conn, record_id = validated
-    approve(
-        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
     conn.execute("DROP TRIGGER lifecycle_events_validate_on_insert")
     approval_id = conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
@@ -439,9 +490,7 @@ def test_a_stored_payload_digest_that_is_not_a_digest_is_refused_by_the_reader(
     that the refusal does not reprint it.
     """
     conn, record_id = validated
-    approve(
-        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
     conn.execute("DROP TRIGGER approval_events_block_update")
     conn.execute("UPDATE approval_events SET payload_sha256 = ?", (PLANTED_SECRET,))
     with pytest.raises(ApprovalError) as excinfo:
@@ -463,9 +512,7 @@ def test_history_ignores_another_records_decisions(ledger: sqlite3.Connection) -
     second = _seed_draft(ledger, record_id="rec-2", question_id=101)
     record_validation(ledger, record_id=first, occurred_at=OCCURRED)
     record_validation(ledger, record_id=second, occurred_at=OCCURRED)
-    approve(
-        ledger, record_id=first, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(ledger, record_id=first, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
 
     assert [record.forecast_record_id for record in approval_history(ledger, first)] == [first]
     assert approval_history(ledger, second) == ()
@@ -506,7 +553,7 @@ def test_every_malformed_shape_arrives_as_an_approval_error(
         **kwargs,
     }
     with pytest.raises(ApprovalError):
-        approve(conn, **call, payload_sha256=PAYLOAD_SHA)  # type: ignore[arg-type]
+        approve(conn, **call, calibration=CALIBRATION)  # type: ignore[arg-type]
     with pytest.raises(ApprovalError):
         reject(conn, **call)  # type: ignore[arg-type]
 
@@ -516,9 +563,7 @@ def test_a_lifecycle_error_never_escapes_as_itself(
 ) -> None:
     """The module-own-error rule, stated as the exception type a caller may see."""
     conn, record_id = validated
-    approve(
-        conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
-    )
+    approve(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED, calibration=CALIBRATION)
     with pytest.raises(ApprovalError) as excinfo:
         reject(conn, record_id=record_id, actor="chris", occurred_at=OCCURRED)
     assert not isinstance(excinfo.value, LifecycleError)
@@ -538,7 +583,7 @@ def test_a_note_value_is_never_echoed_by_a_refusal(
             occurred_at=OCCURRED,
             note="x" * 4001,
             expected_sha256=OTHER_SHA,
-            payload_sha256=PAYLOAD_SHA,
+            calibration=CALIBRATION,
         )
     assert "x" * 20 not in str(excinfo.value)
 
