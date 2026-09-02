@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from whiskeyjack_bot.approval import approve, effective_approval, reject
+from whiskeyjack_bot.forecast.record import record_sha256
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
@@ -47,11 +48,20 @@ from whiskeyjack_bot.submission import (
     submission_key_for_approved_record,
     submission_key_for_record,
 )
+from whiskeyjack_bot.submission_payload import payload_sha256_for_record
+
+from tests.unit.records import CALIBRATION, build_record, seed_record
 
 TS = "2026-08-20T00:00:00.000000+00:00"
 OCCURRED = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
-SHA = "b" * 64
-PAYLOAD_SHA = "d" * 64
+# Both derived from the record `_seed_draft` writes, not picked (M2-707 round 1). `approve`
+# reads the record back and derives the payload it authorizes, so the fixture's approval
+# carries *this* digest and a constant would only be right by coincidence.
+# `OTHER_PAYLOAD_SHA` stays arbitrary: its whole job is to be a well-formed digest that no
+# approval here authorized.
+_DEFAULT_RECORD = build_record(record_id="rec-1")
+SHA = record_sha256(_DEFAULT_RECORD)
+PAYLOAD_SHA = payload_sha256_for_record(_DEFAULT_RECORD, calibration=CALIBRATION)
 OTHER_PAYLOAD_SHA = "e" * 64
 
 KEY_RE = re.compile(r"^wjsub-1-[0-9a-f]{64}\Z")
@@ -86,11 +96,43 @@ def _seed_draft(
     """Insert a draft directly, past `forecast.store`, to exercise the reader alone.
 
     The same shape `tests/unit/test_approval.py` uses, including the per-record
-    `attempt_id` migration 004 indexes UNIQUE.
+    `attempt_id` migration 004 indexes UNIQUE. **It writes a real `ForecastRecord` since
+    M2-707 round 1**: `approve` derives the payload it authorizes from `record_json`, so
+    the `'{}'` placeholder this seeder used to write refuses every approval.
 
     `parent_record_id` is required for any version above 1: migration 007 (M1-602) makes
     version 1 the root of a chain and every later version name the record it supersedes,
     so a fixture that seeded a bare v2 would be seeding a chain with a hole in it.
+    """
+    seed_record(
+        conn,
+        record_id=record_id,
+        question_id=question_id,
+        tournament_id=tournament_id,
+        forecast_version=forecast_version,
+        parent_record_id=parent_record_id,
+        created_at_utc=TS,
+    )
+    return record_id
+
+
+def _seed_raw_draft(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str = "rec-1",
+    question_id: object = 100,
+    tournament_id: object = "minibench",
+    forecast_version: object = 1,
+) -> str:
+    """Insert a row the record *writer* cannot produce, column by column.
+
+    The sibling above builds a real `ForecastRecord`, which is what every ordinary test
+    wants and what `approve` now requires. Two tests want the opposite: a `forecast_records`
+    row holding a value of the wrong storage class, which is reachable only on a ledger
+    written before the migration that started refusing it and upgraded afterwards. A
+    validated record can never carry one, so those rows are written here, straight into the
+    columns, with the placeholder `record_json` -- nothing in either test reads the record
+    back as a record.
     """
     conn.execute(
         "INSERT INTO forecast_records ("
@@ -99,14 +141,13 @@ def _seed_draft(
         "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, ?, ?, ?, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
+        "VALUES (?, ?, ?, ?, NULL, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
         "'run-1', ?, '{}', '{}', ?, ?, ?)",
         (
             record_id,
             question_id,
             tournament_id,
             forecast_version,
-            parent_record_id,
             TS,
             TS,
             SHA,
@@ -130,10 +171,23 @@ def ledger(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 
 @pytest.fixture
 def approved(ledger: sqlite3.Connection) -> tuple[sqlite3.Connection, str]:
-    """A record at `approved` -- the only state a submission attempt is legal from."""
+    """A record at `approved` -- the only state a submission attempt is legal from.
+
+    Bound to `PAYLOAD_SHA` (M2-707), which is the digest every derivation test in this
+    module passes as `request_payload_sha256`. That is not incidental: since `011` an
+    approval authorizes one payload, so a fixture bound to some *other* digest would make
+    every key derivation below fail for the same reason and prove nothing about the four
+    they are each actually testing. `OTHER_PAYLOAD_SHA` is the unauthorized one.
+    """
     record_id = _seed_draft(ledger)
     record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
-    approve(ledger, record_id=record_id, actor="chris", occurred_at=OCCURRED)
+    approve(
+        ledger,
+        record_id=record_id,
+        actor="chris",
+        occurred_at=OCCURRED,
+        calibration=CALIBRATION,
+    )
     return ledger, record_id
 
 
@@ -511,7 +565,7 @@ def test_a_stored_forecast_record_column_of_the_wrong_type_is_refused(
     # INTEGER affinity leaves a non-numeric string as TEXT, and no trigger types this
     # column -- so this row is reachable, and the key derived from it would be a fact
     # about a value the ledger cannot hold.
-    _seed_draft(ledger, question_id="many")  # type: ignore[arg-type]
+    _seed_raw_draft(ledger, question_id="many")
     with pytest.raises(SubmissionError, match="stored question_id is not an integer"):
         submission_key_for_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
 
@@ -762,10 +816,10 @@ def test_a_refusal_from_the_ledger_never_echoes_a_stored_value(
     the connection is this test's own.
     """
     ledger.execute("DROP TRIGGER forecast_records_require_draft_on_insert")
-    _seed_draft(
+    _seed_raw_draft(
         ledger,
         tournament_id="s3cr3t-tournament",
-        forecast_version="two",  # type: ignore[arg-type]
+        forecast_version="two",
     )
     with pytest.raises(SubmissionError) as excinfo:
         submission_key_for_record(ledger, "rec-1", request_payload_sha256=PAYLOAD_SHA)
@@ -849,9 +903,13 @@ def test_an_approval_row_no_lifecycle_event_cites_does_not_open_the_gate(
     record_id = _seed_draft(ledger)
     record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
     ledger.execute(
+        # `payload_sha256` is supplied because `011` refuses an approved row without one.
+        # It makes this shape *more* pointed rather than less: the row now satisfies both
+        # hash-binding clauses and still moves nothing, so what keeps the gate shut is
+        # `effective_approval` reading the lifecycle event and nothing else.
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
-        "created_at_utc) VALUES (?, 'approved', 'nobody', ?, ?)",
-        (record_id, SHA, TS),
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'nobody', ?, ?, ?)",
+        (record_id, SHA, TS, PAYLOAD_SHA),
     )
     with pytest.raises(SubmissionError, match="holds no approval in force"):
         submission_key_for_approved_record(ledger, record_id, request_payload_sha256=PAYLOAD_SHA)
@@ -883,26 +941,83 @@ def test_an_approval_layer_error_never_escapes_as_itself(
     assert not isinstance(excinfo.value, ApprovalError)
 
 
-def test_the_documented_gap_is_real_and_is_asserted(
+def test_only_the_payload_the_approval_authorized_gets_a_key(
     approved: tuple[sqlite3.Connection, str],
 ) -> None:
-    """The recorded limitation, pinned as a test rather than left as prose (D33, M2-707).
+    """D33's gap, closed (M2-707). This test is the one that used to assert it was open.
 
-    Two different payloads for one approved forecast get two different keys and are both
-    served by the gated seam, because an approval binds to `forecast_sha256` and one
-    approved forecast covers every payload built from it. If a later change closes this,
-    the test fails and the note must be updated -- which is the point of asserting a known
-    gap rather than only describing one.
+    It was `test_the_documented_gap_is_real_and_is_asserted`, and it asserted that *two*
+    different payloads for one approved forecast both got keys -- because an approval bound
+    to `forecast_sha256` and one approved forecast covered every payload built from it. It
+    was written to fail the day that changed, so that the note describing the gap could not
+    outlive the gap. It has now done its job and this is what it became.
+
+    The approval carries the payload digest it authorized, so exactly one payload derives a
+    key and every other one is refused -- before the key, and therefore before the
+    reservation and before any post.
     """
     conn, record_id = approved
-    first = submission_key_for_approved_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
-    second = submission_key_for_approved_record(
-        conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA
-    )
-    assert first != second
+    key = submission_key_for_approved_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
+    assert KEY_RE.match(key)
+    with pytest.raises(SubmissionError, match="not the one the approval in force authorized"):
+        submission_key_for_approved_record(
+            conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA
+        )
     approval = effective_approval(conn, record_id)
     assert approval is not None
     assert approval.forecast_sha256 == SHA
+    assert approval.payload_sha256 == PAYLOAD_SHA
+
+
+def test_the_ungated_seam_still_serves_any_payload(
+    approved: tuple[sqlite3.Connection, str],
+) -> None:
+    """The binding is on the *gated* seam only, and that is the whole design.
+
+    `submission_key_for_record` mints a key for a `draft`, because a dry run is how an
+    operator sees what would be submitted before deciding whether to approve it (M2-703).
+    Extending the payload binding to it would make a dry run impossible for a record that
+    has not been approved yet -- which is every record a dry run is for. Asserted rather
+    than left to the reader: the two functions differ in what they refuse, and this is now
+    a third difference between them.
+    """
+    conn, record_id = approved
+    assert KEY_RE.match(
+        submission_key_for_record(conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA)
+    )
+
+
+def test_an_approval_written_before_the_binding_existed_is_refused(
+    ledger: sqlite3.Connection,
+) -> None:
+    """A pre-`011` approval carries a NULL digest, and NULL is refused, not exempted.
+
+    Reached by raw SQL against the current schema rather than by a partial migration walk:
+    what is being tested is the *reader's* rule for a NULL, and `011` deliberately leaves
+    the column nullable so such rows survive an upgrade rather than blocking one. Nothing
+    else about the row is unusual -- it holds an approval in force, at `approved`, and would
+    have minted a key on any tree before this item.
+
+    The stricter reading, and the one that costs a re-approval rather than a post nobody
+    reviewed.
+    """
+    record_id = _seed_draft(ledger)
+    record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
+    approve(
+        ledger,
+        record_id=record_id,
+        actor="chris",
+        occurred_at=OCCURRED,
+        calibration=CALIBRATION,
+    )
+    # `approval_events` is append-only, so the pre-011 shape is made by clearing the column
+    # with the block triggers dropped -- the same technique the migration tests use, and
+    # narrower than rebuilding the ledger from a truncated migration list.
+    ledger.execute("DROP TRIGGER approval_events_block_update")
+    ledger.execute("UPDATE approval_events SET payload_sha256 = NULL")
+    assert current_status(ledger, record_id) == "approved"
+    with pytest.raises(SubmissionError, match="predates the payload binding"):
+        submission_key_for_approved_record(ledger, record_id, request_payload_sha256=PAYLOAD_SHA)
 
 
 # --- the gate is about the status now, not only the history --------------------------
@@ -979,10 +1094,12 @@ def test_an_unresolved_uncertain_attempt_still_passes_the_gate(
         detail_code="timeout",
     )
     assert current_status(conn, record_id) == "approved"
+    # `PAYLOAD_SHA`, not `OTHER_PAYLOAD_SHA`: since M2-707 an unauthorized payload is
+    # refused too, and this test is about the *status* gate. Passing the unauthorized
+    # digest here would still fail, for a reason that has nothing to do with what it is
+    # asserting.
     assert KEY_RE.match(
-        submission_key_for_approved_record(
-            conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA
-        )
+        submission_key_for_approved_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
     )
 
 

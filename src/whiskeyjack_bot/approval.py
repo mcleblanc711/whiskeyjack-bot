@@ -49,7 +49,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast, get_args
+from typing import TYPE_CHECKING, cast, get_args
 
 from whiskeyjack_bot.bounds import MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.lifecycle import (
@@ -60,6 +60,15 @@ from whiskeyjack_bot.lifecycle import (
     record_approval,
     transaction,
 )
+
+if TYPE_CHECKING:
+    # Annotation-only, and that is the whole point (M2-707 round 1). `submission.py`
+    # imports this module, and `submission_payload` imports `submission`, so importing the
+    # builder at module scope would close a cycle. `from __future__ import annotations`
+    # makes every annotation a string, so the names below cost nothing at runtime; the two
+    # real imports happen inside `_record_decision`, by which time every module is loaded.
+    from whiskeyjack_bot.config import NumericCalibrationConfig
+    from whiskeyjack_bot.submission_payload import AuthorizedPayload
 
 # The closed vocabulary of `approval_events.decision`, taken from the module that owns it
 # rather than respelled here: a second spelling is a second thing to keep in agreement.
@@ -120,6 +129,15 @@ class ApprovalRecord:
     so a replayed run reproduces it) and ``created_at_utc`` is when the ledger stored it
     (writer-owned). "actor/timestamp/note are retained" is this dataclass.
 
+    ``payload_sha256`` is the submission payload this decision authorized (M2-707/D33),
+    derived by :func:`approve` from the record itself rather than supplied by a caller.
+    It is ``str`` for every approval written since migration ``011`` and ``None`` for two
+    distinct reasons the ``decision`` field tells apart: a rejection authorizes no payload
+    and never carries one, while an *approval* with ``None`` is a row written before
+    ``011`` and holds no payload binding at all --
+    :func:`whiskeyjack_bot.submission.submission_key_for_approved_record` refuses those
+    rather than treating an absent binding as a satisfied one.
+
     Constructed only from a row the join in :func:`approval_history` returned, so a
     decision with no lifecycle event can never appear as one.
     """
@@ -133,6 +151,7 @@ class ApprovalRecord:
     occurred_at_utc: str
     created_at_utc: str
     event_seq: int
+    payload_sha256: str | None
 
 
 _SUMMARY_COLUMNS = (
@@ -145,7 +164,7 @@ _SUMMARY_COLUMNS = (
 # ALTER TABLE must not be able to reorder it silently.
 _APPROVAL_COLUMNS = (
     "a.event_id, a.forecast_record_id, a.decision, a.actor, a.forecast_sha256, "
-    "a.note, e.occurred_at_utc, a.created_at_utc, e.event_seq"
+    "a.note, e.occurred_at_utc, a.created_at_utc, e.event_seq, a.payload_sha256"
 )
 
 # The join that makes a decision *count*. `e.forecast_record_id = a.forecast_record_id` is
@@ -248,17 +267,64 @@ def effective_approval(conn: sqlite3.Connection, record_id: str) -> ApprovalReco
     return approvals[0]
 
 
+@dataclass(frozen=True)
+class RecordedApproval:
+    """What an approval decided, and what it authorized (M2-707 round 1).
+
+    Two fields because the approval boundary is two claims, not one: ``decision`` is the
+    ledger row, and ``authorized`` is the payload that row binds to -- the mapping, its
+    exact canonical bytes and their digest, all from the single derivation
+    :func:`approve` performed inside its own transaction.
+
+    It is returned rather than left for the caller to rebuild so that what an operator is
+    shown is the derivation that was *stored*, not a second run of the same function. A
+    caller that re-derived in order to print would be comparing two runs and calling the
+    agreement a guarantee.
+
+    :func:`reject` has no counterpart and returns a bare :class:`ApprovalRecord`. The
+    asymmetry is the design: a rejection authorizes nothing, so there is nothing for it to
+    carry.
+    """
+
+    decision: ApprovalRecord
+    authorized: AuthorizedPayload
+
+
 def approve(
     conn: sqlite3.Connection,
     *,
     record_id: str,
     actor: str,
     occurred_at: datetime,
+    calibration: NumericCalibrationConfig,
     note: str | None = None,
     expected_sha256: str | None = None,
-) -> ApprovalRecord:
-    """Record an approval: ``validated -> approved``. See :func:`_record_decision`."""
-    return _record_decision(
+) -> RecordedApproval:
+    """Record an approval: ``validated -> approved``. See :func:`_record_decision`.
+
+    **This function derives the payload it binds to; it does not accept one** (M2-707/D33,
+    and specifically that item's round-1 finding). The first cut took a ``payload_sha256``
+    parameter and argued that a wrong value would fail closed downstream. That argument
+    was wrong, and the review reproduced it: a caller that passes the digest of some other
+    payload and then *submits that same payload* satisfies every downstream comparison,
+    because the comparisons check the payload against the stored digest and nothing checks
+    the stored digest against the record. The acceptance criterion -- "a submission
+    payload that does not derive from the approved forecast is refused before any post" --
+    cannot be established by a value the caller chooses.
+
+    So the record is read and its payload derived here, inside the same transaction that
+    writes the decision, and the digest stored is the one this function computed.
+    ``calibration`` is the one input that derivation needs beyond the record itself; see
+    :func:`whiskeyjack_bot.submission_payload.build_submission_payload` for why a numeric
+    payload depends on it.
+
+    A record whose payload cannot be built cannot be approved, and that is the intended
+    reading rather than a side effect: an approval authorizes exactly one payload, so a
+    record that derives none has nothing to authorize. :func:`reject` is unaffected and
+    takes no ``calibration`` -- a record nobody can submit is exactly the record an
+    operator most needs to be able to reject.
+    """
+    decision, authorized = _record_decision(
         conn,
         record_id=record_id,
         decision="approved",
@@ -266,7 +332,11 @@ def approve(
         occurred_at=occurred_at,
         note=note,
         expected_sha256=expected_sha256,
+        calibration=calibration,
     )
+    if authorized is None:  # pragma: no cover - the branch above always derives one
+        raise ApprovalError("the approved payload could not be derived")
+    return RecordedApproval(decision=decision, authorized=authorized)
 
 
 def reject(
@@ -284,6 +354,12 @@ def reject(
     record stays intact, per the handoff's failure boundaries, and the record can be
     approved afterwards. It carries no ``detail_code`` -- a rejection is a decision, not a
     failure, and its account is the actor and note stored here (M1-603 owner decision).
+
+    It carries no ``payload_sha256`` either, and takes no such argument (M2-707). A
+    rejection authorizes nothing, so there is nothing for it to bind to -- and because the
+    payload is *derived*, requiring one here would make a record whose numeric CDF will not
+    convert impossible to reject, which is the one decision that must always be available.
+    ``011`` refuses a rejection that carries a payload hash.
     """
     return _record_decision(
         conn,
@@ -293,7 +369,7 @@ def reject(
         occurred_at=occurred_at,
         note=note,
         expected_sha256=expected_sha256,
-    )
+    )[0]
 
 
 def _record_decision(
@@ -305,7 +381,8 @@ def _record_decision(
     occurred_at: datetime,
     note: str | None,
     expected_sha256: str | None,
-) -> ApprovalRecord:
+    calibration: NumericCalibrationConfig | None = None,
+) -> tuple[ApprovalRecord, AuthorizedPayload | None]:
     """Bind a decision to the record's stored hash and append it, atomically.
 
     ``expected_sha256`` is the hash the operator reviewed. Supplying it is optional and
@@ -325,8 +402,18 @@ def _record_decision(
     the writer never sees it. ``record_id``, ``actor``, ``note`` and ``occurred_at`` are
     left to ``record_approval``'s validators rather than restated: two sets of field rules
     for one column is how M1-603's round 5 defect happened, one layer up.
+    **The payload derivation happens inside this transaction too** (M2-707 round 1), for
+    the same reason the hash read does: a payload derived outside it would be a payload
+    built from a record that another writer could have appended a version to before the
+    decision landed. ``calibration`` is required for ``'approved'`` and meaningless for
+    ``'rejected'``, which is `011`'s rule appearing here as a parameter rather than as a
+    value -- there is no argument a caller can pass that makes a rejection authorize
+    something.
     """
     expected = None if expected_sha256 is None else _require_sha256(expected_sha256)
+    if (calibration is None) is (decision == "approved"):  # pragma: no cover - internal
+        raise ApprovalError("an approval derives a payload and a rejection does not")
+    authorized: AuthorizedPayload | None = None
     try:
         with transaction(conn):
             summary = read_forecast_summary(conn, record_id)
@@ -344,6 +431,8 @@ def _record_decision(
                     "forecast_sha256 does not match the stored hash of this forecast "
                     "record; the forecast changed and any prior approval no longer binds"
                 )
+            if calibration is not None:
+                authorized = _derive_authorized_payload(conn, record_id, calibration)
             event = record_approval(
                 conn,
                 record_id=record_id,
@@ -352,12 +441,54 @@ def _record_decision(
                 forecast_sha256=stored,
                 occurred_at=occurred_at,
                 note=note,
+                payload_sha256=None if authorized is None else authorized.sha256,
             )
             if event.approval_event_id is None:  # pragma: no cover - 003 forbids it
                 raise ApprovalError("the recorded approval decision could not be read back")
-            return _read_approval(conn, event.approval_event_id)
+            return _read_approval(conn, event.approval_event_id), authorized
     except LifecycleError as exc:
         raise _wrap_lifecycle(exc) from None
+
+
+def _derive_authorized_payload(
+    conn: sqlite3.Connection, record_id: str, calibration: NumericCalibrationConfig
+) -> AuthorizedPayload:
+    """Read the record and build the payload this approval will authorize (M2-707 r1).
+
+    **Both imports are function-local, and neither is a style choice.** ``submission.py``
+    imports this module and ``submission_payload`` imports ``submission``, so a module-scope
+    import here closes a cycle; deferring to call time breaks it, because by then every
+    module is loaded. The second effect is worth as much: the pinned SDK, ``forecast.cdf``
+    and the whole forecasting stack stay off the import path of ``approval_history`` and
+    ``effective_approval``, which are reporting calls with no business loading a
+    forecasting package.
+
+    Both failures arrive as :class:`ApprovalError`, because that is the type every caller
+    of this module already handles, and both use ``from None``: a ``ForecastRecordError``
+    renders a path and a ``PayloadBuildError`` renders the converter's problem strings, and
+    while both are sanitized at their own layer, an approval refusal is not the place to
+    start trusting that. The messages say which of the two happened, since "this record
+    cannot be read" and "this record derives no payload" need different actions.
+    """
+    from whiskeyjack_bot.forecast.record import ForecastRecordError
+    from whiskeyjack_bot.forecast.store import read_forecast_record
+    from whiskeyjack_bot.submission import SubmissionError
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    try:
+        record = read_forecast_record(conn, record_id)
+    except ForecastRecordError as exc:
+        raise ApprovalError(
+            f"this forecast record cannot be read back, so no approval can bind to the "
+            f"payload it authorizes: {exc}"
+        ) from None
+    try:
+        return authorized_payload(record, calibration=calibration)
+    except SubmissionError as exc:
+        raise ApprovalError(
+            f"this forecast record derives no submittable payload, so there is nothing "
+            f"for an approval to authorize: {exc}"
+        ) from None
 
 
 def _read_approval(conn: sqlite3.Connection, approval_event_id: int) -> ApprovalRecord:
@@ -395,6 +526,7 @@ def _approval_from_row(row: sqlite3.Row) -> ApprovalRecord:
         occurred_at_utc=_stored_text(row[6], "occurred_at_utc"),
         created_at_utc=_stored_text(row[7], "created_at_utc"),
         event_seq=_stored_int(row[8], "event_seq"),
+        payload_sha256=(None if row[9] is None else _stored_sha256(row[9], "payload_sha256")),
     )
 
 
@@ -457,16 +589,16 @@ def _require_identifier(value: object, field: str) -> str:
     return text
 
 
-def _require_sha256(value: object) -> str:
-    """Return the operator's expected hash as a 64-character lowercase hex digest.
+def _require_sha256(value: object, field: str = "forecast_sha256") -> str:
+    """Return a caller-supplied hash as a 64-character lowercase hex digest.
 
     A malformed digest gets its own message rather than falling through to the mismatch
     below it: "does not match" would be true but would describe a typo as a changed
     forecast, which are different things for an operator to act on.
     """
-    text = _require_text(value, "forecast_sha256", max_length=64)
+    text = _require_text(value, field, max_length=64)
     if len(text) != 64 or not _HEX_DIGITS.issuperset(text):
-        raise ApprovalError("forecast_sha256 must be 64 lowercase hexadecimal characters")
+        raise ApprovalError(f"{field} must be 64 lowercase hexadecimal characters")
     return text
 
 
@@ -494,6 +626,25 @@ def _stored_text(value: object, field: str) -> str:
             f"stored {field} is not text (detail withheld: it can echo stored values)"
         )
     return value
+
+
+def _stored_sha256(value: object, field: str) -> str:
+    """Gate a stored digest before it is put in a value object (M2-707).
+
+    ``payload_sha256`` is read back out of an append-only table and handed to a caller
+    that compares it against a payload hash it derived itself. A stored value that is not
+    a digest at all would make that comparison answer "not the approved payload" for a
+    reason the operator could not act on, so the shape is checked here and the mismatch
+    below it means only what it says. Same argument as ``lifecycle._require_sha256``,
+    applied on the way out rather than on the way in.
+    """
+    text = _stored_text(value, field)
+    if len(text) != 64 or not _HEX_DIGITS.issuperset(text):
+        raise ApprovalError(
+            f"stored {field} is not a 64-character lowercase hex digest "
+            "(detail withheld: it can echo stored values)"
+        )
+    return text
 
 
 def _wrap_lifecycle(exc: LifecycleError) -> ApprovalError:

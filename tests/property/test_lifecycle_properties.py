@@ -58,6 +58,9 @@ REFETCH_OUTCOMES: tuple[str, ...] = get_args(lifecycle.RefetchOutcome)
 TS = "2026-07-27T00:00:00.000000+00:00"
 WHEN = datetime(2026, 7, 27, tzinfo=timezone.utc)
 SHA = "b" * 64
+# M2-707: the digest of the payload an approval authorizes. Shape-only -- `lifecycle.py`
+# never derives a payload, so any well-formed digest drives the same path a real one does.
+PAYLOAD_SHA = "d" * 64
 # What a confirming refetch saw. Required for a `confirmed` outcome: a confirmation
 # with nothing stored is what carries a record to `submitted` on no evidence.
 SNAPSHOT = '{"probability": 0.6}'
@@ -164,6 +167,11 @@ def test_validators_raise_only_lifecycle_error(value: object) -> None:
     digest=ANYTHING,
     occurred_at=ANYTHING,
     decision=st.sampled_from(["approved", "rejected"]) | ANYTHING,
+    # M2-707. `None` and a well-formed digest are drawn alongside the hostile values,
+    # because for this parameter *both* are legal answers -- required for `approved`,
+    # forbidden for `rejected` -- so a strategy of hostile input alone would never take
+    # the success path this property needs to reach.
+    payload=st.none() | st.just(PAYLOAD_SHA) | ANYTHING,
 )
 @settings(max_examples=60, deadline=None)
 def test_the_approval_writer_raises_only_lifecycle_error(
@@ -173,6 +181,7 @@ def test_the_approval_writer_raises_only_lifecycle_error(
     digest: object,
     occurred_at: object,
     decision: object,
+    payload: object,
 ) -> None:
     # Against a real ledger holding a real validated record, so a call that happens to be
     # well formed takes the success path rather than being rejected on a technicality.
@@ -186,6 +195,7 @@ def test_the_approval_writer_raises_only_lifecycle_error(
                 forecast_sha256=digest,  # type: ignore[arg-type]
                 occurred_at=occurred_at,  # type: ignore[arg-type]
                 note=note,  # type: ignore[arg-type]
+                payload_sha256=payload,  # type: ignore[arg-type]
             )
         except LifecycleError:
             pass
@@ -286,6 +296,7 @@ def test_every_attempt_shape_has_exactly_one_recordable_outcome(
             decision="approved",
             actor="chris",
             forecast_sha256=SHA,
+            payload_sha256=PAYLOAD_SHA,
             occurred_at=WHEN,
         )
         verified = refetch == "confirmed"
@@ -642,7 +653,7 @@ def test_events_survive_the_persisted_json_form_unchanged(
             f"{PLANTED_SECRET}\N{ZERO WIDTH SPACE}",
         ]
     ),
-    field=st.sampled_from(["record_id", "actor", "note", "forecast_sha256"]),
+    field=st.sampled_from(["record_id", "actor", "note", "forecast_sha256", "payload_sha256"]),
 )
 @settings(max_examples=40, deadline=None)
 def test_a_rejected_value_never_reaches_the_message_or_traceback(text: str, field: str) -> None:
@@ -652,6 +663,9 @@ def test_a_rejected_value_never_reaches_the_message_or_traceback(text: str, fiel
             "decision": "approved",
             "actor": "chris",
             "forecast_sha256": SHA,
+            # M2-707: required for an approval, so it is here as a valid default and in the
+            # field list above as one more place a planted value could be reprinted.
+            "payload_sha256": PAYLOAD_SHA,
             "occurred_at": WHEN,
         }
         kwargs[field] = text
@@ -848,9 +862,11 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
     die on an IntegrityError from the fixture rather than from anything under test.
     """
     approved = conn.execute(
+        # M2-707: `011` requires a payload binding on an approval and forbids one on a
+        # rejection below, so the two inserts differ by that column and not by accident.
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
-        "created_at_utc) VALUES (?, 'approved', 'chris', ?, ?)",
-        (record_id, SHA, TS),
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'chris', ?, ?, ?)",
+        (record_id, SHA, TS, PAYLOAD_SHA),
     ).lastrowid
     rejected = conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
@@ -985,9 +1001,12 @@ def _insert_event(
         # back only one event, which is the truthful shape anyway: two rejections are two
         # decisions, each with its own actor, note and timestamp.
         links["approval_event_id"] = conn.execute(
+            # `payload_sha256` follows the decision, which is what `011` requires: present
+            # for `approved`, NULL for `rejected`. Derived from `event_type` rather than
+            # passed in, so a walk holding both kinds writes both shapes (M2-707).
             "INSERT INTO approval_events (forecast_record_id, decision, actor, "
-            "forecast_sha256, created_at_utc) VALUES (?, ?, 'chris', ?, ?)",
-            (record_id, event_type, SHA, TS),
+            "forecast_sha256, created_at_utc, payload_sha256) VALUES (?, ?, 'chris', ?, ?, ?)",
+            (record_id, event_type, SHA, TS, PAYLOAD_SHA if event_type == "approved" else None),
         ).lastrowid
     elif event_type == "submitted":
         links["submission_attempt_id"] = _uncited_attempt(

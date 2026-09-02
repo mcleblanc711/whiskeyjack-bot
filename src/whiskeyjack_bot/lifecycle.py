@@ -947,6 +947,7 @@ def record_approval(
     forecast_sha256: str,
     occurred_at: datetime,
     note: str | None = None,
+    payload_sha256: str | None = None,
 ) -> LifecycleEvent:
     """Append an approval decision and its lifecycle event, atomically.
 
@@ -955,6 +956,15 @@ def record_approval(
     here for a readable failure and again by the migration's trigger, which is the
     binding one -- a writer that forgot to compare cannot get past the database.
 
+    ``payload_sha256`` is the second half of that binding and is **M2-707/D33**: the hash
+    of the submission payload the decision authorizes. It is required for ``'approved'``
+    and must be absent for ``'rejected'``, which is `011`'s rule and is checked here for
+    the same readable-failure reason. What this module does *not* check is that the digest
+    is the payload the record actually derives -- that is a question about canonical JSON,
+    the pinned SDK's CDF conversion and the calibration configuration, none of which the
+    ledger layer can see. :mod:`whiskeyjack_bot.submission_payload` owns the derivation and
+    :func:`whiskeyjack_bot.submission.submission_key_for_approved_record` owns the gate.
+
     ``'rejected'`` leaves the record ``validated``. A rejection records a decision; it
     does not move the record, and the last valid record stays intact.
     """
@@ -962,6 +972,7 @@ def record_approval(
     identifier = _require_identifier(record_id, "record_id")
     actor_text = _require_text(actor, "actor", max_length=MAX_ACTOR_LENGTH)
     digest = _require_sha256(forecast_sha256, "forecast_sha256")
+    payload_digest = _require_payload_digest(payload_sha256, decision)
     note_text = _require_optional_text(note, "note", max_length=MAX_NOTE_LENGTH)
     occurred = _require_utc(occurred_at, "occurred_at")
 
@@ -970,9 +981,18 @@ def record_approval(
         approval_id = _insert(
             conn,
             "INSERT INTO approval_events "
-            "(forecast_record_id, decision, actor, forecast_sha256, note, created_at_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (identifier, decision, actor_text, digest, note_text, _utc_text(_utcnow())),
+            "(forecast_record_id, decision, actor, forecast_sha256, note, created_at_utc, "
+            "payload_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                identifier,
+                decision,
+                actor_text,
+                digest,
+                note_text,
+                _utc_text(_utcnow()),
+                payload_digest,
+            ),
         )
         return _append_event(
             conn,
@@ -1430,6 +1450,37 @@ def _require_no_prior_success(conn: sqlite3.Connection, attempt_id: str) -> None
     row = _fetch_one(conn, "SELECT 1 FROM forecast_records WHERE attempt_id = ?", (attempt_id,))
     if row is not None:
         raise LifecycleError("attempt_id has already produced a stored forecast record")
+
+
+def _require_payload_digest(value: object, decision: str) -> str | None:
+    """Gate ``payload_sha256`` against the decision it belongs to (M2-707, migration 011).
+
+    Two rules, and the asymmetry is the design rather than an omission. An approval
+    authorizes exactly one submission payload, so it carries that payload's hash; a
+    rejection authorizes nothing, so it carries none -- and, more to the point, the payload
+    is *derived*, so a record whose numeric CDF will not convert has no payload hash to
+    offer and must still be rejectable. Requiring it on one side and forbidding it on the
+    other also gives a NULL exactly one meaning per decision: on an approval it is a row
+    written before `011`, which is what lets the submission gate refuse those rather than
+    guess.
+
+    Both rules are `011`'s trigger clauses restated, for the reason every other validator
+    here restates one: a caller gets a field-level message instead of a constraint
+    violation.
+    """
+    if decision == "approved":
+        if value is None:
+            raise LifecycleError(
+                "payload_sha256 is required for an approval: an approval binds to the "
+                "submission payload it authorizes"
+            )
+        return _require_sha256(value, "payload_sha256")
+    if value is not None:
+        raise LifecycleError(
+            "payload_sha256 must be omitted for a rejection: a rejection authorizes no "
+            "submission payload"
+        )
+    return None
 
 
 def _require_hash_binds(conn: sqlite3.Connection, record_id: str, digest: str) -> None:
