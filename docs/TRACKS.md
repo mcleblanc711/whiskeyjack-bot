@@ -40,12 +40,11 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-610 | feat/m1-610-identifier-shape | whiskeyjack-m1-610 | no | none | 2026-09-02 |
-*(M2-707 merged (PR #61, round-2 approve, 2026-09-02) and is swept from this table. Also
-swept `M1-315` (merged, PR #55, 2026-09-01), `M1-608` (merged, PR #57, r1 approve) and
-`M1-314` (merged, PR #58, 2026-09-02) — all landed and their branches are gone from
-`origin`. `M2-709` is the last item on Lane 3's debt queue and is next to pull into a
-pane.)*
+*(No live rows. Swept `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707`
+(merged, PR #61, round-2 approve, 2026-09-02), `M1-315` (merged, PR #55, 2026-09-01),
+`M1-608` (merged, PR #57, r1 approve) and `M1-314` (merged, PR #58, 2026-09-02) — all
+landed and their branches are gone from `origin`. `M2-709` is the last item on Lane 3's
+debt queue and is next to pull into a pane.)*
 
 ## Planned next wave
 
