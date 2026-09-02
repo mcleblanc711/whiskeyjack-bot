@@ -476,6 +476,45 @@ def test_the_other_column_backed_fields_were_never_reachable(field: str) -> None
         _draft(**{field: "a\ud800b"})
 
 
+@pytest.mark.parametrize("field", ["tournament_id", "attempt_id", "retrieval_run_id"])
+@pytest.mark.parametrize("value", ["", " ", "\t\n", "\x00", "a\x00b"])
+def test_a_blank_or_nul_identifier_is_refused_at_build_time(field: str, value: str) -> None:
+    """M1-610: the shape every other layer already refuses, checked at the builder.
+
+    ``Field(min_length=1)`` alone admitted ``'\\n\\t'`` and any NUL-bearing string; the
+    ``_IdentifierText`` annotation added for this item refuses both. Reaches the same
+    generic ``build_forecast_record_draft`` catch every other field constraint on this path
+    already reaches (see ``test_the_other_column_backed_fields_were_never_reachable``), so
+    the message names no field here -- the read-back test below is where a field name
+    survives.
+    """
+    with pytest.raises(ForecastRecordError, match="could not be assembled"):
+        _draft(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["record_id", "tournament_id", "attempt_id", "retrieval_run_id"])
+@pytest.mark.parametrize("value", ["", " ", "\t\n", "\x00", "a\x00b"])
+def test_a_stored_blank_or_nul_identifier_is_refused_naming_the_field(
+    field: str, value: str
+) -> None:
+    """The read-back path, where a field name does survive (M1-610).
+
+    ``_sanitized`` renders ``loc`` for any field this schema declares, and all four
+    identifiers are -- so a stored ``tournament_id`` of ``'\\x00'`` refuses as
+    ``tournament_id: value_error`` (or ``string_too_short`` for the blank cases), naming the
+    field without echoing what it held.
+    """
+    payload = json.loads(canonical_record_json(_record()))
+    payload[field] = value
+    with pytest.raises(ForecastRecordError) as excinfo:
+        record_from_json(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        )
+    message = str(excinfo.value)
+    assert field in message
+    assert "\x00" not in message
+
+
 def test_the_column_probe_covers_every_bare_text_column_the_writer_writes() -> None:
     """The list of probed fields against the writer's own column set.
 

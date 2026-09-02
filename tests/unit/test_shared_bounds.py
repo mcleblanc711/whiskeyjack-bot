@@ -108,21 +108,25 @@ _IDENTIFIER_LAYERS: list[tuple[str, Callable[[str], object], type[Exception]]] =
 ]
 
 
-def _record_model_accepts(value: str) -> bool:
-    """Whether `forecast.record`'s pydantic bound admits `value` as a `record_id`.
+def _record_model_accepts(
+    value: str,
+    *,
+    field: str = "record_id",
+    refusals: frozenset[str] = frozenset({"string_too_long", "string_too_short"}),
+) -> bool:
+    """Whether `forecast.record`'s pydantic bound admits `value` as `field`.
 
     Validated against a dict holding nothing else, so every other field fails as
-    `missing`; only a `string_too_long`/`string_too_short` error *on `record_id`* counts as
-    a refusal. That reaches the field's declared bound without building a whole record, and
-    without restating the annotation here -- an `Annotated[str, Field(max_length=...)]`
-    spelled in the test would be the test asserting itself.
+    `missing`; only a refusal *on `field`* whose `type` is in `refusals` counts as this
+    layer refusing. That reaches the field's declared bound without building a whole
+    record, and without restating the annotation here -- an `Annotated[str,
+    Field(max_length=...)]` spelled in the test would be the test asserting itself.
     """
     try:
-        ForecastRecord.model_validate({"record_id": value})
+        ForecastRecord.model_validate({field: value})
     except ValidationError as error:
         return not any(
-            item["loc"] == ("record_id",)
-            and item["type"] in {"string_too_long", "string_too_short"}
+            item["loc"] == (field,) and item["type"] in refusals
             for item in error.errors(include_input=False, include_url=False)
         )
     return True  # pragma: no cover - the other fields are missing, so this cannot be reached
@@ -137,6 +141,7 @@ def _schema_accepts(conn: sqlite3.Connection, column: str, value: str, serial: i
     """
     record_id = value if column == "record_id" else f"rec-probe-{serial}"
     tournament_id = value if column == "tournament_id" else "minibench"
+    attempt_id = value if column == "attempt_id" else f"att-probe-{serial}"
     conn.execute("BEGIN")
     try:
         conn.execute(
@@ -147,7 +152,7 @@ def _schema_accepts(conn: sqlite3.Connection, column: str, value: str, serial: i
             "record_json, created_at_utc, forecast_sha256, attempt_id) "
             "VALUES (?, ?, ?, 1, NULL, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
             "'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
-            (record_id, 900000 + serial, tournament_id, TS, TS, SHA, f"att-probe-{serial}"),
+            (record_id, 900000 + serial, tournament_id, TS, TS, SHA, attempt_id),
         )
     except sqlite3.IntegrityError:
         return False
@@ -189,6 +194,44 @@ def test_every_layer_reads_the_same_identifier_ceiling(ledger: sqlite3.Connectio
     # while asserting nothing. Naming the vector is what makes the equality mean the
     # boundary is where it should be.
     expected = (True, True, False)
+    assert vectors == {name: expected for name in vectors}, vectors
+
+
+def test_every_layer_refuses_the_same_blank_and_nul_identifiers(
+    ledger: sqlite3.Connection,
+) -> None:
+    """M1-610's acceptance criterion: eight layers, one shape, one witness.
+
+    `Field(min_length=1)` alone admits `'\\n\\t'` and any NUL-bearing string; every other
+    layer that touches `forecast_records.record_id`/`.tournament_id`/`.attempt_id` already
+    refuses both. Same shape as `test_every_layer_reads_the_same_identifier_ceiling`: a
+    vector per layer over a fixed probe set, asserted against a named expectation so the
+    equality cannot be satisfied by every layer refusing (or accepting) everything.
+
+    `attempt_id` is included in the schema comparison because `forecast_records.attempt_id`
+    has carried a real trigger clause since migration `004` -- unlike `retrieval_run_id`,
+    which `006`'s own header documents as covered only transitively through the foreign key
+    into `research_runs.retrieval_run_id`, so it has no `forecast_records`-level witness to
+    compare against here (see `test_lifecycle_properties.py` for that field's parity check).
+    """
+    probes = ["", " ", "\t\n", "\x00", "a\x00b", "ok"]
+    expected = (False, False, False, False, False, True)
+
+    vectors: dict[str, tuple[bool, ...]] = {
+        name: tuple(_accepts(validate, error, probe) for probe in probes)
+        for name, validate, error in _IDENTIFIER_LAYERS
+    }
+    vectors["forecast.record"] = tuple(
+        _record_model_accepts(probe, refusals=frozenset({"string_too_short", "value_error"}))
+        for probe in probes
+    )
+    for column in ("record_id", "tournament_id", "attempt_id"):
+        vectors[f"schema.{column}"] = tuple(
+            _schema_accepts(ledger, column, probe, serial)
+            for serial, probe in enumerate(probes, start=1)
+        )
+    assert not ledger.in_transaction
+
     assert vectors == {name: expected for name in vectors}, vectors
 
 

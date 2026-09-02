@@ -33,6 +33,7 @@ from strategies import ENCODABLE_TEXT, HOSTILE_TEXT
 
 from whiskeyjack_bot import approval, lifecycle
 from whiskeyjack_bot.approval import ApprovalError
+from whiskeyjack_bot.forecast.record import _require_identifier_text as _record_identifier_text
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
@@ -46,6 +47,7 @@ from whiskeyjack_bot.lifecycle import (
     record_approval,
     record_validation,
 )
+from whiskeyjack_bot.research.model import _require_identifier_text as _research_identifier_text
 
 STATUSES: tuple[str, ...] = get_args(LifecycleStatus)
 EVENT_TYPES: tuple[str, ...] = get_args(LifecycleEventType)
@@ -1548,6 +1550,35 @@ def test_the_two_module_copies_of_the_identifier_rule_agree(value: object) -> No
         approval_accepts = True
 
     assert lifecycle_accepts == approval_accepts
+
+
+@given(value=IDENTIFIER_TEXT)
+@settings(max_examples=120, deadline=None)
+def test_the_record_and_research_model_identifier_rules_agree(value: str) -> None:
+    """`forecast.record` (M1-610) holds its own copy of `research.model`'s rule (M1-607).
+
+    Both are used against `retrieval_run_id` -- `forecast_records.retrieval_run_id` and
+    `research_runs.retrieval_run_id` -- and `006`'s own header documents that the former has
+    no trigger clause of its own, covered only transitively through the foreign key into the
+    latter. So the two Python copies are the only witness this column's blank/NUL rule has;
+    `test_shared_bounds.py`'s `record_id`/`tournament_id`/`attempt_id` parity test has a real
+    trigger to compare against and does not need this.
+    """
+    try:
+        _record_identifier_text(value)
+    except ValueError:
+        record_accepts = False
+    else:
+        record_accepts = True
+
+    try:
+        _research_identifier_text(value)
+    except ValueError:
+        research_accepts = False
+    else:
+        research_accepts = True
+
+    assert record_accepts == research_accepts
 
 
 # Every message `_require_identifier` and the `_require_text` beneath it can produce,
