@@ -607,6 +607,18 @@ def _sanitized(exc: ValidationError) -> ForecastRecordError:
     Integer ``loc`` entries are list indices and render as ``[i]`` rather than being
     dropped, so the path stays readable.
     """
+    joined = _sanitized_locations(exc)
+    return ForecastRecordError(f"stored record_json does not match the record schema ({joined})")
+
+
+def _sanitized_locations(exc: ValidationError) -> str:
+    """The ``loc: type`` rendering shared by :func:`_sanitized` and the builder's own catch.
+
+    Pulled out rather than duplicated: it is the leak-safety rule itself (see
+    :func:`_sanitized`), and M1-610's round-1 finding was a second call site that skipped
+    it -- a generic message with no field name at all, which under-shares rather than
+    over-shares but still fails the acceptance criterion that the field be named.
+    """
     known = _schema_field_names(ForecastRecord)
     paths = []
     for error in exc.errors(include_input=False, include_url=False):
@@ -620,8 +632,7 @@ def _sanitized(exc: ValidationError) -> ForecastRecordError:
                 parts.append(_WITHHELD)
         location = ".".join(parts)
         paths.append(f"{location or '<record>'}: {error['type']}")
-    joined = "; ".join(sorted(set(paths)))
-    return ForecastRecordError(f"stored record_json does not match the record schema ({joined})")
+    return "; ".join(sorted(set(paths)))
 
 
 def build_forecast_record_draft(
@@ -720,7 +731,17 @@ def build_forecast_record_draft(
             forecast=forecast,
             generated_at_utc=generated_at,
         )
-    except (AttributeError, ValidationError):
+    except ValidationError as exc:
+        # Named rather than folded into the generic catch below (round 1, finding B1):
+        # this is the one path a caller building a record by hand actually hits for a
+        # blank or NUL identifier, and the acceptance criterion requires the field be
+        # named. `_sanitized_locations` is the same leak-safe rendering `_sanitized` uses
+        # for a stored record, so a builder failure and a stored-record failure agree on
+        # what "naming the field, not the value" means.
+        raise ForecastRecordError(
+            f"the forecast record could not be assembled ({_sanitized_locations(exc)})"
+        ) from None
+    except AttributeError:
         raise ForecastRecordError(
             "the forecast record could not be assembled "
             "(detail withheld: it can echo question, document or model content)"

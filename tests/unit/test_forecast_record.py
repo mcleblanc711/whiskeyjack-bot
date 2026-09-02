@@ -482,14 +482,17 @@ def test_a_blank_or_nul_identifier_is_refused_at_build_time(field: str, value: s
     """M1-610: the shape every other layer already refuses, checked at the builder.
 
     ``Field(min_length=1)`` alone admitted ``'\\n\\t'`` and any NUL-bearing string; the
-    ``_IdentifierText`` annotation added for this item refuses both. Reaches the same
-    generic ``build_forecast_record_draft`` catch every other field constraint on this path
-    already reaches (see ``test_the_other_column_backed_fields_were_never_reachable``), so
-    the message names no field here -- the read-back test below is where a field name
-    survives.
+    ``_IdentifierText`` annotation added for this item refuses both. Round 1 found the
+    builder's ``ValidationError`` catch folded into the same generic, field-less message as
+    a genuinely caller-object failure (``AttributeError``) -- that under-shared relative to
+    the acceptance criterion, which requires the field be named. The catch now splits the
+    two, so this path names ``field`` the same way the read-back path below does.
     """
-    with pytest.raises(ForecastRecordError, match="could not be assembled"):
+    with pytest.raises(ForecastRecordError, match="could not be assembled") as excinfo:
         _draft(**{field: value})
+    message = str(excinfo.value)
+    assert field in message
+    assert "\x00" not in message
 
 
 @pytest.mark.parametrize("field", ["record_id", "tournament_id", "attempt_id", "retrieval_run_id"])

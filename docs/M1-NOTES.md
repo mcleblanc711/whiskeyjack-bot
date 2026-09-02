@@ -7333,12 +7333,18 @@ by direct probe to preserve today's error types exactly.
 
 - **`parent_record_id`.** The backlog row names `record_id`, `tournament_id`, `attempt_id`
   and `retrieval_run_id`; `parent_record_id` is `str | None` and out of scope.
-- **`build_forecast_record_draft`'s generic catch.** A blank/NUL identifier reaching it via
-  `_draft(**{field: value})` still surfaces as "the forecast record could not be assembled
-  (detail withheld...)" — unchanged, and every other field constraint on that path already
-  produced the same generic message before this item. Naming the field is where
-  `record_from_json`'s `_sanitized()` already renders `loc`, which this item's read-back
-  test exercises directly.
+
+### Fixed after round 1 — `build_forecast_record_draft`'s generic catch
+
+Shipped this way, then round 1 found it broke the acceptance criterion: a blank/NUL
+identifier reaching `build_forecast_record_draft` surfaced as "the forecast record could
+not be assembled (detail withheld...)", naming no field, because the `ValidationError` this
+item's new rule raises was folded into the same catch as a genuinely value-echoing
+`AttributeError` (a caller passing an object with no resolvable `.forecast`/`.settings`).
+The two now split: `ValidationError` renders through `_sanitized_locations` (factored out of
+`_sanitized`, which already did this for the read-back path), `AttributeError` keeps the
+detail-withheld wording. A builder-time refusal and a stored-record refusal now name the
+field the same way.
 
 ### Standing risk — `forecast_records.retrieval_run_id` has no schema witness of its own
 
