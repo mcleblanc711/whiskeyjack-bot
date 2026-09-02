@@ -48,6 +48,10 @@ TS = "2026-08-19T00:00:00.000000+00:00"
 WHEN = datetime(2026, 8, 19, tzinfo=timezone.utc)
 SHA = "b" * 64
 OTHER_SHA = "c" * 64
+# M2-707: the digest of the payload an approval authorizes. Shape-only, as in
+# `tests/unit/test_approval.py` -- `approval.py` never derives a payload, so any
+# well-formed digest drives the same path a real one does.
+PAYLOAD_SHA = "d" * 64
 PLANTED_SECRET = "privateFAKE123456"
 
 
@@ -86,6 +90,38 @@ ANYTHING = st.one_of(
 )
 
 DECIDERS = (approve, reject)
+
+# The caller-controlled parameters both deciders take. `payload_sha256` is `approve`'s
+# alone (M2-707): a rejection authorizes no payload and the function takes no such
+# argument, so drawing the pair together is what keeps the new field fuzzed without
+# spending half the examples on a `TypeError` that would prove nothing.
+_SHARED_FIELDS = ["record_id", "actor", "note", "occurred_at", "expected_sha256"]
+
+
+@st.composite
+def _decider_and_field(draw: st.DrawFn, fields: list[str] = _SHARED_FIELDS) -> tuple[Any, str]:
+    decider = draw(st.sampled_from(DECIDERS))
+    choices = [*fields, "payload_sha256"] if decider is approve else list(fields)
+    return decider, draw(st.sampled_from(choices))
+
+
+def _decision_kwargs(decider: Any, record_id: str, /, **overrides: object) -> dict[str, Any]:
+    """The keyword arguments one decider takes, with `payload_sha256` only for `approve`.
+
+    Both parameters are positional-only so that `record_id` -- which is itself one of the
+    fuzzed fields -- can be overridden through `**overrides` like any other.
+    """
+    kwargs: dict[str, Any] = {
+        "record_id": record_id,
+        "actor": "chris",
+        "occurred_at": WHEN,
+        "note": None,
+        "expected_sha256": None,
+    }
+    if decider is approve:
+        kwargs["payload_sha256"] = PAYLOAD_SHA
+    kwargs.update(overrides)
+    return kwargs
 
 
 # --------------------------------------------------------------------------------------
@@ -171,24 +207,13 @@ def _counts(conn: sqlite3.Connection, record_id: str) -> tuple[int, int]:
 # --------------------------------------------------------------------------------------
 
 
-@given(
-    value=ANYTHING,
-    field=st.sampled_from(["record_id", "actor", "note", "occurred_at", "expected_sha256"]),
-    decider=st.sampled_from(DECIDERS),
-)
+@given(value=ANYTHING, chosen=_decider_and_field())
 @settings(max_examples=120, deadline=None)
-def test_a_decision_raises_only_approval_error(value: object, field: str, decider: Any) -> None:
+def test_a_decision_raises_only_approval_error(value: object, chosen: tuple[Any, str]) -> None:
+    decider, field = chosen
     with _record() as (conn, record_id):
-        kwargs: dict[str, Any] = {
-            "record_id": record_id,
-            "actor": "chris",
-            "occurred_at": WHEN,
-            "note": None,
-            "expected_sha256": None,
-        }
-        kwargs[field] = value
         try:
-            decider(conn, **kwargs)
+            decider(conn, **_decision_kwargs(decider, record_id, **{field: value}))
         except ApprovalError:
             pass
         assert not conn.in_transaction
@@ -211,27 +236,16 @@ def test_the_readers_raise_only_approval_error(value: object) -> None:
 # --------------------------------------------------------------------------------------
 
 
-@given(
-    value=ANYTHING,
-    field=st.sampled_from(["record_id", "actor", "note", "occurred_at", "expected_sha256"]),
-    decider=st.sampled_from(DECIDERS),
-)
+@given(value=ANYTHING, chosen=_decider_and_field())
 @settings(max_examples=120, deadline=None)
 def test_a_refused_decision_leaves_the_ledger_where_it_was(
-    value: object, field: str, decider: Any
+    value: object, chosen: tuple[Any, str]
 ) -> None:
+    decider, field = chosen
     with _record() as (conn, record_id):
         before = _counts(conn, record_id)
-        kwargs: dict[str, Any] = {
-            "record_id": record_id,
-            "actor": "chris",
-            "occurred_at": WHEN,
-            "note": None,
-            "expected_sha256": None,
-        }
-        kwargs[field] = value
         try:
-            decider(conn, **kwargs)
+            decider(conn, **_decision_kwargs(decider, record_id, **{field: value}))
         except ApprovalError:
             # Refused: not one row of either kind, and the record has not moved.
             assert _counts(conn, record_id) == before
@@ -252,6 +266,7 @@ def test_only_the_stored_hash_is_ever_bound(expected: object) -> None:
                 record_id=record_id,
                 actor="chris",
                 occurred_at=WHEN,
+                payload_sha256=PAYLOAD_SHA,
                 expected_sha256=expected,  # type: ignore[arg-type]
             )
         except ApprovalError:
@@ -259,6 +274,39 @@ def test_only_the_stored_hash_is_ever_bound(expected: object) -> None:
             return
         assert recorded.forecast_sha256 == SHA
         assert expected in (None, SHA)
+
+
+@given(payload=ANYTHING)
+@settings(max_examples=80, deadline=None)
+def test_only_a_well_formed_digest_ever_binds_a_payload(payload: object) -> None:
+    """M2-707's half of the same claim: an approval carries a digest or does not happen.
+
+    The sibling above pins what a decision binds to; this pins what it *authorizes*. Both
+    are written as "either it is refused and nothing was written, or the stored value is
+    exactly this" rather than as a list of the shapes that should be refused -- a list is
+    only ever as good as its author's imagination, and `ANYTHING` includes the four kinds
+    of value that have broken this code before.
+
+    A `reject` counterpart would be vacuous: `reject` takes no `payload_sha256`, which is
+    the strongest form of "a rejection authorizes nothing" available. `011` refuses one
+    written by raw SQL, and `tests/unit/test_lifecycle.py` is where that is asserted.
+    """
+    with _record() as (conn, record_id):
+        try:
+            recorded = approve(
+                conn,
+                record_id=record_id,
+                actor="chris",
+                occurred_at=WHEN,
+                payload_sha256=payload,  # type: ignore[arg-type]
+            )
+        except ApprovalError:
+            assert _counts(conn, record_id) == (0, 1)
+            return
+        assert recorded.payload_sha256 == payload
+        assert isinstance(payload, str)
+        assert len(payload) == 64 and payload == payload.lower()
+        assert all(character in "0123456789abcdef" for character in payload)
 
 
 # --------------------------------------------------------------------------------------
@@ -282,7 +330,7 @@ def test_a_stored_decision_round_trips_through_the_persisted_form(
     """
     with _record() as (conn, record_id):
         try:
-            recorded = decider(conn, record_id=record_id, actor=actor, occurred_at=WHEN, note=note)
+            recorded = decider(conn, **_decision_kwargs(decider, record_id, actor=actor, note=note))
         except ApprovalError:
             return
         encoded = json.dumps(asdict(recorded), ensure_ascii=True, sort_keys=True)
@@ -310,24 +358,16 @@ def test_a_stored_decision_round_trips_through_the_persisted_form(
             f"{PLANTED_SECRET}\N{ZERO WIDTH SPACE}",
         ]
     ),
-    field=st.sampled_from(["record_id", "actor", "note", "expected_sha256"]),
-    decider=st.sampled_from(DECIDERS),
+    chosen=_decider_and_field(["record_id", "actor", "note", "expected_sha256"]),
 )
 @settings(max_examples=60, deadline=None)
 def test_a_rejected_value_never_reaches_the_message_or_traceback(
-    text: str, field: str, decider: Any
+    text: str, chosen: tuple[Any, str]
 ) -> None:
+    decider, field = chosen
     with _record() as (conn, record_id):
-        kwargs: dict[str, Any] = {
-            "record_id": record_id,
-            "actor": "chris",
-            "occurred_at": WHEN,
-            "note": None,
-            "expected_sha256": None,
-        }
-        kwargs[field] = text
         try:
-            decider(conn, **kwargs)
+            decider(conn, **_decision_kwargs(decider, record_id, **{field: text}))
         except ApprovalError as error:
             assert PLANTED_SECRET not in str(error)
             # The traceback half is what `from None` exists for; a message-only assertion
@@ -342,9 +382,9 @@ def test_a_hostile_timezone_cannot_speak_through_a_refusal(decider: Any) -> None
         with pytest.raises(ApprovalError) as excinfo:
             decider(
                 conn,
-                record_id=record_id,
-                actor="chris",
-                occurred_at=datetime(2026, 8, 19, tzinfo=HostileTimezone()),
+                **_decision_kwargs(
+                    decider, record_id, occurred_at=datetime(2026, 8, 19, tzinfo=HostileTimezone())
+                ),
             )
         assert PLANTED_SECRET not in str(excinfo.value)
         assert PLANTED_SECRET not in "".join(traceback.format_exception(excinfo.value))
@@ -369,7 +409,7 @@ def test_a_record_never_holds_more_than_one_approval(decisions: list[str]) -> No
         for decision in decisions:
             decider = approve if decision == "approved" else reject
             try:
-                decider(conn, record_id=record_id, actor="chris", occurred_at=WHEN)
+                decider(conn, **_decision_kwargs(decider, record_id))
             except ApprovalError:
                 continue
             accepted.append(decision)
@@ -382,6 +422,15 @@ def test_a_record_never_holds_more_than_one_approval(decisions: list[str]) -> No
             record.event_seq for record in history
         )
         assert len({record.event_seq for record in history}) == len(history)
+
+        # M2-707: the two decisions carry the column differently, and which one a row is
+        # decides what a NULL there means -- so the asymmetry is asserted over every
+        # accepted sequence rather than once, in one shape, in a unit test.
+        for stored in history:
+            if stored.decision == "approved":
+                assert stored.payload_sha256 == PAYLOAD_SHA
+            else:
+                assert stored.payload_sha256 is None
 
         in_force = effective_approval(conn, record_id)
         if "approved" in accepted:

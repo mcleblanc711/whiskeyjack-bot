@@ -65,6 +65,11 @@ SHA = "b" * 64
 ATTEMPT_ID_RE = re.compile(r"^wjdry-1-[0-9a-f]{64}\Z")
 
 PAYLOAD: dict[str, Any] = {"probability_yes": 0.37, "comment": "none"}
+# M2-707: what the approvals in this module authorize. Derived from `PAYLOAD` rather than
+# written as a literal, because the receipts under test carry
+# `request_payload_sha256=payload_sha256(PAYLOAD)` and since `011` the approval has to
+# agree with them or the gate refuses before the gateway is ever reached.
+PAYLOAD_SHA = payload_sha256(PAYLOAD)
 
 
 def _key(payload: dict[str, Any] | None = None, *, question_id: int = 100) -> str:
@@ -385,7 +390,9 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
     """Without it, a dry-run receipt's (False, False) is `submission_failed` -> terminal
     `failed`: a rehearsal would permanently kill the forecast version it rehearsed."""
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
-    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    approve(
+        ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
+    )
     receipt = _gateway().submit(_request())
     with pytest.raises(GatewayError):
         record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
@@ -427,7 +434,9 @@ def test_a_live_receipt_is_recorded_against_the_record_it_names(
     """The bound on every identifier is checked by the writer, not by importing its
     private constant -- which would test the constant, not the writer (M1-303)."""
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
-    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    approve(
+        ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
+    )
     receipt = _live()
     event = record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     assert event.event_type == "submitted"
@@ -457,7 +466,13 @@ def test_a_receipt_cannot_be_recorded_against_a_different_record(
     _seed_draft(ledger, "rec-2", question_id=101)
     for record_id in ("rec-1", "rec-2"):
         record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
-        approve(ledger, record_id=record_id, actor="owner", occurred_at=OCCURRED)
+        approve(
+            ledger,
+            record_id=record_id,
+            actor="owner",
+            occurred_at=OCCURRED,
+            payload_sha256=PAYLOAD_SHA,
+        )
 
     record_receipt(ledger, receipt=_live("rec-1"), occurred_at=OCCURRED)
 
@@ -475,7 +490,9 @@ def test_the_recorded_row_drops_what_submission_attempts_has_no_column_for(
     ledger: sqlite3.Connection,
 ) -> None:
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
-    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    approve(
+        ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, payload_sha256=PAYLOAD_SHA
+    )
     receipt = replace(_live(), artifact_path="submissions/dry_run/x.json")
     record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     columns = {
@@ -530,7 +547,13 @@ def test_a_spent_idempotency_key_arrives_as_this_modules_error(
     _seed_draft(ledger, "rec-2", question_id=101)
     for record_id in ("rec-1", "rec-2"):
         record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
-        approve(ledger, record_id=record_id, actor="owner", occurred_at=OCCURRED)
+        approve(
+            ledger,
+            record_id=record_id,
+            actor="owner",
+            occurred_at=OCCURRED,
+            payload_sha256=PAYLOAD_SHA,
+        )
 
     record_receipt(ledger, receipt=_live("rec-1", "att-live-1"), occurred_at=OCCURRED)
     # Same key -- `_request()` derives it from the same payload -- against another record.

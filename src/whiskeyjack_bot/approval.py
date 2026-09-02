@@ -120,6 +120,14 @@ class ApprovalRecord:
     so a replayed run reproduces it) and ``created_at_utc`` is when the ledger stored it
     (writer-owned). "actor/timestamp/note are retained" is this dataclass.
 
+    ``payload_sha256`` is the submission payload this decision authorized (M2-707/D33).
+    It is ``str`` for every approval written since migration ``011`` and ``None`` for two
+    distinct reasons the ``decision`` field tells apart: a rejection authorizes no payload
+    and never carries one, while an *approval* with ``None`` is a row written before
+    ``011`` and holds no payload binding at all --
+    :func:`whiskeyjack_bot.submission.submission_key_for_approved_record` refuses those
+    rather than treating an absent binding as a satisfied one.
+
     Constructed only from a row the join in :func:`approval_history` returned, so a
     decision with no lifecycle event can never appear as one.
     """
@@ -133,6 +141,7 @@ class ApprovalRecord:
     occurred_at_utc: str
     created_at_utc: str
     event_seq: int
+    payload_sha256: str | None
 
 
 _SUMMARY_COLUMNS = (
@@ -145,7 +154,7 @@ _SUMMARY_COLUMNS = (
 # ALTER TABLE must not be able to reorder it silently.
 _APPROVAL_COLUMNS = (
     "a.event_id, a.forecast_record_id, a.decision, a.actor, a.forecast_sha256, "
-    "a.note, e.occurred_at_utc, a.created_at_utc, e.event_seq"
+    "a.note, e.occurred_at_utc, a.created_at_utc, e.event_seq, a.payload_sha256"
 )
 
 # The join that makes a decision *count*. `e.forecast_record_id = a.forecast_record_id` is
@@ -254,10 +263,24 @@ def approve(
     record_id: str,
     actor: str,
     occurred_at: datetime,
+    payload_sha256: str,
     note: str | None = None,
     expected_sha256: str | None = None,
 ) -> ApprovalRecord:
-    """Record an approval: ``validated -> approved``. See :func:`_record_decision`."""
+    """Record an approval: ``validated -> approved``. See :func:`_record_decision`.
+
+    ``payload_sha256`` is **required and has no default** (M2-707/D33). An approval that
+    could be written without one would be an approval that authorizes every payload built
+    from the forecast, which is precisely the state this item exists to end -- and a
+    default would put that state one omitted argument away for every future caller.
+    :func:`whiskeyjack_bot.submission_payload.payload_sha256_for_record` is what computes
+    it; this module deliberately does not, because ``submission.py`` imports this one and
+    a payload builder reachable from here would close an import cycle. That division is
+    safe in the direction that matters: a hash that is not the record's own fails closed
+    at :func:`whiskeyjack_bot.submission.submission_key_for_approved_record` and again at
+    the derivation gate in :func:`whiskeyjack_bot.submission_live.post_approved_forecast`,
+    so a wrong value costs a refused submission, never a wrong post.
+    """
     return _record_decision(
         conn,
         record_id=record_id,
@@ -266,6 +289,7 @@ def approve(
         occurred_at=occurred_at,
         note=note,
         expected_sha256=expected_sha256,
+        payload_sha256=payload_sha256,
     )
 
 
@@ -284,6 +308,12 @@ def reject(
     record stays intact, per the handoff's failure boundaries, and the record can be
     approved afterwards. It carries no ``detail_code`` -- a rejection is a decision, not a
     failure, and its account is the actor and note stored here (M1-603 owner decision).
+
+    It carries no ``payload_sha256`` either, and takes no such argument (M2-707). A
+    rejection authorizes nothing, so there is nothing for it to bind to -- and because the
+    payload is *derived*, requiring one here would make a record whose numeric CDF will not
+    convert impossible to reject, which is the one decision that must always be available.
+    ``011`` refuses a rejection that carries a payload hash.
     """
     return _record_decision(
         conn,
@@ -293,6 +323,7 @@ def reject(
         occurred_at=occurred_at,
         note=note,
         expected_sha256=expected_sha256,
+        payload_sha256=None,
     )
 
 
@@ -305,6 +336,7 @@ def _record_decision(
     occurred_at: datetime,
     note: str | None,
     expected_sha256: str | None,
+    payload_sha256: str | None,
 ) -> ApprovalRecord:
     """Bind a decision to the record's stored hash and append it, atomically.
 
@@ -325,8 +357,14 @@ def _record_decision(
     the writer never sees it. ``record_id``, ``actor``, ``note`` and ``occurred_at`` are
     left to ``record_approval``'s validators rather than restated: two sets of field rules
     for one column is how M1-603's round 5 defect happened, one layer up.
+    ``payload_sha256`` *is* shape-checked here, and that is not a second rule for one
+    column: ``record_approval`` decides whether a hash is required for this decision and
+    this decides whether what arrived is a hash at all, so a caller who typed one wrong
+    gets ``payload_sha256 must be 64 lowercase hexadecimal characters`` instead of a
+    message about the decision. The digest is passed through unchanged either way.
     """
     expected = None if expected_sha256 is None else _require_sha256(expected_sha256)
+    payload = None if payload_sha256 is None else _require_sha256(payload_sha256, "payload_sha256")
     try:
         with transaction(conn):
             summary = read_forecast_summary(conn, record_id)
@@ -352,6 +390,7 @@ def _record_decision(
                 forecast_sha256=stored,
                 occurred_at=occurred_at,
                 note=note,
+                payload_sha256=payload,
             )
             if event.approval_event_id is None:  # pragma: no cover - 003 forbids it
                 raise ApprovalError("the recorded approval decision could not be read back")
@@ -395,6 +434,7 @@ def _approval_from_row(row: sqlite3.Row) -> ApprovalRecord:
         occurred_at_utc=_stored_text(row[6], "occurred_at_utc"),
         created_at_utc=_stored_text(row[7], "created_at_utc"),
         event_seq=_stored_int(row[8], "event_seq"),
+        payload_sha256=(None if row[9] is None else _stored_sha256(row[9], "payload_sha256")),
     )
 
 
@@ -457,16 +497,16 @@ def _require_identifier(value: object, field: str) -> str:
     return text
 
 
-def _require_sha256(value: object) -> str:
-    """Return the operator's expected hash as a 64-character lowercase hex digest.
+def _require_sha256(value: object, field: str = "forecast_sha256") -> str:
+    """Return a caller-supplied hash as a 64-character lowercase hex digest.
 
     A malformed digest gets its own message rather than falling through to the mismatch
     below it: "does not match" would be true but would describe a typo as a changed
     forecast, which are different things for an operator to act on.
     """
-    text = _require_text(value, "forecast_sha256", max_length=64)
+    text = _require_text(value, field, max_length=64)
     if len(text) != 64 or not _HEX_DIGITS.issuperset(text):
-        raise ApprovalError("forecast_sha256 must be 64 lowercase hexadecimal characters")
+        raise ApprovalError(f"{field} must be 64 lowercase hexadecimal characters")
     return text
 
 
@@ -494,6 +534,25 @@ def _stored_text(value: object, field: str) -> str:
             f"stored {field} is not text (detail withheld: it can echo stored values)"
         )
     return value
+
+
+def _stored_sha256(value: object, field: str) -> str:
+    """Gate a stored digest before it is put in a value object (M2-707).
+
+    ``payload_sha256`` is read back out of an append-only table and handed to a caller
+    that compares it against a payload hash it derived itself. A stored value that is not
+    a digest at all would make that comparison answer "not the approved payload" for a
+    reason the operator could not act on, so the shape is checked here and the mismatch
+    below it means only what it says. Same argument as ``lifecycle._require_sha256``,
+    applied on the way out rather than on the way in.
+    """
+    text = _stored_text(value, field)
+    if len(text) != 64 or not _HEX_DIGITS.issuperset(text):
+        raise ApprovalError(
+            f"stored {field} is not a 64-character lowercase hex digest "
+            "(detail withheld: it can echo stored values)"
+        )
+    return text
 
 
 def _wrap_lifecycle(exc: LifecycleError) -> ApprovalError:

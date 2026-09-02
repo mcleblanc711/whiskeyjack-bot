@@ -55,6 +55,9 @@ from whiskeyjack_bot.submission_live import LiveSubmissionError
 TS = "2026-09-01T00:00:00.000000+00:00"
 OCCURRED = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 SHA = "b" * 64
+# M2-707: `011` requires an approval to carry the payload digest it authorized. Shape
+# only -- this module is about the `note` bound, and any well-formed digest reaches it.
+PAYLOAD_SHA = "d" * 64
 
 
 @pytest.fixture
@@ -315,6 +318,7 @@ def test_the_note_bound_is_the_same_for_both_writers(ledger: sqlite3.Connection)
                 decision="approved",
                 actor="ops",
                 forecast_sha256=SHA,
+                payload_sha256=PAYLOAD_SHA,
                 occurred_at=OCCURRED,
                 note=note,
             )

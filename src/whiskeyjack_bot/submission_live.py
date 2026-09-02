@@ -74,11 +74,21 @@ against a blind retry, and :func:`verify_uncertain_attempt` can still resolve it
 retries below are no longer what stands between a lost connection and a wrong permanent
 record; they are audit fidelity, which is a better thing for them to be.
 
-**What this module does not do.** It does not build the payload -- M1-502/M1-503 own that,
-and the payload is an input, supplied by ``--payload-file`` until they exist. It does not
-close D33: an approval binds to ``forecast_sha256``, so it still cannot check that a
-payload *is* the one the approval meant, and **M2-707** remains the filed item. What it can
-check, it checks -- the payload's ``question_type`` must equal the record's stored one.
+**What this module does not do.** It does not build the payload, and after M2-707 that is
+a sharper statement than it used to be rather than a softer one. ``submission_payload.py``
+builds it, and this module must not import that one: the numeric branch is
+``NumericDistribution``, and the guarantee three paragraphs up -- *nothing here imports*
+``forecasting_tools`` -- is worth more than a locally built payload. The payload stays an
+input, and ``cli.py`` is where an omitted ``--payload-file`` is filled in from the record.
+
+**D33 is closed, and not here.** An approval now carries ``payload_sha256`` (migration
+``011``), so "is this the payload the approval meant" is one digest comparison, and it is
+made by :func:`submission.submission_key_for_approved_record` -- gate 5 of
+:func:`post_approved_forecast`, above the reservation and far above the post. The
+``question_type`` gate below it stays: it is a narrower question with a clearer answer, and
+it fires first so a numeric payload posted against a binary record is told *that* rather
+than told its digest does not match.
+
 It does not reserve the idempotency key atomically before posting; ``require_key_unused``
 is a read and says so, and **M2-708** is that item.
 
@@ -1740,14 +1750,19 @@ def post_approved_forecast(
     3. **The record.** ``question_id``, ``post_id`` and ``question_type`` all come from the
        one ``forecast_records`` row, so no caller supplies a value that must agree with
        another (M2-703 round 1's finding, applied ahead of time rather than fixed after).
-    4. **The payload's type must match the record's.** This is the only part of D33 that is
-       checkable today: an approval binds to ``forecast_sha256``, so it still cannot be
-       shown that *this* payload is the one the approval meant, and **M2-707** remains the
-       filed item. A numeric payload posted against a binary record is caught; a different
-       binary payload for the same forecast is not, and that is stated rather than implied.
-    5. **Approval, and still awaiting submission.** :func:`submission.
-       submission_key_for_approved_record` refuses a record that holds no approval *or* has
-       since moved off ``approved`` -- the second check being M2-702 round 2's fix.
+    4. **The payload's type must match the record's.** Kept after M2-707 closed D33, and
+       kept deliberately: gate 5 now refuses any payload the approval did not authorize,
+       which subsumes this one, but it answers with a digest mismatch. A numeric payload
+       posted against a binary record is a different mistake with a different fix, and it
+       is worth being told as itself. This fires first for that reason alone.
+    5. **Approval, still awaiting submission, and the payload it authorized.**
+       :func:`submission.submission_key_for_approved_record` refuses a record that holds no
+       approval, one that has since moved off ``approved`` (M2-702 round 2's fix), and --
+       **M2-707/D33** -- one whose approval bound to a different payload. That last check is
+       what makes the ``payload`` argument safe to accept from a caller at all: an approval
+       carries ``payload_sha256`` (migration ``011``), so a payload nobody reviewed cannot
+       reach a key, and without a key nothing below happens. An approval written before
+       ``011`` carries no binding and is refused rather than exempted.
     6. **The key is claimed, not merely read.** :func:`submission.reserve_submission_key`
        (M2-708) takes a durable row before any network I/O, so two concurrent commands for
        one derived key select a single poster. It replaced :func:`submission.

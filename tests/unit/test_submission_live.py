@@ -51,7 +51,11 @@ from whiskeyjack_bot.lifecycle import (
 )
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
 from whiskeyjack_bot.submission import SubmissionError
-from whiskeyjack_bot.submission_gateway import SubmissionRequest, read_live_artifact
+from whiskeyjack_bot.submission_gateway import (
+    SubmissionRequest,
+    payload_sha256,
+    read_live_artifact,
+)
 from whiskeyjack_bot.bounds import MAX_BODY_LENGTH
 from whiskeyjack_bot.submission_live import (
     _MAX_CATEGORIES,
@@ -90,6 +94,11 @@ OCCURRED = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 
 PROBABILITY = 0.37
 BINARY_PAYLOAD: dict[str, Any] = {"question_type": "binary", "probability_yes": PROBABILITY}
+# M2-707: what the `approved` fixture's approval authorizes. Computed from the payload
+# rather than written as a literal, because since `011` the two have to agree -- a
+# hand-typed digest here would make every post in this module fail at the key seam, and
+# the one that is *supposed* to fail there would prove nothing.
+PAYLOAD_SHA = payload_sha256(BINARY_PAYLOAD)
 BASELINE_START = 1_000_000.0
 NEW_START = 1_000_100.0
 
@@ -314,7 +323,13 @@ def ledger(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 def approved(ledger: sqlite3.Connection) -> tuple[sqlite3.Connection, str]:
     record = append_forecast_version(ledger, draft=_draft())
     record_validation(ledger, record_id=record.record_id, occurred_at=OCCURRED)
-    approve(ledger, record_id=record.record_id, actor="chris", occurred_at=OCCURRED)
+    approve(
+        ledger,
+        record_id=record.record_id,
+        actor="chris",
+        occurred_at=OCCURRED,
+        payload_sha256=PAYLOAD_SHA,
+    )
     return ledger, record.record_id
 
 
@@ -847,32 +862,38 @@ def test_a_payload_of_the_wrong_question_type_is_refused(
     assert poster.posts == 0
 
 
-def test_the_documented_payload_binding_gap_is_real_and_is_asserted(
+def test_a_binary_payload_the_approval_never_authorized_is_refused_before_the_post(
     approved: tuple[sqlite3.Connection, str], live_config: AppConfig
 ) -> None:
-    """D33 / M2-707: one approval still covers every payload of the right *type*.
+    """D33 closed (M2-707). This test is what the gap-pinning test became.
 
-    Pinned as a test rather than described in prose, the call M2-702 made for the same gap:
-    if a later change closes it this fails, and the note that says it is open has to be
-    updated. Two different binary payloads both post under one approval today.
+    It was `test_the_documented_payload_binding_gap_is_real_and_is_asserted`, and it
+    asserted the opposite: two different binary payloads both posted under one approval,
+    the second refused only because the record had moved to `submitted`. It was written to
+    fail the day the gap closed. It has.
+
+    **The record is left at `approved` here, and that is the whole difference.** The old
+    test could only reach the refusal by posting first, which put the status gate in front
+    of the payload gate and meant nothing about the payload was ever tested. Nothing is
+    posted at all now: the same forecast, differing only in its value, is refused because
+    the approval bound to a different digest -- and `poster.posts == 0` says the refusal
+    came before the network, not after it.
     """
     ledger, record_id = approved
-    first = FakePoster()
-    assert _post(ledger, record_id, first, live_config).event.event_type == "submitted"
-    # A *different* forecast, never reviewed, differing only in its value. It is refused
-    # here only because the record has moved to `submitted` -- not because the approval
-    # failed to cover it.
-    other = FakePoster()
-    with pytest.raises(LiveSubmissionError) as excinfo:
-        _post(
-            ledger,
-            record_id,
-            other,
-            live_config,
-            payload={"question_type": "binary", "probability_yes": 0.99},
-        )
-    assert "no longer awaiting submission" in str(excinfo.value)
-    assert other.posts == 0
+    assert current_status(ledger, record_id) == "approved"
+    poster, error = _expect_refusal(
+        ledger,
+        record_id,
+        live_config,
+        payload={"question_type": "binary", "probability_yes": 0.99},
+    )
+    assert "not the one the approval in force authorized" in str(error)
+    assert poster.posts == 0
+    # And the authorized payload still posts, from the same state. Without this the test
+    # above would pass against a gate that refused every payload, which is the vacuity
+    # `docs/LESSONS.md` names.
+    assert current_status(ledger, record_id) == "approved"
+    assert _post(ledger, record_id, FakePoster(), live_config).event.event_type == "submitted"
 
 
 def test_a_spent_idempotency_key_is_refused_before_the_post(

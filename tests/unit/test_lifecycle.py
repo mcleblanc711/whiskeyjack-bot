@@ -379,8 +379,8 @@ def test_an_approval_row_alone_does_not_move_the_record(
     record_validation(conn, record_id=record_id, occurred_at=WHEN)
     conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
-        "created_at_utc) VALUES (?, 'approved', 'chris', ?, ?)",
-        (record_id, SHA, TS),
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'chris', ?, ?, ?)",
+        (record_id, SHA, TS, PAYLOAD_SHA),
     )
     assert current_status(conn, record_id) == "validated"
 
@@ -704,10 +704,18 @@ def test_replace_cannot_flip_a_stored_approval_decision(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
+    # `payload_sha256=None` alongside the flipped decision, and it is not incidental:
+    # `011` refuses a rejection that carries a payload hash, so without it the *bind*
+    # trigger refuses this row before the append-only one is ever reached and the test
+    # would pass while measuring the wrong refusal. `_replace_row`'s docstring states the
+    # rule -- the only thing that may refuse it is the append-only trigger.
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        _replace_row(conn, "approval_events", decision="rejected", actor="usurper")
+        _replace_row(
+            conn, "approval_events", decision="rejected", actor="usurper", payload_sha256=None
+        )
     assert conn.execute("SELECT decision FROM approval_events").fetchone()[0] == "approved"
 
 
@@ -727,6 +735,7 @@ def test_replace_cannot_downgrade_a_verified_submission(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
@@ -759,8 +768,8 @@ def test_replace_cannot_erase_the_first_event_of_a_history(
     first = conn.execute("SELECT event_id FROM lifecycle_events WHERE event_seq = 1").fetchone()[0]
     approval_id = conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
-        "created_at_utc) VALUES (?, 'approved', 'usurper', ?, ?)",
-        (record_id, SHA, TS),
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'usurper', ?, ?, ?)",
+        (record_id, SHA, TS, PAYLOAD_SHA),
     ).lastrowid
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute(
@@ -916,8 +925,8 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
     """Create one valid detail row of every kind, so only the transition can be at fault."""
     approved = conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
-        "created_at_utc) VALUES (?, 'approved', 'chris', ?, ?)",
-        (record_id, SHA, TS),
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'chris', ?, ?, ?)",
+        (record_id, SHA, TS, PAYLOAD_SHA),
     ).lastrowid
     rejected = conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
@@ -1307,6 +1316,7 @@ def test_the_pipeline_walks_draft_to_submitted(draft: tuple[sqlite3.Connection, 
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN + timedelta(minutes=1),
         note="looks right",
     )
@@ -1347,6 +1357,7 @@ def test_a_rejection_records_a_decision_without_moving_the_record(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     assert current_status(conn, record_id) == "approved"
@@ -1362,9 +1373,150 @@ def test_approval_binds_to_the_exact_forecast_hash(draft: tuple[sqlite3.Connecti
             decision="approved",
             actor="chris",
             forecast_sha256=OTHER_SHA,
+            payload_sha256=PAYLOAD_SHA,
             occurred_at=WHEN,
         )
     assert current_status(conn, record_id) == "validated"
+    assert _counts(conn)["approval_events"] == 0
+
+
+# ── M2-707: the payload an approval authorizes ───────────────────────────────
+#
+# Two layers, and they are not the usual pair of identical rules. The writer below decides
+# whether a *hash* is required for this decision; migration `011`'s trigger decides the same
+# thing for a row written by raw SQL; and neither can decide whether the hash is the payload
+# the record actually derives -- that is canonical JSON, the pinned SDK's CDF conversion and
+# the calibration configuration, none of which exist inside SQLite.
+# `tests/unit/test_submission_payload.py` owns that third question.
+#
+# Both layers are tested because neither substitutes for the other, and because a test that
+# only asserted `LifecycleError` would pass with this validator deleted: the trigger would
+# refuse the INSERT and the wrapper would re-raise it as the same type. What is lost then is
+# the field-level message, so the message is what these assert.
+
+
+def test_an_approval_must_carry_the_payload_it_authorizes(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """`011`'s rule at the writer, with the message a caller can act on.
+
+    Matched on the message rather than the type. Without that, this test passes against a
+    tree with `_require_payload_digest` removed -- the trigger refuses the row, the
+    `sqlite3.IntegrityError` is wrapped as a `LifecycleError`, and the only thing actually
+    lost is that the caller is told *which field*. Measured, by deleting the branch.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    with pytest.raises(LifecycleError, match="payload_sha256 is required for an approval"):
+        record_approval(
+            conn,
+            record_id=record_id,
+            decision="approved",
+            actor="chris",
+            forecast_sha256=SHA,
+            occurred_at=WHEN,
+        )
+    assert current_status(conn, record_id) == "validated"
+    assert _counts(conn)["approval_events"] == 0
+
+
+def test_a_rejection_authorizes_no_payload_and_may_not_carry_one(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """The other half of the asymmetry, and the reason a NULL is never ambiguous.
+
+    Required for `approved` and forbidden for `rejected` means a NULL has exactly one
+    meaning per decision: on an approval it is a pre-`011` row and nothing else, which is
+    what lets `submission_key_for_approved_record` refuse those rather than guess.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    with pytest.raises(LifecycleError, match="payload_sha256 must be omitted for a rejection"):
+        record_approval(
+            conn,
+            record_id=record_id,
+            decision="rejected",
+            actor="chris",
+            forecast_sha256=SHA,
+            payload_sha256=PAYLOAD_SHA,
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["approval_events"] == 0
+
+
+def test_a_payload_digest_that_is_not_a_digest_is_refused_by_its_own_name(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """A typo is a typo, not a decision that authorizes nothing.
+
+    The same reason `_require_sha256` gives the forecast hash its own message: "must be
+    omitted for a rejection" would be the wrong thing to tell someone who mistyped 64
+    characters, and a constraint violation would be the wrong thing to tell anyone.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    with pytest.raises(LifecycleError, match="payload_sha256"):
+        record_approval(
+            conn,
+            record_id=record_id,
+            decision="approved",
+            actor="chris",
+            forecast_sha256=SHA,
+            payload_sha256="not a digest",
+            occurred_at=WHEN,
+        )
+    assert _counts(conn)["approval_events"] == 0
+
+
+def test_the_schema_refuses_a_payload_binding_no_writer_would_have_written(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    """`011`'s trigger, reached by raw SQL -- which is the only way to reach it.
+
+    The writer above cannot produce either of these rows, so without this the trigger
+    clauses would be asserted by nothing and could be neutered without a red build. Written
+    as raw INSERTs for the reason the migration header gives: the schema owns the *shape* of
+    the binding independently of whoever is writing it.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    with pytest.raises(sqlite3.IntegrityError, match="must carry a payload_sha256"):
+        conn.execute(
+            "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+            "created_at_utc) VALUES (?, 'approved', 'chris', ?, ?)",
+            (record_id, SHA, TS),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="authorizes no payload"):
+        conn.execute(
+            "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+            "created_at_utc, payload_sha256) VALUES (?, 'rejected', 'chris', ?, ?, ?)",
+            (record_id, SHA, TS, PAYLOAD_SHA),
+        )
+    assert _counts(conn)["approval_events"] == 0
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [SHA[:63], SHA + "0", SHA.upper(), "g" * 64, b"d" * 64, 0],
+    ids=["short", "long", "uppercase", "non-hex", "blob", "integer"],
+)
+def test_the_schema_refuses_a_payload_binding_that_is_not_a_digest(
+    draft: tuple[sqlite3.Connection, str], digest: object
+) -> None:
+    """Shape, at the schema, over the classes `length()` alone would let through.
+
+    `blob` is the one worth spelling out: TEXT is an affinity rather than a type in SQLite,
+    so 64 bytes of BLOB satisfies `length()` and the GLOB both. The `typeof()` probe is what
+    refuses it, for the reason `002` documents for `posts_dropped_no_url`.
+    """
+    conn, record_id = draft
+    record_validation(conn, record_id=record_id, occurred_at=WHEN)
+    with pytest.raises(sqlite3.IntegrityError, match="must carry a payload_sha256"):
+        conn.execute(
+            "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+            "created_at_utc, payload_sha256) VALUES (?, 'approved', 'chris', ?, ?, ?)",
+            (record_id, SHA, TS, digest),
+        )
     assert _counts(conn)["approval_events"] == 0
 
 
@@ -1441,6 +1593,7 @@ def test_rows_written_before_migration_003_survive_it_but_cannot_be_approved(
                 decision="approved",
                 actor="chris",
                 forecast_sha256=SHA,
+                payload_sha256=PAYLOAD_SHA,
                 occurred_at=WHEN,
             )
         assert current_status(conn, legacy) == "validated"
@@ -1578,8 +1731,8 @@ def test_an_event_cannot_borrow_another_records_approval(
     detail = _walk_to(conn, record_id, "validated")
     other_approval = conn.execute(
         "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
-        "created_at_utc) VALUES (?, 'approved', 'chris', ?, ?)",
-        (other, OTHER_SHA, TS),
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'chris', ?, ?, ?)",
+        (other, OTHER_SHA, TS, PAYLOAD_SHA),
     ).lastrowid
     with pytest.raises(sqlite3.IntegrityError):
         _insert_event(
@@ -1600,6 +1753,7 @@ def _approve(conn: sqlite3.Connection, record_id: str) -> None:
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
 
@@ -2413,6 +2567,7 @@ def test_an_unverified_attempt_requires_a_detail_code(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     with pytest.raises(LifecycleError):
@@ -2437,6 +2592,7 @@ def test_a_verified_submission_rejects_a_detail_code(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     with pytest.raises(LifecycleError):
@@ -2779,6 +2935,7 @@ def test_a_second_approval_rolls_back_its_own_approval_row(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     before = _counts(conn)
@@ -2789,6 +2946,7 @@ def test_a_second_approval_rolls_back_its_own_approval_row(
             decision="approved",
             actor="chris",
             forecast_sha256=SHA,
+            payload_sha256=PAYLOAD_SHA,
             occurred_at=WHEN,
         )
     assert _counts(conn) == before
@@ -2806,6 +2964,7 @@ def test_a_second_submission_rolls_back_its_own_attempt_row(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
@@ -2840,6 +2999,7 @@ def test_an_injected_failure_leaves_no_half_written_state(
             decision="approved",
             actor="chris",
             forecast_sha256=SHA,
+            payload_sha256=PAYLOAD_SHA,
             occurred_at=WHEN,
         )
     before = _counts(conn)
@@ -2862,6 +3022,7 @@ def test_an_injected_failure_leaves_no_half_written_state(
                 decision="approved",
                 actor="chris",
                 forecast_sha256=SHA,
+                payload_sha256=PAYLOAD_SHA,
                 occurred_at=WHEN,
             )
         else:
@@ -2914,6 +3075,7 @@ def test_an_inner_failure_does_not_discard_the_outer_transaction(
                 decision="approved",
                 actor="chris",
                 forecast_sha256=SHA,
+                payload_sha256=PAYLOAD_SHA,
                 occurred_at=WHEN,
             )
     assert current_status(conn, "rec-nested") == "draft"
@@ -3080,6 +3242,7 @@ def test_a_lone_surrogate_raises_lifecycle_error_without_echoing_it(
             decision="approved",
             actor="\ud800",
             forecast_sha256=SHA,
+            payload_sha256=PAYLOAD_SHA,
             occurred_at=WHEN,
         )
     assert "\ud800" not in str(excinfo.value)
@@ -3102,6 +3265,7 @@ def _leak_cases(
             "decision": "approved",
             "actor": "chris",
             "forecast_sha256": SHA,
+            "payload_sha256": PAYLOAD_SHA,
             "occurred_at": WHEN,
         }
         kwargs.update(overrides)
@@ -3156,10 +3320,12 @@ def _leak_cases(
         )
 
     return {
-        "record_id": lambda: approve(record_id=PLANTED_SECRET),
-        "actor_over_cap": lambda: approve(actor=PLANTED_SECRET * 40),
-        "note_over_cap": lambda: approve(note=PLANTED_SECRET * 400),
-        "forecast_sha256": lambda: approve(forecast_sha256=PLANTED_SECRET),
+        "record_id": lambda: approve(record_id=PLANTED_SECRET, payload_sha256=PAYLOAD_SHA),
+        "actor_over_cap": lambda: approve(actor=PLANTED_SECRET * 40, payload_sha256=PAYLOAD_SHA),
+        "note_over_cap": lambda: approve(note=PLANTED_SECRET * 400, payload_sha256=PAYLOAD_SHA),
+        "forecast_sha256": lambda: approve(
+            forecast_sha256=PLANTED_SECRET, payload_sha256=PAYLOAD_SHA
+        ),
         "attempt_id": lambda: submit(attempt_id=PLANTED_SECRET),
         "idempotency_key": lambda: submit(key=PLANTED_SECRET),
         "response_body_over_cap": lambda: submit(response_body=PLANTED_SECRET * 6000),
@@ -3172,7 +3338,8 @@ def _leak_cases(
         # something it *calls* -- a timezone, an attribute, an integer conversion -- so
         # the leak arrives as an exception raised elsewhere rather than as stored text.
         "hostile_timezone": lambda: approve(
-            occurred_at=datetime(2026, 7, 27, tzinfo=HostileTimezone())
+            occurred_at=datetime(2026, 7, 27, tzinfo=HostileTimezone()),
+            payload_sha256=PAYLOAD_SHA,
         ),
         "hostile_attempt_subclass": submit_subclass,
     }
@@ -3226,6 +3393,7 @@ def test_an_oversized_integer_is_refused_at_the_field(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     with pytest.raises(LifecycleError, match="outside the range"):
@@ -3267,6 +3435,7 @@ def test_a_submission_attempt_subclass_is_refused(
         decision="approved",
         actor="chris",
         forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
     with pytest.raises(LifecycleError, match="must be a SubmissionAttempt"):
@@ -3803,7 +3972,15 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # first migration since 003 to touch none of them -- and has no upgrade precondition
     # scan, because nothing can predate tables the same migration creates. So a v2 ledger
     # reaching 10 is again the same statement it was when it reached 9.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
+    #
+    # 011 (M2-707) adds one NULLable column to `approval_events` and rewrites that table's
+    # insert trigger, and it too has no upgrade precondition: its new clauses read
+    # `NEW.payload_sha256`, so they constrain rows written *after* it and say nothing about
+    # the row this fixture seeded. A pre-011 approval keeps an honest NULL, which is
+    # `submission_key_for_approved_record`'s "this approval predates the payload binding"
+    # case rather than an approval that authorizes everything. So a v2 ledger reaching 11
+    # is the same statement again.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 11
 
     conn = connect(db)
     try:
@@ -4393,7 +4570,7 @@ def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
     """
     db = tmp_path / "ledger.sqlite3"
     attempt_id = _seed_v8_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 11
 
     conn = connect(db)
     try:
@@ -4490,7 +4667,7 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # COALESCE, and 010 only creates tables, so neither probes the rows a v5 ledger holds.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 10
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 11
 
 
 @pytest.mark.parametrize(
@@ -4595,7 +4772,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 10
+    assert initialize_ledger(db) == 11
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"

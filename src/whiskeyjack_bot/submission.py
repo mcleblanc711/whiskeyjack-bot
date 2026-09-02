@@ -78,15 +78,22 @@ an approval **and** is still at ``approved``, and every path leading to a real p
 through it. They are two functions rather than one function with a flag, for the reason
 M1-402 settled: a bound any caller can lift is not a bound.
 
-**What this module does not do.** It does not build the request payload -- M1-502/M1-503
-own that, and ``request_payload_sha256`` is an *input* here, exactly as the backlog says
-("derive keys from ... and payload hash"). Nor does it check that a payload *is* the one
-an approval meant. An approval binds to ``forecast_sha256``, so one approved forecast
-covers every payload built from it: a payload that changed without the forecast changing
-gets a new key and keeps the old approval. That is a **known, recorded gap**, not an
-oversight -- it cannot be closed without the forecast->payload mapping, which does not
-exist yet. **Decision D33** records the reading; **M2-707** is the filed item; M2-704 is
-where the check lands. See ``docs/M2-NOTES.md``.
+**What this module does not do.** It does not build the request payload --
+``submission_payload.py`` owns that (M2-707, on M1-502/M1-503), and
+``request_payload_sha256`` is an *input* here, exactly as the backlog says ("derive keys
+from ... and payload hash"). The import direction is why: that module reaches
+``forecast.cdf`` and therefore the SDK, and this one is imported by every submission path
+including the dry run.
+
+**What it now does, and did not until M2-707.** It checks that a payload *is* the one an
+approval meant. Until this item an approval bound to ``forecast_sha256`` alone, so one
+approved forecast covered every payload built from it -- a payload that changed without the
+forecast changing got a new key and kept the old approval. That was a known, recorded gap
+(**decision D33**) and not an oversight: closing it needed the forecast->payload mapping,
+which M1-502/M1-503 did not ship. Migration ``011`` adds ``approval_events.payload_sha256``,
+:func:`approval.approve` requires it, and
+:func:`submission_key_for_approved_record` refuses a ``request_payload_sha256`` that is not
+it. See ``docs/M2-NOTES.md``.
 
 Error hygiene follows ``ConfigError``/``LedgerError``/``LifecycleError``/``ApprovalError``:
 a :class:`SubmissionError` never echoes a caller-supplied or stored value, sanitizing
@@ -405,6 +412,21 @@ def submission_key_for_record(
     )
 
 
+# M2-707. Module constants for the same reason `_SPENT_KEY_REFUSAL` is one: a refusal an
+# operator will act on is asserted by tests and rendered by the CLI, and two spellings of
+# one bound is the defect M1-608 and M2-710 were both filed for.
+_UNBOUND_APPROVAL_REFUSAL = (
+    "the approval in force for this forecast record predates the payload binding "
+    "(migration 011) and so authorizes no particular payload; approve the record again to "
+    "bind the decision to the payload it authorizes"
+)
+_UNAUTHORIZED_PAYLOAD_REFUSAL = (
+    "this submission payload is not the one the approval in force authorized, so no "
+    "submission key may be derived for it; either submit the payload this record derives "
+    "or approve the record again"
+)
+
+
 def submission_key_for_approved_record(
     conn: sqlite3.Connection,
     record_id: str,
@@ -437,11 +459,28 @@ def submission_key_for_approved_record(
     request while one is unresolved is decided by ``lifecycle.unresolved_uncertainties``,
     not by refusing to derive a key.
 
-    **What it still does not establish** is that ``request_payload_sha256`` is the payload
-    that approval meant: an approval binds to ``forecast_sha256``, and one approved
-    forecast covers every payload built from it. Closing that needs the forecast->payload
-    mapping, which lives in M1-502/M1-503 and does not exist yet; **M2-707** is the filed
-    item and M2-704 is where the check lands. See ``docs/M2-NOTES.md`` and decision D33.
+    **The third check is M2-707, and it is what closes D33.** Until this item an approval
+    bound to ``forecast_sha256`` alone, so one approved forecast covered every payload built
+    from it and this function could not tell the payload an operator reviewed from any other
+    payload of the same forecast. ``approval_events.payload_sha256`` (migration ``011``)
+    now carries the digest of the payload the decision authorized, and
+    ``request_payload_sha256`` must equal it. Everything downstream follows from that one
+    comparison: the key is derived from the payload hash, so a payload the approval did not
+    authorize cannot reach a key, a reservation, or a post.
+
+    **A pre-``011`` approval carries no binding and is refused rather than exempted.** The
+    column is nullable because ``ADD COLUMN`` cannot be otherwise, so a ``None`` here is a
+    row written before the binding existed -- not a row that authorized every payload. The
+    stricter reading is the one that costs a re-approval and not a post nobody reviewed, and
+    this project has no live approvals to strand: ``submission.enabled`` is committed false
+    and M2-706 has never run.
+
+    **What it still does not establish** is that the stored digest is the payload the record
+    *derives* -- that is a question about canonical JSON, the pinned SDK's CDF conversion
+    and ``numeric_calibration``, none of which this module or the ledger can see.
+    :func:`whiskeyjack_bot.submission_payload.payload_sha256_for_record` establishes it, at
+    approve time, and the digest carries it forward. A wrong digest therefore fails closed
+    -- the payload an operator submits will not match it -- rather than opening a path.
     """
     payload_sha = _require_sha256(request_payload_sha256, "request_payload_sha256")
     identifier = _require_identifier(record_id, "record_id")
@@ -465,6 +504,14 @@ def submission_key_for_approved_record(
             f"this forecast record was approved but is no longer awaiting submission "
             f"(it is {status}), so no submission key may be derived for it"
         )
+    if approval.payload_sha256 is None:
+        raise SubmissionError(_UNBOUND_APPROVAL_REFUSAL)
+    if approval.payload_sha256 != payload_sha:
+        # Neither digest is printed. One is a stored value and the other is the caller's,
+        # so echoing them would let a caller confirm a guess about what was approved --
+        # `lifecycle._require_hash_binds` and `approval._record_decision` refuse the
+        # analogous forecast-hash mismatch in exactly these terms.
+        raise SubmissionError(_UNAUTHORIZED_PAYLOAD_REFUSAL)
     return submission_key_for_record(conn, identifier, request_payload_sha256=payload_sha)
 
 
