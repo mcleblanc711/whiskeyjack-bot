@@ -7451,6 +7451,48 @@ If some common percentile shape hangs, the run degrades to one dead question per
 rather than one stopped run — which is the criterion, and is also the point at which the
 right answer would be to find the input and refuse it deterministically, as M1-503 did twice.
 
+### Round 1 — the handoff window, and why the first fix was not enough
+
+The cross-model review returned CHANGES REQUESTED with one blocking finding, and it was in the
+part of `_bounded` I had already named as the claim I was least able to test. I had reasoned
+about the **teardown** window — a signal delivered before the timer is disarmed, landing during
+cleanup — and closed it with the `armed` flag. I had not reasoned about the **handoff** window
+at the other end.
+
+`_bounded` installs `expire` *before* `setitimer` replaces the caller's timer. For that moment
+a `SIGALRM` is live against our handler while it still belongs to a deadline the *caller* owns
+and may already be due — `tests/conftest.py`'s own fixture is exactly such a caller, so this
+needs no malicious operator and no hostile local state. With `armed` raised from the start,
+that signal raised `_Expired` outside the protected region. Reproduced by execution before any
+fix was written, and it was worse than the finding stated: not only did `_Expired` escape as a
+`BaseException` past `generate._run_attempts` — stopping the batch with no `timeout` recorded,
+the exact outcome this item exists to prevent — but the cleanup never ran, so **the caller's
+handler stayed clobbered by ours for the rest of the process**.
+
+**The first fix stopped the escape and was still wrong.** Moving the installation inside the
+protected region and starting `armed` down meant nothing escaped, but the caller's alarm was
+then *swallowed*: `previous_handler` was bound from `signal.signal`'s return value, and the
+signal arrives before that assignment runs, so `expire` saw `None` in exactly the window it
+exists to cover. Silently dropping a deadline the caller owns is the same class of defect as
+disarming their timer at teardown, which this file already argues against two sections above.
+Reading the handler with `getsignal` **before** installing is what makes the delegation real.
+
+So the final shape is three rules rather than one: the flag starts down; a signal arriving
+before we own the timer is handed back to the caller's handler; and the flag is raised before
+`setitimer` rather than after, because the opposite order leaves a window in which *our* timer
+can fire and be delegated away — a conversion that then runs unbounded, which is a fail-open
+where this is merely a misattribution.
+
+`test_a_signal_arriving_in_the_installation_window_is_handed_back_not_dropped` pins all three,
+and the two mutations discriminate: arming from the start fails it with a misattributed
+`NumericCdfTimeoutError`, and binding `previous_handler` from the return value fails it with
+the alarm eaten. Asserting only the absence of an exception would have passed the second one.
+
+**Process note.** Writing risk area 1 as "this is the claim I am least able to test" is what
+got it read closely; the reviewer's reproduction is the test I could not construct. That is the
+deliberate-choices mechanism working as `docs/LESSONS.md` describes, in the direction that
+costs a round rather than saves one — and it is the right direction.
+
 ### Standing risk — a suspended outer deadline
 
 `_bounded` suspends any timer the caller already owns and restores it with the elapsed time

@@ -22,6 +22,7 @@ drifting away from what the model is actually told and actually configured with.
 
 import copy
 import json
+import os
 import re
 import signal
 import threading
@@ -30,6 +31,7 @@ from itertools import pairwise
 from math import copysign, isfinite, nextafter
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -785,6 +787,51 @@ def test_an_outer_deadline_comes_back_with_the_elapsed_time_deducted() -> None:
     # remain if the conversion were free, strictly more than nothing.
     assert 0.0 < remaining < 4.5, remaining
     assert interval == 0.0
+
+
+def test_a_signal_arriving_in_the_installation_window_is_handed_back_not_dropped() -> None:
+    """Round-1 blocking finding: the handoff window between installing and owning the timer.
+
+    `_bounded` installs `expire` *before* `setitimer` replaces the caller's timer, so for a
+    moment a `SIGALRM` is live against our handler while it still belongs to a deadline the
+    caller owns and may already be due. `tests/conftest.py`'s own fixture is exactly such a
+    caller, so this needs no malicious operator and no hostile local state -- just ordinary
+    timer delivery.
+
+    With the handler armed from the start, that signal raised `_Expired` outside the
+    protected region. Three things went wrong at once and this asserts all three: it escaped
+    as a `BaseException` past `forecast.generate`'s attempt loop, so the batch stopped with
+    no `timeout` recorded; the cleanup never ran, so the caller's handler stayed clobbered by
+    ours for the rest of the process; and the caller's alarm was consumed by us.
+
+    A first fix stopped the escape but still dropped the alarm, because `previous_handler`
+    was bound from `signal.signal`'s *return value* and the signal arrives before that
+    assignment runs. Reading it with `getsignal` beforehand is what makes the delegation
+    real, and asserting `delivered` rather than only the absence of an exception is what
+    distinguishes the two.
+    """
+    delivered: list[int] = []
+    caller = signal.signal(signal.SIGALRM, lambda signum, frame: delivered.append(signum))
+    original = signal.signal
+
+    def install_then_race(sig: Any, handler: Any) -> Any:
+        previous = original(sig, handler)
+        if getattr(handler, "__name__", "") == "expire":
+            os.kill(os.getpid(), signal.SIGALRM)
+        return previous
+
+    try:
+        with patch.object(cdf_module.signal, "signal", install_then_race):
+            with cdf_module._bounded(5.0):
+                pass
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        restored = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, caller)
+    assert delivered == [signal.SIGALRM], "the caller's own alarm must be handed back, not eaten"
+    assert getattr(restored, "__name__", None) != "expire", (
+        "the caller's handler must be restored even when the signal lands mid-installation"
+    )
 
 
 @pytest.mark.usefixtures("deadline")

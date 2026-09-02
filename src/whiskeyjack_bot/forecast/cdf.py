@@ -129,6 +129,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from math import isfinite
 from types import FrameType
+from typing import Any
 
 from forecasting_tools import NumericDistribution, Percentile
 
@@ -295,35 +296,74 @@ def _bounded(seconds: float) -> Iterator[None]:
     if not can_bound_conversion():
         raise NumericCdfError([f"{_PERCENTILES_LOC}: {_CANNOT_BE_BOUNDED}"])
 
-    # Disarming the timer does not retract a signal the kernel has already delivered: it
-    # sits in CPython's pending-call flag until the eval loop next looks, which may be
-    # after this context manager has begun cleaning up. An ``_Expired`` raised there would
-    # escape as a ``BaseException`` past ``forecast.generate``'s attempt loop -- the very
-    # stopped run this bound exists to prevent, reintroduced by the bound itself. So the
-    # handler is gated on a flag rather than on the timer, it can fire at most once, and
-    # the flag is lowered before anything else in the cleanup.
-    armed = True
+    # ``armed`` gates the *handler*, not the timer, and it closes two different races that
+    # a naive "install, then protect" ordering leaves open. Both were reachable; the second
+    # was a round-1 blocking finding.
+    #
+    # **Teardown.** Disarming the timer does not retract a signal the kernel has already
+    # delivered: it sits in CPython's pending-call flag until the eval loop next looks,
+    # which may be after this context manager has begun cleaning up.
+    #
+    # **Handoff.** Between installing ``expire`` and replacing the caller's timer with ours,
+    # any ``SIGALRM`` belongs to a deadline the *caller* already owned and may already be
+    # due -- ``tests/conftest.py``'s own fixture is exactly such a caller. With the flag
+    # raised from the start, that signal raised ``_Expired`` outside the protected region:
+    # it escaped as a ``BaseException`` past ``forecast.generate``'s attempt loop, and the
+    # cleanup never ran, so the caller's handler stayed clobbered by ours. That is the
+    # stopped run this bound exists to prevent, reintroduced by the bound itself.
+    #
+    # So the flag starts **down**, and a signal arriving before we own the timer is handed
+    # back to the caller's handler rather than swallowed or reinterpreted as our timeout.
+    # It is raised before ``setitimer`` rather than after, because the opposite order leaves
+    # a window in which *our* timer can fire and be delegated away -- a conversion that then
+    # runs unbounded, which is a fail-open where this is merely a misattribution.
+    armed = False
+    installed = False
+    previous_delay = previous_interval = 0.0
+    # Read **before** installing, not from ``signal.signal``'s return value. The signal that
+    # ``expire`` has to hand back can be delivered the instant the handler is installed,
+    # which is before the assignment of that return value has run -- so binding it there
+    # leaves ``expire`` looking at ``None`` in exactly the window it exists to cover, and
+    # the caller's deadline is silently dropped instead of delegated. Measured: with the
+    # return-value form the round-1 reproduction swallowed the caller's alarm.
+    previous_handler: Any = signal.getsignal(signal.SIGALRM)
 
     def expire(signum: int, frame: FrameType | None) -> None:
         nonlocal armed
         if not armed:
+            # Not ours. A non-callable previous handler is ``SIG_DFL``/``SIG_IGN`` or a
+            # handler set from C; there is nothing to call, and killing the process on the
+            # caller's behalf from inside a conversion is not this module's decision.
+            if callable(previous_handler):
+                previous_handler(signum, frame)
             return
         armed = False
         raise _Expired
 
     started = time.monotonic()
-    previous_handler = signal.signal(signal.SIGALRM, expire)
-    previous_delay, previous_interval = signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
+        signal.signal(signal.SIGALRM, expire)
+        installed = True
+        armed = True
+        previous_delay, previous_interval = signal.setitimer(signal.ITIMER_REAL, seconds)
         try:
             yield
         finally:
             armed = False
-            signal.setitimer(signal.ITIMER_REAL, 0.0)
-            signal.signal(signal.SIGALRM, previous_handler)
-            if previous_delay:
-                remaining = previous_delay - (time.monotonic() - started)
-                signal.setitimer(signal.ITIMER_REAL, max(remaining, _IMMEDIATE), previous_interval)
+            if installed:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                # ``signal.signal`` returns ``None`` for a handler that was not set from
+                # Python, and refuses ``None`` as an argument. ``SIG_DFL`` is the honest
+                # restore for that case: it is what the C-level default already was.
+                signal.signal(
+                    signal.SIGALRM,
+                    previous_handler if previous_handler is not None else signal.SIG_DFL,
+                )
+                if previous_delay:
+                    remaining = previous_delay - (time.monotonic() - started)
+                    signal.setitimer(
+                        signal.ITIMER_REAL, max(remaining, _IMMEDIATE), previous_interval
+                    )
     except _Expired:
         _LOGGER.warning(
             "numeric CDF conversion exceeded its wall-clock bound and was cut off (M1-514)"
