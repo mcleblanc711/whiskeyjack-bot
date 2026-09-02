@@ -319,7 +319,7 @@ def test_the_same_inputs_always_give_the_same_key(values: tuple[str, int, int, s
 def test_every_accepted_input_yields_a_well_formed_key(values: tuple[str, int, int, str]) -> None:
     key = _key(values)
     assert KEY_RE.match(key)
-    # The writer's bound (`lifecycle._MAX_IDENTIFIER`), restated as a number rather than
+    # The writer's bound (`bounds.MAX_IDENTIFIER_LENGTH`), restated as a number rather than
     # imported: a private constant imported to assert against tests the constant.
     assert len(key) <= 200
 

@@ -6643,3 +6643,175 @@ Each constraint this suite claims to guard was neutered in `src/` and the suite 
 
 The harness itself is not committed — it is scaffolding, and a mutation harness that lives in the
 repo becomes a thing to maintain rather than a thing to run. The result is recorded here.
+
+## M1-608 — Pin the shared identifier bound between lifecycle and approval
+
+`approval._MAX_IDENTIFIER` restated `lifecycle._MAX_IDENTIFIER`; both were 200, behaviour
+agreed at every revision anyone checked, and nothing held them there. A change to either
+would have let the two entry points accept different `record_id` sets — one path writing a
+record the other cannot look up, on an append-only table.
+
+**The surface was six modules, not two.** `submission.py`, `submission_gateway.py` and
+`submission_live.py` each restated the number too, under comments that named *this item* as
+the one that would pin them together, and `forecast/record.py` restated it with no comment
+at all. Owner decision (2026-09-01): pin all six and the whole bound family, because
+merging M1-608 while four modules still carried a literal under a comment pointing at a
+closed item would have been worse than not doing it.
+
+### Decision — a leaf module, and only the constants move
+
+`src/whiskeyjack_bot/bounds.py` holds `MAX_IDENTIFIER_LENGTH`, `MAX_ACTOR_LENGTH`,
+`MAX_NOTE_LENGTH` and `MAX_BODY_LENGTH`, and imports nothing from this package.
+`forecast/record.py` is a pydantic schema module and had to be able to take a number
+without acquiring a dependency on the ledger writer stack; a leaf is what makes that free
+and what makes a cycle impossible.
+
+**Only the constants are shared. The validators stay duplicated**, and the argument that
+kept them apart is untouched: each module owns its sanitized exception type, so a shared
+`_require_identifier` would have to raise one module's error inside another. That argument
+was never about the *number* — a constant carries no error type — which is why the two
+spellings of the rule are tested for equality and the two spellings of the bound were not
+tested at all. That asymmetry was the whole defect.
+
+### Decision — `MAX_ACTOR_LENGTH` stays a separate name from `MAX_IDENTIFIER_LENGTH`
+
+Both are 200. Collapsing them would be this item's own defect pointed the other way: two
+bounds that agree by coincidence, fused into one that cannot move independently. An
+identifier is the value every other table points at; an actor name is prose that `010`
+happens to guard (M2-710). Every test is driven from the constant that names the field it
+is about, so the day the two numbers diverge nothing has to be untangled first.
+
+### Deviation — the scope is the family, not the pair
+
+The backlog row's criteria name approval and lifecycle. Implementing only those would have
+satisfied the text and left the defect, for the reason above. The three `submission*`
+modules and `forecast/record.py` are in this diff on an owner decision, not on a reading of
+the row.
+
+### Rejected — putting the constants in `ledger.py`
+
+It is the obvious home: it already owns `LEDGER_SCHEMA_VERSION` and `LedgerError`, and
+every candidate module already imports it. Its own docstring scopes it to *"database
+connections and migration application only"*, and `forecast/record.py` importing the
+connection layer to learn a field length is a dependency the schema module should not have.
+A four-line leaf costs less than widening a module's stated scope.
+
+### Rejected — a source scan asserting no module spells a bare `200`
+
+Tempting, and it fails on the first legitimate `200` anywhere in the package. The parity
+test below already fails on a re-spelled literal, by execution, and names which layer
+disagreed. A grep-shaped guard would add a second thing to keep true without adding a
+second thing that is true.
+
+### Rejected — one `_require_text` with the strict check, widened across modules
+
+M2-710 rejected this on `submission.py` and the reasoning carries: a writer stricter than
+its schema is the same defect as one looser than it. Nothing here widens what any validator
+accepts; the diff is a rename plus an import in every module it touches.
+
+### Deferred (do not read the absence as an omission)
+
+- **`forecast/record.py`'s identifier fields carry `min_length=1` and no blank/NUL rule.**
+  Every other layer refuses a whitespace-only or NUL-bearing identifier. Closing it would
+  change what a merged, reviewed pydantic model accepts — the behaviour-change-to-merged-code
+  M1-606 refused to smuggle in under a different item. **Filed as `M1-610`.** This branch
+  pins that module's *length* and nothing else about it.
+- **`retrieval_run_id` has no schema ceiling and is not given one.** `006` leaves it off
+  deliberately (`research/store.py` imposes no length on the way out, so the unreadable-row
+  defect the ceiling closes does not exist on that column), and
+  `test_the_run_id_column_has_no_length_ceiling_and_that_is_deliberate` pins the asymmetry.
+  Nothing here regularizes it. `lifecycle.py`'s writer-side cap on it is unchanged.
+- **`_SHA256_LENGTH`/`64` stays where it is.** 64 is fixed by SHA-256, not a policy number
+  that can drift, and M1-401 already records that the four sha256 rules must not be
+  conflated.
+- **The migrations still say `_MAX_IDENTIFIER` in their comments** (`004`, `006`, `007`,
+  `009`). A migration on master is immutable by checksum, so those comments now name a
+  constant that no longer exists and **cannot be corrected**. That immutability is also
+  what makes the test below work, so this is the cost of the mechanism rather than an
+  oversight.
+
+### Standing risk — two bounds equal at 200 cannot be told apart by any test
+
+`MAX_ACTOR_LENGTH == MAX_IDENTIFIER_LENGTH == 200`. Wiring `submission`'s `released_by`
+validator to the identifier bound instead of the actor bound is a mutation that **survives
+the whole suite**, and it was run: nothing goes red. No test can close this while the two
+numbers agree; what the separate names buy is that the day they diverge, the wiring is
+already pointing at the right one. Recorded rather than defended, because a wrong invariant
+defended in a comment is what T-903 cost three passes.
+
+Second, smaller: `MAX_NOTE_LENGTH` and `MAX_BODY_LENGTH` have **no schema clause anywhere**.
+`010` asks only that `note` be text; `003`/`004` put no clause on their body columns. Their
+tests assert cross-writer agreement and nothing more, and the docstrings say so. Do not read
+`bounds.py` as a claim that the ledger enforces those two.
+
+### On the mutation pass
+
+Eight mutants, each restored from a pristine copy with `__pycache__` cleared first. **Two
+survived on the first attempt and both were the test's fault, not the mutant's** — which is
+the part worth keeping.
+
+| Mutant | Killed by |
+| --- | --- |
+| `approval` re-spells the bound as a literal `201` | the seven-layer parity test |
+| `bounds.MAX_IDENTIFIER_LENGTH = 201` | the same test, at its schema layer |
+| `bounds.MAX_ACTOR_LENGTH = 201` | the actor test, at `010`'s trigger |
+| `submission`'s `released_by` call site re-spells `199` | the actor test, at its writer layer |
+| `submission`'s `note` call site re-spells `3999` | the note test — **only after the rewrite** |
+| `lifecycle`'s `note` call site re-spells `4001` | the note test |
+| `storable_text` truncates to `limit + 5` | the receipt-body composition test |
+| `released_by` validator wired to `MAX_IDENTIFIER_LENGTH` | **nothing — see the standing risk** |
+
+**`bounds.MAX_NOTE_LENGTH = 3999` survived, and it was the wrong mutation to aim.** Both
+writers read one constant, so moving it moves both and parity still holds — the note test
+*cannot* detect that, and no test without an independent witness can. The identifier test
+survives the same edit only because the migrations' frozen `length(...) > 200` is a witness
+that `bounds.py` cannot reach. That contrast is the actual content of this item: the
+identifier bound is pinned to something outside the program, and the other three are pinned
+only to each other.
+
+**Then `submission`'s `note` call site re-spelled as `3999` survived as well**, and that one
+was a real hole. The first note test drove
+`_require_optional_text(value, field, max_length=MAX_NOTE_LENGTH)` on each side — two calls
+to the same generic helper handed the same number, which is the test asserting itself. It
+was rewritten to drive `lifecycle.record_approval` and `submission.release_submission_key`
+end to end. This is M2-710's finding on `released_by` recurring one column over: **the rule
+and the wiring are two claims, and a validator-level parity test only makes the first.** The
+actor test was rewritten the same way for the same reason, and keeps the raw INSERT beside
+the writer because the two probe different things.
+
+### Verification
+
+`tests/unit/test_shared_bounds.py` is the acceptance criterion executed rather than asserted
+in a comment. `test_every_layer_reads_the_same_identifier_ceiling` probes at
+`MAX_IDENTIFIER_LENGTH` minus one, exactly, and plus one, and collects an accept vector from
+five Python validators (each caught on its own error type), `forecast.record`'s pydantic
+bound, and rollback-wrapped INSERTs into `forecast_records.record_id` and `.tournament_id`.
+It asserts every vector is equal **and** that the value is `(True, True, False)` — equality
+alone is satisfied by a set of layers that all refuse everything, which is how a parity test
+goes green while asserting nothing.
+
+The assertion is cross-layer equality, never a comparison against the constant: the constant
+only chooses where to probe, and the witness is the schema. That is the M1-303 rule ("a
+private constant imported to assert against tests the constant") satisfied rather than
+worked around.
+
+`forecast.record`'s layer is reached by validating `{"record_id": value}` alone and counting
+only a `string_too_long`/`string_too_short` error *on that field* as a refusal — every other
+field fails as `missing` and is ignored. That reaches the declared bound without building a
+whole record and without restating the annotation in the test.
+
+### On the process
+
+`git checkout src/whiskeyjack_bot/lifecycle.py` was used to restore one mutant and, because
+the branch's own rewiring of that file was still uncommitted, reverted that too — putting
+`_MAX_IDENTIFIER = 200` back in the one module the whole item is anchored on. Caught
+immediately by grepping for the old names, before any gate ran, so nothing was reported
+green against it. **The reason it would not have been caught by a test is the point**: the
+private constant and the shared one are numerically identical, so a reverted `lifecycle.py`
+passes the entire suite, including the new parity test. This item exists precisely because
+that condition is undetectable.
+
+`docs/M1-NOTES.md`'s T-901 entry already says **commit before mutating**, after the same
+restore step destroyed its own evidence there. Second occurrence, so state it as a rule
+rather than an anecdote: while the fix is uncommitted, restore a mutant from a pristine
+*copy*, never from git.

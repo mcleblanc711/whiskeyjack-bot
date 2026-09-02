@@ -43,13 +43,12 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT
 
+from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.submission_gateway import GatewayError
 from whiskeyjack_bot.submission_live import (
     _CATEGORY_SUM_TOLERANCE,
     _LIVE_ERROR_TYPES,
-    _MAX_BODY,
     _MAX_CATEGORIES,
-    _MAX_IDENTIFIER,
     _MAX_OPTION_LABEL,
     _MAX_SNAPSHOT_VALUES,
     BinaryPost,
@@ -613,8 +612,8 @@ def test_a_snapshot_is_storable_and_survives_its_own_round_trip(
         baseline_latest_start_time=baseline,
         result=result,
     )
-    assert len(snapshot) <= _MAX_BODY
-    assert storable_text(snapshot, _MAX_BODY) == snapshot
+    assert len(snapshot) <= MAX_BODY_LENGTH
+    assert storable_text(snapshot, MAX_BODY_LENGTH) == snapshot
     reparsed = json.dumps(
         json.loads(snapshot),
         ensure_ascii=True,
@@ -632,14 +631,14 @@ def test_a_snapshot_is_storable_and_survives_its_own_round_trip(
 # ── the evidence envelope ────────────────────────────────────────────────────
 #
 # Round 4. Three consecutive review rounds found the same class by hand -- an unbounded
-# provider-supplied field rendered into a fixed-size envelope, pushing it past `_MAX_BODY`
+# provider-supplied field rendered into a fixed-size envelope, pushing it past `MAX_BODY_LENGTH`
 # and collapsing it to the reduced form that names no values at all. Round 1 found it in
 # the option list, round 3 in the label strings, round 4 in the observed vector.
 #
 # The reason a fuzzer never found it is written in round 3's review: the multiple-choice
 # properties bounded generated labels to a couple of characters, and the snapshot
 # round-trip property passed `ForecastHistory(())` -- an *empty* history, so the branch
-# that renders observed values was never entered. Its `len(snapshot) <= _MAX_BODY`
+# that renders observed values was never entered. Its `len(snapshot) <= MAX_BODY_LENGTH`
 # assertion was therefore vacuous for exactly the invariant that kept failing. That is the
 # `strategy could not reach the branch it claims to cover` failure this file's own header
 # warns about, and M1-501 and M1-607 before it.
@@ -690,7 +689,7 @@ def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
 
     **This is the property the three rounds should have been.** It says the thing the caps
     exist to guarantee, rather than a consequence of it: whatever the operator's payload
-    and whatever the platform reports back, the snapshot fits `_MAX_BODY` *and still names
+    and whatever the platform reports back, the snapshot fits `MAX_BODY_LENGTH` *and still names
     its evidence*. Delete `_MAX_SNAPSHOT_VALUES`, or raise `_MAX_OPTION_LABEL`, and the
     maximal envelope goes back over the limit and this fails.
 
@@ -752,7 +751,7 @@ def test_no_accepted_input_can_cost_a_snapshot_its_evidence(
     )
     snapshot = read_verification_snapshot(rendered)
 
-    assert len(rendered) <= _MAX_BODY
+    assert len(rendered) <= MAX_BODY_LENGTH
     # The whole point: the envelope never degrades to the form that names nothing.
     assert "values_omitted" not in snapshot
     assert snapshot["expected_values"] == list(expected)
@@ -799,7 +798,7 @@ def test_a_live_attempt_id_is_deterministic_and_never_echoes_its_key(key: str, o
     first = live_attempt_id(key)
     assert first == live_attempt_id(key)
     assert re.fullmatch(r"wjlive-1-[0-9a-f]{64}", first)
-    assert len(first) <= _MAX_IDENTIFIER
+    assert len(first) <= MAX_IDENTIFIER_LENGTH
     # The claim is that an attempt id can never be pasted into a query against
     # `submission_attempts.idempotency_key` and match -- not that the key's characters
     # never appear in a 64-character hex digest, which for a one-character key they

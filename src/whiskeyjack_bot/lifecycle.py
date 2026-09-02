@@ -71,6 +71,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal, cast, get_args
 
+from whiskeyjack_bot.bounds import (
+    MAX_ACTOR_LENGTH,
+    MAX_BODY_LENGTH,
+    MAX_IDENTIFIER_LENGTH,
+    MAX_NOTE_LENGTH,
+)
+
 # The seven states of 001's `forecast_records.status` CHECK.
 LifecycleStatus = Literal[
     "draft", "validated", "approved", "submitted", "failed", "resolved", "scored"
@@ -285,12 +292,9 @@ _DESTINATIONS: dict[tuple[str, str], str] = {
 
 # Length ceilings, by what the field is. Identifiers and actors are short by nature; an
 # operator's note is prose; a provider response body is the one field that can be large
-# and is capped where the handoff says the receipt is "size-limited". These bound what a
-# single row can put into the ledger; they are not a substitute for M1-605's redaction.
-_MAX_IDENTIFIER = 200
-_MAX_ACTOR = 200
-_MAX_NOTE = 4000
-_MAX_BODY = 65536
+# and is capped where the handoff says the receipt is "size-limited". They live in
+# `bounds.py` rather than here (M1-608): five other modules apply the same numbers, and
+# until this item they each spelled them again under a comment saying they matched.
 
 _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
 
@@ -540,7 +544,7 @@ def _require_identifier(value: object, field: str) -> str:
     unjoinable one. So ``actor`` and the body columns keep :func:`_require_text`, and that
     distinction is the reason both functions exist.
     """
-    text = _require_text(value, field, max_length=_MAX_IDENTIFIER)
+    text = _require_text(value, field, max_length=MAX_IDENTIFIER_LENGTH)
     if not text.strip():
         raise LifecycleError(f"{field} must not be blank")
     if "\x00" in text:
@@ -956,9 +960,9 @@ def record_approval(
     """
     _require_member(decision, _APPROVAL_DECISIONS, "decision")
     identifier = _require_identifier(record_id, "record_id")
-    actor_text = _require_text(actor, "actor", max_length=_MAX_ACTOR)
+    actor_text = _require_text(actor, "actor", max_length=MAX_ACTOR_LENGTH)
     digest = _require_sha256(forecast_sha256, "forecast_sha256")
-    note_text = _require_optional_text(note, "note", max_length=_MAX_NOTE)
+    note_text = _require_optional_text(note, "note", max_length=MAX_NOTE_LENGTH)
     occurred = _require_utc(occurred_at, "occurred_at")
 
     with transaction(conn):
@@ -1089,23 +1093,23 @@ def record_submission_attempt(
         _require_sha256(attempt.request_payload_sha256, "attempt.request_payload_sha256"),
         _require_http_status(attempt.http_status, "attempt.http_status"),
         _require_optional_text(
-            attempt.response_body, "attempt.response_body", max_length=_MAX_BODY
+            attempt.response_body, "attempt.response_body", max_length=MAX_BODY_LENGTH
         ),
         _require_optional_text(
-            attempt.response_headers, "attempt.response_headers", max_length=_MAX_BODY
+            attempt.response_headers, "attempt.response_headers", max_length=MAX_BODY_LENGTH
         ),
         success,
         _require_optional_text(
-            attempt.error_type, "attempt.error_type", max_length=_MAX_IDENTIFIER
+            attempt.error_type, "attempt.error_type", max_length=MAX_IDENTIFIER_LENGTH
         ),
         _require_optional_text(
-            attempt.error_message, "attempt.error_message", max_length=_MAX_BODY
+            attempt.error_message, "attempt.error_message", max_length=MAX_BODY_LENGTH
         ),
         verified,
         _require_optional_text(
             attempt.refetched_forecast_snapshot,
             "attempt.refetched_forecast_snapshot",
-            max_length=_MAX_BODY,
+            max_length=MAX_BODY_LENGTH,
         ),
         outcome,
         _utc_text(_utcnow()),
@@ -1179,7 +1183,7 @@ def record_submission_verification(
     snapshot = _require_optional_text(
         verification.refetched_forecast_snapshot,
         "verification.refetched_forecast_snapshot",
-        max_length=_MAX_BODY,
+        max_length=MAX_BODY_LENGTH,
     )
 
     event_type: LifecycleEventType
@@ -1260,7 +1264,7 @@ def record_pre_forecast_failure(
     _require_member(detail_code, _PRE_FORECAST_FAILURE_CODES, "detail_code")
     occurred = _require_utc(occurred_at, "occurred_at")
     run_id = _require_optional_text(
-        retrieval_run_id, "retrieval_run_id", max_length=_MAX_IDENTIFIER
+        retrieval_run_id, "retrieval_run_id", max_length=MAX_IDENTIFIER_LENGTH
     )
     if event_type == "generation_failed" and run_id is None:
         raise LifecycleError("retrieval_run_id is required for a generation failure")
