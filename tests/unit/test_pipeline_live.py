@@ -643,6 +643,85 @@ def test_unpriced_calls_are_counted_rather_than_added_as_zero(
     assert batch.records_written == 3
 
 
+def _failing_after_a_priced_call(monkeypatch: pytest.MonkeyPatch, price: float) -> None:
+    """Make the batch's first question fail *after* a call that reported a price.
+
+    The real orchestrator runs and opens its row first, so the ``research_failed`` event has
+    a genuine ``research_runs`` row to cite and ``004``'s ownership trigger is satisfied --
+    only the price is supplied here. That split is deliberate: **that the fallback's own
+    cost survives its recording failure is the orchestrator's claim**, and
+    ``tests/unit/test_research_orchestrate.py`` proves it against a real Exa response whose
+    ``costDollars.total`` is ``0.01``. What is left for this level, and what round 2's
+    finding was ultimately about, is whether the composer carries that figure into the
+    batch total and lets it reach the cap. Rebuilding an Exa transport here would test the
+    orchestrator a second time and this seam not at all.
+    """
+    from whiskeyjack_bot import pipeline_live as module
+    from whiskeyjack_bot.research.orchestrate import PaidRetrievalError
+
+    real = module.retrieve_for_question
+    seen: list[int] = []
+
+    def wrapped(conn: Any, cfg: Any, **kwargs: Any) -> Any:
+        outcome = real(conn, cfg, **kwargs)
+        seen.append(1)
+        if len(seen) == 1:
+            raise PaidRetrievalError(
+                "could not complete the retrieval run",
+                retrieval_run_ids=outcome.retrieval_run_ids,
+                cost_usd=price,
+                unpriced_calls=1,
+            )
+        return outcome
+
+    monkeypatch.setattr(module, "retrieve_for_question", wrapped)
+
+
+def test_a_question_that_failed_after_paying_still_spends_against_the_budget(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2's finding, at the level its impact is written about.
+
+    The finding was that a fallback billed and then lost to a transient ledger failure
+    reported no cost, and this is the consequence that made it blocking rather than untidy:
+    ``run_live`` accumulates ``QuestionOutcome.cost_usd`` and compares it to
+    ``run_limits.max_cost_usd``, so a spend that does not arrive is a cap that does not
+    bite. A batch would keep buying past a limit real money had already reached.
+
+    A question that failed is still a question that was paid for. That is the whole claim.
+    """
+    config.run_limits.max_cost_usd = 0.01
+    _failing_after_a_priced_call(monkeypatch, 0.01)
+    batch = live(ledger, config, limit=3)
+
+    assert batch.known_cost_usd == pytest.approx(0.01), (
+        "the failed question's known spend must reach the batch total"
+    )
+    assert batch.stop_reason == "cost_limit"
+    assert len(batch.outcomes) == 1
+    assert batch.outcomes[0].status == "research_failed"
+
+
+def test_the_same_spend_under_a_budget_it_cannot_reach_does_not_stop_the_batch(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Anti-vacuity for the test above, and it is not a formality here.
+
+    Without it, ``stop_reason == "cost_limit"`` is satisfied by any batch that stops after a
+    failed first question -- including one that stops *because* the question failed, which
+    is the bug the round-1 fix removed and exactly the wrong reason to go green. Holding the
+    failure fixed and moving only the cap isolates the cause: the same spend, under a budget
+    it cannot reach, runs every question and still shows up in the total.
+    """
+    config.run_limits.max_cost_usd = 1000.0
+    _failing_after_a_priced_call(monkeypatch, 0.01)
+    batch = live(ledger, config, limit=3)
+
+    assert batch.stop_reason == "completed"
+    assert len(batch.outcomes) == 3
+    assert batch.known_cost_usd == pytest.approx(0.01)
+
+
 class _PricedForecaster(_Forecaster):
     """A forecaster whose calls report a cost, so the budget has something to bite on."""
 

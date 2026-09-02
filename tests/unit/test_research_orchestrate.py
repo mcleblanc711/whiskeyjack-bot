@@ -490,6 +490,57 @@ def test_the_fallbacks_own_open_run_is_inside_the_post_spend_region(
     assert caught.value.retrieval_run_ids == (completed[0][0],)
 
 
+def test_a_fallback_ledger_failure_still_reports_what_the_fallback_cost(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2's blocking finding: the *fallback* half of the same post-spend region.
+
+    Round 1 closed the primary's case and left this one open, and the gap was structural
+    rather than an oversight: the error payload was built from the runs that were
+    **recorded**, while the thing it has to account for is the calls that were **billed** --
+    a strictly larger set whenever recording is what failed. The primary's instance had been
+    patched by hand (``or (primary_run_id,)``); the fallback's twin had not.
+
+    It is not a theoretical loss. Exa is the only provider in the tree that reports a
+    currency figure at all -- ``costDollars.total`` becomes ``cost_usd`` -- while
+    ``research/asknews.py`` records ``None`` on every run by design. So the run dropped here
+    was precisely the only priced one, and ``run_live`` accumulates exactly this figure to
+    decide whether ``run_limits.max_cost_usd`` has been reached. Understating it lets a
+    batch keep buying past a cap that real spend had already hit.
+
+    Both figures are asserted, not just the ids: a payload that names the run but reports no
+    cost would pass an id-only check and still understate the budget.
+    """
+    from whiskeyjack_bot.research import orchestrate as module
+
+    monkeypatch.setenv(config.retrieval.fallback.api_key_env, "fakeEXAkey1234567")
+    real = module._record
+
+    def failing_for_the_fallback(*args: Any, **kwargs: Any) -> Any:
+        if kwargs["run"].provider == "exa":
+            raise StoreError("could not complete the fallback run")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_record", failing_for_the_fallback)
+    with pytest.raises(PaidRetrievalError) as caught:
+        retrieve_for_question(
+            ledger,
+            config,
+            question=question(),
+            now=NOW,
+            news_client=_SDK(raises=RuntimeError("upstream said no")),
+            web_client=_web_client(_Exchange()),
+        )
+
+    opened = _rows(ledger, "SELECT retrieval_run_id FROM research_runs ORDER BY provider")
+    assert len(opened) == 2, "both providers were billed and both rows must exist"
+    assert set(caught.value.retrieval_run_ids) == {row[0] for row in opened}
+    assert caught.value.cost_usd == pytest.approx(0.01), (
+        "the fallback's known spend must survive its own recording failure"
+    )
+    assert caught.value.unpriced_calls == 1, "the unpriced primary is still one billed call"
+
+
 # --- the fallback: authorized only by decide_fallback ----------------------------------
 
 

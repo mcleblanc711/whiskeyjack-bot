@@ -6965,9 +6965,61 @@ really is reachable through a validated question, `derive_queries`' `if collapse
 really is a live defence, and the asymmetry between the two fields is now asserted rather than
 left to read as an oversight.
 
+### Round 2 — the remediation's own accounting gap, and the fourth false claim
+
+Round 1's finding closed and the reviewer confirmed it. Round 2 found the same hole's other
+half: a post-spend `StoreError` in the **fallback** pass lost the fallback's known spend and
+undercounted paid calls. `_fallback_pass` called `_record` with no guard, so the failure
+unwound into `retrieve_for_question`'s handler — which built the `PaidRetrievalError` payload
+out of `runs`, and `runs` holds only the runs `_record` already **completed**. The primary's
+instance of this had been patched by hand (`or (primary_run_id,)`, plus a `billed.extend(...)`
+gated on `not runs`); the fallback's twin had not, and the hand-patch is what disguised it.
+
+**The root cause is a set mismatch, and naming it that way is what produced the fix.** The
+payload was assembled from the runs that were *recorded* while the thing it must account for
+is the calls that were *billed* — a strictly larger set exactly when recording is what failed.
+So `_BilledCall` entries are now appended at the point of billing: the primary the moment
+`retrieve_news` returns, the fallback between `retrieve_web` returning and `_record` being
+asked to store it. The handler reports from that list and nothing else. Both special-cased
+branches are deleted, and `retrieval_run_ids is never empty` stops being a claim the code
+maintains in two places and becomes a property of where the first append sits.
+
+**It was a real loss, not a tidiness point, and the reason is one line of `exa.py`.**
+`research/exa.py` reads `costDollars.total` into `cost_usd`; `research/asknews.py` records
+`None` on every run by design. The fallback is therefore the *only* priced provider in the
+tree, so the run the old shape dropped was the only one that ever carries a number — and
+`run_live` accumulates precisely that number to decide whether `run_limits.max_cost_usd` has
+been reached. A batch could keep buying past a cap real money had already hit.
+
+**And a fourth docstring asserted the opposite of the code.** `PaidRetrievalError`'s own text
+said a fallback whose recording failed "contributes no figure, because its cost never reached
+this frame", excusing it as costing nothing "with both committed providers reporting no
+currency figure at all". The first clause described the defect as though it were a design; the
+second was flatly false and one `grep` from being checked. Round 1's entry above says *a prose
+guarantee is not a mechanism*; this is the same lesson landing on a docstring that was written
+to explain a fix, which is the more uncomfortable version of it. **A docstring that excuses a
+behaviour is worth more suspicion than one that promises one** — the promise gets tested, the
+excuse does not.
+
+### Rejected — widening the post-spend `except` to `OrchestrationError`
+
+Two totality backstops sit inside the post-spend region and would still reach the composer as
+the plain type, which it reads as "refused before any provider call, nothing was spent":
+`_opening_run`'s conversion and `ProviderRun.__post_init__`. So the module docstring's *"After
+the spend, nothing refuses"* is not literally true of them.
+
+Not done, and weighed rather than missed. Neither is reachable: the fallback's `_opening_run`
+validates a minted run id, the same `question_id` and the same already-normalized `now_utc`
+that just passed for the primary, and `ProviderRun.__post_init__` checks an invariant
+`persist_paid_run` establishes. Both exist so the functions are total, and this project's
+threat boundary is explicit that an unreachable condition is a backlog candidate rather than a
+blocker. Widening the clause would also make `PaidRetrievalError` — an `OrchestrationError`
+subclass — a type the region both raises and catches, which is a shape worth avoiding for a
+path that cannot fire. Recorded here so it is visible as a decision.
+
 ### Verification
 
-`tests/unit/test_research_orchestrate.py` (32), `tests/unit/test_pipeline_live.py` (29),
+`tests/unit/test_research_orchestrate.py` (33), `tests/unit/test_pipeline_live.py` (31),
 `tests/acceptance/test_live_run_acceptance.py` (13, of which 6 are import-graph guards) and
 `tests/property/test_orchestrate_properties.py` (6 properties over `derive_queries`).
 

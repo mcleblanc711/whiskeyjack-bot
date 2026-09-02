@@ -135,13 +135,26 @@ class PaidRetrievalError(OrchestrationError):
     rule asks for -- a caller handles the module's own error type -- and it is also the only
     place that still knows which runs were opened and what they cost.
 
-    ``retrieval_run_ids`` is never empty: the primary run row is opened before the first
-    billable call, so there is always at least one row that names this question and says
-    money was spent on it. ``cost_usd`` and ``unpriced_calls`` keep M1-303 round 3's
-    distinction -- ``None`` is *unknown, never free*. A fallback pass whose own recording
-    failed contributes no figure, because its cost never reached this frame; that is stated
-    rather than guessed at, and with both committed providers reporting no currency figure
-    at all it costs nothing today.
+    ``retrieval_run_ids`` is never empty: the primary call is registered as billed the
+    moment :func:`asknews.retrieve_news` returns, so there is always at least one entry that
+    names this question and says money was spent on it. ``cost_usd`` and ``unpriced_calls``
+    keep M1-303 round 3's distinction -- ``None`` is *unknown, never free*.
+
+    **Every billed call contributes its figure, including one whose own recording failed**,
+    and round 2 of this item's review is why that sentence is worth writing down. This
+    docstring used to claim the opposite -- that a fallback pass whose recording failed
+    "contributes no figure, because its cost never reached this frame", excused as costing
+    nothing because neither committed provider reported a currency figure. **The second half
+    was simply false.** ``research/exa.py`` reads ``costDollars.total`` and records it as
+    ``cost_usd``; ``research/asknews.py`` records ``None`` on every run by design. So the
+    fallback is the *only* priced provider in the tree, and the one run the old shape dropped
+    was the only one that ever carries a number -- which ``pipeline_live.run_live``
+    accumulates to decide whether ``run_limits.max_cost_usd`` has been reached.
+
+    What makes the figures right now is where they are collected rather than a wider
+    ``except``: :class:`_BilledCall` entries are appended at the point of billing, so the
+    payload is built from the calls that were *billed* rather than the runs that were
+    *recorded* -- a strictly larger set precisely when recording is what failed.
     """
 
     def __init__(
@@ -156,6 +169,27 @@ class PaidRetrievalError(OrchestrationError):
         self.retrieval_run_ids = retrieval_run_ids
         self.cost_usd = cost_usd
         self.unpriced_calls = unpriced_calls
+
+
+@dataclass(frozen=True)
+class _BilledCall:
+    """A call the money has already been spent on, recorded the instant it was spent.
+
+    This exists because :class:`ProviderRun` cannot serve the purpose: it describes a run as
+    it was **recorded**, so it comes into being only *after* :func:`_record` succeeds -- and
+    the failure this module has to account for is :func:`_record` itself refusing. Round 2
+    found the gap that follows from building the error payload out of the wrong set: a
+    fallback billed at ``costDollars.total`` and then lost to a transient ledger failure
+    reported no cost and no call, understating the batch's budget by the only figure in it.
+
+    So a call registers itself as billed between the provider returning and the ledger being
+    asked to record it. ``cost_usd`` is read from the adapter's own run, which is the same
+    figure :func:`_record` would publish -- :func:`store.with_retrieval_counts` overwrites
+    the two count columns and nothing else.
+    """
+
+    retrieval_run_id: str
+    cost_usd: float | None
 
 
 @dataclass(frozen=True)
@@ -408,6 +442,7 @@ def _fallback_pass(
     reasons: tuple[FallbackReason, ...],
     now_utc: datetime,
     injected: Any | None,
+    billed: list[_BilledCall],
 ) -> ProviderRun | None:
     """Run the Exa fallback, or report why it could not run. Never raises for that.
 
@@ -449,6 +484,10 @@ def _fallback_pass(
         # did not happen, which is exactly what an open row means.
         _LOGGER.warning("fallback retrieval refused the call, keeping the primary run: %s", exc)
         return None
+    # Billed. Registered before the ledger is asked to record it, because from here the
+    # ledger is the only thing left that can fail and the caller's payload must not depend
+    # on a `ProviderRun` that a failed `_record` never returns (round 2).
+    billed.append(_BilledCall(retrieval_run_id=run_id, cost_usd=retrieval.run.cost_usd))
     return _record(
         conn,
         config,
@@ -549,6 +588,14 @@ def retrieve_for_question(
         retrieval_run_id=primary_run_id,
         now=now_utc,
     )
+    # Billed. `retrieve_news` refuses a caller mistake before its own network use and reports
+    # a provider failure as `provider_failed` rather than raising, so reaching this line means
+    # the calls happened. Registering here, outside the block below, is what makes
+    # `PaidRetrievalError.retrieval_run_ids` non-empty by construction rather than by the
+    # `or (primary_run_id,)` fallback this replaces.
+    billed: list[_BilledCall] = [
+        _BilledCall(retrieval_run_id=primary_run_id, cost_usd=primary.run.cost_usd)
+    ]
     # The money is gone from here on, so the only remaining failure is the ledger's, and it
     # arrives as this module's own type carrying what was spent -- never as a raw
     # `StoreError` escaping into the composer, which is what round 1 found aborting the
@@ -592,6 +639,7 @@ def retrieve_for_question(
                 reasons=decision.reasons,
                 now_utc=now_utc,
                 injected=web_client,
+                billed=billed,
             )
             if fallback is not None:
                 runs.append(fallback)
@@ -605,18 +653,19 @@ def retrieve_for_question(
             else None
         )
     except StoreError as exc:
-        # `or (primary_run_id,)`: when the primary's own recording is what failed there is
-        # no completed run to name, but `open_run` above already put that row in the ledger
-        # and it names this question -- which is exactly what `004`'s ownership trigger
-        # requires of a cited run, and the only durable statement that this question cost
-        # money.
-        billed = [entry.cost_usd for entry in runs if entry.cost_usd is not None]
-        billed.extend(value for value in (primary.run.cost_usd,) if not runs and value is not None)
+        # Reported from `billed`, never from `runs`: a run reaches `runs` only once `_record`
+        # has succeeded, and `_record` refusing is the whole failure being reported. Each
+        # entry names a row `open_run` already put in the ledger against this question, which
+        # is what `004`'s ownership trigger requires of a cited run and the only durable
+        # statement that this question cost money. Round 2 found the two hand-written
+        # branches this replaces accounting for the primary and silently dropping the
+        # fallback -- the only call that ever carries a price.
+        priced = [call.cost_usd for call in billed if call.cost_usd is not None]
         raise PaidRetrievalError(
             str(exc),
-            retrieval_run_ids=tuple(entry.retrieval_run_id for entry in runs) or (primary_run_id,),
-            cost_usd=sum(billed) if billed else None,
-            unpriced_calls=(len(runs) or 1) - len(billed),
+            retrieval_run_ids=tuple(call.retrieval_run_id for call in billed),
+            cost_usd=sum(priced) if priced else None,
+            unpriced_calls=len(billed) - len(priced),
         ) from None
     return RetrievalOutcome(
         question_id=question_id,
