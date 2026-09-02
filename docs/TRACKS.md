@@ -40,10 +40,11 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-*(no live rows — board is clear. Swept `M1-315` (merged, PR #55, 2026-09-01) and `M1-608`
-(merged, PR #57, r1 approve) — both landed and their branches are gone from `origin`.
-`M1-314` (merged, PR #58, 2026-09-02) is swept too. `M2-709` is the last item on Lane 3's
-debt queue and is next to pull into a pane.)*
+| M2-709 | feat/m2-709-shared-artifact-writer | whiskeyjack-m2-709 | no | none | 2026-09-02 |
+*(Swept `M1-315` (merged, PR #55, 2026-09-01), `M1-608` (merged, PR #57, r1 approve) and
+`M1-314` (merged, PR #58, 2026-09-02). `M2-709` is the last item on Lane 3's debt queue —
+one atomic create-or-fail helper shared by `research/artifacts._write_new_file` and
+`submission_gateway._write_or_confirm`.)*
 
 ## Planned next wave
 
@@ -68,11 +69,10 @@ cheaper problem.** Take it.
 before this section was rewritten — zero open PRs, zero worktrees — the same state Wave
 Eight described at its own boundary.
 
-Lane 3's debt queue is **almost** finished. `M1-609` ran first, then `M2-710` (merged PR
+Lane 3's debt queue is on its last item. `M1-609` ran first, then `M2-710` (merged PR
 #54, 2026-09-01, round-1 approval), `M1-608` (merged PR #57, round-1 approve), and `M1-314`
-(merged PR #58, 2026-09-02). Only `M2-709` remains, one branch, size S, Low priority. Pull
-it into whichever pane frees first below, rather than opening a fifth worktree —
-`wj-layout`'s `max_panes` is 4 for a reason (see below).
+(merged PR #58, 2026-09-02). **`M2-709` is live as of 2026-09-02** — the worktree is set up
+but work has not started.
 
 Wave 9, three lanes, run concurrently. **Lane 1 is two stages**: `M1-506` must be *on
 master* before `M1-404`/`M1-405` start, because both of those register a checker into the
