@@ -434,6 +434,14 @@ is where the check lands. The gap is asserted as a test
 change closes it, that test fails and this note has to be updated, which is the point of
 pinning a known limitation instead of only describing one.
 
+> **Closed 2026-09-02 by M2-707.** The test above did exactly what it was written to do:
+> it failed the day the gap closed, and it is now
+> `test_only_the_payload_the_approval_authorized_gets_a_key`. D33 is **Superseded** by
+> **D34**; migration `011` adds `approval_events.payload_sha256` and
+> `submission_payload.py` is the forecast→payload mapping this note said did not exist.
+> See the M2-707 section at the end of this file. The paragraphs above are left as
+> written, because the code and reviews of that period cite them.
+
 ### Round 2 — an approval event is history, not a current state
 
 Round 2 closed all three round-1 findings and blocked on a defect in the gate round 1 had
@@ -716,6 +724,8 @@ from the caller instead. What *can* be checked is checked — the digest.
   reviewed code, which is its own item: **M2-709**, filed with the behavioural difference
   named so the shared version takes it as a parameter rather than picking one.
 - **No payload→approval binding.** Still D33 and **M2-707**; nothing here changes it.
+  *(Closed by M2-707, 2026-09-02 — gate 5 of `post_approved_forecast` now refuses a
+  payload the approval did not authorize. See D34.)*
 
 ### Standing risk — `-0.0`, and floats generally
 
@@ -2282,3 +2292,414 @@ they seed rows and previously could only do so from the narrow domain — and th
 behaviour is an equivalence between a Python function and a SQL trigger over a set of 32
 enumerated inputs, which is a table, not a distribution. A `hypothesis` strategy over the
 same 32 values would draw the same values with less of the file saying which ones and why.
+
+## M2-707 — Bind an approval to the submission payload it authorized
+
+Closes **D33**. Until this item an approval bound to `forecast_sha256` and stopped there, so
+one approved forecast covered *every* payload built from it: a payload that changed without
+the forecast changing got a new idempotency key (M2-702) and kept its old approval in force.
+M2-702 shipped the half it could — `submission_key_for_approved_record` refuses a record with
+no approval — and recorded why the other half could not be built: the forecast→payload
+mapping did not exist, so an operator asked to approve a payload hash would have been
+approving a value nothing in the tree could compute.
+
+M1-502 and M1-503 have since landed. This item builds the mapping
+(`submission_payload.py`), stores its digest on the approval (migration `011`), and compares
+it at the one seam every real post goes through. **D34** records the decision that replaced
+D33.
+
+What now happens, in the order it happens:
+
+1. `wj approve` records the decision through `approval.approve`, which reads the record,
+   derives the payload it authorizes and writes the decision bound to that digest, all in
+   one transaction; the command then **prints the payload and its digest**. A record that
+   derives no payload cannot be approved — the transaction rolls back and nothing is
+   written. (The derivation moved into `approve` at round 1; see the section at the end.)
+2. `wj reject` does none of that. A rejection authorizes nothing, and `011` forbids it a
+   payload hash.
+3. `wj submit` posts the payload the record derives when `--payload-file` is omitted, or
+   checks a supplied one against the approval and refuses it if it is not what was
+   authorized.
+4. `submission_key_for_approved_record` refuses any `request_payload_sha256` that is not the
+   stored one — above the reservation, far above the post — so a payload nobody reviewed
+   cannot reach a key, and without a key nothing downstream happens.
+
+### Decision — the digest lives on the approval row, not in a new table
+
+`010` added two tables because a reservation is a new fact with its own lifetime — claimed,
+then released or spent — that no existing row could carry. This is the opposite case. The
+payload hash is a property of one approval decision, fixed at the instant that decision is
+made and immutable for as long as the decision is; it has exactly the lifetime of the
+`approval_events` row and exactly its cardinality. A side table would add a join to every
+approval read in exchange for a row count that is always one, and would make "an approval
+with no payload binding" representable two different ways. `forecast_sha256` is already on
+this row for the same reasons.
+
+### Decision — required for `approved`, forbidden for `rejected`
+
+The obvious rule is "an approval authorizes a payload, a rejection does not". The
+load-bearing half is the second one, and it is not symmetry for its own sake: **the payload
+is derived**, and a numeric one runs the pinned SDK's CDF conversion, which can refuse a
+percentile set. Requiring a hash for every decision would make a record whose payload cannot
+be built impossible to *reject* — and rejecting is the one decision that must always be
+available, precisely for a record nobody can submit.
+
+Forbidding it on the other side is what makes the column unambiguous. A NULL then means
+exactly one thing per decision: on a rejection it is the only legal value, and on an approval
+it is a pre-`011` row and nothing else. That is what lets the submission gate refuse those
+rather than guess.
+
+### Decision — a pre-`011` approval is refused, not exempted
+
+`ALTER TABLE ... ADD COLUMN` cannot add `NOT NULL` without a default and no default is honest
+for a row nobody computed a payload for, so the column is nullable and old approvals survive
+the upgrade. They authorize no particular payload, so they get no submission key: the
+stricter reading, which costs a re-approval rather than a post nobody reviewed. Nothing in
+this tree is stranded by it — `submission.enabled` is committed `false` and M2-706 has never
+run — and the alternative would have made the one shape the binding exists to prevent the one
+shape that skips it.
+
+### Decision — the builder is its own module, and `approval.py` may not import it
+
+`submission.py` imports `approval`, so an approval module reaching a payload builder that
+imports `submission` would close an import cycle. `approve` therefore takes `payload_sha256`
+as a parameter rather than computing it, and `cli.py` — which already reaches the SDK, and
+already imports lazily inside its command functions — is the only importer.
+
+That division is safe in the direction that matters. A hash that is not the record's own
+fails **closed**: the payload an operator submits will not match it, at
+`submission_key_for_approved_record` and again at the derivation gate in
+`post_approved_forecast`. A wrong value costs a refused submission, never a wrong post.
+
+`submission_live.py` may not import it either, and for a different reason: that module
+states, and rests design on, *"nothing here imports `forecasting_tools`"* — a four-method
+poster protocol, no transport, no SDK import cost on the one live path. The numeric branch
+**is** `NumericDistribution`, via `forecast.cdf`. The derivation is established once, at
+approve time, and carried forward by the stored digest.
+
+### Decision — the payload is put through `plan_from_payload` before it is returned
+
+`_require_postable` is not a second rule. It is `submission_live`'s own — the complete account
+of what Metaculus accepts, which otherwise runs immediately before the post — moved in front
+of the human decision. An approval can then only ever bind to a payload that would actually be
+accepted, and an operator learns about a disagreement between the stored record and the
+current configuration *before* deciding rather than after.
+
+It is live rather than defensive, on two paths that the record model admits and Metaculus does
+not: the response schema's `Probability` is `[0.0, 1.0]` while Metaculus takes `[0.001,
+0.999]`, and the multiple-choice sum rule lives in `forecast/multiple_choice.py` rather than in
+the response model. `test_a_payload_metaculus_would_refuse_is_refused_here_instead` drives both.
+
+### Decision — `--payload-file` becomes optional, and that is the safe direction
+
+Now that an approval binds to a payload digest, the payload a record derives is the only one
+that can reach a post at all. Requiring an operator to hand-write it — a 201-point CDF, for a
+numeric question — would have made the command undrivable without making anything safer.
+Omitted, the command derives it. Supplied, it is checked against the approval and refused if
+it is not what was authorized, which is the acceptance criterion made reproducible from the
+command line rather than only from a test. Either way the digest is printed first, labelled
+`(derived)` or `(from file)`, and either way the gate is
+`submission_key_for_approved_record`. The command never decides that a payload is authorized;
+it only decides which one to offer.
+
+### Decision — one derivation, one rendering, one digest
+
+`AuthorizedPayload` carries the mapping, its exact canonical bytes and the digest of those
+bytes, and the three travel together. What an operator is shown, what an approval binds to and
+what is posted are then provably the same payload rather than three renderings of one object —
+the second-source-of-truth defect M2-703 removed a parameter to avoid. `_render` calls
+`submission_gateway.canonical_payload_json` and nothing else: the rule that "changing this
+rendering breaks replay and changes every idempotency key derived from a payload" only holds
+while there is one implementation of it, and this module was a new place it could have been
+quietly forked.
+
+### Deviation — the numeric payload depends on `numeric_calibration`
+
+A numeric payload is a *conversion* of the stored percentiles, not a copy of them, so changing
+`numeric_calibration` changes the payload a record derives and the approval stops binding.
+That is deliberate and it fails safe — the operator is asked to approve again rather than
+posting an array nobody reviewed — but it is a dependency the phrase "binds to the forecast"
+does not suggest, so it is named here and asserted in both directions:
+`test_changing_the_calibration_changes_the_payload_a_record_derives` checks that the numeric
+digest moves and that the binary and multiple-choice digests do **not**. Without that second
+half the test would pass against a builder that mixed the calibration into every digest,
+stranding two approvals for a setting neither payload depends on.
+
+### Rejected — binding at the gateway instead of at the ledger
+
+The check could have lived in `submission_live.post_approved_forecast`, comparing a derived
+payload against the one it was handed, leaving `approval_events` untouched and needing no
+migration. Rejected because it binds the wrong thing: it would compare a payload against a
+*derivation performed at submit time*, not against the payload a human actually reviewed. The
+two differ exactly when the configuration or the pinned SDK moved between the decision and the
+post, which is the case the binding exists for. An approval that authorizes something has to
+record what it authorized.
+
+### Rejected — a `NOT NULL` column via a table rebuild
+
+`011` could have rebuilt `approval_events` to make the column `NOT NULL` for approvals. Refused
+for `003`'s reason: the table is append-only and guarded by triggers, and a rebuild of it is
+the hazard `003`'s header exists to describe. The trigger carries the rule instead, which is
+also the only way to express "required for one decision and forbidden for the other" — a
+`NOT NULL` cannot say that.
+
+### Rejected — treating a NULL binding as satisfied
+
+Considered and refused above; recorded here because it is the change a future reader is most
+likely to propose as a convenience. It converts the single shape the binding exists to prevent
+into the single shape that skips it.
+
+### Rejected — deriving the payload inside `approve`
+
+The import cycle is the mechanical reason. The design reason is that it would put the pinned
+SDK, `forecast.cdf` and the calibration configuration behind every approval read — including
+`approval_history` and `effective_approval`, which are reporting calls with no business
+loading a forecasting package.
+
+### Deferred (do not read the absence as an omission)
+
+- **No re-derivation at submit time.** `submission_key_for_approved_record` compares digests;
+  it does not rebuild the payload and check that the stored digest is the one the record
+  *derives*. That is a question about canonical JSON, the SDK's CDF conversion and
+  `numeric_calibration`, none of which `submission.py` or the ledger can see, and adding it
+  there would re-import the SDK onto the dry-run path. The derivation is established once, at
+  approve time; a wrong digest fails closed.
+- **No migration of existing approvals.** There are none to migrate — `submission.enabled` is
+  committed `false` — and a migration that invented a payload hash for a decision nobody made
+  against a payload would be the exact fabrication this item exists to prevent.
+- **No `wj show-payload` command.** `approve` prints the payload and its digest before writing,
+  which is the acceptance criterion's *"an operator can see what a decision authorized"*, and
+  `submit` prints the digest before anything is posted. A third command that printed the same
+  derivation would be a third place for it to disagree.
+- **The four-line duplication between `_binary_payload` and `plan_from_payload`'s binary
+  branch.** They read the same wire key for different purposes — one builds, one validates —
+  and `_WIRE_KEY_FOR_TYPE` stays the single owner of the vocabulary, reached through
+  `plan_from_payload`. Merging them would mean a builder that imports the live path or a live
+  path that imports the builder, and both directions are refused above.
+
+### Standing risk — the derivation is only as stable as the pinned SDK
+
+`build_numeric_cdf` runs `forecasting-tools==0.2.92`'s `NumericDistribution`. If the pin moves
+and the conversion changes by one ULP, every numeric approval stops binding at once: the
+rebuilt payload hashes differently and `submit` refuses. That fails safe — a refused
+submission, never a wrong post — and it is the behaviour this item wants, but it is worth
+knowing that an SDK bump is also an approval-invalidating change, and that the symptom will be
+"submit refuses a payload the operator can see is right".
+
+Not fixable by normalizing the array: rounding inside a replay-critical hash rule changes what
+every future key means, and the CDF is the thing being attributed.
+
+### Standing risk — the approval prints a 201-float payload
+
+For a numeric question the `approve` command prints an 1,800-character JSON line. That is
+deliberate — the digest alone says two payloads differ, and the JSON is what says how — but it
+is not a thing a human reads carefully, and calling it "the operator saw what they approved"
+is a claim about a scroll-back buffer. Nothing about the binding depends on it: what binds is
+the digest, and what an operator can *check* is that the digest printed at approve time is the
+one printed at submit time. A rendering that a person could actually review (percentile table,
+diff against the previous version) is a real improvement and is not this item.
+
+### Round 2 — APPROVE, one non-blocking observation, filed as T-906
+
+Round 2 examined `69c8639`, closed R1-1, and raised no blocking finding. It reported one
+non-blocking observation and it is a real one:
+`test_two_records_share_a_digest_exactly_when_they_derive_one_payload` draws two records
+independently and then assumes both build, so the surviving fraction is roughly the square of
+the single-record build rate and hypothesis's `filter_too_much` health check can fire. The
+reviewer reproduced it once in a focused run; it did not reproduce in three consecutive local
+runs of that module or in the full suite.
+
+Filed as **T-906** rather than fixed here, and the row says why the obvious fix is the wrong
+one: a property whose examples are mostly filtered is also mostly *vacuous*, so suppressing the
+health check would hide the defect the flake is pointing at. The property itself is right and
+is load-bearing — it is what rules out D33 reopening under a new name.
+
+### Found in passing — `scripts/gate.sh` exits 0 on a failed gate (**T-905**, already filed)
+
+Not this item's code and not fixed here. It was filed on this branch as a new row, `M0-009`,
+and that was a mistake: **T-905 already carries it**, filed off M1-315's round-1 remediation
+and merged to master before this branch opened. The duplicate row has been removed and the one
+fact it added — that the defect reproduces on three separate failing runs across two different
+gates, not only the one it was found with — folded into T-905's description. Two rows for one
+defect is how a backlog stops being the single source `CLAUDE.md` says it is.
+
+`run_gate()` captures its status with `status=$?` placed *after* an `if cmd; then ...; fi`
+compound. Bash sets `$?` to 0 for the compound when the condition is false and there is no
+`else`, so `status` is 0 and `exit "$status"` exits 0. The script prints `FAIL`, prints the
+output tail, prints "the remaining gates were not run" — and reports success to anything
+reading its exit code. Confirmed by execution on three separate failing runs during this item
+(a `ruff format` failure, then two `pytest` failures).
+
+**`scripts/review-request.py` is not affected.** It reads `subprocess.run().returncode`
+directly, so no review request has ever claimed a gate that did not pass, and the gate block
+in *this* item's request means what it says. The exposure is the inner loop and any wrapper
+that shells out to `gate.sh` and trusts the code.
+
+Left for its own branch because a workflow change is its own track (CLAUDE.md), and a `chore/`
+branch is where CI's `backlog-status` job skips it. Every gate verdict quoted in these notes
+was read from the script's **last line** rather than its exit status.
+
+### On the mutation pass
+
+Every new assertion was re-run against a deliberately broken tree, one mutation at a time,
+with `__pycache__` cleared between runs (a same-size same-second edit is otherwise served back
+from stale bytecode — `docs/LESSONS.md`). Sixteen mutations, all killed; the two that
+initially **survived** are the ones worth recording, because each was a real hole in the tests
+rather than a redundant guard:
+
+- **`lifecycle._require_payload_digest` neutered on the approval side** — every test still
+  passed. The validator restates `011`'s rule, so with it removed the trigger refuses the row,
+  the `sqlite3.IntegrityError` is wrapped as a `LifecycleError`, and a test asserting only the
+  *type* cannot tell the difference. What is actually lost is the field-level message. Four
+  tests were added asserting the message, and the two trigger clauses were separately covered
+  by raw-SQL inserts — the only way to reach a shape no writer can produce.
+- **`approval._stored_sha256` neutered** — nothing failed, because `011` makes a malformed
+  stored digest unwritable. Reached the way this file's other corrupt-ledger tests are, by
+  dropping the append-only block and rewriting the column, and asserted on both the refusal
+  and the fact that it does not reprint the value.
+
+A third mutation is recorded for what it *disproved*: replacing every `from None` in
+`submission_payload.py` with `from exc` left the leak-search property green. The layers
+underneath — `forecast/cdf.py` and `submission_live.py` — sanitize their own messages first, so
+a traceback search here is really a test of *their* hygiene. The rule this module is asked to
+keep is that nothing chains through it at all, so that is now asserted structurally
+(`__cause__ is None`, and `__context__ is None or __suppress_context__`) in the unit test and
+on every refusal the property pass sees.
+
+### On the property pass
+
+`tests/property/test_submission_payload_properties.py` covers the four CLAUDE.md invariants
+plus the one this item rests on:
+
+- **Injectivity, in both directions.** Two records share a digest exactly when they derive one
+  payload. If different payloads could share a digest, an approval of the first would authorize
+  a post of the second — D33 reopened under a new name; and if identical payloads could
+  disagree, an approval would stop binding to a forecast whose payload never changed.
+- **Replay-stability across the persisted form.** The digest is taken at approve time against
+  an object in memory and compared at submit time against a record rebuilt from `record_json`.
+- **Nothing escapes as anything but `PayloadBuildError`**, over validated records and over
+  arbitrary objects in both parameter positions.
+- **Every refusal is one of this module's own messages**, closed against imported constants
+  rather than transcribed strings, so a reworded message is a red build rather than a property
+  that silently stops closing the set it claims to close.
+- **Every built payload is one `plan_from_payload` accepts.**
+
+Two things about the strategies are worth recording. The numeric one was first written as free
+floats and was the wrong shape: an unsorted percentile set is refused by the conversion long
+before this module's own branches run, so almost every example spent itself on one refusal and
+the calibration property reached its comparison about 4% of the time. It now builds a spread of
+strictly increasing values and *breaks* it in a drawn, tagged way; the comparison is reached in
+about two thirds of examples. And the text pools are narrowed from `HOSTILE_TEXT` to
+`ENCODABLE_TEXT`, because pydantic refuses a lone surrogate at the question boundary — so no
+`ForecastRecord` can carry one in a title or an option label. That narrowing is asserted rather
+than assumed (`test_a_lone_surrogate_cannot_reach_this_module_at_all`), since
+`content_sha256`'s open surrogate defect makes "can a surrogate reach this?" a question worth
+an answer.
+
+`tests/property/test_lifecycle_properties.py` gained it too, and the interesting part is the
+strategy: `payload_sha256` is the one parameter for which **both** `None` and a well-formed
+digest are legal answers, because which one is legal depends on the decision. Drawing hostile
+values alone would have meant the writer's success path was never reached, so the strategy
+draws `None`, a valid digest and `ANYTHING`. The no-leak fuzz gained it as a fifth field for
+the same reason it lists the other four: it is one more place a planted value could be
+reprinted.
+
+`tests/property/test_approval_properties.py` gained the new field: the decider and the field to
+fuzz are drawn together, because the extra parameter is `approve`'s alone and drawing them
+independently would spend half the examples on a `TypeError` that proves nothing. **Round 1
+changed which parameter that is** — `calibration`, not `payload_sha256` — and with it what the
+sibling property can claim; see the round-1 section below.
+
+### Round 1 — `approve` derives the digest; it does not accept one
+
+The review found one blocking defect, and it was the item's own acceptance criterion:
+
+> `approval.approve` can bind an approval to an arbitrary payload digest, allowing a
+> non-derived payload to post.
+
+The first cut took `payload_sha256` as a parameter, on the argument that `approve` could not
+reach `submission_payload` without closing an import cycle (`submission` imports `approval`),
+and that a wrong value was harmless because it would fail closed downstream — at
+`submission_key_for_approved_record` and again at `post_approved_forecast`'s derivation gate.
+
+**The second half of that argument was wrong.** Both gates compare *the payload being
+submitted* against *the stored digest*. Nothing compared the stored digest against the record.
+So a caller who passed the digest of some other payload and then submitted that same payload
+satisfied every gate, and the column recorded an arbitrary asserted binding rather than the
+payload the record derives. A criterion about what a record *derives* cannot be established by
+a value the caller chooses; the comparison is only ever as strong as the derivation that
+produced the value it compares against.
+
+The fix is that `approve` reads the record and derives the payload itself, **inside the same
+transaction that writes the decision** — the same reason the stored-hash read is in there: a
+payload derived outside it would be built from a record another writer could have appended a
+version to before the decision landed. `payload_sha256` is gone from the signature and
+`calibration` takes its place, which is the one input the derivation needs beyond the record.
+
+Three consequences worth recording:
+
+- **The import cycle is real and is broken by deferral, not by architecture.** Both imports in
+  `_derive_authorized_payload` are function-local. `from __future__ import annotations` makes
+  the two type-only imports free as well. The second effect is worth as much as the first: the
+  pinned SDK and the forecasting stack stay off the import path of `approval_history` and
+  `effective_approval`, which are reporting calls with no business loading a forecasting
+  package.
+- **`approve` returns `RecordedApproval` — the decision *and* what it authorized.** A caller
+  that re-derived in order to print would be showing the operator a second run of a function
+  and calling its agreement with the stored value a guarantee. `reject` keeps returning a bare
+  `ApprovalRecord`, and the asymmetry is the design: a rejection authorizes nothing, so it has
+  nothing to carry.
+- **A record that cannot be read, or that derives no payload, cannot be approved.** Both
+  arrive as `ApprovalError`, both with `from None`. That is the intended reading rather than a
+  side effect — an approval authorizes exactly one payload, so a record that derives none has
+  nothing to authorize — and it leaves `reject` untouched, which is what keeps an unsubmittable
+  record decidable.
+
+#### What the tests now pin, and the mutant that proved it
+
+The properties that fuzzed `payload_sha256` were properties about an argument that no longer
+exists. `test_only_a_well_formed_digest_ever_binds_a_payload` became
+**`test_the_digest_bound_is_the_one_the_record_derives`**: whatever the caller passes for the
+one input that is still theirs, an accepted approval stores the digest the record derives, read
+back through the public builder against the record read back out of the ledger.
+`tests/unit/test_approval.py` gained the unit-level counterpart with the second half the
+property cannot state cheaply — a *different* forecast derives a *different* digest, so "the
+record's own" is not a property every digest happens to satisfy.
+
+The strategy needed the same correction M2-707's first pass needed for `payload_sha256`: the
+legal value for `calibration` is a `NumericCalibrationConfig` and nothing else, so a strategy
+that could never draw one would leave every calibration example refused — and "refused" is not
+a claim about the accepted path. `CALIBRATION` is now a member of `ANYTHING`.
+
+Mutating the writer to store a constant digest instead of `authorized.sha256` is refused by
+five tests across three files (two unit, two property, one payload-module integration). The
+mutation was run against a pristine copy restored afterwards, with `__pycache__` cleared first.
+
+#### The test-fixture change this forced, and why it is not scope creep
+
+`approve` now reads the record back, so **a fixture that seeded the `'{}'` placeholder row can
+no longer approve anything**. Four test modules seeded exactly that, past `forecast.store`,
+from before M1-602's writer existed. They now write a real `ForecastRecord` through a new
+shared helper, `tests/unit/records.py`, whose columns come from `store._projection` — imported
+rather than transcribed, so a column added to `forecast_records` cannot leave the helper
+writing a row `read_forecast_record` then refuses.
+
+Two seeders survive as raw inserts, in `tests/unit/test_submission.py`, and deliberately: they
+write `forecast_records` rows holding a value of the wrong *storage class*, which is reachable
+only on a ledger written before the migration that started refusing it and upgraded afterwards.
+A validated record can never carry one, so those rows cannot come from the record writer.
+
+The knock-on is that a test can no longer *choose* a record's `forecast_sha256` or its payload
+digest: both are derived from the record's content, so the modules compute them from the same
+builder (`record_sha256(build_record(...))`, `payload_sha256_for_record(...)`) instead of
+declaring `"b" * 64`. Where a constant survives — `OTHER_SHA`, `OTHER_PAYLOAD_SHA` — its job is
+to be a well-formed digest that is *not* the record's, and that job is unchanged.
+
+#### Non-blocking observation, not taken
+
+The review noted that a stateful custom `Mapping` could render differently between the binding
+gate and the gateway call, and scoped it out itself: it requires a hostile or deliberately
+stateful caller-supplied mapping, which is outside CLAUDE.md's threat boundary (the operator
+and their machine are non-malicious). `AuthorizedPayload` already carries the mapping, its
+exact canonical bytes and their digest together, so every path that derives a payload here
+hashes the bytes it posts. No change.

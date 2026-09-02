@@ -275,6 +275,10 @@ def test_the_stored_hash_is_what_an_approval_binds_to(conn: sqlite3.Connection) 
         decision="approved",
         actor="owner",
         forecast_sha256=record_sha256(record),
+        # M2-707: `011` requires it. Shape only -- this test is about the *forecast* hash
+        # being what an approval binds to, and `test_submission_payload.py` is where the
+        # derived digest is checked against a real payload.
+        payload_sha256="d" * 64,
         occurred_at=GENERATED_AT,
     )
     assert current_status(conn, record.record_id) == "approved"

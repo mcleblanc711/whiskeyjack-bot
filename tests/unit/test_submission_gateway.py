@@ -57,14 +57,22 @@ from whiskeyjack_bot.submission_gateway import (
     write_dry_run_artifact,
 )
 
+from tests.unit.records import CALIBRATION, seed_record
+
 TS = "2026-08-22T00:00:00.000000+00:00"
 FIXED = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
 OCCURRED = datetime(2026, 8, 22, 13, 0, tzinfo=timezone.utc)
-SHA = "b" * 64
 
 ATTEMPT_ID_RE = re.compile(r"^wjdry-1-[0-9a-f]{64}\Z")
 
 PAYLOAD: dict[str, Any] = {"probability_yes": 0.37, "comment": "none"}
+# The digest the receipts under test carry as `request_payload_sha256`. It is *not* what
+# the approvals here authorize: since M2-707 round 1 `approve` derives that from the record
+# and no caller supplies it. Nothing in this module goes through
+# `submission_key_for_approved_record`, which is the one seam that compares the two --
+# these tests drive `submission_key` directly, and what they need from an approval is a
+# record at `approved`.
+PAYLOAD_SHA = payload_sha256(PAYLOAD)
 
 
 def _key(payload: dict[str, Any] | None = None, *, question_id: int = 100) -> str:
@@ -317,26 +325,23 @@ def test_a_dry_run_touches_no_httpx_entry_point(
 def _seed_draft(
     conn: sqlite3.Connection, record_id: str = "rec-1", *, question_id: int = 100
 ) -> str:
-    """Insert a draft directly: M1-602's record writer does not exist yet.
+    """Insert a real draft record under a fixed identifier.
 
     `001` declares UNIQUE (question_id, tournament_id, forecast_version), so a second
     record needs its own question rather than a second version of the same one.
+
+    It writes a genuine `ForecastRecord` since M2-707 round 1: the approvals below go
+    through `approve`, which now reads the record back and derives the payload it
+    authorizes, so a `'{}'` placeholder row would be unapprovable. Nothing here reads the
+    record's *content* -- what these tests need from it is a record that can reach
+    `approved`.
     """
     conn.execute(
         "INSERT OR IGNORE INTO research_runs (retrieval_run_id, provider, question_id, "
         "started_at_utc, created_at_utc) VALUES ('run-1', 'asknews', 100, ?, ?)",
         (TS, TS),
     )
-    conn.execute(
-        "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
-        "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
-        "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
-        "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
-        "'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (record_id, question_id, TS, TS, SHA, f"att-{record_id}"),
-    )
+    seed_record(conn, record_id=record_id, question_id=question_id, created_at_utc=TS)
     return record_id
 
 
@@ -385,7 +390,7 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
     """Without it, a dry-run receipt's (False, False) is `submission_failed` -> terminal
     `failed`: a rehearsal would permanently kill the forecast version it rehearsed."""
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
-    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
     receipt = _gateway().submit(_request())
     with pytest.raises(GatewayError):
         record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
@@ -427,7 +432,7 @@ def test_a_live_receipt_is_recorded_against_the_record_it_names(
     """The bound on every identifier is checked by the writer, not by importing its
     private constant -- which would test the constant, not the writer (M1-303)."""
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
-    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
     receipt = _live()
     event = record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     assert event.event_type == "submitted"
@@ -457,7 +462,13 @@ def test_a_receipt_cannot_be_recorded_against_a_different_record(
     _seed_draft(ledger, "rec-2", question_id=101)
     for record_id in ("rec-1", "rec-2"):
         record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
-        approve(ledger, record_id=record_id, actor="owner", occurred_at=OCCURRED)
+        approve(
+            ledger,
+            record_id=record_id,
+            actor="owner",
+            occurred_at=OCCURRED,
+            calibration=CALIBRATION,
+        )
 
     record_receipt(ledger, receipt=_live("rec-1"), occurred_at=OCCURRED)
 
@@ -475,7 +486,7 @@ def test_the_recorded_row_drops_what_submission_attempts_has_no_column_for(
     ledger: sqlite3.Connection,
 ) -> None:
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
-    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED)
+    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
     receipt = replace(_live(), artifact_path="submissions/dry_run/x.json")
     record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
     columns = {
@@ -530,7 +541,13 @@ def test_a_spent_idempotency_key_arrives_as_this_modules_error(
     _seed_draft(ledger, "rec-2", question_id=101)
     for record_id in ("rec-1", "rec-2"):
         record_validation(ledger, record_id=record_id, occurred_at=OCCURRED)
-        approve(ledger, record_id=record_id, actor="owner", occurred_at=OCCURRED)
+        approve(
+            ledger,
+            record_id=record_id,
+            actor="owner",
+            occurred_at=OCCURRED,
+            calibration=CALIBRATION,
+        )
 
     record_receipt(ledger, receipt=_live("rec-1", "att-live-1"), occurred_at=OCCURRED)
     # Same key -- `_request()` derives it from the same payload -- against another record.
