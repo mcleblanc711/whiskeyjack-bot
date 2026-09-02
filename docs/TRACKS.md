@@ -40,10 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-*(no live rows — board is clear. Swept `M1-315` (merged, PR #55, 2026-09-01) and `M1-608`
-(merged, PR #57, r1 approve) — both landed and their branches are gone from `origin`.
-`M1-314` (merged, PR #58, 2026-09-02) is swept too. `M2-709` is the last item on Lane 3's
-debt queue and is next to pull into a pane.)*
+| M1-514 | feat/m1-514-wall-clock-bound | whiskeyjack-m1-514 | no | none | 2026-09-02 |
 
 ## Planned next wave
 
