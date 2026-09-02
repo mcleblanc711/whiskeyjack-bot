@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from whiskeyjack_bot.config import AppConfig
     from whiskeyjack_bot.lifecycle import ApprovalDecision
+    from whiskeyjack_bot.submission_payload import AuthorizedPayload
 
 # A command that refused to act: an unusable ledger, an unknown record, an illegal
 # transition, or a hash the operator supplied that the record does not store (M2-701).
@@ -104,11 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--record-id", required=True, help="the approved forecast record to post")
     submit.add_argument(
         "--payload-file",
-        required=True,
         type=Path,
         help=(
             "JSON file holding the Metaculus request payload: question_type plus one of "
-            "probability_yes / continuous_cdf / probability_yes_per_category"
+            "probability_yes / continuous_cdf / probability_yes_per_category. Optional "
+            "since M2-707: omit it and the payload the record derives is used, which is "
+            "the only payload the approval authorizes anyway. Supply one to check a "
+            "payload against that approval without posting anything it did not cover"
         ),
     )
 
@@ -358,9 +361,26 @@ def _run_questions_fetch(args: argparse.Namespace) -> int:
 def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
     """Record one approval decision against a stored forecast record (M2-701).
 
-    Prints what is being decided on -- identity, derived status and the content hash --
-    *before* writing, because an approval that binds to a hash the operator never saw is
-    an attribution claim with nothing behind it.
+    Prints identity, derived status and the content hash before writing, and -- since
+    M2-707 -- **the payload the decision authorized and its digest** immediately after,
+    which is the acceptance criterion's "an operator can see what a decision authorized".
+    It is printed in full rather than summarized: the digest alone says two payloads
+    differ, and the JSON says how.
+
+    **The payload line comes after the write, and that is the M2-707 round-1 fix showing
+    through.** :func:`approval.approve` now derives the payload itself, inside the
+    transaction that writes the decision, because a digest the *caller* chose cannot
+    establish a claim about what the record derives. So this command has nothing to print
+    until the decision exists -- and what it prints is the derivation that was stored,
+    rather than a second run of the same function whose agreement with the stored one it
+    would then be asserting. A build failure refuses the whole command and writes nothing
+    (the transaction rolls back), so a numeric record whose percentiles no longer convert
+    still cannot be approved.
+
+    ``reject`` skips every line of that. A rejection authorizes nothing, and a record whose
+    payload cannot be built must still be rejectable -- which is why ``011`` requires the
+    digest for one decision and forbids it for the other, and why ``reject`` takes no
+    ``calibration``.
 
     Nothing here contacts Metaculus. Approval and submission are separate commands (D23),
     and the gateway is M2-703/M2-704.
@@ -400,16 +420,34 @@ def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
         print(f"status:    {summary.status}")
         print(f"hash:      {summary.forecast_sha256 or '(none stored)'}")
 
-        writer = approve if decision == "approved" else reject
         try:
-            recorded = writer(
-                connection,
-                record_id=args.record_id,
-                actor=args.actor,
-                occurred_at=datetime.now(tz=timezone.utc),
-                note=args.note,
-                expected_sha256=args.forecast_sha256,
-            )
+            if decision == "approved":
+                # `approve` derives the payload itself, inside the transaction that writes
+                # the decision (M2-707 round 1), so what is printed below is the derivation
+                # that was *stored* rather than a second run of the same function. The
+                # command no longer derives one to show first: it could only have shown a
+                # value it then asked another function to reproduce.
+                approved = approve(
+                    connection,
+                    record_id=args.record_id,
+                    actor=args.actor,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    calibration=config.numeric_calibration,
+                    note=args.note,
+                    expected_sha256=args.forecast_sha256,
+                )
+                recorded = approved.decision
+                print(f"payload:   sha256 {approved.authorized.sha256}")
+                print(f"           {approved.authorized.canonical}")
+            else:
+                recorded = reject(
+                    connection,
+                    record_id=args.record_id,
+                    actor=args.actor,
+                    occurred_at=datetime.now(tz=timezone.utc),
+                    note=args.note,
+                    expected_sha256=args.forecast_sha256,
+                )
         except ApprovalError as exc:
             print(f"refused: {exc}")
             return EXIT_REFUSED
@@ -422,6 +460,46 @@ def _run_approval(args: argparse.Namespace, decision: ApprovalDecision) -> int:
         connection.close()
 
 
+def _derive_payload(
+    connection: sqlite3.Connection, record_id: str, config: AppConfig
+) -> AuthorizedPayload | None:
+    """Return the payload a record derives -- mapping, bytes and digest -- or ``None``.
+
+    Used by ``submit`` alone, to fill in an omitted ``--payload-file``. ``approve`` used to
+    share it and no longer does: :func:`approval.approve` derives its own payload inside
+    the transaction that writes the decision (M2-707 round 1), because a digest a caller
+    chose cannot establish what a record derives. The two paths therefore call the same
+    ``authorized_payload`` on the same record and cannot disagree -- the function is
+    deterministic in ``(record, calibration)`` -- but ``submit``'s result is a *proposal*
+    checked against the stored digest at the key seam, while ``approve``'s is the stored
+    digest.
+
+    All three fields travel together because the printed JSON, the compared digest and the
+    posted mapping have to be the same payload;
+    :class:`~submission_payload.AuthorizedPayload` renders once and digests that rendering,
+    so they are the same bytes rather than three dumps of one object.
+
+    Refusals print and return ``None`` rather than raising, matching every other refusal in
+    this module. Nothing about the payload's *content* is echoed: ``PayloadBuildError``'s
+    messages name fields and rules, never values.
+    """
+    from whiskeyjack_bot.forecast.record import ForecastRecordError
+    from whiskeyjack_bot.forecast.store import read_forecast_record
+    from whiskeyjack_bot.submission import SubmissionError
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    try:
+        record = read_forecast_record(connection, record_id)
+    except ForecastRecordError as exc:
+        print(f"refused: {exc}")
+        return None
+    try:
+        return authorized_payload(record, calibration=config.numeric_calibration)
+    except SubmissionError as exc:
+        print(f"refused: {exc}")
+        return None
+
+
 def _run_submit(args: argparse.Namespace) -> int:
     """Post one approved forecast, and print what was recorded (M2-704).
 
@@ -432,9 +510,18 @@ def _run_submit(args: argparse.Namespace) -> int:
     is here for the same reason -- a submission whose payload the operator never saw
     described is an attribution claim with nothing behind it.
 
-    ``--payload-file`` rather than a built payload because there is no payload builder:
-    M1-502/M1-503 are ``Not Started``. M2-703's notes anticipated exactly this and said the
-    file argument lands here.
+    **``--payload-file`` is optional since M2-707**, and the asymmetry is the point. Omit
+    it and the payload the record derives is used -- which, now that an approval binds to a
+    payload digest, is the only payload that can reach a post anyway; requiring an operator
+    to hand-write a 201-point CDF that hashes identically would have made the command
+    undrivable for numeric questions. Supply one and it is checked against that approval and
+    refused if it is not what was authorized, which is the acceptance criterion's *"a
+    submission payload that does not derive from the approved forecast is refused before any
+    post"* made reproducible from the command line rather than only from a test.
+
+    Either way the digest is printed before anything else happens, and either way the gate
+    is :func:`submission.submission_key_for_approved_record`. This command never decides
+    that a payload is authorized; it only decides which one to offer.
 
     Every refusal is ``EXIT_REFUSED`` and prints why. A refusal from
     :func:`submission_live.post_approved_forecast` means nothing was posted -- every gate
@@ -468,9 +555,14 @@ def _run_submit(args: argparse.Namespace) -> int:
         return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
     configure_logging(config)
 
-    payload = _read_payload_file(args.payload_file)
-    if payload is None:
-        return EXIT_REFUSED
+    # Read before the ledger is opened, because a caller mistake should be refused without
+    # a read -- M1-303 round 4's rule, already applied to every other argument here. The
+    # *derived* payload cannot follow it: deriving one needs the record.
+    supplied: dict[str, object] | None = None
+    if args.payload_file is not None:
+        supplied = _read_payload_file(args.payload_file)
+        if supplied is None:
+            return EXIT_REFUSED
 
     connection = _open_existing_ledger(config.storage.sqlite_path)
     if connection is None:
@@ -488,12 +580,20 @@ def _run_submit(args: argparse.Namespace) -> int:
         )
         print(f"status:    {summary.status}")
         print(f"hash:      {summary.forecast_sha256 or '(none stored)'}")
-        try:
-            digest = payload_sha256(payload)
-        except SubmissionError as exc:
-            print(f"refused: {exc}")
-            return EXIT_REFUSED
-        print(f"payload:   sha256 {digest}")
+        if supplied is None:
+            derived = _derive_payload(connection, args.record_id, config)
+            if derived is None:
+                return EXIT_REFUSED
+            payload, digest, source = derived.payload, derived.sha256, "derived"
+        else:
+            payload = supplied
+            source = "from file"
+            try:
+                digest = payload_sha256(payload)
+            except SubmissionError as exc:
+                print(f"refused: {exc}")
+                return EXIT_REFUSED
+        print(f"payload:   sha256 {digest} ({source})")
 
         # Before the poster, because constructing one reads METACULUS_TOKEN: an operator
         # running this against the committed configuration should be told that submission

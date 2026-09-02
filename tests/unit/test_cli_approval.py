@@ -9,6 +9,7 @@ themselves are `tests/unit/test_approval.py`.
 from __future__ import annotations
 
 import copy
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +22,24 @@ from whiskeyjack_bot.env_verify import EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import current_status, record_validation
 
+from tests.unit.test_submission_live import (  # noqa: F401 - helpers reused deliberately
+    BINARY_PAYLOAD,
+    QUESTION_ID,
+    RUN_ID,
+    TIMESTAMP,
+    _draft,
+    _generation,
+    _response,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 TS = "2026-08-19T00:00:00.000000+00:00"
 OCCURRED = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
-SHA = "b" * 64
+# A hash no seeded record stores, used only as the `--forecast-sha256` an operator got
+# wrong. Every hash a record actually holds is now derived from the record (see
+# `_seed_ledger`), because M2-707 made `approve` read `record_json` rather than only the
+# `forecast_sha256` column -- a `'{}'` placeholder no longer reaches a decision.
 OTHER_SHA = "c" * 64
 RECORD_ID = "rec-1"
 
@@ -55,29 +69,64 @@ def _ledger_path(config_file: Path) -> Path:
     return Path(data["storage"]["sqlite_path"])
 
 
-def _seed_ledger(path: Path, forecast_sha256: str) -> None:
-    """A ledger holding one record at `validated`, bound to `forecast_sha256`."""
+def _seed_ledger(
+    path: Path, *, attempt_id: str = "attempt-1", probability: float | None = None
+) -> str:
+    """A ledger holding one real record at `validated`, under `RECORD_ID`. Returns its hash.
+
+    **The row is a genuine `ForecastRecord` now, and M2-707 is why.** `approve` derives the
+    submission payload the decision authorizes from `record_json`, so the `'{}'` placeholder
+    this seeder used to write refuses the whole command -- correctly, since a record nothing
+    can read is a record nothing can be approved to submit.
+
+    Built by hand rather than by `store.append_forecast_version` because these tests address
+    the record by a fixed identifier on the command line and the writer mints a UUID. The
+    column values come from `store._projection`, imported rather than transcribed, so a
+    column added to `forecast_records` cannot leave this seeder writing a row
+    `read_forecast_record` then refuses -- which is the failure it exists to avoid.
+
+    `attempt_id` is the knob for producing a *different* record: it is part of the hashed
+    content, so two ledgers seeded with different values hold two distinguishable hashes.
+
+    `probability` is the knob for a record whose payload cannot be *built*. The response
+    schema admits `[0.0, 1.0]` and Metaculus accepts `[0.001, 0.999]`, so a probability in
+    the gap is a record the pipeline can legitimately hold and no approval can bind to --
+    see `test_a_record_with_no_buildable_payload_cannot_be_approved_but_can_be_rejected`.
+    """
+    from whiskeyjack_bot.forecast.record import ForecastRecord
+    from whiskeyjack_bot.forecast.store import _projection
+
+    if probability is None:
+        draft = _draft(attempt_id)
+    else:
+        draft = _draft(
+            attempt_id,
+            generation=_generation(
+                forecast=_response(final_prediction={"probability_yes": probability})
+            ),
+        )
+    record = ForecastRecord(
+        **draft.model_dump(), record_id=RECORD_ID, forecast_version=1, parent_record_id=None
+    )
+    projected = _projection(record)
     initialize_ledger(path)
     conn = connect(path)
     try:
         conn.execute(
             "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
-            "started_at_utc, created_at_utc) VALUES ('run-1', 'asknews', 100, ?, ?)",
-            (TS, TS),
+            "started_at_utc, created_at_utc) VALUES (?, 'exa', ?, ?, ?)",
+            (RUN_ID, QUESTION_ID, TIMESTAMP, TIMESTAMP),
         )
+        columns = ", ".join((*projected, "status", "created_at_utc"))
+        placeholders = ", ".join("?" for _ in range(len(projected) + 2))
         conn.execute(
-            "INSERT INTO forecast_records ("
-            "record_id, question_id, tournament_id, forecast_version, question_type, status, "
-            "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
-            "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
-            "forecast_sha256, attempt_id) "
-            "VALUES (?, 100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
-            "'abc', 'run-1', ?, '{}', '{}', ?, ?, 'att-rec-1')",
-            (RECORD_ID, TS, TS, forecast_sha256),
+            f"INSERT INTO forecast_records ({columns}) VALUES ({placeholders})",
+            (*projected.values(), "draft", TS),
         )
         record_validation(conn, record_id=RECORD_ID, occurred_at=OCCURRED)
     finally:
         conn.close()
+    return str(projected["forecast_sha256"])
 
 
 def _isolated_approval_count(path: Path) -> int:
@@ -100,8 +149,24 @@ def _isolated_approval_count(path: Path) -> int:
 @pytest.fixture()
 def seeded(config_file: Path) -> Path:
     """A ledger at the configured path holding one record at `validated`."""
-    _seed_ledger(_ledger_path(config_file), SHA)
+    _seed_ledger(_ledger_path(config_file))
     return config_file
+
+
+def _stored_hash(config_file: Path) -> str:
+    """The hash the seeded record actually stores -- what a decision binds to.
+
+    Read back from the ledger rather than kept as a module constant, because it is now
+    derived from the record's content and a literal would be a second spelling of it.
+    """
+    conn = sqlite3.connect(_ledger_path(config_file))
+    try:
+        row = conn.execute(
+            "SELECT forecast_sha256 FROM forecast_records WHERE record_id = ?", (RECORD_ID,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return str(row[0])
 
 
 def _status(config_file: Path) -> str:
@@ -143,9 +208,53 @@ def test_approve_records_the_decision_and_prints_what_it_bound_to(
     assert RECORD_ID in out
     assert "minibench" in out
     assert "status:    validated" in out
-    assert SHA in out
+    assert _stored_hash(seeded) in out
     assert "approved rec-1" in out
     assert _status(seeded) == "approved"
+    # M2-707: what the decision authorized, printed in full. It comes *after* the write
+    # since round 1 -- `approve` derives the payload inside the transaction that records the
+    # decision, so this line is the derivation that was stored rather than a second run of
+    # the same function. The digest alone would say two payloads differ; the JSON says how.
+    assert "payload:   sha256 " in out
+    assert json.dumps(BINARY_PAYLOAD, ensure_ascii=True, sort_keys=True, separators=(",", ":")) in (
+        out
+    )
+
+
+def test_a_record_with_no_buildable_payload_cannot_be_approved_but_can_be_rejected(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The asymmetry `011` encodes, driven from the command line (M2-707).
+
+    An approval authorizes one payload, so a record that derives none cannot be approved --
+    and no decision may survive the refusal. Since round 1 the derivation runs inside
+    `approve`'s own transaction rather than in this command, so what makes that true is the
+    rollback, and the approval count below is what asserts it. A rejection authorizes
+    nothing, so it must still be available: a record nobody can submit is exactly the record
+    an operator most needs to be able to reject, and requiring a payload hash for both
+    decisions would have made it permanently undecidable.
+
+    The record is a real one: the response schema admits a probability of 0.0 and Metaculus
+    does not, so this is a forecast the pipeline can legitimately store and no approval can
+    ever bind to.
+    """
+    _seed_ledger(_ledger_path(config_file), probability=0.0)
+    code = main(
+        ["approve", "--config", str(config_file), "--record-id", RECORD_ID, "--actor", "chris"]
+    )
+    out = capsys.readouterr().out
+    assert code == EXIT_REFUSED
+    assert "refused:" in out
+    assert "Metaculus would accept" in out
+    assert _status(config_file) == "validated"
+    assert _isolated_approval_count(_ledger_path(config_file)) == 0
+
+    code = main(
+        ["reject", "--config", str(config_file), "--record-id", RECORD_ID, "--actor", "chris"]
+    )
+    assert code == EXIT_OK
+    assert "rejected rec-1" in capsys.readouterr().out
+    assert _status(config_file) == "validated"
 
 
 def test_reject_leaves_the_record_validated(
@@ -201,7 +310,7 @@ def test_a_supplied_hash_that_matches_is_accepted(seeded: Path) -> None:
             "--actor",
             "chris",
             "--forecast-sha256",
-            SHA,
+            _stored_hash(seeded),
         ]
     )
     assert code == EXIT_OK
@@ -291,8 +400,12 @@ def test_a_ledger_rotated_mid_command_is_not_the_one_that_gets_approved(
     from whiskeyjack_bot import ledger as ledger_module
 
     path = _ledger_path(seeded)
+    verified_hash = _stored_hash(seeded)
     replacement = path.parent / "replacement.sqlite3"
-    _seed_ledger(replacement, OTHER_SHA)
+    # A different `attempt_id` makes a different record and therefore a different hash --
+    # the two ledgers have to be distinguishable by what the command prints.
+    replacement_hash = _seed_ledger(replacement, attempt_id="attempt-2")
+    assert replacement_hash != verified_hash
     archive = path.parent / "rotated.sqlite3"
 
     real_connect = ledger_module.connect
@@ -316,8 +429,8 @@ def test_a_ledger_rotated_mid_command_is_not_the_one_that_gets_approved(
     assert code == EXIT_OK
     out = capsys.readouterr().out
     # The hash the operator was shown is the verified ledger's, not the replacement's.
-    assert SHA in out
-    assert OTHER_SHA not in out
+    assert verified_hash in out
+    assert replacement_hash not in out
     # And the replacement -- read in isolation, so the verified ledger's stranded WAL
     # cannot replay into it -- never received the decision.
     assert _isolated_approval_count(path) == 0
