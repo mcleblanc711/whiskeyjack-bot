@@ -22,8 +22,10 @@ drifting away from what the model is actually told and actually configured with.
 
 import copy
 import json
-import threading
 import re
+import signal
+import threading
+import time
 from itertools import pairwise
 from math import copysign, isfinite, nextafter
 from pathlib import Path
@@ -34,10 +36,17 @@ import yaml
 from forecasting_tools import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from whiskeyjack_bot.config import NumericCalibrationConfig, validate_config_data
+from whiskeyjack_bot.config import (
+    MAX_CONVERSION_TIMEOUT_SECONDS,
+    NumericCalibrationConfig,
+    validate_config_data,
+)
+from whiskeyjack_bot.forecast import cdf as cdf_module
 from whiskeyjack_bot.forecast.cdf import (
     _NOT_CONVERTIBLE,
+    _NOT_WELL_FORMED,
     NumericCdfError,
+    NumericCdfTimeoutError,
     build_numeric_cdf,
     numeric_cdf_or_problems,
 )
@@ -532,33 +541,6 @@ _HANGS_LOG_SCALED_SPAN = (
 )
 
 
-def _convert_under_deadline(
-    values: tuple[float, ...], question_fields: dict[str, Any], seconds: float = 20.0
-) -> tuple[Any, list[str]]:
-    """Convert on a worker thread, failing the test if it does not return.
-
-    A plain call cannot express "this must terminate": if the guard regresses, the test
-    process hangs until the CI job is killed and the failure reads as an infrastructure
-    problem rather than as this assertion. The thread is a daemon, so a regression leaks a
-    spinning thread and fails loudly instead of blocking the run.
-    """
-    outcome: dict[str, Any] = {}
-
-    def run() -> None:
-        outcome["result"] = numeric_cdf_or_problems(
-            _with_values(*values), _calibration(), _question(**question_fields)
-        )
-
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
-    worker.join(seconds)
-    assert not worker.is_alive(), (
-        "the conversion did not return: forecasting-tools 0.2.92's _standardize_cdf "
-        "scale search does not terminate on a negative interior PMF (M1-514)"
-    )
-    return outcome["result"]
-
-
 @pytest.mark.parametrize(
     ("values", "question_fields"),
     [
@@ -566,6 +548,7 @@ def _convert_under_deadline(
         pytest.param(*_HANGS_LOG_SCALED_SPAN, id="log-scaled-span"),
     ],
 )
+@pytest.mark.usefixtures("deadline")
 def test_an_input_that_does_not_terminate_in_the_sdk_is_refused_first(
     values: tuple[float, ...], question_fields: dict[str, Any]
 ) -> None:
@@ -581,6 +564,16 @@ def test_an_input_that_does_not_terminate_in_the_sdk_is_refused_first(
     replies ``numeric_output_problems`` accepts -- asserted below rather than asserted
     about, because "M1-405 would have caught it" is exactly the belief that would make this
     guard look redundant.
+
+    **M1-514 replaced this test's worker-thread harness with the ``deadline`` fixture.**
+    The harness existed because a plain call could not express "this must terminate": a
+    regression hung the process until CI killed it, and the failure read as an
+    infrastructure problem rather than as this assertion. It cannot be used any more, and
+    the reason is the point of M1-514 -- ``forecast.cdf`` now refuses to convert on a thread
+    where it cannot install its own bound, so the harness would measure its own refusal.
+    ``tests/conftest.py``'s ``deadline`` fixture is the replacement and is strictly better:
+    it is an outer ``SIGALRM`` the production bound suspends and restores, so a regression
+    in *either* the guard or the bound fails loudly here rather than hanging.
     """
     assert (
         numeric_output_problems(
@@ -588,7 +581,9 @@ def test_an_input_that_does_not_terminate_in_the_sdk_is_refused_first(
         )
         == []
     )
-    cdf, problems = _convert_under_deadline(values, question_fields)
+    cdf, problems = numeric_cdf_or_problems(
+        _with_values(*values), _calibration(), _question(**question_fields)
+    )
     assert cdf is None
     assert problems == [
         "final_prediction.percentiles: the declared percentiles do not produce a "
@@ -626,6 +621,249 @@ def test_a_well_formed_reply_still_converts_and_pays_only_one_extra_probe() -> N
     assert problems == []
     assert cdf is not None
     assert len(cdf.values) == 201
+
+
+# --- the wall-clock bound: what the guard above cannot promise (M1-514) -------------
+#
+# The guard is keyed on the one mechanism M1-503 had evidence for. This section is about
+# the input nobody has found: the conversion is cut off in bounded time and recorded as a
+# failure, whatever the reason it did not return.
+#
+# Every test here neuters the guard rather than deleting it, and uses one of the two real
+# non-terminating literals above. A synthetic "SDK that sleeps" would pass against a bound
+# that only catches slowness; only the genuine loop -- which does not raise, is not slow,
+# and never returns -- distinguishes a real cutoff from a plausible-looking one.
+
+
+@pytest.fixture
+def guard_neutered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make M1-503's fast path let the two known hanging inputs through.
+
+    ``WHERE 0`` on a trigger rather than ``DROP TRIGGER`` -- M1-607's pattern. Deleting the
+    guard would change which code the rest of the file exercises; forcing its answer to
+    "this converges" leaves everything else identical and puts the SDK into the loop that
+    genuinely does not terminate.
+    """
+    monkeypatch.setattr(cdf_module, "_standardization_can_converge", lambda distribution: True)
+
+
+@pytest.mark.parametrize(
+    ("values", "question_fields"),
+    [
+        pytest.param(*_HANGS_TIE_REWRITTEN_ONTO_BOUND, id="tie-rewritten-onto-open-bound"),
+        pytest.param(*_HANGS_LOG_SCALED_SPAN, id="log-scaled-span"),
+    ],
+)
+@pytest.mark.usefixtures("guard_neutered", "deadline")
+def test_a_conversion_that_does_not_terminate_is_cut_off(
+    values: tuple[float, ...], question_fields: dict[str, Any]
+) -> None:
+    """The acceptance criterion: cut off in bounded time, not left to stop the run.
+
+    With the fast path neutered these inputs reach ``_standardize_cdf`` and the scale search
+    never returns. The assertion is that the call comes back *at all*, and comes back near
+    the configured bound rather than near the SDK's own runtime -- a conversion that
+    returned in 14ms would mean the guard was still doing the work and this test was
+    measuring nothing.
+
+    The ``deadline`` fixture is the outer watchdog: if the bound regresses this fails as an
+    assertion at 10s instead of hanging until CI kills the job.
+    """
+    started = time.monotonic()
+    with pytest.raises(NumericCdfTimeoutError) as excinfo:
+        numeric_cdf_or_problems(
+            _with_values(*values),
+            _calibration(conversion_timeout_seconds=0.5),
+            _question(**question_fields),
+        )
+    elapsed = time.monotonic() - started
+    assert excinfo.value.problems == [
+        "final_prediction.percentiles: the numeric CDF conversion did not complete within "
+        "the configured wall-clock bound (offending input withheld)"
+    ]
+    # Bracketed on both sides. The lower bound is what says the SDK really entered the
+    # non-terminating loop rather than being refused early by something else.
+    assert 0.5 <= elapsed < 5.0, elapsed
+
+
+@pytest.mark.usefixtures("guard_neutered", "deadline")
+def test_a_timeout_is_not_laundered_into_a_repair_turn() -> None:
+    """``_Expired`` must derive from ``BaseException``, and this is the test that says so.
+
+    ``_distribution``, ``_values`` and ``_standardization_can_converge`` each swallow
+    ``Exception`` on purpose, to turn an SDK refusal into a repair turn without letting the
+    SDK's value-quoting text escape. An expiry raised as an ordinary exception is caught by
+    exactly those handlers and comes back as ``_NOT_CONVERTIBLE``: the run continues, the
+    model is asked to repair something no reply could fix, a second call is billed, and the
+    ledger records ``schema_invalid`` for a conversion that never terminated.
+
+    Nothing about that failure is visible from the outside except the message, which is why
+    this asserts the message rather than the class. Flipping ``_Expired`` to ``Exception``
+    must fail here.
+    """
+    values, fields = _HANGS_TIE_REWRITTEN_ONTO_BOUND
+    with pytest.raises(NumericCdfError) as excinfo:
+        numeric_cdf_or_problems(
+            _with_values(*values),
+            _calibration(conversion_timeout_seconds=0.5),
+            _question(**fields),
+        )
+    assert type(excinfo.value) is NumericCdfTimeoutError
+    assert f"final_prediction.percentiles: {_NOT_CONVERTIBLE}" not in excinfo.value.problems
+
+
+@pytest.mark.usefixtures("deadline")
+def test_the_guard_is_still_the_fast_path_and_the_bound_is_the_backstop() -> None:
+    """Both inputs are refused *deterministically*, without spending the deadline.
+
+    This is the half of the acceptance criterion that asks which of the two survives and
+    why. The guard does, as the fast path: it costs one interpolation and produces a repair
+    turn the model can act on, where the bound costs the whole configured deadline and
+    produces a terminal ``timeout``. Asserted by giving the conversion a bound it would
+    obviously blow through if the guard were not there -- the test above proves it does.
+    """
+    for values, fields in (_HANGS_TIE_REWRITTEN_ONTO_BOUND, _HANGS_LOG_SCALED_SPAN):
+        started = time.monotonic()
+        cdf, problems = numeric_cdf_or_problems(
+            _with_values(*values),
+            _calibration(conversion_timeout_seconds=5.0),
+            _question(**fields),
+        )
+        assert cdf is None
+        assert problems == [f"final_prediction.percentiles: {_NOT_WELL_FORMED}"]
+        assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.usefixtures("deadline")
+def test_an_ordinary_conversion_is_not_falsely_timed_out() -> None:
+    """A bound that refused the shipped workload would be a different kind of bug.
+
+    The committed default, the committed prompt example, and every bound-flag combination
+    -- the same control ``test_a_well_formed_reply_still_converts_and_pays_only_one_extra_probe``
+    applies to the guard.
+    """
+    assert _committed_config().numeric_calibration.conversion_timeout_seconds == 10.0
+    for open_lower in (True, False):
+        for open_upper in (True, False):
+            cdf, problems = _convert(
+                open_lower_bound=open_lower,
+                open_upper_bound=open_upper,
+                **({"zero_point": -1.0} if open_lower else {}),
+            )
+            assert problems == [], (open_lower, open_upper, problems)
+            assert cdf is not None
+
+
+@pytest.mark.usefixtures("deadline")
+def test_an_outer_deadline_comes_back_with_the_elapsed_time_deducted() -> None:
+    """The bound suspends an outer timer; it must not cancel or restart it.
+
+    ``forecast.cdf`` installs a process-global ``SIGALRM`` handler and interval timer for
+    the duration of one conversion, so it owes the caller both back. Restoring the handler
+    alone would leave the outer deadline disarmed -- silently, since nothing fires -- and
+    restoring the timer at its original value would push the caller's deadline out by
+    however long the conversion took, every time.
+
+    ``tests/conftest.py``'s own ``deadline`` fixture is an outer ``SIGALRM``, so this is not
+    hypothetical: without the restore, the whole file's watchdog stops working after the
+    first numeric conversion.
+    """
+    fired: list[int] = []
+    previous = signal.signal(signal.SIGALRM, lambda signum, frame: fired.append(signum))
+    signal.setitimer(signal.ITIMER_REAL, 5.0)
+    try:
+        time.sleep(0.5)
+        assert _convert()[1] == []
+        remaining, interval = signal.setitimer(signal.ITIMER_REAL, 0.0)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+    assert fired == [], "the caller's deadline must not fire during the conversion"
+    assert signal.getsignal(signal.SIGALRM) is not None
+    # Still armed, and advanced rather than reset: strictly less than the 4.5s that would
+    # remain if the conversion were free, strictly more than nothing.
+    assert 0.0 < remaining < 4.5, remaining
+    assert interval == 0.0
+
+
+@pytest.mark.usefixtures("deadline")
+def test_a_thread_that_cannot_install_the_bound_refuses_rather_than_running_unbounded() -> None:
+    """Fail closed. A bound that is silently absent is worse than one that is loudly missing.
+
+    ``signal.signal`` raises ``ValueError`` off the main thread of the main interpreter, so
+    the deadline cannot be installed there. The alternative to refusing would be to convert
+    anyway, which restores exactly the stopped run this item exists to prevent -- and does
+    it invisibly, on whichever thread a future ``run_limits.max_parallel_questions > 1``
+    happens to use.
+
+    The response here is the *well-formed* one: the refusal is about the thread, not the
+    reply, so it must fire for input that would otherwise convert cleanly.
+    """
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = numeric_cdf_or_problems(_response(), _calibration(), _question())
+        except NumericCdfError as exc:
+            outcome["problems"] = exc.problems
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(20.0)
+    assert not worker.is_alive(), "the refusal must be immediate, not a conversion that ran"
+    assert "result" not in outcome
+    assert outcome["problems"] == [
+        "final_prediction.percentiles: the numeric CDF conversion cannot be bounded in "
+        "time on this thread; it is refused rather than run unbounded"
+    ]
+
+
+@pytest.mark.parametrize("value", [60.001, 120.0, 86400.0])
+def test_a_bound_above_the_ceiling_is_refused_at_load(value: float) -> None:
+    """A bound any config can lift is not a bound -- ``MAX_MODEL_INVOCATIONS``' argument.
+
+    ``conversion_timeout_seconds: 86400`` would leave the non-terminating scale search
+    running for a day, which is the stopped run with extra steps. Refused where it fails
+    earliest: at config load, and therefore at ``verify-env``.
+    """
+    data = copy.deepcopy(
+        yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    )
+    data["model"]["name"] = "openrouter/test-model"
+    data["numeric_calibration"]["conversion_timeout_seconds"] = value
+    with pytest.raises(Exception):
+        validate_config_data(data)
+
+
+def test_the_committed_bound_is_inside_the_ceiling() -> None:
+    """A ceiling that refused the shipped config would be a different kind of bug."""
+    data = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    assert (
+        0
+        < data["numeric_calibration"]["conversion_timeout_seconds"]
+        <= MAX_CONVERSION_TIMEOUT_SECONDS
+    )
+    assert MAX_CONVERSION_TIMEOUT_SECONDS == 60.0
+
+
+@pytest.mark.usefixtures("deadline")
+def test_the_ceiling_is_refused_again_at_the_conversion_site() -> None:
+    """``model_construct`` bypasses validation, so reaching here means an ``AppConfig``
+    assembled some other way -- the reason ``generate.py`` repeats ``MAX_MODEL_INVOCATIONS``
+    at the site that spends money. A config object carries no memory of which validator
+    built it, and this is the bound that decides how long a hang may stop the run for.
+    """
+    committed = _calibration()
+    unbounded = NumericCalibrationConfig.model_construct(
+        **{**committed.model_dump(), "conversion_timeout_seconds": 86400.0}
+    )
+    assert unbounded.conversion_timeout_seconds == 86400.0
+    with pytest.raises(NumericCdfError) as excinfo:
+        numeric_cdf_or_problems(_response(), unbounded, _question())
+    assert excinfo.value.problems == [
+        "numeric_calibration: conversion_timeout_seconds is outside the wall-clock bound "
+        "the conversion may be given (offending input withheld)"
+    ]
 
 
 # --- message hygiene ---------------------------------------------------------------

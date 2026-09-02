@@ -30,6 +30,7 @@ import pytest
 import yaml
 from asknews_sdk.dto.base import Author, Entities
 from asknews_sdk.dto.news import SearchResponse, SearchResponseDictItem
+from forecasting_tools import NumericDistribution
 from pydantic import AnyUrl
 
 from whiskeyjack_bot.config import AppConfig, validate_config_data
@@ -435,6 +436,60 @@ def test_an_unusable_reply_records_generation_failed_and_keeps_the_text_it_paid_
     events = rows(ledger, "SELECT event_type, detail_code FROM pipeline_failure_events")
     assert events == [("generation_failed", "malformed_response")]
     assert batch.records_written == 2
+
+
+def test_a_conversion_that_never_returns_is_recorded_as_a_timeout_and_the_batch_continues(
+    config: AppConfig, ledger: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-514's acceptance criterion, end to end: cut off and *recorded*, not a stopped run.
+
+    `forecasting-tools==0.2.92`'s `_standardize_cdf` searches for a scale with
+    `while capped_sum(hi) < 1.0: hi *= 1.2`, and on a negative interior PMF that sum falls
+    instead of rising, so `hi` reaches `inf` and the loop has no exit. It does not raise and
+    it is not slow -- it never returns. Before this item that stopped the whole run: no
+    error, no failure event, no billing bound, and the two questions after it in the batch
+    never ran.
+
+    **The condition is simulated here and the inputs that cause it are not.** Two real
+    percentile sets are pinned as literals in `tests/unit/test_forecast_cdf.py`, and both
+    need question bounds this snapshot does not have -- 4000 accepted draws at this
+    question's bounds found none. What this test is about is not which reply triggers it but
+    what the pipeline does with a conversion that does not come back, so `get_cdf` is made
+    to spin in the same shape the SDK's own loop does. Everything below it is the production
+    path: the real `numeric_cdf_or_problems`, the real bound, the real
+    `generate.py` classification, the real ledger write. CLAUDE.md permits a monkeypatch
+    that simulates a reachable condition, and the literals are the evidence that this one is.
+    """
+
+    def never_returns(self: Any) -> Any:
+        x = 1.0
+        while True:
+            x = x * 1.2
+
+    monkeypatch.setattr(NumericDistribution, "get_cdf", never_returns)
+    bounded = config.model_copy(
+        update={
+            "numeric_calibration": config.numeric_calibration.model_copy(
+                update={"conversion_timeout_seconds": 0.5}
+            )
+        }
+    )
+    batch = live(ledger, bounded, limit=3)
+
+    failed = [o for o in batch.outcomes if o.status != "recorded"]
+    assert [o.question_id for o in failed] == [NUMERIC]
+    assert failed[0].status == "generation_failed"
+    assert failed[0].detail_code == "timeout"
+    events = rows(
+        ledger, "SELECT event_type, detail_code, question_id FROM pipeline_failure_events"
+    )
+    assert events == [("generation_failed", "timeout", NUMERIC)]
+    # The rest of the batch is the half of the criterion the ledger row cannot show.
+    assert batch.records_written == 2
+    # The call was billed, so the text it bought reaches disk before the failure is recorded
+    # -- the same rule the malformed-reply case above asserts.
+    assert failed[0].artifact_outcome == "written"
+    assert (bounded.storage.artifact_root / failed[0].raw_output_path).is_file()
 
 
 def test_a_refusal_raised_mid_batch_is_isolated_like_any_other_failure(

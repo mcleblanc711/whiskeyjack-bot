@@ -117,7 +117,11 @@ from whiskeyjack_bot.config import (
     ForecastConfig,
     NumericCalibrationConfig,
 )
-from whiskeyjack_bot.forecast.cdf import numeric_cdf_or_problems
+from whiskeyjack_bot.forecast.cdf import (
+    NumericCdfTimeoutError,
+    can_bound_conversion,
+    numeric_cdf_or_problems,
+)
 from whiskeyjack_bot.forecast.inputs import (
     ForecastInputError,
     ModelInput,
@@ -392,6 +396,24 @@ def generate_forecast(
             "the question's cdf_size does not match numeric_calibration."
             "expected_cdf_points; no percentile set could convert to a submittable CDF"
         )
+    if isinstance(question, CanonicalNumericQuestion) and not can_bound_conversion():
+        # M1-514, and the same category as the two checks above -- unsatisfiable by any
+        # reply, so refused before anything is spent -- but the reason is about this
+        # *thread* rather than about the question. The conversion's wall-clock bound is a
+        # ``SIGALRM`` interval timer, which POSIX and CPython both restrict to the main
+        # thread of the main interpreter. ``forecast.cdf`` refuses to convert where it
+        # cannot install that bound, because the alternative is running the pinned SDK's
+        # non-terminating scale search unbounded, and a bound that is silently absent is
+        # worse than one that is loudly missing.
+        #
+        # Left to ``cdf.numeric_cdf_or_problems`` this would raise *after* a billed call,
+        # breaking this module's contract that every raise means nothing was spent. Here it
+        # costs nothing and it is loud -- which is what whoever implements
+        # ``run_limits.max_parallel_questions > 1`` on threads needs it to be.
+        raise ForecastGenerationError(
+            "the numeric CDF conversion cannot be bounded in time on this thread; "
+            "generate_forecast must be called from the main thread for a numeric question"
+        )
     if not config.forecast.min_probability < config.forecast.max_probability:
         # ForecastConfig refuses this at load, so reaching here means an AppConfig
         # assembled some other way -- the same reason the bound above is repeated.
@@ -531,6 +553,13 @@ def _conversion_problems(
     neither is converted through the package. Dispatch is on the ``question_type`` literal,
     never ``isinstance`` -- ``DiscreteQuestion`` subclasses ``NumericQuestion`` in the
     pinned SDK, and this project's own leaf models mirror the shape deliberately.
+
+    **Propagates ``NumericCdfTimeoutError`` rather than returning it as a problem** (M1-514).
+    Every string this returns becomes a repair turn, and a conversion that did not terminate
+    is the one outcome that must not: ``_run_attempts`` catches the exception, records
+    ``timeout`` and stops. Returning it here would make it indistinguishable from the
+    refusals above at exactly the point where the difference decides whether a second call
+    is billed.
     """
     if forecast.question_type != "numeric":
         return []
@@ -609,7 +638,20 @@ def _run_attempts(
             source_ids=source_ids,
         )
         if forecast is not None:
-            problems = _conversion_problems(forecast, numeric_calibration, question)
+            try:
+                problems = _conversion_problems(forecast, numeric_calibration, question)
+            except NumericCdfTimeoutError as exc:
+                # M1-514. The same shape as the provider-failure branch above and for the
+                # same reason: this is not repairable output. The conversion did not refuse
+                # these percentiles, it failed to *finish* on them, and the model has no way
+                # to aim at that -- a repair turn would buy a second billed call and, if the
+                # reply were similar, a second expiry. So the attempt loop ends here with
+                # the raw response already recorded, and ``timeout`` -- an existing member
+                # of ``PreForecastFailureCode`` and of migration 004's detail_code CHECK --
+                # is what the caller writes to ``pipeline_failure_events``.
+                failure_code = "timeout"
+                problems = list(exc.problems)
+                break
             if problems:
                 forecast = None
         if forecast is not None:
