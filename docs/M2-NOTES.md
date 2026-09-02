@@ -2499,10 +2499,29 @@ the digest, and what an operator can *check* is that the digest printed at appro
 one printed at submit time. A rendering that a person could actually review (percentile table,
 diff against the previous version) is a real improvement and is not this item.
 
-### Found in passing — `scripts/gate.sh` exits 0 on a failed gate (filed as M0-009)
+### Round 2 — APPROVE, one non-blocking observation, filed as T-906
 
-Not this item's code and not fixed here; the row in `docs/backlog/backlog.csv` is the only
-part of it in this diff, and it is here so the finding is not lost between waves.
+Round 2 examined `69c8639`, closed R1-1, and raised no blocking finding. It reported one
+non-blocking observation and it is a real one:
+`test_two_records_share_a_digest_exactly_when_they_derive_one_payload` draws two records
+independently and then assumes both build, so the surviving fraction is roughly the square of
+the single-record build rate and hypothesis's `filter_too_much` health check can fire. The
+reviewer reproduced it once in a focused run; it did not reproduce in three consecutive local
+runs of that module or in the full suite.
+
+Filed as **T-906** rather than fixed here, and the row says why the obvious fix is the wrong
+one: a property whose examples are mostly filtered is also mostly *vacuous*, so suppressing the
+health check would hide the defect the flake is pointing at. The property itself is right and
+is load-bearing — it is what rules out D33 reopening under a new name.
+
+### Found in passing — `scripts/gate.sh` exits 0 on a failed gate (**T-905**, already filed)
+
+Not this item's code and not fixed here. It was filed on this branch as a new row, `M0-009`,
+and that was a mistake: **T-905 already carries it**, filed off M1-315's round-1 remediation
+and merged to master before this branch opened. The duplicate row has been removed and the one
+fact it added — that the defect reproduces on three separate failing runs across two different
+gates, not only the one it was found with — folded into T-905's description. Two rows for one
+defect is how a backlog stops being the single source `CLAUDE.md` says it is.
 
 `run_gate()` captures its status with `status=$?` placed *after* an `if cmd; then ...; fi`
 compound. Bash sets `$?` to 0 for the compound when the condition is false and there is no
