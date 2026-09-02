@@ -407,7 +407,7 @@ def _research(
         reused=False,
         provider_failed=outcome.provider_failed,
         cost_usd=outcome.cost_usd,
-        unpriced_calls=outcome.unpriced_runs,
+        unpriced_calls=outcome.unpriced_calls,
     )
 
 

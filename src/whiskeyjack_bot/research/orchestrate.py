@@ -186,10 +186,19 @@ class _BilledCall:
     asked to record it. ``cost_usd`` is read from the adapter's own run, which is the same
     figure :func:`_record` would publish -- :func:`store.with_retrieval_counts` overwrites
     the two count columns and nothing else.
+
+    ``calls`` is the pass's **billable request count**, not 1. Round 3 found the accounting
+    one layer up publishing a figure named ``unpriced_calls`` while counting provider *runs*:
+    a single AskNews pass issues ``len(queries) x len(_STRATEGIES)`` requests -- two per query,
+    which is why :func:`derive_queries` treats query construction as the largest lever on what
+    a run costs -- so a one-query question under-reported its unpriced calls by half, and a
+    group sibling by three quarters. Both adapters now report the count; neither could be
+    reconstructed from ``raw_responses``, which omits a request that raised.
     """
 
     retrieval_run_id: str
     cost_usd: float | None
+    calls: int
 
 
 @dataclass(frozen=True)
@@ -227,12 +236,18 @@ class RetrievalOutcome:
     empty packet is indistinguishable from research that found nothing, which is the exact
     ambiguity ``replay_research`` refuses to return.
 
-    ``cost_usd`` sums only the runs that reported a figure, and ``unpriced_runs`` counts
-    the ones that did not. They are two fields rather than one optional total because
-    ``None`` means *unknown, never free* (M1-303 round 3) and a single optional total would
-    force a caller to choose between "no cost" and "no answer". The pair lets a caller say
-    the true thing: this much is known to have been spent, across this many priced calls,
-    with this many unpriced ones alongside.
+    ``cost_usd`` sums only the runs that reported a figure, and ``unpriced_calls`` counts
+    the **billable requests** made by the runs that did not. They are two fields rather than
+    one optional total because ``None`` means *unknown, never free* (M1-303 round 3) and a
+    single optional total would force a caller to choose between "no cost" and "no answer".
+    The pair lets a caller say the true thing: this much is known to have been spent, across
+    this many priced calls, with this many unpriced ones alongside.
+
+    **The unit is requests, not runs, and round 3 is why that is spelled out.** This field
+    was ``unpriced_runs`` and the composer assigned it straight into a ``unpriced_calls``
+    that ``forecast/generate.py`` was filling with real invocation counts -- so one number
+    reported to the operator mixed two units, and the retrieval half was low by the factor
+    each provider multiplies queries by. A run is not a call.
     """
 
     question_id: int
@@ -241,7 +256,7 @@ class RetrievalOutcome:
     runs: tuple[ProviderRun, ...]
     document_count: int
     cost_usd: float | None
-    unpriced_runs: int
+    unpriced_calls: int
 
     def __post_init__(self) -> None:
         if (self.packet is None) != (self.document_count == 0):
@@ -487,7 +502,13 @@ def _fallback_pass(
     # Billed. Registered before the ledger is asked to record it, because from here the
     # ledger is the only thing left that can fail and the caller's payload must not depend
     # on a `ProviderRun` that a failed `_record` never returns (round 2).
-    billed.append(_BilledCall(retrieval_run_id=run_id, cost_usd=retrieval.run.cost_usd))
+    billed.append(
+        _BilledCall(
+            retrieval_run_id=run_id,
+            cost_usd=retrieval.run.cost_usd,
+            calls=retrieval.calls_attempted,
+        )
+    )
     return _record(
         conn,
         config,
@@ -594,7 +615,11 @@ def retrieve_for_question(
     # `PaidRetrievalError.retrieval_run_ids` non-empty by construction rather than by the
     # `or (primary_run_id,)` fallback this replaces.
     billed: list[_BilledCall] = [
-        _BilledCall(retrieval_run_id=primary_run_id, cost_usd=primary.run.cost_usd)
+        _BilledCall(
+            retrieval_run_id=primary_run_id,
+            cost_usd=primary.run.cost_usd,
+            calls=primary.calls_attempted,
+        )
     ]
     # The money is gone from here on, so the only remaining failure is the ledger's, and it
     # arrives as this module's own type carrying what was spent -- never as a raw
@@ -647,6 +672,14 @@ def retrieve_for_question(
         run_ids = tuple(entry.retrieval_run_id for entry in runs)
         documents = sum(entry.documents_retained for entry in runs)
         priced = [entry.cost_usd for entry in runs if entry.cost_usd is not None]
+        # Keyed off `billed` rather than `runs` for the unit's sake: `runs` knows what was
+        # recorded, `billed` knows how many requests each pass paid for.
+        recorded_ids = {entry.retrieval_run_id for entry in runs}
+        unpriced_calls = sum(
+            call.calls
+            for call in billed
+            if call.cost_usd is None and call.retrieval_run_id in recorded_ids
+        )
         packet = (
             load_packet(conn, question_id=question_id, retrieval_run_ids=run_ids)
             if documents
@@ -665,7 +698,9 @@ def retrieve_for_question(
             str(exc),
             retrieval_run_ids=tuple(call.retrieval_run_id for call in billed),
             cost_usd=sum(priced) if priced else None,
-            unpriced_calls=len(billed) - len(priced),
+            # Summed, not counted: one entry is a provider pass, and a pass is several
+            # billable requests (round 3).
+            unpriced_calls=sum(call.calls for call in billed if call.cost_usd is None),
         ) from None
     return RetrievalOutcome(
         question_id=question_id,
@@ -674,5 +709,5 @@ def retrieve_for_question(
         runs=tuple(runs),
         document_count=documents,
         cost_usd=sum(priced) if priced else None,
-        unpriced_runs=len(runs) - len(priced),
+        unpriced_calls=unpriced_calls,
     )

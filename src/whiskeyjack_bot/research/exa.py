@@ -287,6 +287,11 @@ class ExaRetrieval:
     duplicates_collapsed: int
     provider_failed: bool
     fallback_reasons: tuple[FallbackReason, ...]
+    # Every billable attempt this pass made, including one that raised or returned
+    # a malformed body. Already computed below to decide whether `cost_usd` is a
+    # whole-run figure; exposed for M1-315 round 3, whose finding was that the paid
+    # composition published a count of *calls* while counting provider *runs*.
+    calls_attempted: int
 
 
 def decide_fallback(
@@ -798,6 +803,7 @@ def retrieve_web(
         duplicates_collapsed=dedup_result.collapsed_count,
         provider_failed=provider_failed,
         fallback_reasons=reasons,
+        calls_attempted=calls_attempted,
     )
 
 

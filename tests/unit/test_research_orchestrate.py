@@ -541,6 +541,66 @@ def test_a_fallback_ledger_failure_still_reports_what_the_fallback_cost(
     assert caught.value.unpriced_calls == 1, "the unpriced primary is still one billed call"
 
 
+def test_one_query_is_two_billable_calls_and_the_outcome_says_so(
+    config: AppConfig, ledger: Any
+) -> None:
+    """Round 3's blocking finding: a provider *run* is not a provider *call*.
+
+    ``retrieve_news`` issues one request per query per strategy, and there are two
+    strategies -- the "current" and "historical" passes whose overlap ``duplicates_collapsed``
+    exists to absorb. So the cheapest possible question is two billable calls, and the
+    accounting used to report one, because it counted entries in the recorded-run list.
+
+    The expected count is asserted against the provider double's own call log rather than a
+    literal, so the test tracks ``_STRATEGIES`` instead of restating it. A literal ``2`` here
+    would keep passing if a third strategy were added -- which is exactly the change that
+    would make the figure wrong again.
+    """
+    sdk = _SDK()
+    outcome = retrieve_for_question(ledger, config, question=question(), now=NOW, news_client=sdk)
+    assert len(sdk.news.calls) == 2, "one query, two strategies"
+    assert outcome.unpriced_calls == len(sdk.news.calls)
+    assert outcome.cost_usd is None, "AskNews never reports a currency figure"
+
+
+def test_a_group_sibling_costs_twice_that_and_the_outcome_says_so(
+    config: AppConfig, ledger: Any
+) -> None:
+    """The same claim where the multiplier bites hardest, and the reason it is worth a
+    second test rather than a parametrization.
+
+    ``derive_queries`` emits two queries for a group sibling -- the parent-qualified form and
+    the bare title -- because a sibling title like "Democratic" means nothing alone (M1-202).
+    Two queries at two strategies is four billable calls for one question, so the old
+    run-counting figure was low by a factor of four exactly where a group expansion makes the
+    batch most expensive. Anti-vacuity for the test above: if both reported the same number,
+    neither would be measuring the multiplier.
+    """
+    sibling = question().model_copy(update={"group_parent_title": "Who wins the 2028 election?"})
+    assert len(derive_queries(sibling)) == 2, "the premise: a sibling searches on two queries"
+
+    sdk = _SDK()
+    outcome = retrieve_for_question(ledger, config, question=sibling, now=NOW, news_client=sdk)
+    assert len(sdk.news.calls) == 4, "two queries, two strategies"
+    assert outcome.unpriced_calls == len(sdk.news.calls)
+
+
+def test_a_provider_failure_still_counts_the_call_that_failed(
+    config: AppConfig, ledger: Any
+) -> None:
+    """A request that raised still reached the provider and may still have been billed.
+
+    This is the half that cannot be reconstructed from ``raw_responses``, which only holds
+    the requests that came back -- and it is why ``calls_attempted`` is reported by the
+    adapter rather than derived by the caller. ``retrieve_news`` stops at the first failure,
+    so the honest count here is one: the call that was made and failed.
+    """
+    sdk = _SDK(raises=RuntimeError("upstream said no"))
+    outcome = retrieve_for_question(ledger, config, question=question(), now=NOW, news_client=sdk)
+    assert len(sdk.news.calls) == 1, "the adapter stops at the first failure"
+    assert outcome.unpriced_calls == 1, "a billed call that failed is still a billed call"
+
+
 # --- the fallback: authorized only by decide_fallback ----------------------------------
 
 
@@ -703,7 +763,7 @@ def test_an_outcome_naming_a_run_it_did_not_perform_is_refused() -> None:
             runs=(),
             document_count=0,
             cost_usd=None,
-            unpriced_runs=0,
+            unpriced_calls=0,
         )
 
 
@@ -716,7 +776,7 @@ def test_a_packet_without_documents_is_refused() -> None:
             runs=(),
             document_count=3,
             cost_usd=None,
-            unpriced_runs=0,
+            unpriced_calls=0,
         )
 
 

@@ -635,10 +635,22 @@ def test_unpriced_calls_are_counted_rather_than_added_as_zero(
     anomaly. It is counted and reported; it is never summed as zero, and it is deliberately
     not a reason to stop, because a rule that stopped on it would stop every batch after its
     first question. ``max_cost_usd`` bounds known spend and cannot bound unknown spend.
+
+    **The assertion is exact, and round 3 is why.** It read ``>= 3`` -- one per question --
+    which is satisfied by counting provider *runs* and equally by counting the requests those
+    runs actually make, so it could not tell the two apart and did not notice when the figure
+    was the smaller one. A lower bound on a count that is supposed to be a count is not a
+    test of it. The expected total is now derived from the provider double's own call log
+    plus one unpriced model invocation per question, so it tracks ``_STRATEGIES`` and
+    ``derive_queries`` rather than restating either.
     """
-    batch = live(ledger, config, limit=3)
+    sdk = _TrackingSDK()
+    batch = live(ledger, config, limit=3, news_client=sdk)
     assert batch.known_cost_usd == 0.0
-    assert batch.unpriced_calls >= 3
+    assert batch.unpriced_calls == len(sdk.news.calls) + 3, (
+        "every billable retrieval request, plus one unpriced model call per question"
+    )
+    assert len(sdk.news.calls) == 6, "three one-query questions at two strategies each"
     assert batch.stop_reason == "completed"
     assert batch.records_written == 3
 

@@ -114,6 +114,16 @@ class AskNewsRetrieval:
     ``provider_failed`` is the fallback signal: it is ``True`` when a provider
     call raised, in which case retrieval stopped early and everything already
     retrieved is still returned.
+
+    ``calls_attempted`` counts every billable request this pass made, including
+    one that then raised. **It is not derivable from the other fields**, which is
+    why it is reported rather than left to the caller: ``raw_responses`` holds
+    only the requests that came back, so a caller reconstructing the count from
+    it silently loses the failed one -- and this adapter issues
+    ``len(queries) x len(_STRATEGIES)`` requests, so a run is never one call.
+    M1-315 round 3 found the paid-run accounting reporting provider *runs* where
+    it published a count of *calls*; this is the field that makes the two agree.
+    ``forecast/generate.py`` reports the same quantity as ``invocations``.
     """
 
     run: ResearchRun
@@ -122,6 +132,7 @@ class AskNewsRetrieval:
     documents_dropped: int
     duplicates_collapsed: int
     provider_failed: bool
+    calls_attempted: int
 
 
 def build_asknews_client(config: AppConfig) -> AskNewsSDK:
@@ -290,11 +301,16 @@ def retrieve_news(
     dropped = 0
     collapsed = 0
     provider_failed = False
+    # Counted at the point of the request, so the one that raises is included: it
+    # reached the provider and may well have been billed. Same rule as
+    # `research/exa.py`'s `calls_attempted` and `forecast/generate.py`'s.
+    calls_attempted = 0
 
     for query in capped_queries:
         if provider_failed:
             break
         for strategy in _STRATEGIES:
+            calls_attempted += 1
             try:
                 response = client.news.search_news(
                     query=query,
@@ -372,6 +388,7 @@ def retrieve_news(
         documents_dropped=dropped,
         duplicates_collapsed=collapsed,
         provider_failed=provider_failed,
+        calls_attempted=calls_attempted,
     )
 
 

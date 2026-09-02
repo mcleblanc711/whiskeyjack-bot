@@ -7017,9 +7017,63 @@ blocker. Widening the clause would also make `PaidRetrievalError` — an `Orches
 subclass — a type the region both raises and catches, which is a shape worth avoiding for a
 path that cannot fire. Recorded here so it is visible as a decision.
 
+### Round 3 — a run is not a call, and the loose assertion is what let it stand
+
+Both prior blockers confirmed closed. Round 3 found a third, in the same accounting surface
+and one level deeper: `unpriced_calls` was **counting provider runs while being published as a
+count of calls**. `retrieve_news` issues one request per query per strategy and there are two
+strategies, so the cheapest possible question is two billable AskNews requests and the batch
+reported one. A group sibling — two queries, because M1-202's unpacking leaves titles whose
+meaning lives in the parent — is four requests reported as one.
+
+**The field mixed two units in the same number.** `forecast/generate.py` has always
+contributed `invocations`, a real per-call count; the retrieval half contributed
+`len(runs) - len(priced)`. One integer shown to the operator was part calls, part runs. That is
+worse than either convention alone, and it is invisible in any single reading of either module.
+
+**The branch asserted the fact that made its own figure wrong.** `derive_queries`' docstring
+says AskNews "bills two calls per query, so query construction is the largest single lever on
+what a run costs" — written on this branch, three hundred lines above the code that then
+counted one. The round-1 entry's lesson was *a prose guarantee is not a mechanism*; this is its
+inverse and it is worse, because here the prose was **right** and unread.
+
+**What actually let it survive: `assert batch.unpriced_calls >= 3`.** Three questions, at least
+three calls. That bound is satisfied by counting runs and equally by counting requests, so the
+one test aimed at this field could not distinguish the defect from correct behaviour. **A lower
+bound on a quantity whose whole content is its exactness is not a test of it** — it is the same
+family as the vacuous-property class in `docs/LESSONS.md`, arriving as a too-weak assertion
+rather than an unreachable branch. The assertion is now derived from the provider double's own
+call log, so it tracks `_STRATEGIES` and `derive_queries` instead of restating them, and the
+mutation that reverts the fix (`calls=1`) turns it red along with two orchestrator tests. Before
+the tightening it stayed green.
+
+**Why the adapters were changed rather than the count derived at the composer.** Neither
+`AskNewsRetrieval` nor `ExaRetrieval` exposed the number, and it cannot be reconstructed:
+`raw_responses` holds only the requests that came back, so a caller deriving the count from it
+silently drops a request that raised — one that reached the provider and may well have been
+billed. `research/exa.py` had already computed exactly the right quantity for its own cost
+logic (`calls_attempted`, "every billable attempt (including one that then raises)") and simply
+never surfaced it; `research/asknews.py` gains the same counter. Two merged modules changed by
+one field each, which is smaller than any correct alternative and puts the count where the calls
+are made.
+
+### Deviation — the round-3 finding's reproduction did not reproduce
+
+Recorded because the fix went in anyway and the distinction is the point. The finding predicted
+`BatchRun.unpriced_calls` would be `1` for a one-query question; executed at the pinned commit
+it was `2`. The `2` was a coincidence — one research run plus one unpriced model invocation —
+and it happened to equal the correct request count for the wrong reason, which is the kind of
+agreement that hides a defect rather than revealing one.
+
+So the observed value in the report was wrong and the mechanism it pointed at was real. Treating
+the wrong number as grounds for a rebuttal would have been lawyering: for an instrument whose
+product is attribution, publishing a paid-call count that is low by a factor of two to four is
+the defect, whatever figure the reproduction quoted. **Reproduce the mechanism, not the
+number** — and when they disagree, say so in the response rather than quietly fixing past it.
+
 ### Verification
 
-`tests/unit/test_research_orchestrate.py` (33), `tests/unit/test_pipeline_live.py` (31),
+`tests/unit/test_research_orchestrate.py` (36), `tests/unit/test_pipeline_live.py` (31),
 `tests/acceptance/test_live_run_acceptance.py` (13, of which 6 are import-graph guards) and
 `tests/property/test_orchestrate_properties.py` (6 properties over `derive_queries`).
 
@@ -7069,4 +7123,3 @@ proved nothing:
 | a replay configuration allowed to drive `run` | the parametrized switch refusal |
 | a submission import added to the replay handler | the `ast.walk` over that handler |
 | whitespace collapse dropped; the storability backstop dropped | two properties |
-
