@@ -2497,6 +2497,27 @@ the digest, and what an operator can *check* is that the digest printed at appro
 one printed at submit time. A rendering that a person could actually review (percentile table,
 diff against the previous version) is a real improvement and is not this item.
 
+### Found in passing — `scripts/gate.sh` exits 0 on a failed gate (filed as M0-009)
+
+Not this item's code and not fixed here; the row in `docs/backlog/backlog.csv` is the only
+part of it in this diff, and it is here so the finding is not lost between waves.
+
+`run_gate()` captures its status with `status=$?` placed *after* an `if cmd; then ...; fi`
+compound. Bash sets `$?` to 0 for the compound when the condition is false and there is no
+`else`, so `status` is 0 and `exit "$status"` exits 0. The script prints `FAIL`, prints the
+output tail, prints "the remaining gates were not run" — and reports success to anything
+reading its exit code. Confirmed by execution on three separate failing runs during this item
+(a `ruff format` failure, then two `pytest` failures).
+
+**`scripts/review-request.py` is not affected.** It reads `subprocess.run().returncode`
+directly, so no review request has ever claimed a gate that did not pass, and the gate block
+in *this* item's request means what it says. The exposure is the inner loop and any wrapper
+that shells out to `gate.sh` and trusts the code.
+
+Left for its own branch because a workflow change is its own track (CLAUDE.md), and a `chore/`
+branch is where CI's `backlog-status` job skips it. Every gate verdict quoted in these notes
+was read from the script's **last line** rather than its exit status.
+
 ### On the mutation pass
 
 Every new assertion was re-run against a deliberately broken tree, one mutation at a time,
