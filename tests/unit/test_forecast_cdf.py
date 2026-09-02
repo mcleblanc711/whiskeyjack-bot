@@ -38,6 +38,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from whiskeyjack_bot.config import (
     MAX_CONVERSION_TIMEOUT_SECONDS,
+    ConfigError,
     NumericCalibrationConfig,
     validate_config_data,
 )
@@ -831,7 +832,7 @@ def test_a_bound_above_the_ceiling_is_refused_at_load(value: float) -> None:
     )
     data["model"]["name"] = "openrouter/test-model"
     data["numeric_calibration"]["conversion_timeout_seconds"] = value
-    with pytest.raises(Exception):
+    with pytest.raises(ConfigError):
         validate_config_data(data)
 
 
