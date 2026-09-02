@@ -224,6 +224,20 @@ def read_raw_responses(artifact_root: Path, relative_path: str) -> tuple[dict[st
         raw = path.read_bytes()
     except OSError:
         raise ArtifactError(f"cannot read retrieval artifact {path}") from None
+    except ValueError:
+        # `UnicodeEncodeError` (a ValueError) rather than an OSError: a lone surrogate in
+        # the path cannot be encoded for the syscall, and `open()` raises before any I/O
+        # happens. An `except OSError` here reads as exhaustive and is not (M1-314; the
+        # analogous fix in `forecast/artifacts.py::read_raw_model_output`).
+        #
+        # Reachable without a hostile operator: `raw_response_path` is a TEXT column
+        # whose shape nothing constrains, and this is a public entry point that takes a
+        # string from a caller. The message must not render the path here, since
+        # interpolating it is itself the failing operation.
+        raise ArtifactError(
+            "the recorded artifact path is not a usable filename "
+            "(path withheld: it cannot be rendered)"
+        ) from None
     try:
         envelope = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
     except ArtifactError:
