@@ -339,7 +339,7 @@ def test_the_key_the_derivation_mints_is_acceptable_to_the_real_writer(
     approved: tuple[sqlite3.Connection, str],
 ) -> None:
     """Asserted through `lifecycle.record_submission_attempt` rather than against
-    `lifecycle._MAX_IDENTIFIER`: a private constant imported to assert against tests the
+    `bounds.MAX_IDENTIFIER_LENGTH`: a private constant imported to assert against tests the
     constant, not the writer that enforces it."""
     conn, record_id = approved
     key = submission_key_for_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)

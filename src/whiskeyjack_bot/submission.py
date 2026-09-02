@@ -108,6 +108,11 @@ from datetime import datetime, timezone
 from typing import Literal, cast, get_args
 
 from whiskeyjack_bot.approval import ApprovalError, effective_approval
+from whiskeyjack_bot.bounds import (
+    MAX_ACTOR_LENGTH,
+    MAX_IDENTIFIER_LENGTH,
+    MAX_NOTE_LENGTH,
+)
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     RefetchOutcome,
@@ -131,10 +136,6 @@ _KEY_PREFIX = "wjsub-1-"
 
 _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdef")
 
-# Matches `lifecycle._MAX_IDENTIFIER` and `approval._MAX_IDENTIFIER` (M1-608 is the item
-# that pins the three together). It exists here to keep a hostile value away from
-# sqlite3's parameter binding, not to restate the writer's field rules.
-_MAX_IDENTIFIER = 200
 
 # SQLite stores integers as signed 64-bit. A Python int outside that range cannot be
 # persisted, so a key derived from one could never be reproduced from the stored row --
@@ -144,11 +145,6 @@ _INT64_MAX = 2**63 - 1
 # 8-character prefix + 64 hex characters. Well inside the writer's 200-character bound.
 KEY_LENGTH = len(_KEY_PREFIX) + 64
 
-# Matches `lifecycle._MAX_ACTOR` / `_MAX_NOTE`. Same standing as `_MAX_IDENTIFIER` above:
-# here to keep a hostile value away from sqlite3's binding, not to restate a writer's
-# rules, and M1-608 is the item that pins the family together.
-_MAX_ACTOR = 200
-_MAX_NOTE = 4000
 
 # Why a key reservation may have been given up. **The membership lives here and not in a
 # column CHECK**, deliberately: M2-711 established what a closed column vocabulary costs on
@@ -730,8 +726,8 @@ def release_submission_key(
     reservation_id = _require_identifier(reservation.reservation_id, "reservation.reservation_id")
     reason_text = _require_reason(reason)
     released = _require_utc(released_at, "released_at")
-    actor = _require_optional_identifier(released_by, "released_by", max_length=_MAX_ACTOR)
-    note_text = _require_optional_text(note, "note", max_length=_MAX_NOTE)
+    actor = _require_optional_identifier(released_by, "released_by", max_length=MAX_ACTOR_LENGTH)
+    note_text = _require_optional_text(note, "note", max_length=MAX_NOTE_LENGTH)
     if reason_text == "not_posted" and actor is not None:
         raise SubmissionError(
             "a not_posted release records that the program proved no post was made, so it "
@@ -824,7 +820,7 @@ def _wrap_approval(exc: ApprovalError) -> SubmissionError:
     return SubmissionError(str(exc) or "the ledger refused to report this record's approval")
 
 
-def _require_text(value: object, field: str, *, max_length: int = _MAX_IDENTIFIER) -> str:
+def _require_text(value: object, field: str, *, max_length: int = MAX_IDENTIFIER_LENGTH) -> str:
     """Return ``value`` as storable text, or raise naming only the *field*.
 
     ``max_length`` defaults to the identifier bound every caller here wants; the free-text
@@ -852,7 +848,9 @@ def _require_text(value: object, field: str, *, max_length: int = _MAX_IDENTIFIE
     return value
 
 
-def _require_identifier(value: object, field: str, *, max_length: int = _MAX_IDENTIFIER) -> str:
+def _require_identifier(
+    value: object, field: str, *, max_length: int = MAX_IDENTIFIER_LENGTH
+) -> str:
     """Return ``value`` as non-blank, NUL-free storable text, or raise (M2-710).
 
     :func:`_require_text` already refuses ``''``, but ``'\\n\\t'`` is truthy and would

@@ -102,6 +102,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol, cast, get_args
 
+from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.config import AppConfig, SupportedQuestionType
 from whiskeyjack_bot.forecast.record import ForecastRecordError
 from whiskeyjack_bot.forecast.store import read_forecast_record
@@ -142,12 +143,9 @@ VERIFICATION_SCHEMA_VERSION = "1.2.0"
 # dry-run attempt id, and all three are append-only claims about whether a post happened.
 _LIVE_ATTEMPT_PREFIX = "wjlive-1-"
 
-# Matches `lifecycle._MAX_IDENTIFIER` / `_MAX_BODY`, re-spelled for the reason the other
-# four modules that restate them give (M1-608 is the item that pins them together). They
-# are here so a receipt can be *pre-sanitized* to what the writer will accept: after a post
-# has happened, a value the ledger refuses is a live post with no row.
-_MAX_IDENTIFIER = 200
-_MAX_BODY = 65536
+# `bounds.MAX_IDENTIFIER_LENGTH` / `MAX_BODY_LENGTH` are used here rather than restated
+# (M1-608). They are used so a receipt can be *pre-sanitized* to what the writer will
+# accept: after a post has happened, a value the ledger refuses is a live post with no row.
 
 # Metaculus's own bound on a binary forecast, enforced by the SDK's public method as a bare
 # `ValueError`. Restated here so the refusal happens *before* the post and arrives as this
@@ -167,14 +165,14 @@ _VALUE_TOLERANCE = 1e-9
 _CATEGORY_SUM_TOLERANCE = 1e-6
 
 # Upper bound on how many options a multiple-choice payload may carry. Not a platform
-# limit: it is what keeps the verification snapshot inside `_MAX_BODY` without a second
+# limit: it is what keeps the verification snapshot inside `MAX_BODY_LENGTH` without a second
 # serialization shape, and it refuses a caller mistake (a "distribution" over thousands of
 # categories) before the post. Metaculus multiple-choice questions carry a few dozen.
 _MAX_CATEGORIES = 64
 
 # The longest option label this module will accept, in characters. Two things rest on it,
 # and the second is why it is a *number* rather than a shrug: a verification snapshot must
-# stay inside `_MAX_BODY` while still carrying the evidence its verdict was reached from,
+# stay inside `MAX_BODY_LENGTH` while still carrying the evidence its verdict was reached from,
 # because the alternative is `build_verification_snapshot`'s reduced envelope -- which is
 # correct, degrades rather than raises, and names no values at all. A `confirmed` row with
 # no evidence is the exact ledger-integrity failure this package exists to prevent, and it
@@ -195,7 +193,7 @@ _MAX_OPTION_LABEL = 128
 
 # How many observed values a snapshot renders. `forecast_values` is provider JSON and is
 # bounded nowhere -- `read_my_forecasts` accepts a 50,000-element vector, and rendering one
-# pushes the envelope past `_MAX_BODY` into the reduced form that names no values at all.
+# pushes the envelope past `MAX_BODY_LENGTH` into the reduced form that names no values at all.
 #
 # A *confirmed* row is unaffected and cannot reach this: every comparison that returns
 # `confirmed` has already required the observed vector to match a bounded expected one --
@@ -342,9 +340,9 @@ def _assert_identity_spaces_are_distinct() -> None:
                 "an identifier another minter in this package produces; these identity "
                 "spaces must not overlap"
             )
-    if len(probe) > _MAX_IDENTIFIER or KEY_LENGTH > _MAX_IDENTIFIER:
+    if len(probe) > MAX_IDENTIFIER_LENGTH or KEY_LENGTH > MAX_IDENTIFIER_LENGTH:
         raise LiveSubmissionError(
-            f"a derived identifier is longer than the {_MAX_IDENTIFIER}-character "
+            f"a derived identifier is longer than the {MAX_IDENTIFIER_LENGTH}-character "
             "ledger identifier limit"
         )
 
@@ -612,7 +610,7 @@ def _require_categories(value: object, field: str) -> tuple[tuple[str, float], .
         if len(label) > _MAX_OPTION_LABEL:
             # Refused here, before the post, because the cost of accepting it lands after
             # one: the label is evidence, it is stored twice over in the verification
-            # snapshot, and a snapshot that outgrows `_MAX_BODY` degrades to an envelope
+            # snapshot, and a snapshot that outgrows `MAX_BODY_LENGTH` degrades to an envelope
             # naming no values -- a `confirmed` row that cannot show what confirmed it.
             raise LiveSubmissionError(
                 f"payload.{field} names an option label longer than {_MAX_OPTION_LABEL} "
@@ -981,7 +979,7 @@ def build_verification_snapshot(
     is bounded nowhere upstream: label length and count by :data:`_MAX_OPTION_LABEL` and
     :data:`_MAX_CATEGORIES` (round 3), and the observed vector by
     :data:`_MAX_SNAPSHOT_VALUES` (round 4). Do not read those caps as belt-and-braces --
-    removing any one of them puts the maximal accepted envelope back over ``_MAX_BODY``,
+    removing any one of them puts the maximal accepted envelope back over ``MAX_BODY_LENGTH``,
     and a property test fails if you do.
 
     So the fallback below **is** reachable in principle, and that is exactly why it must
@@ -1026,7 +1024,7 @@ def build_verification_snapshot(
                 #
                 # Stored as **indices into `expected_labels`** rather than as the labels
                 # themselves. Round 3: writing the strings a second time doubled the one
-                # unbounded thing in the envelope, and a snapshot that outgrows `_MAX_BODY`
+                # unbounded thing in the envelope, and a snapshot that outgrows `MAX_BODY_LENGTH`
                 # degrades to an envelope naming no values -- so a `confirmed` row could
                 # lose the evidence it was confirmed by. The permutation is the whole of
                 # what the second list added, because a confirmation already requires the
@@ -1040,7 +1038,7 @@ def build_verification_snapshot(
         ),
     }
     rendered = _render_snapshot(envelope)
-    if rendered is not None and len(rendered) <= _MAX_BODY:
+    if rendered is not None and len(rendered) <= MAX_BODY_LENGTH:
         return rendered
     reduced = _render_snapshot(
         {
@@ -1233,7 +1231,7 @@ def _body_of(response: object) -> str | None:
         text = getattr(response, "text", None)
     except Exception:
         return None
-    return storable_text(text, _MAX_BODY)
+    return storable_text(text, MAX_BODY_LENGTH)
 
 
 def _headers_of(response: object) -> str | None:
@@ -1246,13 +1244,13 @@ def _headers_of(response: object) -> str | None:
     for name, value in items:
         if type(name) is not str or name.lower() not in _ALLOWED_RESPONSE_HEADERS:
             continue
-        cleaned = storable_text(value, _MAX_IDENTIFIER)
+        cleaned = storable_text(value, MAX_IDENTIFIER_LENGTH)
         if cleaned is not None:
             kept[name.lower()] = cleaned
     if not kept:
         return None
     rendered = _render_snapshot(kept)
-    return None if rendered is None or len(rendered) > _MAX_BODY else rendered
+    return None if rendered is None or len(rendered) > MAX_BODY_LENGTH else rendered
 
 
 def storable_text(value: object, limit: int) -> str | None:
@@ -1649,7 +1647,7 @@ class MetaculusSubmissionGateway:
             # column was the only place left; `refetch_outcome` says it now, in a
             # queryable field rather than in prose an auditor has to read to find.
             message = _MESSAGE_FOR_ERROR[classified] + f" ({type(error).__name__})"
-            error_message = storable_text(message, _MAX_BODY)
+            error_message = storable_text(message, MAX_BODY_LENGTH)
             status, body, headers = http_details(error)
         elif not verified:
             detail_code = result.detail_code
@@ -1673,9 +1671,9 @@ class MetaculusSubmissionGateway:
             http_status=status,
             response_body=body,
             response_headers=headers,
-            error_type=storable_text(error_type, _MAX_IDENTIFIER),
+            error_type=storable_text(error_type, MAX_IDENTIFIER_LENGTH),
             error_message=error_message,
-            refetched_forecast_snapshot=storable_text(snapshot, _MAX_BODY),
+            refetched_forecast_snapshot=storable_text(snapshot, MAX_BODY_LENGTH),
         )
         return LiveSubmissionOutcome(receipt=receipt, detail_code=detail_code)
 
@@ -2115,7 +2113,9 @@ def verify_uncertain_attempt(
         outcome="confirmed" if result.outcome == "confirmed" else "absent",
         observed_at_utc=stamped,
         refetched_forecast_snapshot=(
-            storable_text(observed_snapshot, _MAX_BODY) if result.outcome == "confirmed" else None
+            storable_text(observed_snapshot, MAX_BODY_LENGTH)
+            if result.outcome == "confirmed"
+            else None
         ),
     )
     try:
@@ -2320,16 +2320,19 @@ def _require_identifier(value: object, field: str) -> str:
     """Return storable, non-blank identifier text, or raise naming only the *field*.
 
     ``lifecycle._require_identifier``'s rule, re-spelled for the reason the four other
-    modules that restate it give, and pinned to them by **M1-608**: exact ``str`` type,
-    non-empty, within the 200-character ledger bound, non-blank under ``str.strip()``, no
-    U+0000, UTF-8 encodable. The encode probe is the load-bearing one -- ``sqlite3``
+    modules that restate it give -- each owns its own sanitized error type -- with the
+    *length* taken from ``bounds.MAX_IDENTIFIER_LENGTH`` rather than respelled (M1-608):
+    exact ``str`` type, non-empty, within the shared ledger bound, non-blank under
+    ``str.strip()``, no U+0000, UTF-8 encodable. The encode probe is the load-bearing one -- ``sqlite3``
     encodes text parameters as UTF-8, so a lone surrogate reaching a query raises a raw
     ``UnicodeEncodeError`` quoting the offending character.
     """
     if type(value) is not str or not value:
         raise LiveSubmissionError(f"{field} must be a non-empty string")
-    if len(value) > _MAX_IDENTIFIER:
-        raise LiveSubmissionError(f"{field} is longer than the {_MAX_IDENTIFIER}-character limit")
+    if len(value) > MAX_IDENTIFIER_LENGTH:
+        raise LiveSubmissionError(
+            f"{field} is longer than the {MAX_IDENTIFIER_LENGTH}-character limit"
+        )
     if not value.strip():
         raise LiveSubmissionError(f"{field} must not be blank")
     if "\x00" in value:
