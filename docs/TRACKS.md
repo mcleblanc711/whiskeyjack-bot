@@ -40,8 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-315 | feat/m1-315-live-paid-run | whiskeyjack-m1-315 | no | none | 2026-08-30 |
-| M1-608 | feat/m1-608-shared-identifier-bound | whiskeyjack-m1-608 | no | none | 2026-09-01 |
+| M1-314 | feat/m1-314-unusable-artifact-path | whiskeyjack-m1-314 | no | none | 2026-09-02 |
 *(rows above; each lands on its own branch as it starts — see Wave 11 below. Swept
 `M1-503` (merged, PR #52, 2026-08-30) — the row this table carried into Wave 10's tail is
 now on master and its branch is gone from `origin`. Three new claims replaced it, and two
