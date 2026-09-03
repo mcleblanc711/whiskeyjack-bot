@@ -737,12 +737,16 @@ def _attempt_question(
         if verdict == "no_evidence" or verdict == "stale_evidence":
             if config.forecast.fail_on_stale_research:
                 gate_detail_code = verdict
-            else:
+            elif config.forecast.flag_on_stale_research:
                 _LOGGER.warning(
                     "question %d flagged by the research sufficiency gate: %s",
                     question_id,
                     verdict,
                 )
+            # else: unreachable under a validated config. `ForecastConfig
+            # ._research_gate_is_never_silent` refuses `fail_on_stale_research` and
+            # `flag_on_stale_research` both false, so this branch has nowhere to fall
+            # through to -- a stale or empty packet is always either failed or flagged.
 
         # One unit: the row, its artifact and its validation (or validation-failed) event,
         # or none of them. T-903's round-1 finding 1, and `lifecycle.transaction` nests as a

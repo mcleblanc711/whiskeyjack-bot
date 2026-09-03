@@ -7679,3 +7679,25 @@ and the forecast hash, which *are* asked to replay-stably, do not depend on this
 all. Flagged as a risk rather than fixed because reading the per-run cutoff instead is a
 real alternative with its own tradeoff (a packet spanning several runs would then need a
 rule for combining their cutoffs) that this item's row does not ask it to resolve.
+
+### Round 1 — the flag flag was write-only
+
+CHANGES REQUESTED, one blocking finding: `flag_on_stale_research` was declared,
+threaded into the module docstrings, and never actually read. Both call sites' `else`
+branch fired whenever `fail_on_stale_research` was false, regardless of
+`flag_on_stale_research` — so a config setting both false still flagged, silently
+overriding the operator's own "don't even flag this" choice, and the acceptance
+criterion's "never pass silently" gave that combination no defined behavior to fall
+back to instead.
+
+Fixed at the boundary rather than at the call sites: `ForecastConfig
+._research_gate_is_never_silent` (a `model_validator(mode="after")`, alongside
+`_probability_bounds_ordered`) now refuses `fail_on_stale_research=false` and
+`flag_on_stale_research=false` together, so an accepted config always has a defined,
+non-silent outcome for a non-`sufficient` verdict. Both call sites were then corrected
+to actually branch on `flag_on_stale_research` (`elif config.forecast
+.flag_on_stale_research: ...`) rather than treating "not failing" as "must flag" — the
+validator makes the trailing `else` unreachable, and the comment there says so rather
+than leaving a silent fallthrough for a future reader to wonder about.
+`tests/unit/test_config.py::test_the_research_gate_cannot_be_silenced_entirely` and
+`..._accepts_every_other_combination` pin it.

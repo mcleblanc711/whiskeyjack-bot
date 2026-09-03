@@ -287,6 +287,21 @@ class ForecastConfig(_StrictModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _research_gate_is_never_silent(self) -> ForecastConfig:
+        # M1-504's round-1 finding: with both false, the gate's only two branches --
+        # fail, or flag-and-proceed -- both fail to run, and a stale-or-empty packet
+        # passes through to `validated` with no record that anyone looked. That is
+        # exactly what the acceptance criterion ("never pass silently") forbids, so the
+        # combination is rejected here rather than given a silent-by-default behavior
+        # the gate's own call sites would otherwise have to invent.
+        if not self.fail_on_stale_research and not self.flag_on_stale_research:
+            raise ValueError(
+                "forecast.fail_on_stale_research and forecast.flag_on_stale_research must "
+                "not both be false: a stale or missing research gate is never silent"
+            )
+        return self
+
 
 class NumericCalibrationConfig(_StrictModel):
     use_forecasting_tools_standardization: bool = True
