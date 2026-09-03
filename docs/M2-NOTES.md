@@ -2907,3 +2907,26 @@ The 251 existing tests across `test_submission_gateway.py`, `test_submission_liv
 regression evidence that the extraction is behaviour-preserving. Nothing in them was edited.
 
 No migration and no dependency: both claims in `docs/TRACKS.md` stay free.
+
+### Round 1 — approved, no findings
+
+Reviewed commit `a804735`, verdict APPROVE, zero blocking findings and no backlog candidates
+beyond the M1-322 strict xfail this section already documents. All eight nominated risk areas
+came back Safe, including the two that carried the item's actual argument: that the
+`"confirm_identical"` write/flush/fsync/link/compare sequence is preserved from the deleted
+`_write_or_confirm`, and that the surrogate-path failure reproduces on the diff base and gains
+no reachability here. The reviewer reran the focused regression set and both new suites and
+observed the same single expected xfail.
+
+**One round.** The third single-round approval on this project, after M1-202 and M1-506, and
+for the same reason both of those had: the request went out with the five headings and the
+falsifiable risk claims already written. Every one of the eight risk areas maps to a
+`Safe:` line in the response rather than to a finding — a reviewer who can see the option was
+already weighed does not propose it.
+
+The one deviation worth having named explicitly was the message-text change in the shared
+`mkdir` failure arm (`cannot create artifact directory` -> `cannot create the directory for
+{what}`), which is this branch's only behaviour change to the two pre-existing callers. It was
+stated as a deviation with the tree-wide grep showing nothing asserts the old string, and it
+came back as risk area 1, Safe. Left unstated it is exactly the shape of finding that costs a
+round.
