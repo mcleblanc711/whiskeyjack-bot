@@ -74,6 +74,10 @@ PAYLOAD: dict[str, Any] = {"probability_yes": 0.37, "comment": "none"}
 # record at `approved`.
 PAYLOAD_SHA = payload_sha256(PAYLOAD)
 
+# Low-entropy on purpose: a realistic-looking key would trip the repository's gitleaks
+# full-history scan on every unrelated PR (docs/LESSONS.md).
+PLANTED = "privateFAKE123456"
+
 
 def _key(payload: dict[str, Any] | None = None, *, question_id: int = 100) -> str:
     return submission_key(
@@ -379,7 +383,7 @@ def test_a_dry_run_receipt_cannot_become_a_submission_attempt(
 ) -> None:
     receipt = _gateway().submit(_request())
     with pytest.raises(GatewayError) as excinfo:
-        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
     assert "dry_run" in str(excinfo.value)
     assert ledger.execute("SELECT count(*) FROM submission_attempts").fetchone()[0] == 0
 
@@ -393,7 +397,7 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
     approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
     receipt = _gateway().submit(_request())
     with pytest.raises(GatewayError):
-        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
     # Hand the writer what the refusal withheld, and watch the record die.
     record_submission_attempt(
         ledger,
@@ -409,6 +413,7 @@ def test_the_refusal_is_what_stops_a_rehearsal_killing_the_record(
         ),
         occurred_at=OCCURRED,
         detail_code="internal_error",
+        secret_env_var_names=(),
     )
     assert current_status(ledger, "rec-1") == "failed"
 
@@ -434,7 +439,7 @@ def test_a_live_receipt_is_recorded_against_the_record_it_names(
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
     approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
     receipt = _live()
-    event = record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+    event = record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
     assert event.event_type == "submitted"
     assert event.forecast_record_id == "rec-1"
     assert current_status(ledger, "rec-1") == "submitted"
@@ -442,6 +447,34 @@ def test_a_live_receipt_is_recorded_against_the_record_it_names(
     assert stored is not None
     assert stored.forecast_record_id == "rec-1"
     assert stored.request_payload_sha256 == receipt.request_payload_sha256
+
+
+def test_the_gateway_forwards_secret_redaction_to_the_ledger_writer(
+    ledger: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-605: ``record_receipt`` is the only door into the ledger for a live receipt.
+
+    ``record_submission_attempt`` already redacts ``response_body`` before storing it; this
+    proves ``record_receipt`` actually forwards its ``secret_env_var_names`` rather than
+    silently supplying its own -- the wiring, not the redaction logic itself.
+    """
+    record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
+    approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
+    monkeypatch.setenv("FAKE_METACULUS_TOKEN", PLANTED)
+    receipt = replace(_live(), response_body=f"HTTP 401: Token {PLANTED}")
+    assert PLANTED in receipt.response_body  # type: ignore[operator]
+    record_receipt(
+        ledger,
+        receipt=receipt,
+        occurred_at=OCCURRED,
+        secret_env_var_names=["FAKE_METACULUS_TOKEN"],
+    )
+    stored_body = ledger.execute(
+        "SELECT response_body FROM submission_attempts WHERE attempt_id = ?",
+        (receipt.attempt_id,),
+    ).fetchone()[0]
+    assert PLANTED not in stored_body
+    assert "<redacted:FAKE_METACULUS_TOKEN>" in stored_body
 
 
 def test_a_receipt_cannot_be_recorded_against_a_different_record(
@@ -470,7 +503,7 @@ def test_a_receipt_cannot_be_recorded_against_a_different_record(
             calibration=CALIBRATION,
         )
 
-    record_receipt(ledger, receipt=_live("rec-1"), occurred_at=OCCURRED)
+    record_receipt(ledger, receipt=_live("rec-1"), occurred_at=OCCURRED, secret_env_var_names=())
 
     assert current_status(ledger, "rec-1") == "submitted"
     assert current_status(ledger, "rec-2") == "approved"
@@ -488,7 +521,7 @@ def test_the_recorded_row_drops_what_submission_attempts_has_no_column_for(
     record_validation(ledger, record_id="rec-1", occurred_at=OCCURRED)
     approve(ledger, record_id="rec-1", actor="owner", occurred_at=OCCURRED, calibration=CALIBRATION)
     receipt = replace(_live(), artifact_path="submissions/dry_run/x.json")
-    record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+    record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
     columns = {
         description[0]
         for description in ledger.execute("SELECT * FROM submission_attempts LIMIT 1").description
@@ -509,13 +542,13 @@ def test_the_recorded_row_drops_what_submission_attempts_has_no_column_for(
 )
 def test_the_writer_refuses_a_foreign_object(ledger: sqlite3.Connection, receipt: Any) -> None:
     with pytest.raises(GatewayError):
-        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
 
 
 def test_the_writer_refuses_an_unrecognized_mode(ledger: sqlite3.Connection) -> None:
     receipt = replace(_gateway().submit(_request()), mode="rehearsal")  # type: ignore[arg-type]
     with pytest.raises(GatewayError) as excinfo:
-        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
     assert "rehearsal" not in str(excinfo.value)
 
 
@@ -525,7 +558,7 @@ def test_a_ledger_refusal_arrives_as_this_modules_error(ledger: sqlite3.Connecti
     names no stored or caller-supplied value, and it is what makes a refusal actionable."""
     receipt = _live()  # rec-1 is still `draft`: `submitted` is not legal from there
     with pytest.raises(GatewayError) as excinfo:
-        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED)
+        record_receipt(ledger, receipt=receipt, occurred_at=OCCURRED, secret_env_var_names=())
     assert str(excinfo.value)
     assert excinfo.value.__cause__ is None
     assert isinstance(excinfo.value, SubmissionError)
@@ -549,11 +582,13 @@ def test_a_spent_idempotency_key_arrives_as_this_modules_error(
             calibration=CALIBRATION,
         )
 
-    record_receipt(ledger, receipt=_live("rec-1", "att-live-1"), occurred_at=OCCURRED)
+    record_receipt(
+        ledger, receipt=_live("rec-1", "att-live-1"), occurred_at=OCCURRED, secret_env_var_names=()
+    )
     # Same key -- `_request()` derives it from the same payload -- against another record.
     second = replace(_live("rec-2", "att-live-2"), idempotency_key=_key())
     with pytest.raises(GatewayError) as excinfo:
-        record_receipt(ledger, receipt=second, occurred_at=OCCURRED)
+        record_receipt(ledger, receipt=second, occurred_at=OCCURRED, secret_env_var_names=())
     assert isinstance(excinfo.value, SubmissionError)
     assert excinfo.value.__cause__ is None
     assert current_status(ledger, "rec-2") == "approved"

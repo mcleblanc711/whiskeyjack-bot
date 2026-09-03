@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -77,6 +77,7 @@ from whiskeyjack_bot.bounds import (
     MAX_IDENTIFIER_LENGTH,
     MAX_NOTE_LENGTH,
 )
+from whiskeyjack_bot.redaction import redact_secrets
 
 # The seven states of 001's `forecast_records.status` CHECK.
 LifecycleStatus = Literal[
@@ -501,6 +502,21 @@ def _require_text(value: object, field: str, *, max_length: int) -> str:
 
 def _require_optional_text(value: object, field: str, *, max_length: int) -> str | None:
     return None if value is None else _require_text(value, field, max_length=max_length)
+
+
+def _redact_optional(value: object, secret_env_var_names: Sequence[str]) -> object:
+    """Redact a nullable free-text field before it is bounded or stored (M1-605).
+
+    Applied before ``_require_optional_text``'s length check, not after: redaction can only
+    grow text (a secret value becomes ``<redacted:NAME>``), and bounding the *pre*-redaction
+    text would let a length check clip a marker the writer just produced.
+
+    Passes anything that is not exactly a ``str`` through unchanged -- including ``None`` --
+    so a malformed ``attempt`` field still reaches ``_require_optional_text``'s own type gate
+    and raises the module's sanitized error, rather than this helper raising a raw
+    ``TypeError`` out of a public boundary first.
+    """
+    return redact_secrets(value, secret_env_var_names) if type(value) is str else value
 
 
 def _require_identifier(value: object, field: str) -> str:
@@ -1009,6 +1025,7 @@ def record_submission_attempt(
     record_id: str,
     attempt: SubmissionAttempt,
     occurred_at: datetime,
+    secret_env_var_names: Sequence[str],
     detail_code: FailureCode | None = None,
 ) -> LifecycleEvent:
     """Append a submission attempt and its lifecycle event, atomically.
@@ -1055,6 +1072,13 @@ def record_submission_attempt(
 
     ``detail_code`` is required for both non-verified outcomes and refused for
     ``submitted``.
+
+    ``secret_env_var_names`` is redacted out of ``attempt.response_body``,
+    ``attempt.response_headers`` and ``attempt.error_message`` before either is bounded or
+    stored (M1-605): those three are raw HTTP text from a live submission attempt, the same
+    class of content ``logging_setup.ProviderResponseTextFilter`` already protects in logs,
+    and nothing upstream of this writer redacts them. Required rather than defaulted, so a
+    caller cannot silently skip redaction by omission.
 
     Persistence only. Nothing here contacts Metaculus; the gateways that do are M2-703
     and M2-704, and ``submission.enabled``/``dry_run`` remain what they are until then.
@@ -1113,17 +1137,23 @@ def record_submission_attempt(
         _require_sha256(attempt.request_payload_sha256, "attempt.request_payload_sha256"),
         _require_http_status(attempt.http_status, "attempt.http_status"),
         _require_optional_text(
-            attempt.response_body, "attempt.response_body", max_length=MAX_BODY_LENGTH
+            _redact_optional(attempt.response_body, secret_env_var_names),
+            "attempt.response_body",
+            max_length=MAX_BODY_LENGTH,
         ),
         _require_optional_text(
-            attempt.response_headers, "attempt.response_headers", max_length=MAX_BODY_LENGTH
+            _redact_optional(attempt.response_headers, secret_env_var_names),
+            "attempt.response_headers",
+            max_length=MAX_BODY_LENGTH,
         ),
         success,
         _require_optional_text(
             attempt.error_type, "attempt.error_type", max_length=MAX_IDENTIFIER_LENGTH
         ),
         _require_optional_text(
-            attempt.error_message, "attempt.error_message", max_length=MAX_BODY_LENGTH
+            _redact_optional(attempt.error_message, secret_env_var_names),
+            "attempt.error_message",
+            max_length=MAX_BODY_LENGTH,
         ),
         verified,
         _require_optional_text(

@@ -257,6 +257,7 @@ def test_the_submission_writer_raises_only_lifecycle_error(
                 attempt=attempt,
                 occurred_at=WHEN,
                 detail_code=detail_code,  # type: ignore[arg-type]
+                secret_env_var_names=(),
             )
         except LifecycleError:
             pass
@@ -314,6 +315,7 @@ def test_every_attempt_shape_has_exactly_one_recordable_outcome(
             ),
             occurred_at=WHEN,
             detail_code=None if (success and verified) else "refetch_missing",
+            secret_env_var_names=(),
         )
         # Exactly one, and the database stored it: the row is read back rather than the
         # return value trusted, because the return value is assembled from the stored row
@@ -362,7 +364,11 @@ def test_a_hostile_attempt_subclass_raises_only_lifecycle_error(
         )
         try:
             lifecycle.record_submission_attempt(
-                conn, record_id=valid_id, attempt=attempt, occurred_at=WHEN
+                conn,
+                record_id=valid_id,
+                attempt=attempt,
+                occurred_at=WHEN,
+                secret_env_var_names=(),
             )
         except LifecycleError as exc:
             assert PLANTED_SECRET not in str(exc)

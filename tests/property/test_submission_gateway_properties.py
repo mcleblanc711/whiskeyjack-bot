@@ -190,6 +190,7 @@ def test_the_ledger_guard_raises_only_this_modules_error(receipt_mode: str) -> N
             None,  # type: ignore[arg-type]
             receipt=replace(base, mode=receipt_mode),  # type: ignore[arg-type]
             occurred_at=FIXED,
+            secret_env_var_names=(),
         )
 
 

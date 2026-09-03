@@ -151,6 +151,7 @@ def _write_artifact(
             generation=generation,
             written_at_utc=written_at,
             retain=retain,
+            secret_env_var_names=config.secret_env_var_names(),
         )
     except ArtifactError as exc:
         _LOGGER.warning("raw model output artifact could not be written: %s", exc)

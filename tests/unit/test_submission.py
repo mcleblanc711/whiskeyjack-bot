@@ -370,6 +370,7 @@ def test_a_spent_key_is_read_back_and_then_refused(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
 
     summary = attempt_for_key(conn, key)
@@ -403,6 +404,7 @@ def test_the_key_the_derivation_mints_is_acceptable_to_the_real_writer(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     assert event.event_type == "submission_uncertain"
 
@@ -425,6 +427,7 @@ def test_the_same_key_cannot_create_two_attempts(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     # Narrowed to the writer's own error, and to its sanitized text: `Exception` would
     # have passed for an unrelated failure and proved nothing about the key
@@ -436,6 +439,7 @@ def test_the_same_key_cannot_create_two_attempts(
             attempt=_uncertain_attempt(key, attempt_id="att-2"),
             occurred_at=OCCURRED,
             detail_code="timeout",
+            secret_env_var_names=(),
         )
     assert "the ledger rejected this write" in str(excinfo.value)
     assert key not in str(excinfo.value)
@@ -457,6 +461,7 @@ def test_a_second_attempt_under_a_different_payload_is_not_blocked(
         attempt=_uncertain_attempt(first, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     second = submission_key_for_record(conn, record_id, request_payload_sha256=OTHER_PAYLOAD_SHA)
     assert second != first
@@ -477,6 +482,7 @@ def test_the_reader_sees_a_key_this_module_would_not_mint(
         attempt=_uncertain_attempt(legacy, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     assert attempt_for_key(conn, legacy) is not None
     with pytest.raises(SubmissionError, match="already been used"):
@@ -494,6 +500,7 @@ def test_a_summary_round_trips_through_the_persisted_form(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     summary = attempt_for_key(conn, key)
     assert summary is not None
@@ -841,6 +848,7 @@ def test_the_duplicate_refusal_never_echoes_the_key(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     with pytest.raises(SubmissionError) as excinfo:
         require_key_unused(conn, key)
@@ -1063,6 +1071,7 @@ def test_the_gated_seam_refuses_a_record_that_left_approved(
         attempt=_attempt("k-1", attempt_id="att-1", success=success, refetch=refetch),
         occurred_at=OCCURRED,
         detail_code=detail_code,  # type: ignore[arg-type]
+        secret_env_var_names=(),
     )
     assert current_status(conn, record_id) == expected_status
     # The history still says approved -- which is why the second check is not redundant.
@@ -1092,6 +1101,7 @@ def test_an_unresolved_uncertain_attempt_still_passes_the_gate(
         attempt=_attempt("k-1", attempt_id="att-1", success=True, refetch="absent"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     assert current_status(conn, record_id) == "approved"
     # `PAYLOAD_SHA`, not `OTHER_PAYLOAD_SHA`: since M2-707 an unauthorized payload is
@@ -1116,6 +1126,7 @@ def test_the_ungated_seam_still_serves_a_terminal_record(
         attempt=_attempt("k-1", attempt_id="att-1", success=False, refetch="absent"),
         occurred_at=OCCURRED,
         detail_code="http_error",
+        secret_env_var_names=(),
     )
     assert current_status(conn, record_id) == "failed"
     assert KEY_RE.match(
@@ -1135,6 +1146,7 @@ def test_the_status_refusal_names_only_the_closed_vocabulary(
         attempt=_attempt("k-1", attempt_id="att-1", success=False, refetch="absent"),
         occurred_at=OCCURRED,
         detail_code="http_error",
+        secret_env_var_names=(),
     )
     with pytest.raises(SubmissionError) as excinfo:
         submission_key_for_approved_record(conn, record_id, request_payload_sha256=PAYLOAD_SHA)
@@ -1244,6 +1256,7 @@ def test_a_spent_key_cannot_be_reserved(approved: tuple[sqlite3.Connection, str]
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     with pytest.raises(SubmissionError, match="already been used by a recorded submission"):
         _reserved(conn, record_id, key)
@@ -1428,6 +1441,7 @@ def test_a_consumed_reservation_is_not_abandoned(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     with pytest.raises(SubmissionError, match="consumed by a recorded submission attempt"):
         _abandon(conn, reservation)
@@ -1452,6 +1466,7 @@ def test_the_spent_test_reads_the_key_from_the_stored_row_not_the_object(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     # A lie about the key, which would make the spent test pass if the object were trusted.
     lying = replace_reservation(reservation, idempotency_key="wjsub-1-" + "f" * 64)
@@ -1748,6 +1763,7 @@ def test_the_trigger_refuses_a_key_a_recorded_attempt_already_spent(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     with pytest.raises(sqlite3.IntegrityError, match="already been used"):
         conn.execute(_RAW_RESERVATION, ("wjres-raw", key, record_id, 1, OCCURRED_TEXT, TS))
@@ -1819,6 +1835,7 @@ def test_the_trigger_refuses_releasing_a_reservation_an_attempt_consumed(
         attempt=_uncertain_attempt(key, attempt_id="att-1"),
         occurred_at=OCCURRED,
         detail_code="timeout",
+        secret_env_var_names=(),
     )
     with pytest.raises(sqlite3.IntegrityError, match="was not abandoned"):
         conn.execute(
