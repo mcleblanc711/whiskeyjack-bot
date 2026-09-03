@@ -50,6 +50,8 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import transaction
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 
+from tests.unit.records import FORECAST_CONFIG
+
 QUESTION_ID = 123
 POST_ID = 456
 TOURNAMENT = "minibench"
@@ -619,7 +621,9 @@ def test_appending_versions_never_moves_an_earlier_one(
         snapshots: dict[str, tuple[Any, ...]] = {}
         appended: list[ForecastRecord] = []
         for index in range(1, versions + 1):
-            record = append_forecast_version(conn, draft=_draft_for(index, criteria=criteria))
+            record = append_forecast_version(
+                conn, forecast_config=FORECAST_CONFIG, draft=_draft_for(index, criteria=criteria)
+            )
             for record_id, snapshot in snapshots.items():
                 assert stored_bytes(record_id) == snapshot, "an earlier version moved"
             snapshots[record.record_id] = stored_bytes(record.record_id)
