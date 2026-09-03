@@ -43,6 +43,18 @@ PLACEHOLDER_PREFIX = "REPLACE_WITH"
 # where the value is accepted; forecast.generate imports it rather than restating it,
 # so the schema bound and the spending-site refusal cannot drift apart.
 MAX_MODEL_INVOCATIONS = 2
+
+# The longest wall-clock bound the numeric CDF conversion may be given (M1-514). Same
+# shape and the same reason as MAX_MODEL_INVOCATIONS above: forecast.cdf imports it rather
+# than restating it, so the schema bound and the spending-site refusal cannot drift.
+#
+# It exists because a bound any config can lift is not a bound. The conversion calls into
+# forecasting-tools==0.2.92, whose _standardize_cdf scale search does not terminate on a
+# negative interior PMF -- it does not raise and it is not slow, it never returns -- so
+# `conversion_timeout_seconds: 86400` would silently restore the stopped run this item
+# exists to prevent. A measured normal conversion is 7.7ms, so 60s is four orders of
+# magnitude of headroom and still bounds a hang to something a run survives.
+MAX_CONVERSION_TIMEOUT_SECONDS = 60.0
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Question types the v1 pipeline supports; date/conditional are deferred (D20/D21).
@@ -285,6 +297,18 @@ class NumericCalibrationConfig(_StrictModel):
     max_adjacent_pmf: float = Field(0.2, gt=0, le=1)
     strict_validation: bool = True
     calibration_profile: Literal["identity"]
+    # M1-514: the wall-clock bound on one numeric CDF conversion. Lives on this block
+    # rather than on ModelConfig because it bounds *our* call into the SDK's conversion,
+    # not the provider request -- `model.timeout_seconds` is the transport bound and is
+    # enforced by litellm, while nothing enforced this one until now.
+    #
+    # No floor beyond gt=0. Any specific floor would transcribe the measured 7.7ms
+    # conversion cost into this repository, which is what M1-405 refused to do with the
+    # SDK's 0.25 wiggle factor so that a pin move has nothing here to invalidate. A bound
+    # set too low fails *closed* -- every numeric reply is refused, loudly, on the first
+    # conversion -- so the failure mode of the operator's own foot is a refusal and never
+    # a forecast built from an array nobody checked.
+    conversion_timeout_seconds: float = Field(10.0, gt=0, le=MAX_CONVERSION_TIMEOUT_SECONDS)
 
 
 class SubmissionConfig(_StrictModel):

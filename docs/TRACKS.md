@@ -41,16 +41,17 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M2-709 | feat/m2-709-shared-artifact-writer | whiskeyjack-m2-709 | no | none | 2026-09-02 |
-*(Swept `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707` (merged, PR #61,
-round-2 approve, 2026-09-02), `M1-315` (merged, PR #55, 2026-09-01), `M1-608` (merged,
-PR #57, r1 approve) and `M1-314` (merged, PR #58, 2026-09-02) — all landed and their
-branches are gone from `origin`. `M2-709` is the last item on Lane 3's debt queue —
-one atomic create-or-fail helper shared by every artifact writer. **Its row names a
-duplication that was already half removed**: `research/artifacts._write_new_file` does not
-exist, because M1-406 extracted it to `whiskeyjack_bot/artifacts.py` as public
-`write_new_file` when it added a second artifact kind. The surviving copy was
-`submission_gateway._write_or_confirm` alone, and the item is the part M1-406 could not do —
-parameterizing the two ways the gateway differs, its EEXIST policy and its error type.)*
+*(Swept `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
+`origin` because `finish-item.sh` has not run yet; `scripts/tracks.py` ignores a merged
+branch either way), `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707`
+(merged, PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58). `M2-709` is
+the last item on Lane 3's debt queue — one atomic create-or-fail helper shared by every
+artifact writer. **Its row names a duplication that was already half removed**:
+`research/artifacts._write_new_file` does not exist, because M1-406 extracted it to
+`whiskeyjack_bot/artifacts.py` as public `write_new_file` when it added a second artifact
+kind. The surviving copy was `submission_gateway._write_or_confirm` alone, and the item is
+the part M1-406 could not do — parameterizing the two ways the gateway differs, its EEXIST
+policy and its error type.)*
 
 ## Planned next wave
 

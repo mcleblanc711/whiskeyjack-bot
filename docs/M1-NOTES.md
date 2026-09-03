@@ -7355,3 +7355,225 @@ migration's notes). So `test_shared_bounds.py`'s eight-layer parity test compare
 `record_id`/`tournament_id`/`attempt_id` against real `forecast_records` triggers and leaves
 `retrieval_run_id` out; that field's only parity witness is the two-Python-copies agreement
 test in `test_lifecycle_properties.py`.
+
+## M1-514 — Bound the numeric conversion in time
+
+M1-503 shipped `_standardization_can_converge` and deferred the general answer here: *"a
+wall-clock bound on the conversion, so that an unknown non-terminating input degrades to a
+recorded failure rather than a stopped run."* That is what this item is, and nothing more —
+the guard stays, the conversion is unchanged, and the only new behaviour is what happens
+when the SDK does not come back.
+
+The defect, restated because everything below turns on its exact shape:
+`forecasting-tools==0.2.92`'s `NumericDistribution._standardize_cdf` finds its scale with
+`lo = hi = scale = 1.0; while capped_sum(hi) < 1.0: hi *= 1.2`. A negative interior PMF
+makes that sum fall as `scale` grows, so `hi` reaches `inf`, `inf * 1.2` is still `inf`,
+`capped_sum(inf)` is `-inf`, and the loop has no exit. **It does not raise and it is not
+slow. It never returns.** A slow conversion would have been caught by any timeout anywhere;
+this one is invisible to every mechanism that measures duration of a call that finishes.
+
+### Measurements — every design claim below was executed, not reasoned
+
+| | result |
+|---|---|
+| normal `get_cdf()` | 7.7 ms |
+| `SIGALRM` against the real hanging input | interrupted at the deadline; next conversion 7.9 ms, process healthy |
+| a `BaseException` from the handler | propagated through the SDK **and past a bare `except Exception:`** |
+| `signal.signal` off the main thread | `ValueError: signal only works in main thread of the main interpreter` |
+| `setitimer` while an outer 5.0 s timer had run 0.5 s | returns `(4.50, 0.0)` — the outer remaining time is exact |
+| one leaked spinning daemon thread | ledger I/O **1183x slower**: 300 SQLite commits, 4 ms → 5.1 s |
+| `import forecasting_tools` | 10.6 s |
+| default `multiprocessing` start method here | `fork`, 8 CPUs |
+
+### Decision — a `SIGALRM` interval timer around the SDK section, and fail closed
+
+`forecast/cdf._bounded` installs a handler and an interval timer for the duration of
+`_distribution` → `_standardization_can_converge` → `_values`, and converts an expiry into
+`NumericCdfTimeoutError`. `_require_question` and `_array_problems` stay outside it: they are
+ours and pure, and bounding them would only widen the window in which a caller's own
+deadline is suspended.
+
+Where the timer cannot be installed — off the main thread, or on a platform without
+`setitimer` — the conversion is **refused**, not run. That is the whole of "fail closed"
+and it is the part most worth arguing for, because the tempting alternative is to convert
+unbounded and log a warning. A bound that is silently absent is worse than one that is
+loudly missing: it looks identical to a working bound right up until the run stops.
+`generate_forecast` asks the same question in its preflight, before the first billable call,
+so the refusal costs nothing and lands where this module's contract says every raise lands.
+
+### Decision — `_Expired` derives from `BaseException`, and this is not fastidiousness
+
+`_distribution`, `_values` and `_standardization_can_converge` each swallow `Exception` on
+purpose: an SDK refusal is a problem with the *reply*, and the SDK's messages quote the
+values, so they are caught broadly and never chained. An expiry raised as an ordinary
+exception is caught by **exactly those handlers** and comes back as `_NOT_CONVERTIBLE` — a
+repair turn on a timeout. The run would continue, the model would be asked to fix a
+non-terminating scale search, a second call would be billed, and the ledger would record
+`schema_invalid` for a conversion that never terminated. Every one of those is wrong and
+none of them is visible from outside the module.
+
+`test_a_timeout_is_not_laundered_into_a_repair_turn` is the mutation check: flipping the base
+class to `Exception` must fail it.
+
+### Decision — the guard stays as the fast path; the bound is the backstop
+
+The acceptance criterion asks which survives and why. Both do, and they are not redundant:
+the guard is deterministic, costs one interpolation (14 ms measured on the known inputs), and
+produces a repair turn the model can act on; the bound costs the whole configured deadline
+and produces a terminal `timeout` with no repair. Keeping the guard means the two *known*
+hanging inputs still cost one repair call rather than one dead question. The bound is for
+the input nobody has found.
+
+### Deviation — the conversion only, not the forecast path as a whole
+
+The backlog row allows either. The conversion is the only unbounded synchronous compute on
+the forecast path: `GeneralLlm.invoke` is bounded by `model.timeout_seconds` inside the SDK,
+research has its own transport timeouts, and everything else is our own pure Python. That is
+checkable rather than asserted — the import-graph probe already establishes that `generate`
+and `cdf` are the only forecast modules permitted to reach `forecasting_tools`. An outer
+bound over the whole path would also double-bound the provider call and make
+`detail_code="timeout"` ambiguous about *what* timed out.
+
+### Rejected — a daemon worker thread with `join(deadline)`
+
+The obvious portable mechanism, and the one M1-503's own regression test used. A thread
+cannot be killed, so it bounds the caller and leaves the runaway loop spinning for the life
+of the process. Measured: one such spinner takes 300 ledger commits from 4 ms to 5.1 s, a
+factor of 1183, because a CPU-bound thread and a thread doing many short GIL round-trips
+convoy against each other. A run that "continues" at that rate has stopped — which is
+precisely the outcome this item's criterion is about, reintroduced by the fix. The two tests
+that used the worker-thread harness now use `tests/conftest.py`'s `deadline` fixture, which
+is strictly better here: the production bound suspends and restores it, so a regression in
+*either* the guard or the bound fails as an assertion rather than hanging.
+
+### Rejected — a subprocess
+
+The only other mechanism that can truly cancel the work. `import forecasting_tools` measures
+10.6 s, paid again on every worker the pool replaces after a kill, so `spawn` and `forkserver`
+are both out. The default start method here is `fork`, which would inherit the ledger's open
+SQLite WAL connection into the child — not a thing to do quietly on this project.
+
+### Rejected — an arbitrary floor on `conversion_timeout_seconds`
+
+`gt=0` and a ceiling, no floor. Any specific floor would transcribe the measured 7.7 ms
+conversion cost into this repository, which is what M1-405 refused to do with the SDK's 0.25
+wiggle factor so that a pin move has nothing here to invalidate. A bound set too low fails
+*closed* — every numeric reply refused, loudly, on the first conversion — so the operator's
+own foot costs a refusal and never a forecast built from an array nobody checked. The
+**ceiling** is a different case and does exist (`MAX_CONVERSION_TIMEOUT_SECONDS = 60.0`,
+`config.py`): it is our policy bound, not a transcription, and `MAX_MODEL_INVOCATIONS`'
+argument applies unchanged — `conversion_timeout_seconds: 86400` is the stopped run with
+extra steps.
+
+### Deferred (do not read the absence as an omission)
+
+- **No migration, and that shaped the design rather than being a convenience.** `timeout` is
+  already a member of `PreForecastFailureCode` *and* of `004_pipeline_failure_events.sql`'s
+  `detail_code` CHECK, so a cut-off conversion reaches `pipeline_failure_events` with no
+  schema change and no change to `pipeline_live.py`, which already reads
+  `generation.failure_code` straight through. A new vocabulary member would have meant
+  rebuilding an append-only table — the operation M2-711 refused. Asserted in
+  `test_the_timeout_code_is_one_the_ledger_can_already_store` rather than claimed here.
+- **`_standardization_can_converge` still reaches a private SDK method.** M1-503 named that
+  as part of what this row would answer. It is not answered: the bound makes the guard
+  *survivable* if a pin move breaks it — a broken guard now costs a deadline instead of the
+  run — but the reach itself is unchanged, and removing it means either accepting the
+  timeout cost on the two known inputs or upgrading past the defect.
+- **M0-002 pins 0.2.92 and CI fails on drift**, so upgrading past the defect remains a
+  decision rather than an action. Nothing here forecloses it; the bound is keyed on no
+  version-specific constant, so a pin move changes what it *runs*, not what it asserts.
+- **`run_limits.max_parallel_questions > 1` is not implemented here.** See the standing risk.
+
+### Standing risk — numeric forecasting is now main-thread-and-POSIX-only
+
+The bound is a process-global signal handler and interval timer, so numeric conversion
+requires the main thread of the main interpreter and a platform with `setitimer`. Both are
+true of every path in this repository today — nothing in `src/` is async, `pipeline.py` and
+`pipeline_live.py` call `generate_forecast` from the main thread, and
+`run_limits.max_parallel_questions` is 1 and refused above that — but the constraint is real
+and it is new.
+
+Whoever implements parallel questions on threads will meet it as a refusal at the preflight,
+before any spend, with a message that names the reason. That is the intended outcome and the
+reason "fail closed" was chosen over a thread fallback: the alternative design would have let
+that lane run unbounded and discover the problem as a stopped run months later. The two
+tests that pin it are
+`test_a_numeric_question_off_the_main_thread_is_refused_before_any_spend` and
+`test_a_binary_question_off_the_main_thread_still_generates` — the second is there because
+the one-line way to get the scoping wrong is to hoist the check above the `isinstance` and
+refuse binary work that never needed a bound.
+
+### Standing risk — the bound is on the mechanism, not on a proof
+
+Same shape as the guard it backs up. `_bounded` guarantees that the conversion returns
+control in bounded time; it does not guarantee that every non-terminating input is *rare*.
+If some common percentile shape hangs, the run degrades to one dead question per occurrence
+rather than one stopped run — which is the criterion, and is also the point at which the
+right answer would be to find the input and refuse it deterministically, as M1-503 did twice.
+
+### Round 1 — the handoff window, and why the first fix was not enough
+
+The cross-model review returned CHANGES REQUESTED with one blocking finding, and it was in the
+part of `_bounded` I had already named as the claim I was least able to test. I had reasoned
+about the **teardown** window — a signal delivered before the timer is disarmed, landing during
+cleanup — and closed it with the `armed` flag. I had not reasoned about the **handoff** window
+at the other end.
+
+`_bounded` installs `expire` *before* `setitimer` replaces the caller's timer. For that moment
+a `SIGALRM` is live against our handler while it still belongs to a deadline the *caller* owns
+and may already be due — `tests/conftest.py`'s own fixture is exactly such a caller, so this
+needs no malicious operator and no hostile local state. With `armed` raised from the start,
+that signal raised `_Expired` outside the protected region. Reproduced by execution before any
+fix was written, and it was worse than the finding stated: not only did `_Expired` escape as a
+`BaseException` past `generate._run_attempts` — stopping the batch with no `timeout` recorded,
+the exact outcome this item exists to prevent — but the cleanup never ran, so **the caller's
+handler stayed clobbered by ours for the rest of the process**.
+
+**The first fix stopped the escape and was still wrong.** Moving the installation inside the
+protected region and starting `armed` down meant nothing escaped, but the caller's alarm was
+then *swallowed*: `previous_handler` was bound from `signal.signal`'s return value, and the
+signal arrives before that assignment runs, so `expire` saw `None` in exactly the window it
+exists to cover. Silently dropping a deadline the caller owns is the same class of defect as
+disarming their timer at teardown, which this file already argues against two sections above.
+Reading the handler with `getsignal` **before** installing is what makes the delegation real.
+
+So the final shape is three rules rather than one: the flag starts down; a signal arriving
+before we own the timer is handed back to the caller's handler; and the flag is raised before
+`setitimer` rather than after, because the opposite order leaves a window in which *our* timer
+can fire and be delegated away — a conversion that then runs unbounded, which is a fail-open
+where this is merely a misattribution.
+
+`test_a_signal_arriving_in_the_installation_window_is_handed_back_not_dropped` pins all three,
+and the two mutations discriminate: arming from the start fails it with a misattributed
+`NumericCdfTimeoutError`, and binding `previous_handler` from the return value fails it with
+the alarm eaten. Asserting only the absence of an exception would have passed the second one.
+
+**Process note.** Writing risk area 1 as "this is the claim I am least able to test" is what
+got it read closely; the reviewer's reproduction is the test I could not construct. That is the
+deliberate-choices mechanism working as `docs/LESSONS.md` describes, in the direction that
+costs a round rather than saves one — and it is the right direction.
+
+### Round 2 — approve, prior finding closed
+
+`3b80212`, round-2 verdict APPROVE: the blocker closed, no new blocking findings, no
+non-blocking observations, and all nine risk areas returned Safe. Two rounds, which is the
+M1-202/M1-401 shape rather than the M1-305 one, and the thing that bought it is visible in
+which claims the reviewer engaged with: round 1's finding landed exactly on the risk area the
+request had flagged as the one I was least able to test, and round 2's confirmation is
+enumerated against the same numbered claims rather than re-derived.
+
+Worth recording for the next item that installs process-global state: the useful move was
+writing 1a/1b/1c as three *separate* claims about one function, including 1c, which says
+plainly that I could not construct an execution witness for a sub-microsecond ordering
+window and was reasoning instead. Stating that got it checked rather than assumed.
+
+### Standing risk — a suspended outer deadline
+
+`_bounded` suspends any timer the caller already owns and restores it with the elapsed time
+deducted. During one conversion, a caller's own deadline therefore cannot fire — bounded by
+`conversion_timeout_seconds`, so at most 10 s at the committed default. Restoring it at its
+original value instead would push the caller's deadline out on every conversion, and
+restoring nothing would disarm it silently; both were considered and the deduction is the
+only one of the three that composes. `test_an_outer_deadline_comes_back_with_the_elapsed_time_deducted`
+pins it, and it is not hypothetical — `tests/conftest.py`'s own `deadline` fixture is exactly
+such a caller.

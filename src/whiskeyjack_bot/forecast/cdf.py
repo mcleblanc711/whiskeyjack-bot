@@ -104,18 +104,36 @@ CLAUDE.md classes as untrusted. So every SDK call in this module is fenced and r
 ``from None``, and no problem string this module emits interpolates anything reached
 through ``forecast``, ``question`` or the SDK. M1-405 took this as a round-1 blocking
 finding; the argument is unchanged and the surface here is worse.
+
+**Every SDK call here runs under a wall-clock bound (M1-514).** ``_standardize_cdf`` can
+fail to *terminate* -- not raise, not run slowly, never return -- and until this item
+nothing on the forecast path imposed a deadline, so one percentile set stopped the whole
+run with no error, no failure event and no billing bound.
+:func:`_standardization_can_converge` is M1-503's deterministic refusal of the two inputs
+that were *found*; the bound is the general answer for the one that has not been. Both are
+kept, and the division between them is the point: the guard is the fast path and produces a
+repair turn the model can act on, while the bound is the backstop and produces a terminal
+``timeout`` with no repair. See :func:`_bounded` for the mechanism and what it costs, and
+:class:`_Expired` for why it is a ``BaseException``.
 """
 
 from __future__ import annotations
 
 import logging
+import signal
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import pairwise
 from math import isfinite
+from types import FrameType
+from typing import Any
 
 from forecasting_tools import NumericDistribution, Percentile
 
-from whiskeyjack_bot.config import NumericCalibrationConfig
+from whiskeyjack_bot.config import MAX_CONVERSION_TIMEOUT_SECONDS, NumericCalibrationConfig
 from whiskeyjack_bot.forecast.schema import (
     ForecastSchemaError,
     NumericForecastResponse,
@@ -171,6 +189,20 @@ _UPPER_ENDPOINT = (
     "the converted CDF must end at 1 for a question whose upper_bound is closed "
     "(offending input withheld)"
 )
+_CONVERSION_TIMED_OUT = (
+    "the numeric CDF conversion did not complete within the configured wall-clock bound "
+    "(offending input withheld)"
+)
+_CANNOT_BE_BOUNDED = (
+    "the numeric CDF conversion cannot be bounded in time on this thread; it is refused "
+    "rather than run unbounded"
+)
+
+# What ``_bounded`` restores an already-expired outer timer to. ``setitimer(..., 0.0)``
+# *disarms* a timer, so an outer deadline whose remaining time has run out during our
+# conversion must be re-armed with something small and positive to fire immediately --
+# handing back 0.0 would silently cancel the caller's own deadline instead.
+_IMMEDIATE = 1e-6
 
 
 class NumericCdfError(ForecastSchemaError):
@@ -184,6 +216,162 @@ class NumericCdfError(ForecastSchemaError):
     Carries the same sanitized ``problems`` list as its parent: a field path, a colon and a
     value-free message. Nothing here echoes model output, question fields or SDK text.
     """
+
+
+class NumericCdfTimeoutError(NumericCdfError):
+    """The conversion did not finish inside ``conversion_timeout_seconds`` (M1-514).
+
+    Subclasses :class:`NumericCdfError` for the reason that class gives for subclassing
+    ``ForecastSchemaError``: a caller handling the module's failures as one type keeps
+    working unchanged, and a caller that needs *this* outcome can name it.
+
+    ``forecast.generate`` is that caller. It needs the distinction because a timeout is the
+    one conversion outcome that must **not** become a repair turn -- the model cannot fix a
+    non-terminating scale search, so asking it to would buy a second billed call for
+    nothing. It maps this to ``failure_code="timeout"`` and stops the attempt loop.
+    """
+
+
+class _Expired(BaseException):
+    """Raised from the ``SIGALRM`` handler when the conversion's bound elapses.
+
+    **``BaseException`` rather than ``Exception``, and that is load-bearing rather than
+    fastidious.** :func:`_distribution`, :func:`_values` and
+    :func:`_standardization_can_converge` each swallow ``Exception`` deliberately -- an SDK
+    refusal is a problem with the *reply* and belongs in a repair turn, and the SDK's own
+    messages quote the values, so they are caught broadly and never chained. An expiry
+    raised as an ordinary exception would be caught by exactly those handlers and reported
+    as ``_NOT_CONVERTIBLE``: a repair turn on a timeout, which spends the second call this
+    module budgets on a condition no reply could repair, and loses the ``timeout``
+    classification the ledger needs. Deriving from ``BaseException`` puts it outside every
+    one of those handlers -- and outside any bare ``except Exception`` inside the pinned
+    package too, which was verified by execution rather than read.
+
+    Private and never raised past :func:`_bounded`, which converts it to
+    :class:`NumericCdfTimeoutError` at the module boundary. A ``BaseException`` escaping
+    into ``forecast.generate`` would bypass its attempt loop entirely.
+    """
+
+
+def can_bound_conversion() -> bool:
+    """Whether this thread can install the conversion's deadline.
+
+    ``signal.setitimer`` exists only on POSIX, and ``signal.signal`` raises ``ValueError``
+    off the main thread of the main interpreter. Asked rather than caught so the answer is
+    available to callers *before* they spend anything -- ``forecast.generate`` repeats this
+    in its own preflight, before the first billable call.
+    """
+    return hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+
+
+@contextmanager
+def _bounded(seconds: float) -> Iterator[None]:
+    """Run the enclosed SDK section under a wall-clock deadline, or raise.
+
+    **Why a signal and not a worker thread.** A thread cannot be killed, so a bound built on
+    ``Thread.join(timeout)`` bounds the *caller* and leaves the runaway loop spinning for the
+    life of the process. Measured on this project's own workload, one such spinner makes
+    ledger I/O about **1180x slower** -- 300 SQLite commits went from 4ms to 5.1s -- because
+    a CPU-bound thread and a thread doing many short GIL round-trips convoy against each
+    other. A run that "continues" at that rate has stopped, which is precisely the outcome
+    M1-514's acceptance criterion is about. ``SIGALRM`` interrupts the loop, reclaims the
+    CPU and leaves nothing behind; verified against the real non-terminating input, with the
+    next conversion in the same process still taking its ordinary 7.7ms.
+
+    **Why not a subprocess**, the other mechanism that can truly cancel the work:
+    ``import forecasting_tools`` measures **10.6s**, paid again on every worker the pool has
+    to replace after a kill, and the default start method here is ``fork``, which would
+    inherit the ledger's open SQLite WAL connection into the child.
+
+    **What it costs.** Installing a process-global signal handler and an interval timer for
+    the duration of one conversion. Both the handler *and* the previous timer are restored,
+    the latter with the elapsed time deducted, so a deadline the caller already owns is
+    suspended for the conversion rather than destroyed by it -- that is what lets this nest
+    under ``tests/conftest.py``'s own deadline fixture. ``setitimer`` returns the outer
+    timer's true remaining time, which was measured rather than assumed.
+
+    The caller is responsible for having checked :func:`can_bound_conversion`; this raises
+    :class:`NumericCdfError` rather than running unbounded if it has not.
+    """
+    if not can_bound_conversion():
+        raise NumericCdfError([f"{_PERCENTILES_LOC}: {_CANNOT_BE_BOUNDED}"])
+
+    # ``armed`` gates the *handler*, not the timer, and it closes two different races that
+    # a naive "install, then protect" ordering leaves open. Both were reachable; the second
+    # was a round-1 blocking finding.
+    #
+    # **Teardown.** Disarming the timer does not retract a signal the kernel has already
+    # delivered: it sits in CPython's pending-call flag until the eval loop next looks,
+    # which may be after this context manager has begun cleaning up.
+    #
+    # **Handoff.** Between installing ``expire`` and replacing the caller's timer with ours,
+    # any ``SIGALRM`` belongs to a deadline the *caller* already owned and may already be
+    # due -- ``tests/conftest.py``'s own fixture is exactly such a caller. With the flag
+    # raised from the start, that signal raised ``_Expired`` outside the protected region:
+    # it escaped as a ``BaseException`` past ``forecast.generate``'s attempt loop, and the
+    # cleanup never ran, so the caller's handler stayed clobbered by ours. That is the
+    # stopped run this bound exists to prevent, reintroduced by the bound itself.
+    #
+    # So the flag starts **down**, and a signal arriving before we own the timer is handed
+    # back to the caller's handler rather than swallowed or reinterpreted as our timeout.
+    # It is raised before ``setitimer`` rather than after, because the opposite order leaves
+    # a window in which *our* timer can fire and be delegated away -- a conversion that then
+    # runs unbounded, which is a fail-open where this is merely a misattribution.
+    armed = False
+    installed = False
+    previous_delay = previous_interval = 0.0
+    # Read **before** installing, not from ``signal.signal``'s return value. The signal that
+    # ``expire`` has to hand back can be delivered the instant the handler is installed,
+    # which is before the assignment of that return value has run -- so binding it there
+    # leaves ``expire`` looking at ``None`` in exactly the window it exists to cover, and
+    # the caller's deadline is silently dropped instead of delegated. Measured: with the
+    # return-value form the round-1 reproduction swallowed the caller's alarm.
+    previous_handler: Any = signal.getsignal(signal.SIGALRM)
+
+    def expire(signum: int, frame: FrameType | None) -> None:
+        nonlocal armed
+        if not armed:
+            # Not ours. A non-callable previous handler is ``SIG_DFL``/``SIG_IGN`` or a
+            # handler set from C; there is nothing to call, and killing the process on the
+            # caller's behalf from inside a conversion is not this module's decision.
+            if callable(previous_handler):
+                previous_handler(signum, frame)
+            return
+        armed = False
+        raise _Expired
+
+    started = time.monotonic()
+    try:
+        signal.signal(signal.SIGALRM, expire)
+        installed = True
+        armed = True
+        previous_delay, previous_interval = signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            yield
+        finally:
+            armed = False
+            if installed:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                # ``signal.signal`` returns ``None`` for a handler that was not set from
+                # Python, and refuses ``None`` as an argument. ``SIG_DFL`` is the honest
+                # restore for that case: it is what the C-level default already was.
+                signal.signal(
+                    signal.SIGALRM,
+                    previous_handler if previous_handler is not None else signal.SIG_DFL,
+                )
+                if previous_delay:
+                    remaining = previous_delay - (time.monotonic() - started)
+                    signal.setitimer(
+                        signal.ITIMER_REAL, max(remaining, _IMMEDIATE), previous_interval
+                    )
+    except _Expired:
+        _LOGGER.warning(
+            "numeric CDF conversion exceeded its wall-clock bound and was cut off (M1-514)"
+        )
+        # ``from None``: ``_Expired`` carries no text of its own, but the rule this module
+        # applies to the SDK's exceptions applies to its own -- a rendered traceback is a
+        # channel like any other, and this one would frame the SDK's locals.
+        raise NumericCdfTimeoutError([f"{_PERCENTILES_LOC}: {_CONVERSION_TIMED_OUT}"]) from None
 
 
 @dataclass(frozen=True)
@@ -234,11 +422,29 @@ def _require_question(
     reached this module without running the composed validation would otherwise get an
     unsatisfiable repair turn, which is the failure M1-404's round-1 finding was about.
     Neither number is rendered.
+
+    **M1-514 added two more, and they are about the caller rather than the question.**
+    ``NumericCalibrationConfig`` bounds ``conversion_timeout_seconds`` at load, so a value
+    above the ceiling means an ``AppConfig`` assembled some other way -- repeated here for
+    the reason ``generate.py`` repeats ``MAX_MODEL_INVOCATIONS``: a config object carries no
+    memory of which validator built it, and this is the bound that decides how long a
+    non-terminating conversion may stop the run for. The deadline's availability is checked
+    for the sharper reason: a thread that cannot install it would otherwise run the
+    conversion *unbounded*, which is the bound silently absent rather than loudly refused.
     """
     if not isinstance(calibration, NumericCalibrationConfig):
         raise NumericCdfError(["numeric_calibration: must be a NumericCalibrationConfig"])
     if not isinstance(question, CanonicalNumericQuestion):
         raise NumericCdfError(["question: must be a canonical numeric question"])
+    if not 0 < calibration.conversion_timeout_seconds <= MAX_CONVERSION_TIMEOUT_SECONDS:
+        raise NumericCdfError(
+            [
+                "numeric_calibration: conversion_timeout_seconds is outside the wall-clock "
+                "bound the conversion may be given (offending input withheld)"
+            ]
+        )
+    if not can_bound_conversion():
+        raise NumericCdfError([f"{_PERCENTILES_LOC}: {_CANNOT_BE_BOUNDED}"])
     if question.cdf_size != calibration.expected_cdf_points:
         raise NumericCdfError(
             [
@@ -505,8 +711,14 @@ def numeric_cdf_or_problems(
     repair.
 
     Raises :class:`NumericCdfError` only for a caller mistake -- a response, a calibration
-    config or a question of the wrong type, or a question no percentile set could satisfy.
-    Those are not problems with the model's output and must never become a repair turn.
+    config or a question of the wrong type, a question no percentile set could satisfy, or a
+    thread on which the wall-clock bound cannot be installed. Those are not problems with
+    the model's output and must never become a repair turn.
+
+    Raises :class:`NumericCdfTimeoutError` -- a subclass, so a caller handling the parent
+    needs no change -- when the SDK section does not finish inside
+    ``conversion_timeout_seconds``. That one *is* about this reply, and it is still not a
+    repair turn: see the class for why.
     """
     if not isinstance(forecast, NumericForecastResponse):
         # Exact category, not a duck-typed read: a response of another question type has no
@@ -515,21 +727,30 @@ def numeric_cdf_or_problems(
         raise NumericCdfError(["forecast: must be a numeric forecast response"])
     _require_question(question, calibration)
 
-    distribution = _distribution(forecast, calibration, question)
-    if distribution is None:
-        return None, [f"{_PERCENTILES_LOC}: {_NOT_CONVERTIBLE}"]
-    used = _percentiles_used(distribution)
-    if calibration.use_forecasting_tools_standardization and not _standardization_can_converge(
-        distribution
-    ):
-        # The liveness guard, and it must stay ahead of ``_values``: ``get_cdf`` does not
-        # reject the inputs below, it fails to terminate on them. See
-        # :func:`_well_formed_without_standardization` for the mechanism and why the guard
-        # is on that rather than on a list of triggers. Skipped when standardization is
-        # off, because then ``_values`` *is* the unstandardized path and the loop that
-        # hangs is never reached -- probing first would just convert twice for nothing.
-        return None, [f"{_PERCENTILES_LOC}: {_NOT_WELL_FORMED}"]
-    values = _values(distribution)
+    # Everything that reaches the SDK, and nothing that does not: ``_require_question``
+    # above and ``_array_problems`` below are ours and pure, so bounding them would only
+    # widen the window in which a caller's own deadline is suspended. M1-514.
+    with _bounded(calibration.conversion_timeout_seconds):
+        distribution = _distribution(forecast, calibration, question)
+        if distribution is None:
+            return None, [f"{_PERCENTILES_LOC}: {_NOT_CONVERTIBLE}"]
+        used = _percentiles_used(distribution)
+        if calibration.use_forecasting_tools_standardization and not _standardization_can_converge(
+            distribution
+        ):
+            # The liveness guard, and it must stay ahead of ``_values``: ``get_cdf`` does
+            # not reject the inputs below, it fails to terminate on them. See
+            # :func:`_standardization_can_converge` for the mechanism and why the guard is
+            # on that rather than on a list of triggers. Skipped when standardization is
+            # off, because then ``_values`` *is* the unstandardized path and the loop that
+            # hangs is never reached -- probing first would just convert twice for nothing.
+            #
+            # It stays even though ``_bounded`` now covers the same failure, because the
+            # two outcomes differ: this is deterministic, costs one interpolation, and
+            # gives the model a repair turn, where the bound costs the whole deadline and
+            # gives the question a terminal ``timeout``. Fast path first, backstop second.
+            return None, [f"{_PERCENTILES_LOC}: {_NOT_WELL_FORMED}"]
+        values = _values(distribution)
     if values is None:
         return None, [f"{_PERCENTILES_LOC}: {_NOT_CONVERTIBLE}"]
     problems = _array_problems(values, calibration, question)

@@ -81,6 +81,13 @@ numeric_calibration:
   strict_validation: true
   # No empirical recalibration is applied until resolved forecasts justify it.
   calibration_profile: "identity"
+  # Wall-clock bound on one numeric CDF conversion (M1-514). A measured normal conversion
+  # is 7.7ms on forecasting-tools==0.2.92, so this is generous by three orders of
+  # magnitude; it is here because that package's _standardize_cdf scale search does not
+  # terminate on some percentile sets the prompt itself asks for, and an unbounded
+  # conversion stops the whole run with no error and no failure event. Exceeding it
+  # records the question as a `timeout` pipeline failure and moves on. Hard ceiling 60.
+  conversion_timeout_seconds: 10.0
 
 submission:
   # These three are the committed safe values and stay that way. As of M2-704 a live
