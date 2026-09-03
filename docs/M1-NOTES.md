@@ -7553,6 +7553,20 @@ got it read closely; the reviewer's reproduction is the test I could not constru
 deliberate-choices mechanism working as `docs/LESSONS.md` describes, in the direction that
 costs a round rather than saves one — and it is the right direction.
 
+### Round 2 — approve, prior finding closed
+
+`3b80212`, round-2 verdict APPROVE: the blocker closed, no new blocking findings, no
+non-blocking observations, and all nine risk areas returned Safe. Two rounds, which is the
+M1-202/M1-401 shape rather than the M1-305 one, and the thing that bought it is visible in
+which claims the reviewer engaged with: round 1's finding landed exactly on the risk area the
+request had flagged as the one I was least able to test, and round 2's confirmation is
+enumerated against the same numbered claims rather than re-derived.
+
+Worth recording for the next item that installs process-global state: the useful move was
+writing 1a/1b/1c as three *separate* claims about one function, including 1c, which says
+plainly that I could not construct an execution witness for a sub-microsecond ordering
+window and was reasoning instead. Stating that got it checked rather than assumed.
+
 ### Standing risk — a suspended outer deadline
 
 `_bounded` suspends any timer the caller already owns and restores it with the elapsed time
