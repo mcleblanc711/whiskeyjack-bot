@@ -7701,3 +7701,58 @@ validator makes the trailing `else` unreachable, and the comment there says so r
 than leaving a silent fallthrough for a future reader to wonder about.
 `tests/unit/test_config.py::test_the_research_gate_cannot_be_silenced_entirely` and
 `..._accepts_every_other_combination` pin it.
+
+## M1-507 — Run the composed output validation on the persist path
+
+`append_forecast_version` ran M1-501's attribution rules only. Since M1-506 there is one
+composed entry point, `forecast.validate.validate_output`, that runs attribution *and* the
+type-specific checks, but the writer had no `ForecastConfig` to give it, so a probability
+outside the configured envelope, or (since M1-405) a malformed numeric percentile set,
+could be persisted even though `forecast.generate` refused both. `append_forecast_version`
+now takes a required keyword-only `forecast_config: ForecastConfig` and runs
+`validate.validate_output` instead of `attribution.validate_attribution_fields` directly.
+
+### Decision — required, not optional
+
+An optional parameter a caller could omit would reopen exactly the gap this item closes,
+for whoever omitted it — and the acceptance criterion is that the two paths' *accepted
+sets* are equal, which an optional default cannot guarantee. `persist_generation` threads
+`config.forecast` through; every other caller of the public writer must now supply one too.
+
+### Decision — caught at `ForecastSchemaError`, not at `ForecastOutputError`
+
+The first version of this change caught only `validate_output`'s own `ForecastOutputError`.
+That is wrong: `BinaryOutputError`, `NumericOutputError` and `MultipleChoiceOutputError`
+each subclass `ForecastSchemaError` directly, as siblings of `ForecastOutputError` rather
+than as its subclasses, and each is what a type-specific checker raises for a caller
+mistake it detects on its own argument — a malformed `forecast_config` (`binary._require_config`,
+`numeric.numeric_output_problems`), or a question no percentile set could satisfy
+(`numeric._require_question`). Catching only `ForecastOutputError` would have let any of
+those escape `append_forecast_version` as a raw, module-foreign exception type — the same
+defect this project has taken as a review finding twice, just reopened one layer further
+in. `_require_valid_output` catches `ForecastSchemaError`, the common base, instead.
+
+### Deviation — `numeric._require_question`'s raise now also fires at write time
+
+`_require_question` raises rather than reporting a repairable problem for a numeric
+question whose `zero_point` cannot be strictly below its `lower_bound` — the pinned SDK
+refuses such a question outright. Before this item nothing on the persist path called it,
+so a question with `zero_point == lower_bound` could still be written (only replay's
+re-parse, added by M1-406, ever caught it). `test_forecast_replay.py`'s
+`test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error` depended on that
+gap for its own setup — its premise was "the writer accepts this question; that is the
+premise" — and had to be rewritten to build the row directly (`assign_identity` plus the
+writer's own `_insert`, bypassing `append_forecast_version`) rather than through
+`persist_generation`, simulating the legacy-row shape the test was always actually about.
+No other caller of the public writer was found to depend on this gap; `scripts/gate.sh`'s
+full run is the search that would have found one.
+
+### Rejected — widening `numeric_output_problems`'s raise into a problem-list entry
+
+Turning `_require_question`'s raise into a reported problem so the writer's new refusal
+looked like an ordinary output problem was considered and rejected: the raise means "no
+percentile set could satisfy this question," which is a defect in the *question*, not a
+repairable defect in the *response* — conflating the two would let a caller retry with a
+different response and burn a billed call on something no response could fix. `generate.py`
+already treats it as a preflight raise for the same reason; this item does not change that
+boundary, only where else it is now reachable from.

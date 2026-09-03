@@ -44,6 +44,7 @@ import yaml
 
 from whiskeyjack_bot.approval import approve
 from whiskeyjack_bot.config import (
+    ForecastConfig,
     NumericCalibrationConfig,
     SupportedQuestionType,
     validate_config_data,
@@ -119,6 +120,16 @@ def _calibration(**overrides: Any) -> NumericCalibrationConfig:
 
 
 CALIBRATION = _calibration()
+
+
+def _forecast_config(**overrides: Any) -> ForecastConfig:
+    committed = _committed_config().forecast
+    if not overrides:
+        return committed
+    return committed.model_copy(update=overrides)
+
+
+FORECAST_CONFIG = _forecast_config()
 
 
 def _json_block(heading: str) -> str:
@@ -611,7 +622,9 @@ def test_only_the_payload_the_record_derives_can_reach_a_submission_key(tmp_path
             (RUN_ID, QUESTION_ID, TS, TS),
         )
         stored = append_forecast_version(
-            connection, draft=_draft(_numeric_question(), _response("Numeric schema"), "attempt-1")
+            connection,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(_numeric_question(), _response("Numeric schema"), "attempt-1"),
         )
         record_validation(connection, record_id=stored.record_id, occurred_at=OCCURRED)
 

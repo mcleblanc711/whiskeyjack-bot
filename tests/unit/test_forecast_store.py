@@ -47,6 +47,7 @@ from whiskeyjack_bot.forecast.store import (
     mint_record_id,
     read_forecast_record,
 )
+from whiskeyjack_bot.forecast.validate import output_problems
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     current_status,
@@ -54,7 +55,13 @@ from whiskeyjack_bot.lifecycle import (
     record_validation,
     transaction,
 )
-from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
+from whiskeyjack_bot.questions.model import (
+    CanonicalBinaryQuestion,
+    CanonicalNumericQuestion,
+    CanonicalQuestion,
+)
+
+from tests.unit.records import FORECAST_CONFIG
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_TEXT = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
@@ -90,6 +97,38 @@ def _response(**overrides: Any) -> ForecastResponse:
     return validate_forecast_response(payload, response_model_for(payload["question_type"]))
 
 
+def _numeric_response(**overrides: Any) -> ForecastResponse:
+    """The prompt's own numeric example, validated by the real validator (M1-507)."""
+    payload: dict[str, Any] = {
+        **json.loads(_json_block("Shared fields")),
+        **json.loads("{" + _json_block("Numeric schema") + "}"),
+    }
+    payload["question_id"] = QUESTION_ID
+    # The shared block's priors are binary-only; numeric refuses them.
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    payload.update(overrides)
+    return validate_forecast_response(payload, response_model_for(payload["question_type"]))
+
+
+def _disordered_percentiles() -> list[dict[str, float]]:
+    """The prompt's own nine levels, with the last two values swapped.
+
+    Schema-valid -- ``schema.NumericPrediction`` does not check ordering -- and refused by
+    ``numeric.numeric_output_problems``'s non-decreasing rule, which is the point: a response
+    ``forecast.generate`` would refuse and a direct caller of the writer could otherwise
+    persist.
+    """
+    percentiles: list[dict[str, float]] = json.loads("{" + _json_block("Numeric schema") + "}")[
+        "final_prediction"
+    ]["percentiles"]
+    percentiles[-1]["value"], percentiles[-2]["value"] = (
+        percentiles[-2]["value"],
+        percentiles[-1]["value"],
+    )
+    return percentiles
+
+
 def _question(**overrides: Any) -> CanonicalQuestion:
     fields: dict[str, Any] = {
         "question_id": QUESTION_ID,
@@ -98,6 +137,22 @@ def _question(**overrides: Any) -> CanonicalQuestion:
     }
     fields.update(overrides)
     return CanonicalBinaryQuestion(**fields)
+
+
+def _numeric_question(**overrides: Any) -> CanonicalNumericQuestion:
+    fields: dict[str, Any] = {
+        "question_id": QUESTION_ID,
+        "post_id": POST_ID,
+        "title": "How many things?",
+        "resolution_criteria": "Resolves to the number of things.",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "cdf_size": 201,
+    }
+    fields.update(overrides)
+    return CanonicalNumericQuestion(**fields)
 
 
 def _sources(*source_ids: str) -> tuple[SourceReference, ...]:
@@ -197,10 +252,10 @@ def _leaks(exc: BaseException) -> bool:
 def test_updating_a_question_appends_v2_and_v1_remains_byte_identical(
     conn: sqlite3.Connection,
 ) -> None:
-    v1 = append_forecast_version(conn, draft=_draft("attempt-1"))
+    v1 = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-1"))
     before = _raw(conn, v1.record_id)
 
-    v2 = append_forecast_version(conn, draft=_draft("attempt-2"))
+    v2 = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-2"))
 
     assert (v1.forecast_version, v1.parent_record_id) == (1, None)
     assert (v2.forecast_version, v2.parent_record_id) == (2, v1.record_id)
@@ -210,7 +265,10 @@ def test_updating_a_question_appends_v2_and_v1_remains_byte_identical(
 
 
 def test_a_long_chain_is_contiguous_and_singly_linked(conn: sqlite3.Connection) -> None:
-    records = [append_forecast_version(conn, draft=_draft(f"attempt-{i}")) for i in range(1, 6)]
+    records = [
+        append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft(f"attempt-{i}"))
+        for i in range(1, 6)
+    ]
     assert [record.forecast_version for record in records] == [1, 2, 3, 4, 5]
     assert [record.parent_record_id for record in records] == [None] + [
         record.record_id for record in records[:-1]
@@ -224,16 +282,21 @@ def test_every_earlier_version_is_untouched_by_every_later_one(conn: sqlite3.Con
     """
     stored: dict[str, tuple[Any, ...]] = {}
     for index in range(1, 5):
-        record = append_forecast_version(conn, draft=_draft(f"attempt-{index}"))
+        record = append_forecast_version(
+            conn, forecast_config=FORECAST_CONFIG, draft=_draft(f"attempt-{index}")
+        )
         for record_id, snapshot in stored.items():
             assert _raw(conn, record_id) == snapshot
         stored[record.record_id] = _raw(conn, record.record_id)
 
 
 def test_each_question_and_tournament_has_its_own_chain(conn: sqlite3.Connection) -> None:
-    first = append_forecast_version(conn, draft=_draft("attempt-1"))
+    first = append_forecast_version(
+        conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-1")
+    )
     other_question = append_forecast_version(
         conn,
+        forecast_config=FORECAST_CONFIG,
         draft=_draft(
             "attempt-2",
             question=_question(question_id=999),
@@ -241,7 +304,7 @@ def test_each_question_and_tournament_has_its_own_chain(conn: sqlite3.Connection
         ),
     )
     other_tournament = append_forecast_version(
-        conn, draft=_draft("attempt-3", tournament_id="other-cup")
+        conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-3", tournament_id="other-cup")
     )
     assert first.forecast_version == 1
     assert (other_question.forecast_version, other_question.parent_record_id) == (1, None)
@@ -251,7 +314,7 @@ def test_each_question_and_tournament_has_its_own_chain(conn: sqlite3.Connection
 def test_a_record_is_born_a_draft_and_moves_only_through_lifecycle_events(
     conn: sqlite3.Connection,
 ) -> None:
-    record = append_forecast_version(conn, draft=_draft())
+    record = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft())
     assert _raw(conn, record.record_id)[5] == "draft"
     assert current_status(conn, record.record_id) == "draft"
     record_validation(conn, record_id=record.record_id, occurred_at=GENERATED_AT)
@@ -265,7 +328,7 @@ def test_the_stored_hash_is_what_an_approval_binds_to(conn: sqlite3.Connection) 
     the stored one and aborts on a mismatch, so an approval that lands is proof the two
     agree. This is the one test that ties M1-602's hash to M1-603's binding.
     """
-    record = append_forecast_version(conn, draft=_draft())
+    record = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft())
     record_validation(conn, record_id=record.record_id, occurred_at=GENERATED_AT)
     summary = read_forecast_summary(conn, record.record_id)
     assert summary.forecast_sha256 == record_sha256(record)
@@ -293,7 +356,7 @@ def test_the_writer_composes_inside_a_callers_transaction(conn: sqlite3.Connecti
     """
     with pytest.raises(RuntimeError):
         with transaction(conn):
-            record = append_forecast_version(conn, draft=_draft())
+            record = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft())
             record_validation(conn, record_id=record.record_id, occurred_at=GENERATED_AT)
             raise RuntimeError("the caller's own failure, after both writes")
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 0
@@ -311,7 +374,9 @@ def test_a_response_citing_a_source_it_was_never_given_is_never_stored(
     """M1-501's gate, run one moment before the row becomes uncorrectable."""
     with pytest.raises(ForecastRecordError) as excinfo:
         append_forecast_version(
-            conn, draft=_draft(generation=_generation(sources=_sources("src-009")))
+            conn,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(generation=_generation(sources=_sources("src-009"))),
         )
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 0
     assert not conn.in_transaction
@@ -319,18 +384,74 @@ def test_a_response_citing_a_source_it_was_never_given_is_never_stored(
     assert "source_id" in str(excinfo.value)
 
 
+def test_the_writer_refuses_what_generate_refuses_binary_bounds(
+    conn: sqlite3.Connection,
+) -> None:
+    """M1-507's acceptance criterion, the binary half.
+
+    ``0.9995`` is a structurally valid probability -- ``Probability`` only requires
+    ``[0, 1]`` -- and outside ``FORECAST_CONFIG``'s ``min_probability``/``max_probability``
+    envelope, so ``binary.binary_output_problems`` refuses it. Driven through
+    :func:`forecast.validate.output_problems`, exactly what ``forecast.generate`` runs, and
+    through :func:`append_forecast_version`: the two paths' accepted sets must agree.
+    """
+    out_of_bounds = _response(final_prediction={"probability_yes": 0.9995})
+    problems = output_problems(
+        out_of_bounds, FORECAST_CONFIG, question=_question(), source_ids=["src-001", "src-002"]
+    )
+    assert problems, "generate's composed check accepted a probability outside the envelope"
+
+    with pytest.raises(ForecastRecordError) as excinfo:
+        append_forecast_version(
+            conn,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(generation=_generation(forecast=out_of_bounds)),
+        )
+    assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 0
+    assert "0.9995" not in str(excinfo.value)
+
+
+def test_the_writer_refuses_what_generate_refuses_numeric_ordering(
+    conn: sqlite3.Connection,
+) -> None:
+    """M1-507's acceptance criterion, the numeric half.
+
+    The declared nine levels with the last two values swapped -- schema-valid, since
+    ``schema.NumericPrediction`` does not check ordering, and refused by
+    ``numeric.numeric_output_problems``'s non-decreasing rule. Driven through
+    :func:`forecast.validate.output_problems`, exactly what ``forecast.generate`` runs, and
+    through :func:`append_forecast_version`: the two paths' accepted sets must agree.
+    """
+    question = _numeric_question()
+    malformed = _numeric_response(final_prediction={"percentiles": _disordered_percentiles()})
+    problems = output_problems(
+        malformed, FORECAST_CONFIG, question=question, source_ids=["src-001", "src-002"]
+    )
+    assert problems, "generate's composed check accepted a non-decreasing percentile set"
+
+    with pytest.raises(ForecastRecordError) as excinfo:
+        append_forecast_version(
+            conn,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(question=question, generation=_generation(forecast=malformed)),
+        )
+    assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 0
+    assert "42.0" not in str(excinfo.value)
+    assert "38.0" not in str(excinfo.value)
+
+
 def test_an_already_appended_record_cannot_be_appended_again(conn: sqlite3.Connection) -> None:
-    record = append_forecast_version(conn, draft=_draft())
+    record = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft())
     with pytest.raises(ForecastRecordError):
-        append_forecast_version(conn, draft=record)
+        append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=record)
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 1
 
 
 def test_one_attempt_succeeds_at_most_once(conn: sqlite3.Connection) -> None:
     """``004``'s partial unique index, met by the writer rather than described by it."""
-    append_forecast_version(conn, draft=_draft("attempt-1"))
+    append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-1"))
     with pytest.raises(ForecastRecordError) as excinfo:
-        append_forecast_version(conn, draft=_draft("attempt-1"))
+        append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-1"))
     assert "attempt_id" in str(excinfo.value)
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 1
     assert not conn.in_transaction
@@ -349,7 +470,7 @@ def test_a_forecast_record_cannot_claim_an_attempt_from_another_question(
             (TOURNAMENT, TIMESTAMP, TIMESTAMP),
         )
     with pytest.raises(ForecastRecordError):
-        append_forecast_version(conn, draft=_draft("attempt-1"))
+        append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-1"))
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 0
 
 
@@ -357,12 +478,16 @@ def test_a_forecast_record_cannot_claim_an_attempt_from_another_question(
     ("call", "match"),
     [
         pytest.param(
-            lambda c: append_forecast_version(object(), draft=_draft()),
+            lambda c: append_forecast_version(
+                object(), forecast_config=FORECAST_CONFIG, draft=_draft()
+            ),
             "Connection",
             id="not_a_connection",
         ),
         pytest.param(
-            lambda c: append_forecast_version(c, draft={"a": 1}), "Draft", id="not_a_draft"
+            lambda c: append_forecast_version(c, forecast_config=FORECAST_CONFIG, draft={"a": 1}),
+            "Draft",
+            id="not_a_draft",
         ),
         pytest.param(lambda c: read_forecast_record(c, 42), "string", id="record_id_not_text"),
         pytest.param(
@@ -394,20 +519,23 @@ def test_a_connection_not_opened_by_ledger_connect_is_refused(tmp_path: Path) ->
     initialize_ledger(database)
     raw = sqlite3.connect(database)
     with pytest.raises(ForecastRecordError, match="ledger.connect"):
-        append_forecast_version(raw, draft=_draft())
+        append_forecast_version(raw, forecast_config=FORECAST_CONFIG, draft=_draft())
 
 
 def test_no_refusal_echoes_the_content_it_refused(conn: sqlite3.Connection) -> None:
     attempts: list[Any] = [
         lambda: append_forecast_version(
             conn,
+            forecast_config=FORECAST_CONFIG,
             draft=_draft(
                 question=_question(title=SECRET),
                 generation=_generation(sources=_sources("src-009")),
             ),
         ),
         lambda: append_forecast_version(
-            conn, draft=_draft(attempt_id=SECRET, tournament_id="x" * 201)
+            conn,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(attempt_id=SECRET, tournament_id="x" * 201),
         ),
         lambda: read_forecast_record(conn, SECRET),
     ]
@@ -429,8 +557,8 @@ def test_no_refusal_echoes_the_content_it_refused(conn: sqlite3.Connection) -> N
 
 
 def test_a_stored_record_reads_back_as_what_was_returned(conn: sqlite3.Connection) -> None:
-    v1 = append_forecast_version(conn, draft=_draft("attempt-1"))
-    v2 = append_forecast_version(conn, draft=_draft("attempt-2"))
+    v1 = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-1"))
+    v2 = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-2"))
     assert read_forecast_record(conn, v1.record_id) == v1
     assert read_forecast_record(conn, v2.record_id) == v2
 
@@ -442,7 +570,7 @@ def test_an_unknown_record_id_is_refused_and_an_empty_chain_is_reported(
     with pytest.raises(ForecastRecordError, match="does not name"):
         read_forecast_record(conn, "01a02000-0000-7000-8000-00000000dead")
     assert latest_forecast_version(conn, question_id=QUESTION_ID, tournament_id=TOURNAMENT) is None
-    record = append_forecast_version(conn, draft=_draft())
+    record = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft())
     head = latest_forecast_version(conn, question_id=QUESTION_ID, tournament_id=TOURNAMENT)
     assert head == record
 
@@ -604,7 +732,7 @@ def test_the_chain_refuses_to_grow_past_the_largest_storable_version(
         conn.execute("DROP TRIGGER forecast_records_require_draft_on_insert")
     _insert_raw(conn, forecast_version=2**63 - 1, attempt_id="att-legacy-max")
     with pytest.raises(ForecastRecordError, match="largest version"):
-        append_forecast_version(conn, draft=_draft("attempt-new"))
+        append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft("attempt-new"))
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 1
     assert not conn.in_transaction
 

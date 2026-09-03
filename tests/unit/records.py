@@ -26,7 +26,7 @@ from typing import Any
 
 import yaml
 
-from whiskeyjack_bot.config import NumericCalibrationConfig, validate_config_data
+from whiskeyjack_bot.config import ForecastConfig, NumericCalibrationConfig, validate_config_data
 from whiskeyjack_bot.forecast.generate import ForecastGeneration, ModelSettings
 from whiskeyjack_bot.forecast.inputs import SourceReference
 from whiskeyjack_bot.forecast.record import ForecastRecord, build_forecast_record_draft
@@ -62,6 +62,25 @@ def calibration(**overrides: Any) -> NumericCalibrationConfig:
 
 
 CALIBRATION = calibration()
+
+
+def forecast_config(**overrides: Any) -> ForecastConfig:
+    """The committed `config.example.yaml`'s forecast config, not a hand-built one.
+
+    `append_forecast_version` requires one now (M1-507), and a test that invented its own
+    would stop noticing the committed `min_probability`/`max_probability` envelope drifting
+    away from what the pipeline is actually configured with -- the same argument
+    `calibration` above makes.
+    """
+    data = copy.deepcopy(
+        yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    )
+    data["model"]["name"] = "openrouter/test-model"
+    committed = validate_config_data(data).forecast
+    return committed.model_copy(update=overrides) if overrides else committed
+
+
+FORECAST_CONFIG = forecast_config()
 
 
 def _json_block(heading: str) -> str:
