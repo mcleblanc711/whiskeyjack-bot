@@ -49,6 +49,22 @@ body, a model reply -- can echo back a credential this project sent, the same cl
 here too: :func:`write_raw_model_output` redacts every configured credential's value out of
 ``request`` and each ``raw_responses`` entry before the envelope is written.
 
+**Redaction happens twice, deliberately, and the second is not redundant.**
+``forecast/generate.py::_run_attempts`` redacts each reply *before* it is either parsed or
+appended to ``raw_responses`` -- round 1 finding 1 against this module's first cut, which
+redacted only here. Redacting solely at the artifact-write boundary let the ledger record
+and the raw artifact derive from two different texts whenever a reply echoed a configured
+credential: the parsed forecast (and its hash) came from the original reply, while this
+writer stored the redacted one, so replay's re-parse of the stored text could no longer
+reproduce the record's hash, and the credential still reached the canonical record. Redacting
+at the source keeps the parse, the record and the artifact on one text. This writer redacts
+again anyway -- a caller-supplied ``generation.raw_responses`` is not guaranteed to have
+already passed through ``_run_attempts`` (``tests/acceptance/scenario.py`` builds one
+directly, for one), and a public writer that trusted every caller to have pre-redacted would
+be one caller mistake from silently storing a secret. Redaction is idempotent
+(``tests/property/test_redaction_properties.py::test_redaction_is_idempotent``), so applying
+it twice on the normal path costs nothing.
+
 **D24 is not touched.** What is stored is the provider's returned text -- the reply the
 parser was handed -- not a reasoning trace, and this module has no access to one. The
 canonical record is unaffected: ``record_json`` still carries no raw response, which

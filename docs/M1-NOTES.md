@@ -7837,3 +7837,32 @@ that is transformed before it reaches provider/HTTP text — base64-encoded in a
 encoding than this process holds in `os.environ` — would not match and would not be
 redacted. This is the same limitation `logging_setup.py`'s redaction has always carried;
 this item does not widen or narrow it, only extends the same primitive to two more sinks.
+
+### Decision — round 1, finding 1: redact at generation time, not only at the artifact boundary
+
+Round 1 (PR #69) found the first cut wrong: `write_raw_model_output` was the only place a
+model reply got redacted, and everything upstream of it — `forecast/generate.py::_parse`,
+`forecast/record.py::build_forecast_record_draft`, the record's own hash — ran on the
+*original* reply. For a reply that happened to echo a configured credential (the reviewer's
+example: the value sitting in `rationale_summary`), the canonical record and its hash were
+built from the unredacted text while the stored artifact held the redacted one. Two
+consequences, both real: the credential still reached `forecast_records` (the exact thing
+this item exists to prevent), and `replay_forecast` — which re-parses the *stored* artifact
+and compares its hash to the *record's* — could never reproduce the hash again, permanently.
+
+The fix moves the redaction one layer earlier: `forecast/generate.py::_run_attempts`
+redacts each reply immediately after `_invoke` returns it, before either `_parse` or
+`raw_responses.append` sees it. Every downstream consumer — the parsed `ForecastResponse`,
+the record built from it, the artifact — now derives from one text, so there is nothing
+left to disagree. `write_raw_model_output`'s own redaction stays (it is now normally a
+no-op, since `redact_secrets` is idempotent — `tests/property/test_redaction_properties.py`
+— but it is a public writer, and a caller who built a `ForecastGeneration` some other way,
+as `tests/acceptance/scenario.py` does, must not be trusted to have pre-redacted).
+`test_a_secret_echoed_in_a_reply_is_redacted_before_it_is_parsed`
+(`tests/unit/test_forecast_generate.py`) is the regression test, mutation-tested by
+temporarily removing the new redaction call to confirm it fails without the fix.
+
+The `request` half of the artifact was not moved: `replay_forecast` re-parses only
+`raw_responses[-1]` (confirmed by reading `forecast/replay.py`), never `request`, so nothing
+downstream ever compares a hash derived from `request` against anything else — there was no
+consistency gap on that side, only on `raw_responses`.
