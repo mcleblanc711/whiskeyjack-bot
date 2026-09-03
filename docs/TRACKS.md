@@ -40,15 +40,18 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-514 | feat/m1-514-wall-clock-bound | whiskeyjack-m1-514 | no | none | 2026-09-02 |
-*(Swept `M1-610` (merged, PR #62, round-2 approve, 2026-09-02) on top of master's own sweep of
-`M2-707` (PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58) — all landed and
-their branches are gone from `origin`. One sibling branch is live alongside this one and carries
-its own row on its own branch, which is why it is named here as prose rather than added as a
-row: `M2-709` (PR #60), the last item on Lane 3's debt queue. It touches neither
-`forecast/cdf.py`, `forecast/generate.py` nor `NumericCalibrationConfig`, so the collision this
-table is blind to — two branches widening one signature, the `M1-404`/`M1-405` shape recorded
-below — was checked for rather than assumed.)*
+| M2-709 | feat/m2-709-shared-artifact-writer | whiskeyjack-m2-709 | no | none | 2026-09-02 |
+*(Swept `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
+`origin` because `finish-item.sh` has not run yet; `scripts/tracks.py` ignores a merged
+branch either way), `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707`
+(merged, PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58). `M2-709` is
+the last item on Lane 3's debt queue — one atomic create-or-fail helper shared by every
+artifact writer. **Its row names a duplication that was already half removed**:
+`research/artifacts._write_new_file` does not exist, because M1-406 extracted it to
+`whiskeyjack_bot/artifacts.py` as public `write_new_file` when it added a second artifact
+kind. The surviving copy was `submission_gateway._write_or_confirm` alone, and the item is
+the part M1-406 could not do — parameterizing the two ways the gateway differs, its EEXIST
+policy and its error type.)*
 
 ## Planned next wave
 
@@ -73,11 +76,10 @@ cheaper problem.** Take it.
 before this section was rewritten — zero open PRs, zero worktrees — the same state Wave
 Eight described at its own boundary.
 
-Lane 3's debt queue is **almost** finished. `M1-609` ran first, then `M2-710` (merged PR
+Lane 3's debt queue is on its last item. `M1-609` ran first, then `M2-710` (merged PR
 #54, 2026-09-01, round-1 approval), `M1-608` (merged PR #57, round-1 approve), and `M1-314`
-(merged PR #58, 2026-09-02). Only `M2-709` remains, one branch, size S, Low priority. Pull
-it into whichever pane frees first below, rather than opening a fifth worktree —
-`wj-layout`'s `max_panes` is 4 for a reason (see below).
+(merged PR #58, 2026-09-02). **`M2-709` is live as of 2026-09-02** — the worktree is set up
+but work has not started.
 
 Wave 9, three lanes, run concurrently. **Lane 1 is two stages**: `M1-506` must be *on
 master* before `M1-404`/`M1-405` start, because both of those register a checker into the
@@ -213,7 +215,20 @@ worktrees). `M2-707` is deliberately **not** a fourth pane this wave — see bel
 | 2 — submission | `M2-710` | `whiskeyjack-m2-710` | Debt-queue continuation from Wave 9/10 (`M1-609` → `M2-710` → `M1-608` → `M1-314` → `M2-709`). Deps (`M1-607`, `M2-702`) both merged. S/Low, mechanical: align `submission._require_text` with `006_non_blank_identifiers.sql`'s trigger, restore the property strategy narrowed on the M2-703 branch. No schema change. |
 | 3 — testing | `T-901` | `whiskeyjack-t-901` | Golden schema fixtures. Deps (`M1-201`, `M1-501`) both merged. **Owner-split note:** CLAUDE.md assigns T-901–T-904 to Codex — independent acceptance-test authorship, written from spec without reading the implementation. Started here as Claude Code work by owner decision (2026-08-30); whoever works this branch should draft from `CODEX_HANDOFF.md`'s test-requirements section and the `M1-201`/`M1-501` schemas, not from reading `forecast/`'s current implementation, to preserve the independent-test intent. |
 
-**`M2-707` is queued behind `M2-710`, not started.** Both touch `submission.py`'s
+**`M2-707` is live as of 2026-09-02**, on `feat/m2-707-bind-approval-payload`, alongside
+`M2-709` on `feat/m2-709-shared-artifact-writer`. **The two overlap in one file and it is
+worth naming the regions now rather than at a merge conflict**, because this is the
+`M1-404`/`M1-405` shape the section below already warns about — two items editing one
+module, discovered independently at round 1. `M2-709` touches `submission_gateway.py` in
+five places and no others: the module docstring header, the import block, one paragraph of
+`write_live_artifact`'s docstring, the two artifact-writer call sites, and the deleted
+private `_write_or_confirm`/`_confirm_identical` block. It touches **no validator and no
+payload function**, which is where `M2-707` is expected to work, so the collision should be
+textual at worst. Whichever branch merges second should re-read the other's diff at its daily
+`sync-worktrees.sh --merge` rather than trusting this note, which was written before
+`M2-707` had any code.
+
+The original queueing reasoning, kept because it is still why they are worth watching. Both touch `submission.py`'s
 validators — `M2-710` refuses a bad identifier when deriving a key, `M2-707` binds an
 approval to the payload the key was derived from (decision `D33`) — the same shape of
 collision this file already documents for `M1-404`/`M1-405` (two items widening one shared

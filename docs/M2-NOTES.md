@@ -2703,3 +2703,230 @@ stateful caller-supplied mapping, which is outside CLAUDE.md's threat boundary (
 and their machine are non-malicious). `AuthorizedPayload` already carries the mapping, its
 exact canonical bytes and their digest together, so every path that derives a payload here
 hashes the bytes it posts. No change.
+
+## M2-709 — Share one atomic never-overwrite artifact writer
+
+Three modules create an artifact file with the same race-sensitive sequence: `mkstemp` in
+the destination's own directory, write, `flush`, `fsync`, then `os.link` into place, because
+`link` fails with `EEXIST` rather than clobbering. `os.replace` would be the usual atomic
+rename and is exactly wrong here: it clobbers, and an artifact is the record that a paid call
+happened.
+
+### Deviation — the row describes a duplication that was already half removed
+
+The backlog row says `research/artifacts._write_new_file` and
+`submission_gateway._write_or_confirm` are the same mechanism written twice. **That function
+no longer exists.** M1-406 extracted it into `whiskeyjack_bot/artifacts.py` as public
+`write_new_file(destination, payload, *, what)` when it added a second artifact kind, and
+`research/artifacts.py` and `forecast/artifacts.py` have both called it since. The surviving
+duplicate was one copy, not two: `submission_gateway._write_or_confirm` plus
+`_confirm_identical`, whose own docstring named this item as the one that would merge them.
+
+So the item's real content is not "extract a helper" — it is the part M1-406 could not do,
+because `submission_gateway` differs from the other two writers in exactly two places and a
+shared helper that picked one behaviour for everyone would be wrong for someone. Both
+differences are parameters now, which is what the row asked for. The criterion's "both
+artifact writers" reads as three writers and four entry points (`write_raw_responses`,
+`write_raw_model_output`, `write_dry_run_artifact`, `write_live_artifact`), and all four are
+driven through the shared code by the tests below.
+
+### Decision — the EEXIST policy is a closed vocabulary, validated at runtime
+
+`ExistingFilePolicy = Literal["refuse", "confirm_identical"]`, a module-level `Literal` alias
+rather than an `enum.Enum` per the project convention, checked against `get_args(...)` at the
+top of `write_new_file` and refused **before any I/O**.
+
+The runtime check is not decoration and is worth saying why. Every other branch in that
+function is a two-armed `if`, so an unrecognized policy would fall through into whichever arm
+happens to be written last — silently turning "never overwrite" into "sometimes", at the one
+function whose entire job is that it does not. Refusing an unknown member costs three lines
+and makes the failure mode "unwritable" rather than "wrong", which is this project's standing
+preference everywhere else.
+
+`"refuse"` is the default, so `research/artifacts.py` and `forecast/artifacts.py` call sites
+are unchanged and keep their behaviour by construction rather than by a re-reading of two
+merged modules.
+
+### Decision — the two policies differ in the pre-check too, and that is deliberate
+
+`"refuse"` keeps the `destination.exists()` check *before* the temp file is written, so the
+common case gets a message that says what happened. That check is not what makes the write
+safe — the `link` underneath it is — and it is a check that can be raced.
+
+`"confirm_identical"` deliberately does **not** pre-check. It lets the `link` fail with
+`EEXIST` and compares the bytes, which is one syscall sequence with no window between a check
+and a write. That is exactly the sequence `_write_or_confirm` ran before this branch, so the
+gateway's I/O is unchanged rather than rewritten — which is what lets the existing gateway
+tests stand as the regression evidence they are.
+
+Adding the pre-check to `"confirm_identical"` was considered as a tidiness win (it would skip
+writing a temp file when the destination already exists) and rejected: it would change a
+merged writer's syscall sequence to save one temp file on the *repeat* of a dry run, and it
+reintroduces a check-then-act window at the one place the design is arranged to avoid one.
+
+### Decision — the exception to raise is a parameter, not a wrap-and-relay
+
+`ArtifactError` is a bare `Exception`. `GatewayError` subclasses `submission.SubmissionError`
+so that a caller already handling the submission seam's error type handles it too. Neither
+class can absorb the other without widening what an existing `except` catches, so the shared
+helper cannot pick one. `write_new_file` takes `error: Callable[[str], Exception] =
+ArtifactError` and every failure arm raises it.
+
+### Rejected — catching `ArtifactError` in the gateway and re-raising `GatewayError(str(exc))`
+
+The smaller-looking option, and the one that keeps the shared signature at three parameters.
+It was rejected because it makes the gateway relay another module's message text verbatim.
+Today those messages hold only `what` (a caller literal) and a filesystem path (the settled
+M1-401 carve-out), so nothing leaks — but the coupling is to `artifacts.py`'s hygiene rule
+for *every message it ever adds*, enforced by nothing, and the project's own rule is that a
+module's error messages are that module's responsibility. A parameter makes each writer's
+error type a fact at the call site instead.
+
+### Rejected — renaming `write_new_file`
+
+It is a slight misnomer once one policy accepts an existing file. Renaming it edits two
+merged, reviewed modules and their tests for a change the criteria do not ask for; the
+docstring carries the two policies instead. Same convention as everything else in this
+section.
+
+### Rejected — moving `write_live_artifact` to `submission_live`
+
+`write_live_artifact` and `live_artifact_path` live in `submission_gateway` for one stated
+reason — they shared the private `_write_or_confirm`, and importing a sibling module's
+private helper is the wrong direction. **This branch removes that reason**, and the
+docstring that gave it would otherwise be left dangling. The functions stay anyway: moving a
+merged public entry point is a change every caller's import pays for and the criteria do not
+ask for. The module docstring now says that plainly rather than leaving the old justification
+in place, which would be a false statement about why the code is where it is.
+
+### Decision — the wiring witness is two-part, and each half catches what the other misses
+
+This is M1-608's lesson in a different shape: a parity test with no witness outside the
+program cannot detect a change to the shared thing. Two obvious tests are each insufficient,
+and it is worth recording that this was measured rather than argued:
+
+- `submission_gateway.write_new_file is artifacts.write_new_file` proves the name is the
+  shared one. Against a gateway rewired back to a private copy **it passes** — the import is
+  still there.
+- Patching `write_new_file` in each consumer's own namespace and asserting the spy ran proves
+  the writer routes through a function of that name in that module. Against a gateway that
+  rebinds the name to a local wrapper **it passes**.
+
+And the behavioural EEXIST parity tests pass against *both* of those mutants, because a
+faithful private copy behaves identically — which is the whole trap. Only the two together
+say what the criterion asks. Measured, against a gateway reverted to a private copy:
+
+| test | verdict |
+| --- | --- |
+| `test_every_writer_module_binds_the_shared_helper` | passed — missed it |
+| `test_a_second_write_of_different_content_is_refused_by_every_writer` | passed — missed it |
+| `test_the_policies_disagree_about_identical_content_and_that_is_the_point` | passed — missed it |
+| `test_every_writer_calls_the_helper_it_bound` | **failed — caught it** |
+
+### Deferred (do not read the absence as an omission)
+
+- **`M1-322`, filed off this item's property pass and reproduced by execution.** A lone
+  surrogate in `storage.artifact_root` makes `destination.parent.mkdir()` raise a raw
+  `UnicodeEncodeError` — a `ValueError`, not an `OSError` — so it escapes `except OSError`
+  and reaches the caller as something other than the module's own error type, in all three
+  writers. It is the writer-side twin of the reader-side defect **M1-314** closed, and the
+  fix is M1-314's: `except ValueError`, raising the caller's error with the path *withheld*,
+  because interpolating it is itself the failing operation. Pre-existing on master and not
+  amplified here — the same three writers, the same one code path. Pinned as a **strict**
+  xfail in `tests/unit/test_shared_artifact_writer.py`, so the day M1-322 lands the test
+  turns red and gets deleted rather than quietly passing. Note the reachable case is
+  `\ud800`, not `\udcc3`: the latter is a surrogateescape for a real byte and round-trips
+  through the filesystem fine, which is why probing this with the wrong codepoint reports no
+  defect.
+- **`submission_gateway._require_safe_key` / `_SAFE_KEY_RE` is a second, separate duplication
+  of `artifacts.require_safe_component`.** Both constrain a string that becomes a path
+  component; they are *not* the same constraint (`KEY_LENGTH`-exact hex versus 1–128
+  characters of `[A-Za-z0-9._-]`), so sharing them means deciding whether one rule can
+  express both — a different question from this item's, and a change to what a merged
+  validator accepts. Not filed as a row: unlike M1-322 it is not a defect, and the two rules
+  may be right to stay apart.
+- The `what` parameter is still a free-form string rather than a closed vocabulary. Three
+  callers each pass their own module-level `_WHAT` literal; making it a `Literal` would put
+  every artifact kind's noun in the shared module, which is the coupling `what` exists to
+  avoid.
+
+### Standing risk — one shared writer means one blast radius
+
+Before this branch, a defect in the atomic-write sequence had to be introduced twice to reach
+both the retrieval/model-output artifacts and the submission artifacts. Now it reaches all
+four entry points at once. That is the trade the item was filed to make — a second copy of a
+race-sensitive write is what drifts — but it is a real change in failure coupling and worth
+stating rather than implying. The mitigation is that the sequence now has a property pass and
+a ten-mutant kill record where before it had neither.
+
+### On the mutation pass
+
+Ten mutants, all killed; the survivor list was empty on both runs. `__pycache__` was cleared
+between every mutant — a same-size, same-second edit is served back stale otherwise, which is
+how a mutation pass reports a kill it did not make.
+
+Six against the unit suite: the gateway reverted to a private copy; the gateway rebinding
+`write_new_file` to a local wrapper; the policy ignored so everyone confirms; the `link` arm
+using `os.replace`; the policy vocabulary no longer validated; the caller's `error` ignored.
+
+Four against the property suite: the temp file left behind; the mismatch message echoing the
+differing content; `confirm_identical` accepting a different existing file; the pre-check
+message dropping the path.
+
+### On the property pass
+
+`tests/property/test_shared_artifact_writer_properties.py` is new — the shared module had no
+property pass before, and this item gives it two parameters, one of which decides whether a
+file is overwritten.
+
+**The pre-existing state is drawn as a mode, not as bytes.** Two independent `st.binary()`
+draws are never equal, so a `bytes | None` draw for the existing file would make every
+assertion about the identical-content arm vacuous — this project's top recurring property
+defect. `existing` is drawn from `("absent", "same", "different")` and derived from the
+payload. A 200-example coverage probe confirms all six `(mode, policy)` cells are reached
+(26–42 draws each), rather than the file asserting it.
+
+**Where the strategy stops.** The destination path is well-formed. Fuzzing it with hostile
+text finds M1-322 above, which is pre-existing and out of scope here; it is pinned as an
+executable xfail instead of being hidden inside a property's strategy filter, where a later
+reader would have no way to tell a deliberate boundary from an oversight.
+
+### Verification
+
+`tests/unit/test_shared_artifact_writer.py` (24 tests) is the criterion executed: the
+two-part wiring witness over all three consumer modules and all four writers, the EEXIST arm
+of every writer with a real pre-existing file, the two policies asserted as *differing* on
+identical content, `os.link`'s own `EEXIST` driven under both policies with the pre-check
+defeated (the one deliberate monkeypatch — it simulates the concurrent writer the pre-check
+cannot close, which is the reachable condition the `link` exists for), an unrecognized policy
+refused before the destination's directory is created, and each failure arm raising the error
+its caller supplied.
+
+The 251 existing tests across `test_submission_gateway.py`, `test_submission_live.py`,
+`test_research_artifacts.py` and `test_forecast_artifacts.py` pass unchanged, which is the
+regression evidence that the extraction is behaviour-preserving. Nothing in them was edited.
+
+No migration and no dependency: both claims in `docs/TRACKS.md` stay free.
+
+### Round 1 — approved, no findings
+
+Reviewed commit `a804735`, verdict APPROVE, zero blocking findings and no backlog candidates
+beyond the M1-322 strict xfail this section already documents. All eight nominated risk areas
+came back Safe, including the two that carried the item's actual argument: that the
+`"confirm_identical"` write/flush/fsync/link/compare sequence is preserved from the deleted
+`_write_or_confirm`, and that the surrogate-path failure reproduces on the diff base and gains
+no reachability here. The reviewer reran the focused regression set and both new suites and
+observed the same single expected xfail.
+
+**One round.** The third single-round approval on this project, after M1-202 and M1-506, and
+for the same reason both of those had: the request went out with the five headings and the
+falsifiable risk claims already written. Every one of the eight risk areas maps to a
+`Safe:` line in the response rather than to a finding — a reviewer who can see the option was
+already weighed does not propose it.
+
+The one deviation worth having named explicitly was the message-text change in the shared
+`mkdir` failure arm (`cannot create artifact directory` -> `cannot create the directory for
+{what}`), which is this branch's only behaviour change to the two pre-existing callers. It was
+stated as a deviation with the tree-wide grep showing nothing asserts the old string, and it
+came back as risk area 1, Safe. Left unstated it is exactly the shape of finding that costs a
+round.

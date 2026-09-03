@@ -1,13 +1,23 @@
 """The submission seam, and the gateway that posts nothing (M2-703, M2-704).
 
 **M2-704 added two functions here and nothing else.** :func:`live_artifact_path` and
-:func:`write_live_artifact` are the live twins of the dry-run pair below, and they live in
-this module rather than in ``submission_live`` for one reason: they share
-:func:`_write_or_confirm`. That helper is already spelled twice in the tree -- here and in
-``research/artifacts._write_new_file`` -- and **M2-709** is the filed item for merging
-them. A third copy of a race-sensitive atomic write is what that item exists to prevent,
-and importing a sibling module's private helper is the wrong direction. Everything else
-M2-704 needed is in ``submission_live``, which imports this module's public surface.
+:func:`write_live_artifact` are the live twins of the dry-run pair below. They lived in this
+module rather than in ``submission_live`` for one reason -- both called the private
+``_write_or_confirm``, and importing a sibling module's private helper is the wrong
+direction -- and **M2-709 removed that reason**: the atomic never-overwrite write is now
+:func:`whiskeyjack_bot.artifacts.write_new_file`, which both call with
+``on_existing="confirm_identical"`` and ``error=GatewayError``. The pair stays here anyway,
+because moving a merged and reviewed public entry point is a change M2-709's criteria do not
+ask for and every caller's import would pay for. Everything else M2-704 needed is in
+``submission_live``, which imports this module's public surface.
+
+**What ``on_existing="confirm_identical"`` buys, and why the other two writers do not take
+it.** A retrieval or model-output artifact records that a paid call happened, so a second
+file at the same path is a collision. Here the path is derived from the idempotency key,
+which is derived from the payload, so an existing file whose bytes match means the identical
+submission was written before -- see :func:`write_dry_run_artifact`. That difference is the
+parameter M2-709's row said it had to be, rather than the shared writer picking one
+behaviour for everyone.
 
 ``CODEX_HANDOFF.md`` asks for a :class:`SubmissionGateway` protocol *owned by this
 repository* returning a sanitized :class:`SubmissionReceipt`, with two implementations:
@@ -86,16 +96,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import re
 import sqlite3
-import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol, get_args
 
+from whiskeyjack_bot.artifacts import write_new_file
 from whiskeyjack_bot.bounds import MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.lifecycle import (
     FailureCode,
@@ -139,6 +148,12 @@ _DRY_RUN_ATTEMPT_PREFIX = "wjdry-1-"
 _SUBMISSIONS_SUBDIR = "submissions"
 _DRY_RUN_SUBDIR = "dry_run"
 _LIVE_SUBDIR = "live"
+
+# What this module's write messages call its artifacts, passed to the shared writer so its
+# messages name the kind. One literal for both the dry-run and live writers, because the
+# two share the writer and a message that named only one of them would be wrong half the
+# time. A literal, never content.
+_WHAT = "submission artifact"
 
 # An idempotency key becomes a path component, so it is constrained to characters that
 # cannot escape the artifact root or name a directory entry with a meaning of its own.
@@ -744,7 +759,13 @@ def write_dry_run_artifact(
         ) from None
 
     relative = dry_run_artifact_path(question_id=question, idempotency_key=key)
-    _write_or_confirm(artifact_root / relative, body)
+    write_new_file(
+        artifact_root / relative,
+        body,
+        what=_WHAT,
+        on_existing="confirm_identical",
+        error=GatewayError,
+    )
     return relative
 
 
@@ -782,10 +803,12 @@ def write_live_artifact(
     against, the poster's own description of itself. It is rendered as canonical JSON with
     the same rules as the payload, so it cannot make the artifact unwritable.
 
-    Shares :func:`_write_or_confirm` with :func:`write_dry_run_artifact`; that is the whole
-    reason this lives here rather than in ``submission_live``. A third copy of a
-    race-sensitive atomic write is exactly what **M2-709** was filed to stop, and importing
-    a sibling module's private helper is the wrong direction.
+    Writes through :func:`whiskeyjack_bot.artifacts.write_new_file`, the same helper
+    :func:`write_dry_run_artifact` and both non-submission artifact kinds use, with this
+    module's ``GatewayError`` passed as the error to raise. That helper *was* this module's
+    private ``_write_or_confirm`` until **M2-709**; sharing it is that item, and it is also
+    why this function no longer has to live here rather than in ``submission_live`` -- see
+    the module docstring for why it stays anyway.
 
     It **raises** on any write failure, exactly as its dry-run twin does, and the
     difference in what that means is the caller's to handle: before a post there is nothing
@@ -834,7 +857,13 @@ def write_live_artifact(
         ) from None
 
     relative = live_artifact_path(question_id=question, idempotency_key=key)
-    _write_or_confirm(artifact_root / relative, body)
+    write_new_file(
+        artifact_root / relative,
+        body,
+        what=_WHAT,
+        on_existing="confirm_identical",
+        error=GatewayError,
+    )
     return relative
 
 
@@ -952,84 +981,6 @@ def _reject_json_constant(token: str) -> object:
     raise GatewayError(
         "submission artifact contains a non-finite JSON constant, which this format does not permit"
     )
-
-
-def _write_or_confirm(destination: Path, body: bytes) -> None:
-    """Create ``destination`` with ``body``, atomically; accept an identical existing file.
-
-    Shared by :func:`write_dry_run_artifact` and :func:`write_live_artifact`; the messages
-    below therefore say "submission artifact" rather than naming either one.
-
-    A temp file in the destination's own directory is written and fsynced, then
-    ``os.link`` moves it into place -- ``link`` fails with ``EEXIST`` rather than
-    replacing, so "never overwrite" is atomic against a concurrent writer instead of a
-    check that can be raced. ``os.replace`` would have been the usual atomic rename and is
-    exactly wrong here: it clobbers. This is ``research/artifacts._write_new_file``'s
-    mechanism; it is re-spelled rather than imported because that function is private to
-    its module and raises ``ArtifactError``, and a shared home for it is a refactor of
-    merged code that belongs to its own item, not this one.
-
-    The one behavioural difference is what happens on ``EEXIST``. There it is always an
-    error; here the existing bytes are compared, because the destination name is derived
-    from the payload and an identical file means the identical dry run was performed
-    before. Only a disagreement raises -- and a disagreement at a content-derived path
-    means something outside this module wrote there.
-
-    The failure mode is a stray temp file, never a half-written artifact.
-    """
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        raise GatewayError(
-            f"cannot create submission artifact directory {destination.parent}"
-        ) from None
-    handle, temp_name = -1, ""
-    try:
-        handle, temp_name = tempfile.mkstemp(dir=destination.parent, suffix=".tmp")
-        with os.fdopen(handle, "wb") as stream:
-            handle = -1  # fdopen took ownership; the finally below must not close it twice.
-            stream.write(body)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temp_name, destination)
-        except FileExistsError:
-            _confirm_identical(destination, body)
-    except OSError:
-        raise GatewayError(f"cannot write submission artifact {destination}") from None
-    finally:
-        if handle != -1:
-            os.close(handle)
-        if temp_name:
-            # The link either succeeded (the content now has two names) or did not (the
-            # temp file is garbage). Either way the temp name goes.
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-
-
-def _confirm_identical(destination: Path, body: bytes) -> None:
-    """Accept an existing artifact whose bytes match; raise if they do not.
-
-    On the live path an existing destination should be unreachable -- the path is derived
-    from an idempotency key ``submission.require_key_unused`` has just declared unspent --
-    so a collision there means something outside this module wrote the file, and the
-    comparison is what turns that into a refusal rather than a silent overwrite.
-    """
-    try:
-        existing = destination.read_bytes()
-    except OSError:
-        raise GatewayError(
-            f"a submission artifact already exists at {destination} and could not be read "
-            "back to confirm it records the same submission"
-        ) from None
-    if existing != body:
-        # Names neither body: both are payload-derived content.
-        raise GatewayError(
-            f"a different submission artifact already exists at {destination} and is never "
-            "overwritten (detail withheld: it can echo the payload)"
-        )
 
 
 def _utcnow() -> datetime:
