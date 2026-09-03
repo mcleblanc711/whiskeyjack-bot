@@ -418,6 +418,47 @@ def test_a_provider_that_found_nothing_is_no_evidence_not_provider_error(
     assert batch.records_written == 2
 
 
+# --- the research sufficiency gate (M1-504) ----------------------------------------------
+
+
+def test_a_stale_only_packet_is_flagged_and_recorded_by_default(
+    config: AppConfig, ledger: Any
+) -> None:
+    """The committed defaults (``fail_on_stale_research: false``): shrinking the freshness
+    window past every retrieved document's ``pub_date`` (fixed at 2026-08-29 09:30 by
+    ``_article``) makes the packet ``stale_evidence``, and the record is still written --
+    only flagged, matching ``pipeline.py``'s replay-path behaviour under the same defaults.
+    """
+    config.retrieval.freshness_days_default = 1
+    batch = live(ledger, config, question_id=BINARY)
+    assert batch.records_written == 1
+    outcome = batch.outcomes[0]
+    assert outcome.status == "recorded"
+    events = rows(ledger, "SELECT event_type, detail_code FROM lifecycle_events")
+    assert events == [("validated", None)]
+
+
+def test_a_stale_only_packet_is_failed_when_configured(config: AppConfig, ledger: Any) -> None:
+    """``fail_on_stale_research: true`` turns the same packet into a recorded,
+    ``validation_failed`` terminal outcome instead of ``recorded`` -- the draft is not
+    rolled back, because a paid attempt's cost is a fact whether or not the gate passed."""
+    config.retrieval.freshness_days_default = 1
+    config.forecast.fail_on_stale_research = True
+    batch = live(ledger, config, question_id=BINARY)
+
+    assert batch.records_written == 0
+    outcome = batch.outcomes[0]
+    assert outcome.status == "validation_failed"
+    assert outcome.detail_code == "stale_evidence"
+    assert outcome.record_id is not None
+    assert outcome.forecast_sha256 is not None
+    assert outcome.artifact_outcome == "written"
+
+    assert len(rows(ledger, "SELECT 1 FROM forecast_records")) == 1
+    events = rows(ledger, "SELECT event_type, detail_code FROM lifecycle_events")
+    assert events == [("validation_failed", "stale_evidence")]
+
+
 def test_an_unusable_reply_records_generation_failed_and_keeps_the_text_it_paid_for(
     config: AppConfig, ledger: Any
 ) -> None:
@@ -854,6 +895,37 @@ def test_a_recorded_failure_without_a_detail_code_is_refused() -> None:
             retrieval_run_ids=(),
             document_count=0,
             research_reused=False,
+        )
+
+
+def test_a_validation_failed_outcome_without_a_record_id_is_refused() -> None:
+    """M1-504's status is a new shape -- unlike ``research_failed``/``generation_failed``, a
+    draft *was* persisted, so it must carry a record id like ``recorded`` does, alongside the
+    detail code a failure carries."""
+    with pytest.raises(LiveRunError, match="carries a record id"):
+        QuestionOutcome(
+            question_id=1,
+            status="validation_failed",
+            attempt_id="a",
+            retrieval_run_ids=(),
+            document_count=0,
+            research_reused=False,
+            detail_code="stale_evidence",
+        )
+
+
+def test_a_validation_failed_outcome_without_a_detail_code_is_refused() -> None:
+    with pytest.raises(LiveRunError, match="detail code"):
+        QuestionOutcome(
+            question_id=1,
+            status="validation_failed",
+            attempt_id="a",
+            retrieval_run_ids=(),
+            document_count=0,
+            research_reused=False,
+            record_id="r",
+            forecast_sha256="a" * 64,
+            artifact_outcome="written",
         )
 
 

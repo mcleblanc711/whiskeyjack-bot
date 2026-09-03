@@ -99,7 +99,9 @@ from whiskeyjack_bot.forecast.replay import replay_generation
 from whiskeyjack_bot.forecast.schema import ForecastSchemaError, response_model_for
 from whiskeyjack_bot.forecast.store import mint_record_id
 from whiskeyjack_bot.lifecycle import (
+    FailureCode,
     LifecycleError,
+    record_failure,
     record_pre_forecast_failure,
     record_validation,
     transaction,
@@ -107,8 +109,10 @@ from whiskeyjack_bot.lifecycle import (
 from whiskeyjack_bot.metaculus.snapshots import SnapshotError, load_snapshot
 from whiskeyjack_bot.prompt import PromptError, load_prompt
 from whiskeyjack_bot.questions.normalize import NormalizationError, normalize_questions
+from whiskeyjack_bot.research.freshness import freshness_cutoff
 from whiskeyjack_bot.research.packet import packet_sha256
 from whiskeyjack_bot.research.store import StoreError, list_retrieval_run_ids, replay_research
+from whiskeyjack_bot.research.sufficiency import assess_sufficiency
 
 if TYPE_CHECKING:
     from whiskeyjack_bot.config import AppConfig
@@ -594,6 +598,19 @@ def run_replay(
     # `forecast/store.py` says so itself: `lifecycle.transaction` nests as a SAVEPOINT
     # precisely "so a caller that wants the record and its first event in one unit can have
     # it without this module deciding that on its behalf". This is that caller.
+    verdict = assess_sufficiency(
+        packet, freshness_cutoff(now, config.retrieval.freshness_days_default)
+    )
+    gate_detail_code: FailureCode | None = None
+    if verdict == "no_evidence" or verdict == "stale_evidence":
+        if config.forecast.fail_on_stale_research:
+            gate_detail_code = verdict
+        else:
+            _LOGGER.warning(
+                "record for question %d flagged by the research sufficiency gate: %s",
+                question_id,
+                verdict,
+            )
     try:
         with transaction(conn):
             persisted = persist_generation(
@@ -615,9 +632,32 @@ def run_replay(
                     "the raw model output artifact was not written, so this record could "
                     "not be replayed; nothing was appended" + (f" ({why})" if why else "")
                 )
-            record_validation(conn, record_id=record.record_id, occurred_at=now)
+            # The research sufficiency gate (M1-504). Unlike the artifact check above, a
+            # gate failure does *not* roll the row back: a forecast built on missing or
+            # stale-only evidence is still a real attempt, and `failed` is a legitimate
+            # terminal lifecycle status for it, the same way `validation_failed` already is
+            # for a malformed reply (see `record_pre_forecast_failure` above). The commit is
+            # allowed to stand and `PipelineError` is raised after it, once the transaction
+            # block below has exited.
+            if gate_detail_code is not None:
+                record_failure(
+                    conn,
+                    record_id=record.record_id,
+                    event_type="validation_failed",
+                    detail_code=gate_detail_code,
+                    occurred_at=now,
+                )
+            else:
+                record_validation(conn, record_id=record.record_id, occurred_at=now)
     except (ForecastRecordError, LifecycleError) as exc:
         raise PipelineError(str(exc)) from None
+
+    if gate_detail_code is not None:
+        raise PipelineError(
+            f"research gate refused this replay: {gate_detail_code} "
+            "(forecast.fail_on_stale_research is true); the draft and its "
+            "validation_failed event were recorded, not rolled back"
+        )
 
     return ReplayRun(
         record_id=record.record_id,

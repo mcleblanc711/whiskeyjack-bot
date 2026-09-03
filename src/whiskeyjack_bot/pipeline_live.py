@@ -78,6 +78,7 @@ from whiskeyjack_bot.forecast.store import mint_record_id
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     PreForecastFailureCode,
+    record_failure,
     record_pre_forecast_failure,
     record_validation,
     transaction,
@@ -88,6 +89,7 @@ from whiskeyjack_bot.prompt import PromptError, load_prompt
 from whiskeyjack_bot.questions.normalize import NormalizationError, normalize_questions
 from whiskeyjack_bot.research.asknews import AskNewsRetrievalError, build_asknews_client
 from whiskeyjack_bot.research.exa import ExaFallbackError, build_exa_client
+from whiskeyjack_bot.research.freshness import freshness_cutoff
 from whiskeyjack_bot.research.orchestrate import (
     OrchestrationError,
     PaidRetrievalError,
@@ -95,6 +97,7 @@ from whiskeyjack_bot.research.orchestrate import (
 )
 from whiskeyjack_bot.research.packet import packet_sha256
 from whiskeyjack_bot.research.store import StoreError, list_retrieval_run_ids, load_packet
+from whiskeyjack_bot.research.sufficiency import assess_sufficiency
 
 if TYPE_CHECKING:
     from whiskeyjack_bot.forecast.parse import ForecastGeneration
@@ -110,8 +113,13 @@ StopReason = Literal["completed", "question_limit", "cost_limit"]
 
 # What became of one question. ``not_recorded`` is the one that writes nothing to the
 # ledger: see :func:`_forecast_one` on why a post-generation persistence failure has no
-# honest event type to be written as.
-QuestionStatus = Literal["recorded", "research_failed", "generation_failed", "not_recorded"]
+# honest event type to be written as. ``validation_failed`` is M1-504's: a draft *was*
+# persisted, but the research sufficiency gate refused it (``forecast.fail_on_stale_research``)
+# rather than moving it to ``validated`` -- the one status that, like ``recorded``, carries a
+# record id, and, like ``research_failed``/``generation_failed``, carries a detail code.
+QuestionStatus = Literal[
+    "recorded", "research_failed", "generation_failed", "validation_failed", "not_recorded"
+]
 
 
 class LiveRunError(Exception):
@@ -160,21 +168,29 @@ class QuestionOutcome:
     note: str | None = None
 
     def __post_init__(self) -> None:
-        recorded = self.status == "recorded"
-        if recorded != (self.record_id is not None):
-            raise LiveRunError("a recorded question carries a record id and no other does")
-        if recorded != (self.forecast_sha256 is not None):
-            raise LiveRunError("a recorded question carries a forecast hash and no other does")
-        wrote_event = self.status in ("research_failed", "generation_failed")
+        # A draft was persisted for "recorded" (validated) and "validation_failed" (M1-504's
+        # gate refused it) alike -- the two statuses that reached `persist_generation`. The
+        # other three never got that far.
+        has_record = self.status in ("recorded", "validation_failed")
+        if has_record != (self.record_id is not None):
+            raise LiveRunError(
+                "a question whose draft was persisted carries a record id and no other does"
+            )
+        if has_record != (self.forecast_sha256 is not None):
+            raise LiveRunError(
+                "a question whose draft was persisted carries a forecast hash and no other does"
+            )
+        wrote_event = self.status in ("research_failed", "generation_failed", "validation_failed")
         if wrote_event != (self.detail_code is not None):
             raise LiveRunError(
                 "a question whose failure was recorded carries a detail code and no other does"
             )
-        if recorded and self.artifact_outcome is None:
-            raise LiveRunError("a recorded question reports what became of its artifact")
+        if has_record and self.artifact_outcome is None:
+            raise LiveRunError("a question whose draft was persisted reports its artifact outcome")
         if self.artifact_outcome is not None and self.status not in (
             "recorded",
             "generation_failed",
+            "validation_failed",
         ):
             raise LiveRunError("only a question that reached the model reports an artifact outcome")
 
@@ -710,13 +726,34 @@ def _attempt_question(
             research_packet_sha256=packet_sha256(research.packet),
             generated_at=now,
         )
-        # One unit: the row, its artifact and its validation event, or none of them.
-        # T-903's round-1 finding 1, and `lifecycle.transaction` nests as a SAVEPOINT so
-        # this caller can have exactly that. **What is deliberately absent is `run_replay`'s
-        # refusal of a non-"written" artifact.** For a paid attempt the cost and the
-        # invocation count are facts whether or not the evidence survived, so the row is
-        # written regardless -- M1-312's rule, and `pipeline._require_retained_output`'s own
-        # docstring names this caller as the one that needs it.
+        # The research sufficiency gate (M1-504): a packet with no documents, or with every
+        # document stale, either fails the run or only flags it, per
+        # `forecast.fail_on_stale_research`/`flag_on_stale_research`. Read before the
+        # transaction opens -- it needs nothing the transaction produces.
+        verdict = assess_sufficiency(
+            research.packet, freshness_cutoff(now, config.retrieval.freshness_days_default)
+        )
+        gate_detail_code: PreForecastFailureCode | None = None
+        if verdict == "no_evidence" or verdict == "stale_evidence":
+            if config.forecast.fail_on_stale_research:
+                gate_detail_code = verdict
+            else:
+                _LOGGER.warning(
+                    "question %d flagged by the research sufficiency gate: %s",
+                    question_id,
+                    verdict,
+                )
+
+        # One unit: the row, its artifact and its validation (or validation-failed) event,
+        # or none of them. T-903's round-1 finding 1, and `lifecycle.transaction` nests as a
+        # SAVEPOINT so this caller can have exactly that. **What is deliberately absent is
+        # `run_replay`'s refusal of a non-"written" artifact.** For a paid attempt the cost
+        # and the invocation count are facts whether or not the evidence survived, so the
+        # row is written regardless -- M1-312's rule, and
+        # `pipeline._require_retained_output`'s own docstring names this caller as the one
+        # that needs it. A gate failure is the same shape: the draft and its
+        # `validation_failed` event are not rolled back, because a forecast built on
+        # missing or stale-only evidence is still a real, billed attempt.
         with transaction(conn):
             persisted = persist_generation(
                 conn, config, draft=draft, generation=generation, written_at=now
@@ -724,7 +761,16 @@ def _attempt_question(
             record = persisted.record
             if record is None:  # pragma: no cover - persist_generation raises instead
                 raise ForecastRecordError("the forecast version was not appended")
-            record_validation(conn, record_id=record.record_id, occurred_at=now)
+            if gate_detail_code is not None:
+                record_failure(
+                    conn,
+                    record_id=record.record_id,
+                    event_type="validation_failed",
+                    detail_code=gate_detail_code,
+                    occurred_at=now,
+                )
+            else:
+                record_validation(conn, record_id=record.record_id, occurred_at=now)
     except (ForecastRecordError, StoreError, LifecycleError) as exc:
         _LOGGER.error("could not record the forecast for question %d: %s", question_id, exc)
         return QuestionOutcome(
@@ -737,6 +783,25 @@ def _attempt_question(
             cost_usd=cost,
             unpriced_calls=unpriced,
             note=str(exc),
+        )
+
+    if gate_detail_code is not None:
+        return QuestionOutcome(
+            question_id=question_id,
+            status="validation_failed",
+            attempt_id=record.attempt_id,
+            retrieval_run_ids=run_ids,
+            document_count=documents,
+            research_reused=research.reused,
+            record_id=record.record_id,
+            forecast_version=record.forecast_version,
+            forecast_sha256=record_sha256(record),
+            research_packet_sha256=record.research_packet_sha256,
+            raw_output_path=persisted.raw_output_path,
+            artifact_outcome=persisted.artifact_outcome,
+            detail_code=gate_detail_code,
+            cost_usd=cost,
+            unpriced_calls=unpriced,
         )
 
     return QuestionOutcome(
