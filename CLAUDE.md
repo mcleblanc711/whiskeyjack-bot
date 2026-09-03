@@ -249,10 +249,21 @@ nothing; turning it off silently reopens that collision.
 ### Owner split
 
 Claude Code owns the judgment-heavy seams (normalization, retrieval, forecast generation,
-validation, ledger writers, submission). **Codex owns** M0-003, M1-605, M2-705, T-901–T-904, and
-independent acceptance-test authorship — they write those from spec *without reading the
-implementation*. Write the minimum unit tests to keep yourself honest; **do not pre-write Codex's
-tests.**
+validation, ledger writers, submission) and, as of 2026-09-03 (owner decision), the entire
+former Codex lane too: `M1-605`, `M2-705`, `T-902`, `T-904` and any future acceptance-test
+authorship. `M0-003` and `T-901` were already completed under Codex/the 2026-08-28 partial
+override and stand as-is — no rework. Codex is retired as a distinct owner in this project;
+`docs/backlog/backlog.csv`'s `Suggested Owner` column is historical for rows already `Done`.
+
+**Standing risk this creates, carried forward rather than silently dropped:** the reason
+`T-901`–`T-904` were Codex's was independent acceptance-test authorship — written from spec
+without reading the implementation, so an implementation bug can't also be baked into the
+test meant to catch it. With Claude Code writing both, that independence is gone for
+`T-902`/`T-904`. Mitigate by drafting those tests from `CODEX_HANDOFF.md`'s test-requirements
+section and the relevant schema/spec sections *before* re-reading the current implementation
+in the same sitting, the way `T-901` was already done on the M1-201/M1-501 branch — not a
+full substitute for a second author, but it preserves spec-first drafting over
+implementation-matching.
 
 ## Gotchas
 
