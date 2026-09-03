@@ -30,10 +30,14 @@ run_gate() {
   local started output status
   started=$SECONDS
   if output="$("$@" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
     printf 'pass  (%ds)\n' "$((SECONDS - started))"
     return 0
   fi
-  status=$?
   printf 'FAIL  (%ds)\n\n' "$((SECONDS - started))"
   printf '%s\n' "$output" | tail -40
   printf '\n%s failed; the remaining gates were not run.\n' "$label" >&2
