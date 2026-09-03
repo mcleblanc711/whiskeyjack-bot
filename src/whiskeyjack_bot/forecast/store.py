@@ -28,34 +28,34 @@ binding one. That is not redundancy for its own sake -- M1-603's round 5 is a ru
 lived in the writer and not the schema, defeated by a value the two layers disagreed
 about, on an append-only table that could not then be corrected.
 
-**Attribution is checked before the row exists, not after.** A response citing a source it
-was never given is exactly the record this project exists to prevent, and once appended it
-cannot be withdrawn. :func:`whiskeyjack_bot.forecast.attribution.validate_attribution_fields`
-is M1-501's public entry point and names "a validation pass over a stored record" as its
-use; running it one moment earlier costs nothing and is the last point at which refusing is
-still possible.
+**Every output check is run before the row exists, not after.** A response citing a source
+it was never given, or a probability outside the configured bounds, is exactly the record
+this project exists to prevent, and once appended it cannot be withdrawn.
+:func:`whiskeyjack_bot.forecast.validate.validate_output` is M1-506's composed entry point --
+M1-501's cross-type attribution rules *and* the rules specific to the response's question
+type -- and names "a validation pass over a stored record before it is persisted (M1-507)"
+as its own use; running it one moment earlier costs nothing and is the last point at which
+refusing is still possible.
 
-**It is the cross-type half only, and that gap is M1-507.** Since M1-506 there is one
-composed entry point, ``forecast.validate.validate_output``, which runs the attribution
-rules *and* the rules specific to the response's question type. This module does not call
-it, because the type-specific checkers need a ``ForecastConfig`` and
-:func:`append_forecast_version` has no parameter for one -- so a probability outside the
-configured ``forecast.min_probability``/``max_probability`` can be persisted here even
-though ``forecast.generate`` refuses it. Not reachable from the product path
-(``persist_generation`` runs the full composed check inside the attempt loop before
-anything reaches this writer), reachable by any other caller of this public entry point,
-and widening when M1-404 registers its checker.
+**It runs both halves of the composed check (M1-507).** Before this item, the type-specific
+checkers had no ``ForecastConfig`` to read here, so a probability outside the configured
+``forecast.min_probability``/``max_probability``, or (since M1-405) a numeric record whose
+percentiles were not the declared nine, were out of order, or fell outside the question's
+bounds, could be persisted here even though ``forecast.generate`` refused it. Not reachable
+from the product path even then (``persist_generation`` runs the full composed check inside
+the attempt loop before anything reaches this writer), but reachable by any other caller of
+this public entry point.
 
-**M1-405 both widened that gap and shrank what closing it costs.** Widened: a numeric
-record whose percentiles are not the declared nine, are out of order, or fall outside the
-question's bounds is now refused by ``forecast.generate`` and still persistable here.
-Shrank: the composed entry point takes a ``CanonicalQuestion`` rather than a bare
-``question_id``, and ``ForecastRecordDraft.question`` already carries one -- validated by
-``_one_question`` to agree with the row's own ``question_id`` and ``question_type``. So
-M1-507 needs only the ``ForecastConfig`` threaded in; the question it would otherwise have
-had to thread as well is already inside the argument this writer is handed. Closing it is
-still a signature change to a merged, reviewed public entry point, which is why M1-506
-filed the row rather than taking it -- same convention as M1-314, M2-709 and M1-608.
+**Closing it cost only a ``ForecastConfig`` parameter, and that is M1-405's doing.** The
+composed entry point takes a ``CanonicalQuestion`` rather than a bare ``question_id``, and
+``ForecastRecordDraft.question`` already carries one -- validated by ``_one_question`` to
+agree with the row's own ``question_id`` and ``question_type`` -- so the question this
+writer needed was already inside the argument it is handed. The parameter is required, not
+optional: an optional one a caller could omit would leave this same gap open for any caller
+who didn't pass it, which is exactly what the acceptance criterion (the two paths' accepted
+response sets are equal) rules out. This was still a signature change to a merged, reviewed
+public entry point, which is why M1-506 filed the row rather than taking it inline -- same
+convention as M1-314, M2-709 and M1-608.
 
 **What this module does not do.** It does not append a ``validated`` lifecycle event. A
 record is born ``draft`` and every later state is reachable only through
@@ -81,8 +81,7 @@ from datetime import datetime, timezone
 from math import isfinite
 from typing import Any
 
-from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS
-from whiskeyjack_bot.forecast.attribution import AttributionFieldError, validate_attribution_fields
+from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS, ForecastConfig
 from whiskeyjack_bot.forecast.record import (
     ForecastRecord,
     ForecastRecordDraft,
@@ -94,6 +93,8 @@ from whiskeyjack_bot.forecast.record import (
     record_sha256,
     require_unassigned_draft,
 )
+from whiskeyjack_bot.forecast.schema import ForecastSchemaError
+from whiskeyjack_bot.forecast.validate import validate_output
 from whiskeyjack_bot.lifecycle import LifecycleError, transaction
 
 # The columns this module writes but does not derive from the record.
@@ -368,6 +369,7 @@ def append_forecast_version(
     conn: sqlite3.Connection,
     *,
     draft: ForecastRecordDraft,
+    forecast_config: ForecastConfig,
     call: ModelCall | None = None,
 ) -> ForecastRecord:
     """Append ``draft`` as the next forecast version for its question and tournament.
@@ -375,6 +377,11 @@ def append_forecast_version(
     Returns the persisted :class:`ForecastRecord`, carrying the identity the ledger
     assigned: a fresh ``record_id``, ``forecast_version`` one above the current head, and
     ``parent_record_id`` naming that head (``None`` for the first version).
+
+    ``forecast_config`` is required, not optional (M1-507): it is what lets this writer run
+    the same composed output-validation entry point ``forecast.generate`` runs, and a
+    default a caller could omit would reopen the gap that item closed for whoever omitted
+    it.
 
     ``call`` is M1-406's three columns -- where the raw model output landed, what the call
     cost, how many invocations it took. It is optional and defaults to an all-``None``
@@ -385,13 +392,13 @@ def append_forecast_version(
     frozen, and this one is cheap.
 
     Raises :class:`ForecastRecordError` and nothing else. Caller mistakes -- a wrong type,
-    a response citing an unresolvable source -- are refused before the transaction opens,
-    the rule M1-303 round 4 settled for calls that cost something: here what is being
-    protected is not money but an append-only row.
+    a response citing an unresolvable source, a response the configured output rules refuse
+    -- are refused before the transaction opens, the rule M1-303 round 4 settled for calls
+    that cost something: here what is being protected is not money but an append-only row.
     """
     connection = _require_connection(conn)
     validated = _require_draft(draft)
-    _require_attributable(validated)
+    _require_valid_output(validated, forecast_config)
     if call is None:
         call = ModelCall()
     elif type(call) is not ModelCall:
@@ -425,21 +432,36 @@ def append_forecast_version(
         raise ForecastRecordError(str(exc)) from None
 
 
-def _require_attributable(draft: ForecastRecordDraft) -> None:
-    """Run M1-501's cross-type attribution gate over the response about to be stored.
+def _require_valid_output(draft: ForecastRecordDraft, forecast_config: ForecastConfig) -> None:
+    """Run M1-506's composed output-validation gate over the response about to be stored.
 
-    Re-raised with the message preserved, for approval.py's reason: ``AttributionFieldError``
-    carries a list of field paths and value-free messages, and that list is the entire
-    account of why the record was refused. Replacing it with a constant would satisfy the
-    letter of the module-own-error rule while destroying what the operator needs.
+    Both halves: M1-501's cross-type attribution rules and the rules specific to the
+    response's question type (M1-507). ``question`` and ``source_ids`` are read off the
+    draft rather than taken as parameters, the same reason ``persist.persist_generation``
+    reads its identifiers off a draft instead of a caller-supplied copy (M2-703's lesson):
+    a second source of truth for the same fact could disagree with the row being written.
+
+    Re-raised with the message preserved, for approval.py's reason: every member of
+    :class:`~whiskeyjack_bot.forecast.schema.ForecastSchemaError` carries a list of field
+    paths and value-free messages, and that list is the entire account of why the record
+    was refused. Replacing it with a constant would satisfy the letter of the
+    module-own-error rule while destroying what the operator needs.
+
+    Caught at the ``ForecastSchemaError`` base, not just ``validate_output``'s own
+    ``ForecastOutputError``: a malformed ``forecast_config`` or question is refused by the
+    type-specific checker it reaches (``BinaryOutputError``, ``NumericOutputError``,
+    ``MultipleChoiceOutputError``), each a sibling subclass rather than a
+    ``ForecastOutputError`` itself, and every malformed shape must arrive as this module's
+    own error -- the rule this project has taken as a review finding twice.
     """
     try:
-        validate_attribution_fields(
+        validate_output(
             draft.forecast,
-            question_id=draft.question_id,
+            forecast_config,
+            question=draft.question,
             source_ids=[source.source_id for source in draft.sources],
         )
-    except AttributionFieldError as exc:
+    except ForecastSchemaError as exc:
         raise ForecastRecordError(str(exc)) from None
 
 

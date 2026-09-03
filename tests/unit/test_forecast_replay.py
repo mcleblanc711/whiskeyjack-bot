@@ -35,7 +35,7 @@ import yaml
 
 from whiskeyjack_bot.artifacts import ArtifactError
 from whiskeyjack_bot.config import AppConfig, load_config
-from whiskeyjack_bot.forecast.artifacts import artifact_relative_path
+from whiskeyjack_bot.forecast.artifacts import artifact_relative_path, write_raw_model_output
 from whiskeyjack_bot.forecast.inputs import SourceReference
 from whiskeyjack_bot.forecast.parse import ForecastGeneration, ModelSettings
 from whiskeyjack_bot.forecast.persist import (
@@ -46,6 +46,7 @@ from whiskeyjack_bot.forecast.persist import (
 from whiskeyjack_bot.forecast.record import (
     ForecastRecordDraft,
     ForecastRecordError,
+    assign_identity,
     build_forecast_record_draft,
     record_sha256,
 )
@@ -56,7 +57,13 @@ from whiskeyjack_bot.forecast.schema import (
     response_model_for,
     validate_forecast_response,
 )
-from whiskeyjack_bot.forecast.store import ModelCall, read_forecast_record, read_model_call
+from whiskeyjack_bot.forecast import store as store_module
+from whiskeyjack_bot.forecast.store import (
+    ModelCall,
+    mint_record_id,
+    read_forecast_record,
+    read_model_call,
+)
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
 from whiskeyjack_bot.lifecycle import transaction
@@ -448,16 +455,22 @@ def test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error(
     """M1-405 round 1, finding 2: a member checker's error must not escape this boundary.
 
     ``CanonicalNumericQuestion`` accepts ``zero_point == lower_bound``, so does
-    ``ForecastRecordDraft``, and so did every writer before M1-405 registered a numeric
-    checker -- there was nothing to refuse it. The pinned SDK refuses such a question
-    outright, so ``numeric._require_question`` raises rather than reporting a repairable
-    problem, and ``forecast.generate`` refuses it in a preflight before anything is spent.
+    ``ForecastRecordDraft``. The pinned SDK refuses such a question outright, so
+    ``numeric._require_question`` raises rather than reporting a repairable problem, and
+    ``forecast.generate`` refuses it in a preflight before anything is spent. Since M1-507,
+    ``forecast.store.append_forecast_version`` refuses it too, on the ordinary write path --
+    it runs the same composed check through a ``ForecastConfig`` it did not have before.
 
-    Replay has no preflight: it is reading a row that already exists. So the row is
-    ordinary, already in the ledger, and reaches ``_parse`` -- and this module's own
-    docstring says a raw ``ForecastSchemaError`` out of a public boundary is a review
-    finding here (it has been, three times now). It arrives as ``ForecastRecordError``,
-    the same translation ``response_model_for`` already had one line above.
+    So the row this test is about -- one that is already stored despite being unsatisfiable,
+    which is what makes replay's own re-check the only thing that catches it -- can no
+    longer be produced through the writer. It is built and inserted directly instead
+    (:func:`assign_identity` plus the writer's own ``_insert``, bypassing
+    ``append_forecast_version``'s validation the way a row written before this rule existed
+    would have reached the ledger). Replay has no preflight of its own: it is reading a row
+    that already exists, reaches ``_parse``, and this module's own docstring says a raw
+    ``ForecastSchemaError`` out of a public boundary is a review finding here (it has been,
+    three times now). It arrives as ``ForecastRecordError``, the same translation
+    ``response_model_for`` already had one line above.
     """
     config = _config(tmp_path, artifacts)
     generation = _numeric_generation()
@@ -470,13 +483,31 @@ def test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error(
         research_packet_sha256="d" * 64,
         generated_at=GENERATED_AT,
     )
-    stored = persist_generation(
-        conn, config, draft=draft, generation=generation, written_at=WRITTEN_AT
+    path = write_raw_model_output(
+        artifacts,
+        attempt_id=ATTEMPT,
+        question_id=QUESTION_ID,
+        generation=generation,
+        written_at_utc=WRITTEN_AT,
+        retain=True,
     )
-    assert stored.record is not None, "the writer accepts this question; that is the premise"
+    assert path is not None
+    record = assign_identity(
+        draft, record_id=mint_record_id(), forecast_version=1, parent_record_id=None
+    )
+    with transaction(conn):
+        store_module._insert(
+            conn,
+            record,
+            ModelCall(
+                raw_output_path=path,
+                cost_usd=generation.cost_usd,
+                model_invocations=generation.invocations,
+            ),
+        )
 
     with pytest.raises(ForecastRecordError) as caught:
-        replay_forecast(conn, config, record_id=stored.record.record_id)
+        replay_forecast(conn, config, record_id=record.record_id)
     # Exact type, not isinstance: NumericOutputError also subclasses ForecastSchemaError,
     # so an isinstance assertion here would pass on the unfixed code.
     assert type(caught.value) is ForecastRecordError

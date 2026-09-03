@@ -27,7 +27,7 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import current_status, record_validation
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 
-from tests.unit.records import CALIBRATION
+from tests.unit.records import CALIBRATION, FORECAST_CONFIG
 from tests.unit.test_submission_live import (  # noqa: F401 - fixtures reused deliberately
     BINARY_PAYLOAD,
     PAYLOAD_SHA,
@@ -97,7 +97,7 @@ def record_id(config_file: Path) -> str:
                 "started_at_utc, created_at_utc) VALUES (?, 'exa', ?, ?, ?)",
                 (RUN_ID, QUESTION_ID, TIMESTAMP, TIMESTAMP),
             )
-        record = append_forecast_version(conn, draft=_draft())
+        record = append_forecast_version(conn, forecast_config=FORECAST_CONFIG, draft=_draft())
         record_validation(conn, record_id=record.record_id, occurred_at=OCCURRED)
         approve(
             conn,

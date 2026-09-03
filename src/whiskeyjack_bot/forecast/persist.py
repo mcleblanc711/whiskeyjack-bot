@@ -240,6 +240,7 @@ def persist_generation(
     record = append_forecast_version(
         conn,
         draft=draft,
+        forecast_config=config.forecast,
         call=ModelCall(
             raw_output_path=path,
             cost_usd=generation.cost_usd,

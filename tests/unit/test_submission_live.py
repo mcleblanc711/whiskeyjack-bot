@@ -81,7 +81,7 @@ from whiskeyjack_bot.submission_live import (
     verify_uncertain_attempt,
 )
 
-from tests.unit.records import CALIBRATION
+from tests.unit.records import CALIBRATION, FORECAST_CONFIG
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_TEXT = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
@@ -326,7 +326,7 @@ def ledger(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 
 @pytest.fixture()
 def approved(ledger: sqlite3.Connection) -> tuple[sqlite3.Connection, str]:
-    record = append_forecast_version(ledger, draft=_draft())
+    record = append_forecast_version(ledger, forecast_config=FORECAST_CONFIG, draft=_draft())
     record_validation(ledger, record_id=record.record_id, occurred_at=OCCURRED)
     approve(
         ledger,
@@ -845,7 +845,7 @@ def test_the_committed_flags_refuse_a_post_with_no_network_call(
 def test_an_unapproved_record_is_refused_before_the_post(
     ledger: sqlite3.Connection, live_config: AppConfig
 ) -> None:
-    record = append_forecast_version(ledger, draft=_draft())
+    record = append_forecast_version(ledger, forecast_config=FORECAST_CONFIG, draft=_draft())
     record_validation(ledger, record_id=record.record_id, occurred_at=OCCURRED)
     poster, error = _expect_refusal(ledger, record.record_id, live_config)
     assert "approval" in str(error)
