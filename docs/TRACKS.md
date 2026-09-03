@@ -40,11 +40,15 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-*(No live rows. Swept `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707`
-(merged, PR #61, round-2 approve, 2026-09-02), `M1-315` (merged, PR #55, 2026-09-01),
-`M1-608` (merged, PR #57, r1 approve) and `M1-314` (merged, PR #58, 2026-09-02) — all
-landed and their branches are gone from `origin`. `M2-709` is the last item on Lane 3's
-debt queue and is next to pull into a pane.)*
+| M1-514 | feat/m1-514-wall-clock-bound | whiskeyjack-m1-514 | no | none | 2026-09-02 |
+*(Swept `M1-610` (merged, PR #62, round-2 approve, 2026-09-02) on top of master's own sweep of
+`M2-707` (PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58) — all landed and
+their branches are gone from `origin`. One sibling branch is live alongside this one and carries
+its own row on its own branch, which is why it is named here as prose rather than added as a
+row: `M2-709` (PR #60), the last item on Lane 3's debt queue. It touches neither
+`forecast/cdf.py`, `forecast/generate.py` nor `NumericCalibrationConfig`, so the collision this
+table is blind to — two branches widening one signature, the `M1-404`/`M1-405` shape recorded
+below — was checked for rather than assumed.)*
 
 ## Planned next wave
 

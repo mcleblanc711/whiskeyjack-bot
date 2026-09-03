@@ -15,22 +15,26 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import traceback
 import warnings
 from datetime import datetime, timezone
 from enum import IntEnum
 from math import fsum, nextafter
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 import yaml
+from pydantic import ValidationError
 from forecasting_tools.ai_models.general_llm import GeneralLlm
 
 from whiskeyjack_bot.config import (
+    MAX_CONVERSION_TIMEOUT_SECONDS,
     MAX_MODEL_INVOCATIONS,
     AppConfig,
     ConfigError,
+    NumericCalibrationConfig,
     validate_config_data,
 )
 from whiskeyjack_bot.forecast.generate import (
@@ -40,7 +44,9 @@ from whiskeyjack_bot.forecast.generate import (
     generate_forecast,
 )
 from whiskeyjack_bot.forecast.multiple_choice import _SUM_TOLERANCE
+from whiskeyjack_bot.forecast.numeric import DECLARED_PERCENTILE_LEVELS
 from whiskeyjack_bot.forecast.schema import BinaryForecastResponse
+from whiskeyjack_bot.lifecycle import PreForecastFailureCode
 from whiskeyjack_bot.logging_setup import (
     PayloadDebugFilter,
     SecretRedactionFilter,
@@ -1744,3 +1750,220 @@ def test_the_committed_envelope_still_generates(config: AppConfig, prompt: Loade
     result = _generate(client, _narrowed(config, 0.001, 0.999), prompt)
     assert len(client.calls) == 1
     assert result.invocations == 1
+
+
+# --- M1-514: the conversion's wall-clock bound, at the spending site ---------------
+#
+# `forecast/cdf.py` owns the bound and `tests/unit/test_forecast_cdf.py` owns its mechanism.
+# What is asserted here is the half only this module can state: what a cut-off conversion
+# costs, and that it is never repaired.
+
+# The tie-rewritten-onto-an-open-bound literal from `tests/unit/test_forecast_cdf.py`, with
+# the question it hangs on. Duplicated rather than imported because the two files build
+# their payloads differently and a shared fixture would couple them; the values are a
+# regression corpus, not an interface.
+_HANGING_VALUES = (
+    1.9,
+    1.9,
+    16.689279064930158,
+    40.76687708555057,
+    86.62698362886371,
+    89.04730534332211,
+    101.4345590075338,
+    148.1522332384087,
+    148.1522332384087,
+)
+_HANGING_QUESTION = {
+    "lower_bound": 2.0,
+    "upper_bound": 100.0,
+    "open_lower_bound": True,
+    "open_upper_bound": True,
+    "zero_point": 1.5,
+}
+
+
+def _hanging_reply() -> str:
+    return numeric_reply(
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": value}
+                for level, value in zip(DECLARED_PERCENTILE_LEVELS, _HANGING_VALUES, strict=True)
+            ]
+        }
+    )
+
+
+def _bounded_at(config: AppConfig, seconds: float) -> AppConfig:
+    return config.model_copy(
+        update={
+            "numeric_calibration": config.numeric_calibration.model_copy(
+                update={"conversion_timeout_seconds": seconds}
+            )
+        }
+    )
+
+
+@pytest.fixture
+def guard_neutered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let M1-503's fast path pass the known hanging input through to the SDK.
+
+    Neutered, not deleted -- M1-607's pattern. With the guard answering "this converges",
+    `_standardize_cdf`'s scale search really is entered and really does not return, so what
+    the bound is measured against is the genuine defect rather than a slow stand-in.
+    """
+    monkeypatch.setattr(
+        "whiskeyjack_bot.forecast.cdf._standardization_can_converge", lambda distribution: True
+    )
+
+
+@pytest.mark.usefixtures("guard_neutered", "deadline")
+def test_a_conversion_that_times_out_costs_one_call_and_is_never_repaired(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The billing half of the acceptance criterion.
+
+    A conversion that does not terminate is not repairable output: the model did not return
+    something malformed, it returned percentiles the pinned SDK cannot finish converting,
+    and it has no way to aim at that. So this is the one conversion outcome that must break
+    the attempt loop rather than feed it -- unlike
+    `test_a_conversion_problem_that_persists_costs_two_calls_and_stays_schema_invalid`,
+    which is the same shape of failure and correctly costs two.
+
+    `_Model` would happily serve a second reply; that it is never asked for one is the
+    assertion.
+    """
+    client = _Model(_hanging_reply(), _hanging_reply())
+    result = _generate(
+        client,
+        _bounded_at(config, 0.5),
+        prompt,
+        question=_numeric_question(**_HANGING_QUESTION),
+    )
+    assert len(client.calls) == 1, "a timeout must not buy a second billed call"
+    assert result.invocations == 1
+    assert result.repair_attempted is False
+    assert result.forecast is None
+    assert result.failure_code == "timeout"
+    assert result.failure_problems == (
+        "final_prediction.percentiles: the numeric CDF conversion did not complete within "
+        "the configured wall-clock bound (offending input withheld)",
+    )
+
+
+@pytest.mark.usefixtures("guard_neutered", "deadline")
+def test_a_timed_out_conversion_still_keeps_the_text_it_paid_for(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The call was billed, so its response is evidence and must survive the failure.
+
+    Same rule as the provider-error path and M1-312's: the artifact is the only trace of
+    what a run bought. A timeout that discarded the raw response would make the one
+    conversion outcome nobody can reproduce also the one with no record.
+    """
+    client = _Model(_hanging_reply())
+    result = _generate(
+        client,
+        _bounded_at(config, 0.5),
+        prompt,
+        question=_numeric_question(**_HANGING_QUESTION),
+    )
+    assert result.raw_responses == (_hanging_reply(),)
+    assert result.failure_code == "timeout"
+
+
+@pytest.mark.usefixtures("deadline")
+def test_the_timeout_code_is_one_the_ledger_can_already_store() -> None:
+    """No migration, asserted rather than claimed.
+
+    `timeout` is a member of `PreForecastFailureCode` *and* of
+    `004_pipeline_failure_events.sql`'s `detail_code` CHECK, which is why a non-terminating
+    conversion reaches `pipeline_failure_events` with no schema change. A new vocabulary
+    member would have meant rebuilding an append-only table -- the operation M2-711 refused
+    -- so this is the constraint that shaped the choice, not a convenience.
+    """
+    migration = (
+        REPO_ROOT / "src" / "whiskeyjack_bot" / "migrations" / "004_pipeline_failure_events.sql"
+    ).read_text(encoding="utf-8")
+    assert "timeout" in get_args(PreForecastFailureCode)
+    assert "'timeout'" in migration
+
+
+def test_a_numeric_question_off_the_main_thread_is_refused_before_any_spend(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """Fail closed, and fail *free*.
+
+    The conversion's bound is a `SIGALRM` interval timer, which cannot be installed off the
+    main thread. `forecast.cdf` refuses to convert there rather than run the SDK unbounded
+    -- but left to it, that refusal would land after a billed call, breaking this module's
+    contract that every raise means nothing was spent. So the same question is asked here,
+    in the preflight, where it costs nothing.
+
+    This is the check whoever implements `run_limits.max_parallel_questions > 1` on threads
+    will meet, and it is deliberately loud.
+    """
+    client = _Model(numeric_reply())
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = _generate(client, config, prompt, question=_numeric_question())
+        except ForecastGenerationError as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(20.0)
+    assert not worker.is_alive()
+    assert "result" not in outcome
+    assert isinstance(outcome["error"], ForecastGenerationError)
+    assert client.calls == [], "refusal must happen before any billable call"
+
+
+def test_a_binary_question_off_the_main_thread_still_generates(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The refusal above is scoped to the type that needs the bound, and no wider.
+
+    Only the numeric path reaches the SDK's conversion. Refusing binary and
+    multiple-choice work off the main thread would be a restriction this item has no reason
+    to impose -- and the one-line way to get the scoping wrong is to hoist the check above
+    the `isinstance`, which this catches.
+    """
+    client = _Model(good_reply())
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        outcome["result"] = _generate(client, config, prompt)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(20.0)
+    assert not worker.is_alive()
+    assert outcome["result"].forecast is not None
+    assert len(client.calls) == 1
+
+
+def test_no_configuration_can_lift_the_conversion_bound(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The criterion as a property of every accepted configuration.
+
+    `MAX_MODEL_INVOCATIONS`' argument applied to wall-clock time: a bound any config can
+    lift is not a bound, and `conversion_timeout_seconds: 86400` would leave the
+    non-terminating scale search running for a day -- the stopped run with extra steps.
+    Across the whole accepted range the value is bounded, and the committed default is
+    inside it.
+    """
+    assert config.numeric_calibration.conversion_timeout_seconds <= MAX_CONVERSION_TIMEOUT_SECONDS
+    fields = config.numeric_calibration.model_dump()
+    for seconds in (0.001, 1.0, MAX_CONVERSION_TIMEOUT_SECONDS):
+        accepted = NumericCalibrationConfig.model_validate(
+            fields | {"conversion_timeout_seconds": seconds}
+        )
+        assert accepted.conversion_timeout_seconds <= MAX_CONVERSION_TIMEOUT_SECONDS
+    for rejected in (0.0, -1.0, MAX_CONVERSION_TIMEOUT_SECONDS + 0.001, 86400.0):
+        with pytest.raises(ValidationError):
+            NumericCalibrationConfig.model_validate(
+                fields | {"conversion_timeout_seconds": rejected}
+            )

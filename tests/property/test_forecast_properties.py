@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import time
+import yaml
 from pydantic import ValidationError
 from forecasting_tools import NumericDistribution, Percentile
 from hypothesis import assume, event, given
@@ -34,7 +36,11 @@ from whiskeyjack_bot.forecast.inputs import (
     build_model_input,
     render_model_input,
 )
-from whiskeyjack_bot.config import ForecastConfig, NumericCalibrationConfig
+from whiskeyjack_bot.config import (
+    MAX_CONVERSION_TIMEOUT_SECONDS,
+    ForecastConfig,
+    NumericCalibrationConfig,
+)
 from whiskeyjack_bot.forecast.cdf import (
     _NOT_CONVERTIBLE,
     _NOT_WELL_FORMED,
@@ -44,7 +50,10 @@ from whiskeyjack_bot.forecast.cdf import (
     _WRONG_LENGTH,
     _LOWER_ENDPOINT,
     _UPPER_ENDPOINT,
+    _CANNOT_BE_BOUNDED,
+    _CONVERSION_TIMED_OUT,
     NumericCdfError,
+    NumericCdfTimeoutError,
     build_numeric_cdf,
     numeric_cdf_or_problems,
 )
@@ -1157,6 +1166,13 @@ _CDF_MESSAGES = frozenset(
         _STEP_TOO_TALL,
         _LOWER_ENDPOINT,
         _UPPER_ENDPOINT,
+        # M1-514. Neither is reachable from the draws below -- the bound is generous and
+        # every accepted case converts in milliseconds -- but both are strings this module
+        # can emit, and the property above is membership of the *complete* vocabulary. A
+        # message left out of this set would pass by never being produced, which is the
+        # same vacuity the strategy notes below are about.
+        _CONVERSION_TIMED_OUT,
+        _CANNOT_BE_BOUNDED,
     }
 )
 
@@ -1280,6 +1296,59 @@ def test_no_conversion_message_is_outside_this_modules_own_vocabulary(
         assert message in _CDF_MESSAGES or message.startswith(
             ("cdf_size must equal", "zero_point must be", "must be a canonical")
         ), problem
+
+
+@given(numeric_cases())
+def test_the_conversion_always_terminates(
+    case: tuple[NumericForecastResponse, CanonicalNumericQuestion],
+) -> None:
+    """M1-514: whatever is drawn, the conversion comes back.
+
+    **This is the property that could not be written before this item, and the reason is
+    worth stating rather than assuming.** The three profiles in ``tests/property/conftest.py``
+    all set ``deadline=None``, so hypothesis cannot notice a call that never returns -- and
+    ``_standardize_cdf``'s scale search does not raise and is not slow, it fails to
+    terminate. That is exactly how the defect M1-503 found hung the property suite rather
+    than failing it: a green run and a killed CI job are indistinguishable from here.
+
+    Drawn from the *hostile* strategy rather than the accepted one, because the population
+    this is about is "anything a caller can reach this module with", and both known
+    non-terminating inputs are replies ``forecast/numeric.py`` accepts -- so the accepted
+    strategy is not the wider net.
+
+    The assertion is that the wall-clock elapsed is bounded by roughly the configured
+    timeout, not merely that the call returned. Returning is what the enclosing pytest
+    process would demonstrate anyway; returning *in bounded time* is the claim, and a bound
+    that had been quietly removed would show up here as an elapsed time far past it long
+    before it showed up as a hang.
+    """
+    response, question = case
+    started = time.monotonic()
+    try:
+        numeric_cdf_or_problems(response, _CALIBRATION, question)
+        event("outcome=returned")
+    except NumericCdfTimeoutError:
+        event("outcome=timed out")
+    except NumericCdfError:
+        event("outcome=refused")
+    elapsed = time.monotonic() - started
+    assert elapsed < _CALIBRATION.conversion_timeout_seconds + 5.0, elapsed
+
+
+def test_the_bound_the_property_above_relies_on_is_the_committed_one() -> None:
+    """The anti-vacuity check for the property above, and it is a real risk here.
+
+    ``test_the_conversion_always_terminates`` asserts an elapsed time against
+    ``_CALIBRATION.conversion_timeout_seconds``. If that field ever defaulted to something
+    enormous the assertion would still pass on every draw while promising nothing, and
+    nothing in the property itself could tell. So the value it rests on is pinned to the
+    committed configuration rather than to this file's fixture.
+    """
+    committed = yaml.safe_load((REPO_ROOT / "config.example.yaml").read_text(encoding="utf-8"))[
+        "numeric_calibration"
+    ]["conversion_timeout_seconds"]
+    assert _CALIBRATION.conversion_timeout_seconds == committed
+    assert 0 < committed <= MAX_CONVERSION_TIMEOUT_SECONDS
 
 
 @given(accepted_numeric_cases())
