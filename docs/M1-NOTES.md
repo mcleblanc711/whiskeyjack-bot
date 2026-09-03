@@ -7295,3 +7295,63 @@ proved nothing:
 | a replay configuration allowed to drive `run` | the parametrized switch refusal |
 | a submission import added to the replay handler | the `ast.walk` over that handler |
 | whitespace collapse dropped; the storability backstop dropped | two properties |
+
+## M1-610 — Identifier shape on `forecast/record.py`
+
+M1-608's deferral, closed. `record_id`, `tournament_id`, `attempt_id` and `retrieval_run_id`
+carried `Field(min_length=1, max_length=MAX_IDENTIFIER_LENGTH)` and nothing else --
+`min_length=1` refuses `''` but admits `'\n\t'` and any NUL-bearing string, which every
+other layer touching these columns (`lifecycle`, `approval`, `submission`,
+`submission_gateway`, `submission_live`, `006`'s triggers) already refused.
+
+### Decision — a fifth copy of the rule, not a shared one
+
+`_require_identifier_text` in `forecast/record.py` is a new, private copy of
+`research/model.py`'s M1-607 function (`.strip()` truthy and no `\x00`), not an import of
+it. `bounds.py`'s "only the constants are shared, not the validators" convention was written
+about the five writer functions raising five different sanitized exception types, but the
+underlying reason generalizes here too: a shared helper is one more cross-module coupling
+for a five-line function, and duplication-plus-an-agreement-test is the pattern this
+codebase already uses for this exact rule
+(`test_the_two_module_copies_of_the_identifier_rule_agree`). This item adds
+`test_the_record_and_research_model_identifier_rules_agree` alongside it.
+
+### Decision — a flat `Field(...)`, not a composed `Annotated`
+
+Tried first: `Annotated[research.model.IdentifierString, Field(max_length=MAX_IDENTIFIER_LENGTH)]`,
+reusing the M1-607 type directly. Probed by hand before writing anything against it: stacking
+a second `Field(max_length=...)` around an already-validated `Annotated` alias changes
+pydantic's reported error type on the ceiling from `string_too_long`/`string_too_short` to a
+generic `too_long`/`too_short` — pydantic treats the result of the inner `AfterValidator` as
+opaque for the purpose of the outer length constraint. That would have silently broken the
+`{"string_too_long", "string_too_short"}` check `test_shared_bounds.py` already runs, not by
+failing a test but by changing what a passing one measures. The shipped shape is one flat
+`Field(min_length=1, max_length=MAX_IDENTIFIER_LENGTH)` plus one `AfterValidator`, confirmed
+by direct probe to preserve today's error types exactly.
+
+### Deferred (do not read the absence as an omission)
+
+- **`parent_record_id`.** The backlog row names `record_id`, `tournament_id`, `attempt_id`
+  and `retrieval_run_id`; `parent_record_id` is `str | None` and out of scope.
+
+### Fixed after round 1 — `build_forecast_record_draft`'s generic catch
+
+Shipped this way, then round 1 found it broke the acceptance criterion: a blank/NUL
+identifier reaching `build_forecast_record_draft` surfaced as "the forecast record could
+not be assembled (detail withheld...)", naming no field, because the `ValidationError` this
+item's new rule raises was folded into the same catch as a genuinely value-echoing
+`AttributeError` (a caller passing an object with no resolvable `.forecast`/`.settings`).
+The two now split: `ValidationError` renders through `_sanitized_locations` (factored out of
+`_sanitized`, which already did this for the read-back path), `AttributeError` keeps the
+detail-withheld wording. A builder-time refusal and a stored-record refusal now name the
+field the same way.
+
+### Standing risk — `forecast_records.retrieval_run_id` has no schema witness of its own
+
+`006`'s own header documents this: the column is covered only transitively, through the
+foreign key into `research_runs.retrieval_run_id` (which is guarded, and
+`PRAGMA foreign_keys = ON`'s enforcement is itself an unverified assumption per that
+migration's notes). So `test_shared_bounds.py`'s eight-layer parity test compares
+`record_id`/`tournament_id`/`attempt_id` against real `forecast_records` triggers and leaves
+`retrieval_run_id` out; that field's only parity witness is the two-Python-copies agreement
+test in `test_lifecycle_properties.py`.

@@ -27,8 +27,10 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import current_status, record_validation
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 
+from tests.unit.records import CALIBRATION
 from tests.unit.test_submission_live import (  # noqa: F401 - fixtures reused deliberately
     BINARY_PAYLOAD,
+    PAYLOAD_SHA,
     NEW_START,
     OCCURRED,
     PROBABILITY,
@@ -97,7 +99,13 @@ def record_id(config_file: Path) -> str:
             )
         record = append_forecast_version(conn, draft=_draft())
         record_validation(conn, record_id=record.record_id, occurred_at=OCCURRED)
-        approve(conn, record_id=record.record_id, actor="chris", occurred_at=OCCURRED)
+        approve(
+            conn,
+            record_id=record.record_id,
+            actor="chris",
+            occurred_at=OCCURRED,
+            calibration=CALIBRATION,
+        )
         return record.record_id
     finally:
         conn.close()
@@ -173,6 +181,71 @@ def test_submit_prints_the_record_and_the_payload_digest_before_posting(
     assert "payload:   sha256 " in captured
     assert "status:    approved" in captured
     assert "refused:" in captured
+
+
+def test_submit_without_a_payload_file_posts_the_payload_the_record_derives(
+    config_file: Path,
+    record_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """M2-707 made `--payload-file` optional, and this is why that is the safe direction.
+
+    Now that an approval binds to a payload digest, the payload the record derives is the
+    only one that can reach a post at all -- so requiring an operator to hand-write it
+    (a 201-point CDF, for a numeric question) would have made the command undrivable
+    without making anything safer. Omitted, the command derives it, and the digest it prints
+    is the one the approval holds: the post goes through, which is the assertion, because a
+    derivation that disagreed with `approve`'s would fail at the key seam instead.
+    """
+    poster = FakePoster()
+    _install(monkeypatch, poster)
+    exit_code = main(["submit", "--config", str(config_file), "--record-id", record_id])
+    captured = capsys.readouterr().out
+    assert exit_code == EXIT_OK
+    assert poster.posts == 1
+    assert f"payload:   sha256 {PAYLOAD_SHA} (derived)" in captured
+    assert "result:    submitted" in captured
+
+
+def test_a_supplied_payload_the_approval_never_authorized_is_refused_before_any_post(
+    config_file: Path,
+    record_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """*"A submission payload that does not derive from the approved forecast is refused
+    before any post"* -- the acceptance criterion, from the command line.
+
+    A well-formed binary payload for the same question, differing only in the probability.
+    Before M2-707 this posted: the forecast hash was unchanged, so the approval was still in
+    force and the changed payload merely produced a different idempotency key. `poster.posts`
+    is the assertion that matters -- zero is the only way to show the gate ran in front of
+    the post rather than after it.
+    """
+    unauthorized = tmp_path / "unauthorized.json"
+    unauthorized.write_text(
+        json.dumps({**BINARY_PAYLOAD, "probability_yes": PROBABILITY + 0.1}), encoding="utf-8"
+    )
+    poster = FakePoster()
+    _install(monkeypatch, poster)
+    exit_code = main(
+        [
+            "submit",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--payload-file",
+            str(unauthorized),
+        ]
+    )
+    captured = capsys.readouterr().out
+    assert exit_code == EXIT_REFUSED
+    assert poster.posts == 0
+    assert "(from file)" in captured
+    assert "not the one the approval in force authorized" in captured
 
 
 def test_the_committed_config_refuses_before_a_token_is_even_read(
