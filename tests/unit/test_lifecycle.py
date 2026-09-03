@@ -456,6 +456,7 @@ def test_one_attempt_cannot_back_two_lifecycle_events(
         attempt=_attempt(success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
         conn.execute(
@@ -466,6 +467,53 @@ def test_one_attempt_cannot_back_two_lifecycle_events(
             (record_id, TS, TS),
         )
     assert len(read_history(conn, record_id)) == 3
+
+
+def test_the_writer_redacts_a_configured_secret_from_submission_attempt_text(
+    draft: tuple[sqlite3.Connection, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-605: a credential echoed back in HTTP text must not reach the stored row.
+
+    ``response_body``, ``response_headers`` and ``error_message`` are raw text from a live
+    submission attempt -- exactly where an HTTP error can echo back a header this project
+    sent, the class of leak ``logging_setup.ProviderResponseTextFilter`` already guards
+    against in logs. This proves the same guard now applies to what lands in
+    ``submission_attempts``, and that the guard can actually fail: the planted value is
+    confirmed present in the *input* before it is asserted absent from the stored row.
+    """
+    conn, record_id = draft
+    _approve(conn, record_id)
+    monkeypatch.setenv("FAKE_METACULUS_TOKEN", PLANTED_SECRET)
+    body = f"HTTP 401: invalid header Token {PLANTED_SECRET}"
+    headers = f"Authorization: Token {PLANTED_SECRET}"
+    message = f"request failed with token {PLANTED_SECRET}"
+    assert PLANTED_SECRET in body and PLANTED_SECRET in headers and PLANTED_SECRET in message
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(
+            success=False,
+            refetch="absent",
+            response_body=body,
+            response_headers=headers,
+            error_message=message,
+        ),
+        occurred_at=WHEN,
+        detail_code="http_error",
+        secret_env_var_names=["FAKE_METACULUS_TOKEN"],
+    )
+    row = conn.execute(
+        "SELECT response_body, response_headers, error_message FROM submission_attempts "
+        "WHERE attempt_id = ?",
+        ("att-1",),
+    ).fetchone()
+    stored_body, stored_headers, stored_message = row
+    assert PLANTED_SECRET not in stored_body
+    assert PLANTED_SECRET not in stored_headers
+    assert PLANTED_SECRET not in stored_message
+    assert "<redacted:FAKE_METACULUS_TOKEN>" in stored_body
+    assert "<redacted:FAKE_METACULUS_TOKEN>" in stored_headers
+    assert "<redacted:FAKE_METACULUS_TOKEN>" in stored_message
 
 
 @pytest.mark.parametrize(
@@ -738,7 +786,9 @@ def test_replace_cannot_downgrade_a_verified_submission(
         payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
-    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    record_submission_attempt(
+        conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN, secret_env_var_names=()
+    )
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         _replace_row(
             conn,
@@ -1324,7 +1374,11 @@ def test_the_pipeline_walks_draft_to_submitted(draft: tuple[sqlite3.Connection, 
     assert current_status(conn, record_id) == "approved"
 
     submitted = record_submission_attempt(
-        conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN + timedelta(minutes=2)
+        conn,
+        record_id=record_id,
+        attempt=_attempt(),
+        occurred_at=WHEN + timedelta(minutes=2),
+        secret_env_var_names=(),
     )
     assert submitted.event_type == "submitted"
     assert current_status(conn, record_id) == "submitted"
@@ -1803,6 +1857,7 @@ def test_the_attempt_pair_decides_the_event(
         attempt=_attempt(success=success, refetch=refetch),
         occurred_at=WHEN,
         detail_code=None if expected == "submitted" else "refetch_missing",
+        secret_env_var_names=(),
     )
     assert event.event_type == expected
     assert current_status(conn, record_id) == status
@@ -2038,6 +2093,7 @@ def _leave_uncertain(conn: sqlite3.Connection, record_id: str) -> None:
         attempt=_attempt(success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
     assert current_status(conn, record_id) == "approved"
 
@@ -2176,6 +2232,7 @@ def test_a_second_attempt_while_uncertain_is_recorded_not_refused(
         attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
     assert second.event_type == "submission_uncertain"
     assert _counts(conn)["submission_attempts"] == 2
@@ -2216,6 +2273,7 @@ def test_unresolved_uncertainties_is_the_pre_request_seam(
         attempt=_attempt(success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
     assert unresolved_uncertainties(conn, record_id) == ("att-1",)
 
@@ -2225,6 +2283,7 @@ def test_unresolved_uncertainties_is_the_pre_request_seam(
         attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
     assert unresolved_uncertainties(conn, record_id) == ("att-1", "att-2")
 
@@ -2255,7 +2314,9 @@ def test_a_refetch_cannot_resolve_an_attempt_that_was_never_uncertain(
     """
     conn, record_id = draft
     _approve(conn, record_id)
-    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    record_submission_attempt(
+        conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN, secret_env_var_names=()
+    )
     assert current_status(conn, record_id) == "submitted"
 
     with pytest.raises(LifecycleError, match="nothing for a refetch to resolve"):
@@ -2281,6 +2342,7 @@ def test_a_refetch_cannot_resolve_another_records_attempt(
         attempt=_attempt(attempt_id="att-2", key="idem-2", success=True, refetch="absent"),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
 
     with pytest.raises(LifecycleError, match="nothing for a refetch to resolve"):
@@ -2524,6 +2586,7 @@ def test_an_uncertain_submission_requires_a_detail_code(
             record_id=record_id,
             attempt=_attempt(success=True, refetch="absent"),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert current_status(conn, record_id) == "approved"
     assert _counts(conn)["submission_attempts"] == 0
@@ -2576,6 +2639,7 @@ def test_an_unverified_attempt_requires_a_detail_code(
             record_id=record_id,
             attempt=_attempt(success=False, refetch="absent"),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert current_status(conn, record_id) == "approved"
     assert _counts(conn)["submission_attempts"] == 0
@@ -2602,6 +2666,7 @@ def test_a_verified_submission_rejects_a_detail_code(
             attempt=_attempt(),
             occurred_at=WHEN,
             detail_code="timeout",
+            secret_env_var_names=(),
         )
 
 
@@ -2623,6 +2688,7 @@ def test_a_receipt_without_a_completion_time_is_refused(
             record_id=record_id,
             attempt=_attempt(completed_at_utc=None),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert _counts(conn)["submission_attempts"] == 0
     with pytest.raises(sqlite3.IntegrityError, match="completed_at_utc is required"):
@@ -2652,6 +2718,7 @@ def test_a_receipt_cannot_complete_before_it_was_requested(
             record_id=record_id,
             attempt=_attempt(completed_at_utc=WHEN - timedelta(seconds=1)),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert _counts(conn)["submission_attempts"] == 0
     with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
@@ -2679,6 +2746,7 @@ def test_a_receipt_reversed_by_one_microsecond_is_refused(
             record_id=record_id,
             attempt=_attempt(requested_at_utc=requested, completed_at_utc=completed),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     with pytest.raises(sqlite3.IntegrityError, match="earlier than requested_at_utc"):
         _insert_attempt(
@@ -2704,6 +2772,7 @@ def test_a_refetch_observed_one_microsecond_too_early_is_refused(
         attempt=_attempt(success=True, refetch="absent", completed_at_utc=completed),
         occurred_at=WHEN,
         detail_code="refetch_missing",
+        secret_env_var_names=(),
     )
     with pytest.raises(LifecycleError, match="earlier than the completion"):
         record_submission_verification(
@@ -2756,7 +2825,9 @@ def test_the_writer_renders_the_canonical_form(
     # instant is the case plain isoformat() gets wrong: it drops the fractional part.
     conn, record_id = draft
     _approve(conn, record_id)
-    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    record_submission_attempt(
+        conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN, secret_env_var_names=()
+    )
     stored = conn.execute(
         "SELECT requested_at_utc, completed_at_utc FROM submission_attempts"
     ).fetchone()
@@ -2782,6 +2853,7 @@ def test_an_http_status_outside_the_http_range_is_refused(
             record_id=record_id,
             attempt=_attempt(http_status=status),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert _counts(conn)["submission_attempts"] == 0
 
@@ -2795,7 +2867,11 @@ def test_a_real_http_status_is_stored(
     conn, record_id = draft
     _approve(conn, record_id)
     record_submission_attempt(
-        conn, record_id=record_id, attempt=_attempt(http_status=status), occurred_at=WHEN
+        conn,
+        record_id=record_id,
+        attempt=_attempt(http_status=status),
+        occurred_at=WHEN,
+        secret_env_var_names=(),
     )
     assert (
         conn.execute(
@@ -2967,7 +3043,9 @@ def test_a_second_submission_rolls_back_its_own_attempt_row(
         payload_sha256=PAYLOAD_SHA,
         occurred_at=WHEN,
     )
-    record_submission_attempt(conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN)
+    record_submission_attempt(
+        conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN, secret_env_var_names=()
+    )
     before = _counts(conn)
     with pytest.raises(LifecycleError):
         record_submission_attempt(
@@ -2975,6 +3053,7 @@ def test_a_second_submission_rolls_back_its_own_attempt_row(
             record_id=record_id,
             attempt=_attempt(attempt_id="att-2", key="idem-2"),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert _counts(conn) == before
     assert current_status(conn, record_id) == "submitted"
@@ -3027,7 +3106,11 @@ def test_an_injected_failure_leaves_no_half_written_state(
             )
         else:
             record_submission_attempt(
-                conn, record_id=record_id, attempt=_attempt(), occurred_at=WHEN
+                conn,
+                record_id=record_id,
+                attempt=_attempt(),
+                occurred_at=WHEN,
+                secret_env_var_names=(),
             )
 
     monkeypatch.undo()
@@ -3279,6 +3362,7 @@ def _leak_cases(
             record_id=record_id,
             attempt=_attempt(**overrides),  # type: ignore[arg-type]
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
 
     def submit_subclass() -> LifecycleEvent:
@@ -3295,6 +3379,7 @@ def _leak_cases(
                 refetch_outcome="confirmed",
             ),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
 
     def verify(**overrides: object) -> LifecycleEvent:
@@ -3402,6 +3487,7 @@ def test_an_oversized_integer_is_refused_at_the_field(
             record_id=record_id,
             attempt=_attempt(http_status=10**100),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert _counts(conn)["submission_attempts"] == 0
     assert not conn.in_transaction
@@ -3452,6 +3538,7 @@ def test_a_submission_attempt_subclass_is_refused(
                 refetch_outcome="confirmed",
             ),
             occurred_at=WHEN,
+            secret_env_var_names=(),
         )
     assert _counts(conn)["submission_attempts"] == 0
 
@@ -4408,11 +4495,19 @@ def test_every_guarded_column_agrees_with_the_writers_on_what_blank_means(
             record_validation(conn, record_id=blank, occurred_at=WHEN)
         with pytest.raises(LifecycleError, match=r"attempt\.attempt_id must not be blank"):
             record_submission_attempt(
-                conn, record_id=record_id, attempt=_attempt(attempt_id=blank), occurred_at=WHEN
+                conn,
+                record_id=record_id,
+                attempt=_attempt(attempt_id=blank),
+                occurred_at=WHEN,
+                secret_env_var_names=(),
             )
         with pytest.raises(LifecycleError, match=r"attempt\.idempotency_key must not be blank"):
             record_submission_attempt(
-                conn, record_id=record_id, attempt=_attempt(key=blank), occurred_at=WHEN
+                conn,
+                record_id=record_id,
+                attempt=_attempt(key=blank),
+                occurred_at=WHEN,
+                secret_env_var_names=(),
             )
 
     # Nothing above was allowed to land. A guard that refused 28 codepoints and wrote a row

@@ -1,9 +1,10 @@
 # Milestone 1 implementation notes
 
 Running record of M1 decisions and deviations, in the spirit of `docs/M0-REVIEW.md`.
-M1 began after the owner's explicit stop-point go-ahead (see `docs/M0-REVIEW.md`); Codex
-retains independent verification and owns M1-605 plus the acceptance/contract suites
-(T-901/903/904), which are authored blind against M1 code as it lands.
+M1 began after the owner's explicit stop-point go-ahead (see `docs/M0-REVIEW.md`). As of the
+2026-09-03 owner decision, Codex is retired as a distinct owner; Claude Code owns M1-605 and
+the acceptance/contract suites (T-901/903/904) too, mitigated per `CLAUDE.md`'s "Owner split"
+section (spec-first drafting before re-reading the implementation, not independent authorship).
 
 ## M1-601 — Initial SQLite ledger migration + DB layer
 
@@ -7756,3 +7757,112 @@ repairable defect in the *response* — conflating the two would let a caller re
 different response and burn a billed call on something no response could fix. `generate.py`
 already treats it as a preflight raise for the same reason; this item does not change that
 boundary, only where else it is now reachable from.
+
+## M1-605 — Secret and trace redaction
+
+D24's two hard constraints — never persist a secret, never persist hidden chain-of-thought —
+were already substantially closed before this item: `logging_setup.py`'s
+`SecretRedactionFilter`/`JsonFormatter`/`ProviderResponseTextFilter` scrub every configured
+credential's value and any raw provider-response text out of logs (M0-101, M1-402, M2-704),
+and the forecaster's strict pydantic schema plus `MAX_RATIONALE_WORDS = 120` already keep
+hidden deliberation out of the canonical record. `bounds.py` said as much: it bounds the
+*length* of free-text ledger columns and notes explicitly that this "is not a substitute for
+M1-605's redaction." What remained open was content reaching **the database or an
+export/artifact file** rather than a log: `forecast/artifacts.py::write_raw_model_output`
+wrote `request`/`raw_responses` verbatim to disk, and `lifecycle.py::record_submission_attempt`
+wrote `response_body`/`response_headers`/`error_message` verbatim into `submission_attempts`.
+Both are raw HTTP/model text and exactly the class of leak
+`logging_setup.ProviderResponseTextFilter`'s docstring already describes for logs.
+
+### Decision — one shared primitive, not two redaction schemes
+
+`src/whiskeyjack_bot/redaction.py::redact_secrets(text, env_var_names)` is
+`logging_setup.py`'s `_redact_text` moved out and made public, unchanged in behaviour. Two
+independent implementations of "replace a configured credential's value with
+`<redacted:NAME>`" is exactly the class of defect `bounds.py`'s own docstring warns about for
+constants ("two spellings of a *rule* that are tested for equality is a different thing from
+two spellings of a *number* that are not tested at all") — here it would have been a rule,
+not even a number, spelled twice. The module imports nothing from the package, the same
+posture as `bounds.py`, so `lifecycle.py` (which imports nothing from `config.py` today) does
+not have to acquire that dependency to use it.
+
+### Decision — required parameter, not a defaulted one
+
+`write_raw_model_output`, `record_submission_attempt` and `record_receipt` all gained a
+**required** keyword-only `secret_env_var_names: Sequence[str]`, not one defaulted to `()`.
+A default of `()` would silently mean "redact nothing" for any caller that forgot to pass
+real names — precisely the failure mode this item exists to close, and the M1-507 "required,
+not optional" decision (this same file, above) makes the identical argument for a different
+gap. Every call site, including ~85 test/property/acceptance ones exercising unrelated
+behaviour, now passes `secret_env_var_names=()` explicitly; tests exercising redaction pass a
+real name backed by a planted, monkeypatched environment variable.
+
+### Decision — redact before bounding, not after
+
+`lifecycle.py`'s new `_redact_optional` helper runs before `_require_optional_text`'s
+`max_length` check, not after. Redaction only ever grows text (a secret value becomes the
+longer `<redacted:NAME>` marker), so bounding the *pre*-redaction text first could let the
+length check clip a marker this writer just produced, or — worse — clip a still-unredacted
+secret value down to a truncated fragment that survives.
+
+### Deferred (do not read the absence as an omission) — `forecast/record.py`'s `rationale_summary`
+
+Not touched. It is not raw HTTP/provider text — it is the parser's output, already
+capped by `MAX_RATIONALE_WORDS` and structurally excluded from carrying an
+undeclared field by the schema's `extra="forbid"`. The raw text it derives from
+(`raw_responses`) is exactly what gap 1 above now redacts before it reaches disk; redacting
+the same content a second time at the parsed-field layer would not close a channel that is
+not open.
+
+### Deferred (do not read the absence as an omission) — `record_submission_verification`'s `refetched_forecast_snapshot`
+
+Not touched. It is platform-observed read content — what Metaculus has on file for a
+question, fetched to verify a post — not our own request or error text, and its writer
+(`verify_uncertain_attempt`) explicitly reads no configuration today. Widening it to take a
+redaction list would be new scope with no identified leak vector: a GET response body
+echoing back one of our own credentials has no plausible mechanism the way an HTTP *error*
+response reflecting request state does.
+
+### Deferred (do not read the absence as an omission) — `research/artifacts.py`
+
+Not touched; already excludes the retrieval request outright (M1-306 decision), because a
+retrieval request's URL and headers are exactly where that adapter's API key would appear.
+There is nothing left in that envelope for `redact_secrets` to act on.
+
+### Standing risk — not verifiable offline
+
+`redact_secrets` matches on the *literal value* of a configured credential. A credential
+that is transformed before it reaches provider/HTTP text — base64-encoded in an
+`Authorization` header, partially echoed, or logged by a third party in a different
+encoding than this process holds in `os.environ` — would not match and would not be
+redacted. This is the same limitation `logging_setup.py`'s redaction has always carried;
+this item does not widen or narrow it, only extends the same primitive to two more sinks.
+
+### Decision — round 1, finding 1: redact at generation time, not only at the artifact boundary
+
+Round 1 (PR #69) found the first cut wrong: `write_raw_model_output` was the only place a
+model reply got redacted, and everything upstream of it — `forecast/generate.py::_parse`,
+`forecast/record.py::build_forecast_record_draft`, the record's own hash — ran on the
+*original* reply. For a reply that happened to echo a configured credential (the reviewer's
+example: the value sitting in `rationale_summary`), the canonical record and its hash were
+built from the unredacted text while the stored artifact held the redacted one. Two
+consequences, both real: the credential still reached `forecast_records` (the exact thing
+this item exists to prevent), and `replay_forecast` — which re-parses the *stored* artifact
+and compares its hash to the *record's* — could never reproduce the hash again, permanently.
+
+The fix moves the redaction one layer earlier: `forecast/generate.py::_run_attempts`
+redacts each reply immediately after `_invoke` returns it, before either `_parse` or
+`raw_responses.append` sees it. Every downstream consumer — the parsed `ForecastResponse`,
+the record built from it, the artifact — now derives from one text, so there is nothing
+left to disagree. `write_raw_model_output`'s own redaction stays (it is now normally a
+no-op, since `redact_secrets` is idempotent — `tests/property/test_redaction_properties.py`
+— but it is a public writer, and a caller who built a `ForecastGeneration` some other way,
+as `tests/acceptance/scenario.py` does, must not be trusted to have pre-redacted).
+`test_a_secret_echoed_in_a_reply_is_redacted_before_it_is_parsed`
+(`tests/unit/test_forecast_generate.py`) is the regression test, mutation-tested by
+temporarily removing the new redaction call to confirm it fails without the fix.
+
+The `request` half of the artifact was not moved: `replay_forecast` re-parses only
+`raw_responses[-1]` (confirmed by reading `forecast/replay.py`), never `request`, so nothing
+downstream ever compares a hash derived from `request` against anything else — there was no
+consistency gap on that side, only on `raw_responses`.

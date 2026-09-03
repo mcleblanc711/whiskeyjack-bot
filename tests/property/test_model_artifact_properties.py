@@ -172,6 +172,7 @@ def test_the_writer_raises_only_its_own_error(
             generation=_generation(**{field: value}),
             written_at_utc=WHEN,
             retain=True,
+            secret_env_var_names=(),
         )
     except ArtifactError:
         return
@@ -267,6 +268,7 @@ def test_every_stored_envelope_replays_to_itself(
         generation=generation,
         written_at_utc=WHEN,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative == artifact_relative_path(question_id=question_id, attempt_id=attempt_id)
     assert relative is not None
@@ -306,6 +308,7 @@ def test_an_artifact_is_never_overwritten_whatever_the_draw(
         "question_id": question_id,
         "written_at_utc": WHEN,
         "retain": True,
+        "secret_env_var_names": (),
     }
     relative = write_raw_model_output(
         root,
@@ -366,6 +369,7 @@ def test_the_reader_refuses_any_value_the_writer_could_not_emit(
         generation=_generation(),
         written_at_utc=WHEN,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative is not None
     envelope = json.loads((root / relative).read_text(encoding="utf-8"))
@@ -435,6 +439,7 @@ def test_the_reader_refuses_any_envelope_whose_key_set_the_writer_could_not_emit
         generation=_generation(),
         written_at_utc=WHEN,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative is not None
     envelope = json.loads((root / relative).read_text(encoding="utf-8"))
@@ -479,6 +484,7 @@ def test_no_writer_refusal_echoes_the_value_it_refused(
             generation=_generation(**overrides),
             written_at_utc=WHEN,
             retain=True,
+            secret_env_var_names=(),
         )
     assert not _leaks(caught.value, PLANTED)
 
@@ -496,6 +502,7 @@ def test_no_reader_refusal_echoes_the_file_content_it_refused(
         generation=_generation(raw_responses=(PLANTED,), request=PLANTED),
         written_at_utc=WHEN,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative is not None
     envelope = json.loads((root / relative).read_text(encoding="utf-8"))
@@ -535,6 +542,7 @@ def test_a_written_timestamp_reads_back_as_the_same_instant(
         generation=_generation(),
         written_at_utc=when,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative is not None
     assert read_raw_model_output(root, relative).written_at_utc == when

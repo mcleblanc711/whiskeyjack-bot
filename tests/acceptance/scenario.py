@@ -312,6 +312,7 @@ def seed_scenario(
         generation=generation,
         written_at_utc=COMPLETED,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative is not None
     return Seed(

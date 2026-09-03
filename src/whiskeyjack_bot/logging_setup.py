@@ -19,16 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from whiskeyjack_bot.config import AppConfig
-
-# Values shorter than this are never treated as redactable secrets: replacing
-# a 1-3 character string would mangle unrelated log text far more often than
-# it would protect a real credential.
-_MIN_SECRET_LENGTH = 4
+from whiskeyjack_bot.redaction import redact_secrets
 
 # Third-party loggers that see a model call's payloads. ``forecasting_tools`` logs
 # ``f"Invoking model with prompt: {prompt}"`` and ``f"Model responded with: {response}"``
@@ -66,21 +61,6 @@ _SANITIZED_PROVIDER_MESSAGE = (
 )
 
 
-def _redact_text(text: str, env_var_names: list[str]) -> str:
-    """Replace the value of any named environment variable found in *text*.
-
-    Values are re-read from the environment on every call so a credential set
-    after logging setup is still redacted. Returns *text* itself (identity
-    preserved) when nothing matched.
-    """
-    redacted = text
-    for name in env_var_names:
-        value = os.environ.get(name)
-        if value and len(value) >= _MIN_SECRET_LENGTH and value in redacted:
-            redacted = redacted.replace(value, f"<redacted:{name}>")
-    return redacted
-
-
 class SecretRedactionFilter(logging.Filter):
     """Scrub configured credential values out of log record messages.
 
@@ -97,7 +77,7 @@ class SecretRedactionFilter(logging.Filter):
             message = record.getMessage()
         except Exception:  # noqa: BLE001 - malformed record; let it through unformatted
             return True
-        redacted = _redact_text(message, self._env_var_names)
+        redacted = redact_secrets(message, self._env_var_names)
         if redacted is not message:
             record.msg = redacted
             record.args = None
@@ -190,7 +170,7 @@ class JsonFormatter(logging.Formatter):
             payload["exc_type"] = record.exc_info[0].__name__
             payload["exc_message"] = str(record.exc_info[1])
         redacted = {
-            key: _redact_text(value, self._env_var_names) if isinstance(value, str) else value
+            key: redact_secrets(value, self._env_var_names) if isinstance(value, str) else value
             for key, value in payload.items()
         }
         return json.dumps(redacted, ensure_ascii=False)

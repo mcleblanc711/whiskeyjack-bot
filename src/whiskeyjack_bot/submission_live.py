@@ -1892,7 +1892,11 @@ def post_approved_forecast(
     receipt = replace(outcome.receipt, artifact_path=artifact_path)
     try:
         event = record_receipt(
-            conn, receipt=receipt, occurred_at=stamped, detail_code=outcome.detail_code
+            conn,
+            receipt=receipt,
+            occurred_at=stamped,
+            secret_env_var_names=config.secret_env_var_names(),
+            detail_code=outcome.detail_code,
         )
     except GatewayError as exc:
         # `record_receipt` belongs to `submission_gateway` and raises that module's type;

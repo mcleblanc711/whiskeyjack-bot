@@ -96,6 +96,7 @@ def _write(artifacts: Path, retain: bool = True, **overrides: Any) -> str | None
         generation=_generation(**overrides),
         written_at_utc=WHEN,
         retain=retain,
+        secret_env_var_names=(),
     )
 
 
@@ -233,6 +234,7 @@ def test_an_attempt_id_that_is_not_one_path_component_is_refused(
             generation=_generation(),
             written_at_utc=WHEN,
             retain=True,
+            secret_env_var_names=(),
         )
     assert list(artifacts.rglob("*.json")) == []
 
@@ -291,6 +293,7 @@ def test_a_naive_timestamp_is_refused(artifacts: Path) -> None:
             generation=_generation(),
             written_at_utc=datetime(2026, 8, 24, 12, 0),
             retain=True,
+            secret_env_var_names=(),
         )
 
 
@@ -540,6 +543,7 @@ def test_no_refusal_echoes_the_content_it_refused(artifacts: Path) -> None:
             generation=_generation(),
             written_at_utc=WHEN,
             retain=True,
+            secret_env_var_names=(),
         )
     assert not _leaks(caught.value)
 
@@ -556,3 +560,35 @@ def test_no_refusal_echoes_the_content_it_refused(artifacts: Path) -> None:
 def test_the_planted_value_would_be_visible_if_it_leaked() -> None:
     """The positive control for the test above: `_leaks` must be able to say yes."""
     assert _leaks(ArtifactError(f"model reply was {PLANTED}"))
+
+
+def test_the_writer_redacts_a_configured_secret_from_request_and_replies(
+    artifacts: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-605: a credential echoed back by the model/provider must not reach the artifact.
+
+    ``request`` and ``raw_responses`` are stored verbatim otherwise -- the same class of
+    content ``logging_setup.ProviderResponseTextFilter`` already guards against in logs, now
+    landing in a file instead. This proves the writer's own redaction closes that channel,
+    and that the guard can actually fail: the planted value is confirmed present in the
+    *input* before it is asserted absent from the written envelope.
+    """
+    monkeypatch.setenv("FAKE_MODEL_API_KEY", PLANTED)
+    request = f"Authorization: Bearer {PLANTED}\n\nWhat is the probability?"
+    reply = f'{{"probability": 0.5, "note": "used key {PLANTED}"}}'
+    assert PLANTED in request and PLANTED in reply
+    relative = write_raw_model_output(
+        artifacts,
+        attempt_id=ATTEMPT,
+        question_id=QUESTION,
+        generation=_generation(request=request, raw_responses=(reply,)),
+        written_at_utc=WHEN,
+        retain=True,
+        secret_env_var_names=["FAKE_MODEL_API_KEY"],
+    )
+    assert relative is not None
+    envelope = _envelope(artifacts, relative)
+    assert PLANTED not in envelope["request"]
+    assert all(PLANTED not in body for body in envelope["raw_responses"])
+    assert "<redacted:FAKE_MODEL_API_KEY>" in envelope["request"]
+    assert "<redacted:FAKE_MODEL_API_KEY>" in envelope["raw_responses"][0]

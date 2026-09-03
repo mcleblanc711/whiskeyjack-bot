@@ -490,6 +490,7 @@ def test_a_stored_question_no_percentile_set_could_satisfy_is_a_record_error(
         generation=generation,
         written_at_utc=WRITTEN_AT,
         retain=True,
+        secret_env_var_names=(),
     )
     assert path is not None
     record = assign_identity(

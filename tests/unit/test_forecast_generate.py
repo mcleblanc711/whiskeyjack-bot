@@ -592,6 +592,29 @@ def test_the_api_key_never_reaches_the_result(
     assert all(FAKE_KEY not in raw for raw in result.raw_responses)
 
 
+def test_a_secret_echoed_in_a_reply_is_redacted_before_it_is_parsed(
+    config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-605 round 1, finding 1: redacting only at artifact-write time let the parsed
+    forecast (and its hash) derive from the original reply while the stored artifact held
+    the redacted one, so replay's re-parse of the artifact could never reproduce the
+    record's hash on a reply that happened to echo a configured credential -- and the
+    credential still reached the canonical record's ``rationale_summary``. Redacting the
+    reply *before* ``_parse`` runs (here, inside ``_run_attempts``) means the returned
+    forecast and ``raw_responses`` are both built from the same, already-redacted text, so
+    nothing downstream can observe two different versions of the reply.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
+    reply = good_reply(rationale_summary=f"the model used key {FAKE_KEY} in its reasoning")
+    assert FAKE_KEY in reply
+    result = _generate(_Model(reply), config, prompt)
+    assert result.forecast is not None
+    assert FAKE_KEY not in result.raw_responses[0]
+    assert "<redacted:OPENROUTER_API_KEY>" in result.raw_responses[0]
+    assert FAKE_KEY not in result.forecast.rationale_summary
+    assert "<redacted:OPENROUTER_API_KEY>" in result.forecast.rationale_summary
+
+
 def test_configured_logging_redacts_the_model_key(
     config: AppConfig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

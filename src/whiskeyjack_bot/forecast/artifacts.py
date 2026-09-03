@@ -42,6 +42,29 @@ actually asked -- which is most of what makes it evidence. The model settings ar
 called anywhere in this project because it dumps ``litellm_kwargs`` wholesale, API key
 included.
 
+That closes the *known* channel; it does not close every one. ``request`` and
+``raw_responses`` are otherwise stored verbatim, and a provider's own text -- an HTTP error
+body, a model reply -- can echo back a credential this project sent, the same class of leak
+``logging_setup.ProviderResponseTextFilter`` already guards against in logs. M1-605 closes it
+here too: :func:`write_raw_model_output` redacts every configured credential's value out of
+``request`` and each ``raw_responses`` entry before the envelope is written.
+
+**Redaction happens twice, deliberately, and the second is not redundant.**
+``forecast/generate.py::_run_attempts`` redacts each reply *before* it is either parsed or
+appended to ``raw_responses`` -- round 1 finding 1 against this module's first cut, which
+redacted only here. Redacting solely at the artifact-write boundary let the ledger record
+and the raw artifact derive from two different texts whenever a reply echoed a configured
+credential: the parsed forecast (and its hash) came from the original reply, while this
+writer stored the redacted one, so replay's re-parse of the stored text could no longer
+reproduce the record's hash, and the credential still reached the canonical record. Redacting
+at the source keeps the parse, the record and the artifact on one text. This writer redacts
+again anyway -- a caller-supplied ``generation.raw_responses`` is not guaranteed to have
+already passed through ``_run_attempts`` (``tests/acceptance/scenario.py`` builds one
+directly, for one), and a public writer that trusted every caller to have pre-redacted would
+be one caller mistake from silently storing a secret. Redaction is idempotent
+(``tests/property/test_redaction_properties.py::test_redaction_is_idempotent``), so applying
+it twice on the normal path costs nothing.
+
 **D24 is not touched.** What is stored is the provider's returned text -- the reply the
 parser was handed -- not a reasoning trace, and this module has no access to one. The
 canonical record is unaffected: ``record_json`` still carries no raw response, which
@@ -70,6 +93,7 @@ from whiskeyjack_bot.artifacts import (
 from whiskeyjack_bot.config import MAX_MODEL_INVOCATIONS
 from whiskeyjack_bot.forecast.parse import ForecastGeneration, ModelSettings
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
+from whiskeyjack_bot.redaction import redact_secrets
 
 # The version of *this* envelope. Not `RESPONSE_SCHEMA_VERSION` (the model's output
 # contract), not `RECORD_SCHEMA_VERSION` (the shape of the stored row), and not
@@ -239,12 +263,17 @@ def write_raw_model_output(
     generation: ForecastGeneration,
     written_at_utc: datetime,
     retain: bool,
+    secret_env_var_names: Sequence[str],
 ) -> str | None:
     """Write one attempt's raw model output; return the path to record, or ``None``.
 
     Returns the **relative** path for ``forecast_records.raw_output_path``. Returns ``None``
     -- writing nothing -- when ``retain`` is false, which is the meaning of
     ``storage.retain_raw_model_output: false`` and not a failure.
+
+    ``secret_env_var_names`` is redacted out of ``request`` and every ``raw_responses`` entry
+    before they are written (M1-605) -- see this module's docstring. Required rather than
+    defaulted, so a caller cannot silently skip redaction by omission.
 
     Raises :class:`ArtifactError` rather than swallowing a write failure. Callers on the
     paid path must not let that lose the forecast: write the artifact first, and if it
@@ -294,6 +323,9 @@ def write_raw_model_output(
     problem_list = list(problems)
     if any(type(problem) is not str for problem in problem_list):
         raise ArtifactError("generation.failure_problems must be a sequence of strings")
+
+    request = redact_secrets(request, secret_env_var_names)
+    bodies = [redact_secrets(body, secret_env_var_names) for body in bodies]
 
     envelope = {
         "artifact_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,

@@ -134,6 +134,7 @@ def _write_forecast(root: Path, variant: int) -> str:
         generation=generation,
         written_at_utc=WHEN,
         retain=True,
+        secret_env_var_names=(),
     )
     assert relative is not None
     return relative

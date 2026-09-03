@@ -100,6 +100,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Sequence
 from datetime import datetime
 from math import isfinite
 from typing import Any, Protocol
@@ -150,6 +151,7 @@ from whiskeyjack_bot.forecast.schema import (
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
 from whiskeyjack_bot.prompt import LoadedPrompt
+from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.questions.model import (
     CanonicalNumericQuestion,
     CanonicalQuestion,
@@ -486,6 +488,7 @@ def generate_forecast(
         allowed_tries=config.model.allowed_tries,
         forecast_config=config.forecast,
         numeric_calibration=config.numeric_calibration,
+        secret_env_var_names=config.secret_env_var_names(),
         settings=settings,
         sources=model_input.sources,
         question=question,
@@ -590,12 +593,25 @@ def _run_attempts(
     allowed_tries: int,
     forecast_config: ForecastConfig,
     numeric_calibration: NumericCalibrationConfig,
+    secret_env_var_names: Sequence[str],
     settings: ModelSettings,
     sources: tuple[SourceReference, ...],
     question: CanonicalQuestion,
     request: str,
 ) -> ForecastGeneration:
-    """Invoke, parse, and repair once per remaining try. Never raises."""
+    """Invoke, parse, and repair once per remaining try. Never raises.
+
+    ``secret_env_var_names`` is redacted out of each reply **before** it is either parsed
+    or recorded as a raw response (M1-605 round 1 finding 1). Redacting only at artifact-
+    write time -- this project's first cut -- let the ledger record and the raw artifact
+    derive from two different texts whenever a reply happened to echo a configured
+    credential: the parsed forecast (and its hash) came from the original, unredacted
+    reply, while ``write_raw_model_output`` stored the redacted one. Replay re-parses the
+    *stored* (redacted) text and compares against the *record's* (unredacted-derived) hash,
+    so that split made a normal reply containing a credential both leak the credential into
+    the canonical record and become permanently non-replayable. Redacting here instead
+    means the parse, the record, and the stored artifact all derive from the same text.
+    """
     # The minted citation ids, read once. ``SourceReference.source_id`` is the ``src-NNN``
     # ``forecast.inputs`` assigned over this packet's documents in ``dedup_key`` order,
     # and it is exactly what the model was shown under ``research_documents``. Mapped
@@ -626,6 +642,7 @@ def _run_attempts(
             failure_code = "timeout" if isinstance(exc, TimeoutError) else "provider_error"
             problems = ["the provider call did not complete (detail withheld)"]
             break
+        text = redact_secrets(text, secret_env_var_names)
         raw_responses.append(text)
         if usage > 0.0 and isfinite(usage):
             calls_with_cost += 1

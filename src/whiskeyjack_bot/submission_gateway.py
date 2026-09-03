@@ -98,7 +98,7 @@ import json
 import math
 import re
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -465,6 +465,7 @@ def record_receipt(
     *,
     receipt: SubmissionReceipt,
     occurred_at: datetime,
+    secret_env_var_names: Sequence[str],
     detail_code: FailureCode | None = None,
 ) -> LifecycleEvent:
     """Write a **live** receipt to the ledger, against the record the receipt names.
@@ -495,6 +496,8 @@ def record_receipt(
 
     ``detail_code`` is forwarded unchanged; ``record_submission_attempt`` decides which
     outcomes require one, and re-stating that rule here would be a second copy of it.
+    ``secret_env_var_names`` is forwarded unchanged too -- it is that writer's redaction
+    list (M1-605), not a decision this module makes.
     """
     if type(receipt) is not SubmissionReceipt:
         raise GatewayError("receipt must be a SubmissionReceipt")
@@ -506,6 +509,7 @@ def record_receipt(
             record_id=record_id,
             attempt=attempt,
             occurred_at=occurred_at,
+            secret_env_var_names=secret_env_var_names,
             detail_code=detail_code,
         )
     except LifecycleError as exc:
