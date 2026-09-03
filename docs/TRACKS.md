@@ -41,14 +41,14 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-514 | feat/m1-514-wall-clock-bound | whiskeyjack-m1-514 | no | none | 2026-09-02 |
-*(Swept `M2-707` (merged, PR #61, r2 approve, 2026-09-02) on top of the sweep it carried of
-`M1-315`, `M1-608` and `M1-314`. Two sibling branches are live alongside this one and each
-carries its own row on its own branch, which is why they are named here as prose rather
-than added as rows: `M2-709` (PR #60, the last item on Lane 3's debt queue) and `M1-610`
-(PR #62). Neither touches `forecast/cdf.py`, `forecast/generate.py` or
-`NumericCalibrationConfig`, so the collision this table is blind to — two branches widening
-one signature, the `M1-404`/`M1-405` shape recorded below — was checked for rather than
-assumed.)*
+*(Swept `M1-610` (merged, PR #62, round-2 approve, 2026-09-02) on top of master's own sweep of
+`M2-707` (PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58) — all landed and
+their branches are gone from `origin`. One sibling branch is live alongside this one and carries
+its own row on its own branch, which is why it is named here as prose rather than added as a
+row: `M2-709` (PR #60), the last item on Lane 3's debt queue. It touches neither
+`forecast/cdf.py`, `forecast/generate.py` nor `NumericCalibrationConfig`, so the collision this
+table is blind to — two branches widening one signature, the `M1-404`/`M1-405` shape recorded
+below — was checked for rather than assumed.)*
 
 ## Planned next wave
 
