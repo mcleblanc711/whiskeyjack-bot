@@ -41,6 +41,9 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M2-709 | feat/m2-709-shared-artifact-writer | whiskeyjack-m2-709 | no | none | 2026-09-02 |
+| T-905 | feat/t-905-gate-exit-code | whiskeyjack-t-905 | no | none | 2026-09-03 |
+| M1-504 | feat/m1-504-stale-research-gate | whiskeyjack-m1-504 | no | none | 2026-09-03 |
+| M1-507 | feat/m1-507-persist-path-validation | whiskeyjack-m1-507 | no | none | 2026-09-03 |
 *(Swept `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
 `origin` because `finish-item.sh` has not run yet; `scripts/tracks.py` ignores a merged
 branch either way), `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707`
