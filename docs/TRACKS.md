@@ -40,13 +40,17 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M2-709 | feat/m2-709-shared-artifact-writer | whiskeyjack-m2-709 | no | none | 2026-09-02 |
-*(Swept `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
+| T-905 | feat/t-905-gate-exit-code | whiskeyjack-t-905 | no | none | 2026-09-03 |
+| M1-504 | feat/m1-504-stale-research-gate | whiskeyjack-m1-504 | no | none | 2026-09-03 |
+| M1-507 | feat/m1-507-persist-path-validation | whiskeyjack-m1-507 | no | none | 2026-09-03 |
+*(Swept `M2-709` (merged, PR #60, 2026-09-02; `finish-item.sh` found its branch already
+gone on both local and origin — deleted at merge time — so this row-drop is all the sweep
+left to do), `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
 `origin` because `finish-item.sh` has not run yet; `scripts/tracks.py` ignores a merged
 branch either way), `M1-610` (merged, PR #62, round-2 approve, 2026-09-02), `M2-707`
-(merged, PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58). `M2-709` is
+(merged, PR #61), `M1-315` (PR #55), `M1-608` (PR #57) and `M1-314` (PR #58). `M2-709` was
 the last item on Lane 3's debt queue — one atomic create-or-fail helper shared by every
-artifact writer. **Its row names a duplication that was already half removed**:
+artifact writer. **Its row named a duplication that was already half removed**:
 `research/artifacts._write_new_file` does not exist, because M1-406 extracted it to
 `whiskeyjack_bot/artifacts.py` as public `write_new_file` when it added a second artifact
 kind. The surviving copy was `submission_gateway._write_or_confirm` alone, and the item is
