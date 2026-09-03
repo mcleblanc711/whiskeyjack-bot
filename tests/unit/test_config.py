@@ -218,6 +218,31 @@ def test_probability_bounds_accept_exact_spec_boundaries(valid_data: dict) -> No
     assert config.forecast.max_probability == 0.999
 
 
+def test_the_research_gate_cannot_be_silenced_entirely(valid_data: dict) -> None:
+    """M1-504's round-1 finding: with both false, a stale or empty packet would pass
+    through neither the ``fail`` branch nor the ``flag`` branch and reach ``validated``
+    with nothing recorded -- the acceptance criterion's ``never pass silently`` forbids
+    exactly that, so the combination is rejected here rather than left for the gate's
+    call sites to invent a silent-by-default behavior for."""
+    valid_data["forecast"]["fail_on_stale_research"] = False
+    valid_data["forecast"]["flag_on_stale_research"] = False
+    expect_rejection(valid_data, "fail_on_stale_research")
+
+
+@pytest.mark.parametrize(
+    ("fail_on_stale_research", "flag_on_stale_research"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_the_research_gate_accepts_every_other_combination(
+    valid_data: dict, fail_on_stale_research: bool, flag_on_stale_research: bool
+) -> None:
+    valid_data["forecast"]["fail_on_stale_research"] = fail_on_stale_research
+    valid_data["forecast"]["flag_on_stale_research"] = flag_on_stale_research
+    config = validate_config_data(valid_data)
+    assert config.forecast.fail_on_stale_research == fail_on_stale_research
+    assert config.forecast.flag_on_stale_research == flag_on_stale_research
+
+
 def test_cdf_points_other_than_201_rejected(valid_data: dict) -> None:
     valid_data["numeric_calibration"]["expected_cdf_points"] = 200
     expect_rejection(valid_data, "numeric_calibration.expected_cdf_points")

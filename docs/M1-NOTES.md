@@ -7578,6 +7578,130 @@ only one of the three that composes. `test_an_outer_deadline_comes_back_with_the
 pins it, and it is not hypothetical — `tests/conftest.py`'s own `deadline` fixture is exactly
 such a caller.
 
+## M1-504 — The stale/insufficient research gate
+
+Acceptance: *flag or fail according to config before approval; no-sources and stale-only
+fixtures produce explicit states and never pass silently.*
+
+### Delivered
+
+- `src/whiskeyjack_bot/research/sufficiency.py` — `assess_sufficiency`,
+  `SufficiencyVerdict` (`"sufficient" | "no_evidence" | "stale_evidence"`).
+- `src/whiskeyjack_bot/pipeline.py` (`run_replay`) and `pipeline_live.py`
+  (`_attempt_question`) — both now branch on the verdict at the validation seam, between
+  `persist_generation` and the `validated`/`validation_failed` lifecycle write.
+- `pipeline_live.py` — `QuestionStatus` gained `"validation_failed"`; `QuestionOutcome
+  .__post_init__`'s three invariants were re-derived (not loosened) to admit a status that,
+  uniquely, carries both a persisted record and a detail code.
+- `tests/unit/test_research_sufficiency.py`, `tests/property/test_sufficiency_properties.py`,
+  new cases in `tests/acceptance/test_pipeline_refusals.py` and `tests/unit/test_pipeline_live.py`.
+- No config change (`forecast.fail_on_stale_research`/`flag_on_stale_research` were already
+  committed by M1-501) and no migration (`lifecycle.FailureCode` already carried
+  `no_evidence`/`stale_evidence`) — both were left for this item on purpose by the branches
+  that added them, so this one is wiring only.
+
+### Decision — the sufficiency rule, and where the boundary with M1-305/M1-501 sits
+
+`research/freshness.py` (M1-305) tags one *document*; this module tags one *packet* and
+stops there — it returns a verdict, never a config read or a lifecycle write, so the module
+that decides "fail or flag" stays entirely in the two pipeline call sites. A packet with
+zero documents is `no_evidence`; a non-empty packet where every document assesses stale
+(including `undatable`, M1-305's own stricter reading) is `stale_evidence`; a single fresh
+document among any number of stale ones is `sufficient`. That last threshold is not a new
+one — it is M1-501's own: `attribution.py`'s evidence-conditional rules already turn back on
+the moment a packet supplies even one document, so this gate does not invent a stricter bar
+over the same packet than the rules that already run against it.
+
+### Decision — the live path's pre-existing retrieval-stage refusal is left alone
+
+`pipeline_live.py` already writes an unconditional `research_failed`/`no_evidence`
+`pipeline_failure_event` *before* `generate_forecast` ever runs, whenever
+`RetrievalOutcome.packet is None` — reviewed, merged M1-606-era behaviour, and it means a
+live run's zero-document case never reaches this gate at all: `no_evidence` is reachable in
+`pipeline_live.py` today only defensively, not on any exercised path. Reconciling the two
+(making the retrieval-stage refusal itself config-sensitive) was considered and rejected —
+owner decision — as materially larger scope than this item's row, and out of place: that
+refusal is about a *provider call* that found nothing, this gate is about a *forecast* built
+on what a call found. `pipeline.py`'s replay path has no equivalent pre-check
+(`replay_research` only refuses an empty *run* set, not a completed run with zero
+documents), so its `no_evidence` branch is the one this item actually exercises end to end;
+`pipeline_live.py`'s exists for the day retrieval's own guard is loosened, and for the
+`stale_evidence` case, which no pre-existing check covers on either path.
+
+### Decision — flagging is a log line, not a stored field
+
+`flag_on_stale_research=true` (the committed default) proceeds to `validated` with a
+`_LOGGER.warning`, matching the existing fallback-provider-unavailable pattern in
+`pipeline_live.py`. Widening `record_validation` with a note was considered and rejected:
+the immutable-migration cost `docs/TRACKS.md`'s `010`/`011` write-ups describe for a `CHECK`
+rebuild buys nothing here, since a flagged forecast is still going to `validated` and its
+`research_packet_sha256` already lets anyone who wants the answer recompute
+`assess_sufficiency` against the stored packet — the verdict is derivable, not lost.
+
+### Deviation — `QuestionOutcome`'s invariants needed re-deriving, not a fourth branch
+
+`recorded`/`research_failed`/`generation_failed` cover, respectively, "record persisted, no
+event", "no record, event with a detail code" and the same. `validation_failed` is neither:
+a record **was** persisted (the draft, its artifact and its lifecycle event are the same
+committed transaction the gate failure does not roll back) *and* it carries a detail code.
+Each of the three `__post_init__` checks — record-id presence, detail-code presence,
+artifact-outcome legality — was rewritten to name the right disjunction of statuses rather
+than adding a parallel special case, so the dataclass's "cannot represent a lie" property
+(M1-312's shape, carried into this one) still covers the new status by construction, and
+`test_a_validation_failed_outcome_without_a_record_id_is_refused` /
+`..._without_a_detail_code_is_refused` pin it the same way the existing `recorded`/
+`research_failed` cases already were.
+
+### Deferred (do not read the absence as an omission)
+
+- **A `--refresh-research` style bypass for a flagged record.** Nothing here lets an
+  operator re-run generation against fresher evidence without minting a new attempt through
+  the normal path; M1-315 already provides exactly that path (`--refresh-research`), so
+  there is nothing this item needs to add.
+- **Surfacing the verdict on `run`'s CLI output beyond the log line and the lifecycle
+  event/detail code.** `QuestionOutcome.detail_code` already carries `no_evidence`/
+  `stale_evidence` for the `validation_failed` case; a flagged-but-recorded outcome carries
+  no analogous field, by the log-only decision above, and adding one is a CLI-surface
+  question rather than a gate question.
+
+### Standing risk — the freshness cutoff is derived from `now`, not from the run
+
+`assess_sufficiency`'s cutoff is `freshness_cutoff(now, config.retrieval
+.freshness_days_default)`, where `now` is the pipeline's own "when this run happened" value
+— not `research_run.freshness_cutoff_utc`, which the retrieval side already stores per run.
+Consequence: replaying an old research run under `run-replay` judges its documents against
+*today's* window, not the window in force when the research was retrieved, so a record's
+gate verdict is not guaranteed stable across replays run on different days even though the
+packet hash is. This matches `research/freshness.py`'s own stated intent (a caller derives
+the cutoff from "a reference time... or the question snapshot time"), and no acceptance
+criterion asks for cross-day replay stability of the verdict specifically — the packet hash
+and the forecast hash, which *are* asked to replay-stably, do not depend on this cutoff at
+all. Flagged as a risk rather than fixed because reading the per-run cutoff instead is a
+real alternative with its own tradeoff (a packet spanning several runs would then need a
+rule for combining their cutoffs) that this item's row does not ask it to resolve.
+
+### Round 1 — the flag flag was write-only
+
+CHANGES REQUESTED, one blocking finding: `flag_on_stale_research` was declared,
+threaded into the module docstrings, and never actually read. Both call sites' `else`
+branch fired whenever `fail_on_stale_research` was false, regardless of
+`flag_on_stale_research` — so a config setting both false still flagged, silently
+overriding the operator's own "don't even flag this" choice, and the acceptance
+criterion's "never pass silently" gave that combination no defined behavior to fall
+back to instead.
+
+Fixed at the boundary rather than at the call sites: `ForecastConfig
+._research_gate_is_never_silent` (a `model_validator(mode="after")`, alongside
+`_probability_bounds_ordered`) now refuses `fail_on_stale_research=false` and
+`flag_on_stale_research=false` together, so an accepted config always has a defined,
+non-silent outcome for a non-`sufficient` verdict. Both call sites were then corrected
+to actually branch on `flag_on_stale_research` (`elif config.forecast
+.flag_on_stale_research: ...`) rather than treating "not failing" as "must flag" — the
+validator makes the trailing `else` unreachable, and the comment there says so rather
+than leaving a silent fallthrough for a future reader to wonder about.
+`tests/unit/test_config.py::test_the_research_gate_cannot_be_silenced_entirely` and
+`..._accepts_every_other_combination` pin it.
+
 ## M1-507 — Run the composed output validation on the persist path
 
 `append_forecast_version` ran M1-501's attribution rules only. Since M1-506 there is one

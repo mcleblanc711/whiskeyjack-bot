@@ -33,6 +33,7 @@ from scenario import (
     Seed,
     config_data,
     model_settings,
+    reply_payload,
     research_run,
     seed_scenario,
     write_config,
@@ -364,6 +365,110 @@ def test_a_reply_that_fails_validation_records_the_failure_and_no_record(
         QUESTION_ID,
     )
     assert attempt_id == caught.value.attempt_id
+
+
+# --- the research sufficiency gate (M1-504) --------------------------------------------
+
+
+def _lifecycle_row(config_path: Path) -> tuple[str, str | None]:
+    conn = connect(load_config(config_path).storage.sqlite_path)
+    try:
+        rows = conn.execute("SELECT event_type, detail_code FROM lifecycle_events").fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    event_type, detail_code = rows[0]
+    return event_type, detail_code
+
+
+def _no_evidence_payload() -> dict[str, Any]:
+    """A reply that cites nothing, which is the only shape M1-501's attribution rules
+    accept from a zero-document packet -- any cited id would be unresolved against an
+    empty supplied set, evidence-conditional rules or not."""
+    return reply_payload(
+        base_rate={
+            "reference_class": "no reference class available",
+            "prior_probability": 0.5,
+            "basis": "no evidence was retrieved",
+            "source_ids": [],
+        },
+        evidence_adjustments=[],
+        load_bearing_facts=[],
+    )
+
+
+def test_a_stale_only_packet_is_flagged_and_recorded_by_default(tmp_path: Path) -> None:
+    """The committed defaults (``fail_on_stale_research: false``,
+    ``flag_on_stale_research: true``): a packet of entirely undatable documents --
+    ``research_documents()`` sets neither ``published_at_utc`` nor ``updated_at_utc``, so
+    every document assesses ``stale``/``undatable`` (M1-305's stricter reading) -- still
+    reaches ``validated``, only logged."""
+    config_file = write_config(tmp_path, config_data(tmp_path))
+    seed = seed_scenario(config_file)
+    attempt_run(seed)
+    assert counts(config_file) == {
+        "forecast_records": 1,
+        "lifecycle_events": 1,
+        "pipeline_failure_events": 0,
+    }
+    assert _lifecycle_row(config_file) == ("validated", None)
+
+
+def test_a_stale_only_packet_is_failed_when_configured(tmp_path: Path) -> None:
+    """``fail_on_stale_research: true`` turns the same packet into a terminal, recorded
+    refusal instead -- the draft and its ``validation_failed`` event are not rolled back,
+    unlike every refusal above: this one is a fact about a real attempt."""
+    seed_config = write_config(tmp_path, config_data(tmp_path))
+    seed = seed_scenario(seed_config)
+
+    data = config_data(tmp_path)
+    data["forecast"]["fail_on_stale_research"] = True
+    run_config = write_config(tmp_path, data, name="fail-on-stale.yaml")
+
+    with pytest.raises(PipelineError, match="stale_evidence"):
+        attempt_run(seed, config_path=run_config)
+
+    assert counts(run_config) == {
+        "forecast_records": 1,
+        "lifecycle_events": 1,
+        "pipeline_failure_events": 0,
+    }
+    assert _lifecycle_row(run_config) == ("validation_failed", "stale_evidence")
+
+
+def test_a_no_document_packet_is_failed_when_configured(tmp_path: Path) -> None:
+    """The other verdict: zero documents at all, distinct from the all-stale case above.
+    ``research/store.py``'s ``replay_research`` only refuses an empty *run* set, so this
+    packet -- a completed run that found nothing -- reaches ``run_replay`` with no
+    pre-check at all until this gate."""
+    seed_config = write_config(tmp_path, config_data(tmp_path))
+    seed = seed_scenario(seed_config, documents=0, payload=_no_evidence_payload())
+
+    data = config_data(tmp_path)
+    data["forecast"]["fail_on_stale_research"] = True
+    run_config = write_config(tmp_path, data, name="fail-on-stale.yaml")
+
+    with pytest.raises(PipelineError, match="no_evidence"):
+        attempt_run(seed, config_path=run_config)
+
+    assert counts(run_config) == {
+        "forecast_records": 1,
+        "lifecycle_events": 1,
+        "pipeline_failure_events": 0,
+    }
+    assert _lifecycle_row(run_config) == ("validation_failed", "no_evidence")
+
+
+def test_a_no_document_packet_is_flagged_and_recorded_by_default(tmp_path: Path) -> None:
+    config_file = write_config(tmp_path, config_data(tmp_path))
+    seed = seed_scenario(config_file, documents=0, payload=_no_evidence_payload())
+    attempt_run(seed)
+    assert counts(config_file) == {
+        "forecast_records": 1,
+        "lifecycle_events": 1,
+        "pipeline_failure_events": 0,
+    }
+    assert _lifecycle_row(config_file) == ("validated", None)
 
 
 # --- the freshly minted attempt id is not an accident ---------------------------------
