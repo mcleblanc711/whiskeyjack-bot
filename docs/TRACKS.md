@@ -41,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | T-905 | feat/t-905-gate-exit-code | whiskeyjack-t-905 | no | none | 2026-09-03 |
+| M2-712 | feat/m2-712-init-ledger-command | whiskeyjack-m2-712 | no | none | 2026-09-04 |
 | M1-504 | feat/m1-504-stale-research-gate | whiskeyjack-m1-504 | no | none | 2026-09-03 |
 | M1-507 | feat/m1-507-persist-path-validation | whiskeyjack-m1-507 | no | none | 2026-09-03 |
 | M1-605 | feat/m1-605-secret-trace-redaction | whiskeyjack-m1-605 | no | none | 2026-09-03 |
