@@ -216,9 +216,9 @@ def test_the_golden_was_generated_by_the_installed_package() -> None:
 def test_every_golden_array_has_the_recorded_point_count(case: dict[str, Any]) -> None:
     """The size clause, read out of the record rather than transcribed.
 
-    ``201`` is written nowhere in this file. It is in the fixture because the package put
-    it there, which is what makes this the third site rather than a fourth copy of the
-    first.
+    No assertion in this file spells ``201`` -- the number appears only in prose. It is in
+    the fixture because the package put it there, which is what makes the golden the third
+    site rather than a fourth copy of the first.
     """
     assert len(case["cdf"]) == case["point_count"]
 

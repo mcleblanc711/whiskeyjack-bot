@@ -7919,10 +7919,10 @@ together and the assertion survives the drift it exists to notice.
 | 2 | `forecast/cdf.py:154` — `_SDK_DEFAULT_CDF_SIZE` | a source edit |
 | 3 | the length `NumericDistribution.get_cdf` actually returns | **a package upgrade** |
 
-Only #3 is what this row is about, and before this branch nothing could see it move. The
-number `201` is written **nowhere** in `tests/unit/test_forecast_cdf_golden.py`: the fixture
-holds it because the package put it there, which is what makes the golden a third site rather
-than a fourth copy of the first.
+Only #3 is what this row is about, and before this branch nothing could see it move.
+**No assertion** in `tests/unit/test_forecast_cdf_golden.py` spells `201` — the literal appears
+there ten times and every one is prose. The fixture holds the number because the package put it
+there, which is what makes the golden a third site rather than a fourth copy of the first.
 
 - `test_the_pinned_sdk_still_emits_the_frozen_arrays` and
   `test_every_golden_array_has_the_recorded_point_count` test **#3**.
