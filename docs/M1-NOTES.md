@@ -7867,6 +7867,62 @@ The `request` half of the artifact was not moved: `replay_forecast` re-parses on
 downstream ever compares a hash derived from `request` against anything else — there was no
 consistency gap on that side, only on `raw_responses`.
 
+## T-907 — the multiple-choice distribution property's stale assertion, and its vacuity
+
+`tests/property/test_submission_live_properties.py::test_a_multiple_choice_payload_is_
+accepted_exactly_when_it_is_a_distribution` asserted
+`expected_values(plan) == tuple(sorted(values))`. `expected_values` stopped sorting at
+M2-704's round-1 review (`src/whiskeyjack_bot/submission_live.py:816-823` documents why:
+sorting collapses `{A: 0.1, B: 0.9}` and `{A: 0.9, B: 0.1}` to the same tuple, which would
+let a transposed post read as `confirmed`). This one test was never updated to match.
+
+### Decision — correct the backlog row's severity claim rather than leave it standing
+
+The row (added the day of the M2-704 review) reads: the property "fails deterministically
+whenever hypothesis draws an unsorted values list." Measured against master `ad9f686`,
+2000 draws of the old strategy (`st.lists(st.floats(0.001, 0.999), min_size=1, max_size=6)`)
+reached the accept branch — the only place the stale assertion runs — twice, and 0 of those
+were unsorted. Five consecutive full-`dev`-profile runs passed clean. The true defect isn't
+"fails deterministically"; it's that the accept branch, and the assertion inside it, was
+~99.9% vacuous, so the wrong assertion almost never executed and both the flake and the
+original round-1 finding read as intermittent rather than as what they are. The backlog
+Description is corrected as part of this item rather than merged with the old claim intact.
+
+### Decision — the strategy is fixed, not just the assertion
+
+Fixing line 300 alone leaves the property still evaluating the (now-correct) assertion on
+~0.1% of runs — the same vacuity, pointed at a different bug next time. The replacement
+draws `n` weights (`n` in `[2, 6]`) uniformly from `[0.01, 0.99]` and, on a coin flip,
+either returns them raw (a real non-distribution most of the time) or normalizes them to
+sum to exactly 1.0. The `[0.01, 0.99]` weight range was chosen so every normalized value
+stays inside `_require_probability`'s `[0.001, 0.999]` platform bound for every `n` in
+range (worst cases checked by hand: `0.99/(0.99+(n-1)*0.01)` ≤ 0.99 at `n=2`, and
+`0.01/(0.01+(n-1)*0.99)` ≈ 0.002 at `n=6`), so a normalized draw is refused only by the sum
+rule's complement — never spuriously by the bounds check. Measured: ~39% of 2000 example
+draws land in the accept branch, against ~0.1% before. `min_size=2` replaces the old
+`min_size=1`, which could never sum to 1.0 and was confirmed dead weight.
+
+The property stays two-sided by construction rather than by accident: the un-normalized
+branch is not an edge case carved out of the accept branch, it's an independent draw over
+the same magnitude range, so `is_distribution` genuinely varies example to example. Both
+directions were mutation-tested (`__pycache__` cleared between runs): reintroducing
+`sorted()` inside `expected_values`'s multiple-choice branch fails the property on the
+first `fast`-profile run (`values=[0.6, 0.4]`), and deleting the sum-tolerance check inside
+`_require_categories` also fails on the first run (`values=[0.5, 0.75]`, no error raised
+where one was expected).
+
+### Rejected — filtering the old strategy with `assume()` to force sums near 1.0
+
+Would keep the vacuity risk (rejection-heavy filtering trips Hypothesis's own health
+checks as the target tightens) and would not produce genuine non-distributions with the
+same ease the un-normalized branch does for free.
+
+### Deferred (do not read the absence as an omission)
+
+`expected_values` and `_require_categories` themselves are untouched — both are correct;
+only the test was stale. T-906 (a different property's filtering problem, a different
+function) is out of scope for this item and was not touched.
+
 ## T-904 — Numeric CDF contract tests: freezing what the pinned SDK emits
 
 Acceptance: *"Guard 201-point size, monotonicity, bounds and PMF steps against package
