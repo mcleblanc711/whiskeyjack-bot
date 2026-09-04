@@ -53,6 +53,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to the YAML config file (default: config.yaml)",
     )
 
+    init_ledger = subparsers.add_parser(
+        "init-ledger",
+        help="create or upgrade the ledger database at storage.sqlite_path; a no-op if current",
+    )
+    init_ledger.add_argument(
+        "--config",
+        default="config.yaml",
+        type=Path,
+        help="path to the YAML config file (default: config.yaml)",
+    )
+
     questions = subparsers.add_parser(
         "questions",
         help="fetch or replay tournament questions",
@@ -296,6 +307,43 @@ def _load_verified_config(path: Path) -> AppConfig:
     config = load_config(path)
     load_and_verify_account_allowlist(config)
     return config
+
+
+def _run_init_ledger(args: argparse.Namespace) -> int:
+    """Create-or-upgrade the ledger schema (M2-712); the first-time path ``run``,
+    ``approve``, ``submit`` etc. all need but none of them provide.
+
+    Calls ``ledger.initialize_ledger()`` directly and reports what it returns --
+    idempotency is that function's guarantee, not reimplemented here. Deliberately does
+    not go anywhere near ``_open_existing_ledger``/``open_verified_ledger``: those exist
+    precisely to refuse a database that isn't there yet, which is the case this command
+    is for.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.ledger import LedgerError, initialize_ledger
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    try:
+        version = initialize_ledger(config.storage.sqlite_path)
+    except LedgerError as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
+
+    print(f"ledger:  {config.storage.sqlite_path}")
+    print(f"version: {version}")
+    return EXIT_OK
 
 
 def _run_questions_fetch(args: argparse.Namespace) -> int:
@@ -1201,6 +1249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "verify-env":
         return _run_verify_env(args.config)
+    if args.command == "init-ledger":
+        return _run_init_ledger(args)
     if args.command == "questions":
         if args.questions_command != "fetch":
             parser.parse_args(["questions", "--help"])

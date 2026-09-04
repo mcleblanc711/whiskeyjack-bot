@@ -2930,3 +2930,84 @@ The one deviation worth having named explicitly was the message-text change in t
 stated as a deviation with the tree-wide grep showing nothing asserts the old string, and it
 came back as risk area 1, Safe. Left unstated it is exactly the shape of finding that costs a
 round.
+
+## M2-712 — `init-ledger` command
+
+Acceptance: *a subcommand creates the ledger database at `storage.sqlite_path` when it does
+not yet exist, using `ledger.initialize_ledger()`, and is a no-op on a database already at
+the current schema version; a test drives it against a fresh temp path and asserts
+`schema_migrations` lands at the current version; the A-110x runbook's manual `python -c`
+workaround is removed once the command ships.*
+
+### What the gap actually was
+
+No subcommand ever called `ledger.initialize_ledger()`. The only ledger call site in `cli.py`
+was `_open_existing_ledger`, which requires `path.is_file()` before it will even attempt
+`open_verified_ledger` — correct, per M2-701 above, but it left no first-time path: a fresh
+checkout has nothing at `storage.sqlite_path`, so `run`, `approve`, `submit`,
+`verify-submission` and `replay` all refused with "no ledger database at ...; nothing has been
+recorded there yet" and stopped there.
+
+### Delivered
+
+- `src/whiskeyjack_bot/cli.py` — `init-ledger` subparser (single `--config` argument, the same
+  shape as `verify-env`/`replay`), `_run_init_ledger()`, and its dispatch branch in `main()`.
+- `tests/unit/test_cli_init_ledger.py` — three tests: fresh creation lands at
+  `LEDGER_SCHEMA_VERSION`, a second invocation changes no row in `schema_migrations`, and a
+  parent directory that cannot be created (blocked by a same-named file) refuses without
+  creating anything.
+
+### Decision — a new subcommand, not folded into `verify-env`
+
+`verify-env` reports on an environment; it never mutates one. Folding ledger creation into it
+would make a read-only-sounding command the one place a database gets written, and would tie
+this item's exit-code vocabulary to `verify-env`'s report-rendering shape
+(`report.render()` / `report.exit_code`) instead of the standard
+`_load_verified_config` → try/except → `EXIT_*` pattern every mutating command already uses.
+A dedicated `init-ledger` keeps both commands single-purpose and lets this one reuse the exact
+shape of `_run_verify_submission` et al.
+
+### Decision — call `initialize_ledger()` directly; do not re-derive its idempotency
+
+`initialize_ledger()` (`ledger.py:141`) already re-verifies every applied migration's checksum
+and skips re-execution, and already refuses a database written by a newer build. `_run_init_ledger`
+calls it once and prints what it returns (the schema version); there is no separate "does this
+already exist at the current version" check in `cli.py` to get out of sync with the one
+`initialize_ledger` already performs.
+
+### Decision — do not touch `_open_existing_ledger` or `open_verified_ledger`
+
+Both were shaped by review from opposite directions (round 1 finding 1: the file can vanish
+between check and open; round 2 finding 1: verification and use must be one connection, not
+two opens of the same name — see the M2-701 section above). Threading `create=True` through
+either, or relaxing `_open_existing_ledger`'s `path.is_file()` check, would reopen exactly the
+races those rounds closed. `init-ledger` is a separate, additive call site instead.
+
+### Deviation — the "A-110x runbook" AC clause has nothing to remove
+
+Searched the repo directly: no file matching `*runbook*` exists anywhere, under `docs/` or
+elsewhere. Every mention of "runbook" in the tree (`docs/TRACKS.md`, this file's M2-704/M2-711
+sections, `docs/M0-REVIEW.md`) refers to the operator runbook tracked as `D-1001`, which is
+still `Not Started`. `python -c` appears exactly once in the whole repository: inside M2-712's
+own `docs/backlog/backlog.csv` Description and Acceptance Criteria cells, describing the
+workaround the item was filed to remove. There is no runbook document, checked into this repo,
+that documents that workaround and needs an edit — so this clause is treated as vacuously
+satisfied rather than silently marked done. The backlog `Description` column is left as
+written; it is a historical record of why the item was filed, and the discrepancy is recorded
+here instead of rewritten into the CSV.
+
+### Deferred — CI's CLI smoke test still runs `--help` only
+
+`.github/workflows/ci.yml`'s "CLI smoke" step runs `uv run whiskeyjack-bot --help` and nothing
+else; it does not exercise any subcommand today, `init-ledger` included. Extending it to run a
+live `init-ledger` against a real config would be new coverage this item doesn't need to add —
+the command's behaviour is fully exercised by `tests/unit/test_cli_init_ledger.py`, and CI's
+smoke step exists to catch a broken import/argparse wiring, not to be a second test runner.
+Left as-is; a future item that wants CLI-level smoke coverage of a real ledger bootstrap can
+pick this up.
+
+### Verification
+
+`uv run pytest tests/unit/test_cli_init_ledger.py -x`, three tests, all passing. `scripts/gate.sh`
+run clean at the end (ruff, ruff format, mypy --strict, full pytest). No migration and no
+dependency: this item claimed neither in `docs/TRACKS.md`.
