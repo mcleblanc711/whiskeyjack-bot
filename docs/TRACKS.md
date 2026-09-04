@@ -44,6 +44,7 @@ to the registry, and neither is a habit you can form by reflex.
 | M1-504 | feat/m1-504-stale-research-gate | whiskeyjack-m1-504 | no | none | 2026-09-03 |
 | M1-507 | feat/m1-507-persist-path-validation | whiskeyjack-m1-507 | no | none | 2026-09-03 |
 | M1-605 | feat/m1-605-secret-trace-redaction | whiskeyjack-m1-605 | no | none | 2026-09-03 |
+| T-907 | feat/t-907-distribution-property-vacuity | whiskeyjack-t-907 | no | none | 2026-09-04 |
 *(Swept `M2-709` (merged, PR #60, 2026-09-02; `finish-item.sh` found its branch already
 gone on both local and origin — deleted at merge time — so this row-drop is all the sweep
 left to do), `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
