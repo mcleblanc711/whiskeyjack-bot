@@ -84,8 +84,8 @@ def _wrapped(values: list[float], *, per_row: int, indent: int) -> str:
     """One frozen array as a JSON list, ``per_row`` values to a line.
 
     ``json.dumps(..., indent=2)`` puts each of the 201 values on its own line, which makes
-    the seven cases a 1,400-line file -- and CLAUDE.md keeps review-request diffs embedded,
-    so that file would dominate every request this fixture ever appears in. Wrapping keeps
+    the seven cases an 1,815-line file (506 as written) -- and CLAUDE.md keeps review-request
+    diffs embedded, so it would dominate every request this fixture appears in. Wrapping keeps
     the diff readable *and* keeps it pointing at a range of indices, which is the thing a
     drift diff is read for: a whole-array-on-one-line spelling would report "this case
     changed" and nothing more.
