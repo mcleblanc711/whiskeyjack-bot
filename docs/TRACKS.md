@@ -40,10 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| T-905 | feat/t-905-gate-exit-code | whiskeyjack-t-905 | no | none | 2026-09-03 |
-| M1-504 | feat/m1-504-stale-research-gate | whiskeyjack-m1-504 | no | none | 2026-09-03 |
-| M1-507 | feat/m1-507-persist-path-validation | whiskeyjack-m1-507 | no | none | 2026-09-03 |
-| M1-605 | feat/m1-605-secret-trace-redaction | whiskeyjack-m1-605 | no | none | 2026-09-03 |
+| T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 *(Swept `M2-709` (merged, PR #60, 2026-09-02; `finish-item.sh` found its branch already
 gone on both local and origin — deleted at merge time — so this row-drop is all the sweep
 left to do), `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
@@ -57,6 +54,12 @@ artifact writer. **Its row named a duplication that was already half removed**:
 kind. The surviving copy was `submission_gateway._write_or_confirm` alone, and the item is
 the part M1-406 could not do — parameterizing the two ways the gateway differs, its EEXIST
 policy and its error type.)*
+
+*(Swept again 2026-09-04, opening Wave 12: `T-905` (the `gate.sh` exit-code lie — the
+script reported success on every failing gate, so a green last line was the only honest
+signal it produced), `M1-504`, `M1-507` and `M1-605` (PR #69). All four merged; the rows
+are dropped here rather than by `finish-item.sh`, which leaves them for the next branch
+to sweep.)*
 
 ## Planned next wave
 
