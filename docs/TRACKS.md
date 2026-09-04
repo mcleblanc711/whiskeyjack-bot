@@ -41,13 +41,15 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | T-905 | feat/t-905-gate-exit-code | whiskeyjack-t-905 | no | none | 2026-09-03 |
-| T-904 | feat/t-904-numeric-cdf-contracts | whiskeyjack-t-904 | no | none | 2026-09-04 |
-| M2-712 | feat/m2-712-init-ledger-command | whiskeyjack-m2-712 | no | none | 2026-09-04 |
 | M1-504 | feat/m1-504-stale-research-gate | whiskeyjack-m1-504 | no | none | 2026-09-03 |
 | M1-507 | feat/m1-507-persist-path-validation | whiskeyjack-m1-507 | no | none | 2026-09-03 |
 | M1-605 | feat/m1-605-secret-trace-redaction | whiskeyjack-m1-605 | no | none | 2026-09-03 |
-| T-907 | feat/t-907-distribution-property-vacuity | whiskeyjack-t-907 | no | none | 2026-09-04 |
-*(Swept `M2-709` (merged, PR #60, 2026-09-02; `finish-item.sh` found its branch already
+*(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
+2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) here. `T-905`, `M1-504`, `M1-507` and
+`M1-605` are left in place — their drop is already staged on `feat/t-902-mock-metaculus`
+(uncommitted-to-master, opening Wave 12) and dropping them here too would just be the same
+edit racing itself into a merge conflict. Also swept `M2-709` (merged, PR #60, 2026-09-02;
+`finish-item.sh` found its branch already
 gone on both local and origin — deleted at merge time — so this row-drop is all the sweep
 left to do), `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
 `origin` because `finish-item.sh` has not run yet; `scripts/tracks.py` ignores a merged
