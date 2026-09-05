@@ -40,7 +40,7 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
+| M2-705 | feat/m2-705-response-capture | whiskeyjack-m2-705 | no | none | 2026-09-04 |
 *(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
 2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) at this branch's master merge. The
 master-side note anticipated this exact resolution: it deliberately left `T-905`, `M1-504`,
@@ -66,6 +66,14 @@ script reported success on every failing gate, so a green last line was the only
 signal it produced), `M1-504`, `M1-507` and `M1-605` (PR #69). All four merged; the rows
 are dropped here rather than by `finish-item.sh`, which leaves them for the next branch
 to sweep.)*
+
+*(Swept again 2026-09-05, opening Wave 13: `T-902` (merged, PR #74, round-1 approve with
+zero findings, 2026-09-04 — the mocked-Metaculus integration tier). Its branch is already
+gone from `origin`, so `scripts/tracks.py` was ignoring the row either way; dropping it
+here is the sweep the convention asks the next branch to do. Wave 13's other three lanes
+— `D-1001`, `M1-604` (holding the dependency slot) and `M1-407` — each claim on their own
+branch, so this table is the one place all four collide at merge. That is the cheap
+problem the "Planned next wave" section below deliberately accepts.)*
 
 ## Planned next wave
 
