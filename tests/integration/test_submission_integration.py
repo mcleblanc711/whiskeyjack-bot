@@ -48,7 +48,11 @@ from fake_platform import (
 from tests.unit.test_submission_live import BINARY_PAYLOAD, PROBABILITY
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.lifecycle import current_status
-from whiskeyjack_bot.submission_live import LiveSubmissionError, post_approved_forecast
+from whiskeyjack_bot.submission_live import (
+    LiveSubmissionError,
+    LiveSubmissionRecord,
+    post_approved_forecast,
+)
 
 BASELINE_START = 1_000_000.0
 NEW_START = 1_000_100.0
@@ -68,7 +72,7 @@ def _post(
     config: AppConfig,
     transport: CountingTransport,
     monkeypatch: pytest.MonkeyPatch,
-) -> object:
+) -> LiveSubmissionRecord:
     install_transport(monkeypatch, transport)
     return post_approved_forecast(
         conn,
@@ -148,7 +152,7 @@ def test_a_429_is_recorded_as_http_error_and_sends_exactly_one_request(
     recorded = _post(conn, record_id, live_config, transport, monkeypatch)
 
     assert transport.posts == 1, "the SDK's blind retry would make this four"
-    receipt = recorded.receipt  # type: ignore[attr-defined]
+    receipt = recorded.receipt
     assert receipt.success is False
     assert receipt.error_type == "http_error"
     assert receipt.http_status == 429
@@ -177,11 +181,11 @@ def test_a_5xx_the_platform_never_shows_is_a_terminal_failure(
     recorded = _post(conn, record_id, live_config, transport, monkeypatch)
 
     assert transport.posts == 1
-    assert recorded.event.event_type == "submission_failed"  # type: ignore[attr-defined]
-    assert recorded.receipt.http_status == 503  # type: ignore[attr-defined]
-    assert recorded.receipt.error_type == "http_error"  # type: ignore[attr-defined]
-    assert recorded.receipt.success is False  # type: ignore[attr-defined]
-    assert recorded.receipt.verified_by_refetch is False  # type: ignore[attr-defined]
+    assert recorded.event.event_type == "submission_failed"
+    assert recorded.receipt.http_status == 503
+    assert recorded.receipt.error_type == "http_error"
+    assert recorded.receipt.success is False
+    assert recorded.receipt.verified_by_refetch is False
     assert current_status(conn, record_id) == "failed"
 
 
@@ -211,9 +215,9 @@ def test_a_post_confirmed_by_an_sdk_parsed_refetch_reaches_submitted(
     recorded = _post(conn, record_id, live_config, transport, monkeypatch)
 
     assert transport.posts == 1
-    assert recorded.event.event_type == "submitted"  # type: ignore[attr-defined]
-    assert recorded.receipt.verified_by_refetch is True  # type: ignore[attr-defined]
-    assert recorded.receipt.refetch_outcome == "confirmed"  # type: ignore[attr-defined]
+    assert recorded.event.event_type == "submitted"
+    assert recorded.receipt.verified_by_refetch is True
+    assert recorded.receipt.refetch_outcome == "confirmed"
     assert current_status(conn, record_id) == "submitted"
     assert transport.post_urls == ["https://www.metaculus.com/api/questions/forecast/"]
 
@@ -242,9 +246,9 @@ def test_a_post_the_platform_does_not_show_is_never_recorded_as_verified(
 
     recorded = _post(conn, record_id, live_config, transport, monkeypatch)
 
-    assert recorded.receipt.success is True, "the call itself did not fail"  # type: ignore[attr-defined]
-    assert recorded.receipt.verified_by_refetch is False  # type: ignore[attr-defined]
-    assert recorded.event.event_type == "submission_uncertain"  # type: ignore[attr-defined]
+    assert recorded.receipt.success is True, "the call itself did not fail"
+    assert recorded.receipt.verified_by_refetch is False
+    assert recorded.event.event_type == "submission_uncertain"
     assert current_status(conn, record_id) == "approved", "still resolvable, not terminal"
 
 
