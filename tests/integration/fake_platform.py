@@ -36,6 +36,7 @@ which hardcodes a reason for each of its two statuses. Named here rather than im
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,15 @@ BINARY_POST_ID = 90001
 GROUP_POST_ID = 90004
 
 TOURNAMENT = "minibench"
+
+# Shared instants. They live here rather than in ``conftest.py`` because pytest registers
+# every conftest in ``sys.modules`` under the bare name ``conftest`` -- the collision
+# ``tests/unit/test_conftest_temproot.py`` documents -- so a test module importing
+# ``from conftest import ...`` is importing whichever one got there first. This module's
+# name is unique, so importing from it is unambiguous.
+OCCURRED = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+RESEARCH_TIMESTAMP = "2026-08-22T00:00:00.000000+00:00"
+RUN_ID = "run-1"
 
 
 # ── raw fixtures ─────────────────────────────────────────────────────────────
@@ -287,3 +297,45 @@ LIVE_SUBMISSION_FLAGS: dict[str, Any] = {"enabled": True, "dry_run": False, "no_
 Named because ``submission_live.require_live_submission_enabled`` needs all three flipped
 together and a test that flips two is testing the refusal it did not mean to.
 """
+
+
+# ── the real adapter, over the counted transport ─────────────────────────────
+
+
+def build_real_poster(transport: CountingTransport | None = None) -> Any:
+    """A **real** ``SingleAttemptPoster`` over a **real** ``MetaculusClient``.
+
+    Deliberately not a double. ``tests/unit/test_submission_live.py`` counts calls into its
+    own four-method ``FakePoster``, which structurally cannot observe the SDK's blind POST
+    retry because that retry lives *below* the protocol. Putting the real adapter in the
+    chain and counting at ``requests`` is what makes "exactly one POST" a measurement.
+
+    ``transport`` is accepted only to keep the call sites honest about needing one; it is
+    installed by :func:`install_transport`.
+    """
+    from whiskeyjack_bot.metaculus.client import SingleAttemptPoster
+
+    del transport  # installed separately; named here so a caller cannot forget it exists
+    client = MetaculusClient(token="fake-token-for-integration")
+    client.sleep_time_between_requests_min = 0.0
+    client.sleep_jitter_seconds = 0.0
+    return SingleAttemptPoster(client)
+
+
+def forecast_entry(start_time: float, values: list[float]) -> dict[str, Any]:
+    """One ``my_forecasts.history`` entry, in the platform's own shape."""
+    return {"start_time": start_time, "end_time": None, "forecast_values": values}
+
+
+def binary_values(probability: float) -> list[float]:
+    """What the platform stores for a binary forecast: ``[P(no), P(yes)]``."""
+    return [1.0 - probability, probability]
+
+
+PROBABILITY_YES = 0.37
+"""The probability the shared approved record carries, mirrored from the unit tier."""
+
+CONFIRMING_HISTORY_ENTRIES: list[dict[str, Any]] = [
+    forecast_entry(1_000_100.0, binary_values(PROBABILITY_YES))
+]
+"""What the platform shows after an honest post: one entry newer than an empty baseline."""

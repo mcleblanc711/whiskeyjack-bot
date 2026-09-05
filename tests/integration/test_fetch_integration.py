@@ -111,14 +111,20 @@ def test_the_configured_tournament_and_group_mode_reach_the_platform(
     assert tournament.group_modes == ["unpack_subquestions"]
 
 
-def test_a_group_post_unpacks_into_distinct_forecastable_questions(
+def test_a_group_posts_siblings_stay_distinct_through_normalization(
     config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The second handoff bullet, against ``M1-202``'s actual trap.
 
+    **Named for what it can fail on.** The expansion itself is the SDK's -- a live fetch
+    with ``unpack_subquestions`` is what produces these siblings, and
+    ``tests/unit/test_groups.py`` is where our mirror of it is held to the SDK's. What this
+    asserts is the half that is ours: that normalization carries the group through without
+    collapsing it.
+
     Group expansion deep-copies the parent post, so every sibling carries the **same**
     ``post_id``. A test that keyed on ``post_id`` -- the obvious identity field -- could not
-    fail if unpacking collapsed the group to one question. So both halves are asserted: one
+    fail if the siblings collapsed to one question. So both halves are asserted: one
     canonical question per subquestion with **distinct** ``question_id``s, and exactly one
     ``post_id`` across all of them.
     """
