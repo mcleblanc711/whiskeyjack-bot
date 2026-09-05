@@ -41,6 +41,7 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
+| M1-407 | feat/m1-407-prompt-bounds-crosscheck | whiskeyjack-m1-407 | no | none | 2026-09-04 |
 *(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
 2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) at this branch's master merge. The
 master-side note anticipated this exact resolution: it deliberately left `T-905`, `M1-504`,
