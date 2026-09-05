@@ -7866,3 +7866,346 @@ The `request` half of the artifact was not moved: `replay_forecast` re-parses on
 `raw_responses[-1]` (confirmed by reading `forecast/replay.py`), never `request`, so nothing
 downstream ever compares a hash derived from `request` against anything else — there was no
 consistency gap on that side, only on `raw_responses`.
+
+## T-907 — the multiple-choice distribution property's stale assertion, and its vacuity
+
+`tests/property/test_submission_live_properties.py::test_a_multiple_choice_payload_is_
+accepted_exactly_when_it_is_a_distribution` asserted
+`expected_values(plan) == tuple(sorted(values))`. `expected_values` stopped sorting at
+M2-704's round-1 review (`src/whiskeyjack_bot/submission_live.py:816-823` documents why:
+sorting collapses `{A: 0.1, B: 0.9}` and `{A: 0.9, B: 0.1}` to the same tuple, which would
+let a transposed post read as `confirmed`). This one test was never updated to match.
+
+### Decision — correct the backlog row's severity claim rather than leave it standing
+
+The row (added the day of the M2-704 review) reads: the property "fails deterministically
+whenever hypothesis draws an unsorted values list." Measured against master `ad9f686`,
+2000 draws of the old strategy (`st.lists(st.floats(0.001, 0.999), min_size=1, max_size=6)`)
+reached the accept branch — the only place the stale assertion runs — twice, and 0 of those
+were unsorted. Five consecutive full-`dev`-profile runs passed clean. The true defect isn't
+"fails deterministically"; it's that the accept branch, and the assertion inside it, was
+~99.9% vacuous, so the wrong assertion almost never executed and both the flake and the
+original round-1 finding read as intermittent rather than as what they are. The backlog
+Description is corrected as part of this item rather than merged with the old claim intact.
+
+### Decision — the strategy is fixed, not just the assertion
+
+Fixing line 300 alone leaves the property still evaluating the (now-correct) assertion on
+~0.1% of runs — the same vacuity, pointed at a different bug next time. The replacement
+draws `n` weights (`n` in `[2, 6]`) uniformly from `[0.01, 0.99]` and, on a coin flip,
+either returns them raw (a real non-distribution most of the time) or normalizes them to
+sum to exactly 1.0. The `[0.01, 0.99]` weight range was chosen so every normalized value
+stays inside `_require_probability`'s `[0.001, 0.999]` platform bound for every `n` in
+range (worst cases checked by hand: `0.99/(0.99+(n-1)*0.01)` ≤ 0.99 at `n=2`, and
+`0.01/(0.01+(n-1)*0.99)` ≈ 0.002 at `n=6`), so a normalized draw is refused only by the sum
+rule's complement — never spuriously by the bounds check. Measured: ~39% of 2000 example
+draws land in the accept branch, against ~0.1% before. `min_size=2` replaces the old
+`min_size=1`, which could never sum to 1.0 and was confirmed dead weight.
+
+The property stays two-sided by construction rather than by accident: the un-normalized
+branch is not an edge case carved out of the accept branch, it's an independent draw over
+the same magnitude range, so `is_distribution` genuinely varies example to example. Both
+directions were mutation-tested (`__pycache__` cleared between runs): reintroducing
+`sorted()` inside `expected_values`'s multiple-choice branch fails the property on the
+first `fast`-profile run (`values=[0.6, 0.4]`), and deleting the sum-tolerance check inside
+`_require_categories` also fails on the first run (`values=[0.5, 0.75]`, no error raised
+where one was expected).
+
+### Rejected — filtering the old strategy with `assume()` to force sums near 1.0
+
+Would keep the vacuity risk (rejection-heavy filtering trips Hypothesis's own health
+checks as the target tightens) and would not produce genuine non-distributions with the
+same ease the un-normalized branch does for free.
+
+### Deferred (do not read the absence as an omission)
+
+`expected_values` and `_require_categories` themselves are untouched — both are correct;
+only the test was stale. T-906 (a different property's filtering problem, a different
+function) is out of scope for this item and was not touched.
+
+## T-904 — Numeric CDF contract tests: freezing what the pinned SDK emits
+
+Acceptance: *"Guard 201-point size, monotonicity, bounds and PMF steps against package
+upgrades. Golden edge cases pass on 0.2.92; dependency drift triggers a visible failure."*
+
+`M1-503` shipped the conversion and `tests/unit/test_forecast_cdf.py` with it — 1,165 lines,
+38 tests. That file's own docstring defers this item by name: *"The comprehensive golden set
+and the package-drift guard are Codex's T-904."* Nothing in it is rewritten here, and the
+first thing this item owed was an honest account of what it already discharges.
+
+### Delivered
+
+- `tests/fixtures/forecasts/numeric_cdf_golden.json` — seven frozen 201-point arrays and the
+  inputs that produced them. The first record anywhere in the repository of what
+  `forecasting-tools` actually emits.
+- `scripts/regenerate_cdf_golden.py` — refills the SDK-decided fields and nothing else;
+  `--check` fails if the committed fixture is not what the installed package emits.
+- `tests/unit/test_forecast_cdf_golden.py` — 52 tests in three groups: the frozen record
+  against a live SDK call, the same arrays through this project's own conversion, and four
+  drift simulations.
+- `docs/backlog/backlog.csv` — T-904 → `Done`.
+
+Nothing in `src/` changed. No migration, no dependency, no CLI surface.
+
+### What `test_forecast_cdf.py` already discharges, clause by clause
+
+Written out because a reviewer reading only the new file would over-credit it, and because
+the marginal value of this item is exactly the difference.
+
+| AC clause | Already discharged by | What T-904 adds |
+| --- | --- | --- |
+| 201-point size | `test_exactly_the_configured_number_of_points`, `test_the_prompts_own_numeric_example_converts` — both against `expected_cdf_points` | the length the package itself returns, frozen |
+| monotonicity | `test_the_prompts_own_numeric_example_converts` asserts pairwise `<=` incidentally. `_NOT_MONOTONE` appears in `tests/property/test_forecast_properties.py:1165` **only as a member of the closed message vocabulary — no test anywhere produced it** | strict increase on every frozen array, and the first test that produces `_NOT_MONOTONE` |
+| bounds | `test_the_endpoints_follow_the_bound_flags`, all four flag combinations | the exact frozen endpoint values, and the first tests that produce `_LOWER_ENDPOINT` / `_UPPER_ENDPOINT` |
+| PMF steps | `test_every_adjacent_step_is_within_the_configured_cap`, `test_a_concentrated_reply_saturates_just_below_the_cap`, `test_the_sdk_does_not_check_the_pmf_cap_on_its_own_output`, and `test_standardization_off_is_honoured_and_an_uncapped_array_is_refused` (which already **produces** `_STEP_TOO_TALL`) | the frozen saturation value `0.18999997910000005` |
+| "nothing is clamped, sorted or padded" | `test_nothing_this_module_returns_is_clamped_sorted_or_padded` compares our output against a **live** `get_cdf` call | the same comparison against a **frozen** array |
+
+The gap those four rows have in common: every existing assertion is expressed against *our*
+config and *our* guards, so an upgrade whose `_standardize_cdf` produced materially different
+numbers **in the same shape** passes all of them — our length check, our cap and our endpoint
+rules would clamp or refuse identically. `test_nothing_this_module_returns_is_clamped_sorted_or_padded`
+is the sharpest case: it compares the package against the package, so both sides drift
+together and the assertion survives the drift it exists to notice.
+
+### The three places `201` lives, and which one each assertion tests
+
+| # | Site | What can move it |
+| --- | --- | --- |
+| 1 | `config.py:311` — `expected_cdf_points: Literal[201]` | a config edit; the `Literal` refuses it |
+| 2 | `forecast/cdf.py:154` — `_SDK_DEFAULT_CDF_SIZE` | a source edit |
+| 3 | the length `NumericDistribution.get_cdf` actually returns | **a package upgrade** |
+
+Only #3 is what this row is about, and before this branch nothing could see it move.
+**No assertion** in `tests/unit/test_forecast_cdf_golden.py` spells `201` — the literal appears
+there ten times and every one is prose. The fixture holds the number because the package put it
+there, which is what makes the golden a third site rather than a fourth copy of the first.
+
+- `test_the_pinned_sdk_still_emits_the_frozen_arrays` and
+  `test_every_golden_array_has_the_recorded_point_count` test **#3**.
+- `test_our_conversion_returns_the_frozen_array` tests **#1 against #3** — our length check
+  reads the config, the array comes from the package, and the frozen record is what proves
+  the two still agree.
+- `test_the_three_sources_of_the_point_count_agree` tests **#1, #2 and #3 together**. This is
+  the assertion that turns a pin move into an owner decision: the upgrade fails the array
+  comparison; regenerating the golden then fails the three-way comparison; and `config.py`'s
+  `Literal` refuses the change after that. Three visible failures in a row, which is what
+  *"dependency drift triggers a visible failure"* has to mean for a number that is currently
+  correct in three places at once.
+
+### Decision — exact float equality, no tolerance, and it was measured rather than hoped
+
+A contract test that passes on 0.2.92 **and** on a drifted version is worse than no contract
+test, because it reports a safety it does not have. A tolerance of `1e-12` would not notice
+the one-ulp perturbation these assertions were mutation-tested against, so the golden is
+compared with `==`.
+
+That is only defensible if the arrays are actually reproducible, and the reason they are is
+in the package: `_standardize_cdf` ends with `np.round(cdf, 10)`, so every emitted value is
+snapped to a `1e-10` grid. Measured, by capturing the pre-rounding array and computing each
+value's distance to the nearest rounding boundary in ulps:
+
+| case group | worst margin to a rounding boundary |
+| --- | --- |
+| linear (six cases) | 3.74e4 ulps |
+| log-scaled (one case, the only path running `np.log`) | 1.40e3 ulps |
+
+A libm that differed by a few ulps in `np.log` cannot change the rounded output at those
+margins. Exact equality is therefore a property of the package's own rounding, not a bet on
+the platform — and if a future package drops the `np.round`, the golden fails, which is the
+correct outcome rather than a flake.
+
+### Decision — the golden is compared **without** any of this project's code in the path
+
+`test_the_pinned_sdk_still_emits_the_frozen_arrays` builds `NumericDistribution` straight from
+the fixture's own fields. No `CanonicalNumericQuestion`, no `NumericCalibrationConfig`, no
+`forecast/cdf.py`. That separation is the whole marginal value: our guards are exactly the
+thing that would absorb a drift and report nothing, so the drift detector must not run through
+them.
+
+`test_our_conversion_returns_the_frozen_array` is the one test that deliberately puts our code
+back, and it asserts the case's `standardize_cdf`/`strict_validation` flags equal the committed
+config's before it compares — so a case added later with `standardize_cdf: false` fails there
+instead of quietly comparing our output against an array the committed configuration would
+never have produced.
+
+### Decision — a committed regenerator, and it is not what the test reads
+
+The arrays can only come from running the package, so a golden with no regeneration path is a
+record nobody can honestly update when the pin moves on purpose.
+`scripts/regenerate_cdf_golden.py` reads the committed `name`/`why`/`question`/`distribution`/
+`percentiles` blocks **exactly as they stand** and rewrites only `cdf`, `point_count` and
+`generated_with.version`. Adding a case is a fixture edit followed by a run; the diff a run
+produces is exactly the drift.
+
+The test module does **not** import it. The inputs live in the fixture, the generator fills in
+what the package said, and the test makes its own live call — so the assertion is a live call
+against a frozen record, never a generator checked against itself.
+
+`--check` exists so the same claim is available without pytest, and its idempotence is what
+guarantees the file's rendering is canonical: the arrays are wrapped five values to a line and
+the declared points one pair to a line, which took the fixture from 1,815 lines to 506 (38.1 KB to 27.3 KB). That
+is not cosmetic — CLAUDE.md keeps review-request diffs embedded, and an 1,800-line fixture would
+dominate every request this file ever appears in, while a whole-array-on-one-line spelling
+would report *"this case changed"* and nothing more. `_rendered` parses its own output back
+before returning it, so a value it cannot spell is a hard failure rather than a corrupted
+record.
+
+### Decision — `generated_with.version` is asserted against the installed distribution
+
+`tests/unit/test_dependency_pins.py` already pins `pyproject.toml` against the installed
+distribution. `test_the_golden_was_generated_by_the_installed_package` is a **different**
+claim: it pins the *golden's provenance* against the installed distribution. The arrays could
+in principle survive an upgrade unchanged, and then nothing would have prompted anyone to
+look at them. The failure this produces is the prompt, and its message says to regenerate and
+read the array diff.
+
+### Decision — four drift simulations, each refereed by an independent oracle
+
+`_WRONG_LENGTH`, `_NOT_MONOTONE`, `_LOWER_ENDPOINT` and `_UPPER_ENDPOINT` had **no producing
+test anywhere in the suite** — they existed only as members of the closed message vocabulary
+in `tests/property/test_forecast_properties.py:1159`. They are the four rules `cdf.py` keeps
+*because the package might change*, so leaving them unexercised left the drift guard itself
+unguarded.
+
+Each mutant is injected at `NumericDistribution.get_cdf`, the seam
+`test_the_conversion_normalises_negative_zero_to_zero` already patches for the same reason: no
+percentile set reaches these arrays through 0.2.92, which is precisely the claim under test —
+a *later* version might. Per CLAUDE.md, a monkeypatch is valid evidence when it simulates a
+reachable condition, and "the pinned package was upgraded" is the condition this entire row is
+about.
+
+The mutants are deliberately **surgical**, and `_violations` is the referee. Dropping the
+*last* point would break the length rule and the upper-endpoint rule at once, and a test that
+asserted only *"it was refused"* would pass whichever fired; so the length mutant drops an
+*interior* point, and every mutant asserts `_violations(mutated) == frozenset({one_rule})`
+before asserting `problems == [exactly that one message]`. `_violations` is hand-written from
+the rule statements rather than imported from `cdf.py` — an oracle that called the code under
+test could not referee it — and
+`test_the_oracle_and_the_conversion_agree_on_a_clean_array` shows it is neither vacuously
+empty nor vacuously full.
+
+`_STEP_TOO_TALL` is **not** among the four:
+`test_standardization_off_is_honoured_and_an_uncapped_array_is_refused` already produces it.
+Saying so is the point — a fifth mutant would have been coverage this suite already has.
+
+### Deviation — the log-scaled case is in the golden, and M1-503 refuses one input on that path
+
+`tests/unit/test_forecast_cdf.py` carries `_HANGS_LOG_SCALED_SPAN`, a log-scaled percentile
+set the SDK's scale search does not terminate on. The golden's `log_scaled` case is a
+*different*, ordinary log-scaled question that converts in the usual milliseconds. Both are
+true of 0.2.92 and neither contradicts the other: `_standardization_can_converge` refuses the
+non-terminating one before any array exists, and the golden freezes what the package emits for
+one that converges. It is included precisely because that path is the one an upgrade is most
+likely to move — the package's own source carries two `TODO`s about handling log-scaled
+questions better.
+
+### Rejected — freezing an unstandardized array, and why not
+
+`use_forecasting_tools_standardization: false` is a supported configuration, and an
+unstandardized golden looked like the natural seventh axis. It is not frozen, for a reason
+specific to this design: `np.round(cdf, 10)` lives **inside** `_standardize_cdf`, so an
+unstandardized array is not snapped to any grid, and every ulp-margin measurement above stops
+applying to it. Exact equality on that array would be the platform bet this item spent its
+first hour proving it did not have to make. The knob itself is not left unguarded —
+`test_standardization_off_is_honoured_and_an_uncapped_array_is_refused` covers it behaviourally,
+which is the right shape for a rule about *our* configuration rather than about the package's
+numbers.
+
+### Rejected — asserting `201` anywhere near `submission_live.py`
+
+`expected_cdf_points` is already asserted across nine test files, and
+`submission_live._require_cdf` takes it as a parameter specifically so the value keeps one
+owner. T-902 owns the transport contract. A second source of truth for that number, added
+here, is a review finding waiting to happen.
+
+### Rejected — re-deriving the expected arrays in the test
+
+The obvious alternative to a fixture is a test that computes the expected CDF itself. It was
+never a real option: reimplementing `_get_cdf_at`, `_add_explicit_upper_lower_bound_percentiles`
+and the capped-scale search would transcribe the package's constants — `0.988`, `0.989`,
+`0.99`, `0.01`, `0.2 * 0.95`, `1e-6`, `1e-10` — into this repository, which is exactly what
+M1-405 refused to do with the `0.25` wiggle factor so that a pin move has nothing here to
+invalidate. A frozen array transcribes an *output*, which a pin move is supposed to change.
+
+### Every assertion was mutation-tested before it was believed
+
+The trap this row exists to avoid is a "contract" test that passes on 0.2.92 **and** on a
+drifted version, because that reports a safety it does not have. Each assertion was therefore
+shown to fail against a deliberately corrupted record, with `__pycache__` cleared between runs
+(a same-size same-second edit is otherwise served back stale — the trap
+`docs/LESSONS.md` records). Every mutation was reverted with `git checkout --`, and the tree
+was clean afterwards.
+
+| mutation | what failed |
+| --- | --- |
+| one ulp on `cdf[100]` of `interior_closed_both` (`math.nextafter`) | `test_the_pinned_sdk_still_emits_the_frozen_arrays`, `test_our_conversion_returns_the_frozen_array` — **2** |
+| `point_count` 201 → 200 in every case | `test_every_golden_array_has_the_recorded_point_count` ×7 and `test_the_three_sources_of_the_point_count_agree` — **8** |
+| swap `cdf[100]` and `cdf[101]` | array equality, `test_every_golden_array_is_strictly_increasing`, the passthrough, all four drift cases, the oracle test — **8** |
+| lower `cdf[48]` of `concentrated_saturating` by 0.02 (step → `0.20999997910000007`) | array equality, `test_no_golden_step_exceeds_the_committed_cap`, `test_the_concentrated_case_still_saturates_just_below_the_packages_own_cap`, the passthrough, the oracle test — **5** |
+| `cdf[0]` `0.0` → `0.000545` on a closed lower bound | array equality, strict increase, `test_the_golden_endpoints_follow_the_recorded_bound_flags`, the passthrough, all four drift cases, the oracle test — **9** |
+| `generated_with.version` `0.2.92` → `0.2.91` | `test_the_golden_was_generated_by_the_installed_package` — **1** |
+| all four drift mutators replaced by the identity | all four `test_a_drifted_array_is_refused_for_exactly_one_reason` cases — **4** |
+
+Two of those rows say something beyond "the assertion is live", and both are the design working:
+
+- The one-ulp perturbation fails **exactly two** tests and nothing else. That is the whole
+  argument for exact equality in one line: a `1e-12` tolerance would have left both of them
+  green on a corrupted record.
+- Corrupting `interior_closed_both`'s array also fails the four drift simulations, because
+  they build their mutants from it and their **pre-assertion** — "this mutant breaks exactly
+  one rule of the independent oracle" — no longer holds. The anti-vacuity guard is what
+  notices, which is the guard doing its job rather than a coupling to work around.
+
+The last row is the one that matters most for the drift simulations themselves: with every
+mutator neutered to the identity, all four cases fail. Without it, "the mutant was refused"
+could have stood in for "the mutant was refused *for this reason*", which is the vacuity class
+this project has paid for repeatedly.
+
+### Found while writing, not review-reported
+
+The tie case's tallest step is `1.94x` the untied case's, not `2x`. The first draft asserted
+`tied > 2 * untied` from the prose claim that the rewrite "roughly doubles" the step, and it
+failed on the real numbers. The assertion is now `1.9x` **and** the exact pair
+`(0.0401450109, 0.020675000000000027)`, because a ratio alone would not notice both arrays
+moving together — which is the same failure mode as
+`test_nothing_this_module_returns_is_clamped_sorted_or_padded` comparing the package against
+itself.
+
+### Deferred (do not read the absence as an omission)
+
+- **Discrete questions.** `DiscreteQuestion` subclasses `NumericQuestion` in the pinned SDK
+  and carries a smaller `cdf_size`, and `NumericDefaults.get_max_pmf_value` scales the cap
+  with it. Nothing in this project normalizes a discrete question today —
+  `questions/normalize.py` dispatches on the `question_type` literal and defers it (D21) — so a
+  golden for it would freeze behaviour on an unreachable path.
+- **Date questions.** Same reason: `NumericDistribution.is_date` and `DatePercentile` exist,
+  and nothing here produces either.
+- **The x-axis values.** `get_cdf` returns `(value, percentile)` pairs and the golden freezes
+  only the percentiles, because that is the array the wire takes
+  (`post_numeric_question_prediction` posts it under `continuous_cdf`). The values are the
+  package's own `_cdf_location_to_nominal_location` grid; freezing them would guard a number
+  no submission carries.
+- **A property-based pass over the golden.** `tests/property/test_forecast_properties.py`
+  already fuzzes the conversion, and a frozen record is by construction a fixed set — drawing
+  around it would test the package, not the record.
+
+### Standing risk — not verifiable offline
+
+- **The golden says what 0.2.92 emits, not what Metaculus accepts.** Every number here was
+  produced locally by the pinned package. Nothing in this repository has ever posted a CDF, so
+  a package whose arrays drifted *toward* what the API wants and away from this record would
+  fail these tests while being more correct. That is the intended trade — the failure is
+  visible and cheap to resolve, and the alternative is a record that notices nothing — but it
+  is a trade, and the resolution is an owner decision each time, never a reflexive regenerate.
+- **Independent authorship is gone, and the substitute is named rather than assumed.**
+  `CLAUDE.md` records the standing risk that T-902/T-904 lose Codex's implementation-blind
+  authorship. The mitigation available to *this* item is unusually strong and worth writing
+  down: the oracle is not our code. Six of the seven assertions compare the package against a
+  record the package itself wrote, so the failure mode "an implementation bug is baked into
+  the test meant to catch it" has nowhere to enter. Where our code *is* in the path
+  (`test_our_conversion_returns_the_frozen_array`, and the four drift simulations), it is
+  measured against the frozen record and against a hand-written oracle, not against itself.
+- **Cross-platform reproducibility is measured, not proven.** The ulp margins above were taken
+  on this machine's CPython 3.11 and numpy build. They are large enough that no plausible libm
+  difference reaches them, but the claim is "3.74e4 ulps of margin", not "bit-identical
+  everywhere". CI is the second data point; a third architecture would be the real one.

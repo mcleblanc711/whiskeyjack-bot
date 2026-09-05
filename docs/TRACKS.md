@@ -41,7 +41,13 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
-*(Swept `M2-709` (merged, PR #60, 2026-09-02; `finish-item.sh` found its branch already
+*(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
+2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) at this branch's master merge. The
+master-side note anticipated this exact resolution: it deliberately left `T-905`, `M1-504`,
+`M1-507` and `M1-605` in place because their drop was already staged here, and the merge has
+now applied both halves — so those four rows are gone, once, rather than racing themselves
+into a second conflict. Also swept `M2-709` (merged, PR #60, 2026-09-02; `finish-item.sh`
+found its branch already
 gone on both local and origin — deleted at merge time — so this row-drop is all the sweep
 left to do), `M1-514` (merged, PR #63, round-2 approve, 2026-09-02 — its branch is still on
 `origin` because `finish-item.sh` has not run yet; `scripts/tracks.py` ignores a merged

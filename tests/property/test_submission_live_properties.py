@@ -275,7 +275,33 @@ def test_storable_text_never_raises_and_always_fits(value: Any, limit: int) -> N
     result.encode("utf-8")  # the probe `lifecycle._require_text` performs
 
 
-@given(values=st.lists(st.floats(0.001, 0.999), min_size=1, max_size=6))
+@st.composite
+def _multiple_choice_category_values(draw: st.DrawFn) -> list[float]:
+    """Weighted so the accept branch (a genuine distribution) is reached on most draws.
+
+    ``st.lists(st.floats(0.001, 0.999), min_size=1, max_size=6)`` used to draw
+    independent floats, which sum to 1.0 within tolerance on about 0.1% of draws --
+    ``min_size=1`` cannot sum to 1.0 at all, so a fifth of that range was dead weight.
+    The accept branch, and the assertion inside it, was therefore vacuous on ~99.9% of
+    runs (T-907).
+
+    Drawing ``n`` weights in ``[0.01, 0.99]`` and normalizing them keeps every
+    normalized value inside ``_require_probability``'s ``[0.001, 0.999]`` bound for
+    every ``n`` in ``[2, 6]`` (worst cases: ``0.99/(0.99+(n-1)*0.01)`` at n=2 is 0.99,
+    and ``0.01/(0.01+(n-1)*0.99)`` at n=6 is ~0.002), so a normalized draw fails only
+    the sum rule's complement, never the per-category bound. The un-normalized branch
+    is the same weights unmodified: still a real multi-way float draw, not an edge
+    case, so it produces genuine non-distributions across the same magnitude range.
+    """
+    n = draw(st.integers(min_value=2, max_value=6))
+    weights = draw(st.lists(st.floats(min_value=0.01, max_value=0.99), min_size=n, max_size=n))
+    if draw(st.booleans()):
+        total = math.fsum(weights)
+        return [weight / total for weight in weights]
+    return weights
+
+
+@given(values=_multiple_choice_category_values())
 def test_a_multiple_choice_payload_is_accepted_exactly_when_it_is_a_distribution(
     values: list[float],
 ) -> None:
@@ -285,6 +311,14 @@ def test_a_multiple_choice_payload_is_accepted_exactly_when_it_is_a_distribution
     because the generators only ever produced vectors that already summed to one. A
     one-sided property is vacuous against "the rule was removed" (M1-501's lesson), so the
     accepted set is asserted in both directions.
+
+    ``expected_values`` returns categories in **payload order**, not sorted -- M2-704's
+    round-1 review found that sorting collapses two payloads whose categories land on
+    opposite probabilities (``{A: 0.1, B: 0.9}`` vs ``{A: 0.9, B: 0.1}``) to the same
+    tuple. ``canonical_payload_json`` renders with ``sort_keys=True`` before this
+    module reads the payload back, but the test's keys (``opt-0`` .. ``opt-5``) already
+    sort in the order they were enumerated, so the payload's declared order is exactly
+    ``values`` (T-907).
     """
     payload = {
         "question_type": "multiple_choice",
@@ -297,7 +331,7 @@ def test_a_multiple_choice_payload_is_accepted_exactly_when_it_is_a_distribution
         assert not is_distribution
         return
     assert is_distribution
-    assert expected_values(plan) == tuple(sorted(values))
+    assert expected_values(plan) == tuple(values)
 
 
 @given(probability=st.floats(allow_nan=False, allow_infinity=False, width=32))
