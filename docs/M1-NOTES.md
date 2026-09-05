@@ -8209,3 +8209,194 @@ itself.
   on this machine's CPython 3.11 and numpy build. They are large enough that no plausible libm
   difference reaches them, but the claim is "3.74e4 ulps of margin", not "bit-identical
   everywhere". CI is the second data point; a third architecture would be the real one.
+
+## T-902 — Mocked Metaculus integration tests
+
+`CODEX_HANDOFF.md`'s "Mocked integration tests" tier, and the directory that holds it. The
+repository had `tests/unit/`, `tests/property/` and `tests/acceptance/` and no
+`tests/integration/`; this item creates it and puts 17 tests in it across four modules.
+
+Delivered:
+
+- `tests/integration/fake_platform.py` — the shared doubles: `FakeTournament` and
+  `install_tournament` (read path), `CountingTransport`, `api_response`,
+  `build_real_poster`, `install_transport` (write path), plus the tier's config builder.
+- `tests/integration/conftest.py` — `config` / `live_config` / `live_config_file` /
+  `metaculus_token` / `ledger`, and `validated_record` / `approved_record`.
+- `tests/integration/test_fetch_integration.py` — 6 tests (fetch, the three v1 types, group
+  siblings, a mixed batch, deferral).
+- `tests/integration/test_submission_integration.py` — 6 tests (approval gate, 429, 5xx,
+  refetch confirmation and its discriminating half, the refetch retry).
+- `tests/integration/test_duplicate_submit_integration.py` — 3 tests, the acceptance
+  criterion.
+- `tests/integration/test_model_failure_integration.py` — 2 tests.
+
+No migration, no new dependency, and **no `src/` change**: the suite found no defect in the
+surface it covers, so the fix-in-surface path the owner authorised was never taken.
+
+### Decision — drafted from the spec before the implementation was read, and it caught something
+
+`CLAUDE.md` § Owner split carries the standing risk that `T-901`–`T-904` lost their
+independent author. The mitigation is `T-901`'s: draft from `CODEX_HANDOFF.md` and the
+dependency rows *first*, then read the code. That was done here, and the draft is preserved
+in the plan file rather than paraphrased, because one of its sixteen items was **wrong** and
+the divergence is the only evidence the mitigation did anything.
+
+Draft item 15 read: *"when the refetch resolves to absent, a retry becomes permissible and
+posts once more."* That state does not exist. `verify_uncertain_attempt` records
+`confirmed → submitted` or `absent → failed` and **both are terminal**, so the next `submit`
+is refused by `submission_key_for_approved_record`'s status check, not by the uncertainty
+gate. A genuine retry is a new forecast version behind a fresh human approval — which is
+what M2-704's own notes say, and what the phrase "block retry **until** refetch resolves
+state" does not.
+
+Had the implementation been read first, the test would have been written to match the code
+and the wrong reading would never have surfaced as a question. It ships as
+`test_a_resolved_uncertainty_is_refused_for_status_not_for_uncertainty`, and it is
+load-bearing rather than decorative: a gateway that refused *every* second submit forever
+passes the two duplicate-submit tests beside it, and only the **changed refusal reason**
+shows that the uncertainty gate opened and a different gate closed.
+
+### Decision — the two doubles sit at two different depths, deliberately
+
+The read path is faked at **our own** seam (`metaculus.fetch.build_client`); the write path
+at the **transport** (`requests.post` / `requests.get`).
+
+Faking the read path lower would mean stubbing the SDK's async pagination —
+`get_all_open_questions_from_tournament` runs `asyncio.run(get_questions_matching_filter(...))`
+— which tests the dependency rather than this project. What matters is kept: the questions
+handed back are real SDK objects parsed from the committed API posts by `DataOrganizer`, so
+normalization meets the real types, including the `DiscreteQuestion`/`NumericQuestion`
+inheritance CLAUDE.md's gotcha names. Patching `build_client` also means a read test needs no
+`METACULUS_TOKEN`, because `build_client` is what reads it.
+
+Faking the write path *higher* was the tempting option and would have wasted the item.
+`tests/unit/test_submission_live.py` already counts calls into a hand-written four-method
+`FakePoster` — and says so deliberately, since `submission_live` imports neither
+`forecasting_tools` nor `requests`. The consequence is that **no test there can see the SDK's
+blind POST retry**, because the retry lives below the protocol, and neutralizing that retry is
+the whole of M2-704. Counting at `requests`, with a real `MetaculusClient` and a real
+`SingleAttemptPoster` in between, is what makes "exactly one POST" a measurement taken
+outside the code under test.
+
+### Deviation — "429/5xx **retry** and final failure" is tested as the shipped contract
+
+`CODEX_HANDOFF.md:326` asks for a write retry. There is none, deliberately: the pinned SDK
+blind-retries every POST four times and `SingleAttemptPoster` exists to strip that, on the
+rule *reads may retry, writes must not* (owner decision 2026-08-25), because a re-POST that
+already landed is precisely the duplicate submit this item's own acceptance criterion
+forbids. Testing the handoff's literal words would mean reversing that decision.
+
+Raised with the owner before any test was written and settled: test the shipped contract.
+Both halves are covered, and the *pair* is the assertion —
+`test_the_refetch_retries_where_the_post_does_not` measures **one POST against thirteen
+GETs** for the same underlying failure: one baseline, then the gateway's three refetch
+attempts, each itself retried four times by the SDK decorator the refetch path keeps.
+`1 + 3 × 4 = 13`, plus two gateway pauses of 2.0s. Measured, not assumed.
+
+### Decision — `fake_platform.py`, and the name is not cosmetic
+
+The module was called `platform.py` for about ten minutes. `tests/` carries no `__init__.py`,
+so pytest's default `prepend` import mode puts each test directory on `sys.path` — and a
+module there called `platform` shadows the **standard library's** for the whole process.
+`uuid` imports `platform` at its own import time, so the collision surfaces as a
+circular-import `AttributeError` raised from inside `pytest`, nowhere near the file that
+caused it. Found by execution on the first run of the new tier.
+
+The tier's shared instants (`OCCURRED`, `RESEARCH_TIMESTAMP`, `RUN_ID`) live in that module
+rather than in `conftest.py` for a neighbouring reason: pytest registers every conftest in
+`sys.modules` under the bare name `conftest`, the collision
+`tests/unit/test_conftest_temproot.py` documents, so `from conftest import ...` imports
+whichever one arrived first.
+
+### Rejected — re-asserting what the unit tiers already cover
+
+The largest risk on a size-L testing branch is a second copy of existing coverage, so the
+inventory was taken by reading before anything was written. Already covered and **not**
+repeated here: the refetch matrix, multiple-choice transposition and snapshot replay
+(`test_submission_live.py:495-1550`); `verify-submission`'s four outcomes (`:652-787`); the
+SDK's four-POST premise and the adapter's one (`test_metaculus_poster.py:104-206`);
+`resolve_tournament_id`'s precedence (`test_fetch.py:40-79`); group expansion against the SDK
+(`test_groups.py`); a dozen repair cases (`test_forecast_generate.py`).
+
+`tests/unit/conftest.py`'s autouse `block_network` is likewise **not** copied into the new
+tier. It is the superseded third network guard — `pytest-socket` via `addopts` and the autouse
+DNS block in `tests/conftest.py` both already apply directory-agnostically, which is the whole
+of criterion H's mechanism and needed no configuration.
+
+Two claims in the model-timeout bullet did turn out to have no owner and are the only
+reason that module exists at all: a **model-call** timeout as distinct from the CDF
+conversion timeout `test_pipeline_live.py` covers, and
+`forecast_records.model_invocations` reading back exactly 2 after a repair that actually
+happened. The `== 2` in `test_forecast_replay.py` is a constructed `ModelCall`, not a repair.
+
+### Deferred (do not read the absence as an omission)
+
+- **No new `tests/property/` pass.** The convention applies to new pure functions in `src/`,
+  and this item adds none — it is a tests-only diff. Had the fix-in-surface path been taken,
+  a property pass would have followed it.
+- **AskNews success / stale / partial-error / Exa fallback**, the one bullet of
+  `CODEX_HANDOFF.md:319-328` this item does not touch. Out of scope by the item's own row,
+  which names "fetch, post, timeout, 429/5xx and refetch verification"; retrieval is
+  `M1-302`/`M1-303`'s and is covered in `tests/unit/test_asknews.py` and `test_exa.py`.
+- **No numeric or multiple-choice *submission* scenario.** The posting tests are binary,
+  because the approved record they need is the one the unit tier already builds through the
+  real writers. `test_submission_live.py::test_each_question_type_reaches_its_own_public_post_method`
+  covers the type dispatch; what this tier adds is depth, not breadth.
+- **`verify-submission` is driven only where it changes a submit's outcome.** Its four
+  refusal shapes are `test_submission_live.py`'s.
+
+### Standing risk — not verifiable offline
+
+- **Every fixture is synthetic, and `M2-706` did not change that.** The bot-testing-area
+  smoke test really posted on 2026-09-03 (record `01a0673d…`, question 43332, refetch
+  confirmed), so a real request/response pair *was* observed — but `data/` is gitignored and
+  no notes section recorded the shapes, so nothing from that run is available to build a
+  fixture from. The refetch bodies here are the committed API posts with a `my_forecasts`
+  block spliced in, which is the SDK's documented layout rather than a captured one. This
+  narrows `T-901`'s standing risk (a real SDK parse now runs over a real post body) without
+  closing it.
+- **The 13-GET count is a property of the pinned SDK's retry decorator.** A `forecasting-tools`
+  bump that changed `max_retries` turns
+  `test_the_refetch_retries_where_the_post_does_not` red for a reason unrelated to this
+  project — which is the intended direction, and the same bargain
+  `test_metaculus_poster.py`'s four-POST tests already make.
+- **`api_response` builds a `requests.Response` by assigning `_content`.** That is a private
+  attribute of the transport library and the same construction
+  `tests/unit/test_metaculus_poster.py` already relies on. There is no public constructor for
+  a response with a body; a `requests` major bump would break both files together.
+
+### On the mutation pass
+
+Sixteen mutations, run against a committed tree (T-901's harness destroyed its own evidence
+by restoring uncommitted work with `git checkout -- src/`), with `__pycache__` cleared between
+runs per lesson 8. Fifteen caught. **The one that survived was the mutation's fault, and it is
+the part worth recording.**
+
+`S3 the approval requirement is dropped` deleted the `approval is None` refusal in
+`submission.submission_key_for_approved_record` and expected
+`test_an_unapproved_record_sends_no_request_at_all` to go red. It did not, and the test was
+not at fault: that guard is **two** checks, and an unapproved record is still `validated`, so
+the surviving `status != "approved"` check refused it anyway. Neutering both halves (`S3b`)
+kills it immediately, and by the right test.
+
+That is the same shape as M1-603's whitespace finding one level up: **a mutation aimed at a
+two-part guard proves nothing about a test unless both parts are neutered.** A single-part
+mutation that survives reads as "the test is vacuous" when the truth is "the property is
+still enforced elsewhere", and the tempting response — weakening or deleting the test — would
+have removed real coverage.
+
+The other correction: the first `classify_refetch` mutation was written badly enough to make
+the module raise, and a crash counts as caught for the wrong reason. Replaced with a one-line
+wrong *verdict* — an empty platform history returning `confirmed` — which kills
+`test_a_post_the_platform_does_not_show_is_never_recorded_as_verified`, the discriminating
+half of the refetch pair.
+
+Each remaining mutation expressed the defect its test is named for: the SDK's blind retry
+restored (four POSTs, not one); `HTTPError` dropped from the transport vocabulary; the
+refetch retry budget cut to one; the uncertainty gate stopped refusing; a model `TimeoutError`
+reported as `provider_error`; `invocations` hard-coded to 1; the supported-type set losing
+`multiple_choice` and gaining `discrete`; `post_id` pinned so every id is still present but
+every **pairing** is wrong — that last one is what shows
+`test_every_fetched_question_keeps_the_identity_the_platform_sent` discriminates on its own
+claim rather than on its neighbour's.
