@@ -139,6 +139,9 @@ class Model:
 def case(tmp_path: Path) -> Any:
     config = base_config.__wrapped__(tmp_path)
     data = config.model_dump(mode="json")
+    prompt = tmp_path / "forecaster.md"
+    prompt.write_bytes(config.forecast.prompt_path.read_bytes())
+    data["forecast"]["prompt_path"] = str(prompt)
     data["metaculus"]["tournament"].update(id=32977, use_sdk_current_id=False)
     data["model"].update(
         name=Model.model, max_output_tokens=6000, timeout_seconds=120, temperature=None

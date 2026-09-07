@@ -18,6 +18,7 @@ from whiskeyjack_bot.tournament_state import (
     check_storage,
     events,
     guard_root,
+    storage_transaction,
     utcnow,
 )
 
@@ -82,19 +83,39 @@ def reconcile_restored(conn: sqlite3.Connection, config: AppConfig, poster: Any)
                 )
                 blocked += 1
             if "reservation_id" in data and "estimate_microusd" in data:
-                known = events(conn, "cost_reserved", scope)
-                if not any(e["reservation_id"] == data["reservation_id"] for e in known):
-                    append(
-                        conn,
-                        "cost_reserved",
-                        scope,
-                        {k: data[k] for k in ("reservation_id", "provider", "estimate_microusd")},
-                    )
-            with transaction(conn):
-                conn.execute(
-                    "INSERT INTO tournament_events(event_id,kind,scope,data,created_at_utc) VALUES(?,?,?,?,?)",
-                    (identifier, "witness", scope, canonical(data), utcnow().isoformat()),
-                )
+                with storage_transaction(conn):
+                    known = events(conn, "cost_reserved", scope)
+                    if not any(e["reservation_id"] == data["reservation_id"] for e in known):
+                        append(
+                            conn,
+                            "cost_reserved",
+                            scope,
+                            {
+                                k: data[k]
+                                for k in ("reservation_id", "provider", "estimate_microusd")
+                            },
+                        )
+                    completed = conn.execute(
+                        "SELECT 1 FROM tournament_events s JOIN tournament_events c ON c.scope=s.scope "
+                        "WHERE json_extract(s.data,'$.reservation_id')=? AND "
+                        "((s.kind='retrieval_started' AND c.kind='retrieval_completed') OR "
+                        "(s.kind='model_started' AND c.kind='model_completed')) LIMIT 1",
+                        (data["reservation_id"],),
+                    ).fetchone()
+                    holds = events(conn, "restored_spending_hold", scope)
+                    if completed is None and not any(
+                        h["reservation_id"] == data["reservation_id"] for h in holds
+                    ):
+                        append(
+                            conn,
+                            "restored_spending_hold",
+                            scope,
+                            {
+                                "reservation_id": data["reservation_id"],
+                                "provider": data["provider"],
+                            },
+                        )
+                # Reservation and hold are committed before this witness is reconciled.
             write_new_file(
                 config.storage.artifact_root / "operations" / path.name,
                 path.read_bytes(),
@@ -102,6 +123,11 @@ def reconcile_restored(conn: sqlite3.Connection, config: AppConfig, poster: Any)
                 on_existing="confirm_identical",
                 error=StorageFailure,
             )
+            with transaction(conn):
+                conn.execute(
+                    "INSERT INTO tournament_events(event_id,kind,scope,data,created_at_utc) VALUES(?,?,?,?,?)",
+                    (identifier, "witness", scope, canonical(data), utcnow().isoformat()),
+                )
             imported += 1
         check_storage(conn, config.storage.artifact_root)
         append(

@@ -18,7 +18,8 @@ def require_research_artifacts(
 ) -> None:
     from whiskeyjack_bot.research.store import load_packet
     from whiskeyjack_bot.research.packet import packet_sha256
-    from whiskeyjack_bot.research.quality import without_future
+    from whiskeyjack_bot.research.quality import usable_packet, without_future
+    from whiskeyjack_bot.research.artifacts import ArtifactError, read_raw_responses
     from whiskeyjack_bot.tournament_state import digest, events, StorageFailure
 
     checkpoints = events(
@@ -41,6 +42,16 @@ def require_research_artifacts(
         if packet_sha256(packet) == record.research_packet_sha256:
             matched = packet
             break
+        filtered = usable_packet(
+            packet,
+            record.question,
+            record.generated_at_utc,
+            config.retrieval.freshness_days_default,
+        )
+        if packet_sha256(filtered) == record.research_packet_sha256:
+            matched = packet
+            break
+        # Retain both older reconstruction paths; saved records and hashes are immutable.
         filtered = without_future(packet, record.generated_at_utc)
         if packet_sha256(filtered) == record.research_packet_sha256:
             matched = packet
@@ -48,11 +59,12 @@ def require_research_artifacts(
     if matched is None:
         raise StorageFailure("research packet cannot reproduce its saved hash")
     for run in matched.runs:
-        if (
-            not run.raw_response_path
-            or not (config.storage.artifact_root / run.raw_response_path).is_file()
-        ):
+        if not run.raw_response_path:
             raise StorageFailure("research replay artifact missing")
+        try:
+            read_raw_responses(config.storage.artifact_root, run.raw_response_path)
+        except ArtifactError:
+            raise StorageFailure("research replay artifact missing or invalid") from None
 
 
 def prepare_live_policy(

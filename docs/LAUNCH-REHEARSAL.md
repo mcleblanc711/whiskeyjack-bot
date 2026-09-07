@@ -47,3 +47,32 @@ validation are release gates; see the release PR for the final run results.
 This demonstrates operational compatibility and recovery behavior. It does not establish
 forecast calibration or competitive skill. Production activation and installation/start of
 the polling service remain owner-controlled deployment steps.
+
+## PR #75 review remediation — September 7, 2026 UTC
+
+All eight review findings were reproduced against `287c105` before implementation, using
+fake providers and blocked sockets. The initial regression run had 19 failing cases and
+one passing shutdown control. `tests/unit/test_launch_findings.py` retains those contracts
+and adds interruption, concurrent settlement, and read-only recovery coverage.
+
+| Finding | Observed before the fix | Regression contract |
+|---|---|---|
+| Operator storage | All four non-enable commands created a missing database | Refuse without creation; valid disable still works |
+| Status bindings | Changed config/prompt, missing prompt, and missing guard artifact reported enabled | Shared local activation checks, sanitized refusal, nonzero exit |
+| Phase deadline | AskNews/Exa swallowed the alarm; Sol replaced it with a provider error | Deadline escapes provider handlers, cleans up the timer, and records question failure |
+| Evidence selection | Stale and irrelevant documents reached generation in mixed evidence | Only usable documents reach the model; full research remains retained; three hash paths reproduce |
+| Research artifacts | Truncated JSON and malformed provenance still allowed posting | Parse every referenced artifact before POST |
+| Restored spending | Reservation returned without a hold on new purchases | Persistent account/project hold, committed before witness reconciliation |
+| Cached retrieval | Cached Exa/AskNews responses counted as new calls; Exa repeated its charge | Cache-only runs cost zero; mixed runs count only actual new requests |
+| Completion/settlement crash | Known model and retrieval costs stayed reserved after restart | Original reservation settles once, including concurrent recovery |
+
+The focused provider/tournament suite passes **317 tests**. The full release gate passes
+(lint, formatting, strict typing, and the complete offline suite with the 200-example
+Hypothesis `dev` profile; pytest completed in 392 seconds). Migration/artifact hygiene,
+backlog lint, and systemd validation also pass. Four existing forecasts in the
+operator ledger reproduce their original hashes using read-only SQLite with sockets
+blocked. The prompt bytes, existing migrations, and forecast record schema are unchanged.
+The runbook documents truthful local status and the conservative spending hold; no automatic
+hold release is provided. No provider requests, activation, deployment, or service startup
+were performed during remediation. Read-only checks found both service/timer inactive and
+not installed, and the earlier testing activation still disabled.

@@ -29,6 +29,10 @@ class TournamentError(Exception):
     """A safe refusal, with external content withheld."""
 
 
+class ActivationInactive(TournamentError):
+    """An ordinary disabled or out-of-window activation, not invalid storage."""
+
+
 class StorageFailure(TournamentError):
     """Stop the worker; continuing could lose evidence or spend."""
 
@@ -104,7 +108,7 @@ def check_storage(conn: sqlite3.Connection, root: Path) -> None:
             path = root / "operations" / f"{row[0]}.json"
             if not path.is_file() or not (guard_root(conn) / path.name).is_file():
                 raise StorageFailure("operation artifact missing; platform reconciliation required")
-    except (OSError, ValueError, KeyError, sqlite3.Error):
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         raise StorageFailure("cannot verify operation journal and artifacts") from None
 
 
@@ -182,14 +186,11 @@ def require_activation(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     active = events(conn, "activation", "account")
+    check_storage(conn, config.storage.artifact_root)
     if not active:
-        raise TournamentError("tournament activation is disabled")
+        raise ActivationInactive("tournament activation is disabled")
     data = active[-1]
     instant = now or utcnow()
-    if events(conn, "disabled", data["activation_id"]) or not datetime.fromisoformat(
-        data["starts"]
-    ) <= instant < datetime.fromisoformat(data["ends"]):
-        raise TournamentError("tournament activation is disabled or outside its validity window")
     if (
         data["account_id"] != account_id
         or str(data["project_id"]) != project_id
@@ -199,7 +200,10 @@ def require_activation(
         or any(data[k] != v for k, v in bindings(config).items())
     ):
         raise TournamentError("activation account, destination, configuration, or prompt changed")
-    check_storage(conn, config.storage.artifact_root)
+    if events(conn, "disabled", data["activation_id"]) or not datetime.fromisoformat(
+        data["starts"]
+    ) <= instant < datetime.fromisoformat(data["ends"]):
+        raise ActivationInactive("tournament activation is disabled or outside its validity window")
     return data
 
 
@@ -223,6 +227,13 @@ def storage_transaction(conn: sqlite3.Connection) -> Iterator[None]:
         raise StorageFailure("cannot commit spending transaction; worker stopped") from None
 
 
+def require_spending_clear(conn: sqlite3.Connection, scope: str) -> None:
+    if events(conn, "restored_spending_hold", scope):
+        raise TournamentError(
+            "restored spending outcome is unknown; spending hold blocks purchases"
+        )
+
+
 @dataclass
 class Budget:
     conn: sqlite3.Connection
@@ -238,6 +249,7 @@ class Budget:
         identifier = uuid4().hex
         # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
         with storage_transaction(self.conn):
+            require_spending_clear(self.conn, self.scope)
             actual, held = spending(self.conn, self.scope)
             if actual + held + amount > self.ceiling:
                 raise TournamentError("round budget exhausted; no provider call made")
@@ -266,9 +278,11 @@ class Budget:
     def settle(self, identifier: str, actual: float | None) -> None:
         if actual is None or not math.isfinite(actual) or actual < 0:
             return
-        if events(self.conn, "cost_settled_id", identifier):
-            raise StorageFailure("cost reservation already settled")
         with storage_transaction(self.conn):
+            # Recovery may reach this after completion was committed but settlement
+            # was interrupted. Serialize the check and append across processes.
+            if events(self.conn, "cost_settled_id", identifier):
+                return
             append(
                 self.conn,
                 "cost_settled",

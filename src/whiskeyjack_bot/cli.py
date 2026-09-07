@@ -1271,7 +1271,8 @@ def _run_tournament(args: argparse.Namespace) -> int:
         from whiskeyjack_bot.logging_setup import configure_logging
 
         configure_logging(config)
-        initialize_ledger(config.storage.sqlite_path)
+        if args.tournament_command == "enable":
+            initialize_ledger(config.storage.sqlite_path)
         connection = open_verified_ledger(config.storage.sqlite_path)
         try:
             if args.tournament_command == "enable":
@@ -1300,12 +1301,18 @@ def _run_tournament(args: argparse.Namespace) -> int:
                     )
                 )
             elif args.tournament_command == "status":
-                print(json.dumps(status(connection), indent=2))
+                result = status(connection, config)
+                print(json.dumps(result, indent=2))
+                return 1 if result["refusal_reason"] else 0
             else:
                 result = run_once(connection, config, question_id=args.question_id)
                 print(json.dumps(result, indent=2))
                 heartbeat = result.get("heartbeat") or {}
-                return 1 if result["unresolved"] or heartbeat.get("failures") else 0
+                return (
+                    1
+                    if result["refusal_reason"] or result["unresolved"] or heartbeat.get("failures")
+                    else 0
+                )
         finally:
             connection.close()
     except Exception as exc:

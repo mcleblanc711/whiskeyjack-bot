@@ -327,13 +327,13 @@ def retrieve_news(
                 question_id,
                 now_utc.isoformat(),
             )
-            calls_attempted += 1
             try:
                 if cached is not None:
                     from asknews_sdk.dto.news import SearchResponse
 
                     response = SearchResponse.model_validate(cached)
                 else:
+                    calls_attempted += 1
                     response = client.news.search_news(**request)
 
             except Exception:
@@ -395,7 +395,7 @@ def retrieve_news(
             # rate is configured. Recording a converted number would put an
             # unearned figure in the ledger; the credit count survives in
             # raw_responses for M1-306, which owns cost capture.
-            "cost_usd": None,
+            "cost_usd": None if calls_attempted else 0.0,
         }
     )
 

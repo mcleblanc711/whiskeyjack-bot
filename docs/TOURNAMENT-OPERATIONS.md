@@ -69,6 +69,17 @@ Stopping a running service may interrupt an external request. Its durable intent
 unresolved until refetch establishes the result. Never delete an intent, reservation, or
 receipt to make the next run succeed.
 
+Only `tournament enable` may initialize storage. `disable`, `status`, `run-once`, and
+`reconcile-restored` require an existing compatible ledger; a missing or incorrect database
+path returns nonzero without creating a database. Check the exit code when stopping.
+
+Status validates the effective configuration, prompt, and retained storage guards using the
+same activation checks as the worker. `enabled: true` means those local checks passed; it
+does not verify live credentials or prove that the timer is running. Normal inactivity
+(disabled, not yet valid, or expired) returns zero. Changed bindings, a missing prompt,
+inconsistent storage, or a spending hold report `enabled: false` and return nonzero.
+`refusal_reason` gives a sanitized local reason without provider content or credentials.
+
 Status reports the last heartbeat, discovered/processed/skipped counts, failures, forecast
 confirmation, comment completion, unresolved operations, and actual/reserved/remaining
 budget. The heartbeat's `complete` describes the poll finishing; zero failures and zero
@@ -118,7 +129,18 @@ and artifact backup to the configured paths, then run:
 ```
 
 Reconciliation reads Metaculus before importing missing durable witnesses and conservatively
-restoring held spending. A lost submission intent holds the whole question, including when
+restoring held spending. If a restored purchase witness has no retained provider outcome,
+reconciliation appends both its reservation and a persistent account/project
+`restored_spending_hold` before marking the witness reconciled. Status exposes
+`spending_held` and `restored_spending_holds`. While held, polls fail and no new research,
+model request, forecast, or comment is started; read-only forecast/comment reconciliation
+continues under a valid activation. Restarting, disabling, reactivating, and repeated
+reconciliation cannot clear the hold. There is no automatic release mechanism; resolving
+it requires separately reviewed recovery using retained provider evidence. Known completed
+charges settle their original reservation once during recovery. Cached retrieval records
+zero new calls and spending, while any unknown original cost remains reserved.
+
+A lost submission intent holds the whole question, including when
 its forecast is absent from the current refetch. It does not recreate a missing forecast
 record or discard a question hold. Restore missing artifacts from retained copies; offline
 replay must match before any new submission. Investigate all holds and unresolved operations

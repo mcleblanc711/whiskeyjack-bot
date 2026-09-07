@@ -630,7 +630,7 @@ def _attempt_question(
         )
 
     from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError
-    from whiskeyjack_bot.research.quality import quality_problem, without_future
+    from whiskeyjack_bot.research.quality import quality_problem, usable_packet
 
     if CURRENT_BUDGET.get() is not None:
         from datetime import timedelta
@@ -638,12 +638,18 @@ def _attempt_question(
 
         if question.close_time is None or question.close_time <= utcnow() + timedelta(minutes=5):
             raise TournamentError("less than five minutes remain; no new forecast purchased")
+        research = replace(
+            research,
+            packet=usable_packet(
+                research.packet, question, now, config.retrieval.freshness_days_default
+            ),
+        )
+        assert research.packet is not None
         problem = quality_problem(
             research.packet, question, now, config.retrieval.freshness_days_default
         )
         if problem:
             raise TournamentError(problem)
-        research = replace(research, packet=without_future(research.packet, now))
 
     if research.packet is None:
         raise TournamentError("filtered research packet is missing")

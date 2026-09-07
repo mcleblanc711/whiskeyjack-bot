@@ -35,6 +35,7 @@ from whiskeyjack_bot.submission_live import (
 from whiskeyjack_bot.submission_payload import authorized_payload
 from whiskeyjack_bot.timeouts import phase_timeout
 from whiskeyjack_bot.tournament_state import (
+    ActivationInactive,
     Budget,
     StorageFailure,
     TournamentError,
@@ -42,6 +43,7 @@ from whiskeyjack_bot.tournament_state import (
     budget_context,
     events,
     require_activation,
+    require_spending_clear,
     spending,
     utcnow,
     witness,
@@ -141,7 +143,12 @@ def _matching_comments(
 
 
 def complete_comment(
-    conn: sqlite3.Connection, config: AppConfig, poster: Any, record_id: str
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    poster: Any,
+    record_id: str,
+    *,
+    allow_post: bool = True,
 ) -> bool:
     if not _confirmed(conn, record_id):
         return False
@@ -177,7 +184,7 @@ def complete_comment(
             },
         )
         return True
-    if intents:
+    if intents or not allow_post:
         # A missing result in an immediate or delayed GET does not prove no creation.
         return False
     text = comment_text(conn, record_id)
@@ -200,10 +207,13 @@ def complete_comment(
     return complete_comment(conn, config, poster, record_id)
 
 
-def status(conn: sqlite3.Connection) -> dict[str, Any]:
+def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
     activations = events(conn, "activation", "account")
     data: dict[str, Any] = {
         "enabled": False,
+        "refusal_reason": None,
+        "spending_held": False,
+        "restored_spending_holds": 0,
         "heartbeat": None,
         "forecast_confirmed": 0,
         "comment_completed": 0,
@@ -218,13 +228,33 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
         data.update(
             project_id=active["project_id"],
             account_id=active["account_id"],
-            enabled=not bool(events(conn, "disabled", active["activation_id"]))
-            and datetime.fromisoformat(active["starts"])
-            <= utcnow()
-            < datetime.fromisoformat(active["ends"]),
+            restored_spending_holds=len(
+                events(
+                    conn, "restored_spending_hold", f"{active['account_id']}:{active['project_id']}"
+                )
+            ),
             actual_cost_usd=actual / 1_000_000,
             reserved_cost_usd=held / 1_000_000,
             remaining_budget_usd=max(0, active["budget_microusd"] - actual - held) / 1_000_000,
+        )
+    # This is a local configuration/storage check, not live credential verification.
+    try:
+        require_activation(
+            conn,
+            config,
+            account_id=activations[-1]["account_id"] if activations else 0,
+            project_id=str(config.metaculus.tournament.id),
+        )
+        data["enabled"] = True
+    except ActivationInactive:
+        pass
+    except TournamentError as exc:
+        data["refusal_reason"] = str(exc)
+    data["spending_held"] = bool(data["restored_spending_holds"])
+    if data["spending_held"]:
+        data["enabled"] = False
+        data["refusal_reason"] = data["refusal_reason"] or (
+            "restored spending outcome is unknown; spending hold blocks purchases"
         )
     for kind, key in (
         ("forecast_confirmed", "forecast_confirmed"),
@@ -286,6 +316,7 @@ def run_once(
             "complete": False,
         }
         append(conn, "heartbeat", "worker", heartbeat)
+        spending_held = bool(events(conn, "restored_spending_hold", f"{account}:{project}"))
         # Resume external phases even after a question has closed or left discovery.
         pending = conn.execute(
             "SELECT DISTINCT scope FROM tournament_events WHERE kind='forecast_intent'"
@@ -299,13 +330,19 @@ def run_once(
             try:
                 with phase_timeout(240):
                     if not reconcile_forecast(conn, config, poster, row[0]) or not complete_comment(
-                        conn, config, poster, row[0]
+                        conn, config, poster, row[0], allow_post=not spending_held
                     ):
                         heartbeat["failures"] += 1
             except (StorageFailure, sqlite3.Error, OSError):
                 raise StorageFailure("recovery storage failed; worker stopped") from None
             except Exception:
                 heartbeat["failures"] += 1
+        if spending_held:
+            heartbeat.update(
+                failures=heartbeat["failures"] + 1, complete=True, at=utcnow().isoformat()
+            )
+            append(conn, "heartbeat", "worker", heartbeat)
+            return status(conn, config)
         questions = client.get_all_open_questions_from_tournament(
             int(project), group_question_mode="unpack_subquestions"
         )
@@ -365,6 +402,7 @@ def run_once(
                 if existing:
                     record_id = str(existing[0])
                 else:
+                    require_spending_clear(conn, budget.scope)
                     # Persist a cutoff for restart recovery; generation requests stay byte-identical.
                     scope = f"{project}:{question.question_id}"
                     checkpoints = events(conn, "question_started", scope)
@@ -468,4 +506,4 @@ def run_once(
         heartbeat["complete"] = True
         heartbeat["at"] = utcnow().isoformat()
         append(conn, "heartbeat", "worker", heartbeat)
-        return status(conn)
+        return status(conn, config)

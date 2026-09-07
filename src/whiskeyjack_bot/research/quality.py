@@ -71,6 +71,17 @@ def quality_problem(
     return None
 
 
+def usable_packet(
+    packet: ResearchPacket, question: CanonicalQuestion, now: datetime, days: int
+) -> ResearchPacket:
+    """Select model inputs without modifying retained research or legacy hashing."""
+    return ResearchPacket(
+        question_id=packet.question_id,
+        runs=packet.runs,
+        documents=tuple(d for d in packet.documents if usable(d, question, now, days)),
+    )
+
+
 def without_future(packet: ResearchPacket, now: datetime) -> ResearchPacket:
     return ResearchPacket(
         question_id=packet.question_id,

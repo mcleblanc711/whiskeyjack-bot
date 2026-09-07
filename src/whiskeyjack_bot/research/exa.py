@@ -663,7 +663,8 @@ def retrieve_web(
         from whiskeyjack_bot.research.durable import begin_call, complete_call
 
         call_scope, cached = begin_call("exa", 0.05, payload, question_id, now_utc.isoformat())
-        calls_attempted += 1
+        if cached is None:
+            calls_attempted += 1
         try:
             # follow_redirects is pinned at the call site, not left to the
             # client's default: httpx strips `Authorization` when a redirect
@@ -706,7 +707,7 @@ def retrieve_web(
 
         call_cost = _call_cost_usd(body)
         complete_call(call_scope, body, call_cost)
-        if call_cost is not None:
+        if cached is None and call_cost is not None:
             cost_total += call_cost
             calls_with_cost += 1
 
@@ -762,7 +763,7 @@ def retrieve_web(
     # yielded a usable cost. Anything less is a subtotal, and publishing a
     # subtotal as cost_usd would make an incomplete figure look complete
     # (cross-model review round 3, finding 3).
-    cost_reported = calls_attempted > 0 and calls_with_cost == calls_attempted
+    cost_reported = bool(raw_responses) and calls_with_cost == calls_attempted
     if cost_reported and not isfinite(cost_total):
         # Each call's own cost was finite (_call_cost_usd already checked
         # isfinite); only the sum overflowed. Drop it the same way an

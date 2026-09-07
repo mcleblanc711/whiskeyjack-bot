@@ -44,6 +44,8 @@ class SolClient:
             cached = events(budget.conn, "model_completed", cache_scope)
             if cached:
                 self.last_cost = cached[-1]["cost"]
+                started = events(budget.conn, "model_started", cache_scope)[-1]
+                budget.settle(started["reservation_id"], self.last_cost)
                 return str(cached[-1]["content"])
             if events(budget.conn, "model_started", cache_scope):
                 raise TournamentError(
