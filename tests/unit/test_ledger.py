@@ -18,6 +18,7 @@ from whiskeyjack_bot.ledger import (
 )
 
 LEDGER_TABLES = {
+    "tournament_events",
     "forecast_records",
     "research_runs",
     "research_documents",

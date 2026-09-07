@@ -110,6 +110,8 @@ from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import 
     MonetaryCostManager,
 )
 
+from whiskeyjack_bot.tournament_state import TournamentError
+
 from whiskeyjack_bot.config import (
     MAX_MODEL_INVOCATIONS,
     PROBABILITY_BOUND_CEILING,
@@ -221,7 +223,7 @@ def _require_forecaster(client: Forecaster, config: AppConfig) -> None:
         )
 
 
-def build_forecaster_client(config: AppConfig) -> GeneralLlm:
+def build_forecaster_client(config: AppConfig) -> Any:
     """Construct the one configured forecaster client.
 
     Raises ``MissingCredentialError`` when the configured variable is unset or empty,
@@ -233,6 +235,14 @@ def build_forecaster_client(config: AppConfig) -> GeneralLlm:
     api_key = os.environ.get(config.model.api_key_env)
     if not api_key:
         raise MissingCredentialError(config.model.api_key_env)
+    if config.model.name == "openrouter/openai/gpt-5.6-sol":
+        if config.model.temperature is not None:
+            raise ForecastGenerationError(
+                "Sol requires model.temperature: null; temperature is unsupported"
+            )
+        from whiskeyjack_bot.forecast.sol import SolClient
+
+        return SolClient(config)
     return GeneralLlm(
         model=config.model.name,
         temperature=config.model.temperature,
@@ -286,7 +296,7 @@ async def _invoke_once(client: Forecaster, messages: list[dict[str, str]]) -> tu
     """
     with MonetaryCostManager() as manager:
         text = await client.invoke(messages)
-        usage = manager.current_usage
+        usage = getattr(client, "last_cost", None) or manager.current_usage
     return text, usage
 
 
@@ -635,6 +645,8 @@ def _run_attempts(
         calls_attempted += 1
         try:
             text, usage = _invoke(client, messages)
+        except TournamentError:
+            raise
         except Exception as exc:
             # The exception is never inspected beyond its type: a provider error can
             # quote the request, and the request carries the API key in a header.
@@ -654,6 +666,13 @@ def _run_attempts(
             question=question,
             source_ids=source_ids,
         )
+        if forecast is not None:
+            import json
+
+            cutoff = datetime.fromisoformat(json.loads(request)["as_of_utc"].replace("Z", "+00:00"))
+            if forecast.as_of_utc != cutoff:
+                problems = ["as_of_utc must exactly match the supplied cutoff"]
+                forecast = None
         if forecast is not None:
             try:
                 problems = _conversion_problems(forecast, numeric_calibration, question)

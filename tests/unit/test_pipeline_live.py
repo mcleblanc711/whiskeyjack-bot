@@ -133,6 +133,7 @@ def reply_for(question: CanonicalQuestion) -> str:
                 for level in levels
             ]
         }
+    payload["as_of_utc"] = NOW.isoformat()
     return json.dumps(payload)
 
 
@@ -650,7 +651,7 @@ def test_a_second_run_reuses_the_research_it_already_paid_for(
     """``CODEX_HANDOFF.md``: *retrying a later phase must not repeat an earlier paid call
     unless explicitly requested.* Asserted by call count, which a log line could not do."""
     first = _TrackingSDK()
-    live(ledger, config, question_id=BINARY, news_client=first)
+    initial = live(ledger, config, question_id=BINARY, news_client=first)
     assert first.news.calls, "the first run must actually retrieve"
 
     second = _TrackingSDK()
@@ -659,9 +660,7 @@ def test_a_second_run_reuses_the_research_it_already_paid_for(
     assert batch.outcomes[0].research_reused is True
     assert batch.outcomes[0].status == "recorded"
     # The reused packet is the same evidence, so the second record cites the same runs.
-    assert batch.outcomes[0].retrieval_run_ids == (
-        rows(ledger, "SELECT retrieval_run_id FROM research_runs")[0][0],
-    )
+    assert batch.outcomes[0].retrieval_run_ids == initial.outcomes[0].retrieval_run_ids
 
 
 def test_refresh_research_pays_again_and_says_so(config: AppConfig, ledger: Any) -> None:
@@ -671,7 +670,7 @@ def test_refresh_research_pays_again_and_says_so(config: AppConfig, ledger: Any)
     batch = live(ledger, config, question_id=BINARY, news_client=second, refresh_research=True)
     assert second.news.calls, "--refresh-research must retrieve again"
     assert batch.outcomes[0].research_reused is False
-    assert len(rows(ledger, "SELECT 1 FROM research_runs")) == 2
+    assert len(rows(ledger, "SELECT 1 FROM research_runs WHERE provider = 'asknews'")) == 2
 
 
 def test_reuse_does_not_require_the_replay_switch(config: AppConfig, ledger: Any) -> None:

@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -96,7 +96,7 @@ from whiskeyjack_bot.research.orchestrate import (
     retrieve_for_question,
 )
 from whiskeyjack_bot.research.packet import packet_sha256
-from whiskeyjack_bot.research.store import StoreError, list_retrieval_run_ids, load_packet
+from whiskeyjack_bot.research.store import StoreError, load_packet
 from whiskeyjack_bot.research.sufficiency import assess_sufficiency
 
 if TYPE_CHECKING:
@@ -381,33 +381,24 @@ def _research(
     exactly the identity failure ``list_retrieval_run_ids`` was separated from ``load_packet``
     to prevent.
     """
-    if not refresh:
-        try:
-            existing = list_retrieval_run_ids(conn, question_id=question.question_id)
-            if existing:
-                packet = load_packet(
-                    conn, question_id=question.question_id, retrieval_run_ids=existing
+    from whiskeyjack_bot.tournament_state import append, digest, events
+
+    fingerprint = digest(question.model_dump(mode="json"))
+    saved = events(conn, "research_checkpoint", fingerprint)
+    if not refresh and saved and saved[-1].get("retrieval_policy") == "launch-2":
+        checkpoint = saved[-1]
+        if 0 <= (now - datetime.fromisoformat(checkpoint["at"])).total_seconds() <= 1800:
+            run_ids = tuple(checkpoint["run_ids"])
+            packet = load_packet(conn, question_id=question.question_id, retrieval_run_ids=run_ids)
+            if packet.documents:
+                return _Research(
+                    packet=packet,
+                    retrieval_run_ids=run_ids,
+                    reused=True,
+                    provider_failed=False,
+                    cost_usd=None,
+                    unpriced_calls=0,
                 )
-                if packet.documents:
-                    _LOGGER.info(
-                        "reusing %d completed research run(s) for question %d; no provider "
-                        "call is made (pass --refresh-research to retrieve again)",
-                        len(existing),
-                        question.question_id,
-                    )
-                    return _Research(
-                        packet=packet,
-                        retrieval_run_ids=existing,
-                        reused=True,
-                        provider_failed=False,
-                        cost_usd=None,
-                        unpriced_calls=0,
-                    )
-        except StoreError as exc:
-            # Reuse is an optimisation over paying again, so a ledger that cannot answer
-            # "what is already here" degrades to retrieving rather than failing the
-            # question. Logged, because silently paying twice is the thing being avoided.
-            _LOGGER.warning("could not reuse stored research, retrieving instead: %s", exc)
 
     outcome = retrieve_for_question(
         conn,
@@ -416,6 +407,22 @@ def _research(
         now=now,
         news_client=news_client,
         web_client=web_client,
+    )
+    from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, StorageFailure
+
+    if CURRENT_BUDGET.get() is not None and any(
+        r.artifact_outcome == "failed" for r in outcome.runs
+    ):
+        raise StorageFailure("research artifact failed; worker stopped before forecasting")
+    append(
+        conn,
+        "research_checkpoint",
+        fingerprint,
+        {
+            "at": now.isoformat(),
+            "run_ids": list(outcome.retrieval_run_ids),
+            "retrieval_policy": "launch-2",
+        },
     )
     return _Research(
         packet=outcome.packet,
@@ -533,6 +540,12 @@ def _attempt_question(
             web_client=web_client,
         )
     except PaidRetrievalError as exc:
+        from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, StorageFailure
+
+        if CURRENT_BUDGET.get() is not None:
+            raise StorageFailure(
+                "research storage failed after a paid call; worker stopped"
+            ) from None
         # The ledger refused a write *after* the provider was billed. Caught before its
         # parent class because the two cases differ in everything the ledger and the budget
         # care about: this one names the run row that says money was spent on this question,
@@ -616,6 +629,24 @@ def _attempt_question(
             note=note,
         )
 
+    from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError
+    from whiskeyjack_bot.research.quality import quality_problem, without_future
+
+    if CURRENT_BUDGET.get() is not None:
+        from datetime import timedelta
+        from whiskeyjack_bot.tournament_state import utcnow
+
+        if question.close_time is None or question.close_time <= utcnow() + timedelta(minutes=5):
+            raise TournamentError("less than five minutes remain; no new forecast purchased")
+        problem = quality_problem(
+            research.packet, question, now, config.retrieval.freshness_days_default
+        )
+        if problem:
+            raise TournamentError(problem)
+        research = replace(research, packet=without_future(research.packet, now))
+
+    if research.packet is None:
+        raise TournamentError("filtered research packet is missing")
     run_ids = research.retrieval_run_ids
     try:
         generation: ForecastGeneration = generate_forecast(

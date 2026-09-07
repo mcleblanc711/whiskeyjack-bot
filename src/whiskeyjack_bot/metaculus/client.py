@@ -223,7 +223,66 @@ class SingleAttemptPoster:
             )
 
     def get_question_by_post_id(self, post_id: int) -> object:
-        return self._client.get_question_by_post_id(post_id)
+        return self._client.get_question_by_post_id(
+            post_id, group_question_mode="unpack_subquestions"
+        )
+
+    def get_current_user_id(self) -> int:
+        return int(self._client.get_current_user_id())
+
+    def _json_request(self, method: str, path: str, **kwargs: Any) -> Any:
+        import httpx
+
+        # No write retries. httpx defaults to zero transport retries.
+        try:
+            with httpx.Client(timeout=self._client.timeout) as client:
+                response = client.request(
+                    method,
+                    f"{self._client.base_url}/{path}",
+                    **self._client._get_auth_headers(),
+                    **kwargs,
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception:
+            raise PosterContractError(
+                "Metaculus request failed; outcome may be uncertain"
+            ) from None
+
+    def create_private_comment(self, post_id: int, text: str) -> object:
+        return self._json_request(
+            "POST",
+            "comments/create/",
+            json={"on_post": post_id, "text": text, "is_private": True, "included_forecast": False},
+        )
+
+    def list_my_comments(self, post_id: int, account_id: int) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            data = self._json_request(
+                "GET",
+                "comments/",
+                params={
+                    "post": post_id,
+                    "is_private": "true",
+                    "use_root_comments_pagination": "true",
+                    "author": account_id,
+                    "limit": 100,
+                    "offset": offset,
+                },
+            )
+            page = data.get("results") if isinstance(data, dict) else data
+            if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+                raise PosterContractError("Metaculus comments are unreadable")
+            results.extend(page)
+            if isinstance(data, dict) and data.get("next") is None:
+                return results
+            if isinstance(data, list) and len(page) < 100:
+                return results
+            offset += 100
+            if offset >= 10000:
+                raise PosterContractError("Metaculus comment pagination exceeded its bound")
 
     @contextmanager
     def _single_attempt(self) -> Iterator[None]:

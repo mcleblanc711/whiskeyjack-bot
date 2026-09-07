@@ -251,6 +251,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--config", default="config.yaml", type=Path)
     replay.add_argument("--record-id", required=True, help="the forecast record to replay")
+    tournament = subparsers.add_parser("tournament", help="activated tournament operation")
+    commands = tournament.add_subparsers(dest="tournament_command", required=True)
+    for name in ("run-once", "enable", "disable", "status", "reconcile-restored"):
+        command = commands.add_parser(name)
+        command.add_argument("--config", type=Path, default=Path("config.yaml"))
+        if name == "run-once":
+            command.add_argument(
+                "--question-id",
+                type=int,
+                help="restrict discovery to one subquestion for rehearsal",
+            )
+        if name == "enable":
+            command.add_argument("--project-id", type=int, required=True)
+            command.add_argument("--starts", required=True, help="UTC ISO timestamp")
+            command.add_argument("--ends", required=True, help="UTC ISO timestamp")
+            command.add_argument("--budget-usd", type=float, default=20.0)
     return parser
 
 
@@ -695,7 +711,7 @@ def _run_submit(args: argparse.Namespace) -> int:
                 f"--attempt-id {receipt.attempt_id}` before submitting anything else "
                 "for this record"
             )
-        return EXIT_OK
+        return EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED
     finally:
         connection.close()
 
@@ -1241,12 +1257,76 @@ def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _run_tournament(args: argparse.Namespace) -> int:
+    import json
+    from datetime import datetime
+    from whiskeyjack_bot.config import load_config
+    from whiskeyjack_bot.ledger import initialize_ledger, open_verified_ledger
+    from whiskeyjack_bot.metaculus.client import build_poster
+    from whiskeyjack_bot.tournament import run_once, status
+    from whiskeyjack_bot.tournament_state import disable, enable
+
+    try:
+        config = load_config(args.config)
+        from whiskeyjack_bot.logging_setup import configure_logging
+
+        configure_logging(config)
+        initialize_ledger(config.storage.sqlite_path)
+        connection = open_verified_ledger(config.storage.sqlite_path)
+        try:
+            if args.tournament_command == "enable":
+                account = build_poster(config).get_current_user_id()
+                identifier = enable(
+                    connection,
+                    config,
+                    account_id=account,
+                    project_id=args.project_id,
+                    starts=datetime.fromisoformat(args.starts.replace("Z", "+00:00")),
+                    ends=datetime.fromisoformat(args.ends.replace("Z", "+00:00")),
+                    budget_usd=args.budget_usd,
+                )
+                print(
+                    f"Activated policy {identifier} for account {account}, project {args.project_id}"
+                )
+            elif args.tournament_command == "disable":
+                disable(connection)
+                print("Tournament activation disabled")
+            elif args.tournament_command == "reconcile-restored":
+                from whiskeyjack_bot.restore import reconcile_restored
+
+                print(
+                    json.dumps(
+                        reconcile_restored(connection, config, build_poster(config)), indent=2
+                    )
+                )
+            elif args.tournament_command == "status":
+                print(json.dumps(status(connection), indent=2))
+            else:
+                result = run_once(connection, config, question_id=args.question_id)
+                print(json.dumps(result, indent=2))
+                heartbeat = result.get("heartbeat") or {}
+                return 1 if result["unresolved"] or heartbeat.get("failures") else 0
+        finally:
+            connection.close()
+    except Exception as exc:
+        # SDK exceptions may carry tokens and response bodies. Safe, stable type only.
+        from whiskeyjack_bot.tournament_state import TournamentError
+
+        print(
+            f"Tournament refused: {str(exc) if isinstance(exc, TournamentError) else type(exc).__name__}"
+        )
+        return 1
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "tournament":
+        return _run_tournament(args)
     if args.command == "verify-env":
         return _run_verify_env(args.config)
     if args.command == "init-ledger":
