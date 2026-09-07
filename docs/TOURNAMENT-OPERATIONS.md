@@ -1,0 +1,127 @@
+# Tournament operator runbook
+
+Production activation requires owner authorization for the reviewed account, project
+**33122**, validity window, and **US$20** ceiling. Committing configuration, installing a
+service, or passing tests does not activate the bot. Use testing project **32977** for
+rehearsals, with separate SQLite and artifact paths.
+
+## Deployment
+
+The supplied files target `/home/cleblanc/projects/whiskeyjack-bot`. First check out the
+reviewed release, run `uv sync --locked`, and review `config/tournament.yaml`. Keep the host
+online and user-service lingering enabled. Put credentials in the host's `.env` with
+mode 0600 using ordinary `NAME=value` entries, without shell commands. The service uses
+systemd `EnvironmentFile`; it disables implicit dotenv and remote model-price initialization.
+
+```bash
+systemd-analyze verify deploy/systemd/whiskeyjack-tournament.service deploy/systemd/whiskeyjack-tournament.timer
+install -D -m 644 deploy/systemd/whiskeyjack-tournament.service ~/.config/systemd/user/whiskeyjack-tournament.service
+install -D -m 644 deploy/systemd/whiskeyjack-tournament.timer ~/.config/systemd/user/whiskeyjack-tournament.timer
+systemctl --user daemon-reload
+```
+
+After explicit owner authorization, load credentials into the operator shell and run the
+README's `tournament enable` command with actual UTC timestamps. Activation checks the live
+account ID and hashes the complete effective configuration and prompt. Changing either
+requires a new reviewed activation. Disabling and re-enabling does not reset spending.
+Then start the timer:
+
+```bash
+systemctl --user enable --now whiskeyjack-tournament.timer
+systemctl --user list-timers whiskeyjack-tournament.timer
+journalctl --user -u whiskeyjack-tournament.service -n 100
+.venv/bin/whiskeyjack-bot tournament status --config config/tournament.yaml
+```
+
+The timer polls every five minutes; a file lock prevents overlapping workers. The service
+has a 40-minute total bound, each question's paid phase has an eight-minute bound, and
+HTTP requests have configured timeouts. A timer tick while the oneshot service is active
+does not start a second worker. Processing is sequential and sorted by deadline. No new
+forecast starts within five minutes of closing. Questions released during an ongoing poll
+are discovered on a later poll.
+
+## Rehearsal
+
+Copy the production profile to a testing profile. Set `environment: test`, project 32977,
+separate storage paths, the actual prompt path, and `run_limits.max_questions: 1`. Enable
+that profile for a short validity window. Pick one live supported subquestion with no
+existing account forecast, then run the same command twice:
+
+```bash
+.venv/bin/whiskeyjack-bot tournament run-once --config /absolute/path/testing.yaml --question-id QUESTION_ID
+```
+
+The first run must report one confirmed forecast, one completed comment, and zero unresolved
+operations/failures. The second must leave the forecast/comment totals unchanged and make
+no new paid call. Retain the ledger and artifacts as evidence. Disable testing activation
+afterward. A failure or incomplete comment is a failed rehearsal, even if the forecast is
+visible on the website.
+
+## Stop and inspect
+
+```bash
+systemctl --user stop whiskeyjack-tournament.timer
+.venv/bin/whiskeyjack-bot tournament disable --config config/tournament.yaml
+systemctl --user stop whiskeyjack-tournament.service
+```
+
+Stopping a running service may interrupt an external request. Its durable intent remains
+unresolved until refetch establishes the result. Never delete an intent, reservation, or
+receipt to make the next run succeed.
+
+Status reports the last heartbeat, discovered/processed/skipped counts, failures, forecast
+confirmation, comment completion, unresolved operations, and actual/reserved/remaining
+budget. The heartbeat's `complete` describes the poll finishing; zero failures and zero
+unresolved operations are also required for success. Counts include retained operations in
+that ledger; use a separate ledger per operating profile for clear reporting.
+
+Budget exhaustion refuses the next purchase before calling a provider. Unknown charges
+continue to consume the conservative reservation after restart. Inspect `cost_reserved`,
+`cost_settled`, `retrieval_started`, and `model_started` events in `tournament_events` using
+a read-only SQLite connection. Do not raise the US$20 ceiling or erase charges to continue.
+Provider prices above the configured ceiling or unavailable routes cause refusal.
+
+## Uncertain forecast or comment
+
+Rerun `tournament run-once` with the same activation/profile. Recovery first refetches
+pending forecast intents, including questions that have closed or left discovery. It
+compares the bot's saved payload with its live history and records confirmation. It never
+repeats an uncertain forecast POST. A confirmed forecast with no comment intent proceeds
+only to comment creation. An uncertain comment is reconciled using the account, post,
+privacy flag, and unique record marker; a known returned ID must also agree.
+
+If the platform still shows nothing, the operation remains unresolved. Wait and refetch;
+a negative immediate response is not proof that the original request failed. There is no
+automatic override for an uncertain write. Inspect Metaculus and retained evidence before
+any separately reviewed repair. Group comments explicitly identify their subquestion.
+Storage failures stop the worker; ordinary question/provider failures are isolated.
+
+## Consistent backup and restore
+
+Stop the timer and service before taking a backup. Use SQLite's backup API (or the sqlite3
+`.backup` command), then copy the entire artifact tree while the worker remains stopped.
+Retain the database and artifacts together, plus the exact configuration and prompt. A plain
+copy of a live WAL database file is not a consistent backup. Protect backups as account data.
+
+**Keep the current `.posting-guard` directory beside the live database outside the rollback.**
+It holds synchronized witnesses for purchases and external write intents. Back it up
+separately for host disaster recovery, retaining the newest copy. Restoring both the ledger
+and this guard to an older time destroys the evidence needed to detect rollback; do not
+resume posting in that state.
+
+To restore: stop service/timer, preserve the current guard, restore the matched database
+and artifact backup to the configured paths, then run:
+
+```bash
+.venv/bin/whiskeyjack-bot tournament reconcile-restored --config config/tournament.yaml
+.venv/bin/whiskeyjack-bot tournament status --config config/tournament.yaml
+```
+
+Reconciliation reads Metaculus before importing missing durable witnesses and conservatively
+restoring held spending. A lost submission intent holds the whole question, including when
+its forecast is absent from the current refetch. It does not recreate a missing forecast
+record or discard a question hold. Restore missing artifacts from retained copies; offline
+replay must match before any new submission. Investigate all holds and unresolved operations
+before enabling the timer. If the latest guard is unavailable, keep posting disabled until
+account history and retained records have been reconciled through a separately reviewed
+recovery.
