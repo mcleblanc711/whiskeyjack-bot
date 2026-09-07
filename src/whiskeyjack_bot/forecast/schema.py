@@ -330,6 +330,12 @@ _RESPONSE_MODELS: dict[str, type[ForecastResponse]] = {
     "binary": BinaryForecastResponse,
     "multiple_choice": MultipleChoiceForecastResponse,
     "numeric": NumericForecastResponse,
+    # The same response model as numeric, deliberately (M1-205). A discrete question asks
+    # the forecaster for the same nine percentile levels over the same range -- the prompt
+    # does not distinguish the two and was not changed to. The difference appears only when
+    # those percentiles are converted, where the array's length and per-step cap come from
+    # the question rather than from the numeric configuration.
+    "discrete": NumericForecastResponse,
 }
 
 # Derived from config's single source of truth (D20) rather than restated -- the

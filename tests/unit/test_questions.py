@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from whiskeyjack_bot.logging_setup import JsonFormatter
 from whiskeyjack_bot.questions.events import DeferralEvent, NormalizationResult
 from whiskeyjack_bot.questions.model import (
+    CanonicalDiscreteQuestion,
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
@@ -74,11 +75,17 @@ def test_fixtures_normalize_to_expected_canonical_types() -> None:
         CanonicalBinaryQuestion,
         CanonicalMultipleChoiceQuestion,
         CanonicalNumericQuestion,
+        CanonicalDiscreteQuestion,
     }
-    assert {q.qtype for q in canonical} == {"binary", "multiple_choice", "numeric"}
+    assert {q.qtype for q in canonical} == {
+        "binary",
+        "multiple_choice",
+        "numeric",
+        "discrete",
+    }
 
 
-@pytest.mark.parametrize("name", ["binary", "multiple_choice", "numeric"])
+@pytest.mark.parametrize("name", ["binary", "multiple_choice", "numeric", "discrete"])
 def test_normalization_retains_resolution_fine_print(name: str) -> None:
     """The headline M1-201 acceptance criterion."""
     source = raw_post(name)["question"]
@@ -181,28 +188,36 @@ def test_date_question_is_rejected() -> None:
         normalize_question(_synthetic_date_question())
 
 
-def test_discrete_question_is_rejected_despite_subclassing_numeric() -> None:
-    """Regression guard for the SDK's inheritance trap.
+def test_discrete_normalizes_to_its_own_sibling_type_despite_subclassing_numeric() -> None:
+    """Regression guard for the SDK's inheritance trap, after M1-205 made discrete supported.
 
     ``DiscreteQuestion`` subclasses ``NumericQuestion``, so dispatching on
-    ``isinstance(q, NumericQuestion)`` would silently normalize an unsupported
-    type as numeric. Dispatch keys on the ``question_type`` tag instead.
+    ``isinstance(q, NumericQuestion)`` would normalize a discrete question as numeric.
+    Until M1-205 that produced a refusal; now that discrete is supported it would produce a
+    **wrong forecast** -- converted against the numeric 201-point rule and the numeric step
+    cap -- so the guard matters more than it did, not less. Dispatch keys on the
+    ``question_type`` tag instead.
+
+    The negative assertion is the load-bearing one: the canonical models are siblings, so
+    every ``isinstance(question, CanonicalNumericQuestion)`` guard in ``forecast/`` refuses
+    a discrete question until it is widened on purpose.
     """
-    question = DiscreteQuestion(
-        question_text="[SYNTHETIC] How many?",
-        lower_bound=0.0,
-        upper_bound=10.0,
-        open_lower_bound=False,
-        open_upper_bound=False,
-    )
+    question = DataOrganizer.get_question_from_post_json(raw_post("discrete"))
+    assert isinstance(question, DiscreteQuestion)
     assert isinstance(question, NumericQuestion)  # the trap is real
-    with pytest.raises(UnsupportedQuestionTypeError, match="discrete"):
-        normalize_question(question)
+
+    canonical = normalize_question(question)
+
+    assert type(canonical) is CanonicalDiscreteQuestion
+    assert not isinstance(canonical, CanonicalNumericQuestion)
+    assert canonical.qtype == "discrete"
+    # 16 outcomes on the wire become a 17-point CDF; the SDK computes it, we carry it.
+    assert canonical.cdf_size == 17
 
 
 @pytest.mark.parametrize(
     "tag",
-    ["conditional", "date", "discrete", "", None, 7, [], {}, ["binary"], {"binary": 1}],
+    ["conditional", "date", "", None, 7, [], {}, ["binary"], {"binary": 1}],
 )
 def test_unsupported_tags_are_refused_without_reading_any_field(tag: object) -> None:
     """A bare tag is enough to refuse: no field access, so no model call.
@@ -505,7 +520,7 @@ def test_a_deferred_type_does_not_abort_the_batch() -> None:
     """
     result = normalize_questions([*load_fixture_questions(), _synthetic_date_question()])
 
-    assert len(result.questions) == 3
+    assert len(result.questions) == 4
     assert len(result.deferrals) == 1
     assert result.deferrals[0].question_type == "date"
     assert result.deferrals[0].reason == "deferred_v1_type"
@@ -909,7 +924,6 @@ def test_deferral_event_enforces_no_echo_on_direct_construction() -> None:
         # deferral -- regardless of the reason the constructor was handed.
         ("date", "deferred_v1_type", "date", "deferred_v1_type"),
         ("conditional", "deferred_v1_type", "conditional", "deferred_v1_type"),
-        ("discrete", "deferred_v1_type", "discrete", "deferred_v1_type"),
         # Mismatch #1: a known deferred type mislabeled 'unrecognized_type' is
         # corrected -- reason follows the type, not the caller.
         ("date", "unrecognized_type", "date", "deferred_v1_type"),

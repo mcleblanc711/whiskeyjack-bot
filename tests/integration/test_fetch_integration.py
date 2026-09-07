@@ -27,6 +27,7 @@ from fake_platform import (
     MULTIPLE_CHOICE_QUESTION_ID,
     NUMERIC_QUESTION_ID,
     FakeTournament,
+    discrete_question,
     flat_questions,
     install_tournament,
     unpacked_group_questions,
@@ -35,6 +36,7 @@ from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuesti
 
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.metaculus.fetch import fetch_open_questions_live
+from whiskeyjack_bot.questions.model import CanonicalDiscreteQuestion, CanonicalNumericQuestion
 from whiskeyjack_bot.questions.normalize import normalize_questions
 
 V1_TYPES = {"binary", "multiple_choice", "numeric"}
@@ -164,22 +166,14 @@ def test_a_group_and_the_flat_questions_normalize_as_one_batch(
 def test_an_unsupported_type_is_deferred_without_costing_its_siblings(
     config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``M1-203``/D21 at the batch boundary, with the SDK inheritance trap in the batch.
+    """``M1-203``/D21 at the batch boundary.
 
-    ``DiscreteQuestion`` subclasses ``NumericQuestion``, so a normalizer dispatching on
-    ``isinstance`` would silently emit it as a fourth numeric forecast -- a wrong forecast
-    rather than an error. Driven here through a fetch alongside the three supported types,
-    because the failure that matters is one unsupported question either taking the batch
-    down or slipping into it.
+    Driven through a fetch alongside the supported types, because the failure that matters
+    is one unsupported question either taking the batch down or slipping into it. ``date``
+    is the deferred type here: ``discrete`` was one until M1-205 and now has its own
+    covering test below.
     """
     unsupported = [
-        DiscreteQuestion(
-            question_text="[SYNTHETIC] How many?",
-            lower_bound=0.0,
-            upper_bound=10.0,
-            open_lower_bound=False,
-            open_upper_bound=False,
-        ),
         DateQuestion(
             question_text="[SYNTHETIC] When?",
             lower_bound=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -188,7 +182,6 @@ def test_an_unsupported_type_is_deferred_without_costing_its_siblings(
             open_upper_bound=False,
         ),
     ]
-    assert isinstance(unsupported[0], NumericQuestion), "the inheritance trap is real"
     install_tournament(monkeypatch, FakeTournament(flat_questions() + unsupported))
 
     _, fetched = fetch_open_questions_live(config)
@@ -196,5 +189,39 @@ def test_an_unsupported_type_is_deferred_without_costing_its_siblings(
 
     assert {q.qtype for q in result.questions} == V1_TYPES
     assert len(result.questions) == 3
-    assert {d.question_type for d in result.deferrals} == {"discrete", "date"}
+    assert {d.question_type for d in result.deferrals} == {"date"}
     assert {d.reason for d in result.deferrals} == {"deferred_v1_type"}
+
+
+def test_a_discrete_question_normalizes_as_discrete_and_never_as_numeric(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SDK inheritance trap, now guarded by the canonical type rather than by deferral.
+
+    ``DiscreteQuestion`` subclasses ``NumericQuestion``, so a normalizer dispatching on
+    ``isinstance`` would emit a discrete question as a numeric one -- and since M1-205 made
+    discrete *supported*, that would no longer be a refused forecast but a **wrong** one,
+    converted against the numeric 201-point rule and the numeric step cap.
+
+    The assertion that matters is the negative one: the canonical model must not be, and
+    must not inherit from, ``CanonicalNumericQuestion``. That is what makes every
+    ``isinstance(question, CanonicalNumericQuestion)`` guard in ``forecast/`` refuse a
+    discrete question until it is widened on purpose.
+    """
+    discrete = discrete_question()
+    assert isinstance(discrete, DiscreteQuestion), "the fixture must parse as discrete"
+    assert isinstance(discrete, NumericQuestion), "the inheritance trap is real"
+    install_tournament(monkeypatch, FakeTournament(flat_questions() + [discrete]))
+
+    _, fetched = fetch_open_questions_live(config)
+    result = normalize_questions(fetched)
+
+    assert not result.deferrals
+    assert {q.qtype for q in result.questions} == V1_TYPES | {"discrete"}
+    canonical = [q for q in result.questions if q.qtype == "discrete"]
+    assert len(canonical) == 1
+    assert type(canonical[0]) is CanonicalDiscreteQuestion
+    assert not isinstance(canonical[0], CanonicalNumericQuestion), (
+        "the canonical models must be siblings: a subclass would make every "
+        "isinstance guard in forecast/ accept discrete silently"
+    )

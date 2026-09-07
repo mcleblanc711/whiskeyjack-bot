@@ -102,7 +102,11 @@ from whiskeyjack_bot.forecast.schema import (
     ForecastSchemaError,
     NumericForecastResponse,
 )
-from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
+from whiskeyjack_bot.questions.model import (
+    BoundedQuestion,
+    CanonicalDiscreteQuestion,
+    CanonicalNumericQuestion,
+)
 
 # The nine levels ``prompts/forecaster.md`` prints under "## Numeric schema", in its
 # order. Transcribed rather than parsed at import: the prompt is a hashed artifact and
@@ -224,9 +228,7 @@ def _ordering_problem(forecast: NumericForecastResponse) -> str | None:
     return f"{_PERCENTILES_LOC}: values must be non-decreasing (offending input withheld)"
 
 
-def _bound_problems(
-    forecast: NumericForecastResponse, question: CanonicalNumericQuestion
-) -> list[str]:
+def _bound_problems(forecast: NumericForecastResponse, question: BoundedQuestion) -> list[str]:
     """Closed bounds and the zero point; an open bound constrains nothing here.
 
     Both bound comparisons are inclusive, which is the SDK's own reading of a closed bound:
@@ -247,7 +249,7 @@ def _bound_problems(
     return problems
 
 
-def _require_question(question: CanonicalNumericQuestion) -> None:
+def _require_question(question: BoundedQuestion) -> None:
     """Refuse a question no percentile set could satisfy, before it becomes a repair turn.
 
     ``binary._require_config``'s precedent, for its reason: a value object carries no memory
@@ -270,8 +272,17 @@ def _require_question(question: CanonicalNumericQuestion) -> None:
     The raise stays a raise: it is not a problem the model can repair, and turning it into
     one would ask a model to fix a question.
     """
-    if not isinstance(question, CanonicalNumericQuestion):
-        raise NumericOutputError(["question: must be a canonical numeric question"])
+    if not isinstance(question, (CanonicalNumericQuestion, CanonicalDiscreteQuestion)):
+        # Widened deliberately by M1-205, and this is the guard the sibling decision was
+        # made for. Every check in this module is about percentile *levels, ordering and
+        # bounds* -- facts about a distribution over a range, identical for both types.
+        # What differs between them is resolution and the step cap, and neither is decided
+        # here: both live in ``forecast/cdf.py``. So discrete reuses this checker whole.
+        #
+        # Had ``CanonicalDiscreteQuestion`` subclassed ``CanonicalNumericQuestion``, this
+        # line would have accepted discrete silently, months before anyone decided it
+        # should -- which is the failure mode the two models are siblings to prevent.
+        raise NumericOutputError(["question: must be a canonical numeric or discrete question"])
     if question.zero_point is not None and question.lower_bound <= question.zero_point:
         # Neither number is rendered -- not here and not anywhere else in this module.
         # Round 1 found that the bound diagnostics disclosed question-field values and
@@ -286,7 +297,7 @@ def _require_question(question: CanonicalNumericQuestion) -> None:
 def numeric_output_problems(
     forecast: NumericForecastResponse,
     forecast_config: ForecastConfig,
-    question: CanonicalNumericQuestion,
+    question: BoundedQuestion,
 ) -> list[str]:
     """Every declared-level, ordering and bound problem with one numeric response.
 
@@ -334,7 +345,7 @@ def numeric_output_problems(
 def validate_numeric_output(
     forecast: NumericForecastResponse,
     forecast_config: ForecastConfig,
-    question: CanonicalNumericQuestion,
+    question: BoundedQuestion,
 ) -> NumericForecastResponse:
     """Return the response unchanged, or raise with the sanitized problems.
 

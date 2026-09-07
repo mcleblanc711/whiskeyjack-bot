@@ -526,6 +526,13 @@ def plan_from_canonical_payload(canonical: str, *, expected_cdf_points: int) -> 
 _WIRE_KEY_FOR_TYPE: dict[str, str] = {
     "binary": "probability_yes",
     "numeric": "continuous_cdf",
+    # Metaculus takes a discrete forecast on the same wire key as a numeric one: a discrete
+    # question *is* a CDF question whose grid is the outcome set, which is why the SDK
+    # models it as a ``NumericQuestion`` subclass and computes ``cdf_size`` as
+    # ``inbound_outcome_count + 1``. What differs is the array's length, and that arrives
+    # here as ``expected_cdf_points`` from the question rather than from configuration
+    # (M1-205).
+    "discrete": "continuous_cdf",
     "multiple_choice": "probability_yes_per_category",
 }
 

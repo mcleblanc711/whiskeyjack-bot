@@ -58,7 +58,11 @@ MAX_CONVERSION_TIMEOUT_SECONDS = 60.0
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Question types the v1 pipeline supports; date/conditional are deferred (D20/D21).
-SupportedQuestionType = Literal["binary", "multiple_choice", "numeric"]
+# ``discrete`` was deferred with them until M1-205 and is now supported: D21's reversal
+# trigger names MiniBench, where discrete is 11 of 42 questions, while date and
+# conditional have not appeared at all. Dispatch on this literal, never on isinstance --
+# the SDK's ``DiscreteQuestion`` subclasses ``NumericQuestion``.
+SupportedQuestionType = Literal["binary", "multiple_choice", "numeric", "discrete"]
 
 # Verified against forecasting-tools==0.2.92 metaculus_client.GroupQuestionMode.
 GroupQuestionMode = Literal["exclude", "unpack_subquestions"]
@@ -308,8 +312,34 @@ class NumericCalibrationConfig(_StrictModel):
     # 201 is the verified Metaculus CDF length on forecasting-tools==0.2.92;
     # any other value would produce unsubmittable arrays, so it is a hard
     # error (stricter reading), not a tunable.
+    #
+    # M1-205 narrowed what this governs: it is the *numeric* length rule, not the
+    # pipeline's. A discrete question's length rule is its own declared ``cdf_size``
+    # (``inbound_outcome_count + 1``), which the conversion and the submission plan now
+    # read from the question. That is strictly tighter than what stood before, because a
+    # numeric question declaring some other resolution used to be measured against this
+    # constant and is now measured against what it actually declared.
     expected_cdf_points: Literal[201]
     max_adjacent_pmf: float = Field(0.2, gt=0, le=1)
+    # The same cap for a discrete question, and it must be a different number (M1-205).
+    #
+    # ``max_adjacent_pmf`` bounds the probability between two *adjacent CDF points*. On a
+    # 201-point numeric array those points are 0.5% of the range apart, so 0.2 in one
+    # step is an enormous, almost certainly malformed spike. On a discrete question the
+    # adjacent points are the outcomes themselves: for MiniBench post 45559 ("how many
+    # countries will abstain", 16 outcomes) a step *is* the probability of one integer.
+    # Measured against the pinned SDK on that question, a moderate forecast peaks at
+    # 0.137, a confident one at 0.446 and a tight one at 0.886. Only the first clears
+    # 0.2, so the numeric cap would refuse most confident discrete forecasts -- each
+    # refusal costing a repair turn, i.e. a second billed model call, before failing
+    # anyway.
+    #
+    # Defaulted permissively because Metaculus imposes no per-outcome cap on a discrete
+    # question: the grid *is* the question's declared resolution, and concentrating mass
+    # on one outcome is a forecast, not a malformed array. It is deliberately not 1.0 --
+    # a single point holding the entire distribution is still worth a repair turn, and
+    # `gt=0, le=1` keeps the field's own envelope identical to the numeric one.
+    discrete_max_adjacent_pmf: float = Field(0.9, gt=0, le=1)
     strict_validation: bool = True
     calibration_profile: Literal["identity"]
     # M1-514: the wall-clock bound on one numeric CDF conversion. Lives on this block
