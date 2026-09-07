@@ -40,8 +40,20 @@ to the registry, and neither is a habit you can form by reflex.
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| LAUNCH | release/launch-readiness | /tmp/whiskeyjack-launch | no | 012 | 2026-09-06 |
-| T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
+| M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | none | 2026-09-07 |
+*(Swept `LAUNCH` (`release/launch-readiness`, merged PR #75, 2026-09-07 — it shipped the
+operator runbook and the activated tournament runner, and spent migration `012`) and `T-902`
+(merged PR #74, round-1 approve, 0 findings; its branch is already gone from `origin`). The
+board is otherwise clear: four parked branches remain, all 0 behind master and none
+tournament-relevant.*
+
+**This item lands mid-round, while the tournament is live, and that is deliberate.** `discrete`
+is 11 of MiniBench's 42 questions and every one is currently deferred under D21. It changes no
+file that is hashed into the activation — not `config/tournament.yaml`, not
+`prompts/forecaster-tournament.md` — so the running worker does not refuse and does not need
+re-enabling. Say so in the review request: a stateless reviewer reads a live-system change as a
+bigger claim than it is.*
+
 *(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
 2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) at this branch's master merge. The
 master-side note anticipated this exact resolution: it deliberately left `T-905`, `M1-504`,
