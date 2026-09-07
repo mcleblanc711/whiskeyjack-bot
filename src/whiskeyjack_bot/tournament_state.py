@@ -213,6 +213,16 @@ def spending(conn: sqlite3.Connection, scope: str) -> tuple[int, int]:
     return actual, held
 
 
+@contextmanager
+def storage_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """Keep transaction failures fatal through provider exception handling."""
+    try:
+        with transaction(conn):
+            yield
+    except (sqlite3.Error, LifecycleError):
+        raise StorageFailure("cannot commit spending transaction; worker stopped") from None
+
+
 @dataclass
 class Budget:
     conn: sqlite3.Connection
@@ -227,7 +237,7 @@ class Budget:
         amount = math.ceil(estimate * 1_000_000)
         identifier = uuid4().hex
         # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
-        with transaction(self.conn):
+        with storage_transaction(self.conn):
             actual, held = spending(self.conn, self.scope)
             if actual + held + amount > self.ceiling:
                 raise TournamentError("round budget exhausted; no provider call made")
@@ -258,7 +268,7 @@ class Budget:
             return
         if events(self.conn, "cost_settled_id", identifier):
             raise StorageFailure("cost reservation already settled")
-        with transaction(self.conn):
+        with storage_transaction(self.conn):
             append(
                 self.conn,
                 "cost_settled",

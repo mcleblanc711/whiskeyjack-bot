@@ -672,3 +672,13 @@ def test_archived_resolution_url_names_the_original_publisher(case: Any) -> None
         }
     )
     assert source_domains(q) == ("www.forbes.com",)
+
+
+def test_budget_transaction_failure_is_fatal_before_provider_invocation(case: Any) -> None:
+    conn, config, *_ = case
+    closed = connect(config.storage.sqlite_path)
+    closed.close()
+    with pytest.raises(StorageFailure, match="spending transaction"):
+        Budget(closed, config.storage.artifact_root, "42:32977", 1_000_000).reserve(
+            "provider", 0.1, {}
+        )
