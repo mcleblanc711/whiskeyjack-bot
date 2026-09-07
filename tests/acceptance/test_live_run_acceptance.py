@@ -160,7 +160,13 @@ class _Forecaster:
         request = json.loads(next(m for m in prompt if m["role"] == "user")["content"])
         question_id = int(request["question_id"])
         self.calls.append(question_id)
-        return self._replies.get(question_id, "not json")
+        text = self._replies.get(question_id, "not json")
+        try:
+            reply = json.loads(text)
+            reply["as_of_utc"] = request["as_of_utc"]
+            return json.dumps(reply)
+        except ValueError:
+            return text
 
 
 @pytest.fixture()

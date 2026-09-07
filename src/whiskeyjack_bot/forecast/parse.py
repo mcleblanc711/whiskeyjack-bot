@@ -72,7 +72,7 @@ class ModelSettings:
 
     provider: str
     name: str
-    temperature: float
+    temperature: float | None
     max_output_tokens: int
     timeout_seconds: float
     allowed_tries: int

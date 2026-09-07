@@ -137,7 +137,7 @@ class ModelConfig(_StrictModel):
     provider: str
     name: str
     api_key_env: str
-    temperature: float = Field(0.0, ge=0)
+    temperature: float | None = Field(0.0, ge=0)
     timeout_seconds: float = Field(120, gt=0)
     max_output_tokens: int = Field(6000, gt=0)
     # Total model invocations for one forecast: 1 means no repair, 2 means one

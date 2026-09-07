@@ -310,16 +310,32 @@ def retrieve_news(
         if provider_failed:
             break
         for strategy in _STRATEGIES:
-            calls_attempted += 1
+            from whiskeyjack_bot.research.durable import begin_call, complete_call
+
+            request: dict[str, Any] = {
+                "query": query,
+                "strategy": strategy,
+                "n_articles": retrieval.max_documents_per_query,
+                "return_type": "dicts",
+                "hours_back": hours_back,
+                "historical": strategy == _STRATEGY_HISTORICAL,
+            }
+            call_scope, cached = begin_call(
+                "asknews",
+                0.125 if strategy == _STRATEGY_HISTORICAL else 0.025,
+                request,
+                question_id,
+                now_utc.isoformat(),
+            )
             try:
-                response = client.news.search_news(
-                    query=query,
-                    n_articles=retrieval.max_documents_per_query,
-                    return_type="dicts",
-                    strategy=strategy,
-                    historical=strategy == _STRATEGY_HISTORICAL,
-                    hours_back=hours_back,
-                )
+                if cached is not None:
+                    from asknews_sdk.dto.news import SearchResponse
+
+                    response = SearchResponse.model_validate(cached)
+                else:
+                    calls_attempted += 1
+                    response = client.news.search_news(**request)
+
             except Exception:
                 # Stop, but do not raise: calls already made were billed, and
                 # their responses are the only record of that spend. The SDK
@@ -332,7 +348,9 @@ def retrieve_news(
             # suppression: pydantic's serializer warnings embed the offending
             # *value* in their text, and this dict is built from untrusted
             # provider data. Do not remove. (GPT review round 1, finding 1.)
-            raw_responses.append(response.model_dump(mode="json", warnings=False))
+            raw = response.model_dump(mode="json", warnings=False)
+            complete_call(call_scope, raw)
+            raw_responses.append(raw)
 
             for article in response.as_dicts or []:
                 try:
@@ -377,7 +395,7 @@ def retrieve_news(
             # rate is configured. Recording a converted number would put an
             # unearned figure in the ledger; the credit count survives in
             # raw_responses for M1-306, which owns cost capture.
-            "cost_usd": None,
+            "cost_usd": None if calls_attempted else 0.0,
         }
     )
 

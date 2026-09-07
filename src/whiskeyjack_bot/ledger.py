@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
-LEDGER_SCHEMA_VERSION = 11
+LEDGER_SCHEMA_VERSION = 12
 
 _MIGRATIONS_PACKAGE = "whiskeyjack_bot.migrations"
 _MIGRATION_NAME_RE = re.compile(r"^(\d+)_.*\.sql$")
@@ -91,7 +91,7 @@ def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
         conn.isolation_level = None
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         journal_mode_row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
-        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA foreign_keys = ON")
         foreign_keys_row = conn.execute("PRAGMA foreign_keys").fetchone()
         # The append-only guarantee depends on this one. `INSERT OR REPLACE` (and

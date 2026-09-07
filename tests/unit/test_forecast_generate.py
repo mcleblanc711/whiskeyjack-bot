@@ -99,6 +99,7 @@ def good_reply(**overrides: Any) -> str:
         **json.loads(_json_block("Shared fields")),
         **json.loads("{" + _json_block("Binary schema") + "}"),
         "question_id": 42,
+        "as_of_utc": NOW.isoformat(),
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -1180,6 +1181,7 @@ def numeric_reply(**overrides: Any) -> str:
         **json.loads(_json_block("Shared fields")),
         **json.loads("{" + _json_block("Numeric schema") + "}"),
         "question_id": 42,
+        "as_of_utc": NOW.isoformat(),
         # The prompt's own rule for a non-binary response.
         "model_prior": None,
     }

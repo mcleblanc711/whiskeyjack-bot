@@ -110,7 +110,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, cast, get_args
+from typing import Any, Literal, Protocol, cast, get_args
 
 from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.config import AppConfig, SupportedQuestionType
@@ -380,6 +380,8 @@ class MetaculusPoster(Protocol):
     entirely through guarded attribute access anyway -- everything it returns is untrusted
     provider data.
     """
+
+    def get_current_user_id(self) -> int: ...
 
     def post_binary_question_prediction(
         self, question_id: int, prediction_in_decimal: float
@@ -1311,6 +1313,14 @@ class LiveSubmissionOutcome:
     detail_code: FailureCode | None
 
 
+def select_subquestion(fetched: object, question_id: int) -> object:
+    candidates = fetched if isinstance(fetched, list) else [fetched]
+    matches = [q for q in candidates if _int_attribute(q, "id_of_question") == question_id]
+    if len(matches) != 1:
+        raise LiveSubmissionError("the exact subquestion could not be selected (wrong question)")
+    return matches[0]
+
+
 class MetaculusSubmissionGateway:
     """A gateway that posts to Metaculus exactly once and verifies by refetch.
 
@@ -1340,6 +1350,7 @@ class MetaculusSubmissionGateway:
         sleep: Callable[[float], None] | None = None,
         refetch_attempts: int = _REFETCH_ATTEMPTS,
         refetch_pause_seconds: float = _REFETCH_PAUSE_SECONDS,
+        before_post: Callable[[object, ForecastHistory], None] | None = None,
     ) -> None:
         if poster is None:
             raise LiveSubmissionError("poster is required")
@@ -1353,6 +1364,7 @@ class MetaculusSubmissionGateway:
             raise LiveSubmissionError("refetch_attempts must be a positive integer")
         if type(refetch_pause_seconds) not in (int, float) or refetch_pause_seconds < 0:
             raise LiveSubmissionError("refetch_pause_seconds must be a non-negative number")
+        self._before_post = before_post
         self._poster = poster
         self._expected_cdf_points = expected_cdf_points
         self._clock: Callable[[], datetime] = _utcnow if clock is None else clock
@@ -1416,7 +1428,7 @@ class MetaculusSubmissionGateway:
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         plan = plan_from_canonical_payload(canonical, expected_cdf_points=self._expected_cdf_points)
 
-        baseline_question = self._fetch_or_refuse(post_id)
+        baseline_question = select_subquestion(self._fetch_or_refuse(post_id), question_id)
         self._require_matching_identity(baseline_question, question_id=question_id, post_id=post_id)
         self._require_open(baseline_question)
         baseline = read_my_forecasts(baseline_question)
@@ -1426,6 +1438,12 @@ class MetaculusSubmissionGateway:
                 "could never be confirmed; nothing was posted"
             )
 
+        if baseline.entries:
+            raise LiveSubmissionError(
+                "the account already forecast on this question; nothing was posted"
+            )
+        if self._before_post is not None:
+            self._before_post(baseline_question, baseline)
         requested = _require_aware_utc(self._clock(), "clock()")
         error: BaseException | None = None
         try:
@@ -1522,19 +1540,17 @@ class MetaculusSubmissionGateway:
         platform side -- it saves the *idempotency key*, which is spent by the attempt row
         that failure would produce, and it turns an opaque 4xx into a refusal that says
         what is wrong. The state is read through guarded attribute access and an
-        unreadable one is **not** treated as closed: this refuses what it can positively
-        establish, and nothing else.
+        unreadable state also refuses before POST.
         """
         try:
             state = getattr(question, "state", None)
             rendered = None if state is None else getattr(state, "value", state)
         except Exception:
-            return
-        if type(rendered) is str and rendered != "open":
+            rendered = None
+        if rendered != "open":
             # `state` here is one of the SDK's own closed vocabulary, not free content.
             raise LiveSubmissionError(
-                f"the question is {rendered}, not open, so it accepts no forecasts; "
-                "nothing was posted"
+                "the question is not open or its state is unreadable; nothing was posted"
             )
 
     def observe(self, post_id: int, *, question_id: int) -> ForecastHistory | None:
@@ -1569,7 +1585,9 @@ class MetaculusSubmissionGateway:
                 except Exception:  # noqa: BLE001 - an injected sleep must not cost the row
                     pass
             try:
-                question = self._poster.get_question_by_post_id(post_id)
+                question = select_subquestion(
+                    self._poster.get_question_by_post_id(post_id), question_id
+                )
             except Exception as exc:  # noqa: BLE001 - classified, never re-raised
                 detail = _DETAIL_FOR_ERROR[classify_error(exc)]
                 continue
@@ -1722,6 +1740,12 @@ class LiveSubmissionRecord:
     artifact_error: str | None
 
 
+def prepare_live_policy(*args: Any, **kwargs: Any) -> Callable[[object, ForecastHistory], None]:
+    from whiskeyjack_bot.submission_policy import prepare_live_policy as prepare
+
+    return prepare(*args, **kwargs)
+
+
 def post_approved_forecast(
     conn: sqlite3.Connection,
     *,
@@ -1831,8 +1855,11 @@ def post_approved_forecast(
             f"{record.question_type}; nothing was posted"
         )
 
+    before_post = prepare_live_policy(conn, config, poster, record, payload, digest)
+
     gateway = MetaculusSubmissionGateway(
         poster=poster,
+        before_post=before_post,
         expected_cdf_points=config.numeric_calibration.expected_cdf_points,
         clock=clock,
         sleep=sleep,

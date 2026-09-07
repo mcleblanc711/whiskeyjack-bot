@@ -516,9 +516,9 @@ def test_an_unchanged_history_is_absent_even_though_a_forecast_exists(
     existing = [_entry(BASELINE_START, _binary_values(PROBABILITY))]
     poster = FakePoster(before=FakeQuestion(history=existing), after=FakeQuestion(history=existing))
     ledger, record_id = approved
-    recorded = _post(ledger, record_id, poster, live_config)
-    assert recorded.event.event_type == "submission_uncertain"
-    assert recorded.event.detail_code == "refetch_missing"
+    with pytest.raises(LiveSubmissionError, match="already forecast"):
+        _post(ledger, record_id, poster, live_config)
+    assert poster.posts == 0
 
 
 def test_a_new_entry_with_the_wrong_value_is_a_mismatch(
@@ -1957,3 +1957,12 @@ def test_the_open_transaction_refusal_precedes_every_other_gate(
             _post(ledger, record_id, FakePoster(), disabled)
     finally:
         ledger.execute("ROLLBACK")
+
+
+@pytest.fixture(autouse=True)
+def isolate_activation_policy_for_gateway_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These legacy tests exercise receipt/idempotency mechanics with minimal fake
+    # records. Full activation, artifacts and real SDK checks live in test_tournament.
+    monkeypatch.setattr(
+        "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
+    )

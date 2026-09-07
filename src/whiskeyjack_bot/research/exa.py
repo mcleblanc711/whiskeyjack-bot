@@ -153,7 +153,7 @@ _FALLBACK_REASONS: Final[tuple[FallbackReason, ...]] = get_args(FallbackReason)
 # authorize a fallback call on its own -- retrieve_web enforces that directly,
 # since nothing upstream of it does yet.
 _AUTHORIZING_REASONS: Final[frozenset[FallbackReason]] = frozenset(
-    {"primary_provider_failed", "official_source_required"}
+    {"primary_provider_failed", "primary_returned_no_documents", "official_source_required"}
 )
 
 _BASE_URL: Final = "https://api.exa.ai"
@@ -334,7 +334,7 @@ def decide_fallback(
     if primary_documents < 0:
         raise ExaFallbackError("primary_documents must not be negative")
 
-    should_run = primary_failed or official_source_required
+    should_run = primary_failed or primary_documents == 0 or official_source_required
     if not should_run:
         return FallbackDecision(should_run=False, reasons=())
 
@@ -592,9 +592,7 @@ def retrieve_web(
         )
     if not any(reason in _AUTHORIZING_REASONS for reason in reasons):
         raise ExaFallbackError(
-            "fallback_reasons must include primary_provider_failed or "
-            "official_source_required; primary_returned_no_documents cannot "
-            "authorize the fallback on its own"
+            "fallback_reasons must include an authorized empty, failed, or insufficient primary outcome"
         )
     # Normalized once, here, and used everywhere below: converting at the end
     # instead let an upper-bound datetime bill a call and then raise (round 5,
@@ -662,7 +660,11 @@ def retrieve_web(
         if domains:
             payload["includeDomains"] = domains
 
-        calls_attempted += 1
+        from whiskeyjack_bot.research.durable import begin_call, complete_call
+
+        call_scope, cached = begin_call("exa", 0.05, payload, question_id, now_utc.isoformat())
+        if cached is None:
+            calls_attempted += 1
         try:
             # follow_redirects is pinned at the call site, not left to the
             # client's default: httpx strips `Authorization` when a redirect
@@ -671,7 +673,13 @@ def retrieve_web(
             # the run still recorded provider="exa". The same silent switch
             # _require_exa_client refuses, arrived at from a third side
             # (cross-model review round 5, finding 1).
-            response = client.post(_SEARCH_PATH, json=payload, follow_redirects=False)
+            response = (
+                httpx.Response(
+                    200, json=cached, request=httpx.Request("POST", _BASE_URL + _SEARCH_PATH)
+                )
+                if cached is not None
+                else client.post(_SEARCH_PATH, json=payload, follow_redirects=False)
+            )
             if response.is_redirect:
                 # Refused on its own terms rather than left to raise_for_status.
                 # The pinned httpx does treat a 3xx as an error status, so this
@@ -698,7 +706,8 @@ def retrieve_web(
         raw_responses.append(body)
 
         call_cost = _call_cost_usd(body)
-        if call_cost is not None:
+        complete_call(call_scope, body, call_cost)
+        if cached is None and call_cost is not None:
             cost_total += call_cost
             calls_with_cost += 1
 
@@ -754,7 +763,7 @@ def retrieve_web(
     # yielded a usable cost. Anything less is a subtotal, and publishing a
     # subtotal as cost_usd would make an incomplete figure look complete
     # (cross-model review round 3, finding 3).
-    cost_reported = calls_attempted > 0 and calls_with_cost == calls_attempted
+    cost_reported = bool(raw_responses) and calls_with_cost == calls_attempted
     if cost_reported and not isfinite(cost_total):
         # Each call's own cost was finite (_call_cost_usd already checked
         # isfinite); only the sum overflowed. Drop it the same way an

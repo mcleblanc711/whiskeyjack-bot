@@ -4067,7 +4067,7 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # `submission_key_for_approved_record`'s "this approval predates the payload binding"
     # case rather than an approval that authorizes everything. So a v2 ledger reaching 11
     # is the same statement again.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 11
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 12
 
     conn = connect(db)
     try:
@@ -4665,7 +4665,7 @@ def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
     """
     db = tmp_path / "ledger.sqlite3"
     attempt_id = _seed_v8_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 11
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 12
 
     conn = connect(db)
     try:
@@ -4762,7 +4762,7 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # COALESCE, and 010 only creates tables, so neither probes the rows a v5 ledger holds.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 11
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 12
 
 
 @pytest.mark.parametrize(
@@ -4867,7 +4867,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 11
+    assert initialize_ledger(db) == 12
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"
