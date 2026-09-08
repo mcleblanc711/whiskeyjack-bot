@@ -26,6 +26,7 @@ from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot.submission_live import (
     MetaculusSubmissionGateway,
     classify_refetch,
+    expected_points_for_record,
     expected_option_labels,
     expected_values,
     plan_from_payload,
@@ -81,7 +82,16 @@ def reconcile_forecast(
     observed = gateway.observe(intent["post_id"], question_id=intent["question_id"])
     if observed is None:
         return False
-    plan = plan_from_payload(intent["payload"], expected_cdf_points=201)
+    # The record's question decides the length, not a literal 201 (M1-205 round 1). A
+    # discrete forecast reconciled against 201 refuses its own stored payload, so a posted
+    # forecast would never reach `forecast_confirmed` and would be retried as unresolved
+    # for as long as the intent stands.
+    plan = plan_from_payload(
+        intent["payload"],
+        expected_cdf_points=expected_points_for_record(
+            read_forecast_record(conn, record_id), config
+        ),
+    )
     result = classify_refetch(
         question_type=plan.question_type,
         expected=expected_values(plan),

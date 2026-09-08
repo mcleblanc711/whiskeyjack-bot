@@ -9,9 +9,11 @@ canonical schema.
 
 Type dispatch keys on the SDK's ``question_type`` literal rather than
 ``isinstance``: ``DiscreteQuestion`` subclasses ``NumericQuestion`` in the SDK,
-so an ``isinstance(q, NumericQuestion)`` test would silently swallow the
-unsupported ``discrete`` type. Only the three v1 types (D20) map; ``date``,
-``conditional``, ``discrete`` and anything else are deferred (D21).
+so an ``isinstance(q, NumericQuestion)`` test would map a discrete question onto
+the numeric canonical model and produce a wrong forecast rather than an error.
+That hazard is why M1-205 could add ``discrete`` support **without** relaxing this
+rule: the two types map to sibling canonical models and the literal still decides
+which. ``date``, ``conditional`` and anything else remain deferred (D21).
 
 Refusal is two-tier (M1-203). :func:`normalize_question` -- the single-question
 path, and the type-policy chokepoint -- *raises*
@@ -41,6 +43,7 @@ from whiskeyjack_bot.config import SupportedQuestionType
 from whiskeyjack_bot.questions.events import DeferralEvent, NormalizationResult
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
+    CanonicalDiscreteQuestion,
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestion,
@@ -68,7 +71,7 @@ class NormalizationError(Exception):
 
 
 class UnsupportedQuestionTypeError(NormalizationError):
-    """The question is a type deferred in v1 (date/conditional/discrete, D21).
+    """The question is a type deferred in v1 (date/conditional, D21).
 
     Raised before any model or submission call is made. The message names the
     ``question_type`` tag only when it is one of the SDK's own enum values
@@ -292,7 +295,12 @@ def _build_canonical(q: MetaculusQuestion, question_type: str) -> CanonicalQuest
                 options=q.options,
                 option_is_instance_of=q.option_is_instance_of,
             )
-        elif question_type == "numeric":
+        elif question_type in ("numeric", "discrete"):
+            # One field read for both: the SDK's ``DiscreteQuestion`` *is* a
+            # ``NumericQuestion`` and exposes exactly these attributes, populating
+            # ``cdf_size`` from its own ``inbound_outcome_count + 1``. Sharing the read
+            # is safe precisely because the *construction* below does not share -- the
+            # literal still selects which canonical sibling is built.
             fields.update(
                 lower_bound=q.lower_bound,
                 upper_bound=q.upper_bound,
@@ -321,6 +329,8 @@ def _build_canonical(q: MetaculusQuestion, question_type: str) -> CanonicalQuest
             return CanonicalMultipleChoiceQuestion(**fields)
         if question_type == "numeric":
             return CanonicalNumericQuestion(**fields)
+        if question_type == "discrete":
+            return CanonicalDiscreteQuestion(**fields)
     except ValidationError as exc:
         # from None: the ValidationError text echoes the offending input values.
         raise _sanitize(exc) from None

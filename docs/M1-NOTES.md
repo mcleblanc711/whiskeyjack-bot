@@ -8400,3 +8400,165 @@ reported as `provider_error`; `invocations` hard-coded to 1; the supported-type 
 every **pairing** is wrong — that last one is what shows
 `test_every_fetched_question_keeps_the_identity_the_platform_sent` discriminates on its own
 claim rather than on its neighbour's.
+
+## M1-205 — Discrete question support
+
+Shipped mid-round, with the tournament live. `discrete` was **11 of MiniBench's 42
+questions on 2026-09-07 — 26%** — and every one was deferred as unsupported.
+
+### Decision — reverse D21 for `discrete` only, and why
+
+D21 defers "date and conditional"; the code deferred `discrete` under the same banner
+without the decision row naming it. D21's own reversal trigger reads *"MiniBench/current
+successor requires them"*. MiniBench posted **zero** date and **zero** conditional
+questions that day, and eleven discrete. So the trigger fired for a type the row never
+mentioned. Date and conditional stay deferred — nothing has asked for them.
+
+### Decision — the canonical models are siblings, never one subclassing the other
+
+`_CanonicalBoundedQuestion` holds the shared fields; `CanonicalNumericQuestion` and
+`CanonicalDiscreteQuestion` both extend it and neither extends the other.
+
+The reason is `forecast/numeric.py`'s `isinstance(question, CanonicalNumericQuestion)`
+guard. Had discrete subclassed numeric, that line would have **silently accepted** a
+discrete question and converted it against the numeric 201-point rule and the numeric step
+cap — reproducing inside our own schema exactly the `DiscreteQuestion(NumericQuestion)`
+trap CLAUDE.md's gotcha list exists to warn about. Before this item that trap produced a
+refusal; now that discrete is *supported* it would produce a **wrong forecast**. As
+siblings, every such guard refuses discrete until widened one call site at a time, which is
+what made this diff auditable.
+
+`inbound_outcome_count` is deliberately not carried: it is `cdf_size - 1` exactly, and one
+fact reached two ways is the second source of truth M2-703's review removed.
+
+### Decision (revised at round 1) — the step cap is Metaculus's formula, not a number
+
+**The first version of this item invented a flat `discrete_max_adjacent_pmf: 0.9`, and that
+was wrong.** Round 1 supplied the platform's actual rule: the server validator caps an
+adjacent step at `0.2 * 200 / inbound_outcome_count`. Any flat number is wrong in *both*
+directions, and the second is the dangerous one:
+
+| outcomes | platform cap | flat 0.9 |
+|---|---|---|
+| 16 | 2.500 | far too strict |
+| 71 | 0.563 | **too permissive** |
+| 200 | 0.200 | **too permissive** |
+
+Too strict costs a repair turn. **Too permissive approves locally what the wire refuses** —
+after the forecast is billed, recorded and approved. The real testing-area question 45517
+has 71 outcomes, so this was not hypothetical.
+
+`_cdf_rules` now computes `max_adjacent_pmf * (expected_cdf_points - 1) / (cdf_size - 1)`,
+clamped at 1.0. Substituting a numeric question returns `max_adjacent_pmf` unchanged, so
+there is **one rule and no branch** — and the config field I added was deleted. The original
+reasoning below is kept because the measurement that motivated it still stands; only the
+remedy changed.
+
+### Superseded — the flat cap, and the measurement that motivated it
+
+`max_adjacent_pmf` bounds the probability between two **adjacent CDF points**. On a
+201-point numeric array those are 0.5% of the range apart, so `0.2` in one step is a
+malformed spike. On a discrete question the adjacent points **are the outcomes**: a step is
+the probability of one integer. Measured against the pinned SDK on live post 45559 (16
+outcomes):
+
+| reply | max adjacent step | under `0.2`? |
+|---|---|---|
+| moderate | 0.137 | passes |
+| confident | **0.446** | refused |
+| tight | **0.886** | refused |
+
+Concentrating mass on the modal outcome is what a confident discrete forecast *is*. Under
+the numeric cap each one costs a repair turn — a second billed model call — and then fails
+anyway. Defaulted permissively because Metaculus imposes no per-outcome cap: the grid is
+the question's own declared resolution. Not `1.0`, because a single point holding the whole
+distribution is still worth one repair turn.
+
+**This is the change that fails soft.** A wrong length is refused loudly by Metaculus; a
+wrong cap just degrades forecasts and says nothing. It is why the properties assert the
+*relationship between the two caps on one array* rather than either number.
+
+### Round 1 also found two dispatch omissions, both reproduced before fixing
+
+**The response model kept `Literal["numeric"]`.** Every discrete generation failed schema
+validation *after* being billed, and returning `"numeric"` instead failed the record's
+identity validator — the reply had nowhere to go either way. `NumericForecastResponse.
+question_type` is now `Literal["numeric", "discrete"]`.
+
+**Adding the wire-key row was not adding a dispatch arm.** A discrete CDF fell through
+`submission_live`'s plan builder to `_require_categories` and was refused as "must be a JSON
+object". Fixing it needed a `DiscretePost` member (not `NumericPost` with a different tag —
+`post_approved_forecast` compares the plan's type against the record's), plus the
+record-derived length threaded through `post_approved_forecast` and `tournament.py`'s
+reconciliation, both of which passed a literal 201.
+
+**And widening the union made `mypy --strict` find a third instance the review had not
+named:** the actual POST dispatched on `== "numeric"` with a bare fall-through, so a
+discrete plan would have been posted to `post_multiple_choice_question_prediction`. Both
+fall-throughs are now explicit branches ending in a `raise`, because a fall-through is how
+the next union member gets routed to the wrong endpoint silently.
+
+**Why the property suite did not catch any of this:** it built responses tagged `"numeric"`
+and handed them straight to the conversion, so it never traversed schema dispatch,
+generation, or submission planning. The properties were sound about the function they
+covered and the coverage was drawn too narrowly — the same shape as a vacuous property,
+one layer up.
+
+### Deviation — `expected_cdf_points` narrowed rather than relaxed
+
+`Literal[201]` stayed. It stopped being the pipeline's length rule and became the *numeric*
+one; the array length now comes from the question's own `cdf_size` via
+`expected_cdf_points_for`, which the conversion and the submission preflight both read so
+they cannot disagree. This is **stricter** than before: a numeric question declaring some
+other resolution used to be measured against the constant and is now measured against what
+it actually declared.
+
+### Rejected — a separate discrete checker in `_TYPE_CHECKERS`
+
+`"discrete"` maps to `numeric_output_problems` itself, not a copy. Everything that function
+asserts — the nine exact levels, non-decreasing values, closed-bound and zero-point
+compatibility — is a fact about a distribution over a range and is identical for both
+types. A near-duplicate would be two places to fix the next percentile rule.
+
+### Rejected — changing the prompt
+
+The prompt asks for **nine percentiles** and never for a CDF; its two mentions of "201" are
+explanatory prose. It is byte-identical, which is what kept `prompts/forecaster-tournament.md`
+out of the activation hash. Those two prose lines are now slightly inaccurate for a discrete
+question — recorded here rather than fixed, because fixing them would force a re-enable for
+no behavioural gain.
+
+### Deferred (do not read the absence as an omission)
+
+- **`M1-206` — the discrete CDF golden.** The properties cover length, monotonicity,
+  endpoints and the cap for arbitrary `cdf_size`. What no golden covers is *package drift*
+  in the SDK's discrete-specific `inbound_outcome_count + 1` derivation, which the numeric
+  golden cannot see. Filed, not forgotten; deferred to reach the live round.
+- **The prose "201" in the prompt**, above.
+- **Deferral events still are not ledger rows.** A skipped question exists only in
+  `tournament.jsonl`. That is M1-203's settled design, unchanged here, but it means the
+  attribution instrument has no immutable record of what it declined to forecast.
+
+### Standing risk — this required a config change, and therefore a re-activation
+
+`forecast.supported_question_types` gates generation (`forecast/generate.py:351`), so
+`config/tournament.yaml` gained `- discrete`. **That file is hashed into the activation**,
+so after deploy the worker refuses with `refusal_reason: "activation account, destination,
+configuration, or prompt changed"` until `tournament enable` is re-run.
+
+Two things make that safe rather than alarming, both verified rather than assumed:
+spending is scoped by `account_id:project_id` (`tournament.py:227`), **not** by
+`activation_id`, so re-enabling preserves the accumulated spend and the remaining budget;
+and merging changes nothing on the live host until someone pulls. The deploy is therefore a
+deliberate operator step, in this order: pull, re-enable, confirm `status` reads
+`enabled: true` with a null `refusal_reason`.
+
+### Standing risk — not verifiable offline
+
+No discrete forecast has been posted to Metaculus by this code. The conversion is verified
+against the pinned SDK offline and against the live *question payloads*, but the wire
+acceptance of a 17-point `continuous_cdf` is asserted from the SDK's own post method and
+the shape of a discrete question, not from a `201 Created`. The bot-testing-area questions
+**43321** (16 outcomes, both bounds closed — the endpoint rule the live question cannot
+exercise) and **45517** (71 outcomes, both bounds open, non-integer grid) are the intended
+first posts.

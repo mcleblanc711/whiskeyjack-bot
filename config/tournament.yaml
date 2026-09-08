@@ -55,6 +55,7 @@ forecast:
   - binary
   - multiple_choice
   - numeric
+  - discrete
   min_probability: 0.001
   max_probability: 0.999
   community_prediction_policy: log_after_forecast_do_not_use_as_input
