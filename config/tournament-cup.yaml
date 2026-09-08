@@ -94,9 +94,14 @@ submission:
   post_private_reasoning_comment: true
   block_retry_on_uncertain_result: true
 storage:
-  sqlite_path: /home/cleblanc/projects/whiskeyjack-bot/data/whiskeyjack_bot_cup.sqlite3
-  artifact_root: /home/cleblanc/projects/whiskeyjack-bot/data/artifacts_cup
-  export_root: /home/cleblanc/projects/whiskeyjack-bot/data/exports_cup
+  # Own subdirectory, not just a differently-named file in data/: the posting guard
+  # (tournament_state.py's check_storage) is scoped by the ledger's *parent directory*,
+  # not by filename, so sharing data/ with config/tournament.yaml's live MiniBench ledger
+  # would collide on its .posting-guard witnesses at activation (found rehearsing this
+  # profile, 2026-09-08 -- see docs/M1-NOTES.md).
+  sqlite_path: /home/cleblanc/projects/whiskeyjack-bot/data/cup/ledger.sqlite3
+  artifact_root: /home/cleblanc/projects/whiskeyjack-bot/data/cup/artifacts
+  export_root: /home/cleblanc/projects/whiskeyjack-bot/data/cup/exports
   sqlite_wal: true
   retain_raw_model_output: true
   retain_raw_research: true
