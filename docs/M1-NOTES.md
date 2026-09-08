@@ -8562,3 +8562,61 @@ the shape of a discrete question, not from a `201 Created`. The bot-testing-area
 **43321** (16 outcomes, both bounds closed — the endpoint rule the live question cannot
 exercise) and **45517** (71 outcomes, both bounds open, non-integer grid) are the intended
 first posts.
+
+## M1-323 — Stop trusting the model with the question-type tag
+
+Found live, not offline. MiniBench question **45754** (discrete) failed **8 consecutive
+five-minute cycles** between 03:55 and 04:31 UTC on 2026-09-08, each one billed, producing
+zero discrete `forecast_records`.
+
+### Decision — the tag is derived, not read, and why
+
+`question.qtype` is what selects the response model in the first place. A reply that *also*
+states its question type is therefore a second source of truth for one fact, and the only
+thing a disagreement between the two can mean is that the model got it wrong. So `_parse`
+stamps `payload["question_type"] = question.qtype` and the model's own value is discarded
+unread. This is the same shape as M2-703's finding — a value object the writer also took as
+a separate parameter — and the same resolution: remove the second source rather than
+cross-check the two.
+
+**Before schema validation, deliberately.** Stamping *after* would repair the pairing check
+just as well, which is exactly why it is the dangerous fix: the `Literal` on the selected
+model is what still refuses a question type that model does not serve, and it only gets to
+do that if the stamp lands in the payload first. Both placements are mutation-tested.
+
+### Deviation
+
+None from the spec. The behavioural change is that a reply's `question_type` is now ignored
+rather than validated, so a binary reply mislabelled `"numeric"` is accepted. That is the
+intended reading of "the tag is not the model's to author", and it is pinned by
+`test_the_models_tag_is_ignored_rather_than_cross_checked`.
+
+### Rejected — relaxing the pairing check, and why not
+
+The narrow fix is to let `validate.output_problems` treat `numeric` and `discrete` as
+compatible. Rejected: that is the `isinstance` trap CLAUDE.md warns about in different
+clothes — `DiscreteQuestion` subclasses `NumericQuestion` in the pinned SDK, and the whole
+reason dispatch is keyed on the literal is that conflating the two silently normalizes a
+discrete question as numeric, which is a wrong forecast rather than an error.
+
+Also rejected: teaching the prompt to emit `"discrete"`. It re-hashes the prompt for a fact
+the program already knows, and it leaves the failure one bad model reply away.
+
+### Deferred (do not read the absence as an omission)
+
+`schema.py:316`'s `Literal["numeric", "discrete"]` stays widened. With the stamp in place the
+model's value never reaches it, so narrowing it per question type is now dead weight rather
+than a safety property — but it is also the thing that would catch a future caller that
+stamps late, so it stays.
+
+The prompt still does not mention discrete. M1-205's judgement that a discrete question asks
+for the same nine percentiles is unchanged and untouched here.
+
+### Standing risk — not verifiable offline
+
+The 8 failures recorded `internal_error` and nothing else: `QuestionOutcome.problems` reaches
+neither the ledger nor the log, and every member of the caught exception tuple in
+`pipeline_live` collapses to that one detail code. This branch logs the sanitized reason at
+both failure sites, which makes the *next* incident diagnosable from the journal — but it is
+a log line, not a ledger row, so it is outside the attribution instrument. Giving a refused
+generation a durable identity is `M1-317`'s neighbouring problem and is not solved here.
