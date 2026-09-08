@@ -48,11 +48,18 @@ board is otherwise clear: four parked branches remain, all 0 behind master and n
 tournament-relevant.*
 
 **This item lands mid-round, while the tournament is live, and that is deliberate.** `discrete`
-is 11 of MiniBench's 42 questions and every one is currently deferred under D21. It changes no
-file that is hashed into the activation — not `config/tournament.yaml`, not
-`prompts/forecaster-tournament.md` — so the running worker does not refuse and does not need
-re-enabling. Say so in the review request: a stateless reviewer reads a live-system change as a
-bigger claim than it is.*
+is 11 of MiniBench's 42 questions and every one is currently deferred under D21.
+
+**Correction (round 1 caught this claim before it could mislead anyone):** an earlier version
+of this note said the item changes no activation-hashed file. That was wrong.
+`prompts/forecaster-tournament.md` is untouched, but **`config/tournament.yaml` is not** --
+`forecast.supported_question_types` gates generation at `forecast/generate.py:351`, so it
+gains `- discrete` and the worker **will** refuse until `tournament enable` is re-run.
+
+Deploy order: pull, re-enable, confirm `status` reads `enabled: true` with a null
+`refusal_reason`. Re-enabling does not reset spending — it is scoped by
+`account_id:project_id` (`tournament.py:227`), not by `activation_id`. Merging changes
+nothing on the live host until someone pulls.*
 
 *(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
 2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) at this branch's master merge. The
