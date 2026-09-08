@@ -39,10 +39,13 @@ Four rules this module applies, and why each is here rather than in the SDK:
   another resolution. For a **discrete** question (M1-205) the declared ``cdf_size`` --
   ``inbound_outcome_count + 1`` -- *is* the rule, bounded only by a sanity envelope.
   :func:`_cdf_rules` is the single place that decides which.
-- **Every adjacent step at or below the configured cap** -- ``max_adjacent_pmf`` for
-  numeric, ``discrete_max_adjacent_pmf`` for discrete, because on a discrete grid two
-  adjacent points are two outcomes and the numeric number refuses ordinary confident
-  forecasts (M1-205). This is the half of the
+- **Every adjacent step at or below the cap :func:`_cdf_rules` derives** --
+  ``max_adjacent_pmf`` scaled by how much coarser this question's grid is than the
+  201-point continuous one, which is Metaculus's own server-side rule and reduces to
+  ``max_adjacent_pmf`` exactly at 201 points (M1-205). A flat per-type number was tried and
+  removed: on a discrete grid two adjacent points are two outcomes, so any fixed value is
+  simultaneously too strict on a coarse grid and too permissive on a fine one. This is the
+  half of the
   acceptance criterion the package does **not** do for us, and it is worth being exact
   about why, because reading ``numeric_report.py`` casually suggests the opposite.
   ``_check_distribution_too_tall`` is the SDK's PMF cap; ``get_cdf`` re-validates its own
@@ -158,6 +161,18 @@ _LOGGER = logging.getLogger(__name__)
 # so a repair turn that named the CDF would name something the model was told not to
 # produce ("Do not return a 201-value CDF", ``prompts/forecaster.md``).
 _PERCENTILES_LOC = "final_prediction.percentiles"
+
+# Two points is the minimum a cumulative distribution can have, and the divisor
+# ``points - 1`` is why the floor is enforced rather than assumed. The ceiling is
+# ``expected_cdf_points``: a discrete grid finer than the continuous case it specialises is
+# not a question this pipeline has seen or can justify converting, and the scaling block it
+# arrives in is untrusted Metaculus payload where an unbounded value is an unbounded
+# allocation inside the SDK.
+_MIN_CDF_POINTS = 2
+_CDF_SIZE_OUTSIDE_ENVELOPE = (
+    "question: cdf_size must be between 2 and numeric_calibration.expected_cdf_points "
+    "(offending input withheld)"
+)
 
 # ``get_cdf`` falls back to this when ``cdf_size`` is unset. Not reachable through this
 # module -- ``_require_question`` pins a numeric ``cdf_size`` to ``expected_cdf_points``
@@ -432,6 +447,17 @@ def _cdf_rules(
     canonical models are siblings.
     """
     points = question.cdf_size if question.qtype == "discrete" else calibration.expected_cdf_points
+    # The envelope is enforced *here*, not only in ``_require_question`` (M1-205 round 2).
+    # It used to live solely in the preflight, which meant the public helpers below --
+    # ``expected_cdf_points_for`` and, through it, ``submission_live.
+    # expected_points_for_record`` -- divided by ``points - 1`` without ever running it. A
+    # Metaculus payload declaring ``inbound_outcome_count: 0`` normalizes to ``cdf_size``
+    # 1 and produced a raw ``ZeroDivisionError`` out of a public boundary, which is the
+    # "every malformed shape arrives as the module's own error type" rule broken by the
+    # remediation that introduced the division. Guarding the arithmetic rather than its
+    # callers is what makes that true for every entry point, including the next one.
+    if not _MIN_CDF_POINTS <= points <= calibration.expected_cdf_points:
+        raise NumericCdfError([_CDF_SIZE_OUTSIDE_ENVELOPE])
     # Metaculus's own rule, and it subsumes both types rather than special-casing one:
     # the server validator caps an adjacent step at ``0.2 * 200 / inbound_outcome_count``,
     # i.e. ``max_adjacent_pmf`` scaled by how much coarser this grid is than the 201-point
@@ -514,19 +540,11 @@ def _require_question(question: BoundedQuestion, calibration: NumericCalibration
         raise NumericCdfError([f"{_PERCENTILES_LOC}: {_CANNOT_BE_BOUNDED}"])
     if question.qtype == "discrete":
         # A discrete question declares its own resolution and that declaration *is* the
-        # rule, so there is nothing to compare it against -- only a sanity envelope. Two
-        # points is the minimum a CDF can have. The ceiling is ``expected_cdf_points``
-        # because a discrete grid finer than the continuous one it is a special case of is
-        # not a question this pipeline has seen or can justify converting; the scaling
-        # block it comes from is untrusted Metaculus payload, and an unbounded value here
-        # is an unbounded allocation inside the SDK.
-        if not 2 <= question.cdf_size <= calibration.expected_cdf_points:
-            raise NumericCdfError(
-                [
-                    "question: a discrete cdf_size must be between 2 and "
-                    "numeric_calibration.expected_cdf_points (offending input withheld)"
-                ]
-            )
+        # rule, so there is nothing to compare it against -- only a sanity envelope, which
+        # ``_cdf_rules`` applies for every caller. Calling it here rather than restating
+        # the bounds keeps one definition: round 2 found the two had already diverged, in
+        # the sense that only this path ran them at all.
+        _cdf_rules(question, calibration)
     elif question.cdf_size != calibration.expected_cdf_points:
         raise NumericCdfError(
             [

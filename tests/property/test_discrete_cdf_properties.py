@@ -372,6 +372,28 @@ def test_a_discrete_cdf_size_outside_the_envelope_is_refused_as_a_caller_mistake
     assert all(SECRET not in problem for problem in caught.value.problems)
 
 
+@pytest.mark.parametrize("cdf_size", [1, 0, -1, 202, 10_000])
+def test_the_public_length_helper_refuses_an_invalid_grid_rather_than_dividing(
+    cdf_size: int,
+) -> None:
+    """Round 2's blocking finding: the guard has to be on the arithmetic, not its callers.
+
+    The envelope originally lived only in ``_require_question``, so the public helpers --
+    ``expected_cdf_points_for`` and, through it,
+    ``submission_live.expected_points_for_record`` -- divided by ``cdf_size - 1`` without
+    ever running it. A Metaculus payload declaring ``inbound_outcome_count: 0`` normalizes
+    to ``cdf_size`` 1 and produced a raw ``ZeroDivisionError`` out of a public boundary.
+
+    `cdf_size=1` is the one that used to raise; the others are the rest of the envelope,
+    kept together so the entry point is covered for the whole rule and not just the
+    arithmetic edge.
+    """
+    question = _discrete_question(4, cdf_size=cdf_size)
+    with pytest.raises(NumericCdfError) as caught:
+        expected_cdf_points_for(question, _calibration())
+    assert all(SECRET not in problem for problem in caught.value.problems)
+
+
 def test_the_length_rule_differs_between_the_two_types_for_one_calibration() -> None:
     """``expected_cdf_points_for`` is the single source both the conversion and the
     submission preflight read, so this pins that they cannot disagree per type."""

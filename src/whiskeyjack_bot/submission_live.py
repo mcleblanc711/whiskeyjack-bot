@@ -417,9 +417,12 @@ class NumericPost:
 def expected_points_for_record(record: Any, config: Any) -> int:
     """The CDF length this record's question declares (M1-205).
 
-    Imported lazily so this module keeps the SDK-free, forecast-package-free import graph
-    ``submission_payload``'s docstring relies on: ``forecast.cdf`` pulls in the SDK, and
-    this module is on the one live path where that import cost is paid per post.
+    Imported inside the function so **this module**, imported alone, stays free of the SDK
+    that ``forecast.cdf`` pulls in. That is the whole of the claim, corrected in round 2
+    after it was overstated: it is not a per-post cost saving (Python caches modules, so
+    the import runs once), and it does not keep the SDK out of every caller --
+    ``tournament.py`` already loads it by other routes. What it preserves is the narrower,
+    checkable property that importing ``submission_live`` does not.
     """
     from whiskeyjack_bot.forecast.cdf import expected_cdf_points_for
 

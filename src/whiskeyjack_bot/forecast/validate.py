@@ -137,7 +137,7 @@ _TYPE_CHECKERS: dict[str, _TypeChecker | None] = {
     # over a range and is identical for a discrete question. What differs is the converted
     # array's length and its per-step cap, and neither is decided here: both belong to
     # ``forecast/cdf.py``, which reads them from the question's own ``cdf_size`` and from
-    # ``discrete_max_adjacent_pmf``. A second entry pointing at a near-duplicate function
+    # ``_cdf_rules``. A second entry pointing at a near-duplicate function
     # would be two places to fix the next percentile rule.
     "discrete": numeric_output_problems,
 }
