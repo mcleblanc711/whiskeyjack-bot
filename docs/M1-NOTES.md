@@ -8620,3 +8620,27 @@ neither the ledger nor the log, and every member of the caught exception tuple i
 both failure sites, which makes the *next* incident diagnosable from the journal — but it is
 a log line, not a ledger row, so it is outside the attribution instrument. Giving a refused
 generation a durable identity is `M1-317`'s neighbouring problem and is not solved here.
+
+## Metaculus Cup Fall 2026 — second tournament profile
+
+Added `config/tournament-cup.yaml` alongside `config/tournament.yaml` (MiniBench): a
+fully separate profile (own SQLite ledger, artifact root, logs, systemd units) targeting
+https://www.metaculus.com/notebooks/45384/announcing-the-metaculus-cup-fall-2026-with-kiko-llaneras/.
+No code change was needed — `TournamentConfig.id` and every downstream call site were
+already config-driven per profile, and `tournament_state.py` activation is scoped to one
+ledger/account/project at a time, so two tournaments run as two independent profiles rather
+than one process polling both.
+
+Verified 2026-09-08, live, against the account's existing `METACULUS_TOKEN`: the URL slug
+`metaculus-cup-fall-2026` resolves directly through `questions fetch --live --tournament`,
+returning 5 open questions (binary, multiple_choice, numeric) — no separate numeric project
+ID was needed. `config/tournament-cup.yaml` now carries that slug as a verified value, not a
+placeholder (D31: verify tournament ids at runtime, never hardcode blind).
+
+Bots may forecast the Metaculus Cup via the API but are not prize-eligible there — fine for
+whiskeyjack's purpose (the attribution instrument, not prize-hunting), just recorded here so
+it isn't rediscovered as a surprise later.
+
+Not yet done: rehearsal (`docs/TOURNAMENT-OPERATIONS.md`) and owner-authorized `tournament
+enable` against this profile — both still require a deliberate operator act, same as
+MiniBench's launch.

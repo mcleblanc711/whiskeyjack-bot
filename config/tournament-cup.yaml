@@ -5,11 +5,9 @@
 # Bots may forecast via the API but are not prize-eligible in the Metaculus Cup -- fine for
 # whiskeyjack's purpose (the attribution instrument), just worth the owner knowing.
 #
-# tournament.id below is the URL slug, NOT yet verified against the live API (D31: verify
-# SDK/API aliases at runtime, never hardcode blind). Confirm it before the first live run:
-#   .venv/bin/whiskeyjack-bot questions fetch --live --tournament metaculus-cup-fall-2026 \
-#       --config config/tournament-cup.yaml --save /tmp/cup-check.json
-# Correct this file's tournament.id if the platform reports a different id/slug.
+# tournament.id below (the URL slug) was verified live against the API on 2026-09-08:
+# `questions fetch --live --tournament metaculus-cup-fall-2026` returned 5 open questions
+# (binary, multiple_choice, numeric) under this exact slug -- see docs/M1-NOTES.md.
 #
 # Entirely separate ledger, artifacts, and logs from config/tournament.yaml (MiniBench) --
 # tournament_state.py activation is scoped to one ledger/account/project at a time, so the
