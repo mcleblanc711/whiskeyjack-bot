@@ -1,0 +1,17 @@
+[Unit]
+Description=Whiskeyjack activated tournament poll (Metaculus Cup Fall 2026)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cleblanc/projects/whiskeyjack-bot
+EnvironmentFile=/home/cleblanc/projects/whiskeyjack-bot/.env
+Environment=PYTHON_DOTENV_DISABLED=1
+Environment=LITELLM_LOCAL_MODEL_COST_MAP=True
+ExecStart=/home/cleblanc/projects/whiskeyjack-bot/.venv/bin/python -m whiskeyjack_bot.cli tournament run-once --config /home/cleblanc/projects/whiskeyjack-bot/config/tournament-cup.yaml
+TimeoutStartSec=2400
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true

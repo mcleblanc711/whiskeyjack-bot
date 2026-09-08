@@ -5,6 +5,17 @@ Production activation requires owner authorization for the reviewed account, pro
 service, or passing tests does not activate the bot. Use testing project **32977** for
 rehearsals, with separate SQLite and artifact paths.
 
+**A second tournament is a second, fully independent profile — never a shared ledger.**
+`config/tournament-cup.yaml` targets the Metaculus Cup Fall 2026 alongside MiniBench, with
+its own SQLite path, artifact root, log file, and `deploy/systemd/whiskeyjack-tournament-cup.*`
+units. Activation in `tournament_state.py` is scoped to one ledger/account/project at a time,
+so the two tournaments can never share storage — this is the same shape as the rehearsal
+(production) split below, just two live profiles instead of one live and one test. Verify
+`metaculus.tournament.id` in that file against the live API before first use (D31); the file
+ships with the URL slug, unconfirmed. Everything else in this runbook (deployment, rehearsal,
+stop/inspect, uncertain-forecast recovery, backup/restore) applies per profile — substitute
+`config/tournament-cup.yaml` and the `-cup` unit names throughout.
+
 ## Deployment
 
 The supplied files target `/home/cleblanc/projects/whiskeyjack-bot`. First check out the
