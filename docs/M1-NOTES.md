@@ -8682,3 +8682,14 @@ unchanged (`skipped: 1`, `processed: 0`). Activation disabled afterward per the 
 
 Not yet done: owner-authorized `tournament enable` against `config/tournament-cup.yaml`
 (production) and starting the `whiskeyjack-tournament-cup.timer`.
+
+## Metaculus Cup Fall 2026 — production activated
+
+Owner-authorized 2026-09-08, 16:32 UTC: `tournament enable --config config/tournament-cup.yaml
+--project-id 33108 --starts 2026-09-08T16:32:22Z --ends 2027-01-01T00:00:00Z --budget-usd 10`
+(account 305299, activation `51b412f9c2094a9bacdd9080a7159454`). Window runs through the
+tournament's own `forecasting_end_date`; $10 of the $20 project ceiling, capped low
+deliberately while OpenRouter credits from Metaculus are still pending. `deploy/systemd/
+whiskeyjack-tournament-cup.{service,timer}` installed and started the same session
+(`systemctl --user enable --now whiskeyjack-tournament-cup.timer`); polls every five minutes
+independently of the MiniBench timer, sharing no storage (`data/cup/`).
