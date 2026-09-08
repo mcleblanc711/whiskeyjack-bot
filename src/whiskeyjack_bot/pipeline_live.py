@@ -670,6 +670,16 @@ def _attempt_question(
         ForecastSchemaError,
         MissingCredentialError,
     ) as exc:
+        # The reason, or it is lost (M1-323). `problems` rides on the returned
+        # `QuestionOutcome` and is written to neither the ledger nor the log, and every
+        # member of this except tuple collapses to the same `internal_error` detail code --
+        # so without this line a refused generation leaves no account of *why* anywhere
+        # durable. M1-205's discrete defect failed 8 consecutive live cycles, each one
+        # billed, and every recorded trace of all 8 was the string "internal_error".
+        # The type name and the message are module-owned and value-free by contract.
+        _LOGGER.error(
+            "generation refused for question %d: %s: %s", question_id, type(exc).__name__, exc
+        )
         # Every one of these is raised *before* the spend, by contract. The forecast still
         # did not happen, so it is a recorded generation failure -- with no artifact, because
         # there is no reply to keep.
@@ -709,6 +719,16 @@ def _attempt_question(
         # is set, but an `assert` would be stripped under `-O` and a crash is a worse answer
         # than a true-but-vague one. `internal_error` is what an unclassified failure is.
         failure_code: PreForecastFailureCode = generation.failure_code or "internal_error"
+        # Same argument as the handler above (M1-323): `problems` is the only account of
+        # why the reply was rejected and it reaches nothing durable. Its members are
+        # schema-authored, value-free strings (`_parse` / `_repair_turn`).
+        _LOGGER.error(
+            "generation produced no forecast for question %d: code=%s invocations=%d problems=%s",
+            question_id,
+            failure_code,
+            generation.invocations,
+            list(generation.failure_problems),
+        )
         artifact_outcome: ArtifactOutcome = "retention_disabled"
         artifact_path: str | None = None
         try:
