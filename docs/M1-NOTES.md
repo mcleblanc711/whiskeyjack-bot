@@ -8644,3 +8644,41 @@ it isn't rediscovered as a surprise later.
 Not yet done: rehearsal (`docs/TOURNAMENT-OPERATIONS.md`) and owner-authorized `tournament
 enable` against this profile — both still require a deliberate operator act, same as
 MiniBench's launch.
+
+## Metaculus Cup Fall 2026 — rehearsal passed
+
+Ran the rehearsal from `docs/TOURNAMENT-OPERATIONS.md` for the Cup profile, 2026-09-08:
+`config/tournament-cup-rehearsal.yaml`, sandbox project 32977, environment `test`, capped at
+$5 (operator request, to conserve OpenRouter credits pending the Metaculus credit grant),
+its own ledger at `data/cup-rehearsal/`.
+
+**Found and fixed before rehearsing**: `config/tournament-cup.yaml` and the first draft of
+the rehearsal config both put their SQLite ledger in `data/` alongside MiniBench's live
+ledger, just under a different filename. `tournament_state.py`'s posting guard
+(`check_storage`/`guard_root`) is scoped by the ledger's **parent directory**, not its
+filename, so activating either would have collided against MiniBench's `.posting-guard`
+witnesses and refused with "storage restore detected" -- which is exactly what the first
+`tournament enable` attempt did. Fixed by giving both Cup profiles their own subdirectory
+(`data/cup/`, `data/cup-rehearsal/`), matching the existing `data/launch-rehearsal/`
+precedent. Worth a line in `docs/TOURNAMENT-OPERATIONS.md` for the next second-tournament
+profile someone adds.
+
+**First run-once attempt used question 43330** (a Forbes-sourced net-worth subquestion) and
+failed both times with `TournamentError("question research or generation failed")`, silently
+-- no ledger row, no error log, just `tournament_events` kind `question_failure` recording
+only `error_type`. Traced (not a bug): `research/quality.py`'s `quality_problem` correctly
+refuses when the question's resolution criteria name a specific domain (`forbes.com`, via a
+Wayback-archived URL in the group's fine print) and neither AskNews nor Exa returned a
+document from that domain -- the pipeline's own evidence-quality gate working as designed,
+just an unlucky first pick. This failure mode's near-total silence (no `pipeline_failure_events`
+row, since the raise happens before `_record_pre_forecast` is reachable, and no `_LOGGER.error`
+at that site) is worth filing as a follow-up alongside M1-323/M1-317's existing observation
+about `TournamentError`'s message being dropped at `tournament.py`'s outer catch-all.
+
+**Second attempt used question 45708** (no resolution criteria/fine print at all, so the
+domain gate can't fire) and passed cleanly: run 1 produced one confirmed forecast and one
+completed comment ($0.049 actual spend); run 2 made no new paid call and left both counts
+unchanged (`skipped: 1`, `processed: 0`). Activation disabled afterward per the runbook.
+
+Not yet done: owner-authorized `tournament enable` against `config/tournament-cup.yaml`
+(production) and starting the `whiskeyjack-tournament-cup.timer`.
