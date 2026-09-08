@@ -5,9 +5,12 @@
 # Bots may forecast via the API but are not prize-eligible in the Metaculus Cup -- fine for
 # whiskeyjack's purpose (the attribution instrument), just worth the owner knowing.
 #
-# tournament.id below (the URL slug) was verified live against the API on 2026-09-08:
-# `questions fetch --live --tournament metaculus-cup-fall-2026` returned 5 open questions
-# (binary, multiple_choice, numeric) under this exact slug -- see docs/M1-NOTES.md.
+# tournament.id below is the verified numeric project ID (read out of a live question's
+# embedded `default_project`/`tournament` metadata on 2026-09-08, name "Metaculus Cup Fall
+# 2026", slug metaculus-cup-fall-2026, prize_pool 5000.00, bot_leaderboard_status
+# exclude_and_show -- bots may forecast but are excluded from the leaderboard/prizes).
+# `tournament enable` requires the numeric ID to string-match --project-id; the slug alone
+# (which worked for read-only `questions fetch`) is not accepted there. See docs/M1-NOTES.md.
 #
 # Entirely separate ledger, artifacts, and logs from config/tournament.yaml (MiniBench) --
 # tournament_state.py activation is scoped to one ledger/account/project at a time, so the
@@ -17,7 +20,7 @@ metaculus:
   base_url: https://www.metaculus.com/api
   token_env: METACULUS_TOKEN
   tournament:
-    id: metaculus-cup-fall-2026
+    id: 33108
     use_sdk_current_id: false
   group_question_mode: unpack_subquestions
   request_timeout_seconds: 30
