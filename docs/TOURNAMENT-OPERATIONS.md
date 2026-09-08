@@ -44,6 +44,14 @@ journalctl --user -u whiskeyjack-tournament.service -n 100
 .venv/bin/whiskeyjack-bot tournament status --config config/tournament.yaml
 ```
 
+**Watching multiple profiles at once**: `scripts/watch-tournaments.py` tails
+`data/logs/tournament.jsonl` and `data/logs/tournament-cup.jsonl` together, tagging each line
+by profile and de-emphasizing routine question-discovery/fetch chatter so a `Posted
+prediction`/`Posted comment` line (or any `WARNING`/`ERROR`) stands out instead of scrolling
+past in the same weight as everything else. Run with no arguments for the two profiles this
+repo currently runs, or `LABEL=path/to.jsonl` pairs for others. A plain `tail -f` on one log
+file still works fine for a single profile; this is for watching more than one at a time.
+
 The timer polls every five minutes; a file lock prevents overlapping workers. The service
 has a 40-minute total bound, each question's paid phase has an eight-minute bound, and
 HTTP requests have configured timeouts. A timer tick while the oneshot service is active
