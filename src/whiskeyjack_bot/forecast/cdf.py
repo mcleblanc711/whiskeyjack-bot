@@ -418,17 +418,33 @@ def _cdf_rules(
 
     A numeric array is 201 points spanning the range, so two adjacent points are half a
     percent of it apart and ``max_adjacent_pmf`` bounds a spike. A discrete array has one
-    point per outcome plus one, so two adjacent points *are* an outcome, and the same
-    number would refuse most confident forecasts -- 0.446 for a confident reply on
-    MiniBench post 45559, against a numeric cap of 0.2. See
-    ``NumericCalibrationConfig.discrete_max_adjacent_pmf``.
+    point per outcome plus one, so two adjacent points *are* an outcome, and the flat
+    numeric number would refuse most confident forecasts -- 0.446 for a confident reply on
+    MiniBench post 45559, against a cap of 0.2.
+
+    **Round 1 replaced a flat discrete cap with the platform's own formula**, which is the
+    better answer for the reason the flat one was wrong in both directions: 0.9 was far
+    below what Metaculus permits on a 16-outcome grid (2.5) and far *above* what it permits
+    on a 71-outcome one (0.563), so a fine-grained discrete question would have been
+    approved locally and refused on the wire, after the forecast was billed and recorded.
 
     Keyed on the ``qtype`` literal, never ``isinstance``: that is the whole reason the two
     canonical models are siblings.
     """
-    if question.qtype == "discrete":
-        return question.cdf_size, calibration.discrete_max_adjacent_pmf
-    return calibration.expected_cdf_points, calibration.max_adjacent_pmf
+    points = question.cdf_size if question.qtype == "discrete" else calibration.expected_cdf_points
+    # Metaculus's own rule, and it subsumes both types rather than special-casing one:
+    # the server validator caps an adjacent step at ``0.2 * 200 / inbound_outcome_count``,
+    # i.e. ``max_adjacent_pmf`` scaled by how much coarser this grid is than the 201-point
+    # continuous one. Substituting a numeric question (``cdf_size`` 201,
+    # ``inbound_outcome_count`` 200) returns ``max_adjacent_pmf`` unchanged, so there is one
+    # rule here and no branch.
+    #
+    # Clamped at 1.0 because a coarse grid produces a bound above 1 (2.5 for the 16-outcome
+    # MiniBench post 45559) and a step between two CDF points cannot exceed 1 -- an
+    # unclamped value would be a cap that is not a probability.
+    inbound = points - 1
+    cap = min(1.0, calibration.max_adjacent_pmf * (calibration.expected_cdf_points - 1) / inbound)
+    return points, cap
 
 
 def expected_cdf_points_for(

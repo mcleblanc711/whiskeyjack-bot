@@ -2,15 +2,21 @@
 
 ``forecast/cdf.py`` converted numeric questions against two constants: a 201-point length
 and ``max_adjacent_pmf``. A discrete question brings its own length -- ``cdf_size`` is
-``inbound_outcome_count + 1`` and ranges from 2 up -- and needs its own per-step cap,
-because on a grid of sixteen outcomes two adjacent CDF points *are* two outcomes and the
-numeric cap refuses ordinary confident forecasts.
+``inbound_outcome_count + 1`` and ranges from 2 up -- and its own per-step cap, because on
+a grid of sixteen outcomes two adjacent CDF points *are* two outcomes.
 
-Both of those are numbers now reached through a question rather than written down, which
-is exactly the shape that fails silently: a wrong length is refused loudly by Metaculus,
-but a wrong *cap* just converts a confident forecast into a repair turn and then a
-failure, and nothing in the ledger would say why. So the properties below are about the
-question's own declaration deciding the outcome, not about any particular number.
+Both are numbers now reached through a question rather than written down, which is exactly
+the shape that fails silently: a wrong length is refused loudly by Metaculus, but a wrong
+*cap* turns a confident forecast into a repair turn and then a failure, and nothing in the
+ledger would say why. So the properties below are about the question's own declaration
+deciding the outcome, never about a particular number.
+
+**Round 1 is why the cap is a formula.** The first version used a flat discrete cap of
+0.9. Metaculus's server validator actually caps an adjacent step at
+``0.2 * 200 / inbound_outcome_count``, so any flat number is wrong in both directions:
+0.9 is far below what the platform permits on a 16-outcome grid (2.5) and far above what
+it permits on a 71-outcome one (0.563) -- and the second of those is the dangerous half,
+approving locally what the wire would refuse after the forecast was billed and recorded.
 
 The payload is built from ``prompts/forecaster.md`` for the reason
 ``tests/unit/test_forecast_cdf.py`` gives: a response shape transcribed into a test is one
@@ -34,6 +40,7 @@ from hypothesis import strategies as st
 from whiskeyjack_bot.config import NumericCalibrationConfig, validate_config_data
 from whiskeyjack_bot.forecast.cdf import (
     NumericCdfError,
+    _cdf_rules,
     expected_cdf_points_for,
     numeric_cdf_or_problems,
 )
@@ -123,9 +130,11 @@ def _discrete_question(outcomes: int, **overrides: Any) -> CanonicalDiscreteQues
 def _grids(draw: st.DrawFn) -> tuple[CanonicalDiscreteQuestion, NumericForecastResponse]:
     """A discrete question and a well-formed nine-percentile reply inside its range.
 
-    Outcome counts stay modest so the property suite stays fast; the two real shapes this
-    item was built against (17 and 72 points) are pinned as goldens in
-    ``tests/unit/test_discrete_cdf_golden.py`` rather than left to a draw to happen upon.
+    Outcome counts stay modest so the property suite stays fast. The two real shapes this
+    item was built against (17 and 72 points) are asserted directly in
+    ``test_the_step_cap_is_the_platform_rule_scaled_to_the_grid`` and
+    ``test_the_length_rule_differs_between_the_two_types_for_one_calibration`` rather than
+    left to a draw to happen upon; freezing the emitted arrays as goldens is M1-206.
     """
     outcomes = draw(st.integers(min_value=3, max_value=40))
     lower, upper = -0.5, outcomes - 0.5
@@ -151,13 +160,13 @@ def _grids(draw: st.DrawFn) -> tuple[CanonicalDiscreteQuestion, NumericForecastR
 
 
 # The three shape properties below deliberately convert under a cap that cannot filter
-# anything (``1.0``). The cap has its own property further down, and leaving it live here
-# would make these three quietly conditional on it: under a restrictive cap most draws
-# convert to ``None``, the ``assume`` discards them, and the properties either prove
-# nothing or fail by assumption-exhaustion rather than by assertion. Watched happen --
-# mutating ``_cdf_rules`` to the numeric cap made the monotonicity property fail for that
-# reason and not for its own.
-_SHAPE_ONLY = {"discrete_max_adjacent_pmf": 1.0}
+# anything: ``max_adjacent_pmf=1.0`` scales to exactly 1.0 on any grid of 200 outcomes or
+# fewer. The cap has its own properties further down, and leaving it live here would make
+# these three quietly conditional on it: under a restrictive cap most draws convert to
+# ``None``, the ``assume`` discards them, and the properties either prove nothing or fail
+# by assumption-exhaustion rather than by assertion. Watched happen -- mutating
+# ``_cdf_rules`` made the monotonicity property fail for that reason and not its own.
+_SHAPE_ONLY = {"max_adjacent_pmf": 1.0}
 
 
 @given(_grids())
@@ -275,38 +284,74 @@ def _confident_reply(outcomes: int) -> NumericForecastResponse:
     )
 
 
-def test_the_discrete_cap_admits_a_confident_forecast_the_numeric_cap_refuses() -> None:
-    """The item's load-bearing behaviour, and the mutation this suite exists to catch.
+def test_the_step_cap_is_the_platform_rule_scaled_to_the_grid() -> None:
+    """The cap is derived, not chosen -- round 1 replaced a flat 0.9 with this.
 
-    Concentrating probability on the modal outcome is what a confident discrete forecast
-    *is*. Under the numeric cap it is refused as a malformed spike, and the refusal is not
-    free: it becomes a repair turn, i.e. a second billed model call, before failing anyway.
+    Metaculus's server validator caps an adjacent step at
+    ``0.2 * 200 / inbound_outcome_count``. A **flat** discrete number is wrong in both
+    directions and that is why this property is about the formula rather than a value: 0.9
+    was far under what the platform allows on a 16-outcome grid (2.5) and far *over* what
+    it allows on a 71-outcome one (0.563), so a fine-grained discrete question would have
+    been approved locally and refused on the wire after being billed and recorded.
+    """
+    calibration = _calibration()
+    base = calibration.max_adjacent_pmf
 
-    Asserted as one array measured against both caps, so the test states the relationship
-    rather than a number either default could move away from. If ``_cdf_rules`` is mutated
-    to return ``max_adjacent_pmf`` for a discrete question, the first assertion fails.
+    # A numeric question reduces to the configured number exactly -- one rule, no branch.
+    numeric = CanonicalNumericQuestion(
+        question_id=QUESTION_ID,
+        post_id=POST_ID,
+        title="How many things?",
+        lower_bound=0.0,
+        upper_bound=100.0,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        cdf_size=201,
+    )
+    assert _cdf_rules(numeric, calibration) == (201, base)
+
+    for outcomes, platform_cap in ((16, 2.5), (71, 0.2 * 200 / 71), (200, 0.2)):
+        points, cap = _cdf_rules(_discrete_question(outcomes), calibration)
+        assert points == outcomes + 1
+        assert cap == pytest.approx(min(1.0, platform_cap))
+
+    # The direction is the point: a coarser grid permits a larger step.
+    assert (
+        _cdf_rules(_discrete_question(8), calibration)[1]
+        > (_cdf_rules(_discrete_question(120), calibration)[1])
+    )
+
+
+def test_the_scaled_cap_admits_a_confident_forecast_the_flat_numeric_cap_refuses() -> None:
+    """The behaviour the scaling exists for, on the live question's own shape.
+
+    Concentrating mass on the modal outcome is what a confident discrete forecast *is*.
+    Under the unscaled numeric 0.2 it is refused as a malformed spike, and the refusal is
+    not free: it becomes a repair turn, a second billed model call, before failing anyway.
+
+    Asserted as one array measured both ways, so the test states the relationship rather
+    than a number either default could move away from.
     """
     outcomes = 16
     question = _discrete_question(outcomes)
     forecast = _confident_reply(outcomes)
 
     cdf, problems = numeric_cdf_or_problems(forecast, _calibration(), question)
-    assert cdf is not None, f"the discrete cap must admit a confident forecast: {problems}"
+    assert cdf is not None, f"the scaled cap must admit a confident forecast: {problems}"
 
     steps = [second - first for first, second in pairwise(cdf.values)]
     committed = _committed_calibration()
     assert max(steps) > committed.max_adjacent_pmf, (
-        "vacuity guard: this reply must actually exceed the numeric cap, or the test "
-        "proves nothing about which cap was applied"
+        "vacuity guard: this reply must actually exceed the unscaled numeric cap, or the "
+        "test proves nothing about which cap was applied"
     )
-    assert max(steps) <= committed.discrete_max_adjacent_pmf
 
-    # And the same array, converted under the numeric cap, is refused -- so the difference
-    # is the cap and not something else about the reply.
-    under_numeric = _calibration(discrete_max_adjacent_pmf=committed.max_adjacent_pmf)
-    refused, refusals = numeric_cdf_or_problems(forecast, under_numeric, question)
-    assert refused is None
-    assert any("adjacent" in problem or "concentrates" in problem for problem in refusals)
+    # The same array under a calibration whose scaling cannot help it: at 201 configured
+    # points and a 201-point grid the rule returns `max_adjacent_pmf` unchanged.
+    numeric_shaped = _discrete_question(outcomes, cdf_size=201)
+    _, flat_cap = _cdf_rules(numeric_shaped, _calibration())
+    assert flat_cap == committed.max_adjacent_pmf
+    assert max(steps) > flat_cap
 
 
 @pytest.mark.parametrize("cdf_size", [1, 0, -1, 202, 10_000])

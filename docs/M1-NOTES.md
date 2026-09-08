@@ -8431,7 +8431,30 @@ what made this diff auditable.
 `inbound_outcome_count` is deliberately not carried: it is `cdf_size - 1` exactly, and one
 fact reached two ways is the second source of truth M2-703's review removed.
 
-### Decision — `discrete_max_adjacent_pmf: 0.9`, separate from the numeric `0.2`
+### Decision (revised at round 1) — the step cap is Metaculus's formula, not a number
+
+**The first version of this item invented a flat `discrete_max_adjacent_pmf: 0.9`, and that
+was wrong.** Round 1 supplied the platform's actual rule: the server validator caps an
+adjacent step at `0.2 * 200 / inbound_outcome_count`. Any flat number is wrong in *both*
+directions, and the second is the dangerous one:
+
+| outcomes | platform cap | flat 0.9 |
+|---|---|---|
+| 16 | 2.500 | far too strict |
+| 71 | 0.563 | **too permissive** |
+| 200 | 0.200 | **too permissive** |
+
+Too strict costs a repair turn. **Too permissive approves locally what the wire refuses** —
+after the forecast is billed, recorded and approved. The real testing-area question 45517
+has 71 outcomes, so this was not hypothetical.
+
+`_cdf_rules` now computes `max_adjacent_pmf * (expected_cdf_points - 1) / (cdf_size - 1)`,
+clamped at 1.0. Substituting a numeric question returns `max_adjacent_pmf` unchanged, so
+there is **one rule and no branch** — and the config field I added was deleted. The original
+reasoning below is kept because the measurement that motivated it still stands; only the
+remedy changed.
+
+### Superseded — the flat cap, and the measurement that motivated it
 
 `max_adjacent_pmf` bounds the probability between two **adjacent CDF points**. On a
 201-point numeric array those are 0.5% of the range apart, so `0.2` in one step is a
@@ -8454,6 +8477,32 @@ distribution is still worth one repair turn.
 **This is the change that fails soft.** A wrong length is refused loudly by Metaculus; a
 wrong cap just degrades forecasts and says nothing. It is why the properties assert the
 *relationship between the two caps on one array* rather than either number.
+
+### Round 1 also found two dispatch omissions, both reproduced before fixing
+
+**The response model kept `Literal["numeric"]`.** Every discrete generation failed schema
+validation *after* being billed, and returning `"numeric"` instead failed the record's
+identity validator — the reply had nowhere to go either way. `NumericForecastResponse.
+question_type` is now `Literal["numeric", "discrete"]`.
+
+**Adding the wire-key row was not adding a dispatch arm.** A discrete CDF fell through
+`submission_live`'s plan builder to `_require_categories` and was refused as "must be a JSON
+object". Fixing it needed a `DiscretePost` member (not `NumericPost` with a different tag —
+`post_approved_forecast` compares the plan's type against the record's), plus the
+record-derived length threaded through `post_approved_forecast` and `tournament.py`'s
+reconciliation, both of which passed a literal 201.
+
+**And widening the union made `mypy --strict` find a third instance the review had not
+named:** the actual POST dispatched on `== "numeric"` with a bare fall-through, so a
+discrete plan would have been posted to `post_multiple_choice_question_prediction`. Both
+fall-throughs are now explicit branches ending in a `raise`, because a fall-through is how
+the next union member gets routed to the wrong endpoint silently.
+
+**Why the property suite did not catch any of this:** it built responses tagged `"numeric"`
+and handed them straight to the conversion, so it never traversed schema dispatch,
+generation, or submission planning. The properties were sound about the function they
+covered and the coverage was drawn too narrowly — the same shape as a vacuous property,
+one layer up.
 
 ### Deviation — `expected_cdf_points` narrowed rather than relaxed
 

@@ -320,26 +320,13 @@ class NumericCalibrationConfig(_StrictModel):
     # numeric question declaring some other resolution used to be measured against this
     # constant and is now measured against what it actually declared.
     expected_cdf_points: Literal[201]
+    # The adjacent-step cap for a **201-point** array. M1-205 made it the base of a rule
+    # rather than the rule: ``forecast/cdf._cdf_rules`` scales it by how much coarser a
+    # discrete question's grid is, which is Metaculus's own server-side formula
+    # (0.2 * 200 / inbound_outcome_count) and reduces to exactly this value at 201 points.
+    # A separate discrete field was tried and removed in round 1: any flat number is both
+    # too strict on a coarse grid and too permissive on a fine one.
     max_adjacent_pmf: float = Field(0.2, gt=0, le=1)
-    # The same cap for a discrete question, and it must be a different number (M1-205).
-    #
-    # ``max_adjacent_pmf`` bounds the probability between two *adjacent CDF points*. On a
-    # 201-point numeric array those points are 0.5% of the range apart, so 0.2 in one
-    # step is an enormous, almost certainly malformed spike. On a discrete question the
-    # adjacent points are the outcomes themselves: for MiniBench post 45559 ("how many
-    # countries will abstain", 16 outcomes) a step *is* the probability of one integer.
-    # Measured against the pinned SDK on that question, a moderate forecast peaks at
-    # 0.137, a confident one at 0.446 and a tight one at 0.886. Only the first clears
-    # 0.2, so the numeric cap would refuse most confident discrete forecasts -- each
-    # refusal costing a repair turn, i.e. a second billed model call, before failing
-    # anyway.
-    #
-    # Defaulted permissively because Metaculus imposes no per-outcome cap on a discrete
-    # question: the grid *is* the question's declared resolution, and concentrating mass
-    # on one outcome is a forecast, not a malformed array. It is deliberately not 1.0 --
-    # a single point holding the entire distribution is still worth a repair turn, and
-    # `gt=0, le=1` keeps the field's own envelope identical to the numeric one.
-    discrete_max_adjacent_pmf: float = Field(0.9, gt=0, le=1)
     strict_validation: bool = True
     calibration_profile: Literal["identity"]
     # M1-514: the wall-clock bound on one numeric CDF conversion. Lives on this block
