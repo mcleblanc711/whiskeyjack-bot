@@ -23,11 +23,13 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from hypothesis import given, settings
+import pytest
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 from strategies import ENCODABLE_TEXT, ROOT_DOT_SUFFIXES
 
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
+from whiskeyjack_bot.research.canonical import CanonicalizationError, _canonical_host
 from whiskeyjack_bot.research.model import ResearchDocument, validate_document, validate_run
 from whiskeyjack_bot.research.packet import ResearchPacket
 from whiskeyjack_bot.research.quality import (
@@ -80,7 +82,24 @@ BROKEN_URLS = st.sampled_from(
         "https://results.cik.bg/2026/",
         "not a url at all",
         "",
+        # Hosts `urlsplit` reads out happily and canonicalization then refuses. These are
+        # the second raising class, one layer below the first: `host` returns a string, so
+        # the `except ValueError` above is no defence, and `comparable_host` is what raises.
+        # See UNCANONICALIZABLE_HOSTS below.
+        "https://a..b/x",
+        "https://-bad.example/y",
+        "https://abc-.com/z",
     ]
+)
+
+# Hosts that `urlsplit` yields as an ordinary string but `canonical._canonical_host`
+# refuses: an empty label, a leading hyphen, a trailing hyphen, an over-long label, a
+# bare root dot and a lone surrogate. Reachable -- this is question text from the
+# Metaculus API, and `source_domains` scans it before retrieval -- which is what makes
+# `host_identity`'s totality a property and not a nicety. Asserted to actually be
+# refused in `test_an_uncanonicalizable_named_host_still_yields_a_verdict`.
+UNCANONICALIZABLE_HOSTS = st.sampled_from(
+    ["a..b", "-bad.example", "abc-.com", "x" * 70 + ".com", ".", "\ud800.com"]
 )
 CRITERIA = st.one_of(
     ENCODABLE_TEXT,
@@ -286,6 +305,93 @@ def test_no_verdict_message_echoes_question_or_document_content(where: str, titl
     )
     assert problem is not None, "an irrelevant document is exactly the refusal under test"
     assert MARKER not in problem.message and MARKER not in problem.code
+
+
+@given(bad=UNCANONICALIZABLE_HOSTS, title=TITLES, carried=HOSTS)
+def test_an_uncanonicalizable_named_host_still_yields_a_verdict(
+    bad: str, title: str, carried: str
+) -> None:
+    """``host_identity`` is total, and this is the reachable path that needs it.
+
+    ``host``'s ``except ValueError`` catches only the URLs ``urlsplit`` itself refuses.
+    A second class gets past it: ``https://a..b/x`` parses fine and yields the host
+    ``a..b``, which ``_canonical_host`` then rejects. Because ``missing_source_domains``
+    canonicalizes *the question's* named domains, that raise lands inside a verdict
+    function with no error type of its own -- a ``CanonicalizationError`` escaping to
+    ``pipeline_live`` from one string of Metaculus-supplied resolution criteria. It is the
+    same defect ``host`` was fixed for, one layer down, and removing the ``except
+    CanonicalizationError`` fallback in ``canonical.host_identity`` fails this test.
+
+    The first assertion is the vacuity guard: if canonicalization ever starts *accepting*
+    these hosts, the strategy stops reaching the fallback and this test must fail loudly
+    rather than keep passing on a branch it no longer enters.
+    """
+    with pytest.raises(CanonicalizationError):
+        _canonical_host(bad)
+
+    question = _question(title=title, resolution_criteria=f"Resolves per https://{bad}/x .")
+    document = _document(f"https://{carried}/story", text=f"{title} -- reported today.")
+    packet = _packet((document,))
+
+    assert comparable_host(bad) == bad.lower().removeprefix("www.")
+    assert isinstance(missing_source_domains(packet, question, NOW, DAYS), tuple)
+    quality_problem(packet, question, NOW, DAYS)
+
+
+@given(title=TITLES, carried=HOSTS, text=ENCODABLE_TEXT)
+def test_a_question_naming_no_source_reports_no_gap(title: str, carried: str, text: str) -> None:
+    """The negative control on the empty-set branch.
+
+    Most questions name no resolution URL at all, so a gap reported here would put an
+    ``evidence_gap`` row against essentially every forecast in the ledger and make the
+    attribution claim meaningless by dilution. Returning anything but ``()`` from
+    ``missing_source_domains``' ``if not domains`` branch fails this test.
+    """
+    question = _question(title=title, resolution_criteria=text, fine_print=None)
+    assume(not source_domains(question))
+    packet = _packet((_document(f"https://{carried}/story", text=f"{title} -- today."),))
+
+    assert missing_source_domains(packet, question, NOW, DAYS) == ()
+
+
+@given(
+    host_name=HOSTS,
+    title=TITLES,
+    spoiler=st.sampled_from(["stale", "irrelevant"]),
+)
+def test_an_unusable_document_from_the_named_source_leaves_the_gap(
+    host_name: str, title: str, spoiler: str
+) -> None:
+    """Only a **usable** document closes the gap.
+
+    ``missing_source_domains`` filters on ``usable`` for the same reason
+    ``quality_problem`` does: a document from the named authority that is two years stale,
+    or about something else entirely, is not evidence the forecast rested on. Without the
+    filter the ledger would record "we had resolution-source evidence" on the strength of
+    a document the forecaster never saw -- an *overstated* attribution claim, which is the
+    failure mode this item is least willing to accept.
+
+    The two guards are the vacuity pair: the document must carry the named host (or the
+    gap would be open for the trivial reason) and must be unusable (or it would close it).
+    """
+    named = f"https://{host_name}/2026/"
+    if spoiler == "stale":
+        document = _document(
+            f"https://{host_name}/story",
+            text=f"{title} -- reported then.",
+            published=NOW - timedelta(days=DAYS * 40),
+        )
+    else:
+        document = _document(f"https://{host_name}/story", text="wholly unrelated filler prose")
+    question = _question(title=title, resolution_criteria=f"Resolves per {named} .")
+    packet = _packet((document,))
+
+    assert comparable_host(host(document.canonical_url) or "") == comparable_host(host_name), (
+        "the document must carry the named host"
+    )
+    assert not usable(document, question, NOW, DAYS), "the document must be unusable"
+
+    assert missing_source_domains(packet, question, NOW, DAYS) == source_domains(question)
 
 
 @given(title=TITLES)

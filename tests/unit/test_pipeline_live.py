@@ -928,6 +928,25 @@ def test_a_validation_failed_outcome_without_a_detail_code_is_refused() -> None:
         )
 
 
+def test_a_question_with_no_record_reports_no_evidence_gap() -> None:
+    """M1-327. An evidence gap is a statement *about a forecast* -- "this forecast was made
+    without a document from the resolution authority the question named". An attempt that
+    never persisted a draft has no forecast for that sentence to be about, and the ledger's
+    ``evidence_gap`` row is scoped to the record id, so an outcome reporting a gap with no
+    record describes a row that cannot exist."""
+    with pytest.raises(LiveRunError, match="evidence gap"):
+        QuestionOutcome(
+            question_id=1,
+            status="research_failed",
+            attempt_id="a",
+            retrieval_run_ids=(),
+            document_count=0,
+            research_reused=False,
+            detail_code="no_evidence",
+            evidence_gaps=("named_source_absent",),
+        )
+
+
 def test_a_question_that_never_reached_the_model_reports_no_artifact() -> None:
     with pytest.raises(LiveRunError, match="reached the model"):
         QuestionOutcome(

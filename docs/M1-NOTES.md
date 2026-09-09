@@ -9041,9 +9041,40 @@ question 45452 with `--question-id`, before any timer is re-enabled.
 
 ### Verification
 
-Every property and every new unit test was mutation-tested; the twelve mutants and their
-verdicts are in the review request. Three of the four new `test_tournament.py` cases fail
-on `master`'s source with the tests unchanged, which is the pre-fix proof:
+Every property and every new unit test was mutation-tested: thirteen mutants, twelve caught
+and one knowingly accepted. The table and each verdict are in the review request.
+
+Five of the thirteen survived the first pass, which is the reason this section is worth
+reading. Four were closed by tests written against them, and one of the four was a live
+defect rather than a coverage hole: **`canonical.host_identity`'s totality fallback had no
+test, and the branch it guards is reachable.** `quality.host`'s `except ValueError` catches
+only the URLs `urlsplit` itself refuses; a second class gets past it, because
+`https://a..b/x` parses fine and yields the host `a..b`, which `_canonical_host` then
+rejects. Since `missing_source_domains` canonicalizes *the question's* named domains, that
+raise would leave a `CanonicalizationError` escaping a verdict function with no error type
+of its own — the same defect `host` was fixed for, one layer down, reached from one string
+of Metaculus-supplied resolution criteria. The fallback was already correct; nothing proved
+it, and the property pool contained no host that canonicalization rejects. That is the
+vacuity trap in its usual form: the strategy could not reach the branch the claim was about.
+
+The asymmetry underneath it is worth stating, because it is what makes the guard belong on
+the shared helper. A document's `canonical_url` is `HttpUrlString`, and every URL class that
+yields an unreadable host is refused at the schema boundary — verified by execution over all
+six. A question's `resolution_criteria` is free text and has no such gate. Which side is
+schema-protected is a fact about today's models, not something either caller should have to
+know.
+
+**The accepted survivor is M8**, `missing_source_domains`' `carried is not None` guard.
+Neutering it to `carried is None or ...` changes no test, and it cannot: reaching it needs a
+schema-valid `ResearchDocument` whose `canonical_url` has no readable host, and the six URL
+classes that would produce one are all refused by `validate_document`. The only way to test
+it is `model_construct`, which manufactures a condition the public path cannot produce —
+CLAUDE.md's threat boundary says that does not make a finding blocking, and it should not
+make a test either. The guard stays because it is on a shared helper whose other caller is
+unprotected; it is documented here rather than defended by a test that would prove nothing.
+
+Three of the four new `test_tournament.py` cases fail on `master`'s source with the tests
+unchanged, which is the pre-fix proof:
 `test_a_named_resolution_source_no_longer_refuses_the_forecast`,
 `test_pre_activation_attempts_do_not_retire_a_question`, and
 `test_re_enabling_the_tournament_re_arms_a_blocked_question`. The fourth,
