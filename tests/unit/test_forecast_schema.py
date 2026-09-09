@@ -128,7 +128,7 @@ def test_an_unsupported_question_type_is_refused_without_echoing_it() -> None:
     with pytest.raises(ForecastSchemaError) as excinfo:
         response_model_for(f"discrete-{SECRET}")
     assert not _leaks(excinfo.value)
-    assert "binary, multiple_choice, numeric" in str(excinfo.value)
+    assert "binary, discrete, multiple_choice, numeric" in str(excinfo.value)
 
 
 def test_a_response_cannot_claim_another_question_type() -> None:

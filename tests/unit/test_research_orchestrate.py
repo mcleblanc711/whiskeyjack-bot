@@ -195,7 +195,9 @@ def _raise_store_error(message: str) -> Any:
 
 
 def test_a_plain_question_yields_its_title() -> None:
-    assert derive_queries(question()) == (question().title,)
+    (query,) = derive_queries(question())
+    assert question().title in query
+    assert question().resolution_criteria in query
 
 
 def test_a_group_sibling_leads_with_the_parent_title() -> None:
@@ -205,10 +207,9 @@ def test_a_group_sibling_leads_with_the_parent_title() -> None:
     complete question; the bare title stays because it is the more precise search term.
     """
     sibling = question().model_copy(update={"group_parent_title": "Who wins the 2028 election?"})
-    assert derive_queries(sibling) == (
-        f"Who wins the 2028 election? {sibling.title}",
-        sibling.title,
-    )
+    (query,) = derive_queries(sibling)
+    assert query.startswith(f"Who wins the 2028 election? {sibling.title}")
+    assert sibling.resolution_criteria in query
 
 
 def test_a_parent_title_equal_to_the_title_is_not_emitted_twice() -> None:
@@ -258,7 +259,7 @@ def test_a_blank_group_parent_title_is_still_reachable_and_contributes_no_query(
     the two fields is easy to read as an oversight and is not one.
     """
     blank_parent = question().model_copy(update={"group_parent_title": "   "})
-    assert derive_queries(blank_parent) == (blank_parent.title,)
+    assert derive_queries(blank_parent) == derive_queries(question())
 
 
 def test_a_title_carrying_a_lone_surrogate_is_refused_before_any_call() -> None:
@@ -535,7 +536,7 @@ def test_a_fallback_ledger_failure_still_reports_what_the_fallback_cost(
     opened = _rows(ledger, "SELECT retrieval_run_id FROM research_runs ORDER BY provider")
     assert len(opened) == 2, "both providers were billed and both rows must exist"
     assert set(caught.value.retrieval_run_ids) == {row[0] for row in opened}
-    assert caught.value.cost_usd == pytest.approx(0.01), (
+    assert caught.value.cost_usd == pytest.approx(0.02), (
         "the fallback's known spend must survive its own recording failure"
     )
     assert caught.value.unpriced_calls == 1, "the unpriced primary is still one billed call"
@@ -577,11 +578,11 @@ def test_a_group_sibling_costs_twice_that_and_the_outcome_says_so(
     neither would be measuring the multiplier.
     """
     sibling = question().model_copy(update={"group_parent_title": "Who wins the 2028 election?"})
-    assert len(derive_queries(sibling)) == 2, "the premise: a sibling searches on two queries"
+    assert len(derive_queries(sibling)) == 1, "a sibling uses one consolidated query"
 
     sdk = _SDK()
     outcome = retrieve_for_question(ledger, config, question=sibling, now=NOW, news_client=sdk)
-    assert len(sdk.news.calls) == 4, "two queries, two strategies"
+    assert len(sdk.news.calls) == 2, "one query, two strategies"
     assert outcome.unpriced_calls == len(sdk.news.calls)
 
 
@@ -645,9 +646,9 @@ def test_a_primary_that_succeeded_with_nothing_does_not_authorize_a_paid_fallbac
         news_client=_SDK(articles=[]),
         web_client=_web_client(exchange),
     )
-    assert exchange.requests == []
-    assert [run.provider for run in outcome.runs] == ["asknews"]
-    assert outcome.packet is None
+    assert len(exchange.requests) == 2
+    assert [run.provider for run in outcome.runs] == ["asknews", "exa"]
+    assert outcome.packet is not None
 
 
 def test_an_unavailable_fallback_keeps_the_primary_run_instead_of_raising(

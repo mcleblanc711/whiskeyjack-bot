@@ -413,7 +413,7 @@ def test_an_uncertain_submission_tells_the_operator_the_next_command(
         ]
     )
     captured = capsys.readouterr().out
-    assert exit_code == EXIT_OK
+    assert exit_code == EXIT_REFUSED
     assert "result:    submission_uncertain" in captured
     assert "verify-submission" in captured
     assert "--attempt-id wjlive-1-" in captured
@@ -440,7 +440,7 @@ def test_verify_submission_resolves_the_uncertainty_the_submit_left(
                 str(payload_file),
             ]
         )
-        == EXIT_OK
+        == EXIT_REFUSED
     )
     printed = capsys.readouterr().out
     attempt_id = next(
@@ -788,3 +788,12 @@ def test_submit_prints_no_release_hint_when_it_refuses_for_another_reason(
     # still prints "a key reservation is standing ... (0)" and then loops over nothing --
     # no `release-key` line, and an operator told to release a claim that does not exist.
     assert "key reservation is standing" not in out
+
+
+@pytest.fixture(autouse=True)
+def isolate_activation_policy_for_gateway_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These legacy tests exercise receipt/idempotency mechanics with minimal fake
+    # records. Full activation, artifacts and real SDK checks live in test_tournament.
+    monkeypatch.setattr(
+        "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
+    )

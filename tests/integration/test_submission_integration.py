@@ -303,3 +303,12 @@ def test_the_refetch_retries_where_the_post_does_not(
     assert recorded.receipt.refetch_outcome == "unreadable"
     assert recorded.event.event_type == "submission_uncertain"
     assert current_status(conn, record_id) == "approved", "unreadable is not absent"
+
+
+@pytest.fixture(autouse=True)
+def isolate_activation_policy_for_transport_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Transport failure cases remain independent of activation setup; the launch
+    # integration tests exercise both boundaries together with retained artifacts.
+    monkeypatch.setattr(
+        "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
+    )

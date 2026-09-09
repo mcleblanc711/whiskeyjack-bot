@@ -57,6 +57,7 @@ from whiskeyjack_bot.prompt import LoadedPrompt, load_prompt
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
+    CanonicalDiscreteQuestion,
     CanonicalNumericQuestion,
 )
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
@@ -99,6 +100,7 @@ def good_reply(**overrides: Any) -> str:
         **json.loads(_json_block("Shared fields")),
         **json.loads("{" + _json_block("Binary schema") + "}"),
         "question_id": 42,
+        "as_of_utc": NOW.isoformat(),
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -1180,6 +1182,7 @@ def numeric_reply(**overrides: Any) -> str:
         **json.loads(_json_block("Shared fields")),
         **json.loads("{" + _json_block("Numeric schema") + "}"),
         "question_id": 42,
+        "as_of_utc": NOW.isoformat(),
         # The prompt's own rule for a non-binary response.
         "model_prior": None,
     }
@@ -1990,3 +1993,78 @@ def test_no_configuration_can_lift_the_conversion_bound(
             NumericCalibrationConfig.model_validate(
                 fields | {"conversion_timeout_seconds": rejected}
             )
+
+
+def _discrete_question(**overrides: Any) -> CanonicalDiscreteQuestion:
+    fields: dict[str, Any] = {
+        "question_id": 42,
+        "post_id": 7,
+        "title": "How many things, on a grid?",
+        "lower_bound": 0.0,
+        "upper_bound": 100.0,
+        "open_lower_bound": False,
+        "open_upper_bound": False,
+        "cdf_size": 16,
+    }
+    fields.update(overrides)
+    return CanonicalDiscreteQuestion(**fields)
+
+
+def test_a_discrete_question_accepts_a_reply_tagged_numeric(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-323, the live defect: every discrete forecast was billed and thrown away.
+
+    ``prompts/forecaster.md`` never mentions discrete, so the model answers a discrete
+    question with ``"question_type": "numeric"`` -- exactly what ``numeric_reply()``
+    produces. ``NumericForecastResponse`` serves both types, so the schema accepted that,
+    and then ``validate.output_problems`` refused the pairing because "discrete" is not
+    "numeric". It *raised* rather than returning a problem, so the repair turn never ran.
+
+    The tag is now stamped from the question, so the reply is accepted in one call and
+    carries the question's own type. Mutation check: delete the ``payload["question_type"]``
+    assignment in ``forecast/parse.py`` and this fails with ``ForecastOutputError``.
+    """
+    client = _Model(numeric_reply())
+    result = _generate(client, config, prompt, question=_discrete_question())
+    assert result.invocations == 1
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "discrete"
+
+
+def test_the_models_tag_is_ignored_rather_than_cross_checked(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The stamp replaces the model's tag; it does not merely agree with it (M1-323).
+
+    A binary question answered with binary content but tagged ``"numeric"`` is accepted,
+    because the tag was never the model's to author -- ``question.qtype`` is what selected
+    ``BinaryForecastResponse`` in the first place.
+
+    This is the test that pins *where* the stamp runs. Move it after
+    ``validate_forecast_response`` and the payload still says "numeric" when the schema
+    sees it, so ``Literal["binary"]`` refuses the reply and this fails with
+    ``schema_invalid`` -- the mutation the discrete test above cannot detect, because
+    stamping late still repairs the pairing check it exercises.
+    """
+    client = _Model(good_reply(question_type="numeric"))
+    result = _generate(client, config, prompt, question=_question())
+    assert result.invocations == 1
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "binary"
+
+
+def test_the_stamped_tag_does_not_launder_a_reply_for_the_wrong_model(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """Stamping the tag must not let any reply satisfy any question.
+
+    The tag is corrected; the *content* still has to be what the selected model declares.
+    A numeric-shaped reply against a binary question fails on its own missing fields.
+    """
+    client = _Model(numeric_reply())
+    result = _generate(client, config, prompt, question=_question())
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"

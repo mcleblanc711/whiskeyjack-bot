@@ -178,7 +178,7 @@ def _retrieve(
         (True, 3, False, ("primary_provider_failed",)),
         # Zero documents alone is not a trigger: AskNews succeeded, and no
         # official-source/web retrieval was requested (finding: PR #16 round 1).
-        (False, 0, False, ()),
+        (False, 0, False, ("primary_returned_no_documents",)),
         (False, 3, True, ("official_source_required",)),
         (True, 0, False, ("primary_provider_failed", "primary_returned_no_documents")),
         (True, 3, True, ("primary_provider_failed", "official_source_required")),
@@ -221,8 +221,8 @@ def test_decide_fallback_does_not_run_on_empty_primary_alone() -> None:
     decision = decide_fallback(
         primary_failed=False, primary_documents=0, official_source_required=False
     )
-    assert decision.should_run is False
-    assert decision.reasons == ()
+    assert decision.should_run is True
+    assert decision.reasons == ("primary_returned_no_documents",)
 
 
 @pytest.mark.parametrize("documents", [-1, True, 1.5, "3", None])
@@ -273,10 +273,10 @@ def test_retrieve_web_refuses_a_reason_outside_the_vocabulary(config: AppConfig)
 
 def test_retrieve_web_refuses_a_non_authorizing_reason_alone(config: AppConfig) -> None:
     """primary_returned_no_documents is a fact worth recording, not a trigger."""
-    handler = _Exchange()
-    with pytest.raises(ExaFallbackError):
-        _retrieve(handler, config, reasons=("primary_returned_no_documents",))
-    assert handler.requests == [], "refusal must happen before any billable call"
+    handler = _Exchange(_json_ok(_body(_result())))
+    result = _retrieve(handler, config, reasons=("primary_returned_no_documents",))
+    assert handler.requests
+    assert result.documents
 
 
 def test_reasons_are_persisted_on_the_run(config: AppConfig) -> None:

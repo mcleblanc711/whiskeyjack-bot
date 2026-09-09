@@ -69,10 +69,10 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Literal, Mapping
 
 from whiskeyjack_bot.config import NumericCalibrationConfig, SupportedQuestionType
-from whiskeyjack_bot.forecast.cdf import build_numeric_cdf
+from whiskeyjack_bot.forecast.cdf import build_numeric_cdf, expected_cdf_points_for
 from whiskeyjack_bot.forecast.record import ForecastRecord
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
@@ -80,7 +80,10 @@ from whiskeyjack_bot.forecast.schema import (
     MultipleChoiceForecastResponse,
     NumericForecastResponse,
 )
-from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
+from whiskeyjack_bot.questions.model import (
+    CanonicalDiscreteQuestion,
+    CanonicalNumericQuestion,
+)
 from whiskeyjack_bot.submission import SubmissionError
 from whiskeyjack_bot.submission_gateway import GatewayError, canonical_payload_json
 from whiskeyjack_bot.submission_live import LiveSubmissionError, plan_from_payload
@@ -135,10 +138,18 @@ def build_submission_payload(
     elif question_type == "multiple_choice":
         payload = _multiple_choice_payload(record)
     elif question_type == "numeric":
-        payload = _numeric_payload(record, calibration)
+        payload = _bounded_payload(
+            record, calibration, question_type="numeric", question_cls=CanonicalNumericQuestion
+        )
+    elif question_type == "discrete":
+        payload = _bounded_payload(
+            record, calibration, question_type="discrete", question_cls=CanonicalDiscreteQuestion
+        )
     else:  # pragma: no cover - `SupportedQuestionType` is closed and the record validates it
         raise PayloadBuildError(_UNSUPPORTED_TYPE)
-    _require_postable(payload, calibration)
+    _require_postable(
+        payload, calibration, expected_cdf_points=_expected_points(record, calibration)
+    )
     return payload
 
 
@@ -238,14 +249,29 @@ def _multiple_choice_payload(record: ForecastRecord) -> dict[str, object]:
     }
 
 
-def _numeric_payload(
-    record: ForecastRecord, calibration: NumericCalibrationConfig
+def _bounded_payload(
+    record: ForecastRecord,
+    calibration: NumericCalibrationConfig,
+    *,
+    question_type: Literal["numeric", "discrete"],
+    question_cls: type[CanonicalNumericQuestion] | type[CanonicalDiscreteQuestion],
 ) -> dict[str, object]:
+    """The CDF payload for either bounded type (M1-205).
+
+    One function rather than two: the two differ only in which canonical class the stored
+    question must exactly be and which literal goes on the wire. The array itself is built
+    by ``build_numeric_cdf``, which reads the length and the step cap off the question --
+    so the discrete/numeric distinction is made once, there, and not re-decided here.
+
+    ``question_cls`` is passed rather than derived from ``question_type`` because the exact
+    ``type(...) is`` check below is what refuses a record whose stored question and stored
+    ``question_type`` disagree, and that check must name a class, not a string.
+    """
     forecast = record.forecast
     question = record.question
     if type(forecast) is not NumericForecastResponse:
         raise PayloadBuildError(_MISMATCHED_RESPONSE)
-    if type(question) is not CanonicalNumericQuestion:
+    if type(question) is not question_cls:
         raise PayloadBuildError(_MISMATCHED_QUESTION)
     try:
         cdf = build_numeric_cdf(forecast, calibration, question)
@@ -267,7 +293,7 @@ def _numeric_payload(
             f"is no payload for an approval to bind to: {'; '.join(exc.problems)}"
         ) from None
     return {
-        "question_type": "numeric",
+        "question_type": question_type,
         "continuous_cdf": list(cdf.values),
     }
 
@@ -285,7 +311,26 @@ _MISMATCHED_QUESTION = (
 _UNSUPPORTED_TYPE = "this record's question_type is not one this project can submit"
 
 
-def _require_postable(payload: Mapping[str, object], calibration: NumericCalibrationConfig) -> None:
+def _expected_points(record: ForecastRecord, calibration: NumericCalibrationConfig) -> int:
+    """The CDF length the live plan must be preflighted against.
+
+    A binary or multiple-choice payload carries no CDF, so the number is unused for them
+    and the numeric one is passed unchanged rather than inventing a sentinel. For the two
+    bounded types it comes from ``forecast.cdf`` -- the same call the conversion itself
+    made -- so this module cannot come to disagree with it (M1-205).
+    """
+    question = record.question
+    if question.qtype in ("numeric", "discrete"):
+        return expected_cdf_points_for(question, calibration)
+    return calibration.expected_cdf_points
+
+
+def _require_postable(
+    payload: Mapping[str, object],
+    calibration: NumericCalibrationConfig,
+    *,
+    expected_cdf_points: int,
+) -> None:
     """Refuse a payload the live path would refuse, here rather than after an approval.
 
     :func:`submission_live.plan_from_payload` is the complete account of what Metaculus
@@ -298,7 +343,7 @@ def _require_postable(payload: Mapping[str, object], calibration: NumericCalibra
     before approving and not after.
     """
     try:
-        plan_from_payload(payload, expected_cdf_points=calibration.expected_cdf_points)
+        plan_from_payload(payload, expected_cdf_points=expected_cdf_points)
     except LiveSubmissionError as exc:
         raise PayloadBuildError(
             f"the payload derived from this record is not one Metaculus would accept: {exc}"
@@ -325,5 +370,5 @@ def _render(payload: Mapping[str, object]) -> str:
 # added to `config.py` with no branch here must be a red build, not a payload that falls
 # through to `_UNSUPPORTED_TYPE` at approval time.
 BUILDABLE_QUESTION_TYPES: frozenset[SupportedQuestionType] = frozenset(
-    {"binary", "multiple_choice", "numeric"}
+    {"binary", "multiple_choice", "numeric", "discrete"}
 )

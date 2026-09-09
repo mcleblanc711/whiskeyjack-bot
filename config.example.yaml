@@ -65,6 +65,9 @@ forecast:
     - "binary"
     - "multiple_choice"
     - "numeric"
+    # M1-205. Omitting this does not merely skip discrete questions: forecast/generate.py
+    # refuses them, which is the deferral this item exists to end.
+    - "discrete"
   min_probability: 0.001
   max_probability: 0.999
   community_prediction_policy: "log_after_forecast_do_not_use_as_input"
