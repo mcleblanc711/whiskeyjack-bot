@@ -638,6 +638,15 @@ def _attempt_question(
 
         if question.close_time is None or question.close_time <= utcnow() + timedelta(minutes=5):
             raise TournamentError("less than five minutes remain; no new forecast purchased")
+        # Judged on the UNFILTERED packet, then filtered for the model. The order matters:
+        # `quality_problem` applies `usable` itself, so handing it an already-filtered
+        # packet left it unable to tell "we retrieved nothing" from "everything we
+        # retrieved had aged out" -- its `stale_evidence` branch could never be reached,
+        # because the documents that would prove staleness had been dropped a line earlier.
+        # The refusal decision is unchanged either way; only its recorded reason improves.
+        problem = quality_problem(
+            research.packet, question, now, config.retrieval.freshness_days_default
+        )
         research = replace(
             research,
             packet=usable_packet(
@@ -645,11 +654,39 @@ def _attempt_question(
             ),
         )
         assert research.packet is not None
-        problem = quality_problem(
-            research.packet, question, now, config.retrieval.freshness_days_default
-        )
         if problem:
-            raise TournamentError(problem)
+            # Recorded, not raised past the recorder. Until M1-326 this was
+            # `raise TournamentError(problem)`, which propagated straight past
+            # `_record_pre_forecast` -- so the verdict left no pipeline_failure_events row
+            # at all, and the caller could not tell a deterministic refusal from a
+            # transient provider error. Question 45452 refused 17 times and left exactly
+            # one such row, and that one was AskNews returning nothing, not this gate.
+            # `tournament.py` still turns this outcome into a TournamentError, so the
+            # question fails exactly as before -- it is now merely legible, and cheap to
+            # decline a second time.
+            note = _record_pre_forecast(
+                conn,
+                attempt_id=attempt_id,
+                question_id=question_id,
+                tournament_id=tournament_id,
+                event_type="research_failed",
+                detail_code=problem.code,
+                retrieval_run_id=research.retrieval_run_ids[0]
+                if research.retrieval_run_ids
+                else None,
+                occurred_at=now,
+            )
+            return QuestionOutcome(
+                question_id=question_id,
+                status="research_failed",
+                attempt_id=attempt_id,
+                retrieval_run_ids=research.retrieval_run_ids,
+                document_count=len(research.packet.documents),
+                research_reused=research.reused,
+                detail_code=problem.code,
+                problems=(problem.message,),
+                note=note,
+            )
 
     if research.packet is None:
         raise TournamentError("filtered research packet is missing")

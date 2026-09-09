@@ -16,7 +16,9 @@ from asknews_sdk.dto.news import SearchResponse
 from whiskeyjack_bot.config import validate_config_data
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.questions.normalize import normalize_questions
-from whiskeyjack_bot.tournament import run_once
+from whiskeyjack_bot import tournament as whiskeyjack_tournament
+from whiskeyjack_bot import tournament_state
+from whiskeyjack_bot.tournament import MAX_TRANSIENT_ATTEMPTS, run_once
 from whiskeyjack_bot.tournament_state import (
     Budget,
     StorageFailure,
@@ -208,6 +210,122 @@ def test_unusable_evidence_never_purchases_a_forecast(case: Any, field: str) -> 
     setattr(case[3], field, True)
     assert poll(case)["heartbeat"]["failures"] == 1
     assert case[4].calls == case[2].posts == 0
+
+
+@pytest.mark.parametrize(
+    "field,expected_code", [("future", "stale_evidence"), ("stale", "stale_evidence")]
+)
+def test_deterministic_refusal_is_recorded_and_never_re_purchased(
+    case: Any, field: str, expected_code: str
+) -> None:
+    """M1-326: the second poll declines for free.
+
+    Asserted on ``News.calls`` -- billed provider calls -- and never on ``research_runs``
+    rows, which are wrong in both directions: ``started_at_utc`` is the *pinned* ``now``
+    rather than wall clock, so distinct timestamps undercount retrievals, while the row
+    count overcounts billed calls because a within-window repeat is served from
+    ``durable.py``'s dedup without billing. Live, question 45452 spent 33 billed AskNews
+    calls re-deriving one unchanging verdict.
+    """
+    conn, _config, platform, news, model = case
+    setattr(news, field, True)
+
+    assert poll(case)["heartbeat"]["failures"] == 1
+    first = news.calls
+    assert first == 2, "one retrieval is two AskNews calls, never one"
+
+    row = conn.execute("SELECT event_type, detail_code FROM pipeline_failure_events").fetchone()
+    assert tuple(row) == ("research_failed", expected_code), (
+        "the verdict must reach pipeline_failure_events; before M1-326 it was raised "
+        "straight past the recorder and left no row at all"
+    )
+
+    second = poll(case)
+    assert news.calls == first, "a deterministic verdict must never be re-purchased"
+    assert model.calls == platform.posts == 0
+    assert second["heartbeat"]["blocked"] == 1
+    assert second["heartbeat"]["failures"] == 0, "declining is not failing"
+
+
+def test_editing_the_question_re_qualifies_a_blocked_question(case: Any) -> None:
+    """The block is keyed on the fingerprint, so a changed question is a new question."""
+    conn, _config, _platform, news, _model = case
+    news.stale = True
+    poll(case)
+    blocked = conn.execute(
+        "SELECT COUNT(*) FROM tournament_events WHERE kind='question_blocked'"
+    ).fetchone()[0]
+    assert blocked == 1 and news.calls == 2
+
+    poll(case)
+    assert news.calls == 2, "unchanged question: still blocked"
+
+    news.raw["question"]["title"] += " (revised)"
+    poll(case)
+    assert news.calls == 4, "an edited question must be retrieved again"
+
+
+def test_transient_exhaustion_records_the_blocked_question(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-1 finding B1: exhaustion must name the question, not just count it.
+
+    A provider outage is transient, so the question is retried -- bounded. When the bound is
+    reached the skip has to append a fingerprint-bound `question_blocked` row; before the fix
+    it left only an aggregate ``heartbeat["exhausted"]``, so the exhausted question was
+    unidentifiable in the ledger.
+
+    The clock advances 31 minutes between polls because attempts are counted in
+    `question_started` events, and those are appended only once the 1800s checkpoint has
+    expired -- inside one window `now` is pinned and four polls consume a single attempt.
+    That is the checkpoint-round semantics the cap is deliberately built on.
+    """
+    conn, _config, platform, news, _model = case
+    real_now = utcnow()
+    platform.raw["question"]["scheduled_close_time"] = (real_now + timedelta(hours=8)).isoformat()
+
+    clock = {"now": real_now}
+    monkeypatch.setattr(tournament_state, "utcnow", lambda: clock["now"])
+    monkeypatch.setattr(whiskeyjack_tournament, "utcnow", lambda: clock["now"])
+
+    def outage(**kwargs: Any) -> SearchResponse:
+        news.calls += 1
+        raise RuntimeError("provider outage")
+
+    monkeypatch.setattr(news, "search_news", outage)
+
+    for _ in range(MAX_TRANSIENT_ATTEMPTS):
+        assert poll(case)["heartbeat"]["failures"] == 1
+        clock["now"] += timedelta(minutes=31)
+
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM tournament_events WHERE kind='question_blocked'"
+        ).fetchone()[0]
+        == 0
+    ), "a transient failure must not block before the bound"
+
+    exhausted = poll(case)
+    assert exhausted["heartbeat"]["exhausted"] == 1
+    rows = [
+        json.loads(r[0])
+        for r in conn.execute("SELECT data FROM tournament_events WHERE kind='question_blocked'")
+    ]
+    assert len(rows) == 1, "exhaustion must record exactly one block, at the transition"
+    assert rows[0]["reason"] == "transient_attempts_exhausted"
+    assert rows[0]["attempts"] == MAX_TRANSIENT_ATTEMPTS
+    assert rows[0]["fingerprint"], "the block must be fingerprint-bound"
+
+    billed = news.calls
+    clock["now"] += timedelta(minutes=31)
+    again = poll(case)
+    assert again["heartbeat"]["blocked"] == 1 and news.calls == billed
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM tournament_events WHERE kind='question_blocked'"
+        ).fetchone()[0]
+        == 1
+    ), "the block is appended at the transition, not on every later poll"
 
 
 def test_wrong_timestamp_is_repaired_at_most_once_and_never_posted(case: Any) -> None:
