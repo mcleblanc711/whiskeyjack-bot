@@ -210,6 +210,61 @@ def test_unusable_evidence_never_purchases_a_forecast(case: Any, field: str) -> 
     assert case[4].calls == case[2].posts == 0
 
 
+@pytest.mark.parametrize(
+    "field,expected_code", [("future", "stale_evidence"), ("stale", "stale_evidence")]
+)
+def test_deterministic_refusal_is_recorded_and_never_re_purchased(
+    case: Any, field: str, expected_code: str
+) -> None:
+    """M1-326: the second poll declines for free.
+
+    Asserted on ``News.calls`` -- billed provider calls -- and never on ``research_runs``
+    rows, which are wrong in both directions: ``started_at_utc`` is the *pinned* ``now``
+    rather than wall clock, so distinct timestamps undercount retrievals, while the row
+    count overcounts billed calls because a within-window repeat is served from
+    ``durable.py``'s dedup without billing. Live, question 45452 spent 33 billed AskNews
+    calls re-deriving one unchanging verdict.
+    """
+    conn, _config, platform, news, model = case
+    setattr(news, field, True)
+
+    assert poll(case)["heartbeat"]["failures"] == 1
+    first = news.calls
+    assert first == 2, "one retrieval is two AskNews calls, never one"
+
+    row = conn.execute(
+        "SELECT event_type, detail_code FROM pipeline_failure_events"
+    ).fetchone()
+    assert tuple(row) == ("research_failed", expected_code), (
+        "the verdict must reach pipeline_failure_events; before M1-326 it was raised "
+        "straight past the recorder and left no row at all"
+    )
+
+    second = poll(case)
+    assert news.calls == first, "a deterministic verdict must never be re-purchased"
+    assert model.calls == platform.posts == 0
+    assert second["heartbeat"]["blocked"] == 1
+    assert second["heartbeat"]["failures"] == 0, "declining is not failing"
+
+
+def test_editing_the_question_re_qualifies_a_blocked_question(case: Any) -> None:
+    """The block is keyed on the fingerprint, so a changed question is a new question."""
+    conn, _config, _platform, news, _model = case
+    news.stale = True
+    poll(case)
+    blocked = conn.execute(
+        "SELECT COUNT(*) FROM tournament_events WHERE kind='question_blocked'"
+    ).fetchone()[0]
+    assert blocked == 1 and news.calls == 2
+
+    poll(case)
+    assert news.calls == 2, "unchanged question: still blocked"
+
+    news.raw["question"]["title"] += " (revised)"
+    poll(case)
+    assert news.calls == 4, "an edited question must be retrieved again"
+
+
 def test_wrong_timestamp_is_repaired_at_most_once_and_never_posted(case: Any) -> None:
     case[4].wrong_time = True
     assert poll(case)["heartbeat"]["failures"] == 1

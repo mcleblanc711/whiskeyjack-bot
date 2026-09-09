@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 from whiskeyjack_bot.approval import approve
@@ -42,6 +42,7 @@ from whiskeyjack_bot.tournament_state import (
     TournamentError,
     append,
     budget_context,
+    digest,
     events,
     require_activation,
     require_spending_clear,
@@ -49,6 +50,30 @@ from whiskeyjack_bot.tournament_state import (
     utcnow,
     witness,
 )
+
+
+# Which recorded failures a second attempt could actually change (M1-326).
+#
+# Deterministic verdicts are re-derived identically from the same question and the same
+# stored evidence, so re-buying research to reach one again is not a retry -- it is the
+# same answer at full price. `research/quality.py`'s verdict and
+# `research/sufficiency.py`'s are both explicitly pure over a stored packet and a fixed
+# `now`; `schema_invalid`/`calibration_invalid` are a model response failing a fixed
+# schema. The transient half is genuinely worth another attempt: a provider, a socket or
+# an unlucky sample.
+#
+# Split, rather than gating on "any failure", because a provider outage must not
+# permanently retire a question -- and gated on the question FINGERPRINT, so an edited
+# question is a new question and qualifies again.
+DETERMINISTIC_FAILURE_CODES: Final = frozenset(
+    {"no_evidence", "stale_evidence", "schema_invalid", "calibration_invalid"}
+)
+
+# A transient failure is worth retrying, but not without end: MiniBench question 45754
+# spent 10 `generation_failed/internal_error` attempts and 45764 six `schema_invalid`
+# ones, and generation runs *after* retrieval is billed, so an unbounded transient retry
+# is the same money pump wearing a different label.
+MAX_TRANSIENT_ATTEMPTS: Final = 3
 
 
 @contextmanager
@@ -387,6 +412,33 @@ def run_once(
             if events(conn, "restored_question_hold", f"{project}:{question.question_id}"):
                 heartbeat["skipped"] += 1
                 continue
+            # The M1-326 gate, placed with the other skips and so ahead of every provider
+            # call AND ahead of the Metaculus refetch below. A question whose recorded
+            # verdict cannot change is declined here for free; before this, the verdict was
+            # re-derived by re-buying the research it was derived from, every 30 minutes,
+            # for as long as the question stayed open.
+            scope = f"{project}:{question.question_id}"
+            fingerprint = digest(question.model_dump(mode="json"))
+            blocked = [
+                event
+                for event in events(conn, "question_blocked", scope)
+                if event.get("fingerprint") == fingerprint
+            ]
+            if blocked:
+                heartbeat["skipped"] += 1
+                heartbeat["blocked"] = heartbeat.get("blocked", 0) + 1
+                continue
+            if (
+                sum(
+                    1
+                    for event in events(conn, "question_started", scope)
+                    if event.get("fingerprint") == fingerprint
+                )
+                >= MAX_TRANSIENT_ATTEMPTS
+            ):
+                heartbeat["skipped"] += 1
+                heartbeat["exhausted"] = heartbeat.get("exhausted", 0) + 1
+                continue
             existing = conn.execute(
                 "SELECT record_id FROM forecast_records WHERE question_id=? AND tournament_id=? "
                 "ORDER BY forecast_version DESC LIMIT 1",
@@ -414,11 +466,10 @@ def run_once(
                 else:
                     require_spending_clear(conn, budget.scope)
                     # Persist a cutoff for restart recovery; generation requests stay byte-identical.
-                    scope = f"{project}:{question.question_id}"
+                    # `scope` and `fingerprint` are the ones the M1-326 gate above already
+                    # computed -- recomputing them here would let the gate and the
+                    # checkpoint disagree about what "the same question" means.
                     checkpoints = events(conn, "question_started", scope)
-                    from whiskeyjack_bot.tournament_state import digest
-
-                    fingerprint = digest(question.model_dump(mode="json"))
                     if (
                         checkpoints
                         and checkpoints[-1]["fingerprint"] == fingerprint
@@ -459,6 +510,25 @@ def run_once(
                         or outcome.artifact_outcome == "failed"
                     ):
                         raise StorageFailure("forecast or evidence storage failed; worker stopped")
+                    if (
+                        outcome.detail_code in DETERMINISTIC_FAILURE_CODES
+                        and outcome.status != "recorded"
+                    ):
+                        # Record the verdict as gate state before re-raising. The question
+                        # still fails this poll exactly as it did before M1-326; what
+                        # changes is that the next poll can decline it without buying the
+                        # evidence again. The fingerprint travels with it, so an edited
+                        # question is not covered by an older question's verdict.
+                        append(
+                            conn,
+                            "question_blocked",
+                            scope,
+                            {
+                                "at": utcnow().isoformat(),
+                                "fingerprint": fingerprint,
+                                "detail_code": outcome.detail_code,
+                            },
+                        )
                     if outcome.status != "recorded" or outcome.record_id is None:
                         raise TournamentError("question research or generation failed")
                     record_id = outcome.record_id
