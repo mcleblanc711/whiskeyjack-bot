@@ -304,25 +304,10 @@ def _require_storable(text: str, message: str) -> str:
 
 
 def derive_queries(question: CanonicalQuestion) -> tuple[str, ...]:
-    """The retrieval queries for one question. Pure, deterministic, and deliberately few.
+    """One consolidated query with group context and the resolution contract.
 
-    **Minimal on purpose.** ``retrieval.max_queries_per_question`` is 6 and AskNews bills
-    two calls per query, so query construction is the largest single lever on what a run
-    costs. The alternatives were weighed and rejected: asking the model to expand the
-    question into search queries spends a billable call to decide how to spend billable
-    calls, and hand-written keyword heuristics over a question title are guesses this
-    project cannot evaluate offline. What is left is what the question actually says.
-
-    So: the title, and -- when the question is a group sibling (M1-202) -- the parent title
-    joined to it, *first*, because unpacking leaves sibling titles like "Democratic" whose
-    meaning lives entirely in the parent. Both are emitted when they differ, since the
-    combined form is the more complete question and the bare title is the more precise
-    search term.
-
-    Richer construction is filed as its own row rather than invented here. The adapters
-    apply ``max_queries_per_question`` themselves, so this returns everything it derived
-    and does not read config -- which is what keeps it a pure function worth a property
-    pass.
+    Deterministic, capped at 4,000 characters; AskNews applies current and archive
+    retrieval to this same query. Exa receives at most two complementary queries.
     """
     if not isinstance(question, _CanonicalQuestionBase):
         raise OrchestrationError("question must be a canonical question")
@@ -340,18 +325,11 @@ def derive_queries(question: CanonicalQuestion) -> tuple[str, ...]:
         raise OrchestrationError("the question has no title to search on")
     _require_storable(title, "the question title cannot be stored (offending value withheld)")
 
-    queries: list[str] = []
-    parent = question.group_parent_title
-    if parent is not None:
-        collapsed = " ".join(parent.split())
-        if collapsed:
-            _require_storable(
-                collapsed, "the group parent title cannot be stored (offending value withheld)"
-            )
-            queries.append(f"{collapsed} {title}")
-    if title not in queries:
-        queries.append(title)
-    return tuple(queries)
+    pieces = [question.group_parent_title, title, question.resolution_criteria, question.fine_print]
+    collapsed = [" ".join(p.split()) for p in pieces if p]
+    for part in collapsed:
+        _require_storable(part, "question search material cannot be stored")
+    return (" ".join(p for p in collapsed if p)[:4000].rstrip(),)
 
 
 def _opening_run(
@@ -458,6 +436,7 @@ def _fallback_pass(
     now_utc: datetime,
     injected: Any | None,
     billed: list[_BilledCall],
+    include_domains: tuple[str, ...] = (),
 ) -> ProviderRun | None:
     """Run the Exa fallback, or report why it could not run. Never raises for that.
 
@@ -491,6 +470,7 @@ def _fallback_pass(
             retrieval_run_id=run_id,
             now=now_utc,
             fallback_reasons=list(reasons),
+            include_domains=include_domains,
         )
     except ExaFallbackError as exc:
         # `retrieve_web` refuses before its own network use, so nothing was billed *here*
@@ -578,6 +558,8 @@ def retrieve_for_question(
             "the fallback and refuses to run without a reason the primary was left"
         )
 
+    from whiskeyjack_bot.research.quality import source_domains, usable
+
     queries = derive_queries(question)
     question_id = question.question_id
     primary_run_id = _mint_run_id()
@@ -646,9 +628,11 @@ def retrieve_for_question(
         decision = decide_fallback(
             primary_failed=primary.provider_failed,
             primary_documents=len(primary.documents),
-            # No config field expresses this and this module will not invent one; see the
-            # module docstring. M1-304's router is where it belongs.
-            official_source_required=False,
+            official_source_required=bool(source_domains(question))
+            or not any(
+                usable(d, question, now_utc, config.retrieval.freshness_days_default)
+                for d in primary.documents
+            ),
         )
         if decision.should_run:
             _LOGGER.info(
@@ -660,11 +644,15 @@ def retrieve_for_question(
                 conn,
                 config,
                 question_id=question_id,
-                queries=queries,
+                queries=(
+                    queries[0],
+                    f"{question.title} latest data {' '.join(source_domains(question))}",
+                ),
                 reasons=decision.reasons,
                 now_utc=now_utc,
                 injected=web_client,
                 billed=billed,
+                include_domains=source_domains(question),
             )
             if fallback is not None:
                 runs.append(fallback)

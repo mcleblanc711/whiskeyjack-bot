@@ -526,7 +526,8 @@ def test_an_unregistered_question_type_raises_this_modules_error() -> None:
     with pytest.raises(ForecastOutputError) as caught:
         _problems(forecast)
     assert caught.value.problems == [
-        "question_type: must be one of binary, multiple_choice, numeric (offending input withheld)"
+        "question_type: must be one of binary, discrete, multiple_choice, numeric "
+        "(offending input withheld)"
     ]
 
 

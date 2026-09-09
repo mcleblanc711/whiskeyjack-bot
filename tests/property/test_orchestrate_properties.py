@@ -206,5 +206,8 @@ def test_the_strategy_reaches_both_arms() -> None:
     honestly be reached.
     """
     assert not _refuses(find(questions(), lambda question: not _refuses(question)))
-    assert len(derive_queries(find(questions(), lambda q: len(derive_queries(q)) == 2))) == 2
-    assert len(derive_queries(find(questions(), lambda q: len(derive_queries(q)) == 1))) == 1
+    assert len(derive_queries(find(questions(), lambda q: q.group_parent_title is None))) == 1
+    parent = find(
+        questions(), lambda q: bool(q.group_parent_title and q.group_parent_title.strip())
+    )
+    assert len(derive_queries(parent)) == 1

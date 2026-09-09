@@ -43,3 +43,11 @@ data/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Operator-local configuration. `config.example.yaml` is the committed contract and
+# `config/tournament.yaml` is what the systemd unit actually loads; a `config.yaml` in the
+# repo root is a machine-local file that nothing in the program reads by default. It was
+# untracked and shadowing the real one during the M1-323 incident, which is how a stale copy
+# came to be read as the live config -- ignore it rather than leaving it to dirty the tree
+# and block `review-request.py`.
+/config.yaml

@@ -247,6 +247,9 @@ def _settings_payload(settings: object) -> dict[str, Any]:
         payload[name] = value
     for name in _SETTINGS_FLOAT_FIELDS:
         value = getattr(settings, name, None)
+        if name == "temperature" and value is None and hasattr(settings, name):
+            payload[name] = None
+            continue
         if type(value) is int:
             value = float(value)
         if type(value) is not float or value != value or value in (float("inf"), float("-inf")):
@@ -328,7 +331,9 @@ def write_raw_model_output(
     bodies = [redact_secrets(body, secret_env_var_names) for body in bodies]
 
     envelope = {
-        "artifact_schema_version": MODEL_OUTPUT_SCHEMA_VERSION,
+        "artifact_schema_version": "1.1.0"
+        if getattr(getattr(generation, "settings", None), "temperature", 0) is None
+        else MODEL_OUTPUT_SCHEMA_VERSION,
         "attempt_id": attempt,
         "question_id": question,
         "model_settings": _settings_payload(getattr(generation, "settings", None)),
@@ -414,6 +419,12 @@ def _settings_from(envelope: dict[str, Any], path: Path) -> ModelSettings:
         # Strict for `_reader_number`'s reason: `_settings_payload` normalizes an int to a
         # float before the envelope is rendered, so a bare int here is a shape the writer
         # cannot emit.
+        if (
+            name == "temperature"
+            and payload[name] is None
+            and envelope.get("artifact_schema_version") == "1.1.0"
+        ):
+            continue
         _reader_number(payload[name], f"raw model output artifact model_settings {name}")
     return ModelSettings(
         provider=payload["provider"],
@@ -470,7 +481,7 @@ def read_raw_model_output(artifact_root: Path, relative_path: str) -> StoredMode
     if not isinstance(envelope, dict):
         raise ArtifactError(f"raw model output artifact is not a JSON object: {path}")
     version = envelope.get("artifact_schema_version")
-    if version != MODEL_OUTPUT_SCHEMA_VERSION:
+    if version not in (MODEL_OUTPUT_SCHEMA_VERSION, "1.1.0"):
         # The expected version is this module's own literal; the found one is file content
         # and is withheld, exactly as load_snapshot does.
         raise ArtifactError(

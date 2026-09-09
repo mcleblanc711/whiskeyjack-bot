@@ -543,7 +543,7 @@ def test_the_gated_seam_never_mints_a_key_for_an_unapproved_record(
     so the gated seam must refuse every one of them -- whatever the tournament, question
     or payload happens to be.
     """
-    record_id, _ = _seed(tournament_id, 1)
+    record_id, _ = _seed(tournament_id, 1_000_000 + next(_COUNTER))
     with pytest.raises(SubmissionError, match="holds no approval in force"):
         submission_key_for_approved_record(_conn(), record_id, request_payload_sha256=digest)
 
@@ -560,14 +560,8 @@ def test_the_gated_seam_never_mints_a_key_for_an_unapproved_record(
 
 
 def _fresh_key(tournament_id: str, digest: str) -> tuple[str, str]:
-    """A record and a key nothing has claimed yet.
-
-    `_seed` appends a new version to the chain every call, and `forecast_version` is one
-    of the four hashed inputs, so two examples drawing the same tournament and digest
-    still derive different keys. Without that this file's own reuse of shrunk draws would
-    make half these examples assert against a key a previous example had already spent.
-    """
-    record_id, _ = _seed(tournament_id, 1)
+    """Use a fresh question: reservation exclusion now spans forecast versions."""
+    record_id, _ = _seed(tournament_id, 1_000_000 + next(_COUNTER))
     return record_id, submission_key_for_record(_conn(), record_id, request_payload_sha256=digest)
 
 

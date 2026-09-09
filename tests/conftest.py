@@ -15,6 +15,20 @@ from typing import Final
 import pytest
 from pytest_socket import SocketBlockedError
 
+# Prevent dependency import-time dotenv loading and paid-client initialization.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+for _credential in (
+    "METACULUS_TOKEN",
+    "OPENROUTER_API_KEY",
+    "ASKNEWS_API_KEY",
+    "EXA_API_KEY",
+    "XAI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+):
+    os.environ.pop(_credential, None)
+
 # Where to put pytest's temp root when the platform offers a memory-backed filesystem.
 TMPFS_ROOT: Final = Path("/dev/shm")
 

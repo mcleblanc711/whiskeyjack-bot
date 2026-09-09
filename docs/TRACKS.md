@@ -34,13 +34,63 @@ to the registry, and neither is a habit you can form by reflex.
 | --- | --- | --- |
 | Dependency additions (`pyproject.toml` + `uv.lock`) | *free* | Previously claimed by M1-303 on 2026-07-27 and **released unused** (the Exa adapter used `httpx` instead of adding `exa-py`). **M1-311 claimed it 2026-08-25, spent it, and merged** (PR #40, round-2 approval, 2026-08-25): `publicsuffix2` rejects multi-label suffixes (`co.uk`, `com.au`) that the old dependency-free rule missed. Released now that the branch is on master. |
 | Workflow / test-infrastructure change | *free* — **and should stay free until this wave closes** | Three concurrent lanes means every workflow change lands in three open review cycles at once, which is lesson 1 at triple cost. If one is genuinely needed mid-wave, claim the slot here and **say so in the next review request on every open lane** — the reviewer is stateless and reads a format change as a substantive one. Lesson 1: a workflow change is a track and takes a slot. Held 2026-08-17 by `test/tmpfs-temp-root` (PR #24) and `chore/review-loop` (PR #25), **both merged and released the same day**. #24 moved pytest's temp root to tmpfs (`tests/conftest.py`): full suite 497.7s → 81.3s, `test_lifecycle.py` 96.5s → 3.2s, because the dev machine's only drive is a 7200rpm platter at 49.6ms/fsync. #25 added `scripts/gate.sh`, `scripts/run-review.sh` and the `fast` hypothesis profile. They landed **mid-wave** by deliberate exception, having been checked against every live branch first — the only conflict was this table. **Say so in the next review request:** the conftest change moves where temp files land, nothing about what is asserted. |
-| Next free migration number | **`012`** — free. **M2-707 spends `011`** (`011_approval_payload_binding.sql`, 2026-09-02, on `feat/m2-707-bind-approval-payload`): closing `D33` needed somewhere to put the digest of the payload a decision authorized, and this is the *column* case rather than `010`'s new-table case — the hash has exactly the lifetime and exactly the cardinality of the `approval_events` row it sits on, so a side table would have bought a join per approval read for a row count that is always one. One `ADD COLUMN` plus one `DROP`/`CREATE` of `approval_events_bind_forecast_hash_on_insert` — the **first** rewrite of that trigger since `003` wrote it, and the same cheap escape hatch `004`, `006`, `007`, `008` and `009` used rather than the append-only table rebuild `003`'s header exists to warn about. The recreated trigger is `003`'s definition with two clauses appended and nothing else changed: a payload hash is **required** for `approved` and **forbidden** for `rejected`, which is what makes a NULL mean exactly one thing per decision (on an approval, a pre-`011` row). `010` was M2-708's, merged (PR #51, 2026-08-29) and now immutable on master | `001`-`010` are immutable on master; `006_non_blank_identifiers.sql` landed with **M1-607**, `007_forecast_version_chain.sql` with **M1-602** (PR #38), and **`008_forecast_raw_output.sql` with M1-406** (merged 2026-08-25, PR #41) — it added `raw_output_path`, `cost_usd` and `model_invocations` to `forecast_records` and appended three clauses to `forecast_records_require_draft_on_insert`, the fourth DROP/CREATE of that trigger (`004`, `006`, `007`, `008`) and the reason that pattern is worth keeping cheap. **M2-711 spent `009`** (`009_submission_refetch_outcome.sql`, 2026-08-26): recording a post whose outcome no refetch established needed a vocabulary member that `(success, verified_by_refetch)` had no room for. Worth recording **which** vocabulary, because the choice was the item: not a twelfth `lifecycle_events.event_type`, which is a column `CHECK` and so costs a rebuild of the append-only table `003`'s header exists to protect, but a new `submission_attempts.refetch_outcome` column reached by `ADD COLUMN`, with `submission_uncertain` widened to cover the new cell. One `ADD COLUMN` plus two `DROP`/`CREATE` trigger rewrites — the cheap escape hatch `004`, `006`, `007` and `008` used, now on `submission_attempts_require_receipt_on_insert` (second rewrite, after `006`) and `lifecycle_events_validate_on_insert` (**first** rewrite since `003` wrote it). It was the only item in wave 9 that needed a migration. **M2-708 spends `010`** (`010_submission_key_reservations.sql`, 2026-08-28): reserving an idempotency key *before* a post needs somewhere durable to put the claim, and neither existing table could hold it — `submission_attempts` is written once, after the call, and widening `lifecycle_events` means the `CHECK` rebuild `009` refused. So this one adds two new tables rather than a column: `submission_key_reservations` (the claim) and `submission_key_releases` (its resolution), the same claim/resolution pair `submission_attempts`/`submission_verifications` already are. New tables cost no precondition scan and no trigger rewrite — the first migration since `003` that touches none of the existing trigger bodies. Remember this column is advisory and nothing reads it — `.github/scripts/check-migrations.sh` plus master's up-to-date-branch requirement is the enforcement, as the `004` collision records: `004_pipeline_failure_events.sql` landed with **M1-606** and `005_research_run_counters.sql` with **M1-306**, and both branches were told `004` was free, because a claim lives on its holder's branch and this column is advisory — `scripts/tracks.py` checks the *dependency* claim and nothing reads this one. M1-606 merged first; M1-306 renumbered to `005` at its daily master merge, which is the designed outcome, and renumbering was safe only because M1-306's `004` had never reached master. |
+| Next free migration number | **`014`** — next free. **M1-205 spends `013`** (`013_discrete_question_type.sql`, 2026-09-07): admitting `discrete` to `forecast_records_require_draft_on_insert`'s question_type vocabulary, which is the DROP/CREATE escape hatch 008's own comment predicted for exactly this case rather than the append-only table rebuild 003's header warns about. Fifth rewrite of that trigger (004, 006, 007, 008, 013). **Claimed after the item started, which is a process miss worth recording:** the item planned "no migration" because it checked `forecast_records` for a CHECK constraint on the column and found none — the vocabulary is enforced by a trigger. Cross-model review round 3 found it. Launch readiness claimed `012`. **M2-707 spends `011`** (`011_approval_payload_binding.sql`, 2026-09-02, on `feat/m2-707-bind-approval-payload`): closing `D33` needed somewhere to put the digest of the payload a decision authorized, and this is the *column* case rather than `010`'s new-table case — the hash has exactly the lifetime and exactly the cardinality of the `approval_events` row it sits on, so a side table would have bought a join per approval read for a row count that is always one. One `ADD COLUMN` plus one `DROP`/`CREATE` of `approval_events_bind_forecast_hash_on_insert` — the **first** rewrite of that trigger since `003` wrote it, and the same cheap escape hatch `004`, `006`, `007`, `008` and `009` used rather than the append-only table rebuild `003`'s header exists to warn about. The recreated trigger is `003`'s definition with two clauses appended and nothing else changed: a payload hash is **required** for `approved` and **forbidden** for `rejected`, which is what makes a NULL mean exactly one thing per decision (on an approval, a pre-`011` row). `010` was M2-708's, merged (PR #51, 2026-08-29) and now immutable on master | `001`-`010` are immutable on master; `006_non_blank_identifiers.sql` landed with **M1-607**, `007_forecast_version_chain.sql` with **M1-602** (PR #38), and **`008_forecast_raw_output.sql` with M1-406** (merged 2026-08-25, PR #41) — it added `raw_output_path`, `cost_usd` and `model_invocations` to `forecast_records` and appended three clauses to `forecast_records_require_draft_on_insert`, the fourth DROP/CREATE of that trigger (`004`, `006`, `007`, `008`) and the reason that pattern is worth keeping cheap. **M2-711 spent `009`** (`009_submission_refetch_outcome.sql`, 2026-08-26): recording a post whose outcome no refetch established needed a vocabulary member that `(success, verified_by_refetch)` had no room for. Worth recording **which** vocabulary, because the choice was the item: not a twelfth `lifecycle_events.event_type`, which is a column `CHECK` and so costs a rebuild of the append-only table `003`'s header exists to protect, but a new `submission_attempts.refetch_outcome` column reached by `ADD COLUMN`, with `submission_uncertain` widened to cover the new cell. One `ADD COLUMN` plus two `DROP`/`CREATE` trigger rewrites — the cheap escape hatch `004`, `006`, `007` and `008` used, now on `submission_attempts_require_receipt_on_insert` (second rewrite, after `006`) and `lifecycle_events_validate_on_insert` (**first** rewrite since `003` wrote it). It was the only item in wave 9 that needed a migration. **M2-708 spends `010`** (`010_submission_key_reservations.sql`, 2026-08-28): reserving an idempotency key *before* a post needs somewhere durable to put the claim, and neither existing table could hold it — `submission_attempts` is written once, after the call, and widening `lifecycle_events` means the `CHECK` rebuild `009` refused. So this one adds two new tables rather than a column: `submission_key_reservations` (the claim) and `submission_key_releases` (its resolution), the same claim/resolution pair `submission_attempts`/`submission_verifications` already are. New tables cost no precondition scan and no trigger rewrite — the first migration since `003` that touches none of the existing trigger bodies. Remember this column is advisory and nothing reads it — `.github/scripts/check-migrations.sh` plus master's up-to-date-branch requirement is the enforcement, as the `004` collision records: `004_pipeline_failure_events.sql` landed with **M1-606** and `005_research_run_counters.sql` with **M1-306**, and both branches were told `004` was free, because a claim lives on its holder's branch and this column is advisory — `scripts/tracks.py` checks the *dependency* claim and nothing reads this one. M1-606 merged first; M1-306 renumbered to `005` at its daily master merge, which is the designed outcome, and renumbering was safe only because M1-306's `004` had never reached master. |
 
 ## Worktrees
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
+| M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
+| T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
+| M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |
+| M1-327 | feat/m1-327-named-source-evidence-gap | whiskeyjack-m1-327 | no | none | 2026-09-09 |
+| M1-407 | feat/m1-407-prompt-bounds-crosscheck | whiskeyjack-m1-407 | no | none | 2026-09-04 |
+| D-1001 | feat/d-1001-operator-runbook | whiskeyjack-d-1001 | no | none | 2026-09-04 |
+| M1-604 | feat/m1-604-ledger-exports | whiskeyjack-m1-604 | **yes** | none | 2026-09-04 |
 | M2-705 | feat/m2-705-response-capture | whiskeyjack-m2-705 | no | none | 2026-09-04 |
+*(Merged and left in place, per the rule below: **M1-326** (PR #79, round-2 approve,
+2026-09-09) and **M1-327** (PR #80, round-2 approve, 2026-09-09 — it demoted the
+named-resolution-source gate from fatal to a recorded `evidence_gap` row and scoped M1-326's
+attempt counters to `activation_id`). Their rows stay in the table above as the landed-claim
+evidence `scripts/tracks.py` needs; this note is the record of the merge, **in addition to**
+the row and never instead of it.*
+
+*The four rows added above are the **live** wave-13 lanes, written into the table on master so
+the board is readable from one place. Each row also exists on its own branch, which is what
+`scripts/tracks.py` actually reads — `M1-407`'s claim was invisible until 2026-09-09 because
+its branch had never been pushed, so the claim existed only in a local commit. Pushing a claim
+branch is what publishes the claim.*
+
+**Do not sweep a landed row out of this table into the prose below.** `scripts/tracks.py`
+proves a claim is a *stale landed* one rather than a misspelling by finding the exact row on
+`origin/master` (`live_claims`: `signature in master_rows`) — so deleting the row destroys the
+only evidence that its deleted branch merged rather than vanished. `T-902` was swept on
+2026-09-07 while three parked branches still carried its row, and from then until 2026-09-09
+`scripts/tracks.py claims` exited 1, which under `set -euo pipefail` made `start-item.sh` abort
+for **every** item, deps or not. The row above is restored for that reason; `M1-205`'s row, also
+merged, was correctly left in place. Record a merge in the prose *in addition to* the row, never
+instead of it.
+
+*(Swept `LAUNCH` (`release/launch-readiness`, merged PR #75, 2026-09-07 — it shipped the
+operator runbook and the activated tournament runner, and spent migration `012`) and `T-902`
+(merged PR #74, round-1 approve, 0 findings; its branch is already gone from `origin`). The
+board is otherwise clear: four parked branches remain, all 0 behind master and none
+tournament-relevant.*
+
+**This item lands mid-round, while the tournament is live, and that is deliberate.** `discrete`
+is 11 of MiniBench's 42 questions and every one is currently deferred under D21.
+
+**Correction (round 1 caught this claim before it could mislead anyone):** an earlier version
+of this note said the item changes no activation-hashed file. That was wrong.
+`prompts/forecaster-tournament.md` is untouched, but **`config/tournament.yaml` is not** --
+`forecast.supported_question_types` gates generation at `forecast/generate.py:351`, so it
+gains `- discrete` and the worker **will** refuse until `tournament enable` is re-run.
+
+Deploy order: pull, re-enable, confirm `status` reads `enabled: true` with a null
+`refusal_reason`. Re-enabling does not reset spending — it is scoped by
+`account_id:project_id` (`tournament.py:227`), not by `activation_id`. Merging changes
+nothing on the live host until someone pulls.*
+
 *(Swept `T-904` (merged, PR #72, round-1 approve, 2026-09-04), `M2-712` (merged, PR #71,
 2026-09-04) and `T-907` (merged, PR #70, 2026-09-04) at this branch's master merge. The
 master-side note anticipated this exact resolution: it deliberately left `T-905`, `M1-504`,
@@ -66,14 +116,6 @@ script reported success on every failing gate, so a green last line was the only
 signal it produced), `M1-504`, `M1-507` and `M1-605` (PR #69). All four merged; the rows
 are dropped here rather than by `finish-item.sh`, which leaves them for the next branch
 to sweep.)*
-
-*(Swept again 2026-09-05, opening Wave 13: `T-902` (merged, PR #74, round-1 approve with
-zero findings, 2026-09-04 — the mocked-Metaculus integration tier). Its branch is already
-gone from `origin`, so `scripts/tracks.py` was ignoring the row either way; dropping it
-here is the sweep the convention asks the next branch to do. Wave 13's other three lanes
-— `D-1001`, `M1-604` (holding the dependency slot) and `M1-407` — each claim on their own
-branch, so this table is the one place all four collide at merge. That is the cheap
-problem the "Planned next wave" section below deliberately accepts.)*
 
 ## Planned next wave
 

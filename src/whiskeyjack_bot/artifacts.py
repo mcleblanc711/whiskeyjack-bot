@@ -151,6 +151,7 @@ def write_new_file(
         raise error(
             f"on_existing must be one of {get_args(ExistingFilePolicy)} (offending input withheld)"
         )
+    new_directories = [p for p in destination.parents if not p.exists()]
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -169,6 +170,13 @@ def write_new_file(
             os.fsync(stream.fileno())
         try:
             os.link(temp_name, destination)
+            # Persist both the link and any newly created ancestor directories.
+            for directory in {destination.parent, *(p.parent for p in new_directories)}:
+                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
         except FileExistsError:
             if on_existing == "refuse":
                 raise error(

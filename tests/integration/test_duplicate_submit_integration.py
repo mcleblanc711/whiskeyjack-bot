@@ -117,7 +117,7 @@ def test_re_running_submit_after_an_uncertain_outcome_makes_no_second_post(
     )
     install_transport(monkeypatch, transport)
 
-    assert _submit(config_file, record_id) == 0
+    assert _submit(config_file, record_id) == EXIT_REFUSED
     posts_after_first = transport.posts
     assert posts_after_first == 1, "the SDK's blind retry would make this four"
     assert _status(database, record_id) == "approved", "uncertain, not terminal"
@@ -150,7 +150,7 @@ def test_the_block_is_the_uncertainty_and_it_names_itself(
     )
     install_transport(monkeypatch, transport)
 
-    assert _submit(config_file, record_id) == 0
+    assert _submit(config_file, record_id) == EXIT_REFUSED
     capsys.readouterr()
 
     assert _submit(config_file, record_id) == EXIT_REFUSED
@@ -206,4 +206,13 @@ def test_a_resolved_uncertainty_is_refused_for_status_not_for_uncertainty(
     assert "no longer awaiting submission" in refusal, (
         "the status gate is the one that must refuse now; a bare exit code cannot say which "
         "of the six did, and 'approved' alone appears in the uncertainty message too"
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_activation_policy_for_transport_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Transport failure cases remain independent of activation setup; the launch
+    # integration tests exercise both boundaries together with retained artifacts.
+    monkeypatch.setattr(
+        "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
     )
