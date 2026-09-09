@@ -8798,12 +8798,26 @@ mechanism.
 
 ### Standing risk — not verifiable offline
 
-The replay test drives `45452`'s **stored** packet, so it proves the gate refuses to
-re-purchase for the evidence we actually retrieved. It cannot prove that a *live* AskNews
-call today would return the same documents, and it should not be read as doing so. The
-claim under test is narrow and is stated that way: given a recorded deterministic verdict
-and an unchanged question fingerprint, a second attempt issues **zero billed provider
-calls**.
+**Correction, round 1.** An earlier draft of this section -- and of the round-1 review
+request -- said the test "drives 45452's stored packet". It does not, and the reviewer was
+right to catch it. The tests use the existing synthetic fixture (question 91001) with
+generated stale/future articles, exercising the same code path with a constructed packet.
+The stored-packet replay was described before it was written, and then not written. Recording
+that plainly, because a claim about evidence is exactly the kind of thing this ledger exists
+to keep honest.
+
+What the tests actually prove: given a recorded deterministic verdict and an unchanged
+question fingerprint, a second attempt issues **zero billed provider calls** -- asserted on
+the fake client's own counter, over a constructed packet that reaches the same branch.
+
+What they do not prove, and no offline test can: that a *live* AskNews call today would
+return the same documents for 45452, or that the historical packet reproduces byte for byte.
+A stored-packet replay is worth adding and is filed rather than claimed. Sockets are blocked
+offline, so "no provider call was made" is observed at the fake client, never at the network.
+
+Determinism of the verdict is an inference from the code being pure over a stored packet and
+a fixed `now` -- the property `assess_sufficiency` claims in its own docstring -- corroborated
+by 17 identical live refusals, not proven by the suite.
 
 That assertion is on `calls_attempted`/`cost_reserved`, never on `research_runs` rows,
 because run rows are wrong in both directions -- `started_at_utc` is the *pinned* `now`
