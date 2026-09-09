@@ -8693,3 +8693,152 @@ deliberately while OpenRouter credits from Metaculus are still pending. `deploy/
 whiskeyjack-tournament-cup.{service,timer}` installed and started the same session
 (`systemctl --user enable --now whiskeyjack-tournament-cup.timer`); polls every five minutes
 independently of the MiniBench timer, sharing no storage (`data/cup/`).
+
+## M1-326 — Do not re-buy research for a deterministic verdict
+
+### Decision — the gate reads `question_blocked`, not `pipeline_failure_events`, and why
+
+Two records are written, deliberately, and they are not redundant.
+
+`pipeline_failure_events` is the **audit** record. Routing `quality_problem`'s verdict
+through `_record_pre_forecast` is the half of this item that closes M1-325's diagnostic
+gap: today the verdict is `raise TournamentError(problem)` at `pipeline_live.py:648-652`,
+which propagates past `_record_pre_forecast` entirely, so question 45452 failed 18+ times
+and left exactly **one** `research_failed/no_evidence` row -- and that one is the
+01:25:19 poll where AskNews itself returned nothing, not the quality gate.
+
+`question_blocked` (a `tournament_events` row) is the **operational** state the skip reads.
+It is a separate row because `pipeline_failure_events` carries no question fingerprint, so
+gating on it alone would need a timestamp correlation across two tables to answer "was the
+question the same when it failed?" -- and an edited question must re-qualify. Carrying
+`{fingerprint, detail_code, at}` on one row makes the skip a single keyed read through the
+existing `events(conn, kind, scope)` helper, which is the shape `restored_question_hold`
+already uses at `tournament.py:387`.
+
+### Decision — the deterministic/transient split is the existing `detail_code` vocabulary
+
+No new vocabulary. `PreForecastFailureCode` already distinguishes the two classes; this
+item only says which side of the line each member sits on:
+
+  deterministic (skip until the fingerprint changes)
+      no_evidence, stale_evidence, schema_invalid, calibration_invalid
+  transient (retry under a bounded cap on the same fingerprint)
+      provider_error, provider_unavailable, http_error, timeout, internal_error,
+      malformed_response
+
+The transient side needs the cap because it is not hypothetical: MiniBench 45754 burned
+**10** `generation_failed/internal_error` attempts and 45764 **six** `schema_invalid`
+ones, and generation failures happen *after* retrieval is billed, so an unbounded transient
+retry is the same money pump with a different label.
+
+### Decision — `quality_problem` returns a verdict code, following `sufficiency.py`
+
+The gate needs a `detail_code`, and deriving one by matching `quality_problem`'s prose
+would make the classification depend on message wording -- a string that CLAUDE.md's
+error-hygiene rule may legitimately reword at any time. So `quality.py` returns the code
+alongside the message.
+
+This is not a new pattern: `research/sufficiency.py` already does exactly this, and its
+own comment says why -- `SufficiencyVerdict` is "deliberately spelled out with
+``lifecycle.FailureCode``'s own two members (``no_evidence``, ``stale_evidence``) rather
+than a fresh vocabulary translated at the call site". `quality.py` reuses that same
+vocabulary rather than inventing a third. Both of its branches are `no_evidence` for the
+*gate*'s purposes -- both mean "the evidence required to forecast is absent" -- and the
+branches stay distinguishable in the recorded message, which is M1-325's half.
+
+Worth noting the two gates are distinct and both already exist: `assess_sufficiency`
+(M1-504) asks whether the packet holds usable evidence at all, and `quality_problem`
+(LAUNCH) is a second, tournament-only gate layered above it. This item does not merge
+them. It also does not change any refusal -- M1-327 changes what these branches *do*;
+M1-326 only makes the verdict machine-readable and stops it being re-purchased.
+
+`assess_sufficiency`'s docstring already states the determinism this item depends on:
+"Pure and deterministic ... the verdict replays identically from stored timestamps."
+`quality_problem` has the same character, which is precisely why re-buying research to
+re-derive it is waste rather than retry.
+
+### Deviation — no migration, and none is needed
+
+`pipeline_failure_events` already carries `question_id`, `tournament_id`, `event_type` and
+a closed `detail_code` CHECK. `tournament_events.kind` has **no** CHECK constraint, so
+`question_blocked` needs no schema change. The migration column in `docs/TRACKS.md` stays
+at `014` free. This was checked against the live schema, not assumed.
+
+### Rejected — widening the `research_checkpoint` TTL, and why not
+
+The obvious cheap fix is to raise the 1800s window in `pipeline_live.py:390` and
+`tournament.py:425`. Rejected: it changes *how often* a permanent failure re-bills without
+changing *that* it re-bills, so it converts an unbounded loss into a slower unbounded loss
+and makes the bug harder to see. It would also silently stale the research behind every
+*succeeding* forecast, trading a cost bug for an attribution one.
+
+### Rejected — gating on the `question_failure` event that already exists
+
+`tournament.py:506-513` already appends a `question_failure` row per failure. Rejected as
+the gate's input because it records only `{"error_type": type(exc).__name__}` -- every
+distinct refusal in `_attempt_question` arrives as the string `"TournamentError"`, so it
+cannot distinguish a deterministic verdict from a five-minutes-remaining skip or a
+transient provider error. That is M1-325, and it is this item's dependency rather than its
+mechanism.
+
+### Deferred (do not read the absence as an omission)
+
+- **The refusal itself stays fatal.** After this item 45452 is skipped *cheaply*; it still
+  produces no forecast. Making it forecastable is M1-327, which is a behaviour change and
+  is argued on its own branch.
+- **The two AskNews strategies per retrieval** are M1-328. Unchanged here.
+- **AskNews reservations never settle** (0 of 87; `$6.48` held across both profiles). It
+  distorts the dollar ledger but did not cause the quota exhaustion -- call count ran out,
+  not budget. Not touched, not conflated.
+- **No head-of-line block.** An earlier reading of this item claimed a failing question
+  stranded the questions behind it. It does not: `run_once` catches per question and
+  continues, every heartbeat reads `complete=true`, and the Cup's other four questions hold
+  `forecast_records` from the first poll. `cli.py:1313` returning 1 on any failure count is
+  what made the unit report failed every five minutes. That is real, and it is M1-329's.
+
+### Standing risk — not verifiable offline
+
+The replay test drives `45452`'s **stored** packet, so it proves the gate refuses to
+re-purchase for the evidence we actually retrieved. It cannot prove that a *live* AskNews
+call today would return the same documents, and it should not be read as doing so. The
+claim under test is narrow and is stated that way: given a recorded deterministic verdict
+and an unchanged question fingerprint, a second attempt issues **zero billed provider
+calls**.
+
+That assertion is on `calls_attempted`/`cost_reserved`, never on `research_runs` rows,
+because run rows are wrong in both directions -- `started_at_utc` is the *pinned* `now`
+rather than wall clock, so distinct timestamps undercount retrievals, while the row count
+overcounts billed calls (3 of 45452's 20 rows were served from `durable.py`'s within-window
+dedup and never billed). M1-315 round 3 found this project reporting provider *runs* under
+a heading that claimed *calls*; the same trap produced a wrong figure in this item's own
+first backlog draft, corrected in its second commit.
+
+### Deviation — one latent bug fixed on the way, and why it was not deferred
+
+`quality_problem` was being handed a packet `usable_packet` had already filtered, and it
+applies `usable` itself -- so its `stale_evidence` branch **could never be reached**: the
+documents that would prove staleness were dropped a line earlier. Judged before filtering
+now.
+
+This was not scope creep, it was forced: without it the `stale_evidence` code this item
+introduces would be a branch no test could reach, which is this project's top recurring
+defect wearing a new hat. The refusal *decision* is identical either way -- `quality_problem`
+re-derives the same `useful` set from either packet -- so only the recorded reason changes.
+
+### Verification — every mutant killed, each guard half separately
+
+The guard has two halves, and [[whiskeyjack-two-part-guard-mutation]] is explicit that a
+survivor from neutering only one reads exactly like a vacuous test. Each was neutered on
+its own, from a committed tree with `__pycache__` cleared between runs:
+
+| mutant | result |
+| --- | --- |
+| baseline | 3 passed |
+| skip half neutered (`if blocked:` -> `if False:`) | 2 failed |
+| emit half neutered (never append `question_blocked`) | 3 failed |
+| fingerprint ignored in the block lookup | 1 failed |
+| recorder removed (revert to raising past it) | 2 failed |
+
+The assertions are on `News.calls` -- billed provider calls -- never on `research_runs`
+rows. The baseline test also pins `first == 2`, so "one retrieval is two AskNews calls,
+never one" is asserted rather than assumed.

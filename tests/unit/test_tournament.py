@@ -232,9 +232,7 @@ def test_deterministic_refusal_is_recorded_and_never_re_purchased(
     first = news.calls
     assert first == 2, "one retrieval is two AskNews calls, never one"
 
-    row = conn.execute(
-        "SELECT event_type, detail_code FROM pipeline_failure_events"
-    ).fetchone()
+    row = conn.execute("SELECT event_type, detail_code FROM pipeline_failure_events").fetchone()
     assert tuple(row) == ("research_failed", expected_code), (
         "the verdict must reach pipeline_failure_events; before M1-326 it was raised "
         "straight past the recorder and left no row at all"
