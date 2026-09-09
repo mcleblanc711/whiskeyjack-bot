@@ -947,3 +947,319 @@ def test_re_enabling_the_tournament_re_arms_a_blocked_question(
         ).fetchone()[0]
         == 1
     ), "the stale block stays in the journal; it is superseded, never deleted"
+
+
+# ── M1-329: which operational alerts a real poll actually pushes ──────────────
+#
+# The module's own contract is unit- and property-tested in `tests/unit/test_notify.py`
+# and `tests/property/test_notify_properties.py`. What is left, and what the acceptance
+# criterion is actually about, is *where* the five events are wired: "fires only after a
+# submission is CONFIRMED" and "does not re-alert every poll" are claims about call sites,
+# and no test of the notifier in isolation can hold them up. These run the whole poll.
+
+
+class _Pushes:
+    """A MockTransport handler that records what a poll pushed, by event."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, str]] = []
+
+    def __call__(self, request: Any) -> Any:
+        import httpx
+
+        headers = dict(request.headers)
+        self.sent.append(
+            {
+                "title": headers.get("title", ""),
+                "priority": headers.get("priority", ""),
+                "body": request.content.decode("utf-8"),
+            }
+        )
+        return httpx.Response(200)
+
+    def titles(self) -> list[str]:
+        return [entry["title"] for entry in self.sent]
+
+    def matching(self, fragment: str) -> list[dict[str, str]]:
+        return [entry for entry in self.sent if fragment in entry["title"]]
+
+
+def _recording(monkeypatch: pytest.MonkeyPatch, config: Any) -> _Pushes:
+    """Install a notifier whose transport is a recorder, for the duration of a poll.
+
+    ``build_notifier`` is patched rather than the environment because the point here is
+    which call sites fire, not how the client is built -- that is covered where it belongs.
+    Everything downstream reads ``CURRENT_NOTIFIER``, which ``run_once`` sets from this.
+    """
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier
+
+    pushes = _Pushes()
+    monkeypatch.setattr(
+        whiskeyjack_tournament,
+        "build_notifier",
+        lambda _config: Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(pushes)),
+            topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+            state_root=config.storage.artifact_root,
+            secret_names=tuple(config.secret_env_var_names()),
+        ),
+    )
+    return pushes
+
+
+def test_a_confirmed_forecast_pushes_one_prediction_posted_and_never_a_rationale(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fires once, after CONFIRMED, and carries nothing the platform does not already show.
+
+    The "once" half is the part a hook in the wrong place gets wrong. ``reconcile_forecast``
+    runs on every poll that re-reconciles a standing intent, so a hook at its ``return True``
+    would push every five minutes for a forecast that landed days ago; the hook is inside
+    the ``forecast_confirmed`` write guard, which is by construction the first confirmation.
+
+    The "no rationale" half is why ntfy being a third party matters. The posted value is
+    public the moment it lands on Metaculus. The reasoning never becomes public, so it must
+    not be handed to a push service -- and that is asserted against the record's own stored
+    rationale rather than against a hand-written string, which would only prove that one
+    sentence is absent.
+    """
+    conn, config, _platform, _news, _model = case
+    pushes = _recording(monkeypatch, config)
+    result = poll(case)
+    assert result["forecast_confirmed"] == 1
+
+    posted = pushes.matching("forecast confirmed")
+    assert len(posted) == 1
+    body = posted[0]["body"]
+
+    record_id, record_json = conn.execute(
+        "SELECT record_id, record_json FROM forecast_records"
+    ).fetchone()
+    stored = json.loads(record_json)
+    assert str(stored["question"]["question_id"]) in body
+
+    # Walked rather than named: the assertion has to survive the forecast schema growing a
+    # field, and a check against one known key would not. Every string the record stores
+    # that is long enough to be prose must be absent from what left the process.
+    def _strings(node: Any) -> Any:
+        if isinstance(node, dict):
+            for value in node.values():
+                yield from _strings(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from _strings(value)
+        elif isinstance(node, str):
+            yield node
+
+    prose = [text for text in _strings(stored["forecast"]) if len(text) > 24]
+    assert prose, "the strategy never reached a record with prose in it"
+    for text in prose:
+        assert text not in body
+    assert "rationale" not in body.lower()
+
+    # The second poll re-reconciles the same record and must stay silent.
+    repeated = _recording(monkeypatch, config)
+    poll(case)
+    assert repeated.matching("forecast confirmed") == []
+    assert record_id
+
+
+@pytest.mark.parametrize("field", ["future", "stale"])
+def test_a_deterministic_block_pushes_once_and_the_next_poll_is_silent(
+    case: Any, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """The alert is on the transition, never on the gate that reads it.
+
+    M1-326's read gate skips an already-blocked question on every poll, so hooking there
+    would re-page every five minutes about a verdict recorded once -- the precise failure
+    the durable throttle exists to prevent, reintroduced above it.
+    """
+    conn, config, _platform, news, _model = case
+    setattr(news, field, True)
+    pushes = _recording(monkeypatch, config)
+    poll(case)
+
+    blocked = pushes.matching("question blocked")
+    assert len(blocked) == 1
+    assert "deterministic_verdict" in blocked[0]["body"]
+    assert blocked[0]["priority"] == "high"
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM tournament_events WHERE kind='question_blocked'"
+        ).fetchone()[0]
+        == 1
+    )
+
+    silent = _recording(monkeypatch, config)
+    poll(case)
+    assert silent.matching("question blocked") == []
+
+
+def test_the_daily_digest_fires_on_a_normal_poll(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, config, _platform, _news, _model = case
+    pushes = _recording(monkeypatch, config)
+    result = poll(case)
+    digests = pushes.matching("daily worker digest")
+    assert len(digests) == 1
+    body = digests[0]["body"]
+    assert f"confirmed_total={result['forecast_confirmed']}" in body
+    assert "remaining_usd=" in body
+    assert digests[0]["priority"] == "low"
+    assert conn is not None
+
+
+def test_the_daily_digest_also_fires_on_the_spending_hold_exit(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_once`` has two exits, and the early one is the more alarming state.
+
+    A digest hooked only to the normal return would go quiet exactly when spending is
+    held -- that is, when the worker has stopped doing anything and most needs to say so.
+    """
+    conn, config, _platform, _news, _model = case
+    append(conn, "restored_spending_hold", "42:32977", {})
+    pushes = _recording(monkeypatch, config)
+    poll(case)
+    assert len(pushes.matching("daily worker digest")) == 1
+
+
+def test_a_reservation_that_crosses_a_budget_level_pushes_from_inside_the_poll(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Reported from ``Budget.reserve``, the only place spend and ceiling are both in hand.
+
+    Emitted after the transaction commits, never inside it: that block holds BEGIN
+    IMMEDIATE, and an HTTP POST under it would serialize every other process's budget
+    check behind a third party's latency.
+    """
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier, notifier_context
+
+    conn, config, _platform, _news, _model = case
+    pushes = _Pushes()
+    notifier = Notifier(
+        client=httpx.Client(transport=httpx.MockTransport(pushes)),
+        topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+        state_root=tmp_path / "notify-state",
+    )
+    # A ceiling of USD 1.00 against a USD 0.60 reservation: 60%, over the 50% level.
+    budget = Budget(conn, config.storage.artifact_root, "42:32977", 1_000_000)
+    with notifier_context(notifier):
+        budget.reserve("asknews", 0.60, {"query": "test"})
+        crossed = pushes.matching("budget at")
+        assert len(crossed) == 1
+        assert "50%" in crossed[0]["title"]
+        # Never settled and still counted: that is the whole point of the field choice.
+        assert "never settle" in crossed[0]["body"]
+
+        # The refusal itself is the alert an operator most needs, and it is only
+        # reachable on the raising path.
+        with pytest.raises(TournamentError, match="budget exhausted"):
+            budget.reserve("asknews", 0.60, {"query": "again"})
+    exhausted = pushes.matching("budget at 100%")
+    assert len(exhausted) == 1
+    assert "paid calls are being refused" in exhausted[0]["body"]
+
+
+def test_a_push_failure_never_costs_the_forecast(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The acceptance criterion, run end to end against a poll that really posts.
+
+    Every transport call fails, and the poll must still confirm the forecast, complete the
+    private comment and record everything. This is the one assertion that cannot be made
+    against the notifier alone.
+    """
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier
+
+    conn, config, platform, _news, _model = case
+
+    def always_fails(request: Any) -> Any:
+        raise httpx.ConnectError("the topic host is gone")
+
+    monkeypatch.setattr(
+        whiskeyjack_tournament,
+        "build_notifier",
+        lambda _config: Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(always_fails)),
+            topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+            state_root=config.storage.artifact_root,
+        ),
+    )
+    result = poll(case)
+    assert result["forecast_confirmed"] == result["comment_completed"] == 1
+    assert result["unresolved"] == 0
+    assert result["heartbeat"]["failures"] == 0
+    assert platform.posts == 1
+    assert conn.execute("SELECT count(*) FROM forecast_records").fetchone()[0] == 1
+
+
+def test_a_poll_pushes_nothing_when_notifications_are_not_configured(case: Any) -> None:
+    """The committed default. Notifications are opt-in and never load-bearing.
+
+    No patching here on purpose: the fixture's config has ``notify.enabled`` false, so
+    ``run_once`` builds no notifier and every ``emit`` is inert. If that ever stopped being
+    true the suite's own network guards would say so, loudly.
+    """
+    conn, config, _platform, _news, _model = case
+    assert config.notify.enabled is False
+    result = poll(case)
+    assert result["forecast_confirmed"] == 1
+    assert not (config.storage.artifact_root / "notifications").exists()
+    assert conn is not None
+
+
+def test_a_primary_provider_failure_pushes_provider_failed(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Half of a pair; the other half is the test below, and neither is sufficient alone.
+
+    This one would pass against code that pushes on *every* fallback, which is the wrong
+    behaviour -- see the negative arm for why.
+    """
+    _conn, config, _platform, news, _model = case
+
+    def outage(**kwargs: Any) -> Any:
+        news.calls += 1
+        raise RuntimeError("provider outage")
+
+    monkeypatch.setattr(news, "search_news", outage)
+    loud = _recording(monkeypatch, config)
+    poll(case)
+
+    failures = loud.matching("failed")
+    assert len(failures) == 1
+    assert "asknews" in failures[0]["title"]
+    # It says a provider failed and does not pretend to know why: on 2026-09-08 this same
+    # code path saw a quota exhaustion and a dropped connection as the same event, because
+    # `asknews.py` discards the SDK exception rather than inspecting it.
+    assert "the cause is not recorded" in failures[0]["body"].lower()
+
+
+def test_a_named_source_fallback_pushes_nothing(case: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The negative arm, and the whole reason the alert reads the reason LIST.
+
+    A fallback on ``official_source_required`` is the system working as intended: the
+    question named a resolution authority, and Exa is how the run looks for it. Paging on
+    it would fire on ordinary healthy forecasts and train the operator to ignore the
+    channel -- which reports exactly as much as having no channel.
+
+    A fresh ledger rather than a second poll in the test above: once a forecast exists the
+    next poll skips the question before any retrieval, so the fallback would never run and
+    the assertion would hold for the wrong reason.
+    """
+    _conn, config, platform, _news, _model = case
+    platform.raw["question"]["resolution_criteria"] = (
+        "Resolves to the count published at https://results.example.gov/2026/ ."
+    )
+    quiet = _recording(monkeypatch, config)
+    assert poll(case)["heartbeat"]["failures"] == 0, "a missing resolution source is not a failure"
+    assert platform.posts == 1, "and the forecast is still made"
+    assert quiet.matching("failed") == []

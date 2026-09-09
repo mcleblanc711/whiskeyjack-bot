@@ -308,6 +308,50 @@ def test_the_throttle_survives_a_simulated_restart(tmp_path: Path) -> None:
     assert len(fresh.requests) == 1
 
 
+def test_the_stamp_file_alone_decides_the_throttle(tmp_path: Path) -> None:
+    """The file is both necessary and sufficient -- nothing in memory participates.
+
+    The mutation pass is why this test exists. "Rebuild the notifier and send again"
+    looked like a restart test and was not one: a throttle held in a *class* attribute
+    survives a new instance in the same interpreter, so that mutant passed while being
+    exactly the 288-a-day bug the durable throttle exists to prevent. A restart test whose
+    only witness is inside the program cannot see the difference.
+
+    So the witness is the filesystem, in both directions: removing the stamp must re-arm
+    the push (necessary), and a stamp this process never sent must suppress one
+    (sufficient). No in-memory scheme can satisfy both.
+    """
+    stamps = tmp_path / "artifacts" / "notifications"
+    assert (
+        _notifier(tmp_path, _Exchange()).send("question_blocked", subject="a", title="t", body="b")
+        == "sent"
+    )
+    stamp = next(stamps.glob("*.json"))
+    contents = stamp.read_bytes()
+
+    # Necessary: with the file gone, the same window is open again. An in-memory throttle
+    # would still refuse here, because deleting a file tells it nothing.
+    stamp.unlink()
+    handler = _Exchange()
+    assert (
+        _notifier(tmp_path, handler).send("question_blocked", subject="a", title="t", body="b")
+        == "sent"
+    )
+    assert len(handler.requests) == 1
+
+    # Sufficient: a stamp put there by something other than a send suppresses one. This is
+    # the other process's write, in the only form a test can stage it.
+    for existing in stamps.glob("*.json"):
+        existing.unlink()
+    stamp.write_bytes(contents)
+    quiet = _Exchange()
+    assert (
+        _notifier(tmp_path, quiet).send("question_blocked", subject="a", title="t", body="b")
+        == "throttled"
+    )
+    assert quiet.requests == []
+
+
 def test_the_window_is_per_event(tmp_path: Path) -> None:
     """A daily digest and a 30-minute incident alert cannot share one number."""
     assert notify._WINDOW_SECONDS["poll_summary"] == 86400
