@@ -9437,3 +9437,72 @@ whitespace to Python — so `\x00` survived into an HTTP header value on the fir
 `test_a_title_never_carries_a_header_separator` run. Fixed by replacing every C0 control and
 DEL before the collapse. Non-ASCII is deliberately left alone: header framing is
 byte-oriented and a multi-byte UTF-8 sequence contains no `0x0D` or `0x0A`.
+
+### Round 1 — CHANGES REQUESTED, two blocking findings, both real
+
+Both were reproduced by execution against the reviewed commit
+(`e6b455ea8df0893b3aab04bbb48c280651efc516`) before any fix code was written, and both
+falsified a claim this branch had made in writing.
+
+**Finding 1 — a slow push could consume the forecasting phase.** The module docstring
+claimed the bound was "doubled the way `forecast/sol.py` doubles it — a client timeout plus
+`MAX_NOTIFY_TIMEOUT_SECONDS` capping what any configuration may ask for". That was not a
+second bound; it was a cap on the first one. `httpx`'s `timeout` bounds each *operation* —
+connect, write, one read — and never their sum, so a peer that keeps the socket productive
+stalls for as long as it likes. Measured against the reviewed commit: a **0.1s** client
+timeout with a 1.5s response returned `"sent"` after **1.69s**, and the same push inside
+`phase_timeout(0.5)` raised `TournamentError: tournament phase exceeded its wall-clock
+timeout` — a notification killing a forecast, which is the one thing this module may not do.
+
+Fixed with `notify._push_deadline`, a real elapsed-time bound. The interesting part is what
+it does about the *enclosing* deadline, because `timeouts.phase_timeout` cannot simply be
+nested: its `finally` runs `setitimer(ITIMER_REAL, 0)`, which cancels whatever timer was
+already running, so an inner use would silently disarm the 480-second phase bound — trading
+a bug that stops one poll for one that never stops it. So the deadline reads the outer
+timer, borrows from it, and puts back what is left; the prior handler is read with
+`getsignal` **before** ours is installed (M1-514's lesson).
+
+The governing rule is that **a notification may never be the reason a phase expires**, and
+the first attempt at this fix got it wrong in a way worth recording: when the outer deadline
+was the tighter one it simply yielded, on the reasoning that the outer already bounded us.
+Re-running the reproduction showed the phase still dying — the finding relabelled, not
+fixed. The push now gets `min(its own budget, outer remaining - _PHASE_MARGIN)` and is
+abandoned outright when that is not positive. Near the end of a phase the push is squeezed
+and then skipped, which is the correct precedence.
+
+**Finding 2 — `emit` logged the value it had just rejected.**
+`_LOGGER.warning("the %s notification could not be prepared", event)` — and on that path
+`event` is the caller's unvalidated argument, because the exception being handled is usually
+the vocabulary check refusing it. `emit("privateFAKE123456", …)` logged
+`the privateFAKE123456 notification could not be prepared`. The event is now named only once
+it is known to be one of this module's own literals, and `"unrecognized"` otherwise.
+
+`test_a_recognized_event_is_still_named_when_preparation_fails` is the negative control:
+withholding the name from *every* failure would pass the leak test and leave an operator
+with a log line saying only that something failed.
+
+**Non-blocking observation, taken anyway.** `Path.exists` in `_claim`'s collision check is
+itself I/O and raises `PermissionError` when directory traversal is lost between the write
+attempt and the check, letting a raw `OSError` escape `Notifier.send`. `emit` would have
+contained it downstream, but a raw `OSError` leaving a module that owns a sanitized error
+type violates the rule on its own terms, and the fix is two lines.
+
+The same exposure exists one layer down in `artifacts.write_new_file`, whose
+`destination.parents` pre-check runs outside its own `try`. That is **pre-existing on
+master**, shared by all three of its callers, and not this branch's to change; the
+regression test therefore patches this module's own seam rather than driving the real writer.
+
+**Remediation teeth: 8 new mutants, 8 killed.** No deadline at all; the outer phase timer
+not restored; the no-room skip removed; `_PHASE_MARGIN` set to zero; `emit` logging the
+rejected value again; `emit` never naming any event; the collision-check `OSError` guard
+removed; deadline expiry re-raising instead of degrading. The earlier 34 were re-run and
+still all die.
+
+**One of the eight started as a survivor, and the reason is worth keeping.** Deleting the
+`budget <= 0` skip still produced `"failed"` and still sent nothing — but by accident: the
+negative budget made `setitimer` raise, and that raise was caught by the same arm that
+degrades. The outcome was right for the wrong reason, and one step from being wrong for it
+too, because a budget of exactly zero does not raise — `setitimer(0)` *disables* the timer,
+which would cancel the enclosing phase deadline and then run the push unbounded. The
+replacement asserts the mechanism instead of the outcome: with no room left, nothing touches
+the interval timer at all.

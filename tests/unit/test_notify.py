@@ -14,6 +14,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import signal
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +28,8 @@ import yaml
 from whiskeyjack_bot import notify
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.logging_setup import configure_logging
+from whiskeyjack_bot.timeouts import phase_timeout
+from whiskeyjack_bot.tournament_state import TournamentError
 from whiskeyjack_bot.notify import (
     BUDGET_THRESHOLD_PERCENTS,
     CURRENT_NOTIFIER,
@@ -71,6 +75,7 @@ def _notifier(
     *,
     clock: Any = None,
     secret_names: tuple[str, ...] = (),
+    deadline_seconds: float = 10.0,
 ) -> Notifier:
     # ``artifacts`` rather than ``root`` itself: production passes
     # ``config.storage.artifact_root``, and a test whose stamps live somewhere the real
@@ -79,6 +84,7 @@ def _notifier(
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         topic_url=FAKE_TOPIC,
         state_root=root / "artifacts",
+        deadline_seconds=deadline_seconds,
         secret_names=secret_names,
         clock=clock or (lambda: NOW),
     )
@@ -206,8 +212,12 @@ def test_a_rejected_push_does_not_log_the_third_party_response_body(
     assert "403" in caplog.text
 
 
-def test_a_slow_push_does_not_block(tmp_path: Path, deadline: None) -> None:
-    """The ``deadline`` fixture is the point: a regression here is a hang, not a wrong answer."""
+def test_a_transport_timeout_degrades(tmp_path: Path, deadline: None) -> None:
+    """The easy half of "slow": the transport itself gives up and raises.
+
+    Round 1 finding 1 was right that this is not enough on its own -- it exercises exception
+    handling, not bounded execution. The four tests below are the other half.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("the topic host never answered")
@@ -216,6 +226,210 @@ def test_a_slow_push_does_not_block(tmp_path: Path, deadline: None) -> None:
         _notifier(tmp_path, handler).send("poll_summary", subject="worker", title="t", body="b")
         == "failed"
     )
+
+
+def test_a_genuinely_slow_response_is_abandoned_at_its_deadline(
+    tmp_path: Path, deadline: None
+) -> None:
+    """Round 1 finding 1: an *actually delayed* response, not one that raises immediately.
+
+    ``httpx``'s ``timeout`` bounds each operation and never their sum, so a peer that keeps
+    the socket productive can stall indefinitely under any timeout setting. Measured against
+    the pre-fix code: a 0.1s client timeout and a 1.5s response returned ``"sent"`` after
+    1.69s. What is asserted here is elapsed time, which is the bound that was missing.
+    """
+    slept: list[float] = []
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        started = time.monotonic()
+        try:
+            time.sleep(5)
+        finally:
+            slept.append(time.monotonic() - started)
+        return httpx.Response(200)
+
+    sender = _notifier(tmp_path, slow, deadline_seconds=0.25)
+    started = time.monotonic()
+    assert sender.send("poll_summary", subject="w", title="t", body="b") == "failed"
+    elapsed = time.monotonic() - started
+    assert elapsed < 2, f"the push ran for {elapsed:.2f}s against a 0.25s deadline"
+    # The handler really did block. Without this the test would also pass against a
+    # transport that returned instantly, which is the vacuous version of the assertion.
+    assert slept and slept[0] >= 0.2
+
+
+def test_a_slow_push_never_consumes_an_enclosing_phase_deadline(
+    tmp_path: Path, deadline: None
+) -> None:
+    """A notification may never be the reason a forecasting phase expires.
+
+    Pre-fix, one 1.5s notification inside ``phase_timeout(0.5)`` raised ``TournamentError:
+    tournament phase exceeded its wall-clock timeout`` and the statement after ``send`` was
+    never reached.
+    """
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        time.sleep(5)
+        return httpx.Response(200)
+
+    reached = False
+    with phase_timeout(3):
+        assert (
+            _notifier(tmp_path, slow, deadline_seconds=0.25).send(
+                "poll_summary", subject="w", title="t", body="b"
+            )
+            == "failed"
+        )
+        reached = True
+    assert reached
+
+
+def test_the_enclosing_phase_deadline_still_fires_after_a_push(
+    tmp_path: Path, deadline: None
+) -> None:
+    """The other direction, and the more dangerous one.
+
+    ``timeouts.phase_timeout``'s ``finally`` runs ``setitimer(ITIMER_REAL, 0)``, so a naive
+    nested use would *cancel* the enclosing timer -- trading a bug that stops one poll for
+    one that never stops it. The push has to hand back what is left of the phase.
+    """
+
+    def quick(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    started = time.monotonic()
+    with pytest.raises(TournamentError, match="wall-clock timeout"):
+        with phase_timeout(1.5):
+            assert (
+                _notifier(tmp_path, quick, deadline_seconds=0.2).send(
+                    "poll_summary", subject="w", title="t", body="b"
+                )
+                == "sent"
+            )
+            time.sleep(10)
+    # Fired at the phase's own deadline, not at the push's and not never. The window is
+    # generous either side; what it excludes is 0.2s (the push's timer left installed) and
+    # 10s (the phase's timer cancelled by the push, which is the trap this guards).
+    elapsed = time.monotonic() - started
+    assert 1.0 < elapsed < 4.0, f"the phase fired after {elapsed:.2f}s, not at its own 1.5s"
+
+
+def test_a_push_is_skipped_when_the_phase_has_no_room_left(tmp_path: Path, deadline: None) -> None:
+    """Squeezed, then skipped. The forecast is the work; the notification is commentary.
+
+    With less than the reserved margin left on the phase there is no time to notify without
+    taking it from the phase, so the push is abandoned before the timer is touched.
+    """
+    handler = _Exchange()
+    with phase_timeout(0.4):
+        assert (
+            _notifier(tmp_path, handler, deadline_seconds=10).send(
+                "poll_summary", subject="w", title="t", body="b"
+            )
+            == "failed"
+        )
+    assert handler.requests == [], "no request may be made when there is no time for one"
+
+
+def test_no_room_on_the_phase_means_the_timer_is_never_touched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skip happens *before* any signal call, and that is the part worth pinning.
+
+    Written this way because the black-box version of it survived a mutation. Deleting the
+    ``budget <= 0`` guard still produced "failed" and still sent nothing -- but by accident:
+    the negative budget made ``setitimer`` raise, and the raise was caught by the same arm
+    that degrades. The outcome was right for the wrong reason, and one step away from being
+    wrong for it too, since a budget of exactly zero does not raise -- ``setitimer(0)``
+    *disables* the timer, which would cancel the enclosing phase deadline and then run the
+    push unbounded.
+
+    So the assertion is about the mechanism rather than the outcome: with no room left,
+    nothing touches the interval timer at all.
+    """
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(notify.signal, "getitimer", lambda which: (0.5, 0.0))
+    monkeypatch.setattr(notify.signal, "setitimer", lambda *args: calls.append(args))
+
+    with pytest.raises(notify._PushExpired):
+        with notify._push_deadline(10.0):
+            raise AssertionError("the body must not run when there is no room")
+    assert calls == [], "the enclosing phase timer was modified"
+
+
+def test_a_push_outside_any_phase_leaves_no_timer_behind(tmp_path: Path) -> None:
+    """The common case: no enclosing deadline, and none left running afterwards."""
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert (
+        _notifier(tmp_path, _Exchange()).send("poll_summary", subject="w", title="t", body="b")
+        == "sent"
+    )
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_a_rejected_event_name_is_never_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round 1 finding 2: ``emit`` used to interpolate the value it had just rejected.
+
+    ``event`` is the caller's argument and is unvalidated on this path -- the exception
+    being handled is usually the vocabulary check refusing it -- so naming it put a rejected
+    field value straight into a diagnostic.
+    """
+    with notifier_context(_notifier(tmp_path, _Exchange())):
+        with caplog.at_level(logging.DEBUG):
+            assert emit(f"blocked_{PLANTED}", subject="s", title="t", body="b") == "failed"
+    assert PLANTED not in caplog.text
+    assert "unrecognized" in caplog.text
+
+
+def test_a_recognized_event_is_still_named_when_preparation_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The negative control for the fix above.
+
+    Withholding the event name from every failure would be a cheap way to pass that test and
+    would leave an operator with a log line that says only that *something* failed. A name
+    drawn from this module's own vocabulary is safe to state, so it still is.
+    """
+
+    def broken_clock() -> datetime:
+        raise RuntimeError("the clock is gone")
+
+    with notifier_context(_notifier(tmp_path, _Exchange(), clock=broken_clock)):
+        with caplog.at_level(logging.DEBUG):
+            assert emit("question_blocked", subject="s", title="t", body="b") == "failed"
+    assert "question_blocked" in caplog.text
+
+
+def test_a_stamp_collision_check_that_cannot_run_stays_a_notify_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 non-blocking observation: ``Path.exists`` is I/O and can raise.
+
+    Losing directory traversal between the failed write and the collision check let a raw
+    ``PermissionError`` escape ``Notifier.send``. ``emit`` would have contained it, but a
+    raw ``OSError`` leaving a module that owns a sanitized error type is a violation of the
+    rule on its own terms.
+    """
+
+    def failed_write(*args: Any, **kwargs: Any) -> None:
+        raise NotifyError("cannot write notification stamp /somewhere")
+
+    def refuse(self: Path) -> bool:
+        raise PermissionError("traversal lost")
+
+    # Patched at this module's own seam. Driving it through the real writer would exercise
+    # `artifacts.write_new_file`'s own `Path.exists` pre-check instead, which has the same
+    # exposure, is pre-existing on master and is not this branch's to change.
+    monkeypatch.setattr(notify, "write_new_file", failed_write)
+    monkeypatch.setattr(Path, "exists", refuse)
+    handler = _Exchange()
+    assert (
+        _notifier(tmp_path, handler).send("poll_summary", subject="w", title="t", body="b")
+        == "throttled"
+    )
+    assert handler.requests == []
 
 
 def test_emit_absorbs_a_caller_mistake_rather_than_losing_the_caller(

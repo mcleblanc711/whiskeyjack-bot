@@ -17,9 +17,10 @@ Three rules shape everything here.
 **A notification never costs a forecast.** Every failure arm degrades: :meth:`Notifier.send`
 returns a closed-``Literal`` outcome and does not raise into a caller. The exception from a
 failed push is discarded rather than inspected, because an ``httpx`` error quotes the
-request and the request URL *is* the credential. The bound is doubled the way
-``forecast/sol.py`` doubles it -- a client timeout plus ``config.MAX_NOTIFY_TIMEOUT_SECONDS``
-capping what any configuration may ask for -- so a *slow* ntfy is as harmless as a dead one.
+request and the request URL *is* the credential. **Slow** is bounded separately from
+**failed**, and by a different mechanism: ``httpx``'s ``timeout`` bounds each operation and
+never their sum, so :func:`_push_deadline` puts a real elapsed-time bound around the push
+and hands back whatever is left of the enclosing phase deadline.
 
 **The throttle is durable across processes.** The worker is a ``Type=oneshot`` restarted
 every five minutes, so in-memory dedup would page 288 times a day and the channel would be
@@ -44,12 +45,16 @@ import hashlib
 import json
 import logging
 import os
+import signal
+import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import FrameType
 from typing import Final, Literal, get_args
 
 import httpx
@@ -147,6 +152,98 @@ _PRIORITY: Final[dict[str, str]] = {
 assert set(_PRIORITY) == set(get_args(NotifyEvent))
 
 
+class _PushExpired(BaseException):
+    """The elapsed-time deadline for one push fired.
+
+    ``BaseException`` for the same reason ``timeouts._PhaseExpired`` is one: it has to
+    escape ``httpx``'s own ``except Exception`` handlers to reach the boundary that
+    degrades. It never leaves this module.
+    """
+
+
+# Never hand ``setitimer`` a zero when restoring a live outer timer: zero means *disabled*,
+# so an outer phase deadline whose remaining time has already elapsed would be silently
+# cancelled rather than fired. This is the smallest positive value that fires promptly.
+_MIN_TICK = 1e-6
+
+# Seconds of an enclosing phase deadline that a notification may never borrow. The phase
+# bounds in `tournament.py` are 240s and 480s, so this is under half a percent of them, and
+# it is what makes "the push finishes strictly before the phase does" true rather than
+# nearly true.
+_PHASE_MARGIN = 1.0
+
+
+@contextmanager
+def _push_deadline(seconds: float) -> Iterator[None]:
+    """Bound the elapsed time of one push, without disturbing an enclosing phase deadline.
+
+    Round 1 finding 1, and the module docstring used to claim this was already handled by
+    "a client timeout plus the config cap". That was wrong, and the reviewer was right to
+    call it: ``httpx``'s ``timeout`` bounds each *operation* -- connect, write, one read --
+    and never the total. A response whose body dribbles in under the read timeout stalls
+    for as long as the peer likes. Measured against the pre-fix code: a 0.1s client timeout
+    and a 1.5s response returned ``"sent"`` after 1.69s, and inside ``phase_timeout(0.5)``
+    a single notification killed the forecasting phase outright.
+
+    ``timeouts.phase_timeout`` cannot simply be nested to fix it. Its ``finally`` runs
+    ``setitimer(ITIMER_REAL, 0)``, which cancels whatever timer was already running, so an
+    inner use would silently disarm the enclosing 480-second bound -- trading a bug that
+    stops one poll for one that never stops it. So this reads the outer timer, borrows from
+    it, and puts back what is left:
+
+    The governing rule is that **a notification may never be the reason a phase expires**,
+    which decides what happens when the two deadlines disagree. Borrowing the whole of the
+    outer's remaining time is not good enough: with 0.5s left on the phase and a 10s push
+    budget, letting the outer fire is precisely the reported defect, just relabelled. So the
+    push gets ``min(its own budget, outer remaining - _PHASE_MARGIN)`` and is abandoned
+    outright when that is not positive. Near the end of a phase the push is squeezed and
+    then skipped, which is the correct order of precedence: the forecast is the work, the
+    notification is commentary on it.
+
+    - **Not the main thread**: no deadline. ``setitimer`` is main-thread-only, the worker is
+      single-threaded, and the per-operation timeouts still apply. Better than raising.
+    - **No outer timer**: the push gets its own budget.
+    - **Otherwise**: install ours for the squeezed budget, and on the way out restore the
+      outer's remaining time less what we consumed. The prior handler is read with
+      ``getsignal`` *before* ours is installed (M1-514's lesson: read it after, and the
+      handoff window swallows the caller's alarm).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    try:
+        outer_remaining, outer_interval = signal.getitimer(signal.ITIMER_REAL)
+    except (ValueError, OSError):  # pragma: no cover - defensive; guarded above
+        yield
+        return
+    budget = seconds
+    if outer_remaining > 0:
+        budget = min(seconds, outer_remaining - _PHASE_MARGIN)
+        if budget <= 0:
+            # No room left to notify without eating the phase. Abandoned before the timer
+            # is touched, so the outer deadline is left exactly as it was found.
+            raise _PushExpired
+
+    def expired(signum: int, frame: FrameType | None) -> None:
+        raise _PushExpired
+
+    prior = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, expired)
+    started = time.monotonic()
+    try:
+        signal.setitimer(signal.ITIMER_REAL, budget)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, prior)
+        if outer_remaining > 0:
+            # `budget <= outer_remaining - _PHASE_MARGIN`, so this is at least the margin
+            # and the `_MIN_TICK` floor is unreachable here; it is kept because "restore a
+            # live timer, never disarm it" must hold whatever the arithmetic does.
+            left = outer_remaining - (time.monotonic() - started)
+            signal.setitimer(signal.ITIMER_REAL, max(left, _MIN_TICK), outer_interval)
+
+
 class NotifyError(Exception):
     """A notification could not be prepared or recorded.
 
@@ -223,6 +320,9 @@ class Notifier:
     client: httpx.Client
     topic_url: str = field(repr=False)
     state_root: Path
+    # Total elapsed seconds one push may take, enforced by :func:`_push_deadline`. Distinct
+    # from the client's timeout, which bounds each operation and not the sum of them.
+    deadline_seconds: float = 10.0
     secret_names: tuple[str, ...] = ()
     clock: Callable[[], datetime] = _utcnow
     # Not part of equality or the repr: it is a cache, not identity.
@@ -327,7 +427,16 @@ class Notifier:
         try:
             write_new_file(path, payload, what="notification stamp", error=NotifyError)
         except NotifyError as exc:
-            if path.exists():
+            try:
+                collided = path.exists()
+            except OSError:
+                # Round 1 non-blocking observation. `exists()` is itself I/O and raises
+                # `PermissionError` when directory traversal is lost between the write
+                # attempt and this check. A raw OSError escaping is a violation of the rule
+                # that every malformed shape arrives as the module's own error type, and
+                # `emit` containing it downstream does not make it right here.
+                collided = False
+            if collided:
                 # Someone else claimed this window -- the ordinary throttled case, and the
                 # only one that is not a problem.
                 return False
@@ -379,7 +488,13 @@ class Notifier:
         }
         content = redact_secrets(body, self.secret_names).encode("utf-8", "replace")
         try:
-            response = self.client.post(self.topic_url, content=content, headers=headers)
+            with _push_deadline(self.deadline_seconds):
+                response = self.client.post(self.topic_url, content=content, headers=headers)
+        except _PushExpired:
+            # The elapsed-time bound, not a transport error: nothing about the peer is
+            # known and nothing about it is said.
+            _LOGGER.warning("the %s notification exceeded its wall-clock bound", event)
+            return "failed"
         except BaseException as exc:
             # ``phase_timeout`` raises a BaseException subclass precisely so provider
             # ``except Exception`` handlers cannot swallow it (M1-514). Re-raise it and
@@ -431,6 +546,7 @@ def build_notifier(config: AppConfig) -> Notifier | None:
         client=client,
         topic_url=topic_url,
         state_root=config.storage.artifact_root,
+        deadline_seconds=config.notify.timeout_seconds,
         secret_names=tuple(config.secret_env_var_names()),
     )
 
@@ -483,7 +599,15 @@ def emit(event: str, *, subject: str, title: str, body: str) -> NotifyOutcome:
     try:
         return notifier.send(event, subject=subject, title=title, body=body)
     except Exception:
-        _LOGGER.warning("the %s notification could not be prepared", event)
+        # Round 1 finding 2. ``event`` is the caller's argument and is unvalidated on this
+        # path -- the exception being handled is usually the vocabulary check rejecting it
+        # -- so interpolating it puts a rejected field value straight into a diagnostic,
+        # which is the one thing every error message in this project may not do. Named only
+        # once it is known to be one of this module's own literals.
+        _LOGGER.warning(
+            "the %s notification could not be prepared",
+            event if event in get_args(NotifyEvent) else "unrecognized",
+        )
         return "failed"
 
 
