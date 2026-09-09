@@ -8856,3 +8856,26 @@ its own, from a committed tree with `__pycache__` cleared between runs:
 The assertions are on `News.calls` -- billed provider calls -- never on `research_runs`
 rows. The baseline test also pins `first == 2`, so "one retrieval is two AskNews calls,
 never one" is asserted rather than assumed.
+
+### Round 2 — APPROVE, and what it left open
+
+Round 2 approved at `3c535f2`. B1 closed: the reviewer's own reproduction confirmed three
+spaced rounds are allowed, the fourth records exactly one exhaustion block, a title edit
+starts a separate attempt count with its own single block, and reverting the fingerprint
+retains the original block.
+
+Two follow-ups filed rather than absorbed, because both survive this branch:
+
+- **M1-331 — fingerprint stability under unordered API metadata.** Raised as a risk area in
+  round 1, retained in round 2, unproven in both. If Metaculus reorders any semantically
+  unordered list between polls, the fingerprint changes, the block stops matching, and the
+  question is re-researched at full price — M1-326's own failure reintroduced through the
+  *key* rather than the gate. Silent, and indistinguishable from correct re-qualification
+  after a genuine edit. **The most plausible remaining way this gate leaks paid calls.**
+- **M1-330 — stored-packet replay.** See the correction above.
+
+The reviewer also pushed back on deferring the quality-verdict property pass to M1-327, and
+the pushback is right in a way my deferral argument missed: *satisfiability* depends on
+M1-327's decision, but **verdict stability across the persisted form and sanitized-message
+properties do not** — they hold whatever the named-source rule becomes. That distinction is
+now part of M1-327's scope rather than a reason to defer the whole pass.
