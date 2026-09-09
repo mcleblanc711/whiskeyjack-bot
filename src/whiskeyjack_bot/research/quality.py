@@ -17,6 +17,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from whiskeyjack_bot.questions.model import CanonicalQuestion
+from whiskeyjack_bot.research.canonical import host_identity
 from whiskeyjack_bot.research.model import ResearchDocument
 from whiskeyjack_bot.research.packet import ResearchPacket
 
@@ -59,11 +60,16 @@ def host(url: str) -> str | None:
 def comparable_host(value: str) -> str:
     """One host reduced to the form two spellings of it share.
 
-    ``urlsplit`` already lower-cases, so the ``www.`` prefix is the whole of it. Kept as
-    a named function because it must be applied to *both* sides of every comparison and
-    was previously written out twice inside one boolean expression.
+    Delegated to ``research/canonical.host_identity``, which is where this project's
+    knowledge of host spellings already lives. The old rule was ``removeprefix("www.")``
+    written out twice inside one boolean expression, and the property pass this item
+    required found what it missed on its first run: a question naming
+    ``https://results.cik.bg./2026/`` -- one terminal DNS root dot, D32's own example --
+    could never match a document from ``results.cik.bg``, because the two were compared
+    as strings. That is the same unsatisfiability M1-327 exists to remove, one layer down
+    from the branch it was filed against.
     """
-    return value.removeprefix("www.")
+    return host_identity(value)
 
 
 def source_domains(question: CanonicalQuestion) -> tuple[str, ...]:
