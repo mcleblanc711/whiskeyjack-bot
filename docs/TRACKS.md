@@ -48,6 +48,7 @@ to the registry, and neither is a habit you can form by reflex.
 | D-1001 | feat/d-1001-operator-runbook | whiskeyjack-d-1001 | no | none | 2026-09-04 |
 | M1-604 | feat/m1-604-ledger-exports | whiskeyjack-m1-604 | **yes** | none | 2026-09-04 |
 | M2-705 | feat/m2-705-response-capture | whiskeyjack-m2-705 | no | none | 2026-09-04 |
+| M1-329 | feat/m1-329-ntfy-operational-alerts | whiskeyjack-m1-329 | no | none* | 2026-09-09 |
 *(Merged and left in place, per the rule below: **M1-326** (PR #79, round-2 approve,
 2026-09-09) and **M1-327** (PR #80, round-2 approve, 2026-09-09 — it demoted the
 named-resolution-source gate from fatal to a recorded `evidence_gap` row and scoped M1-326's
@@ -60,6 +61,14 @@ the board is readable from one place. Each row also exists on its own branch, wh
 `scripts/tracks.py` actually reads — `M1-407`'s claim was invisible until 2026-09-09 because
 its branch had never been pushed, so the claim existed only in a local commit. Pushing a claim
 branch is what publishes the claim.*
+
+*`M1-329` claims **no dependency slot** — `httpx` is already a direct dependency
+(`pyproject.toml:24`), so the notifier adds no package and no `uv.lock` churn, leaving
+M1-604's Parquet claim uncontested. **\*Migration is conditional:** the item needs a
+throttle that is durable across processes, and if that lands as a ledger table rather
+than a state file it must claim **`014`** here first. The operator-local systemd stopgap
+installed 2026-09-09 uses a state file under `$XDG_STATE_HOME/whiskeyjack`, which is the
+cheaper precedent.*
 
 **Do not sweep a landed row out of this table into the prose below.** `scripts/tracks.py`
 proves a claim is a *stale landed* one rather than a misspelling by finding the exact row on
