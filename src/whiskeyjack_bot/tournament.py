@@ -428,14 +428,29 @@ def run_once(
                 heartbeat["skipped"] += 1
                 heartbeat["blocked"] = heartbeat.get("blocked", 0) + 1
                 continue
-            if (
-                sum(
-                    1
-                    for event in events(conn, "question_started", scope)
-                    if event.get("fingerprint") == fingerprint
+            attempts = sum(
+                1
+                for event in events(conn, "question_started", scope)
+                if event.get("fingerprint") == fingerprint
+            )
+            if attempts >= MAX_TRANSIENT_ATTEMPTS:
+                # Round 1 finding B1: exhaustion skipped the question but recorded no
+                # `question_blocked` row, so the exhausted question was visible only as an
+                # aggregate heartbeat count and never identifiable in the ledger. Appended
+                # at the transition and exactly once: the `blocked` check above runs first
+                # on every later poll, so this branch is not reached again.
+                append(
+                    conn,
+                    "question_blocked",
+                    scope,
+                    {
+                        "at": utcnow().isoformat(),
+                        "fingerprint": fingerprint,
+                        "reason": "transient_attempts_exhausted",
+                        "detail_code": None,
+                        "attempts": attempts,
+                    },
                 )
-                >= MAX_TRANSIENT_ATTEMPTS
-            ):
                 heartbeat["skipped"] += 1
                 heartbeat["exhausted"] = heartbeat.get("exhausted", 0) + 1
                 continue
@@ -526,6 +541,7 @@ def run_once(
                             {
                                 "at": utcnow().isoformat(),
                                 "fingerprint": fingerprint,
+                                "reason": "deterministic_verdict",
                                 "detail_code": outcome.detail_code,
                             },
                         )
