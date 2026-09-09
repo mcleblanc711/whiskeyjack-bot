@@ -3011,3 +3011,80 @@ pick this up.
 `uv run pytest tests/unit/test_cli_init_ledger.py -x`, three tests, all passing. `scripts/gate.sh`
 run clean at the end (ruff, ruff format, mypy --strict, full pytest). No migration and no
 dependency: this item claimed neither in `docs/TRACKS.md`.
+
+## M2-705 — Spike: exact response capture
+
+### Evidence — what the live ledger holds after 22 real submissions
+
+Read from the operator's own ledgers on **2026-09-09**, after MiniBench's first batch closed
+and the Cup profile had run. This is production evidence, not fixture evidence, and it is the
+strongest input this spike has to the question it exists to answer.
+
+```
+sqlite3 data/whiskeyjack_bot.sqlite3 \
+  "SELECT count(*) attempts,
+          sum(refetched_forecast_snapshot IS NOT NULL) with_snapshot,
+          sum(response_body IS NOT NULL)               with_body,
+          sum(verified_by_refetch)                     verified
+   FROM submission_attempts;"
+```
+
+| attempts | with_snapshot | with_body | verified |
+|---|---|---|---|
+| 22 | **22** | **0** | 22 |
+
+All 22 partition into a single cell: `(success=1, refetch_outcome='confirmed')`. So the two
+halves of the question separate cleanly, and only one of them is open.
+
+**`response_body` is NULL on every row.** Not sometimes — never. That is consistent with this
+branch's own verified fact ("public posting methods return `None` and raise on failure; they do
+not expose the HTTP response"): there is no response body to store without a second transport,
+which is precisely the adapter this spike is deciding whether to build.
+
+**`refetched_forecast_snapshot` is populated on every row**, and it is not a thin receipt. One
+stored snapshot, whitespace added:
+
+```json
+{"baseline":{"entry_count":0,"latest_start_time":null},
+ "expected_labels":null,
+ "expected_values":[0.008],
+ "observed":{"entry_count":1,"label_order":null,
+             "latest_start_time":1788438646.166348,
+             "latest_value_count":2,"latest_values":[0.992,0.008]},
+ "outcome":"confirmed","question_type":"binary", ...}
+```
+
+It carries the **expected values, the observed values, the baseline it was compared against,
+entry counts, label order and the classified outcome** — the full input to `classify_refetch`,
+not merely its verdict. A reader of the ledger can therefore re-derive *why* an attempt was
+called confirmed, which is the property an attribution instrument actually needs.
+
+### What this does and does not settle
+
+It settles the **common** cell. For a first-try confirmed submission, the ledger already holds
+enough to answer "what did the platform show, and why did we call that a match?" without the
+response body. The row-count argument that an exact response is *needed* is not available on
+this evidence: 22 of 22 confirmations are already auditable.
+
+It settles **nothing** about the cells that have never occurred. `refetch_outcome` has four
+members and the live ledger has exercised **one**. `unreadable` and `mismatched` both raise in
+`verify_uncertain_attempt` rather than recording, and `absent` has never fired. The interesting
+question — whether a refetch can be *wrong* rather than merely absent — remains untested by
+production and is exactly what `tests/integration/test_receipt_sufficiency.py`'s eight-cell
+partition exists to drive.
+
+**A caution against reading this as "the receipt is sufficient, done."** Zero occurrences of a
+cell is weak evidence about that cell; it may mean the condition is rare, or it may mean the
+tournament has not yet met the platform state that produces it. The spike's conclusion should
+rest on the driven partition, with these figures as the reason the *default* leans toward
+sufficiency rather than as proof of it.
+
+### Provenance
+
+Gathered 2026-09-09 while confirming a separate claim about `submission_verifications` — which
+is empty, and correctly so: it is written only by `verify_uncertain_attempt`, the operator's
+uncertainty-recovery route, so an empty table means no submission has ever been uncertain. The
+happy path stores its snapshot on `submission_attempts` instead. The absence of
+`submission_confirmed` lifecycle events has the same explanation: that transition is the way
+back out of `approved`, and nothing has needed recovering. Recorded here because an empty
+verification table reads like a gap and is not one.
