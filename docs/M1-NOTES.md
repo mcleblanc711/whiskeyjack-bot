@@ -9527,3 +9527,33 @@ draw the relationship as a mode rather than to suppress the health check — a f
 high is evidence of the distribution problem this project's tests most often have, so
 silencing it would hide exactly the thing worth knowing. It is worth knowing more broadly
 that the required `quality-gate` check can go red at random on any PR until that lands.
+
+### Round 2 — APPROVE, no blocking findings, one observation taken
+
+Both round-1 blockers verified CLOSED by the reviewer's own execution against
+`ec07da56faa83127372986f0b8762d94b4d86f58`: a delayed push returned `failed` after 0.101s
+against a 0.1s deadline; a 0.5s enclosing phase skipped the push and continued; and with a
+1.3s phase and a 10s push budget the push stopped after 0.300s while the restored phase
+deadline fired at 1.300s. The rejected-event log line reported `unrecognized`, and a
+recognized event stayed named.
+
+The one non-blocking observation was right and is taken rather than filed. Two arms of
+`min(own budget, outer remaining - _PHASE_MARGIN)` had committed tests — the push's own
+budget winning, and the outer leaving no room at all — but the **middle** arm did not: the
+one where the outer wins and still leaves room, which is the only branch that actually runs a
+*shortened* push and therefore the only place an off-by-one would let a push overrun into the
+phase. `test_a_push_is_squeezed_into_what_the_phase_can_spare` covers it with 2.5s of phase, a
+10s push budget and a peer that never answers, asserting both that the push gives up at about
+1.5s and that the phase still expires on its own 2.5s schedule.
+
+Two further mutants confirm that branch is load-bearing, both killed: the push ignoring the
+phase and using its own budget, and the squeeze forgetting the margin.
+
+**Final tally: 44 mutants, 44 killed** — 34 in round 1 (23 module, 11 wiring), 8 in the
+remediation, 2 for the squeeze branch. Three of the 44 started as survivors, and all three
+were the same underlying defect in different disguises: an assertion satisfied for a reason
+other than the one it claimed.
+
+The reviewer noted it could not run `pytest` in its read-only environment (no writable
+temporary directory) and validated by direct in-memory execution instead. The suite pass
+reported in the request is `scripts/gate.sh`'s, run locally.

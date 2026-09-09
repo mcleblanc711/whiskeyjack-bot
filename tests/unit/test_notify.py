@@ -314,6 +314,41 @@ def test_the_enclosing_phase_deadline_still_fires_after_a_push(
     assert 1.0 < elapsed < 4.0, f"the phase fired after {elapsed:.2f}s, not at its own 1.5s"
 
 
+def test_a_push_is_squeezed_into_what_the_phase_can_spare(tmp_path: Path, deadline: None) -> None:
+    """Round 2's non-blocking observation, taken: the middle branch had no committed test.
+
+    Two arms of ``min(own budget, outer remaining - margin)`` were covered -- the push's own
+    budget winning, and the outer leaving no room at all. The third, where the outer wins but
+    still leaves room, is the one that actually runs a *shortened* push, and it is where an
+    off-by-one would let the push overrun into the phase.
+
+    2.5s of phase, a 10s push budget and a peer that never answers: the push must give up at
+    about 1.5s, and the phase must still expire at its own 2.5s rather than at the push's.
+    """
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        time.sleep(30)
+        return httpx.Response(200)
+
+    started = time.monotonic()
+    push_ended = 0.0
+    with pytest.raises(TournamentError, match="wall-clock timeout"):
+        with phase_timeout(2.5):
+            assert (
+                _notifier(tmp_path, slow, deadline_seconds=10).send(
+                    "poll_summary", subject="w", title="t", body="b"
+                )
+                == "failed"
+            )
+            push_ended = time.monotonic() - started
+            time.sleep(30)
+    phase_ended = time.monotonic() - started
+    # Gave up inside the phase, leaving at least the reserved margin behind.
+    assert 0.5 < push_ended < 2.0, f"the push ran {push_ended:.2f}s of a 2.5s phase"
+    # And the phase still expired on its own schedule, not on the push's.
+    assert 2.0 < phase_ended < 5.0, f"the phase fired at {phase_ended:.2f}s, not at its 2.5s"
+
+
 def test_a_push_is_skipped_when_the_phase_has_no_room_left(tmp_path: Path, deadline: None) -> None:
     """Squeezed, then skipped. The forecast is the work; the notification is commentary.
 
