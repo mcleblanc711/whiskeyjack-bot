@@ -41,6 +41,18 @@ to the registry, and neither is a habit you can form by reflex.
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
+| T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
+| M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |
+**Do not sweep a landed row out of this table into the prose below.** `scripts/tracks.py`
+proves a claim is a *stale landed* one rather than a misspelling by finding the exact row on
+`origin/master` (`live_claims`: `signature in master_rows`) — so deleting the row destroys the
+only evidence that its deleted branch merged rather than vanished. `T-902` was swept on
+2026-09-07 while three parked branches still carried its row, and from then until 2026-09-09
+`scripts/tracks.py claims` exited 1, which under `set -euo pipefail` made `start-item.sh` abort
+for **every** item, deps or not. The row above is restored for that reason; `M1-205`'s row, also
+merged, was correctly left in place. Record a merge in the prose *in addition to* the row, never
+instead of it.
+
 *(Swept `LAUNCH` (`release/launch-readiness`, merged PR #75, 2026-09-07 — it shipped the
 operator runbook and the activated tournament runner, and spent migration `012`) and `T-902`
 (merged PR #74, round-1 approve, 0 findings; its branch is already gone from `origin`). The
