@@ -8879,3 +8879,174 @@ the pushback is right in a way my deferral argument missed: *satisfiability* dep
 M1-327's decision, but **verdict stability across the persisted form and sanitized-message
 properties do not** — they hold whatever the named-source rule becomes. That distinction is
 now part of M1-327's scope rather than a reason to defer the whole pass.
+
+## M1-327 — A missing resolution source is recorded, not refused
+
+M1-326 made a refusal cheap. It did not make question 45452 forecastable, and two things
+stood between it and a forecast: the gate that refused it, and — found by looking at the
+live ledger rather than at the code — M1-326's own attempt counter.
+
+### Decision — the named-source branch is demoted, and the first branch stays fatal
+
+`quality_problem` had three branches. Two say "there is nothing usable here", which is a
+real reason not to forecast. The third said "nothing usable here **came from the authority
+the question names**", and that is a different claim entirely: it asks a resolution
+*authority* to appear as a news *publisher*, when AskNews and Exa are the only two
+retrievers this project has.
+
+It is not a results-portal edge case. Both live instances are on the record:
+
+- **Cup 45452** names `https://results.cik.bg/`, the Bulgarian election commission's
+  results portal for an election on **2026-10-25**. It cannot have news coverage before the
+  event it exists to report. AskNews returned 13 good documents (`bta.bg`, `infobae`, …) on
+  every retrieval and all 13 were discarded; **zero of the 196 documents stored across 20
+  run rows came from `cik.bg`**, and none ever could.
+- **Cup rehearsal 43330** names `forbes.com` — a real news publisher — and was refused
+  twice anyway, because it simply was not in either provider's result set.
+
+So the branch is `missing_source_domains` now, and it refuses nothing. The gap is appended
+as an `evidence_gap` `tournament_events` row scoped to the **record id**, the scope
+`forecast_intent` and `witness` already use, so the ledger states that *this forecast* was
+made without direct resolution-source evidence. For an attribution instrument that is
+strictly better than the alternative, which is not a forecast to say it about.
+
+Owner decision, 2026-09-09, asked explicitly because it changes forecast behaviour.
+
+### Decision — the `evidence_gap` row carries hostnames; `QuestionOutcome` does not
+
+The row carries `domains`. They come out of the question's own `resolution_criteria`, which
+`forecast_records.question` already stores verbatim, and the ledger already holds every
+retrieved document's URL, title and summary — so this is ledger **storage**, and storage is
+what makes the gap answerable later ("which authority did we lack?").
+
+The error-hygiene rule binds the **message** path, and that path is unchanged:
+`QualityProblem.message` is untouched, and `QuestionOutcome.evidence_gaps` is a bare
+`("named_source_absent",)` code tuple, because it rides back into logs.
+
+### Decision — M1-326's counters are scoped to the current activation
+
+**This is the half that actually unblocks anything, and without it the rest is inert.**
+
+M1-326 counts attempts by counting `question_started` events with a matching fingerprint.
+But `question_started` predates M1-326: it was the launch-readiness *checkpoint*, written to
+pin `now` for restart recovery, and it never claimed to be an attempt counter. Read against
+the live ledgers on 2026-09-09:
+
+| Ledger | Scope | `question_started` rows, one fingerprint | Cap |
+|---|---|---|---|
+| `data/cup` | `33108:45452` | **17** | 3 |
+| `data/whiskeyjack_bot` | `33122:45754` | 3 | 3 |
+| `data/whiskeyjack_bot` | `33122:45760`, `:45764` | 2 each | 3 |
+
+So on the first poll after any restart, 45452 reads 17 ≥ 3 and is retired as
+`transient_attempts_exhausted` **before the fixed gate ever runs**. Fixing `quality.py`
+alone changes nothing on the machine that matters.
+
+Both counters — the attempt count and the `question_blocked` check — now match on the
+current `activation_id` as well as the fingerprint, and all three writers stamp it. Rows
+written before this change carry no `activation_id` and so match no activation, which is
+the correct reading of them: they recorded that a question was *started*, and claimed
+nothing about how many times it had been *tried*.
+
+It also gives a verdict an expiry, which it needed. A deterministic block asserts "this
+answer cannot change", and that is only ever true of a fixed question **and fixed code**.
+When the code that produced a verdict changes — exactly what this branch is — the operator
+needs a way to retire the verdicts it invalidated, and an append-only journal offers none.
+`tournament enable` is that gesture: already required after any config change, already
+recorded as an event, already the explicit "go".
+
+### Deviation — one latent bug fixed on the way, and why it was not deferred
+
+`source_domains` propagated a raw `ValueError` from `urlsplit`. `urlsplit("https://[abc")`
+is `ValueError: Invalid IPv6 URL`, question text arrives from the Metaculus API and is
+untrusted under CLAUDE.md's threat boundary, and `research/orchestrate.py:631` calls
+`source_domains` **before** retrieval — so one such string in one question's resolution
+criteria aborted the retrieval, not merely this gate. A raw `ValueError` escaping a module
+is a review finding on its own terms; it is also inside the exact function this item
+rewrites, and the required property pass finds it on its first run. Deferring it would have
+meant writing the totality property around the input class that breaks it.
+
+Document URLs cannot reach that branch — `HttpUrlString` refuses the same string — but the
+guard is on the shared `host` helper rather than on the question side alone, because which
+side is schema-protected is a fact about today's models and not something either caller
+should have to know.
+
+### Deviation — the property pass found the same defect one layer down
+
+The satisfiability property failed on its first run, and it was right to. A question naming
+`https://results.cik.bg./2026/` — one terminal DNS root dot, **D32's own worked example** —
+could never match a document from `results.cik.bg`, because the old rule compared the two
+hosts as strings with a `www.` strip written out twice inside one boolean.
+
+That is the same unsatisfiability M1-327 was filed against, one layer below the branch it
+named, and it would have kept a fraction of named sources permanently unmatchable after the
+demotion. `comparable_host` delegates to a new `canonical.host_identity`, which lives in the
+module that already owns host spellings — a hand-rolled separator table in the calling
+module is the speculative host transform `canonical.py`'s own header records losing to three
+times. `host_identity` is deliberately **total** (a value it cannot canonicalize is
+lower-cased and returned) and deliberately **never persisted**, which is what lets it carry
+the `www.` strip that a real canonicalizer must not: `www.forbes.com` and `forbes.com` are
+genuinely different hosts to DNS.
+
+### Rejected — matching named domains by registrable domain
+
+`research/allowlist.py` already carries the public-suffix list, so `results.cik.bg` could
+have matched anything under `cik.bg`. Rejected: it changes what "the named source" *means*,
+widening a rule this item is narrowing, and it would silently accept `evil.cik.bg`. The
+comparison stays host-for-host.
+
+### Rejected — leaving `orchestrate.py`'s `official_source_required` alone was the choice
+
+`orchestrate.py:631` sets `official_source_required=bool(source_domains(question))`, which
+triggers the Exa fallback whenever a question names any URL. That is left exactly as it is,
+and deliberately: biasing *retrieval* toward a named domain is the one mechanism that could
+actually obtain such evidence. Only the *refusal* was wrong.
+
+### Rejected — a config flag for the demotion
+
+`forecast.require_named_source_evidence`, defaulted off, would let the hard gate return
+without a code change. Rejected: any config-schema change moves `config_sha256`, and
+`require_activation` compares it, so both tournament profiles would refuse to run until
+`tournament enable` was re-run — an operational cost paid for a switch nobody has asked for.
+The demotion is unconditional and the code change is the record of it.
+
+### Deferred (do not read the absence as an omission)
+
+- **Enforcing the named-source rule after the scheduled resolution moment.** The context
+  document's alternative, and coherent: once the authority *could* have published, its
+  absence means something. Not built, because it leaves 45452 unforecastable until
+  2026-10-25 and the owner chose the demotion. Worth filing if the gap count ever suggests
+  the forecasts are actually worse.
+- **M1-331** (fingerprint stability under unordered API metadata) is untouched here and
+  still the most plausible way this gate leaks paid calls.
+- **A per-question unblock command.** Considered as the alternative to activation scoping;
+  it is more precise but adds a CLI surface and a new event kind, and the activation is a
+  gesture that already exists and is already recorded.
+
+### Standing risk — re-enabling re-arms deterministic blocks too
+
+Scoping the block check to the activation means `tournament enable` re-opens every blocked
+question, not only the ones a code change invalidated. Bounded: one re-attempt per blocked
+question per activation, under the same budget guard and the same `MAX_TRANSIENT_ATTEMPTS`
+as anything else, at roughly $0.29 a question. That is the intended trade — the alternative
+is a verdict with no expiry in an append-only journal — but it means **`tournament enable`
+is not free**, and an operator who re-enables to change one config value pays for it.
+
+### Standing risk — not verifiable offline
+
+Sockets are blocked, so nothing here was run against the real Metaculus or AskNews. The
+counts in the table above are read from the operator's own ledgers, which is evidence about
+what happened, not proof about what will. The end-to-end check is one `run-once` against
+question 45452 with `--question-id`, before any timer is re-enabled.
+
+### Verification
+
+Every property and every new unit test was mutation-tested; the twelve mutants and their
+verdicts are in the review request. Three of the four new `test_tournament.py` cases fail
+on `master`'s source with the tests unchanged, which is the pre-fix proof:
+`test_a_named_resolution_source_no_longer_refuses_the_forecast`,
+`test_pre_activation_attempts_do_not_retire_a_question`, and
+`test_re_enabling_the_tournament_re_arms_a_blocked_question`. The fourth,
+`test_a_forecast_from_the_named_source_records_no_gap`, is the negative control and passes
+on both trees by design — without it the first would hold on code that records a gap for
+every forecast.

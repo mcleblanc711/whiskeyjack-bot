@@ -67,8 +67,11 @@ The activated round budget is at most **US$20**, enforced through durable reserv
 before tournament research and model calls. Unknown charges retain their estimates;
 confirmed actual charges are reported separately. Research uses one consolidated AskNews
 query (current and archive calls), plus at most two complementary Exa searches when needed.
-Evidence must be contemporary and relevant, with evidence from a named resolution source
-when the question specifies one. Future-dated evidence is excluded. Research recovery is
+Evidence must be contemporary and relevant. Where the question names a resolution source
+and no retrieved document comes from it, that gap is **recorded against the forecast** as an
+`evidence_gap` ledger row rather than refusing the forecast: the two available retrievers are
+news retrievers, and a resolution authority is often not a news publisher. Future-dated
+evidence is excluded. Research recovery is
 limited to the same unchanged question within 30 minutes.
 
 ## Safety and recovery

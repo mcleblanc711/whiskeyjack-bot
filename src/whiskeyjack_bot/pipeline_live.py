@@ -901,6 +901,14 @@ def _attempt_question(
                 # transaction on purpose: `tournament_state.append` nests as a SAVEPOINT,
                 # so the row, its validation event and this land as one unit or not at all.
                 #
+                # That does cut against M1-312's rule that a paid attempt's row is written
+                # regardless -- a journal failure here rolls the forecast record back with
+                # it. Taken deliberately, and the stricter reading: outside the transaction,
+                # a crash between the commit and this append leaves a record whose silence
+                # *asserts* it had resolution-source evidence. An understated attribution
+                # claim is worse than a lost one, and a `StorageFailure` on the tournament
+                # journal already stops the worker everywhere else in this pipeline.
+                #
                 # The hostnames are carried. They come out of the question's own
                 # `resolution_criteria`, which `forecast_records.question` already stores
                 # verbatim, so this is ledger *storage* and not a diagnostic message --
