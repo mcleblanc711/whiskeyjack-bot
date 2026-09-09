@@ -84,7 +84,7 @@ def config(tmp_path: Path) -> AppConfig:
 
 @pytest.fixture()
 def prompt(config: AppConfig) -> LoadedPrompt:
-    return load_prompt(PROMPT_PATH, config.forecast.prompt_version)
+    return load_prompt(PROMPT_PATH, config.forecast.prompt_version, min_probability=0.001, max_probability=0.999)
 
 
 def _json_block(heading: str) -> str:
@@ -373,7 +373,9 @@ def test_a_prompt_of_another_version_is_refused(config: AppConfig, prompt: Loade
     """A LoadedPrompt carries no memory of which config loaded it, the same reason
     the Exa adapter repeats its configuration check at the spending site."""
     client = _Model(good_reply())
-    stale = LoadedPrompt(version="1.0.0", sha256=prompt.sha256, text=prompt.text)
+    stale = LoadedPrompt(
+        version="1.0.0", sha256=prompt.sha256, text=prompt.text, bounds=prompt.bounds
+    )
     with pytest.raises(ForecastGenerationError):
         _generate(client, config, prompt, prompt=stale)
     assert client.calls == []

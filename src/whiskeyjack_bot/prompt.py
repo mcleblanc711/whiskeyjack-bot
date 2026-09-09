@@ -29,6 +29,17 @@ never a coercion: a prompt whose declared version does not match the version
 that will be recorded against every forecast is exactly the drift D04 exists to
 catch.
 
+**The probability range the prompt declares to the model is parsed and
+cross-checked the same way (M1-407).** ``forecast.min_probability`` and
+``forecast.max_probability`` bound what the *application* will accept back;
+``prompts/forecaster.md`` states a range to the model in prose. Nothing compared
+them, so a configuration outside the declared range asks for a probability the
+prompt never permits and pays a repair turn to find out. The check reads the
+prompt ``forecast.prompt_path`` actually names -- never a copy of its numbers,
+which is the whole of the acceptance criterion. It is deliberately *not* the
+same check as ``forecast.generate``'s spec-envelope preflight: see
+``probability_bounds_problem``.
+
 Error hygiene matches ``ConfigError``/``LedgerError``/``NormalizationError``: a
 :class:`PromptError` never echoes file contents (a prompt can carry a
 mistakenly pasted credential), and wrapping raises use ``from None`` so an
@@ -77,6 +88,31 @@ BARE_VERSION_RE = re.compile(_SEMVER, re.ASCII)
 _H1_PREFIX_RE = re.compile(r"#[ \t]+\S")
 _H1_VERSION_TOKEN_RE = re.compile(rf"\bv({_SEMVER})(?![\w.])", re.ASCII)
 
+# M1-407. Unlike the version, the probability range is declared *in the body*
+# and more than once -- ``prompts/forecaster.md`` v1.1.0 states it three times
+# (binary prose guidance, the ``probability_yes`` bound, the multiple-choice
+# per-option bound), because all three are things the model must be told where
+# it reads them. So there is no single anchored line to match, and a
+# document-wide scan for a decimal pair is exactly the mistake
+# ``parse_declared_version``'s comment above describes: the body also carries a
+# ``1e-6`` sum tolerance and a percentile ladder of decimals.
+#
+# The scan is therefore *scoped by line to lines that are about probability*.
+# That is what keeps "percentile values must be non-decreasing" and
+# "sum to 1 within ``1e-6``" out of the result, and it is a rule a custom prompt
+# can satisfy by writing the sentence any operator would write anyway.
+_PROBABILITY_LINE_RE = re.compile(r"probabilit", re.IGNORECASE)
+
+# A digit is required before the point: ``.5`` is not a spelling this accepts,
+# and the parser refuses rather than guessing at a prompt that uses one.
+# Deliberately not bounded in length -- the matched text is never echoed, only
+# the parsed ``float`` is, and every overlong digit string collapses to a short
+# repr (or to ``inf``, which then fails the range check below).
+_DECIMAL = r"\d+(?:\.\d+)?"
+_DECLARED_RANGE_RE = re.compile(
+    rf"\bbetween\s+({_DECIMAL})\s+and\s+({_DECIMAL})\b", re.ASCII | re.IGNORECASE
+)
+
 
 class PromptError(Exception):
     """The forecaster prompt cannot be loaded, parsed or version-verified.
@@ -88,6 +124,20 @@ class PromptError(Exception):
 
 
 @dataclass(frozen=True)
+class DeclaredProbabilityBounds:
+    """The probability range the prompt states to the model (M1-407).
+
+    Two floats parsed out of the prompt body, never the matched text. Both are
+    safe in the repr for the reason ``LoadedPrompt.version`` is: each has
+    already matched a strict decimal pattern and been range-checked, so neither
+    can carry arbitrary file content.
+    """
+
+    low: float
+    high: float
+
+
+@dataclass(frozen=True)
 class LoadedPrompt:
     """A verified prompt: its declared version, raw-byte digest and text.
 
@@ -95,13 +145,15 @@ class LoadedPrompt:
     but the value object was not: a traceback frame, a failed assertion or a log
     line rendering this dataclass printed the whole prompt -- including any
     mistakenly pasted credential, the same hazard the module docstring names.
-    ``version`` and ``sha256`` stay in the repr; both are safe by construction
-    (a matched semver, a hex digest) and a repr without them is useless.
+    ``version``, ``sha256`` and ``bounds`` stay in the repr; all three are safe
+    by construction (a matched semver, a hex digest, two range-checked floats)
+    and a repr without them is useless.
     """
 
     version: str
     sha256: str
     text: str = field(repr=False)
+    bounds: DeclaredProbabilityBounds
 
 
 def prompt_sha256(data: bytes) -> str:
@@ -143,12 +195,131 @@ def parse_declared_version(text: str) -> str:
     return only.group(1)
 
 
-def load_prompt(path: Path, expected_version: str) -> LoadedPrompt:
+def parse_declared_probability_bounds(text: str) -> DeclaredProbabilityBounds:
+    """Return the probability range the prompt declares to the model (M1-407).
+
+    Every line that is about probability is scanned for ``between <low> and
+    <high>``; **every match found must agree**, and at least one is required.
+
+    Both of those are the stricter reading, and both follow
+    ``parse_declared_version``. A prompt whose three statements of the range
+    disagree is drift, and picking a winner -- even the narrowest one -- would
+    silently accept a prompt that tells the model two different things where it
+    reads them. A prompt that declares no range at all cannot be checked
+    against, and "reported at startup" is not satisfied by guessing that the
+    default applies: an operator who points ``forecast.prompt_path`` at a prompt
+    stating no range gets told so, once, before anything is spent.
+
+    Raises :class:`PromptError` and nothing else. No message echoes a line: the
+    only file-derived values that reach one are parsed ``float``s.
+    """
+    found: list[tuple[float, float]] = []
+    for line in text.splitlines():
+        if _PROBABILITY_LINE_RE.search(line) is None:
+            continue
+        for match in _DECLARED_RANGE_RE.finditer(line):
+            # float() cannot raise on this pattern: it is digits with at most
+            # one point. An overlong run becomes ``inf`` and fails the range
+            # check below rather than escaping as an OverflowError.
+            found.append((float(match.group(1)), float(match.group(2))))
+
+    if not found:
+        raise PromptError(
+            "forecaster prompt declares no probability range: at least one line about "
+            "probability must state it as 'between <low> and <high>', so a configured "
+            "bound can be checked against the prompt rather than against a copy of its "
+            "numbers (M1-407) (lines withheld: they can echo prompt contents)"
+        )
+
+    low, high = found[0]
+    if any(pair != (low, high) for pair in found[1:]):
+        raise PromptError(
+            "forecaster prompt declares more than one probability range and they disagree; "
+            "exactly one range is required so the bound checked here is the bound the model "
+            "is told (lines withheld: they can echo prompt contents)"
+        )
+    if not 0.0 <= low < high <= 1.0:
+        # Echoing the parsed pair follows the version mismatch below: each value
+        # has matched a strict pattern, so neither can carry arbitrary content,
+        # and a message without them names no fixable defect.
+        raise PromptError(
+            f"forecaster prompt declares the probability range {low!r} to {high!r}, which "
+            "cannot bound a probability; 0 <= low < high <= 1 is required"
+        )
+    return DeclaredProbabilityBounds(low=low, high=high)
+
+
+def probability_bounds_problem(
+    bounds: DeclaredProbabilityBounds, *, min_probability: float, max_probability: float
+) -> str | None:
+    """Return a sanitized problem string if config falls outside ``bounds`` (M1-407).
+
+    ``None`` means the configured pair is contained in the range the prompt
+    declares. This is **containment, not equality**: a configuration narrower
+    than the prompt is accepted, because the acceptance criterion is about a
+    config falling *outside* the declared range, and a narrower one is a bound
+    ``forecast.binary``'s repair turn already states to the model.
+
+    **This is not ``forecast.generate``'s envelope preflight and must not be
+    fused with it.** That check asks whether the configured pair is inside the
+    ``0.001``-``0.999`` the *submission path* will accept, and its numbers come
+    from ``config.PROBABILITY_BOUND_FLOOR``/``CEILING`` for that reason. This
+    one asks whether the configured pair is inside the range *the loaded prompt
+    states to the model*. The two agree today only because the shipped prompt
+    happens to print the spec's endpoints; a custom prompt separates them
+    immediately. Collapsing them is the mistake ``bounds.py``'s docstring
+    describes for ``MAX_ACTOR_LENGTH`` and ``MAX_IDENTIFIER_LENGTH``, and giving
+    the submission envelope one owner is a different open row (M1-513).
+
+    The declared pair is named and the configured pair is withheld, which is
+    exactly what ``forecast.multiple_choice``'s envelope diagnostic already
+    does: the declared values are file-derived but strictly matched, while
+    whether a *configured* value may be rendered at all is open (M1-509).
+    """
+    if bounds.low <= min_probability and max_probability <= bounds.high:
+        return None
+    return (
+        f"forecast.min_probability/forecast.max_probability fall outside the {bounds.low!r} "
+        f"to {bounds.high!r} range the loaded forecaster prompt declares to the model, so "
+        "every forecast would be asked for a probability the prompt does not permit "
+        "(configured pair withheld)"
+    )
+
+
+def load_prompt(
+    path: Path,
+    expected_version: str,
+    *,
+    min_probability: float,
+    max_probability: float,
+) -> LoadedPrompt:
     """Load the prompt at ``path``, verifying its declared version and hashing it.
 
     ``expected_version`` is ``forecast.prompt_version`` from config, in bare
     form. A mismatch against the prompt's own H1 raises :class:`PromptError`.
+
+    ``min_probability``/``max_probability`` are ``forecast.min_probability`` and
+    ``forecast.max_probability``. They are **required keyword arguments and not
+    a separate function** on purpose (M1-407): every path that reaches a
+    billable call loads the prompt through here -- both pipelines,
+    ``verify-env`` and the acceptance harness -- so binding the cross-check to
+    the load makes it inherited by construction rather than remembered at each
+    site. A caller that has no configuration to check against does not exist;
+    one that appears must say what it is checking.
     """
+    # Exact-type, and range-checked before use: these two reach ``<=``
+    # comparisons below, so a str or a NaN would escape this module as a raw
+    # TypeError or pass a comparison silently -- and every malformed shape must
+    # arrive as this module's own error type. ``ForecastConfig`` already
+    # guarantees floats; this is the AppConfig-assembled-some-other-way case
+    # ``forecast.generate`` repeats its own preflights for.
+    for value in (min_probability, max_probability):
+        if type(value) is not float or not 0.0 <= value <= 1.0:
+            raise PromptError(
+                "forecast.min_probability and forecast.max_probability must be floats "
+                "between 0 and 1 (values withheld)"
+            )
+
     # fullmatch, not match: ``match`` + ``$`` accepts a terminal newline, so
     # "1.1.0\n" passed this guard and then reached the mismatch diagnostic below
     # -- exactly the unvalidated-value-in-a-message case the guard exists for.
@@ -184,6 +355,10 @@ def load_prompt(path: Path, expected_version: str) -> LoadedPrompt:
             "(detail withheld: it can echo prompt contents)"
         ) from None
 
+    # Version first, deliberately: M1-401's checks keep the precedence they had,
+    # so a prompt that fails both reports the version drift D04 exists to catch
+    # rather than a new message. One PromptError per load either way -- the
+    # first failure wins, here and in ``verify-env``.
     declared = parse_declared_version(text)
     if declared != expected_version:
         # Both versions are safe to echo: each has already matched a strict
@@ -194,4 +369,11 @@ def load_prompt(path: Path, expected_version: str) -> LoadedPrompt:
             "version it was not generated from (D04)"
         )
 
-    return LoadedPrompt(version=declared, sha256=digest, text=text)
+    bounds = parse_declared_probability_bounds(text)
+    problem = probability_bounds_problem(
+        bounds, min_probability=min_probability, max_probability=max_probability
+    )
+    if problem is not None:
+        raise PromptError(problem)
+
+    return LoadedPrompt(version=declared, sha256=digest, text=text, bounds=bounds)

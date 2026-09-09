@@ -150,7 +150,7 @@ from whiskeyjack_bot.forecast.schema import (
 )
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
-from whiskeyjack_bot.prompt import LoadedPrompt
+from whiskeyjack_bot.prompt import LoadedPrompt, probability_bounds_problem
 from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.questions.model import (
     CanonicalNumericQuestion,
@@ -439,6 +439,26 @@ def generate_forecast(
             "forecast.min_probability and forecast.max_probability are not within the "
             "0.001 to 0.999 envelope the submission path requires"
         )
+    prompt_bounds_problem = probability_bounds_problem(
+        prompt.bounds,
+        min_probability=config.forecast.min_probability,
+        max_probability=config.forecast.max_probability,
+    )
+    if prompt_bounds_problem is not None:
+        # M1-407, and **a different check from the one directly above** although the
+        # shipped prompt makes them agree. That one asks whether the configured pair is
+        # inside the envelope the *submission path* accepts, from the spec constants. This
+        # one asks whether it is inside the range *this loaded prompt* states to the model,
+        # read from the file config actually names. A custom prompt separates them
+        # immediately, and a config outside what the model was told costs a repair turn --
+        # two billed calls -- to reject a probability no model reading that prompt would
+        # have supplied.
+        #
+        # Repeated here although ``load_prompt`` already refused it, for the reason the
+        # version check at the top of this function is repeated: a LoadedPrompt carries no
+        # memory of which config loaded it, so the pair checked at load time is not
+        # provably the pair in this ``config``. Refused before any billable call.
+        raise ForecastGenerationError(prompt_bounds_problem)
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(

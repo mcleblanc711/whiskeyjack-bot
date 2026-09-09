@@ -21,7 +21,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REAL_PROMPT = REPO_ROOT / "prompts" / "forecaster.md"
 EXAMPLE_CONFIG = REPO_ROOT / "config.example.yaml"
 
-MINIMAL_PROMPT = "# MiniBench forecaster prompt — v1.1.0\n\nBody text.\n"
+# The declared probability range is part of the minimum a prompt must carry since
+# M1-407: ``load_prompt`` refuses a prompt that states no range rather than
+# assuming the shipped one applies, so a fixture without this line is no longer a
+# loadable prompt.
+DECLARED_RANGE = "Probabilities must be between 0.001 and 0.999 inclusive."
+MINIMAL_PROMPT = f"# MiniBench forecaster prompt — v1.1.0\n\nBody text.\n{DECLARED_RANGE}\n"
 
 
 def write_prompt(tmp_path: Path, text: str) -> Path:
@@ -47,7 +52,7 @@ def test_real_prompt_and_example_config_agree() -> None:
     """Editing the prompt without bumping config.example.yaml fails CI (D04)."""
     config = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
     declared = config["forecast"]["prompt_version"]
-    loaded = load_prompt(REAL_PROMPT, declared)
+    loaded = load_prompt(REAL_PROMPT, declared, min_probability=0.001, max_probability=0.999)
     assert loaded.version == declared
 
 
@@ -57,7 +62,7 @@ def test_real_prompt_bytes_match_the_pinned_digest() -> None:
     The version check above cannot see body drift: both versions stay 1.1.0
     while the bytes the model actually sees change.
     """
-    loaded = load_prompt(REAL_PROMPT, "1.1.0")
+    loaded = load_prompt(REAL_PROMPT, "1.1.0", min_probability=0.001, max_probability=0.999)
     assert loaded.version in RELEASED_PROMPT_SHA256, (
         f"prompt declares v{loaded.version} with no pinned digest; add its sha256 to "
         "RELEASED_PROMPT_SHA256 when releasing a new prompt version"
@@ -84,7 +89,10 @@ def test_identical_bytes_hash_identically(tmp_path: Path) -> None:
     (tmp_path / "b").mkdir()
     a = write_prompt(tmp_path / "a", MINIMAL_PROMPT)
     b = write_prompt(tmp_path / "b", MINIMAL_PROMPT)
-    assert load_prompt(a, "1.1.0").sha256 == load_prompt(b, "1.1.0").sha256
+    assert (
+        load_prompt(a, "1.1.0", min_probability=0.001, max_probability=0.999).sha256
+        == load_prompt(b, "1.1.0", min_probability=0.001, max_probability=0.999).sha256
+    )
 
 
 def test_single_changed_byte_changes_hash(tmp_path: Path) -> None:
@@ -92,7 +100,10 @@ def test_single_changed_byte_changes_hash(tmp_path: Path) -> None:
     (tmp_path / "b").mkdir()
     a = write_prompt(tmp_path / "a", MINIMAL_PROMPT)
     b = write_prompt(tmp_path / "b", MINIMAL_PROMPT.replace("Body text.", "Body texts"))
-    assert load_prompt(a, "1.1.0").sha256 != load_prompt(b, "1.1.0").sha256
+    assert (
+        load_prompt(a, "1.1.0", min_probability=0.001, max_probability=0.999).sha256
+        != load_prompt(b, "1.1.0", min_probability=0.001, max_probability=0.999).sha256
+    )
 
 
 def test_whitespace_reflow_changes_hash(tmp_path: Path) -> None:
@@ -100,9 +111,12 @@ def test_whitespace_reflow_changes_hash(tmp_path: Path) -> None:
     whose whitespace-collapsing rule would hash these two identically."""
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
-    a = write_prompt(tmp_path / "a", "# p — v1.1.0\n\nOne two three.\n")
-    b = write_prompt(tmp_path / "b", "# p — v1.1.0\n\nOne two\nthree.\n")
-    assert load_prompt(a, "1.1.0").sha256 != load_prompt(b, "1.1.0").sha256
+    a = write_prompt(tmp_path / "a", f"# p — v1.1.0\n\nOne two three.\n{DECLARED_RANGE}\n")
+    b = write_prompt(tmp_path / "b", f"# p — v1.1.0\n\nOne two\nthree.\n{DECLARED_RANGE}\n")
+    assert (
+        load_prompt(a, "1.1.0", min_probability=0.001, max_probability=0.999).sha256
+        != load_prompt(b, "1.1.0", min_probability=0.001, max_probability=0.999).sha256
+    )
 
     from whiskeyjack_bot.research.hashing import content_sha256
 
@@ -112,7 +126,9 @@ def test_whitespace_reflow_changes_hash(tmp_path: Path) -> None:
 
 def test_hash_matches_sha256_of_file_bytes(tmp_path: Path) -> None:
     path = write_prompt(tmp_path, MINIMAL_PROMPT)
-    assert load_prompt(path, "1.1.0").sha256 == prompt_sha256(path.read_bytes())
+    assert load_prompt(
+        path, "1.1.0", min_probability=0.001, max_probability=0.999
+    ).sha256 == prompt_sha256(path.read_bytes())
 
 
 # --- Version parsing -------------------------------------------------------
@@ -127,7 +143,9 @@ def test_version_comes_from_h1_not_body() -> None:
 def test_v_prefix_is_stripped(tmp_path: Path) -> None:
     """Config's bare form is canonical; the H1's 'v' prefix normalizes to it."""
     path = write_prompt(tmp_path, MINIMAL_PROMPT)
-    assert load_prompt(path, "1.1.0").version == "1.1.0"
+    assert (
+        load_prompt(path, "1.1.0", min_probability=0.001, max_probability=0.999).version == "1.1.0"
+    )
 
 
 @pytest.mark.parametrize(
@@ -165,7 +183,7 @@ def test_ambiguous_h1_is_rejected_not_silently_resolved() -> None:
 def test_version_mismatch_is_a_hard_error(tmp_path: Path) -> None:
     path = write_prompt(tmp_path, MINIMAL_PROMPT)
     with pytest.raises(PromptError) as exc:
-        load_prompt(path, "1.0.0")
+        load_prompt(path, "1.0.0", min_probability=0.001, max_probability=0.999)
     # Both versions are safe to echo: each matched a strict semver pattern.
     assert "1.1.0" in str(exc.value)
     assert "1.0.0" in str(exc.value)
@@ -186,7 +204,7 @@ def test_malformed_expected_version_rejected(tmp_path: Path, expected_version: s
     """The guard exists because this value is echoed in the mismatch message."""
     path = write_prompt(tmp_path, MINIMAL_PROMPT)
     with pytest.raises(PromptError):
-        load_prompt(path, expected_version)
+        load_prompt(path, expected_version, min_probability=0.001, max_probability=0.999)
 
 
 # --- Error hygiene ---------------------------------------------------------
@@ -194,20 +212,20 @@ def test_malformed_expected_version_rejected(tmp_path: Path, expected_version: s
 
 def test_missing_file_raises_prompt_error(tmp_path: Path) -> None:
     with pytest.raises(PromptError):
-        load_prompt(tmp_path / "absent.md", "1.1.0")
+        load_prompt(tmp_path / "absent.md", "1.1.0", min_probability=0.001, max_probability=0.999)
 
 
 def test_directory_raises_prompt_error(tmp_path: Path) -> None:
     """A path that exists but is not a readable file still arrives as PromptError."""
     with pytest.raises(PromptError):
-        load_prompt(tmp_path, "1.1.0")
+        load_prompt(tmp_path, "1.1.0", min_probability=0.001, max_probability=0.999)
 
 
 def test_invalid_utf8_raises_prompt_error(tmp_path: Path) -> None:
     path = tmp_path / "forecaster.md"
     path.write_bytes(b"# p \xff\xfe v1.1.0\n")
     with pytest.raises(PromptError):
-        load_prompt(path, "1.1.0")
+        load_prompt(path, "1.1.0", min_probability=0.001, max_probability=0.999)
 
 
 # Low-entropy on purpose: gitleaks scans every branch in CI, so a realistic-looking
@@ -225,7 +243,7 @@ PLANTED = "privateFAKE123456"
 def test_errors_never_echo_prompt_contents(tmp_path: Path, text: str) -> None:
     path = write_prompt(tmp_path, text)
     with pytest.raises(PromptError) as exc:
-        load_prompt(path, "1.1.0")
+        load_prompt(path, "1.1.0", min_probability=0.001, max_probability=0.999)
     rendered = "".join(
         traceback.format_exception(type(exc.value), exc.value, exc.value.__traceback__)
     )
@@ -236,8 +254,8 @@ def test_errors_never_echo_prompt_contents(tmp_path: Path, text: str) -> None:
 def test_repr_does_not_expose_the_prompt_body(tmp_path: Path) -> None:
     """The error paths were sanitized but the value object was not: repr() of a
     LoadedPrompt printed the whole prompt, credential included."""
-    path = write_prompt(tmp_path, f"# p — v1.1.0\n\n{PLANTED}\n")
-    loaded = load_prompt(path, "1.1.0")
+    path = write_prompt(tmp_path, f"# p — v1.1.0\n\n{PLANTED}\n{DECLARED_RANGE}\n")
+    loaded = load_prompt(path, "1.1.0", min_probability=0.001, max_probability=0.999)
 
     assert PLANTED not in repr(loaded)
     # The safe fields stay visible -- a repr with neither is useless.
@@ -250,13 +268,18 @@ def test_repr_does_not_expose_the_prompt_body(tmp_path: Path) -> None:
 def test_repr_leak_survives_a_rendered_traceback(tmp_path: Path) -> None:
     """The realistic leak path: a failed assertion or a frame-capturing logger
     renders locals, not just the exception message."""
-    path = write_prompt(tmp_path, f"# p — v1.1.0\n\n{PLANTED}\n")
-    loaded = load_prompt(path, "1.1.0")
+    path = write_prompt(tmp_path, f"# p — v1.1.0\n\n{PLANTED}\n{DECLARED_RANGE}\n")
+    loaded = load_prompt(path, "1.1.0", min_probability=0.001, max_probability=0.999)
     assert PLANTED not in f"{loaded!r}" and PLANTED not in str([loaded])
 
 
 def test_loaded_prompt_is_frozen(tmp_path: Path) -> None:
-    loaded = load_prompt(write_prompt(tmp_path, MINIMAL_PROMPT), "1.1.0")
+    loaded = load_prompt(
+        write_prompt(tmp_path, MINIMAL_PROMPT),
+        "1.1.0",
+        min_probability=0.001,
+        max_probability=0.999,
+    )
     assert isinstance(loaded, LoadedPrompt)
     with pytest.raises(AttributeError):
         loaded.version = "2.0.0"  # type: ignore[misc]
