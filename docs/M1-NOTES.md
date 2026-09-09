@@ -9103,3 +9103,337 @@ unchanged, which is the pre-fix proof:
 `test_a_forecast_from_the_named_source_records_no_gap`, is the negative control and passes
 on both trees by design — without it the first would hold on code that records a gap for
 every forecast.
+
+---
+
+## M1-329 — Push operational alerts to ntfy
+
+Acceptance: *a notify module owns a sanitized `NotifyError` and never echoes a stored, file
+or field value; a closed event vocabulary is a module-level `Literal` validated with
+`get_args`, covering `question_blocked`, `provider_failed`, `budget_threshold`,
+`prediction_posted` and `poll_summary`; `prediction_posted` fires only after a submission is
+CONFIRMED and carries no rationale; a failed or slow push degrades rather than blocks; the
+throttle is durable across processes; the topic URL is read from an env var whose NAME alone
+appears in config and which is added to `secret_env_var_names`; tests inject a fake
+transport; and the tracked systemd units carry the `OnFailure` wiring installed
+operator-locally on 2026-09-09.*
+
+### Delivered
+
+- `src/whiskeyjack_bot/notify.py` — `NotifyEvent`, `NotifyOutcome`, `NotifyError`,
+  `Notifier`, `build_notify_client`, `build_notifier`, `notifier_context`,
+  `CURRENT_NOTIFIER`, `emit`, `budget_level_crossed`, `describe`, `_WINDOW_SECONDS`,
+  `BUDGET_THRESHOLD_PERCENTS`.
+- `src/whiskeyjack_bot/config.py` — `NotifyConfig`, `MAX_NOTIFY_TIMEOUT_SECONDS`,
+  `AppConfig.notify`, the ntfy name in `secret_env_var_names()`, and a new
+  `required_env_var_names()`.
+- `src/whiskeyjack_bot/env_verify.py` — presence checks now read `required_env_var_names()`.
+- Five call sites: `tournament.py` (`prediction_posted`, `question_blocked` ×2,
+  `poll_summary` ×2, and the notifier install), `tournament_state.py`
+  (`budget_threshold`), `research/orchestrate.py` (`provider_failed`).
+- `deploy/systemd/whiskeyjack-notify@.service` (new) and `OnFailure=` on both service units.
+- `config.example.yaml` and the three `config/tournament*.yaml` profiles.
+- `tests/unit/test_notify.py` (51), `tests/property/test_notify_properties.py` (10),
+  13 wiring tests in `tests/unit/test_tournament.py`, four in `tests/unit/test_config.py`.
+
+**No migration and no dependency.** `httpx` is already a direct dependency
+(`pyproject.toml:24`), so `uv.lock` is untouched and the `none*` migration claim in
+`docs/TRACKS.md` stands as written.
+
+### Read the incident before reading the design
+
+Every number below is a read of the live Cup ledger (`data/cup/ledger.sqlite3`, activation
+`305299:33108`, ceiling **$10**), not an estimate.
+
+Question 45452 produced **110 `question_failure` rows** from `2026-09-08T16:38:47Z` to
+`2026-09-09T01:40:25Z` — nine hours and two minutes — every one with the payload
+`{"at": …, "error_type": "TournamentError"}`. No reason, no provider, no message. It
+re-bought research **17 times** on a ~30-minute cadence; every Exa run returned
+`no documents retained` and AskNews returned 13 documents on 14 of the 17.
+
+| provider | reservations | reserved | settled | actual |
+|---|---|---|---|---|
+| asknews | 43 | $3.1750 | **0** | **$0.0000** |
+| exa | 40 | $2.0000 | 40 | $0.0210 |
+| openrouter | 5 | $0.6669 | 5 | $0.1650 |
+
+### Decision — `question_blocked` is the alert the incident needed, and the vocabulary is right
+
+The item asks whether at least one of `provider_failed` / `question_blocked` would genuinely
+have fired within minutes, and to prove it against the ledger rather than assert it.
+
+**`provider_failed` would not have.** Only **3 of 17** AskNews runs recorded a failure at all
+— 17:40, 22:10, 01:25 — the first **62 minutes** in. `asknews.py:337-343` discards the SDK
+exception without inspecting it (deliberately: it may quote the request or an auth header),
+so `research_runs.error_summary` has a two-string vocabulary and **quota exhaustion is
+indistinguishable from a socket reset**. Nothing under `src/whiskeyjack_bot/research/`
+handles 402, 429 or quota.
+
+**`question_blocked` would have, within about four minutes.** The one
+`pipeline_failure_events` row for the incident is `research_failed` / `no_evidence`, and
+`no_evidence ∈ DETERMINISTIC_FAILURE_CODES` (`tournament.py:68-70`), so under today's code —
+that is, with M1-326 merged, which is this item's dependency — the first attempt at 16:38
+appends `question_blocked(deterministic_verdict, no_evidence)` and this fires on it. The
+transient route converges too: `MAX_TRANSIENT_ATTEMPTS = 3` at a 30-minute cadence is
+`question_blocked(transient_attempts_exhausted)` inside about 90 minutes.
+
+So the vocabulary is not wrong, and the most valuable finding is a narrower one: **the event
+that catches this class of incident is the one M1-326 created, and it catches it only
+because M1-326 exists.** Before that item there was no `question_blocked` at all, and the
+110 rows that did exist carried an exception class name and nothing else. An alert built on
+`question_failure` would have said "question 45452 failed, TournamentError" 110 times.
+
+`provider_failed` still ships, and its body says what it can: a provider failed, and *the
+cause is not recorded*. Claiming more would be false.
+
+### Decision — the durable throttle is a stamp file, not a ledger table
+
+`artifacts.write_new_file` uses `os.link`, which fails `EEXIST` rather than clobbering
+(`artifacts.py:125-131`). That is already a cross-process, restart-surviving
+compare-and-set, fsynced on both file and parent directory, reviewed under M2-709 and
+property-tested. The throttle is a stamp at
+`<artifact_root>/notifications/<event>-<sha256(subject)[:32]>-<window>.json`; the first
+process in a window links it and pushes, everyone else gets `EEXIST`.
+
+Three reasons over a ledger table, in increasing order of weight. It needs no migration, so
+no `014` claim against four live lanes. A notification throttle is operational state rather
+than attribution, and appending it to the append-only attribution journal is exactly the
+shortcut `CLAUDE.md` says not to take. And decisively: **the systemd half has no ledger
+connection at all.** State only the healthy program can reach is not state an alerting path
+may depend on.
+
+The window is **tumbling** (`floor(epoch / window)`), not sliding. A sliding window needs
+read-then-write and reintroduces the race `os.link` closes. Two pushes can land either side
+of a boundary; a duplicate alert is a much better failure than a lost or raced one.
+
+Windows are **per event**, because the events are not the same kind of thing: 30 minutes for
+`question_blocked` and `provider_failed` (matching the worker's own re-attempt cadence), 24
+hours for the other three.
+
+### Decision — `poll_summary` is a daily liveness digest, and its job is to be missed
+
+A push per poll is 288 a day, the operator mutes the channel, and a muted channel reports
+exactly as much as no channel. So it is throttled to 24 hours and carries the heartbeat plus
+`status()`'s counts and remaining budget.
+
+The defence for it existing at all: it is the only signal for the failure neither other half
+can see. `OnFailure` fires when a unit **fails** — not when the timer is disabled, the user
+session ends, or the machine is off. In-process code says nothing in any of those. A digest
+that stops arriving is the only thing that covers them, and it also covers this module's own
+fail-closed arm (below).
+
+It is emitted at **both** of `run_once`'s exits. A digest hooked only to the normal return
+would go quiet precisely when spending is held — when the worker has stopped doing anything
+and most needs to say so.
+
+### Decision — `budget_threshold` is set on `actual + held`, and is honest about what it cannot catch
+
+`actual` alone can never fire for the provider that caused the incident: AskNews settled
+**zero of 43** reservations, so its `actual_cost_usd` is permanently $0.00. `held` is
+inflated by that same non-settlement — and that is not a reason to discard it, because
+inflated or not it is the number that stops the worker. `Budget.reserve` refuses when
+`actual + held + amount > ceiling` (`tournament_state.py:254`), so the alert is set on
+exactly that sum, at 80% and 50%, plus 100% on the refusal itself.
+
+**It would not have caught 2026-09-08, and the notes say so rather than the thresholds being
+tuned until it would.** The nine hours reached **31.7%** of the $10 ceiling (33.6% a day
+later). This is a budget alarm; `question_blocked` is the stall alarm. A budget alarm tuned
+to catch stalls is a budget alarm that pages daily, and `test_the_measured_incident_
+trajectory_never_crosses_a_level` pins that trade-off so the next incident does not quietly
+erode it.
+
+### Decision — `prediction_posted` is emitted inside the `forecast_confirmed` write guard
+
+Not after `reconcile_forecast`'s `return True`: that function runs on every poll that
+re-reconciles a standing intent, so a hook there pages every five minutes for a forecast
+that landed days ago. Inside the guard it is by construction the first confirmation, and it
+is emitted after the ledger row commits so the ledger never lags a push.
+
+CONFIRMED means what `classify_refetch` returned — the payload was refetched from the
+platform and matched — never what the POST returned.
+
+The body carries question id, post id and a 12-character payload hash prefix: all public the
+moment the forecast lands. **No rationale field.** The reasoning never becomes public, and
+ntfy is a third party. The test walks every string in the stored record and asserts each one
+longer than 24 characters is absent, rather than checking one named key, so the claim
+survives the forecast schema growing a field.
+
+### Decision — the ntfy variable is scrubbed unconditionally, and presence is a separate question
+
+`secret_env_var_names()` includes `notify.topic_url_env` whether or not `notify.enabled`,
+which breaks the `social.enabled` pattern on purpose. The unit files pass the whole `.env`
+through `EnvironmentFile=`, so the value is in the worker's environment either way, and
+gating the scrub on the feature flag would stop redacting a live bearer token in exactly the
+configuration an operator would assume was safest.
+
+That forced a split. `secret_env_var_names()` asks *what may hold a credential, so the
+logging filter can scrub it*; the new `required_env_var_names()` asks *what must be set, so
+verify-env can refuse a half-configured machine*. Before this item every name answered both.
+Collapsing them again in either direction gets one wrong: verify-env would report every
+machine without notifications as not ready, or the filter would stop scrubbing a live token.
+
+### Decision — the systemd half stays shell and curl
+
+`deploy/systemd/whiskeyjack-notify@.service` is the operator-local unit tracked with its
+`ExecStart` **byte-identical** to what has been running since 2026-09-09 (verified by diff).
+It could have called back into the CLI for a richer message. It must not: this unit's entire
+value is that it still works when the interpreter, the package or the ledger is the broken
+thing, and calling into the program would make it fail in precisely the cases it exists to
+report. Its 30-minute per-unit throttle and its `$XDG_STATE_HOME/whiskeyjack` state file are
+kept as installed — deliberately *not* the artifact root, for the same reason.
+
+**On merge, delete the two operator-local drop-ins**, which the tracked units supersede:
+
+```
+rm ~/.config/systemd/user/whiskeyjack-tournament.service.d/notify.conf
+rm ~/.config/systemd/user/whiskeyjack-tournament-cup.service.d/notify.conf
+systemctl --user daemon-reload
+```
+
+### Deviation — this item changes `AppConfig`, so both live activations must be re-enabled
+
+`tournament_state.bindings()` digests `config.model_dump(mode="json")` into `config_sha256`,
+so **any** new `AppConfig` field changes the activation hash for byte-identical YAML, and
+`require_activation` then refuses every poll with *"activation account, destination,
+configuration, or prompt changed"*. The acceptance criterion requires the variable name to
+be in config, so this is not avoidable; it was put to the owner on 2026-09-09 with the two
+alternatives below and the literal reading was chosen.
+
+**The deploy step, which is not optional:**
+
+```
+tournament enable --config config/tournament.yaml \
+  --project-id 33122 --starts 2026-09-07T22:00:00Z --ends 2026-09-29T00:00:00Z --budget-usd 20
+tournament enable --config config/tournament-cup.yaml \
+  --project-id 33108 --starts 2026-09-08T16:32:53Z --ends 2027-01-01T00:00:00Z --budget-usd 10
+```
+
+`--starts` must predate the open questions. Spend is scoped `{account}:{project}` and is
+**not** reset by re-enabling, so the $3.175 of held AskNews reservations carries over. A new
+`activation_id` does re-arm M1-326's blocked verdicts — at most one re-purchase per blocked
+question, which is that gate's documented and intended expiry — and re-arms the
+`budget_threshold` levels, which is also correct.
+
+### Rejected — a module constant instead of a config field, and why not
+
+`secret_env_var_names()` is a *method*, so registering a hardcoded `NTFY_TOPIC_URL` there
+would have satisfied every secret-hygiene property with **no** config field, no hash change
+and no re-enable. It was rejected because the criterion says the name appears in config and
+`CLAUDE.md`'s stricter-reading rule applies; and because a hardcoded topic variable cannot be
+changed per profile, which the three tournament configs would eventually need.
+
+### Rejected — exempting `notify` from `bindings()`, and why not
+
+Excluding the section from `config_sha256` would also avoid the re-enable, with a
+defensible argument: notification settings cannot affect a forecast. Rejected because it
+makes a total binding partial, and "which fields are exempt" then becomes something every
+later item has to reason about. A manual step at one deploy is cheaper than a permanently
+weaker activation binding.
+
+### Rejected — a sliding throttle window, and why not
+
+It would avoid two pushes near a boundary, and it needs read-then-write, which is the race
+`os.link` exists to close. A duplicate alert is a better failure than a raced one.
+
+### Rejected — failing open when the stamp cannot be written
+
+An unwritable state directory means no push, not an unthrottled one. A notifier that cannot
+record what it sent sends 288 times a day and the channel gets muted; the fail-closed arm at
+least leaves the daily digest to stop arriving. Logged at WARNING and pinned by
+`test_an_unwritable_state_directory_fails_closed_and_says_so`. Carried as a standing risk
+below.
+
+### Deferred (do not read the absence as an omission)
+
+- **Classifying AskNews quota exhaustion.** The change that would most directly address the
+  incident's root cause: `asknews.py:337-343` discards the SDK exception, so `provider_failed`
+  cannot distinguish a blown monthly quota from a dropped connection. It is doable without
+  reading the message — walk `type(exc).__mro__` matching module and class *names*, the way
+  `submission_live.classify_error` already does for `requests.exceptions` — but it edits a
+  paid-call adapter that explicitly refuses to look at its exception and needs its own no-leak
+  property pass. Put to the owner on 2026-09-09 and deliberately kept out of scope; filed as
+  **M1-330**.
+- **Alerting on repeated `question_failure`.** 110 identical rows is a signal in its own
+  right, and it is not in the vocabulary. Under M1-326 the transient path now converges on
+  `question_blocked` within three attempts, so this would be a second alert for a condition
+  already covered; revisit only if a failure shape appears that reaches neither.
+- **A notification for the deferrals `normalize_questions` returns.** `tournament.py:400`
+  drops `NormalizationResult.deferrals` entirely, so a deferred question is invisible today.
+  That is a gap in the *ledger* first and an alerting gap second; fixing it here would be
+  fixing it in the wrong layer.
+- **`prediction_posted` for the private comment.** `comment_confirmed` is a separate
+  confirmation and could carry its own event. One push per forecast is the right volume;
+  two is the beginning of the noise problem.
+
+### Standing risk — not verifiable offline
+
+- **No message has ever been delivered to a real ntfy host by this code.** Sockets are
+  blocked in tests and the topic URL is a live credential, so every test uses
+  `httpx.MockTransport`. What is verified offline is the exact request: absolute URL posted
+  byte-for-byte (no `base_url` normalization), `Title`/`Priority`/`Tags` headers, body.
+  What is not verified is that ntfy accepts it. First live poll after deploy is the check.
+- **A broken state directory silences in-process alerting.** Deliberate (above), and the
+  reason `poll_summary` exists as a liveness digest — but the operator has to know that a
+  digest which stops arriving is a real signal and not a quiet week.
+- **The systemd half cannot see a timer that was never triggered.** `OnFailure` fires on a
+  failed unit. A disabled timer, an ended user session or a powered-off machine produces no
+  unit failure and no in-process code, so the daily digest is the *only* cover for those, and
+  it covers them only by absence.
+- **The 2026-09-08 replay is a reconstruction, not a re-run.** The claim that
+  `question_blocked` fires in about four minutes is derived from the stored ledger plus the
+  current code path, and `question_blocked` did not exist when the incident happened, so
+  there are no rows of it to point at. What is directly measured is the `no_evidence`
+  detail code, its membership in `DETERMINISTIC_FAILURE_CODES`, and the 16:38:47 timestamp
+  of the first failure.
+
+### Teeth — the mutation pass
+
+Every assertion below was demonstrated rather than asserted, with `PYTHONDONTWRITEBYTECODE=1`
+(a same-size same-second mutation is otherwise served back stale from `__pycache__`) and
+against a committed tree.
+
+**23 module mutants, 23 killed** — throttle window ignored; window index dropped from the
+key; subject dropped from the key; **throttle held in memory only**; vocabulary check
+removed; stamp I/O failure fails open; push failure propagates; transport exception logged
+verbatim; response body logged; body not redacted; topic URL back in the repr; header
+control characters not stripped; header not collapsed; budget levels ordered lowest first;
+budget comparison off by a factor; `emit` stops absorbing; naive clock accepted; clock error
+reprinted; subject not hashed into the filename; client not closed; ntfy name dropped from
+`secret_env_var_names`; required names stop tracking `enabled`; validator removed.
+
+**11 wiring mutants, 11 killed** — `prediction_posted` hooked at the return instead of the
+guard; `question_blocked` also alerted from the read gate; never alerted on the transition;
+digest dropped from either exit; budget alert on success only, and dropped entirely;
+`provider_failed` on every fallback, and never; notifier never installed; push failures
+propagate into the poll.
+
+**Two of those started as survivors, and both were the vacuity trap in a new shape.**
+
+*"Throttle held in memory only" survived the first pass.* The restart test rebuilt the
+`Notifier` and sent again — which looks like a restart and is not one, because a throttle
+held in a *class* attribute survives a new instance in the same interpreter. A restart test
+whose only witness is inside the program cannot see the difference. The replacement uses the
+filesystem as the witness in both directions: deleting the stamp must re-arm the push
+(necessary) and a stamp this process never wrote must suppress one (sufficient). No
+in-memory scheme satisfies both.
+
+*"`question_blocked` also alerted from the read gate" survived.* The second poll ran inside
+the first poll's 30-minute window, so the extra push was **throttled**, and the assertion
+"the second poll pushed nothing" was satisfied by the throttle rather than by the call site
+staying quiet — a test of the wiring had silently become a test of the throttle. Wiring
+tests now get a private, empty stamp directory per poll.
+
+A third, *"`prediction_posted` hooked at the return"*, survived for a related reason worth
+recording: the plain repeat poll skips the question before `reconcile_forecast` is ever
+called, so the assertion held no matter where the hook sat. Reaching that path needs a
+standing `forecast_intent` with no `comment_confirmed`, which
+`test_a_re_reconciled_forecast_does_not_push_prediction_posted_again` builds by losing the
+comment response.
+
+### Found by the property pass, not by review
+
+`_header_safe` collapsed whitespace with `" ".join(value.split())`, and `NUL` is not
+whitespace to Python — so `\x00` survived into an HTTP header value on the first
+`test_a_title_never_carries_a_header_separator` run. Fixed by replacing every C0 control and
+DEL before the collapse. Non-ASCII is deliberately left alone: header framing is
+byte-oriented and a multi-byte UTF-8 sequence contains no `0x0D` or `0x0A`.
