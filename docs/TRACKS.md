@@ -43,6 +43,7 @@ to the registry, and neither is a habit you can form by reflex.
 | M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 | M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |
+| M1-327 | feat/m1-327-named-source-evidence-gap | whiskeyjack-m1-327 | no | none | 2026-09-09 |
 **Do not sweep a landed row out of this table into the prose below.** `scripts/tracks.py`
 proves a claim is a *stale landed* one rather than a misspelling by finding the exact row on
 `origin/master` (`live_claims`: `signature in master_rows`) — so deleting the row destroys the

@@ -195,6 +195,37 @@ def _canonical_host(host: str) -> str:
         raise CanonicalizationError(_BAD_URL) from None
 
 
+def host_identity(value: str) -> str:
+    """One host reduced to the form its other spellings share, for comparison only.
+
+    Added for M1-327, and living here rather than in ``research/quality.py`` because
+    everything it knows is already this module's: the terminal DNS root dot in all four
+    of its IDNA-equivalent spellings, the IDN A-label fold, and IP-literal compression.
+    A hand-rolled separator table in the calling module is the speculative host transform
+    this file's header records losing to three times.
+
+    Two differences from :func:`_canonical_host`, both because the caller is a **verdict**
+    function with no error type of its own:
+
+    * It is **total**. A value that cannot be canonicalized is lower-cased and returned,
+      so a comparison still happens and still means "these two strings are the same host
+      as written". Nothing downstream stores this value, so a fallback cannot corrupt an
+      identity -- the worst it does is decline to see two spellings as one.
+    * It strips a leading ``www.``. That is a comparison convention rather than a host
+      identity (``www.forbes.com`` and ``forbes.com`` are genuinely different hosts to
+      DNS), which is exactly why it is confined to a function whose output is never
+      persisted and never hashed.
+
+    Not a canonicalizer: nothing may store this. :func:`canonicalize_url` remains the only
+    thing that decides what a document's ``canonical_url`` is.
+    """
+    try:
+        identity = _canonical_host(value)
+    except CanonicalizationError:
+        identity = value.lower()
+    return identity.removeprefix("www.")
+
+
 def _strip_tracking(query: str) -> str:
     """Drop tracking pairs; keep everything else in order, byte-for-byte.
 
