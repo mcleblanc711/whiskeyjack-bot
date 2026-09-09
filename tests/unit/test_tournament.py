@@ -984,12 +984,20 @@ class _Pushes:
         return [entry for entry in self.sent if fragment in entry["title"]]
 
 
-def _recording(monkeypatch: pytest.MonkeyPatch, config: Any) -> _Pushes:
+def _recording(monkeypatch: pytest.MonkeyPatch, config: Any, state: Path | None = None) -> _Pushes:
     """Install a notifier whose transport is a recorder, for the duration of a poll.
 
     ``build_notifier`` is patched rather than the environment because the point here is
     which call sites fire, not how the client is built -- that is covered where it belongs.
     Everything downstream reads ``CURRENT_NOTIFIER``, which ``run_once`` sets from this.
+
+    ``state`` gives the notifier a private, empty throttle directory. That matters more
+    than it looks: with the shared one, "the second poll pushed nothing" is satisfied by a
+    *throttled* push just as well as by a call site that correctly stayed quiet, so a test
+    of where the hooks are would silently become a test of the throttle. The mutation pass
+    found exactly that -- a `_notify_blocked` call added to M1-326's read gate survived,
+    because the second poll ran inside the first one's 30-minute window. Durability is
+    proven in `tests/unit/test_notify.py`; these tests are about the wiring.
     """
     import httpx
 
@@ -1002,7 +1010,7 @@ def _recording(monkeypatch: pytest.MonkeyPatch, config: Any) -> _Pushes:
         lambda _config: Notifier(
             client=httpx.Client(transport=httpx.MockTransport(pushes)),
             topic_url="https://ntfy.invalid/wj-fake-topic-0001",
-            state_root=config.storage.artifact_root,
+            state_root=state or config.storage.artifact_root,
             secret_names=tuple(config.secret_env_var_names()),
         ),
     )
@@ -1010,7 +1018,7 @@ def _recording(monkeypatch: pytest.MonkeyPatch, config: Any) -> _Pushes:
 
 
 def test_a_confirmed_forecast_pushes_one_prediction_posted_and_never_a_rationale(
-    case: Any, monkeypatch: pytest.MonkeyPatch
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Fires once, after CONFIRMED, and carries nothing the platform does not already show.
 
@@ -1058,17 +1066,44 @@ def test_a_confirmed_forecast_pushes_one_prediction_posted_and_never_a_rationale
     for text in prose:
         assert text not in body
     assert "rationale" not in body.lower()
-
-    # The second poll re-reconciles the same record and must stay silent.
-    repeated = _recording(monkeypatch, config)
-    poll(case)
-    assert repeated.matching("forecast confirmed") == []
     assert record_id
+    assert record_id
+
+
+def test_a_re_reconciled_forecast_does_not_push_prediction_posted_again(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The half that decides where the hook goes, exercised on the path that reaches it.
+
+    ``reconcile_forecast`` runs again only when a *later* phase is still outstanding, so
+    the scenario has to be built: the comment response is lost and the comment is hidden,
+    which leaves a standing ``forecast_intent`` with no ``comment_confirmed``. The next
+    poll's recovery pass then re-reconciles a record that is already confirmed -- and that
+    is the poll a hook at ``reconcile_forecast``'s ``return True`` would push from, every
+    five minutes, forever.
+
+    Without this the plain repeat poll looks like it proves the same thing and does not:
+    it skips the question before ``reconcile_forecast`` is ever called, so it holds no
+    matter where the hook sits. The mutation pass is what said so.
+    """
+    _conn, config, platform, _news, _model = case
+    platform.lose_comment_response = True
+    platform.hide_comments = True
+
+    first = _recording(monkeypatch, config, tmp_path / "first-poll")
+    assert poll(case)["forecast_confirmed"] == 1
+    assert len(first.matching("forecast confirmed")) == 1
+
+    # A fresh throttle directory: silence must mean the call site stayed quiet, not that
+    # the 24-hour window suppressed a push the hook did make.
+    again = _recording(monkeypatch, config, tmp_path / "second-poll")
+    assert poll(case)["unresolved"] == 1
+    assert again.matching("forecast confirmed") == []
 
 
 @pytest.mark.parametrize("field", ["future", "stale"])
 def test_a_deterministic_block_pushes_once_and_the_next_poll_is_silent(
-    case: Any, monkeypatch: pytest.MonkeyPatch, field: str
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str
 ) -> None:
     """The alert is on the transition, never on the gate that reads it.
 
@@ -1092,7 +1127,7 @@ def test_a_deterministic_block_pushes_once_and_the_next_poll_is_silent(
         == 1
     )
 
-    silent = _recording(monkeypatch, config)
+    silent = _recording(monkeypatch, config, tmp_path / "second-poll")
     poll(case)
     assert silent.matching("question blocked") == []
 
@@ -1196,6 +1231,42 @@ def test_a_push_failure_never_costs_the_forecast(
     result = poll(case)
     assert result["forecast_confirmed"] == result["comment_completed"] == 1
     assert result["unresolved"] == 0
+    assert result["heartbeat"]["failures"] == 0
+    assert platform.posts == 1
+    assert conn.execute("SELECT count(*) FROM forecast_records").fetchone()[0] == 1
+
+
+def test_a_notifier_that_raises_never_costs_the_forecast(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other absorb boundary: ``emit`` swallows ``NotifyError`` too.
+
+    A failing *transport* is handled inside ``Notifier``; this is the case where the
+    notifier itself raises before it ever gets to the network -- a broken clock here, a
+    caller mistake in general. Nothing about that is worth losing a forecast for, and the
+    only place that can be decided is ``emit``, which every call site goes through.
+    """
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier
+
+    conn, config, platform, _news, _model = case
+
+    def broken_clock() -> Any:
+        raise RuntimeError("the clock is gone")
+
+    monkeypatch.setattr(
+        whiskeyjack_tournament,
+        "build_notifier",
+        lambda _config: Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(_Pushes())),
+            topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+            state_root=config.storage.artifact_root,
+            clock=broken_clock,
+        ),
+    )
+    result = poll(case)
+    assert result["forecast_confirmed"] == result["comment_completed"] == 1
     assert result["heartbeat"]["failures"] == 0
     assert platform.posts == 1
     assert conn.execute("SELECT count(*) FROM forecast_records").fetchone()[0] == 1
