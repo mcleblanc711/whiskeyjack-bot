@@ -153,7 +153,7 @@ class RecordedModelSettings(_StrictModel):
 
     provider: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    temperature: float = Field(allow_inf_nan=False)
+    temperature: float | None = Field(allow_inf_nan=False)
     max_output_tokens: int
     timeout_seconds: float = Field(allow_inf_nan=False)
     allowed_tries: int
@@ -250,7 +250,7 @@ class ForecastRecordDraft(_StrictModel):
 
     @model_validator(mode="after")
     def _schema_version_matches(self) -> ForecastRecordDraft:
-        if self.record_schema_version != RECORD_SCHEMA_VERSION:
+        if self.record_schema_version not in (RECORD_SCHEMA_VERSION, "1.1.0"):
             raise ValueError(
                 f"record_schema_version must be {RECORD_SCHEMA_VERSION} "
                 "(offending input withheld from this message)"
@@ -715,7 +715,9 @@ def build_forecast_record_draft(
 
     try:
         draft = ForecastRecordDraft(
-            record_schema_version=RECORD_SCHEMA_VERSION,
+            record_schema_version="1.1.0"
+            if settings.temperature is None
+            else RECORD_SCHEMA_VERSION,
             question_id=question.question_id,
             post_id=question.post_id,
             tournament_id=tournament_id,

@@ -58,7 +58,11 @@ MAX_CONVERSION_TIMEOUT_SECONDS = 60.0
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Question types the v1 pipeline supports; date/conditional are deferred (D20/D21).
-SupportedQuestionType = Literal["binary", "multiple_choice", "numeric"]
+# ``discrete`` was deferred with them until M1-205 and is now supported: D21's reversal
+# trigger names MiniBench, where discrete is 11 of 42 questions, while date and
+# conditional have not appeared at all. Dispatch on this literal, never on isinstance --
+# the SDK's ``DiscreteQuestion`` subclasses ``NumericQuestion``.
+SupportedQuestionType = Literal["binary", "multiple_choice", "numeric", "discrete"]
 
 # Verified against forecasting-tools==0.2.92 metaculus_client.GroupQuestionMode.
 GroupQuestionMode = Literal["exclude", "unpack_subquestions"]
@@ -137,7 +141,7 @@ class ModelConfig(_StrictModel):
     provider: str
     name: str
     api_key_env: str
-    temperature: float = Field(0.0, ge=0)
+    temperature: float | None = Field(0.0, ge=0)
     timeout_seconds: float = Field(120, gt=0)
     max_output_tokens: int = Field(6000, gt=0)
     # Total model invocations for one forecast: 1 means no repair, 2 means one
@@ -308,7 +312,20 @@ class NumericCalibrationConfig(_StrictModel):
     # 201 is the verified Metaculus CDF length on forecasting-tools==0.2.92;
     # any other value would produce unsubmittable arrays, so it is a hard
     # error (stricter reading), not a tunable.
+    #
+    # M1-205 narrowed what this governs: it is the *numeric* length rule, not the
+    # pipeline's. A discrete question's length rule is its own declared ``cdf_size``
+    # (``inbound_outcome_count + 1``), which the conversion and the submission plan now
+    # read from the question. That is strictly tighter than what stood before, because a
+    # numeric question declaring some other resolution used to be measured against this
+    # constant and is now measured against what it actually declared.
     expected_cdf_points: Literal[201]
+    # The adjacent-step cap for a **201-point** array. M1-205 made it the base of a rule
+    # rather than the rule: ``forecast/cdf._cdf_rules`` scales it by how much coarser a
+    # discrete question's grid is, which is Metaculus's own server-side formula
+    # (0.2 * 200 / inbound_outcome_count) and reduces to exactly this value at 201 points.
+    # A separate discrete field was tried and removed in round 1: any flat number is both
+    # too strict on a coarse grid and too permissive on a fine one.
     max_adjacent_pmf: float = Field(0.2, gt=0, le=1)
     strict_validation: bool = True
     calibration_profile: Literal["identity"]

@@ -131,6 +131,15 @@ _TYPE_CHECKERS: dict[str, _TypeChecker | None] = {
     "binary": binary_output_problems,
     "multiple_choice": multiple_choice_output_problems,
     "numeric": numeric_output_problems,
+    # Deliberately the *same* checker as numeric, not a copy of it (M1-205). Everything
+    # ``numeric_output_problems`` asserts -- the nine exact levels, non-decreasing values,
+    # compatibility with closed bounds and the zero point -- is a fact about a distribution
+    # over a range and is identical for a discrete question. What differs is the converted
+    # array's length and its per-step cap, and neither is decided here: both belong to
+    # ``forecast/cdf.py``, which reads them from the question's own ``cdf_size`` and from
+    # ``_cdf_rules``. A second entry pointing at a near-duplicate function
+    # would be two places to fix the next percentile rule.
+    "discrete": numeric_output_problems,
 }
 
 # The vocabulary the message below names is ``schema``'s, reused rather than recomputed

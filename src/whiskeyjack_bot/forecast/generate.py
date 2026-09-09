@@ -110,6 +110,8 @@ from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import 
     MonetaryCostManager,
 )
 
+from whiskeyjack_bot.tournament_state import TournamentError
+
 from whiskeyjack_bot.config import (
     MAX_MODEL_INVOCATIONS,
     PROBABILITY_BOUND_CEILING,
@@ -119,8 +121,10 @@ from whiskeyjack_bot.config import (
     NumericCalibrationConfig,
 )
 from whiskeyjack_bot.forecast.cdf import (
+    NumericCdfError,
     NumericCdfTimeoutError,
     can_bound_conversion,
+    expected_cdf_points_for,
     numeric_cdf_or_problems,
 )
 from whiskeyjack_bot.forecast.inputs import (
@@ -153,11 +157,19 @@ from whiskeyjack_bot.metaculus.client import MissingCredentialError
 from whiskeyjack_bot.prompt import LoadedPrompt, probability_bounds_problem
 from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.questions.model import (
+    BoundedQuestion,
+    CanonicalDiscreteQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestion,
     _CanonicalQuestionBase,
 )
 from whiskeyjack_bot.research.packet import ResearchPacket
+
+# The two bounded types, spelled once for the `isinstance` narrowing below. M1-205 round 3:
+# every one of these gates was numeric-only, so a discrete question skipped the *pre-billing*
+# preflight entirely and reached the model with an unsatisfiable grid -- the exact "refusal
+# lands after the forecast has been billed" failure the gates below exist to prevent.
+_BOUNDED = (CanonicalNumericQuestion, CanonicalDiscreteQuestion)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -221,7 +233,7 @@ def _require_forecaster(client: Forecaster, config: AppConfig) -> None:
         )
 
 
-def build_forecaster_client(config: AppConfig) -> GeneralLlm:
+def build_forecaster_client(config: AppConfig) -> Any:
     """Construct the one configured forecaster client.
 
     Raises ``MissingCredentialError`` when the configured variable is unset or empty,
@@ -233,6 +245,14 @@ def build_forecaster_client(config: AppConfig) -> GeneralLlm:
     api_key = os.environ.get(config.model.api_key_env)
     if not api_key:
         raise MissingCredentialError(config.model.api_key_env)
+    if config.model.name == "openrouter/openai/gpt-5.6-sol":
+        if config.model.temperature is not None:
+            raise ForecastGenerationError(
+                "Sol requires model.temperature: null; temperature is unsupported"
+            )
+        from whiskeyjack_bot.forecast.sol import SolClient
+
+        return SolClient(config)
     return GeneralLlm(
         model=config.model.name,
         temperature=config.model.temperature,
@@ -286,7 +306,7 @@ async def _invoke_once(client: Forecaster, messages: list[dict[str, str]]) -> tu
     """
     with MonetaryCostManager() as manager:
         text = await client.invoke(messages)
-        usage = manager.current_usage
+        usage = getattr(client, "last_cost", None) or manager.current_usage
     return text, usage
 
 
@@ -365,7 +385,7 @@ def generate_forecast(
             "model.allowed_tries exceeds the one-repair bound; a malformed response "
             "may cost at most one initial call and one repair"
         )
-    if isinstance(question, CanonicalNumericQuestion) and (
+    if isinstance(question, _BOUNDED) and (
         question.zero_point is not None and question.lower_bound <= question.zero_point
     ):
         # ``forecast.numeric._require_question`` refuses this too; repeated at the spending
@@ -381,9 +401,8 @@ def generate_forecast(
             "the question's zero_point is not strictly below its lower_bound; no "
             "percentile set could satisfy it"
         )
-    if (
-        isinstance(question, CanonicalNumericQuestion)
-        and question.cdf_size != config.numeric_calibration.expected_cdf_points
+    if isinstance(question, _BOUNDED) and not _grid_is_convertible(
+        question, config.numeric_calibration
     ):
         # M1-503, and the same shape as the check directly above: ``cdf.
         # _require_question`` refuses it too, and it is repeated here because it is
@@ -398,7 +417,7 @@ def generate_forecast(
             "the question's cdf_size does not match numeric_calibration."
             "expected_cdf_points; no percentile set could convert to a submittable CDF"
         )
-    if isinstance(question, CanonicalNumericQuestion) and not can_bound_conversion():
+    if isinstance(question, _BOUNDED) and not can_bound_conversion():
         # M1-514, and the same category as the two checks above -- unsatisfiable by any
         # reply, so refused before anything is spent -- but the reason is about this
         # *thread* rather than about the question. The conversion's wall-clock bound is a
@@ -543,6 +562,28 @@ def _model_input_or_refuse(
         ) from None
 
 
+def _grid_is_convertible(question: BoundedQuestion, calibration: NumericCalibrationConfig) -> bool:
+    """Whether this question's declared grid can produce a submittable array at all.
+
+    Delegates to ``forecast.cdf`` rather than restating the rule, so the numeric
+    ``cdf_size == expected_cdf_points`` pin and the discrete envelope stay in one place --
+    round 2's lesson, applied one module out. Returns a bool rather than raising because
+    the caller owns the message and the exception type at this boundary.
+    """
+    if question.qtype == "numeric":
+        # The numeric pin, kept explicit. ``expected_cdf_points_for`` *returns* the
+        # configured constant for a numeric question rather than comparing the question's
+        # own declaration against it, so delegating alone would have silently deleted this
+        # check -- which is what happened in the first draft of this helper and is why the
+        # two rules are spelled separately here.
+        return bool(question.cdf_size == calibration.expected_cdf_points)
+    try:
+        expected_cdf_points_for(question, calibration)
+    except NumericCdfError:
+        return False
+    return True
+
+
 def _conversion_problems(
     forecast: ForecastResponse,
     numeric_calibration: NumericCalibrationConfig,
@@ -584,11 +625,9 @@ def _conversion_problems(
     refusals above at exactly the point where the difference decides whether a second call
     is billed.
     """
-    if forecast.question_type != "numeric":
+    if forecast.question_type not in ("numeric", "discrete"):
         return []
-    if not isinstance(forecast, NumericForecastResponse) or not isinstance(
-        question, CanonicalNumericQuestion
-    ):
+    if not isinstance(forecast, NumericForecastResponse) or not isinstance(question, _BOUNDED):
         # Unreachable from ``_run_attempts``: the response is the model
         # ``_response_model_or_refuse`` selected from ``question.qtype``, and
         # ``output_problems`` has already refused a question whose ``qtype`` disagrees with
@@ -655,6 +694,8 @@ def _run_attempts(
         calls_attempted += 1
         try:
             text, usage = _invoke(client, messages)
+        except TournamentError:
+            raise
         except Exception as exc:
             # The exception is never inspected beyond its type: a provider error can
             # quote the request, and the request carries the API key in a header.
@@ -674,6 +715,13 @@ def _run_attempts(
             question=question,
             source_ids=source_ids,
         )
+        if forecast is not None:
+            import json
+
+            cutoff = datetime.fromisoformat(json.loads(request)["as_of_utc"].replace("Z", "+00:00"))
+            if forecast.as_of_utc != cutoff:
+                problems = ["as_of_utc must exactly match the supplied cutoff"]
+                forecast = None
         if forecast is not None:
             try:
                 problems = _conversion_problems(forecast, numeric_calibration, question)

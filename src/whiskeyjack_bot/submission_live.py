@@ -110,7 +110,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, cast, get_args
+from typing import Any, Literal, Protocol, cast, get_args
 
 from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
 from whiskeyjack_bot.config import AppConfig, SupportedQuestionType
@@ -381,6 +381,8 @@ class MetaculusPoster(Protocol):
     provider data.
     """
 
+    def get_current_user_id(self) -> int: ...
+
     def post_binary_question_prediction(
         self, question_id: int, prediction_in_decimal: float
     ) -> None: ...
@@ -412,6 +414,38 @@ class NumericPost:
     question_type: Literal["numeric"] = "numeric"
 
 
+def expected_points_for_record(record: Any, config: Any) -> int:
+    """The CDF length this record's question declares (M1-205).
+
+    Imported inside the function so **this module**, imported alone, stays free of the SDK
+    that ``forecast.cdf`` pulls in. That is the whole of the claim, corrected in round 2
+    after it was overstated: it is not a per-post cost saving (Python caches modules, so
+    the import runs once), and it does not keep the SDK out of every caller --
+    ``tournament.py`` already loads it by other routes. What it preserves is the narrower,
+    checkable property that importing ``submission_live`` does not.
+    """
+    from whiskeyjack_bot.forecast.cdf import expected_cdf_points_for
+
+    question = record.question
+    if question.qtype in ("numeric", "discrete"):
+        return expected_cdf_points_for(question, config.numeric_calibration)
+    return int(config.numeric_calibration.expected_cdf_points)
+
+
+@dataclass(frozen=True)
+class DiscretePost:
+    """A validated discrete forecast: the same wire shape as numeric, its own identity.
+
+    Not ``NumericPost`` with a different tag, and not a subclass of it (M1-205). The plan's
+    ``question_type`` is compared against the *record's* in ``post_approved_forecast``, so a
+    discrete record whose plan said "numeric" would be refused there -- and the array length
+    differs, so the two are not interchangeable even where the wire key is.
+    """
+
+    continuous_cdf: tuple[float, ...]
+    question_type: Literal["discrete"] = "discrete"
+
+
 @dataclass(frozen=True)
 class MultipleChoicePost:
     """A validated multiple-choice forecast, as ordered pairs rather than a dict."""
@@ -425,7 +459,7 @@ class MultipleChoicePost:
 # CLAUDE.md's rule, written for the pinned SDK's ``DiscreteQuestion(NumericQuestion)`` and
 # worth keeping even where nothing here subclasses anything. Tuples rather than lists so a
 # plan cannot be mutated between validation and the post.
-PostPlan = BinaryPost | NumericPost | MultipleChoicePost
+PostPlan = BinaryPost | NumericPost | DiscretePost | MultipleChoicePost
 
 
 def plan_from_payload(payload: Mapping[str, object], *, expected_cdf_points: int) -> PostPlan:
@@ -516,6 +550,14 @@ def plan_from_canonical_payload(canonical: str, *, expected_cdf_points: int) -> 
         return NumericPost(
             continuous_cdf=_require_cdf(value, wire_key, expected_cdf_points=expected_cdf_points)
         )
+    if question_type == "discrete":
+        # Round 1 found this missing: adding the wire key alone left a discrete CDF falling
+        # through to `_require_categories`, which refused it as "must be a JSON object". A
+        # table entry is not a dispatch arm, and this module's own tagged-union comment is
+        # what made the omission look handled.
+        return DiscretePost(
+            continuous_cdf=_require_cdf(value, wire_key, expected_cdf_points=expected_cdf_points)
+        )
     return MultipleChoicePost(probability_yes_per_category=_require_categories(value, wire_key))
 
 
@@ -524,6 +566,13 @@ def plan_from_canonical_payload(canonical: str, *, expected_cdf_points: int) -> 
 _WIRE_KEY_FOR_TYPE: dict[str, str] = {
     "binary": "probability_yes",
     "numeric": "continuous_cdf",
+    # Metaculus takes a discrete forecast on the same wire key as a numeric one: a discrete
+    # question *is* a CDF question whose grid is the outcome set, which is why the SDK
+    # models it as a ``NumericQuestion`` subclass and computes ``cdf_size`` as
+    # ``inbound_outcome_count + 1``. What differs is the array's length, and that arrives
+    # here as ``expected_cdf_points`` from the question rather than from configuration
+    # (M1-205).
+    "discrete": "continuous_cdf",
     "multiple_choice": "probability_yes_per_category",
 }
 
@@ -824,9 +873,16 @@ def expected_values(plan: PostPlan) -> tuple[float, ...]:
     """
     if plan.question_type == "binary":
         return (plan.probability_yes,)
-    if plan.question_type == "numeric":
+    if plan.question_type in ("numeric", "discrete"):
         return plan.continuous_cdf
-    return tuple(probability for _, probability in plan.probability_yes_per_category)
+    if plan.question_type == "multiple_choice":
+        return tuple(probability for _, probability in plan.probability_yes_per_category)
+    # Named rather than left as a fall-through. The previous spelling returned the
+    # multiple-choice projection for anything that was not binary or numeric, so adding
+    # `DiscretePost` to the union silently routed a CDF into it -- which is exactly how
+    # round 1's finding 2 reached a public boundary. mypy found this one because the union
+    # grew; the `raise` is what keeps the next member from being absorbed the same way.
+    raise LiveSubmissionError("this plan has no expected-value projection")
 
 
 def expected_option_labels(plan: PostPlan) -> tuple[str, ...] | None:
@@ -860,7 +916,7 @@ def observed_values(
     """
     if question_type == "binary":
         return (entry.values[1],) if len(entry.values) == 2 else None
-    if question_type == "numeric":
+    if question_type in ("numeric", "discrete"):
         return entry.values
     if platform_labels is None or expected_labels is None:
         return None
@@ -1311,6 +1367,14 @@ class LiveSubmissionOutcome:
     detail_code: FailureCode | None
 
 
+def select_subquestion(fetched: object, question_id: int) -> object:
+    candidates = fetched if isinstance(fetched, list) else [fetched]
+    matches = [q for q in candidates if _int_attribute(q, "id_of_question") == question_id]
+    if len(matches) != 1:
+        raise LiveSubmissionError("the exact subquestion could not be selected (wrong question)")
+    return matches[0]
+
+
 class MetaculusSubmissionGateway:
     """A gateway that posts to Metaculus exactly once and verifies by refetch.
 
@@ -1340,6 +1404,7 @@ class MetaculusSubmissionGateway:
         sleep: Callable[[float], None] | None = None,
         refetch_attempts: int = _REFETCH_ATTEMPTS,
         refetch_pause_seconds: float = _REFETCH_PAUSE_SECONDS,
+        before_post: Callable[[object, ForecastHistory], None] | None = None,
     ) -> None:
         if poster is None:
             raise LiveSubmissionError("poster is required")
@@ -1353,6 +1418,7 @@ class MetaculusSubmissionGateway:
             raise LiveSubmissionError("refetch_attempts must be a positive integer")
         if type(refetch_pause_seconds) not in (int, float) or refetch_pause_seconds < 0:
             raise LiveSubmissionError("refetch_pause_seconds must be a non-negative number")
+        self._before_post = before_post
         self._poster = poster
         self._expected_cdf_points = expected_cdf_points
         self._clock: Callable[[], datetime] = _utcnow if clock is None else clock
@@ -1416,7 +1482,7 @@ class MetaculusSubmissionGateway:
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         plan = plan_from_canonical_payload(canonical, expected_cdf_points=self._expected_cdf_points)
 
-        baseline_question = self._fetch_or_refuse(post_id)
+        baseline_question = select_subquestion(self._fetch_or_refuse(post_id), question_id)
         self._require_matching_identity(baseline_question, question_id=question_id, post_id=post_id)
         self._require_open(baseline_question)
         baseline = read_my_forecasts(baseline_question)
@@ -1426,6 +1492,12 @@ class MetaculusSubmissionGateway:
                 "could never be confirmed; nothing was posted"
             )
 
+        if baseline.entries:
+            raise LiveSubmissionError(
+                "the account already forecast on this question; nothing was posted"
+            )
+        if self._before_post is not None:
+            self._before_post(baseline_question, baseline)
         requested = _require_aware_utc(self._clock(), "clock()")
         error: BaseException | None = None
         try:
@@ -1463,12 +1535,28 @@ class MetaculusSubmissionGateway:
         if plan.question_type == "binary":
             self._poster.post_binary_question_prediction(question_id, plan.probability_yes)
             return
-        if plan.question_type == "numeric":
+        if plan.question_type in ("numeric", "discrete"):
+            # One SDK method for both: `post_numeric_question_prediction` takes a bare
+            # `list[float]` and does not enforce 201 -- its docstring mentions the number,
+            # its signature does not. Metaculus accepts a discrete forecast on the same
+            # `continuous_cdf` wire key, which is why the SDK models discrete as a
+            # `NumericQuestion` subclass in the first place.
+            #
+            # **This is the line that would actually have posted a discrete CDF to the
+            # multiple-choice endpoint.** Before M1-205 round 1 the branch was
+            # `== "numeric"` with a bare fall-through, so a discrete plan reached
+            # `post_multiple_choice_question_prediction`. mypy caught it only because
+            # `DiscretePost` made the union wider than the branches covered.
             self._poster.post_numeric_question_prediction(question_id, list(plan.continuous_cdf))
             return
-        self._poster.post_multiple_choice_question_prediction(
-            question_id, dict(plan.probability_yes_per_category)
-        )
+        if plan.question_type == "multiple_choice":
+            self._poster.post_multiple_choice_question_prediction(
+                question_id, dict(plan.probability_yes_per_category)
+            )
+            return
+        # Same reason as `expected_values`: a fall-through here is how a new plan member
+        # gets posted to the wrong endpoint. Named, and refused.
+        raise LiveSubmissionError("this plan has no posting route")
 
     def _fetch_or_refuse(self, post_id: int) -> object:
         """Fetch the question before posting, or refuse. Nothing has been spent yet."""
@@ -1522,19 +1610,17 @@ class MetaculusSubmissionGateway:
         platform side -- it saves the *idempotency key*, which is spent by the attempt row
         that failure would produce, and it turns an opaque 4xx into a refusal that says
         what is wrong. The state is read through guarded attribute access and an
-        unreadable one is **not** treated as closed: this refuses what it can positively
-        establish, and nothing else.
+        unreadable state also refuses before POST.
         """
         try:
             state = getattr(question, "state", None)
             rendered = None if state is None else getattr(state, "value", state)
         except Exception:
-            return
-        if type(rendered) is str and rendered != "open":
+            rendered = None
+        if rendered != "open":
             # `state` here is one of the SDK's own closed vocabulary, not free content.
             raise LiveSubmissionError(
-                f"the question is {rendered}, not open, so it accepts no forecasts; "
-                "nothing was posted"
+                "the question is not open or its state is unreadable; nothing was posted"
             )
 
     def observe(self, post_id: int, *, question_id: int) -> ForecastHistory | None:
@@ -1569,7 +1655,9 @@ class MetaculusSubmissionGateway:
                 except Exception:  # noqa: BLE001 - an injected sleep must not cost the row
                     pass
             try:
-                question = self._poster.get_question_by_post_id(post_id)
+                question = select_subquestion(
+                    self._poster.get_question_by_post_id(post_id), question_id
+                )
             except Exception as exc:  # noqa: BLE001 - classified, never re-raised
                 detail = _DETAIL_FOR_ERROR[classify_error(exc)]
                 continue
@@ -1722,6 +1810,12 @@ class LiveSubmissionRecord:
     artifact_error: str | None
 
 
+def prepare_live_policy(*args: Any, **kwargs: Any) -> Callable[[object, ForecastHistory], None]:
+    from whiskeyjack_bot.submission_policy import prepare_live_policy as prepare
+
+    return prepare(*args, **kwargs)
+
+
 def post_approved_forecast(
     conn: sqlite3.Connection,
     *,
@@ -1820,9 +1914,11 @@ def post_approved_forecast(
 
     canonical = _canonical_or_refuse(payload)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    plan = plan_from_canonical_payload(
-        canonical, expected_cdf_points=config.numeric_calibration.expected_cdf_points
-    )
+    # The record's own question decides the length, not the numeric constant (M1-205
+    # round 1). A discrete record validated against 201 here would be refused at the last
+    # gate before the post, after approval.
+    expected_points = expected_points_for_record(record, config)
+    plan = plan_from_canonical_payload(canonical, expected_cdf_points=expected_points)
     if plan.question_type != record.question_type:
         # Both are members of `config.SupportedQuestionType`, a closed vocabulary this
         # package defines, so naming them is safe and it is what makes this actionable.
@@ -1831,9 +1927,12 @@ def post_approved_forecast(
             f"{record.question_type}; nothing was posted"
         )
 
+    before_post = prepare_live_policy(conn, config, poster, record, payload, digest)
+
     gateway = MetaculusSubmissionGateway(
         poster=poster,
-        expected_cdf_points=config.numeric_calibration.expected_cdf_points,
+        before_post=before_post,
+        expected_cdf_points=expected_points,
         clock=clock,
         sleep=sleep,
     )

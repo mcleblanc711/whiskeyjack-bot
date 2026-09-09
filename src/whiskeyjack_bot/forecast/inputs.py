@@ -282,7 +282,14 @@ def build_model_input(
     # from the tag, which is the same fact the dispatch rule rests on.
     if question.qtype == "multiple_choice":
         fields["options"] = list(question.options)
-    elif question.qtype == "numeric":
+    elif question.qtype in ("numeric", "discrete"):
+        # Both bounded types, and discrete needs these *more* than numeric does, not less:
+        # the prompt tells the model "percentile values must be non-decreasing and
+        # consistent with the supplied bounds", and before M1-205 round 1 a discrete
+        # question supplied none -- so the model was asked for a distribution over a range
+        # it was never told. Raised as a non-blocking observation in round 1 and fixed
+        # here rather than filed, because an unbounded reply is a forecast-quality defect
+        # the schema cannot catch.
         fields["lower_bound"] = question.lower_bound
         fields["upper_bound"] = question.upper_bound
         fields["open_lower_bound"] = question.open_lower_bound

@@ -308,7 +308,12 @@ class MultipleChoiceForecastResponse(_ForecastResponseBase):
 class NumericForecastResponse(_ForecastResponseBase):
     """A numeric forecast: the shared fields plus the declared percentiles."""
 
-    question_type: Literal["numeric"]
+    # Both bounded types, because this one model serves both (M1-205) and the record's
+    # identity validator requires the response tag to equal the question tag. Round 1: with
+    # ``Literal["numeric"]`` every discrete generation failed schema validation *after*
+    # being billed, and returning "numeric" instead failed the identity check -- the reply
+    # had nowhere to go either way.
+    question_type: Literal["numeric", "discrete"]
     final_prediction: NumericPrediction
 
     @model_validator(mode="after")
@@ -330,6 +335,12 @@ _RESPONSE_MODELS: dict[str, type[ForecastResponse]] = {
     "binary": BinaryForecastResponse,
     "multiple_choice": MultipleChoiceForecastResponse,
     "numeric": NumericForecastResponse,
+    # The same response model as numeric, deliberately (M1-205). A discrete question asks
+    # the forecaster for the same nine percentile levels over the same range -- the prompt
+    # does not distinguish the two and was not changed to. The difference appears only when
+    # those percentiles are converted, where the array's length and per-step cap come from
+    # the question rather than from the numeric configuration.
+    "discrete": NumericForecastResponse,
 }
 
 # Derived from config's single source of truth (D20) rather than restated -- the

@@ -2426,7 +2426,7 @@ def test_an_unregistered_question_type_is_refused_rather_than_passed(
         output_problems(mutated, config, question=question, source_ids=supplied)
     except ForecastOutputError as exc:
         assert exc.problems == [
-            "question_type: must be one of binary, multiple_choice, numeric "
+            "question_type: must be one of binary, discrete, multiple_choice, numeric "
             "(offending input withheld)"
         ]
     else:

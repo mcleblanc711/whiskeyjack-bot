@@ -8400,3 +8400,706 @@ reported as `provider_error`; `invocations` hard-coded to 1; the supported-type 
 every **pairing** is wrong — that last one is what shows
 `test_every_fetched_question_keeps_the_identity_the_platform_sent` discriminates on its own
 claim rather than on its neighbour's.
+
+## M1-205 — Discrete question support
+
+Shipped mid-round, with the tournament live. `discrete` was **11 of MiniBench's 42
+questions on 2026-09-07 — 26%** — and every one was deferred as unsupported.
+
+### Decision — reverse D21 for `discrete` only, and why
+
+D21 defers "date and conditional"; the code deferred `discrete` under the same banner
+without the decision row naming it. D21's own reversal trigger reads *"MiniBench/current
+successor requires them"*. MiniBench posted **zero** date and **zero** conditional
+questions that day, and eleven discrete. So the trigger fired for a type the row never
+mentioned. Date and conditional stay deferred — nothing has asked for them.
+
+### Decision — the canonical models are siblings, never one subclassing the other
+
+`_CanonicalBoundedQuestion` holds the shared fields; `CanonicalNumericQuestion` and
+`CanonicalDiscreteQuestion` both extend it and neither extends the other.
+
+The reason is `forecast/numeric.py`'s `isinstance(question, CanonicalNumericQuestion)`
+guard. Had discrete subclassed numeric, that line would have **silently accepted** a
+discrete question and converted it against the numeric 201-point rule and the numeric step
+cap — reproducing inside our own schema exactly the `DiscreteQuestion(NumericQuestion)`
+trap CLAUDE.md's gotcha list exists to warn about. Before this item that trap produced a
+refusal; now that discrete is *supported* it would produce a **wrong forecast**. As
+siblings, every such guard refuses discrete until widened one call site at a time, which is
+what made this diff auditable.
+
+`inbound_outcome_count` is deliberately not carried: it is `cdf_size - 1` exactly, and one
+fact reached two ways is the second source of truth M2-703's review removed.
+
+### Decision (revised at round 1) — the step cap is Metaculus's formula, not a number
+
+**The first version of this item invented a flat `discrete_max_adjacent_pmf: 0.9`, and that
+was wrong.** Round 1 supplied the platform's actual rule: the server validator caps an
+adjacent step at `0.2 * 200 / inbound_outcome_count`. Any flat number is wrong in *both*
+directions, and the second is the dangerous one:
+
+| outcomes | platform cap | flat 0.9 |
+|---|---|---|
+| 16 | 2.500 | far too strict |
+| 71 | 0.563 | **too permissive** |
+| 200 | 0.200 | **too permissive** |
+
+Too strict costs a repair turn. **Too permissive approves locally what the wire refuses** —
+after the forecast is billed, recorded and approved. The real testing-area question 45517
+has 71 outcomes, so this was not hypothetical.
+
+`_cdf_rules` now computes `max_adjacent_pmf * (expected_cdf_points - 1) / (cdf_size - 1)`,
+clamped at 1.0. Substituting a numeric question returns `max_adjacent_pmf` unchanged, so
+there is **one rule and no branch** — and the config field I added was deleted. The original
+reasoning below is kept because the measurement that motivated it still stands; only the
+remedy changed.
+
+### Superseded — the flat cap, and the measurement that motivated it
+
+`max_adjacent_pmf` bounds the probability between two **adjacent CDF points**. On a
+201-point numeric array those are 0.5% of the range apart, so `0.2` in one step is a
+malformed spike. On a discrete question the adjacent points **are the outcomes**: a step is
+the probability of one integer. Measured against the pinned SDK on live post 45559 (16
+outcomes):
+
+| reply | max adjacent step | under `0.2`? |
+|---|---|---|
+| moderate | 0.137 | passes |
+| confident | **0.446** | refused |
+| tight | **0.886** | refused |
+
+Concentrating mass on the modal outcome is what a confident discrete forecast *is*. Under
+the numeric cap each one costs a repair turn — a second billed model call — and then fails
+anyway. Defaulted permissively because Metaculus imposes no per-outcome cap: the grid is
+the question's own declared resolution. Not `1.0`, because a single point holding the whole
+distribution is still worth one repair turn.
+
+**This is the change that fails soft.** A wrong length is refused loudly by Metaculus; a
+wrong cap just degrades forecasts and says nothing. It is why the properties assert the
+*relationship between the two caps on one array* rather than either number.
+
+### Round 1 also found two dispatch omissions, both reproduced before fixing
+
+**The response model kept `Literal["numeric"]`.** Every discrete generation failed schema
+validation *after* being billed, and returning `"numeric"` instead failed the record's
+identity validator — the reply had nowhere to go either way. `NumericForecastResponse.
+question_type` is now `Literal["numeric", "discrete"]`.
+
+**Adding the wire-key row was not adding a dispatch arm.** A discrete CDF fell through
+`submission_live`'s plan builder to `_require_categories` and was refused as "must be a JSON
+object". Fixing it needed a `DiscretePost` member (not `NumericPost` with a different tag —
+`post_approved_forecast` compares the plan's type against the record's), plus the
+record-derived length threaded through `post_approved_forecast` and `tournament.py`'s
+reconciliation, both of which passed a literal 201.
+
+**And widening the union made `mypy --strict` find a third instance the review had not
+named:** the actual POST dispatched on `== "numeric"` with a bare fall-through, so a
+discrete plan would have been posted to `post_multiple_choice_question_prediction`. Both
+fall-throughs are now explicit branches ending in a `raise`, because a fall-through is how
+the next union member gets routed to the wrong endpoint silently.
+
+**Why the property suite did not catch any of this:** it built responses tagged `"numeric"`
+and handed them straight to the conversion, so it never traversed schema dispatch,
+generation, or submission planning. The properties were sound about the function they
+covered and the coverage was drawn too narrowly — the same shape as a vacuous property,
+one layer up.
+
+### Deviation — `expected_cdf_points` narrowed rather than relaxed
+
+`Literal[201]` stayed. It stopped being the pipeline's length rule and became the *numeric*
+one; the array length now comes from the question's own `cdf_size` via
+`expected_cdf_points_for`, which the conversion and the submission preflight both read so
+they cannot disagree. This is **stricter** than before: a numeric question declaring some
+other resolution used to be measured against the constant and is now measured against what
+it actually declared.
+
+### Rejected — a separate discrete checker in `_TYPE_CHECKERS`
+
+`"discrete"` maps to `numeric_output_problems` itself, not a copy. Everything that function
+asserts — the nine exact levels, non-decreasing values, closed-bound and zero-point
+compatibility — is a fact about a distribution over a range and is identical for both
+types. A near-duplicate would be two places to fix the next percentile rule.
+
+### Rejected — changing the prompt
+
+The prompt asks for **nine percentiles** and never for a CDF; its two mentions of "201" are
+explanatory prose. It is byte-identical, which is what kept `prompts/forecaster-tournament.md`
+out of the activation hash. Those two prose lines are now slightly inaccurate for a discrete
+question — recorded here rather than fixed, because fixing them would force a re-enable for
+no behavioural gain.
+
+### Deferred (do not read the absence as an omission)
+
+- **`M1-206` — the discrete CDF golden.** The properties cover length, monotonicity,
+  endpoints and the cap for arbitrary `cdf_size`. What no golden covers is *package drift*
+  in the SDK's discrete-specific `inbound_outcome_count + 1` derivation, which the numeric
+  golden cannot see. Filed, not forgotten; deferred to reach the live round.
+- **The prose "201" in the prompt**, above.
+- **Deferral events still are not ledger rows.** A skipped question exists only in
+  `tournament.jsonl`. That is M1-203's settled design, unchanged here, but it means the
+  attribution instrument has no immutable record of what it declined to forecast.
+
+### Standing risk — this required a config change, and therefore a re-activation
+
+`forecast.supported_question_types` gates generation (`forecast/generate.py:351`), so
+`config/tournament.yaml` gained `- discrete`. **That file is hashed into the activation**,
+so after deploy the worker refuses with `refusal_reason: "activation account, destination,
+configuration, or prompt changed"` until `tournament enable` is re-run.
+
+Two things make that safe rather than alarming, both verified rather than assumed:
+spending is scoped by `account_id:project_id` (`tournament.py:227`), **not** by
+`activation_id`, so re-enabling preserves the accumulated spend and the remaining budget;
+and merging changes nothing on the live host until someone pulls. The deploy is therefore a
+deliberate operator step, in this order: pull, re-enable, confirm `status` reads
+`enabled: true` with a null `refusal_reason`.
+
+### Standing risk — not verifiable offline
+
+No discrete forecast has been posted to Metaculus by this code. The conversion is verified
+against the pinned SDK offline and against the live *question payloads*, but the wire
+acceptance of a 17-point `continuous_cdf` is asserted from the SDK's own post method and
+the shape of a discrete question, not from a `201 Created`. The bot-testing-area questions
+**43321** (16 outcomes, both bounds closed — the endpoint rule the live question cannot
+exercise) and **45517** (71 outcomes, both bounds open, non-integer grid) are the intended
+first posts.
+
+## M1-323 — Stop trusting the model with the question-type tag
+
+Found live, not offline. MiniBench question **45754** (discrete) failed **8 consecutive
+five-minute cycles** between 03:55 and 04:31 UTC on 2026-09-08, each one billed, producing
+zero discrete `forecast_records`.
+
+### Decision — the tag is derived, not read, and why
+
+`question.qtype` is what selects the response model in the first place. A reply that *also*
+states its question type is therefore a second source of truth for one fact, and the only
+thing a disagreement between the two can mean is that the model got it wrong. So `_parse`
+stamps `payload["question_type"] = question.qtype` and the model's own value is discarded
+unread. This is the same shape as M2-703's finding — a value object the writer also took as
+a separate parameter — and the same resolution: remove the second source rather than
+cross-check the two.
+
+**Before schema validation, deliberately.** Stamping *after* would repair the pairing check
+just as well, which is exactly why it is the dangerous fix: the `Literal` on the selected
+model is what still refuses a question type that model does not serve, and it only gets to
+do that if the stamp lands in the payload first. Both placements are mutation-tested.
+
+### Deviation
+
+None from the spec. The behavioural change is that a reply's `question_type` is now ignored
+rather than validated, so a binary reply mislabelled `"numeric"` is accepted. That is the
+intended reading of "the tag is not the model's to author", and it is pinned by
+`test_the_models_tag_is_ignored_rather_than_cross_checked`.
+
+### Rejected — relaxing the pairing check, and why not
+
+The narrow fix is to let `validate.output_problems` treat `numeric` and `discrete` as
+compatible. Rejected: that is the `isinstance` trap CLAUDE.md warns about in different
+clothes — `DiscreteQuestion` subclasses `NumericQuestion` in the pinned SDK, and the whole
+reason dispatch is keyed on the literal is that conflating the two silently normalizes a
+discrete question as numeric, which is a wrong forecast rather than an error.
+
+Also rejected: teaching the prompt to emit `"discrete"`. It re-hashes the prompt for a fact
+the program already knows, and it leaves the failure one bad model reply away.
+
+### Deferred (do not read the absence as an omission)
+
+`schema.py:316`'s `Literal["numeric", "discrete"]` stays widened. With the stamp in place the
+model's value never reaches it, so narrowing it per question type is now dead weight rather
+than a safety property — but it is also the thing that would catch a future caller that
+stamps late, so it stays.
+
+The prompt still does not mention discrete. M1-205's judgement that a discrete question asks
+for the same nine percentiles is unchanged and untouched here.
+
+### Standing risk — not verifiable offline
+
+The 8 failures recorded `internal_error` and nothing else: `QuestionOutcome.problems` reaches
+neither the ledger nor the log, and every member of the caught exception tuple in
+`pipeline_live` collapses to that one detail code. This branch logs the sanitized reason at
+both failure sites, which makes the *next* incident diagnosable from the journal — but it is
+a log line, not a ledger row, so it is outside the attribution instrument. Giving a refused
+generation a durable identity is `M1-317`'s neighbouring problem and is not solved here.
+
+## Metaculus Cup Fall 2026 — second tournament profile
+
+Added `config/tournament-cup.yaml` alongside `config/tournament.yaml` (MiniBench): a
+fully separate profile (own SQLite ledger, artifact root, logs, systemd units) targeting
+https://www.metaculus.com/notebooks/45384/announcing-the-metaculus-cup-fall-2026-with-kiko-llaneras/.
+No code change was needed — `TournamentConfig.id` and every downstream call site were
+already config-driven per profile, and `tournament_state.py` activation is scoped to one
+ledger/account/project at a time, so two tournaments run as two independent profiles rather
+than one process polling both.
+
+Verified 2026-09-08, live, against the account's existing `METACULUS_TOKEN`: the URL slug
+`metaculus-cup-fall-2026` resolves directly through `questions fetch --live --tournament`,
+returning 5 open questions (binary, multiple_choice, numeric) — no separate numeric project
+ID was needed. `config/tournament-cup.yaml` now carries that slug as a verified value, not a
+placeholder (D31: verify tournament ids at runtime, never hardcode blind).
+
+Bots may forecast the Metaculus Cup via the API but are not prize-eligible there — fine for
+whiskeyjack's purpose (the attribution instrument, not prize-hunting), just recorded here so
+it isn't rediscovered as a surprise later.
+
+Not yet done: rehearsal (`docs/TOURNAMENT-OPERATIONS.md`) and owner-authorized `tournament
+enable` against this profile — both still require a deliberate operator act, same as
+MiniBench's launch.
+
+## Metaculus Cup Fall 2026 — rehearsal passed
+
+Ran the rehearsal from `docs/TOURNAMENT-OPERATIONS.md` for the Cup profile, 2026-09-08:
+`config/tournament-cup-rehearsal.yaml`, sandbox project 32977, environment `test`, capped at
+$5 (operator request, to conserve OpenRouter credits pending the Metaculus credit grant),
+its own ledger at `data/cup-rehearsal/`.
+
+**Found and fixed before rehearsing**: `config/tournament-cup.yaml` and the first draft of
+the rehearsal config both put their SQLite ledger in `data/` alongside MiniBench's live
+ledger, just under a different filename. `tournament_state.py`'s posting guard
+(`check_storage`/`guard_root`) is scoped by the ledger's **parent directory**, not its
+filename, so activating either would have collided against MiniBench's `.posting-guard`
+witnesses and refused with "storage restore detected" -- which is exactly what the first
+`tournament enable` attempt did. Fixed by giving both Cup profiles their own subdirectory
+(`data/cup/`, `data/cup-rehearsal/`), matching the existing `data/launch-rehearsal/`
+precedent. Worth a line in `docs/TOURNAMENT-OPERATIONS.md` for the next second-tournament
+profile someone adds.
+
+**First run-once attempt used question 43330** (a Forbes-sourced net-worth subquestion) and
+failed both times with `TournamentError("question research or generation failed")`, silently
+-- no ledger row, no error log, just `tournament_events` kind `question_failure` recording
+only `error_type`. Traced (not a bug): `research/quality.py`'s `quality_problem` correctly
+refuses when the question's resolution criteria name a specific domain (`forbes.com`, via a
+Wayback-archived URL in the group's fine print) and neither AskNews nor Exa returned a
+document from that domain -- the pipeline's own evidence-quality gate working as designed,
+just an unlucky first pick. This failure mode's near-total silence (no `pipeline_failure_events`
+row, since the raise happens before `_record_pre_forecast` is reachable, and no `_LOGGER.error`
+at that site) is worth filing as a follow-up alongside M1-323/M1-317's existing observation
+about `TournamentError`'s message being dropped at `tournament.py`'s outer catch-all.
+
+**Second attempt used question 45708** (no resolution criteria/fine print at all, so the
+domain gate can't fire) and passed cleanly: run 1 produced one confirmed forecast and one
+completed comment ($0.049 actual spend); run 2 made no new paid call and left both counts
+unchanged (`skipped: 1`, `processed: 0`). Activation disabled afterward per the runbook.
+
+Not yet done: owner-authorized `tournament enable` against `config/tournament-cup.yaml`
+(production) and starting the `whiskeyjack-tournament-cup.timer`.
+
+## Metaculus Cup Fall 2026 — production activated
+
+Owner-authorized 2026-09-08, 16:32 UTC: `tournament enable --config config/tournament-cup.yaml
+--project-id 33108 --starts 2026-09-08T16:32:22Z --ends 2027-01-01T00:00:00Z --budget-usd 10`
+(account 305299, activation `51b412f9c2094a9bacdd9080a7159454`). Window runs through the
+tournament's own `forecasting_end_date`; $10 of the $20 project ceiling, capped low
+deliberately while OpenRouter credits from Metaculus are still pending. `deploy/systemd/
+whiskeyjack-tournament-cup.{service,timer}` installed and started the same session
+(`systemctl --user enable --now whiskeyjack-tournament-cup.timer`); polls every five minutes
+independently of the MiniBench timer, sharing no storage (`data/cup/`).
+
+## M1-326 — Do not re-buy research for a deterministic verdict
+
+### Decision — the gate reads `question_blocked`, not `pipeline_failure_events`, and why
+
+Two records are written, deliberately, and they are not redundant.
+
+`pipeline_failure_events` is the **audit** record. Routing `quality_problem`'s verdict
+through `_record_pre_forecast` is the half of this item that closes M1-325's diagnostic
+gap: today the verdict is `raise TournamentError(problem)` at `pipeline_live.py:648-652`,
+which propagates past `_record_pre_forecast` entirely, so question 45452 failed 18+ times
+and left exactly **one** `research_failed/no_evidence` row -- and that one is the
+01:25:19 poll where AskNews itself returned nothing, not the quality gate.
+
+`question_blocked` (a `tournament_events` row) is the **operational** state the skip reads.
+It is a separate row because `pipeline_failure_events` carries no question fingerprint, so
+gating on it alone would need a timestamp correlation across two tables to answer "was the
+question the same when it failed?" -- and an edited question must re-qualify. Carrying
+`{fingerprint, detail_code, at}` on one row makes the skip a single keyed read through the
+existing `events(conn, kind, scope)` helper, which is the shape `restored_question_hold`
+already uses at `tournament.py:387`.
+
+### Decision — the deterministic/transient split is the existing `detail_code` vocabulary
+
+No new vocabulary. `PreForecastFailureCode` already distinguishes the two classes; this
+item only says which side of the line each member sits on:
+
+  deterministic (skip until the fingerprint changes)
+      no_evidence, stale_evidence, schema_invalid, calibration_invalid
+  transient (retry under a bounded cap on the same fingerprint)
+      provider_error, provider_unavailable, http_error, timeout, internal_error,
+      malformed_response
+
+The transient side needs the cap because it is not hypothetical: MiniBench 45754 burned
+**10** `generation_failed/internal_error` attempts and 45764 **six** `schema_invalid`
+ones, and generation failures happen *after* retrieval is billed, so an unbounded transient
+retry is the same money pump with a different label.
+
+### Decision — `quality_problem` returns a verdict code, following `sufficiency.py`
+
+The gate needs a `detail_code`, and deriving one by matching `quality_problem`'s prose
+would make the classification depend on message wording -- a string that CLAUDE.md's
+error-hygiene rule may legitimately reword at any time. So `quality.py` returns the code
+alongside the message.
+
+This is not a new pattern: `research/sufficiency.py` already does exactly this, and its
+own comment says why -- `SufficiencyVerdict` is "deliberately spelled out with
+``lifecycle.FailureCode``'s own two members (``no_evidence``, ``stale_evidence``) rather
+than a fresh vocabulary translated at the call site". `quality.py` reuses that same
+vocabulary rather than inventing a third. Both of its branches are `no_evidence` for the
+*gate*'s purposes -- both mean "the evidence required to forecast is absent" -- and the
+branches stay distinguishable in the recorded message, which is M1-325's half.
+
+Worth noting the two gates are distinct and both already exist: `assess_sufficiency`
+(M1-504) asks whether the packet holds usable evidence at all, and `quality_problem`
+(LAUNCH) is a second, tournament-only gate layered above it. This item does not merge
+them. It also does not change any refusal -- M1-327 changes what these branches *do*;
+M1-326 only makes the verdict machine-readable and stops it being re-purchased.
+
+`assess_sufficiency`'s docstring already states the determinism this item depends on:
+"Pure and deterministic ... the verdict replays identically from stored timestamps."
+`quality_problem` has the same character, which is precisely why re-buying research to
+re-derive it is waste rather than retry.
+
+### Deviation — no migration, and none is needed
+
+`pipeline_failure_events` already carries `question_id`, `tournament_id`, `event_type` and
+a closed `detail_code` CHECK. `tournament_events.kind` has **no** CHECK constraint, so
+`question_blocked` needs no schema change. The migration column in `docs/TRACKS.md` stays
+at `014` free. This was checked against the live schema, not assumed.
+
+### Rejected — widening the `research_checkpoint` TTL, and why not
+
+The obvious cheap fix is to raise the 1800s window in `pipeline_live.py:390` and
+`tournament.py:425`. Rejected: it changes *how often* a permanent failure re-bills without
+changing *that* it re-bills, so it converts an unbounded loss into a slower unbounded loss
+and makes the bug harder to see. It would also silently stale the research behind every
+*succeeding* forecast, trading a cost bug for an attribution one.
+
+### Rejected — gating on the `question_failure` event that already exists
+
+`tournament.py:506-513` already appends a `question_failure` row per failure. Rejected as
+the gate's input because it records only `{"error_type": type(exc).__name__}` -- every
+distinct refusal in `_attempt_question` arrives as the string `"TournamentError"`, so it
+cannot distinguish a deterministic verdict from a five-minutes-remaining skip or a
+transient provider error. That is M1-325, and it is this item's dependency rather than its
+mechanism.
+
+### Deferred (do not read the absence as an omission)
+
+- **The refusal itself stays fatal.** After this item 45452 is skipped *cheaply*; it still
+  produces no forecast. Making it forecastable is M1-327, which is a behaviour change and
+  is argued on its own branch.
+- **The two AskNews strategies per retrieval** are M1-328. Unchanged here.
+- **AskNews reservations never settle** (0 of 87; `$6.48` held across both profiles). It
+  distorts the dollar ledger but did not cause the quota exhaustion -- call count ran out,
+  not budget. Not touched, not conflated.
+- **No head-of-line block.** An earlier reading of this item claimed a failing question
+  stranded the questions behind it. It does not: `run_once` catches per question and
+  continues, every heartbeat reads `complete=true`, and the Cup's other four questions hold
+  `forecast_records` from the first poll. `cli.py:1313` returning 1 on any failure count is
+  what made the unit report failed every five minutes. That is real, and it is M1-329's.
+
+### Standing risk — not verifiable offline
+
+**Correction, round 1.** An earlier draft of this section -- and of the round-1 review
+request -- said the test "drives 45452's stored packet". It does not, and the reviewer was
+right to catch it. The tests use the existing synthetic fixture (question 91001) with
+generated stale/future articles, exercising the same code path with a constructed packet.
+The stored-packet replay was described before it was written, and then not written. Recording
+that plainly, because a claim about evidence is exactly the kind of thing this ledger exists
+to keep honest.
+
+What the tests actually prove: given a recorded deterministic verdict and an unchanged
+question fingerprint, a second attempt issues **zero billed provider calls** -- asserted on
+the fake client's own counter, over a constructed packet that reaches the same branch.
+
+What they do not prove, and no offline test can: that a *live* AskNews call today would
+return the same documents for 45452, or that the historical packet reproduces byte for byte.
+A stored-packet replay is worth adding and is filed rather than claimed. Sockets are blocked
+offline, so "no provider call was made" is observed at the fake client, never at the network.
+
+Determinism of the verdict is an inference from the code being pure over a stored packet and
+a fixed `now` -- the property `assess_sufficiency` claims in its own docstring -- corroborated
+by 17 identical live refusals, not proven by the suite.
+
+That assertion is on `calls_attempted`/`cost_reserved`, never on `research_runs` rows,
+because run rows are wrong in both directions -- `started_at_utc` is the *pinned* `now`
+rather than wall clock, so distinct timestamps undercount retrievals, while the row count
+overcounts billed calls (3 of 45452's 20 rows were served from `durable.py`'s within-window
+dedup and never billed). M1-315 round 3 found this project reporting provider *runs* under
+a heading that claimed *calls*; the same trap produced a wrong figure in this item's own
+first backlog draft, corrected in its second commit.
+
+### Deviation — one latent bug fixed on the way, and why it was not deferred
+
+`quality_problem` was being handed a packet `usable_packet` had already filtered, and it
+applies `usable` itself -- so its `stale_evidence` branch **could never be reached**: the
+documents that would prove staleness were dropped a line earlier. Judged before filtering
+now.
+
+This was not scope creep, it was forced: without it the `stale_evidence` code this item
+introduces would be a branch no test could reach, which is this project's top recurring
+defect wearing a new hat. The refusal *decision* is identical either way -- `quality_problem`
+re-derives the same `useful` set from either packet -- so only the recorded reason changes.
+
+### Verification — every mutant killed, each guard half separately
+
+The guard has two halves, and [[whiskeyjack-two-part-guard-mutation]] is explicit that a
+survivor from neutering only one reads exactly like a vacuous test. Each was neutered on
+its own, from a committed tree with `__pycache__` cleared between runs:
+
+| mutant | result |
+| --- | --- |
+| baseline | 3 passed |
+| skip half neutered (`if blocked:` -> `if False:`) | 2 failed |
+| emit half neutered (never append `question_blocked`) | 3 failed |
+| fingerprint ignored in the block lookup | 1 failed |
+| recorder removed (revert to raising past it) | 2 failed |
+
+The assertions are on `News.calls` -- billed provider calls -- never on `research_runs`
+rows. The baseline test also pins `first == 2`, so "one retrieval is two AskNews calls,
+never one" is asserted rather than assumed.
+
+### Round 2 — APPROVE, and what it left open
+
+Round 2 approved at `3c535f2`. B1 closed: the reviewer's own reproduction confirmed three
+spaced rounds are allowed, the fourth records exactly one exhaustion block, a title edit
+starts a separate attempt count with its own single block, and reverting the fingerprint
+retains the original block.
+
+Two follow-ups filed rather than absorbed, because both survive this branch:
+
+- **M1-331 — fingerprint stability under unordered API metadata.** Raised as a risk area in
+  round 1, retained in round 2, unproven in both. If Metaculus reorders any semantically
+  unordered list between polls, the fingerprint changes, the block stops matching, and the
+  question is re-researched at full price — M1-326's own failure reintroduced through the
+  *key* rather than the gate. Silent, and indistinguishable from correct re-qualification
+  after a genuine edit. **The most plausible remaining way this gate leaks paid calls.**
+- **M1-330 — stored-packet replay.** See the correction above.
+
+The reviewer also pushed back on deferring the quality-verdict property pass to M1-327, and
+the pushback is right in a way my deferral argument missed: *satisfiability* depends on
+M1-327's decision, but **verdict stability across the persisted form and sanitized-message
+properties do not** — they hold whatever the named-source rule becomes. That distinction is
+now part of M1-327's scope rather than a reason to defer the whole pass.
+
+## M1-327 — A missing resolution source is recorded, not refused
+
+M1-326 made a refusal cheap. It did not make question 45452 forecastable, and two things
+stood between it and a forecast: the gate that refused it, and — found by looking at the
+live ledger rather than at the code — M1-326's own attempt counter.
+
+### Decision — the named-source branch is demoted, and the first branch stays fatal
+
+`quality_problem` had three branches. Two say "there is nothing usable here", which is a
+real reason not to forecast. The third said "nothing usable here **came from the authority
+the question names**", and that is a different claim entirely: it asks a resolution
+*authority* to appear as a news *publisher*, when AskNews and Exa are the only two
+retrievers this project has.
+
+It is not a results-portal edge case. Both live instances are on the record:
+
+- **Cup 45452** names `https://results.cik.bg/`, the Bulgarian election commission's
+  results portal for an election on **2026-10-25**. It cannot have news coverage before the
+  event it exists to report. AskNews returned 13 good documents (`bta.bg`, `infobae`, …) on
+  every retrieval and all 13 were discarded; **zero of the 196 documents stored across 20
+  run rows came from `cik.bg`**, and none ever could.
+- **Cup rehearsal 43330** names `forbes.com` — a real news publisher — and was refused
+  twice anyway, because it simply was not in either provider's result set.
+
+So the branch is `missing_source_domains` now, and it refuses nothing. The gap is appended
+as an `evidence_gap` `tournament_events` row scoped to the **record id**, the scope
+`forecast_intent` and `witness` already use, so the ledger states that *this forecast* was
+made without direct resolution-source evidence. For an attribution instrument that is
+strictly better than the alternative, which is not a forecast to say it about.
+
+Owner decision, 2026-09-09, asked explicitly because it changes forecast behaviour.
+
+### Decision — the `evidence_gap` row carries hostnames; `QuestionOutcome` does not
+
+The row carries `domains`. They come out of the question's own `resolution_criteria`, which
+`forecast_records.question` already stores verbatim, and the ledger already holds every
+retrieved document's URL, title and summary — so this is ledger **storage**, and storage is
+what makes the gap answerable later ("which authority did we lack?").
+
+The error-hygiene rule binds the **message** path, and that path is unchanged:
+`QualityProblem.message` is untouched, and `QuestionOutcome.evidence_gaps` is a bare
+`("named_source_absent",)` code tuple, because it rides back into logs.
+
+### Decision — M1-326's counters are scoped to the current activation
+
+**This is the half that actually unblocks anything, and without it the rest is inert.**
+
+M1-326 counts attempts by counting `question_started` events with a matching fingerprint.
+But `question_started` predates M1-326: it was the launch-readiness *checkpoint*, written to
+pin `now` for restart recovery, and it never claimed to be an attempt counter. Read against
+the live ledgers on 2026-09-09:
+
+| Ledger | Scope | `question_started` rows, one fingerprint | Cap |
+|---|---|---|---|
+| `data/cup` | `33108:45452` | **17** | 3 |
+| `data/whiskeyjack_bot` | `33122:45754` | 3 | 3 |
+| `data/whiskeyjack_bot` | `33122:45760`, `:45764` | 2 each | 3 |
+
+So on the first poll after any restart, 45452 reads 17 ≥ 3 and is retired as
+`transient_attempts_exhausted` **before the fixed gate ever runs**. Fixing `quality.py`
+alone changes nothing on the machine that matters.
+
+Both counters — the attempt count and the `question_blocked` check — now match on the
+current `activation_id` as well as the fingerprint, and all three writers stamp it. Rows
+written before this change carry no `activation_id` and so match no activation, which is
+the correct reading of them: they recorded that a question was *started*, and claimed
+nothing about how many times it had been *tried*.
+
+It also gives a verdict an expiry, which it needed. A deterministic block asserts "this
+answer cannot change", and that is only ever true of a fixed question **and fixed code**.
+When the code that produced a verdict changes — exactly what this branch is — the operator
+needs a way to retire the verdicts it invalidated, and an append-only journal offers none.
+`tournament enable` is that gesture: already required after any config change, already
+recorded as an event, already the explicit "go".
+
+### Deviation — one latent bug fixed on the way, and why it was not deferred
+
+`source_domains` propagated a raw `ValueError` from `urlsplit`. `urlsplit("https://[abc")`
+is `ValueError: Invalid IPv6 URL`, question text arrives from the Metaculus API and is
+untrusted under CLAUDE.md's threat boundary, and `research/orchestrate.py:631` calls
+`source_domains` **before** retrieval — so one such string in one question's resolution
+criteria aborted the retrieval, not merely this gate. A raw `ValueError` escaping a module
+is a review finding on its own terms; it is also inside the exact function this item
+rewrites, and the required property pass finds it on its first run. Deferring it would have
+meant writing the totality property around the input class that breaks it.
+
+Document URLs cannot reach that branch — `HttpUrlString` refuses the same string — but the
+guard is on the shared `host` helper rather than on the question side alone, because which
+side is schema-protected is a fact about today's models and not something either caller
+should have to know.
+
+### Deviation — the property pass found the same defect one layer down
+
+The satisfiability property failed on its first run, and it was right to. A question naming
+`https://results.cik.bg./2026/` — one terminal DNS root dot, **D32's own worked example** —
+could never match a document from `results.cik.bg`, because the old rule compared the two
+hosts as strings with a `www.` strip written out twice inside one boolean.
+
+That is the same unsatisfiability M1-327 was filed against, one layer below the branch it
+named, and it would have kept a fraction of named sources permanently unmatchable after the
+demotion. `comparable_host` delegates to a new `canonical.host_identity`, which lives in the
+module that already owns host spellings — a hand-rolled separator table in the calling
+module is the speculative host transform `canonical.py`'s own header records losing to three
+times. `host_identity` is deliberately **total** (a value it cannot canonicalize is
+lower-cased and returned) and deliberately **never persisted**, which is what lets it carry
+the `www.` strip that a real canonicalizer must not: `www.forbes.com` and `forbes.com` are
+genuinely different hosts to DNS.
+
+### Rejected — matching named domains by registrable domain
+
+`research/allowlist.py` already carries the public-suffix list, so `results.cik.bg` could
+have matched anything under `cik.bg`. Rejected: it changes what "the named source" *means*,
+widening a rule this item is narrowing, and it would silently accept `evil.cik.bg`. The
+comparison stays host-for-host.
+
+### Rejected — leaving `orchestrate.py`'s `official_source_required` alone was the choice
+
+`orchestrate.py:631` sets `official_source_required=bool(source_domains(question))`, which
+triggers the Exa fallback whenever a question names any URL. That is left exactly as it is,
+and deliberately: biasing *retrieval* toward a named domain is the one mechanism that could
+actually obtain such evidence. Only the *refusal* was wrong.
+
+### Rejected — a config flag for the demotion
+
+`forecast.require_named_source_evidence`, defaulted off, would let the hard gate return
+without a code change. Rejected: any config-schema change moves `config_sha256`, and
+`require_activation` compares it, so both tournament profiles would refuse to run until
+`tournament enable` was re-run — an operational cost paid for a switch nobody has asked for.
+The demotion is unconditional and the code change is the record of it.
+
+### Deferred (do not read the absence as an omission)
+
+- **Enforcing the named-source rule after the scheduled resolution moment.** The context
+  document's alternative, and coherent: once the authority *could* have published, its
+  absence means something. Not built, because it leaves 45452 unforecastable until
+  2026-10-25 and the owner chose the demotion. Worth filing if the gap count ever suggests
+  the forecasts are actually worse.
+- **M1-331** (fingerprint stability under unordered API metadata) is untouched here and
+  still the most plausible way this gate leaks paid calls.
+- **A per-question unblock command.** Considered as the alternative to activation scoping;
+  it is more precise but adds a CLI surface and a new event kind, and the activation is a
+  gesture that already exists and is already recorded.
+
+### Standing risk — re-enabling re-arms deterministic blocks too
+
+Scoping the block check to the activation means `tournament enable` re-opens every blocked
+question, not only the ones a code change invalidated. Bounded: one re-attempt per blocked
+question per activation, under the same budget guard and the same `MAX_TRANSIENT_ATTEMPTS`
+as anything else, at roughly $0.29 a question. That is the intended trade — the alternative
+is a verdict with no expiry in an append-only journal — but it means **`tournament enable`
+is not free**, and an operator who re-enables to change one config value pays for it.
+
+### Standing risk — not verifiable offline
+
+Sockets are blocked, so nothing here was run against the real Metaculus or AskNews. The
+counts in the table above are read from the operator's own ledgers, which is evidence about
+what happened, not proof about what will. The end-to-end check is one `run-once` against
+question 45452 with `--question-id`, before any timer is re-enabled.
+
+### Verification
+
+Every property and every new unit test was mutation-tested: thirteen mutants, twelve caught
+and one knowingly accepted. The table and each verdict are in the review request.
+
+Five of the thirteen survived the first pass, which is the reason this section is worth
+reading. Four were closed by tests written against them, and one of the four was a live
+defect rather than a coverage hole: **`canonical.host_identity`'s totality fallback had no
+test, and the branch it guards is reachable.** `quality.host`'s `except ValueError` catches
+only the URLs `urlsplit` itself refuses; a second class gets past it, because
+`https://a..b/x` parses fine and yields the host `a..b`, which `_canonical_host` then
+rejects. Since `missing_source_domains` canonicalizes *the question's* named domains, that
+raise would leave a `CanonicalizationError` escaping a verdict function with no error type
+of its own — the same defect `host` was fixed for, one layer down, reached from one string
+of Metaculus-supplied resolution criteria. The fallback was already correct; nothing proved
+it, and the property pool contained no host that canonicalization rejects. That is the
+vacuity trap in its usual form: the strategy could not reach the branch the claim was about.
+
+The asymmetry underneath it is worth stating, because it is what makes the guard belong on
+the shared helper. A document's `canonical_url` is `HttpUrlString`, and every URL class that
+yields an unreadable host is refused at the schema boundary — verified by execution over all
+six. A question's `resolution_criteria` is free text and has no such gate. Which side is
+schema-protected is a fact about today's models, not something either caller should have to
+know.
+
+**The accepted survivor is M8**, `missing_source_domains`' `carried is not None` guard.
+Neutering it to `carried is None or ...` changes no test, and it cannot: reaching it needs a
+schema-valid `ResearchDocument` whose `canonical_url` has no readable host, and the six URL
+classes that would produce one are all refused by `validate_document`. The only way to test
+it is `model_construct`, which manufactures a condition the public path cannot produce —
+CLAUDE.md's threat boundary says that does not make a finding blocking, and it should not
+make a test either. The guard stays because it is on a shared helper whose other caller is
+unprotected; it is documented here rather than defended by a test that would prove nothing.
+
+### Round 1 — APPROVE, no blocking findings, one observation worth taking
+
+The one non-blocking observation was right, and it was the vacuity trap again — in the
+property written to guard against it. `test_the_verdict_replays_across_the_persisted_form`
+built its document's text *from the question's own title*, so `relevant` was always true and
+`published_at_utc` was always a day old, so `contemporary` was too. Over all six generated
+inputs the verdict was `None`, and the assertion compared `None == None` every time. A
+replay-stability claim that never replays a **refusal** says nothing about `stale_evidence`
+or `no_evidence`, which are the two codes M1-326's gate actually stores — the entire reason
+the property exists.
+
+Reproduced by execution before fixing: the committed property's reachable verdict set is
+exactly `{None}`. The property now draws a packet `shape` over `passing` / `empty` / `stale`
+/ `irrelevant`, reaching all three verdicts by all four routes, and asserts the expected code
+**before** the round-trip so a future change to `_document`'s defaults cannot silently
+collapse the shapes back to one verdict.
+
+Teeth demonstrated rather than asserted, which is what round 1 asked for. Three mutants —
+the stale branch returning the wrong code, the stale branch never taken, and an unusable
+packet treated as passing — **survive the committed property 3/3 and are caught 3/3 by the
+widened one.**
+
+Three of the four new `test_tournament.py` cases fail on `master`'s source with the tests
+unchanged, which is the pre-fix proof:
+`test_a_named_resolution_source_no_longer_refuses_the_forecast`,
+`test_pre_activation_attempts_do_not_retire_a_question`, and
+`test_re_enabling_the_tournament_re_arms_a_blocked_question`. The fourth,
+`test_a_forecast_from_the_named_source_records_no_gap`, is the negative control and passes
+on both trees by design — without it the first would hold on code that records a gap for
+every forecast.

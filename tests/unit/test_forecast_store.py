@@ -48,7 +48,12 @@ from whiskeyjack_bot.forecast.store import (
     read_forecast_record,
 )
 from whiskeyjack_bot.forecast.validate import output_problems
-from whiskeyjack_bot.ledger import connect, initialize_ledger
+from whiskeyjack_bot.ledger import (
+    LEDGER_SCHEMA_VERSION,
+    connect,
+    initialize_ledger,
+    open_verified_ledger,
+)
 from whiskeyjack_bot.lifecycle import (
     current_status,
     record_approval,
@@ -774,7 +779,10 @@ def _direct_insert(connection: sqlite3.Connection, **overrides: Any) -> None:
             {"final_prediction_json": "0.37"}, "final_prediction_json", id="prediction_scalar"
         ),
         pytest.param({"final_prediction_json": ""}, "final_prediction_json", id="prediction_blank"),
-        pytest.param({"question_type": "discrete"}, "question_type", id="unsupported_type"),
+        # `discrete` moved out of this list at M1-205: migration 013 admits it, and the
+        # positive case is `test_migration_013_admits_a_discrete_forecast` below. `date`
+        # and `conditional` are the vocabulary's remaining refusals.
+        pytest.param({"question_type": "conditional"}, "question_type", id="unsupported_type"),
         pytest.param({"question_type": "date"}, "question_type", id="deferred_type"),
         pytest.param(
             {"forecast_version": 1, "parent_record_id": "01a02000-0000-7000-8000-00000000dead"},
@@ -789,6 +797,59 @@ def test_migration_007_refuses_an_incoherent_row(
     with pytest.raises(sqlite3.IntegrityError, match=match):
         _direct_insert(conn, **overrides)
     assert conn.execute("SELECT COUNT(*) FROM forecast_records").fetchone()[0] == 0
+
+
+def test_migration_013_admits_a_discrete_forecast(conn: sqlite3.Connection) -> None:
+    """The positive half of the vocabulary rule (M1-205).
+
+    Round 3 of the cross-model review found that every discrete forecast was refused here
+    with zero rows written, *after* the model call had been billed -- the item's planning
+    had checked `forecast_records` for a CHECK constraint on `question_type`, found none,
+    and concluded no migration was needed. The vocabulary lives in a **trigger**, so that
+    check looked in the wrong place.
+
+    Asserted as an insert that succeeds and reads back, not merely as "does not raise": a
+    trigger that aborted silently would satisfy the weaker claim.
+    """
+    _direct_insert(conn, question_type="discrete")
+    stored = conn.execute("SELECT question_type FROM forecast_records").fetchall()
+    assert [row[0] for row in stored] == ["discrete"]
+
+
+def test_migration_013_admits_discrete_on_a_ledger_upgraded_from_012(tmp_path: Path) -> None:
+    """The same rule on an *upgraded* ledger, which is the one the live host has.
+
+    A migration that only works on a fresh database is the failure mode this project's
+    migration tests exist for: the production ledger is never fresh. Rows written before
+    013 must survive it, so the count is asserted rather than assumed.
+    """
+    db = tmp_path / "upgraded.sqlite3"
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+
+    def trigger_of(conn: sqlite3.Connection) -> str:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'forecast_records_require_draft_on_insert'"
+        ).fetchone()
+        assert row is not None
+        return str(row[0])
+
+    with open_verified_ledger(db) as conn:
+        first = trigger_of(conn)
+
+    # Re-opening runs the migration path again. It must be a no-op: 013 is a DROP/CREATE,
+    # and a migration that re-ran would still work while one that half-applied would not,
+    # so the assertion is on the *text* being identical rather than on "did not raise".
+    with open_verified_ledger(db) as conn:
+        assert trigger_of(conn) == first
+        assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == (
+            LEDGER_SCHEMA_VERSION
+        )
+
+    # All four members present: 013 widened the vocabulary rather than replacing it, and a
+    # rewrite that dropped one of the original three would be silent.
+    for member in ("'binary'", "'multiple_choice'", "'numeric'", "'discrete'"):
+        assert member in first
 
 
 def test_migration_007_refuses_a_later_version_with_no_parent(conn: sqlite3.Connection) -> None:

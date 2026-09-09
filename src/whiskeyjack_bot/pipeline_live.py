@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -96,7 +96,7 @@ from whiskeyjack_bot.research.orchestrate import (
     retrieve_for_question,
 )
 from whiskeyjack_bot.research.packet import packet_sha256
-from whiskeyjack_bot.research.store import StoreError, list_retrieval_run_ids, load_packet
+from whiskeyjack_bot.research.store import StoreError, load_packet
 from whiskeyjack_bot.research.sufficiency import assess_sufficiency
 
 if TYPE_CHECKING:
@@ -166,6 +166,10 @@ class QuestionOutcome:
     cost_usd: float | None = None
     unpriced_calls: int = 0
     note: str | None = None
+    # What the forecast was made *without* (M1-327). Codes only, never hostnames: this
+    # rides back to `tournament.py` and into logs, while the ledger's `evidence_gap` row
+    # is the half that carries the domains. Empty is the ordinary case.
+    evidence_gaps: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A draft was persisted for "recorded" (validated) and "validation_failed" (M1-504's
@@ -193,6 +197,11 @@ class QuestionOutcome:
             "validation_failed",
         ):
             raise LiveRunError("only a question that reached the model reports an artifact outcome")
+        # An evidence gap is a statement *about a forecast*, so it cannot be reported by an
+        # attempt that produced no record to attach it to. Same shape as the rules above:
+        # the object refuses to describe a forecast that was never written.
+        if self.evidence_gaps and not has_record:
+            raise LiveRunError("only a question whose draft was persisted reports an evidence gap")
 
 
 @dataclass(frozen=True)
@@ -381,33 +390,24 @@ def _research(
     exactly the identity failure ``list_retrieval_run_ids`` was separated from ``load_packet``
     to prevent.
     """
-    if not refresh:
-        try:
-            existing = list_retrieval_run_ids(conn, question_id=question.question_id)
-            if existing:
-                packet = load_packet(
-                    conn, question_id=question.question_id, retrieval_run_ids=existing
+    from whiskeyjack_bot.tournament_state import append, digest, events
+
+    fingerprint = digest(question.model_dump(mode="json"))
+    saved = events(conn, "research_checkpoint", fingerprint)
+    if not refresh and saved and saved[-1].get("retrieval_policy") == "launch-2":
+        checkpoint = saved[-1]
+        if 0 <= (now - datetime.fromisoformat(checkpoint["at"])).total_seconds() <= 1800:
+            run_ids = tuple(checkpoint["run_ids"])
+            packet = load_packet(conn, question_id=question.question_id, retrieval_run_ids=run_ids)
+            if packet.documents:
+                return _Research(
+                    packet=packet,
+                    retrieval_run_ids=run_ids,
+                    reused=True,
+                    provider_failed=False,
+                    cost_usd=None,
+                    unpriced_calls=0,
                 )
-                if packet.documents:
-                    _LOGGER.info(
-                        "reusing %d completed research run(s) for question %d; no provider "
-                        "call is made (pass --refresh-research to retrieve again)",
-                        len(existing),
-                        question.question_id,
-                    )
-                    return _Research(
-                        packet=packet,
-                        retrieval_run_ids=existing,
-                        reused=True,
-                        provider_failed=False,
-                        cost_usd=None,
-                        unpriced_calls=0,
-                    )
-        except StoreError as exc:
-            # Reuse is an optimisation over paying again, so a ledger that cannot answer
-            # "what is already here" degrades to retrieving rather than failing the
-            # question. Logged, because silently paying twice is the thing being avoided.
-            _LOGGER.warning("could not reuse stored research, retrieving instead: %s", exc)
 
     outcome = retrieve_for_question(
         conn,
@@ -416,6 +416,22 @@ def _research(
         now=now,
         news_client=news_client,
         web_client=web_client,
+    )
+    from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, StorageFailure
+
+    if CURRENT_BUDGET.get() is not None and any(
+        r.artifact_outcome == "failed" for r in outcome.runs
+    ):
+        raise StorageFailure("research artifact failed; worker stopped before forecasting")
+    append(
+        conn,
+        "research_checkpoint",
+        fingerprint,
+        {
+            "at": now.isoformat(),
+            "run_ids": list(outcome.retrieval_run_ids),
+            "retrieval_policy": "launch-2",
+        },
     )
     return _Research(
         packet=outcome.packet,
@@ -533,6 +549,12 @@ def _attempt_question(
             web_client=web_client,
         )
     except PaidRetrievalError as exc:
+        from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, StorageFailure
+
+        if CURRENT_BUDGET.get() is not None:
+            raise StorageFailure(
+                "research storage failed after a paid call; worker stopped"
+            ) from None
         # The ledger refused a write *after* the provider was billed. Caught before its
         # parent class because the two cases differ in everything the ledger and the budget
         # care about: this one names the run row that says money was spent on this question,
@@ -616,6 +638,82 @@ def _attempt_question(
             note=note,
         )
 
+    from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError, append
+    from whiskeyjack_bot.research.quality import (
+        missing_source_domains,
+        quality_problem,
+        usable_packet,
+    )
+
+    # Named resolution authorities this packet has no usable document from. Empty unless
+    # the gate below runs, which is deliberate: it is derived from the UNFILTERED packet
+    # and there is no unfiltered packet outside the tournament path.
+    absent_sources: tuple[str, ...] = ()
+
+    if CURRENT_BUDGET.get() is not None:
+        from datetime import timedelta
+        from whiskeyjack_bot.tournament_state import utcnow
+
+        if question.close_time is None or question.close_time <= utcnow() + timedelta(minutes=5):
+            raise TournamentError("less than five minutes remain; no new forecast purchased")
+        # Judged on the UNFILTERED packet, then filtered for the model. The order matters:
+        # `quality_problem` applies `usable` itself, so handing it an already-filtered
+        # packet left it unable to tell "we retrieved nothing" from "everything we
+        # retrieved had aged out" -- its `stale_evidence` branch could never be reached,
+        # because the documents that would prove staleness had been dropped a line earlier.
+        # The refusal decision is unchanged either way; only its recorded reason improves.
+        problem = quality_problem(
+            research.packet, question, now, config.retrieval.freshness_days_default
+        )
+        # Judged on the same unfiltered packet and for the same reason, but it is not a
+        # refusal (M1-327). Carried down to the write below rather than acted on here:
+        # the row it is recorded against does not exist yet.
+        absent_sources = missing_source_domains(
+            research.packet, question, now, config.retrieval.freshness_days_default
+        )
+        research = replace(
+            research,
+            packet=usable_packet(
+                research.packet, question, now, config.retrieval.freshness_days_default
+            ),
+        )
+        assert research.packet is not None
+        if problem:
+            # Recorded, not raised past the recorder. Until M1-326 this was
+            # `raise TournamentError(problem)`, which propagated straight past
+            # `_record_pre_forecast` -- so the verdict left no pipeline_failure_events row
+            # at all, and the caller could not tell a deterministic refusal from a
+            # transient provider error. Question 45452 refused 17 times and left exactly
+            # one such row, and that one was AskNews returning nothing, not this gate.
+            # `tournament.py` still turns this outcome into a TournamentError, so the
+            # question fails exactly as before -- it is now merely legible, and cheap to
+            # decline a second time.
+            note = _record_pre_forecast(
+                conn,
+                attempt_id=attempt_id,
+                question_id=question_id,
+                tournament_id=tournament_id,
+                event_type="research_failed",
+                detail_code=problem.code,
+                retrieval_run_id=research.retrieval_run_ids[0]
+                if research.retrieval_run_ids
+                else None,
+                occurred_at=now,
+            )
+            return QuestionOutcome(
+                question_id=question_id,
+                status="research_failed",
+                attempt_id=attempt_id,
+                retrieval_run_ids=research.retrieval_run_ids,
+                document_count=len(research.packet.documents),
+                research_reused=research.reused,
+                detail_code=problem.code,
+                problems=(problem.message,),
+                note=note,
+            )
+
+    if research.packet is None:
+        raise TournamentError("filtered research packet is missing")
     run_ids = research.retrieval_run_ids
     try:
         generation: ForecastGeneration = generate_forecast(
@@ -633,6 +731,16 @@ def _attempt_question(
         ForecastSchemaError,
         MissingCredentialError,
     ) as exc:
+        # The reason, or it is lost (M1-323). `problems` rides on the returned
+        # `QuestionOutcome` and is written to neither the ledger nor the log, and every
+        # member of this except tuple collapses to the same `internal_error` detail code --
+        # so without this line a refused generation leaves no account of *why* anywhere
+        # durable. M1-205's discrete defect failed 8 consecutive live cycles, each one
+        # billed, and every recorded trace of all 8 was the string "internal_error".
+        # The type name and the message are module-owned and value-free by contract.
+        _LOGGER.error(
+            "generation refused for question %d: %s: %s", question_id, type(exc).__name__, exc
+        )
         # Every one of these is raised *before* the spend, by contract. The forecast still
         # did not happen, so it is a recorded generation failure -- with no artifact, because
         # there is no reply to keep.
@@ -672,6 +780,16 @@ def _attempt_question(
         # is set, but an `assert` would be stripped under `-O` and a crash is a worse answer
         # than a true-but-vague one. `internal_error` is what an unclassified failure is.
         failure_code: PreForecastFailureCode = generation.failure_code or "internal_error"
+        # Same argument as the handler above (M1-323): `problems` is the only account of
+        # why the reply was rejected and it reaches nothing durable. Its members are
+        # schema-authored, value-free strings (`_parse` / `_repair_turn`).
+        _LOGGER.error(
+            "generation produced no forecast for question %d: code=%s invocations=%d problems=%s",
+            question_id,
+            failure_code,
+            generation.invocations,
+            list(generation.failure_problems),
+        )
         artifact_outcome: ArtifactOutcome = "retention_disabled"
         artifact_path: str | None = None
         try:
@@ -775,6 +893,40 @@ def _attempt_question(
                 )
             else:
                 record_validation(conn, record_id=record.record_id, occurred_at=now)
+            if absent_sources:
+                # M1-327: the evidence gap, scoped to the RECORD, which is the convention
+                # `forecast_intent` and `witness` already use -- so the ledger says "this
+                # forecast was made without direct resolution-source evidence" rather than
+                # leaving the claim beside the record for a reader to join up. Inside this
+                # transaction on purpose: `tournament_state.append` nests as a SAVEPOINT,
+                # so the row, its validation event and this land as one unit or not at all.
+                #
+                # That does cut against M1-312's rule that a paid attempt's row is written
+                # regardless -- a journal failure here rolls the forecast record back with
+                # it. Taken deliberately, and the stricter reading: outside the transaction,
+                # a crash between the commit and this append leaves a record whose silence
+                # *asserts* it had resolution-source evidence. An understated attribution
+                # claim is worse than a lost one, and a `StorageFailure` on the tournament
+                # journal already stops the worker everywhere else in this pipeline.
+                #
+                # The hostnames are carried. They come out of the question's own
+                # `resolution_criteria`, which `forecast_records.question` already stores
+                # verbatim, so this is ledger *storage* and not a diagnostic message --
+                # the error-hygiene rule binds the message path, and `QuestionOutcome
+                # .evidence_gaps` below stays a bare code for exactly that reason.
+                append(
+                    conn,
+                    "evidence_gap",
+                    record.record_id,
+                    {
+                        "at": now.isoformat(),
+                        "code": "named_source_absent",
+                        "question_id": question_id,
+                        "tournament_id": tournament_id,
+                        "forecast_sha256": record_sha256(record),
+                        "domains": list(absent_sources),
+                    },
+                )
     except (ForecastRecordError, StoreError, LifecycleError) as exc:
         _LOGGER.error("could not record the forecast for question %d: %s", question_id, exc)
         return QuestionOutcome(
@@ -806,6 +958,7 @@ def _attempt_question(
             detail_code=gate_detail_code,
             cost_usd=cost,
             unpriced_calls=unpriced,
+            evidence_gaps=("named_source_absent",) if absent_sources else (),
         )
 
     return QuestionOutcome(
@@ -823,6 +976,7 @@ def _attempt_question(
         artifact_outcome=persisted.artifact_outcome,
         cost_usd=cost,
         unpriced_calls=unpriced,
+        evidence_gaps=("named_source_absent",) if absent_sources else (),
     )
 
 

@@ -92,6 +92,16 @@ def flat_questions() -> list[MetaculusQuestion]:
     ]
 
 
+def discrete_question() -> MetaculusQuestion:
+    """The discrete post, parsed by the SDK exactly as a live fetch would parse it (M1-205).
+
+    Kept out of :func:`flat_questions` deliberately. That helper is the batch every
+    fetch-path test asserts against, and folding a fourth type into it would quietly change
+    what a dozen unrelated assertions are about. Tests that want discrete ask for it.
+    """
+    return DataOrganizer.get_question_from_post_json(raw_post("discrete"))
+
+
 def unpacked_group_questions() -> list[MetaculusQuestion]:
     """The group post expanded the way a live fetch with ``unpack_subquestions`` expands it.
 

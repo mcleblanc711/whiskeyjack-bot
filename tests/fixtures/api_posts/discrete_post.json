@@ -1,0 +1,42 @@
+{
+  "id": 90004,
+  "published_at": "2026-07-06T14:00:00Z",
+  "nr_forecasters": 11,
+  "forecasts_count": 27,
+  "projects": {
+    "tournament": [
+      {"slug": "minibench", "name": "MiniBench"}
+    ],
+    "default_project": {"id": 90900, "slug": "minibench", "name": "MiniBench"}
+  },
+  "question": {
+    "id": 91004,
+    "type": "discrete",
+    "title": "[SYNTHETIC FIXTURE] How many of the 15 example members will abstain on 2026-07-15?",
+    "description": "Synthetic fixture question for offline tests. Shaped like a MiniBench discrete question -- a small integer grid rather than a continuous range -- and never submitted anywhere.",
+    "resolution_criteria": "Resolves to the number of example members recorded as abstaining in the published roll call for 2026-07-15.",
+    "fine_print": "If no roll call is published that day, the question resolves to the next published roll call.",
+    "status": "open",
+    "open_time": "2026-07-06T14:00:00Z",
+    "scheduled_close_time": "2026-07-15T14:00:00Z",
+    "scheduled_resolve_time": "2026-07-16T14:00:00Z",
+    "cp_reveal_time": "2026-07-08T14:00:00Z",
+    "actual_resolve_time": null,
+    "resolution": null,
+    "include_bots_in_aggregates": true,
+    "question_weight": 1.0,
+    "label": null,
+    "unit": "abstentions",
+    "open_upper_bound": true,
+    "open_lower_bound": false,
+    "scaling": {
+      "range_min": -0.5,
+      "range_max": 15.5,
+      "zero_point": null,
+      "inbound_outcome_count": 16,
+      "nominal_min": 0,
+      "nominal_max": 15
+    },
+    "my_forecasts": {"history": null}
+  }
+}
