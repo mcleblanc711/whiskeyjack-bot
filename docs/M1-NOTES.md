@@ -9073,6 +9073,28 @@ CLAUDE.md's threat boundary says that does not make a finding blocking, and it s
 make a test either. The guard stays because it is on a shared helper whose other caller is
 unprotected; it is documented here rather than defended by a test that would prove nothing.
 
+### Round 1 — APPROVE, no blocking findings, one observation worth taking
+
+The one non-blocking observation was right, and it was the vacuity trap again — in the
+property written to guard against it. `test_the_verdict_replays_across_the_persisted_form`
+built its document's text *from the question's own title*, so `relevant` was always true and
+`published_at_utc` was always a day old, so `contemporary` was too. Over all six generated
+inputs the verdict was `None`, and the assertion compared `None == None` every time. A
+replay-stability claim that never replays a **refusal** says nothing about `stale_evidence`
+or `no_evidence`, which are the two codes M1-326's gate actually stores — the entire reason
+the property exists.
+
+Reproduced by execution before fixing: the committed property's reachable verdict set is
+exactly `{None}`. The property now draws a packet `shape` over `passing` / `empty` / `stale`
+/ `irrelevant`, reaching all three verdicts by all four routes, and asserts the expected code
+**before** the round-trip so a future change to `_document`'s defaults cannot silently
+collapse the shapes back to one verdict.
+
+Teeth demonstrated rather than asserted, which is what round 1 asked for. Three mutants —
+the stale branch returning the wrong code, the stale branch never taken, and an unusable
+packet treated as passing — **survive the committed property 3/3 and are caught 3/3 by the
+widened one.**
+
 Three of the four new `test_tournament.py` cases fail on `master`'s source with the tests
 unchanged, which is the pre-fix proof:
 `test_a_named_resolution_source_no_longer_refuses_the_forecast`,

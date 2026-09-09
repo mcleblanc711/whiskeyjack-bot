@@ -263,21 +263,57 @@ def test_a_document_from_elsewhere_leaves_the_gap_and_still_forecasts(
     criteria=CRITERIA,
     title=TITLES,
     url=st.sampled_from(["https://example.org/a", "https://forbes.com/x"]),
+    shape=st.sampled_from(["passing", "empty", "stale", "irrelevant"]),
 )
-def test_the_verdict_replays_across_the_persisted_form(criteria: str, title: str, url: str) -> None:
+def test_the_verdict_replays_across_the_persisted_form(
+    criteria: str, title: str, url: str, shape: str
+) -> None:
     """Replay stability. The ledger holds JSON, so a verdict derived from a stored packet
     must equal the verdict derived from the live one, or M1-326's gate declines a question
-    on an answer the replay would not reproduce."""
-    question = _question(title=title, resolution_criteria=criteria)
-    live = _document(url, text=title)
-    stored = _round_trip(live)
-    assert _persisted(stored) == _persisted(live)
+    on an answer the replay would not reproduce.
 
-    first = quality_problem(_packet((live,)), question, NOW, DAYS)
-    second = quality_problem(_packet((stored,)), question, NOW, DAYS)
+    ``shape`` is round 1's non-blocking finding, and it was right. Every packet this
+    property built was contemporary and relevant -- the document's text *was* the question's
+    title -- so ``quality_problem`` returned ``None`` on all six inputs and the assertion
+    below compared ``None == None`` forever. A replay-stability claim that never replays a
+    **refusal** says nothing about the two codes M1-326's gate actually stores, which is the
+    whole reason the property exists. The four shapes reach every branch: ``None``,
+    ``stale_evidence``, and ``no_evidence`` by both routes (nothing retrieved, and retrieved
+    but irrelevant).
+
+    ``EXPECTED`` is the vacuity guard, and it is asserted *before* the round-trip. Without it
+    a future change to ``_document``'s defaults could quietly collapse the shapes back to one
+    verdict and leave this test green while proving nothing again -- the exact way it failed
+    the first time.
+    """
+    question = _question(title=title, resolution_criteria=criteria)
+    if shape == "empty":
+        live = ()
+    elif shape == "stale":
+        live = (_document(url, text=title, published=NOW - timedelta(days=DAYS * 40)),)
+    elif shape == "irrelevant":
+        live = (_document(url, text="wholly unrelated filler prose"),)
+    else:
+        live = (_document(url, text=title),)
+    stored = tuple(_round_trip(document) for document in live)
+    assert [_persisted(d) for d in stored] == [_persisted(d) for d in live]
+
+    expected = {
+        "passing": None,
+        "empty": "no_evidence",
+        "stale": "stale_evidence",
+        "irrelevant": "no_evidence",
+    }[shape]
+    first = quality_problem(_packet(live), question, NOW, DAYS)
+    assert (first.code if first else None) == expected, (
+        f"the {shape!r} packet must reach the {expected!r} branch, or this property "
+        "compares one verdict against itself"
+    )
+
+    second = quality_problem(_packet(stored), question, NOW, DAYS)
     assert first == second
-    assert missing_source_domains(_packet((live,)), question, NOW, DAYS) == missing_source_domains(
-        _packet((stored,)), question, NOW, DAYS
+    assert missing_source_domains(_packet(live), question, NOW, DAYS) == missing_source_domains(
+        _packet(stored), question, NOW, DAYS
     )
 
 
