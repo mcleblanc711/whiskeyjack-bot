@@ -9506,3 +9506,24 @@ too, because a budget of exactly zero does not raise — `setitimer(0)` *disable
 which would cancel the enclosing phase deadline and then run the push unbounded. The
 replacement asserts the mechanism instead of the outcome: with no room left, nothing touches
 the interval timer at all.
+
+### A pre-existing gate flake found while generating the round-2 request
+
+`scripts/review-request.py` refused to emit, and the cause was **not** on this branch.
+`tests/property/test_submission_payload_properties.py:397` fails intermittently with
+hypothesis `FailedHealthCheck: filter_too_much` — "8 inputs were generated successfully,
+while 50 inputs were filtered out". It is not a falsified property; the strategy `assume`s
+its way to the shared-digest and distinct-digest arms rather than drawing them, so on an
+unlucky seed generation gives up.
+
+Reproduced on **master at `fe781dc`** with
+`--hypothesis-seed=37229261598144587348945677694901145758 -p no:randomly`, and this branch
+touches neither the property nor `submission_payload.py`. It surfaced here only because
+`pytest-randomly` reseeds hypothesis per ordering, so a different test order draws different
+examples.
+
+Filed as **M1-333** rather than fixed here: it belongs to M2-707, and the correct fix is to
+draw the relationship as a mode rather than to suppress the health check — a filter rate that
+high is evidence of the distribution problem this project's tests most often have, so
+silencing it would hide exactly the thing worth knowing. It is worth knowing more broadly
+that the required `quality-gate` check can go red at random on any PR until that lands.
