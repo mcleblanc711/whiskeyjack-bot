@@ -19,11 +19,14 @@ from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot import tournament as whiskeyjack_tournament
 from whiskeyjack_bot import tournament_state
 from whiskeyjack_bot.tournament import MAX_TRANSIENT_ATTEMPTS, run_once
+from whiskeyjack_bot.tournament import status
 from whiskeyjack_bot.tournament_state import (
     Budget,
     StorageFailure,
     TournamentError,
+    append,
     check_storage,
+    digest,
     disable,
     enable,
     require_activation,
@@ -803,3 +806,144 @@ def test_budget_transaction_failure_is_fatal_before_provider_invocation(case: An
         Budget(closed, config.storage.artifact_root, "42:32977", 1_000_000).reserve(
             "provider", 0.1, {}
         )
+
+
+def test_a_named_resolution_source_no_longer_refuses_the_forecast(case: Any) -> None:
+    """M1-327: the forecast is made, and the ledger says what it was made without.
+
+    The Cup's question 45452 in miniature. It names `https://results.cik.bg/`, the
+    Bulgarian election commission's results portal for an election on 2026-10-25; AskNews
+    and Exa are news retrievers, so no document they return can carry that host before the
+    event it exists to report. Thirteen usable documents were discarded on each of 17
+    retrievals and the question was never forecast. `News` here returns `example.org`
+    documents and never the named host, which is the same situation exactly.
+    """
+    conn, _config, platform, news, model = case
+    platform.raw["question"]["resolution_criteria"] = (
+        "Resolves to the count published at https://results.example.gov/2026/ ."
+    )
+
+    result = poll(case)
+
+    assert result["heartbeat"]["failures"] == 0, "a missing resolution source is not a failure"
+    assert platform.posts == 1 and model.calls == 1, "the forecast must actually be made"
+    assert news.calls == 2, "one retrieval, two AskNews calls"
+
+    rows = [
+        (scope, json.loads(data))
+        for scope, data in conn.execute(
+            "SELECT scope, data FROM tournament_events WHERE kind='evidence_gap'"
+        )
+    ]
+    assert len(rows) == 1, "one forecast, one recorded gap"
+    scope, gap = rows[0]
+    record_id, forecast_sha = conn.execute(
+        "SELECT record_id, forecast_sha256 FROM forecast_records"
+    ).fetchone()
+    assert scope == record_id, "the gap is scoped to the attribution record it describes"
+    assert gap["code"] == "named_source_absent"
+    assert gap["domains"] == ["results.example.gov"]
+    assert gap["forecast_sha256"] == forecast_sha
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_failure_events").fetchone()[0] == 0, (
+        "a recorded gap is not a recorded failure"
+    )
+    assert status(conn, _config)["evidence_gaps"] == 1
+
+
+def test_a_forecast_from_the_named_source_records_no_gap(case: Any) -> None:
+    """The other half: naming a source the retrieval *did* reach records nothing.
+
+    Without this the test above passes on code that records a gap unconditionally, which
+    would be a claim about every forecast rather than about this one.
+    """
+    conn, _config, platform, news, _model = case
+    platform.raw["question"]["resolution_criteria"] = "Resolves per https://www.example.org/x ."
+
+    assert poll(case)["heartbeat"]["failures"] == 0
+    assert platform.posts == 1 and news.calls == 2
+    assert (
+        conn.execute("SELECT COUNT(*) FROM tournament_events WHERE kind='evidence_gap'").fetchone()[
+            0
+        ]
+        == 0
+    ), "a document from the named host is exactly what the gate asked for"
+
+
+def test_pre_activation_attempts_do_not_retire_a_question(case: Any) -> None:
+    """M1-327: `question_started` rows from before M1-326 are not attempts.
+
+    Question 45452's ledger holds 17 of them under one fingerprint against a cap of 3,
+    written by the launch-readiness checkpoint months before M1-326 gave that event a
+    second meaning. Reading them as attempts retires the question permanently, before the
+    gate this branch fixes is ever reached -- so the seeded rows here carry the exact
+    pre-M1-326 shape: a fingerprint and an `at`, and no `activation_id`.
+    """
+    conn, config, platform, news, _model = case
+    question = normalize_questions(
+        platform.get_all_open_questions_from_tournament(32977)
+    ).questions[0]
+    fingerprint = digest(question.model_dump(mode="json"))
+    for _ in range(MAX_TRANSIENT_ATTEMPTS + 2):
+        append(
+            conn,
+            "question_started",
+            f"32977:{question.question_id}",
+            {"at": utcnow().isoformat(), "fingerprint": fingerprint},
+        )
+
+    result = poll(case)
+
+    assert news.calls == 2, "legacy checkpoints must not read as exhausted attempts"
+    assert platform.posts == 1 and result["heartbeat"]["failures"] == 0
+    assert result["heartbeat"].get("exhausted", 0) == 0
+
+
+def test_re_enabling_the_tournament_re_arms_a_blocked_question(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verdict expires with the activation that produced it (M1-327).
+
+    A deterministic block claims the answer cannot change, which is only ever true of a
+    fixed question *and* fixed code. `tournament enable` is the operator's existing,
+    recorded "go", so it is what retires the verdicts a code change invalidated -- the
+    situation this whole branch is: 45452's recorded refusal is wrong now, and nothing
+    else could clear it without editing an append-only journal.
+
+    The clock advances 31 minutes so the re-attempt is a real one. Inside the 1800s
+    window `now` is pinned and the research checkpoint serves the same packet back, which
+    would re-derive the same verdict off cached evidence and prove nothing about the gate.
+    """
+    conn, config, platform, news, _model = case
+    real_now = utcnow()
+    platform.raw["question"]["scheduled_close_time"] = (real_now + timedelta(hours=8)).isoformat()
+    clock = {"now": real_now}
+    monkeypatch.setattr(tournament_state, "utcnow", lambda: clock["now"])
+    monkeypatch.setattr(whiskeyjack_tournament, "utcnow", lambda: clock["now"])
+
+    news.stale = True
+    assert poll(case)["heartbeat"]["failures"] == 1
+    billed = news.calls
+    clock["now"] += timedelta(minutes=31)
+    assert poll(case)["heartbeat"]["blocked"] == 1 and news.calls == billed
+
+    enable(
+        conn,
+        config,
+        account_id=42,
+        project_id=32977,
+        starts=clock["now"] - timedelta(minutes=1),
+        ends=clock["now"] + timedelta(days=1),
+    )
+    news.stale = False
+    clock["now"] += timedelta(minutes=31)
+
+    result = poll(case)
+    assert result["heartbeat"].get("blocked", 0) == 0, "the block belonged to the old activation"
+    assert news.calls > billed, "a fresh activation re-arms the question"
+    assert platform.posts == 1 and result["heartbeat"]["failures"] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM tournament_events WHERE kind='question_blocked'"
+        ).fetchone()[0]
+        == 1
+    ), "the stale block stays in the journal; it is superseded, never deleted"

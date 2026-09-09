@@ -305,6 +305,13 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
     data["restored_question_holds"] = conn.execute(
         "SELECT count(DISTINCT scope) FROM tournament_events WHERE kind='restored_question_hold'"
     ).fetchone()[0]
+    # Forecasts made without a document from a resolution authority the question named
+    # (M1-327). Counted by scope, which is the record id, so this is a count of forecasts
+    # and not of gaps. Reported rather than held against anything: it is not a failure and
+    # deliberately does not touch `unresolved`.
+    data["evidence_gaps"] = conn.execute(
+        "SELECT count(DISTINCT scope) FROM tournament_events WHERE kind='evidence_gap'"
+    ).fetchone()[0]
     data["unresolved"] += data["restored_question_holds"]
     return data
 
@@ -419,10 +426,30 @@ def run_once(
             # for as long as the question stayed open.
             scope = f"{project}:{question.question_id}"
             fingerprint = digest(question.model_dump(mode="json"))
+            # Both counters are scoped to the CURRENT activation as well as to the
+            # fingerprint (M1-327). The fingerprint alone was not enough, and the gap was
+            # not hypothetical: `question_started` predates M1-326 -- it was written by
+            # the launch-readiness *checkpoint*, which was never an attempt counter -- so
+            # the Cup ledger carries 17 of them for question 45452 under one fingerprint
+            # against a cap of 3. Read that history as attempts and the first poll after
+            # this change retires the question as `transient_attempts_exhausted` before
+            # the gate M1-327 exists to fix ever runs. Rows written before this change
+            # carry no `activation_id` and so match no activation, which is the intended
+            # reading of them: they recorded that a question was started, and claimed
+            # nothing about how many times it had been tried.
+            #
+            # It also gives a verdict an expiry. A deterministic block says "this cannot
+            # change", which is only ever true of a fixed question *and fixed code*; when
+            # the code that produced the verdict changes, the operator needs a way to
+            # retire the verdicts it invalidated. `tournament enable` is that gesture --
+            # already required after any config change, already recorded, already the
+            # explicit "go" -- and re-running it costs at most one re-purchase per blocked
+            # question per activation, under the same budget guard as any other purchase.
             blocked = [
                 event
                 for event in events(conn, "question_blocked", scope)
                 if event.get("fingerprint") == fingerprint
+                and event.get("activation_id") == activation["activation_id"]
             ]
             if blocked:
                 heartbeat["skipped"] += 1
@@ -432,6 +459,7 @@ def run_once(
                 1
                 for event in events(conn, "question_started", scope)
                 if event.get("fingerprint") == fingerprint
+                and event.get("activation_id") == activation["activation_id"]
             )
             if attempts >= MAX_TRANSIENT_ATTEMPTS:
                 # Round 1 finding B1: exhaustion skipped the question but recorded no
@@ -446,6 +474,7 @@ def run_once(
                     {
                         "at": utcnow().isoformat(),
                         "fingerprint": fingerprint,
+                        "activation_id": activation["activation_id"],
                         "reason": "transient_attempts_exhausted",
                         "detail_code": None,
                         "attempts": attempts,
@@ -497,7 +526,11 @@ def run_once(
                             conn,
                             "question_started",
                             scope,
-                            {"at": now.isoformat(), "fingerprint": fingerprint},
+                            {
+                                "at": now.isoformat(),
+                                "fingerprint": fingerprint,
+                                "activation_id": activation["activation_id"],
+                            },
                         )
                     if clients is None:
                         clients = _build_clients(
@@ -541,6 +574,7 @@ def run_once(
                             {
                                 "at": utcnow().isoformat(),
                                 "fingerprint": fingerprint,
+                                "activation_id": activation["activation_id"],
                                 "reason": "deterministic_verdict",
                                 "detail_code": outcome.detail_code,
                             },

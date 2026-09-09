@@ -166,6 +166,10 @@ class QuestionOutcome:
     cost_usd: float | None = None
     unpriced_calls: int = 0
     note: str | None = None
+    # What the forecast was made *without* (M1-327). Codes only, never hostnames: this
+    # rides back to `tournament.py` and into logs, while the ledger's `evidence_gap` row
+    # is the half that carries the domains. Empty is the ordinary case.
+    evidence_gaps: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A draft was persisted for "recorded" (validated) and "validation_failed" (M1-504's
@@ -193,6 +197,11 @@ class QuestionOutcome:
             "validation_failed",
         ):
             raise LiveRunError("only a question that reached the model reports an artifact outcome")
+        # An evidence gap is a statement *about a forecast*, so it cannot be reported by an
+        # attempt that produced no record to attach it to. Same shape as the rules above:
+        # the object refuses to describe a forecast that was never written.
+        if self.evidence_gaps and not has_record:
+            raise LiveRunError("only a question whose draft was persisted reports an evidence gap")
 
 
 @dataclass(frozen=True)
@@ -629,8 +638,17 @@ def _attempt_question(
             note=note,
         )
 
-    from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError
-    from whiskeyjack_bot.research.quality import quality_problem, usable_packet
+    from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError, append
+    from whiskeyjack_bot.research.quality import (
+        missing_source_domains,
+        quality_problem,
+        usable_packet,
+    )
+
+    # Named resolution authorities this packet has no usable document from. Empty unless
+    # the gate below runs, which is deliberate: it is derived from the UNFILTERED packet
+    # and there is no unfiltered packet outside the tournament path.
+    absent_sources: tuple[str, ...] = ()
 
     if CURRENT_BUDGET.get() is not None:
         from datetime import timedelta
@@ -645,6 +663,12 @@ def _attempt_question(
         # because the documents that would prove staleness had been dropped a line earlier.
         # The refusal decision is unchanged either way; only its recorded reason improves.
         problem = quality_problem(
+            research.packet, question, now, config.retrieval.freshness_days_default
+        )
+        # Judged on the same unfiltered packet and for the same reason, but it is not a
+        # refusal (M1-327). Carried down to the write below rather than acted on here:
+        # the row it is recorded against does not exist yet.
+        absent_sources = missing_source_domains(
             research.packet, question, now, config.retrieval.freshness_days_default
         )
         research = replace(
@@ -869,6 +893,32 @@ def _attempt_question(
                 )
             else:
                 record_validation(conn, record_id=record.record_id, occurred_at=now)
+            if absent_sources:
+                # M1-327: the evidence gap, scoped to the RECORD, which is the convention
+                # `forecast_intent` and `witness` already use -- so the ledger says "this
+                # forecast was made without direct resolution-source evidence" rather than
+                # leaving the claim beside the record for a reader to join up. Inside this
+                # transaction on purpose: `tournament_state.append` nests as a SAVEPOINT,
+                # so the row, its validation event and this land as one unit or not at all.
+                #
+                # The hostnames are carried. They come out of the question's own
+                # `resolution_criteria`, which `forecast_records.question` already stores
+                # verbatim, so this is ledger *storage* and not a diagnostic message --
+                # the error-hygiene rule binds the message path, and `QuestionOutcome
+                # .evidence_gaps` below stays a bare code for exactly that reason.
+                append(
+                    conn,
+                    "evidence_gap",
+                    record.record_id,
+                    {
+                        "at": now.isoformat(),
+                        "code": "named_source_absent",
+                        "question_id": question_id,
+                        "tournament_id": tournament_id,
+                        "forecast_sha256": record_sha256(record),
+                        "domains": list(absent_sources),
+                    },
+                )
     except (ForecastRecordError, StoreError, LifecycleError) as exc:
         _LOGGER.error("could not record the forecast for question %d: %s", question_id, exc)
         return QuestionOutcome(
@@ -900,6 +950,7 @@ def _attempt_question(
             detail_code=gate_detail_code,
             cost_usd=cost,
             unpriced_calls=unpriced,
+            evidence_gaps=("named_source_absent",) if absent_sources else (),
         )
 
     return QuestionOutcome(
@@ -917,6 +968,7 @@ def _attempt_question(
         artifact_outcome=persisted.artifact_outcome,
         cost_usd=cost,
         unpriced_calls=unpriced,
+        evidence_gaps=("named_source_absent",) if absent_sources else (),
     )
 
 
