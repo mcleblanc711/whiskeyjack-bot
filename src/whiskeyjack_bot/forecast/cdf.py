@@ -30,12 +30,22 @@ anything.
 
 Four rules this module applies, and why each is here rather than in the SDK:
 
-- **Exactly ``expected_cdf_points`` values.** ``get_cdf`` returns ``self.cdf_size or 201``
-  points, and ``cdf_size`` reaches us from a Metaculus payload through
-  ``CanonicalNumericQuestion``, which types it as a plain ``int`` and defers the check by
+- **Exactly the question's own number of values.** ``get_cdf`` returns
+  ``self.cdf_size or 201`` points, and ``cdf_size`` reaches us from a Metaculus payload
+  through the canonical model, which types it as a plain ``int`` and defers the check by
   name: "calibration-time enforcement of the point count belongs to the validation epic
-  (M1-503), not the model".
-- **Every adjacent step at or below ``max_adjacent_pmf``.** This is the half of the
+  (M1-503), not the model". For a **numeric** question the rule is
+  ``expected_cdf_points`` and ``_require_question`` refuses any question declaring
+  another resolution. For a **discrete** question (M1-205) the declared ``cdf_size`` --
+  ``inbound_outcome_count + 1`` -- *is* the rule, bounded only by a sanity envelope.
+  :func:`_cdf_rules` is the single place that decides which.
+- **Every adjacent step at or below the cap :func:`_cdf_rules` derives** --
+  ``max_adjacent_pmf`` scaled by how much coarser this question's grid is than the
+  201-point continuous one, which is Metaculus's own server-side rule and reduces to
+  ``max_adjacent_pmf`` exactly at 201 points (M1-205). A flat per-type number was tried and
+  removed: on a discrete grid two adjacent points are two outcomes, so any fixed value is
+  simultaneously too strict on a coarse grid and too permissive on a fine one. This is the
+  half of the
   acceptance criterion the package does **not** do for us, and it is worth being exact
   about why, because reading ``numeric_report.py`` casually suggests the opposite.
   ``_check_distribution_too_tall`` is the SDK's PMF cap; ``get_cdf`` re-validates its own
@@ -138,7 +148,11 @@ from whiskeyjack_bot.forecast.schema import (
     ForecastSchemaError,
     NumericForecastResponse,
 )
-from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
+from whiskeyjack_bot.questions.model import (
+    BoundedQuestion,
+    CanonicalDiscreteQuestion,
+    CanonicalNumericQuestion,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -148,9 +162,22 @@ _LOGGER = logging.getLogger(__name__)
 # produce ("Do not return a 201-value CDF", ``prompts/forecaster.md``).
 _PERCENTILES_LOC = "final_prediction.percentiles"
 
+# Two points is the minimum a cumulative distribution can have, and the divisor
+# ``points - 1`` is why the floor is enforced rather than assumed. The ceiling is
+# ``expected_cdf_points``: a discrete grid finer than the continuous case it specialises is
+# not a question this pipeline has seen or can justify converting, and the scaling block it
+# arrives in is untrusted Metaculus payload where an unbounded value is an unbounded
+# allocation inside the SDK.
+_MIN_CDF_POINTS = 2
+_CDF_SIZE_OUTSIDE_ENVELOPE = (
+    "question: cdf_size must be between 2 and numeric_calibration.expected_cdf_points "
+    "(offending input withheld)"
+)
+
 # ``get_cdf`` falls back to this when ``cdf_size`` is unset. Not reachable through this
-# module -- ``_require_question`` pins ``cdf_size`` to ``expected_cdf_points`` before
-# anything converts -- but the evaluation grid must match ``get_cdf``'s either way.
+# module -- ``_require_question`` pins a numeric ``cdf_size`` to ``expected_cdf_points``
+# and bounds a discrete one before anything converts -- but the evaluation grid must match
+# ``get_cdf``'s either way.
 _SDK_DEFAULT_CDF_SIZE = 201
 
 # Stated as constants so no call site can interpolate a question field, a config value or
@@ -396,9 +423,71 @@ class NumericCdf:
     standardized: bool
 
 
-def _require_question(
-    question: CanonicalNumericQuestion, calibration: NumericCalibrationConfig
-) -> None:
+def _cdf_rules(
+    question: BoundedQuestion, calibration: NumericCalibrationConfig
+) -> tuple[int, float]:
+    """The (length, max adjacent step) pair this question's converted array must satisfy.
+
+    One place, because the length and the cap disagree between the two types for the *same*
+    underlying reason and separating them invites fixing one and not the other.
+
+    A numeric array is 201 points spanning the range, so two adjacent points are half a
+    percent of it apart and ``max_adjacent_pmf`` bounds a spike. A discrete array has one
+    point per outcome plus one, so two adjacent points *are* an outcome, and the flat
+    numeric number would refuse most confident forecasts -- 0.446 for a confident reply on
+    MiniBench post 45559, against a cap of 0.2.
+
+    **Round 1 replaced a flat discrete cap with the platform's own formula**, which is the
+    better answer for the reason the flat one was wrong in both directions: 0.9 was far
+    below what Metaculus permits on a 16-outcome grid (2.5) and far *above* what it permits
+    on a 71-outcome one (0.563), so a fine-grained discrete question would have been
+    approved locally and refused on the wire, after the forecast was billed and recorded.
+
+    Keyed on the ``qtype`` literal, never ``isinstance``: that is the whole reason the two
+    canonical models are siblings.
+    """
+    points = question.cdf_size if question.qtype == "discrete" else calibration.expected_cdf_points
+    # The envelope is enforced *here*, not only in ``_require_question`` (M1-205 round 2).
+    # It used to live solely in the preflight, which meant the public helpers below --
+    # ``expected_cdf_points_for`` and, through it, ``submission_live.
+    # expected_points_for_record`` -- divided by ``points - 1`` without ever running it. A
+    # Metaculus payload declaring ``inbound_outcome_count: 0`` normalizes to ``cdf_size``
+    # 1 and produced a raw ``ZeroDivisionError`` out of a public boundary, which is the
+    # "every malformed shape arrives as the module's own error type" rule broken by the
+    # remediation that introduced the division. Guarding the arithmetic rather than its
+    # callers is what makes that true for every entry point, including the next one.
+    if not _MIN_CDF_POINTS <= points <= calibration.expected_cdf_points:
+        raise NumericCdfError([_CDF_SIZE_OUTSIDE_ENVELOPE])
+    # Metaculus's own rule, and it subsumes both types rather than special-casing one:
+    # the server validator caps an adjacent step at ``0.2 * 200 / inbound_outcome_count``,
+    # i.e. ``max_adjacent_pmf`` scaled by how much coarser this grid is than the 201-point
+    # continuous one. Substituting a numeric question (``cdf_size`` 201,
+    # ``inbound_outcome_count`` 200) returns ``max_adjacent_pmf`` unchanged, so there is one
+    # rule here and no branch.
+    #
+    # Clamped at 1.0 because a coarse grid produces a bound above 1 (2.5 for the 16-outcome
+    # MiniBench post 45559) and a step between two CDF points cannot exceed 1 -- an
+    # unclamped value would be a cap that is not a probability.
+    inbound = points - 1
+    cap = min(1.0, calibration.max_adjacent_pmf * (calibration.expected_cdf_points - 1) / inbound)
+    return points, cap
+
+
+def expected_cdf_points_for(
+    question: BoundedQuestion, calibration: NumericCalibrationConfig
+) -> int:
+    """How many CDF values this question's submission payload must carry.
+
+    Public because ``submission_payload`` needs the same number to preflight a payload
+    against ``submission_live.plan_from_payload``, and deriving it there a second time is
+    how the numeric 201 and a discrete question's own resolution would come to disagree
+    across a module boundary. One rule, one place (M1-205).
+    """
+    points, _ = _cdf_rules(question, calibration)
+    return points
+
+
+def _require_question(question: BoundedQuestion, calibration: NumericCalibrationConfig) -> None:
     """Refuse what no percentile set could fix, before it becomes a repair turn.
 
     ``binary._require_config``'s precedent and its reason: a value object carries no memory
@@ -434,8 +523,12 @@ def _require_question(
     """
     if not isinstance(calibration, NumericCalibrationConfig):
         raise NumericCdfError(["numeric_calibration: must be a NumericCalibrationConfig"])
-    if not isinstance(question, CanonicalNumericQuestion):
-        raise NumericCdfError(["question: must be a canonical numeric question"])
+    if not isinstance(question, (CanonicalNumericQuestion, CanonicalDiscreteQuestion)):
+        # Both arms named explicitly. They are siblings, so no single class covers them and
+        # a check against either alone would refuse the other -- which is the point: adding
+        # a third bounded type must fail here loudly rather than be swallowed by a base
+        # class that happened to match (M1-205).
+        raise NumericCdfError(["question: must be a canonical numeric or discrete question"])
     if not 0 < calibration.conversion_timeout_seconds <= MAX_CONVERSION_TIMEOUT_SECONDS:
         raise NumericCdfError(
             [
@@ -445,7 +538,14 @@ def _require_question(
         )
     if not can_bound_conversion():
         raise NumericCdfError([f"{_PERCENTILES_LOC}: {_CANNOT_BE_BOUNDED}"])
-    if question.cdf_size != calibration.expected_cdf_points:
+    if question.qtype == "discrete":
+        # A discrete question declares its own resolution and that declaration *is* the
+        # rule, so there is nothing to compare it against -- only a sanity envelope, which
+        # ``_cdf_rules`` applies for every caller. Calling it here rather than restating
+        # the bounds keeps one definition: round 2 found the two had already diverged, in
+        # the sense that only this path ran them at all.
+        _cdf_rules(question, calibration)
+    elif question.cdf_size != calibration.expected_cdf_points:
         raise NumericCdfError(
             [
                 "question: cdf_size must equal numeric_calibration.expected_cdf_points "
@@ -556,7 +656,7 @@ def _standardization_can_converge(distribution: NumericDistribution) -> bool:
 def _distribution(
     forecast: NumericForecastResponse,
     calibration: NumericCalibrationConfig,
-    question: CanonicalNumericQuestion,
+    question: BoundedQuestion,
     *,
     standardize: bool | None = None,
 ) -> NumericDistribution | None:
@@ -647,9 +747,14 @@ def _values(distribution: NumericDistribution) -> tuple[float, ...] | None:
 def _array_problems(
     values: tuple[float, ...],
     calibration: NumericCalibrationConfig,
-    question: CanonicalNumericQuestion,
+    question: BoundedQuestion,
 ) -> list[str]:
     """Every problem with a converted array, in a stable order.
+
+    The length and the step cap both come from :func:`_cdf_rules` rather than being read
+    off the calibration here, because for a discrete question neither is the numeric one
+    (M1-205). The endpoint and monotonicity rules are type-independent: they are facts
+    about a cumulative distribution, not about its resolution.
 
     The order is length, membership of the unit interval, monotonicity, the step cap, then
     the two endpoint rules -- and every rule is reported rather than the first one, because
@@ -664,8 +769,9 @@ def _array_problems(
     human approved the forecast. The test says it is unreachable rather than inventing a
     draw that reaches it.
     """
+    expected_points, max_step = _cdf_rules(question, calibration)
     problems: list[str] = []
-    if len(values) != calibration.expected_cdf_points:
+    if len(values) != expected_points:
         problems.append(f"{_PERCENTILES_LOC}: {_WRONG_LENGTH}")
     if not all(isfinite(value) and 0.0 <= value <= 1.0 for value in values):
         problems.append(f"{_PERCENTILES_LOC}: {_NOT_IN_UNIT_INTERVAL}")
@@ -675,7 +781,7 @@ def _array_problems(
         return problems
     if not all(first <= second for first, second in pairwise(values)):
         problems.append(f"{_PERCENTILES_LOC}: {_NOT_MONOTONE}")
-    if any(second - first > calibration.max_adjacent_pmf for first, second in pairwise(values)):
+    if any(second - first > max_step for first, second in pairwise(values)):
         problems.append(f"{_PERCENTILES_LOC}: {_STEP_TOO_TALL}")
     if not question.open_lower_bound and values and values[0] != 0.0:
         problems.append(f"{_PERCENTILES_LOC}: {_LOWER_ENDPOINT}")
@@ -687,7 +793,7 @@ def _array_problems(
 def numeric_cdf_or_problems(
     forecast: NumericForecastResponse,
     calibration: NumericCalibrationConfig,
-    question: CanonicalNumericQuestion,
+    question: BoundedQuestion,
 ) -> tuple[NumericCdf | None, list[str]]:
     """Convert one numeric response, or report why it cannot be converted.
 
@@ -782,7 +888,7 @@ def numeric_cdf_or_problems(
 def build_numeric_cdf(
     forecast: NumericForecastResponse,
     calibration: NumericCalibrationConfig,
-    question: CanonicalNumericQuestion,
+    question: BoundedQuestion,
 ) -> NumericCdf:
     """Return the converted CDF, or raise with the sanitized problems.
 

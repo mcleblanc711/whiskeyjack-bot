@@ -11,6 +11,7 @@ import pytest
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.questions import (
     BinaryQuestion,
+    DiscreteQuestion,
     MetaculusQuestion,
     MultipleChoiceQuestion,
     NumericQuestion,
@@ -38,7 +39,7 @@ def load_fixture_questions() -> list[MetaculusQuestion]:
 def test_api_post_fixtures_parse_to_expected_types() -> None:
     questions = load_fixture_questions()
     types = {type(q) for q in questions}
-    assert types == {BinaryQuestion, MultipleChoiceQuestion, NumericQuestion}
+    assert types == {BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DiscreteQuestion}
     for q in questions:
         assert "minibench" in q.tournament_slugs
         assert q.id_of_question is not None

@@ -133,6 +133,7 @@ def reply_for(question: CanonicalQuestion) -> str:
                 for level in levels
             ]
         }
+    payload["as_of_utc"] = NOW.isoformat()
     return json.dumps(payload)
 
 
@@ -650,7 +651,7 @@ def test_a_second_run_reuses_the_research_it_already_paid_for(
     """``CODEX_HANDOFF.md``: *retrying a later phase must not repeat an earlier paid call
     unless explicitly requested.* Asserted by call count, which a log line could not do."""
     first = _TrackingSDK()
-    live(ledger, config, question_id=BINARY, news_client=first)
+    initial = live(ledger, config, question_id=BINARY, news_client=first)
     assert first.news.calls, "the first run must actually retrieve"
 
     second = _TrackingSDK()
@@ -659,9 +660,7 @@ def test_a_second_run_reuses_the_research_it_already_paid_for(
     assert batch.outcomes[0].research_reused is True
     assert batch.outcomes[0].status == "recorded"
     # The reused packet is the same evidence, so the second record cites the same runs.
-    assert batch.outcomes[0].retrieval_run_ids == (
-        rows(ledger, "SELECT retrieval_run_id FROM research_runs")[0][0],
-    )
+    assert batch.outcomes[0].retrieval_run_ids == initial.outcomes[0].retrieval_run_ids
 
 
 def test_refresh_research_pays_again_and_says_so(config: AppConfig, ledger: Any) -> None:
@@ -671,7 +670,7 @@ def test_refresh_research_pays_again_and_says_so(config: AppConfig, ledger: Any)
     batch = live(ledger, config, question_id=BINARY, news_client=second, refresh_research=True)
     assert second.news.calls, "--refresh-research must retrieve again"
     assert batch.outcomes[0].research_reused is False
-    assert len(rows(ledger, "SELECT 1 FROM research_runs")) == 2
+    assert len(rows(ledger, "SELECT 1 FROM research_runs WHERE provider = 'asknews'")) == 2
 
 
 def test_reuse_does_not_require_the_replay_switch(config: AppConfig, ledger: Any) -> None:
@@ -926,6 +925,25 @@ def test_a_validation_failed_outcome_without_a_detail_code_is_refused() -> None:
             record_id="r",
             forecast_sha256="a" * 64,
             artifact_outcome="written",
+        )
+
+
+def test_a_question_with_no_record_reports_no_evidence_gap() -> None:
+    """M1-327. An evidence gap is a statement *about a forecast* -- "this forecast was made
+    without a document from the resolution authority the question named". An attempt that
+    never persisted a draft has no forecast for that sentence to be about, and the ledger's
+    ``evidence_gap`` row is scoped to the record id, so an outcome reporting a gap with no
+    record describes a row that cannot exist."""
+    with pytest.raises(LiveRunError, match="evidence gap"):
+        QuestionOutcome(
+            question_id=1,
+            status="research_failed",
+            attempt_id="a",
+            retrieval_run_ids=(),
+            document_count=0,
+            research_reused=False,
+            detail_code="no_evidence",
+            evidence_gaps=("named_source_absent",),
         )
 
 

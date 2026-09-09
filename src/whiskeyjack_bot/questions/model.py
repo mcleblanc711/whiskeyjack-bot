@@ -9,7 +9,10 @@ the whole pipeline. :mod:`whiskeyjack_bot.questions.normalize` maps the SDK
 objects onto these models.
 
 Scope is fixed by decisions D20 (support binary, multiple-choice and numeric in
-v1) and D21 (defer date and conditional). Only the three supported types have a
+v1) and D21 (defer date and conditional), **as amended by M1-205, which adds
+discrete**: D21's own reversal trigger reads "MiniBench/current successor requires
+them", and discrete is 11 of MiniBench's 42 questions. Date and conditional stay
+deferred -- MiniBench has posted neither. Only the four supported types have a
 canonical model here; refusing the deferred types is
 :mod:`whiskeyjack_bot.questions.normalize`'s job, either by raising or -- on the
 batch path -- by skipping and recording a
@@ -141,40 +144,95 @@ class CanonicalMultipleChoiceQuestion(_CanonicalQuestionBase):
         return self
 
 
-class CanonicalNumericQuestion(_CanonicalQuestionBase):
-    qtype: Literal["numeric"] = "numeric"
+class _CanonicalBoundedQuestion(_CanonicalQuestionBase):
+    """Fields shared by the two types that forecast a distribution over a range.
+
+    Numeric and discrete questions carry an identical field set: the SDK's own
+    ``DiscreteQuestion`` is a ``NumericQuestion`` subclass and reads the same scaling
+    block. They are modelled here as **siblings under this base, never as a subclass of
+    each other** (M1-205), and that is the load-bearing decision of the item rather than
+    a stylistic one.
+
+    ``forecast/numeric.py`` gates its entry point with
+    ``isinstance(question, CanonicalNumericQuestion)``. Had discrete subclassed numeric,
+    that guard would have *silently accepted* a discrete question and validated it against
+    the numeric step cap and the numeric 201-point rule -- reproducing, inside our own
+    schema, precisely the ``DiscreteQuestion(NumericQuestion)`` trap CLAUDE.md's gotcha
+    list exists to warn about, and turning a wrong forecast into the failure mode instead
+    of a refusal. As siblings, every such guard refuses discrete until it is widened
+    deliberately, one call site at a time.
+    """
+
     lower_bound: _Finite
     upper_bound: _Finite
     open_lower_bound: bool
     open_upper_bound: bool
     zero_point: _Finite | None = None
-    # The Metaculus/SDK cdf resolution; agrees with config.expected_cdf_points
-    # (Literal[201]). Kept as a plain int here -- calibration-time enforcement
-    # of the point count belongs to the validation epic (M1-503), not the model.
+    # The Metaculus/SDK cdf resolution. For numeric this agrees with
+    # config.expected_cdf_points (Literal[201]); for discrete it is the question's own
+    # ``inbound_outcome_count + 1`` and is the *only* length rule that applies to it.
+    # Kept as a plain int here -- calibration-time enforcement of the point count belongs
+    # to the validation epic (M1-503), not the model.
+    #
+    # ``inbound_outcome_count`` is deliberately NOT carried alongside it: it is
+    # ``cdf_size - 1`` exactly, and one fact reached two ways is the second source of
+    # truth M2-703's review removed rather than cross-checked.
     cdf_size: int
     nominal_lower_bound: _Finite | None = None
     nominal_upper_bound: _Finite | None = None
 
     @model_validator(mode="after")
-    def _bounds_ordered(self) -> CanonicalNumericQuestion:
+    def _bounds_ordered(self) -> _CanonicalBoundedQuestion:
         # NaN is refused by the field's allow_inf_nan=False before this runs, so the
         # comparison cannot be silently false for a non-finite bound.
         if self.lower_bound >= self.upper_bound:
             # Do not echo the bound values: mirror the project-wide rule that a
             # validation message never reprints record content.
-            raise ValueError("numeric lower_bound must be strictly less than upper_bound")
+            raise ValueError("lower_bound must be strictly less than upper_bound")
         return self
+
+
+class CanonicalNumericQuestion(_CanonicalBoundedQuestion):
+    qtype: Literal["numeric"] = "numeric"
+
+
+class CanonicalDiscreteQuestion(_CanonicalBoundedQuestion):
+    """A question over a finite ordered grid of outcomes (M1-205).
+
+    Structurally identical to :class:`CanonicalNumericQuestion` and deliberately not
+    related to it by inheritance -- see :class:`_CanonicalBoundedQuestion`. What differs
+    is downstream: the converted CDF has ``cdf_size`` points rather than 201, and the
+    per-step probability cap that is right for 201 continuous slices is wrong for a grid
+    of sixteen, where the modal outcome legitimately holds far more than a numeric
+    question's adjacent pair ever does.
+    """
+
+    qtype: Literal["discrete"] = "discrete"
+
+
+# The two types that forecast a distribution over a range (M1-205). Spelled as an explicit
+# union rather than as ``_CanonicalBoundedQuestion`` because the base is private and,
+# more importantly, because naming both arms is what makes adding a third bounded type a
+# visible edit at every call site instead of a silent widening -- the same reason the two
+# are siblings rather than one subclassing the other.
+BoundedQuestion = CanonicalNumericQuestion | CanonicalDiscreteQuestion
 
 
 # Discriminated union: pydantic selects the subclass by the ``qtype`` tag, so a
 # serialized canonical question round-trips back to the right type.
 CanonicalQuestion = Annotated[
-    CanonicalBinaryQuestion | CanonicalMultipleChoiceQuestion | CanonicalNumericQuestion,
+    CanonicalBinaryQuestion
+    | CanonicalMultipleChoiceQuestion
+    | CanonicalNumericQuestion
+    | CanonicalDiscreteQuestion,
     Field(discriminator="qtype"),
 ]
 
 # Adapter for validating/round-tripping a raw dict against the union (the models
 # themselves are validated directly when constructed by ``normalize``).
 CanonicalQuestionAdapter: TypeAdapter[
-    CanonicalBinaryQuestion | CanonicalMultipleChoiceQuestion | CanonicalNumericQuestion
+    CanonicalBinaryQuestion
+    | CanonicalMultipleChoiceQuestion
+    | CanonicalNumericQuestion
+    | CanonicalDiscreteQuestion
 ] = TypeAdapter(CanonicalQuestion)

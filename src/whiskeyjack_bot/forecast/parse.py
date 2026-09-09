@@ -72,7 +72,7 @@ class ModelSettings:
 
     provider: str
     name: str
-    temperature: float
+    temperature: float | None
     max_output_tokens: int
     timeout_seconds: float
     allowed_tries: int
@@ -147,6 +147,20 @@ def _parse(
         return None, [_NOT_JSON]
     if not isinstance(payload, dict):
         return None, [_NOT_JSON]
+    # The question type is *ours*, never the model's to author (M1-323). It is already
+    # known -- ``question.qtype`` is what selected ``model`` in the first place -- so a
+    # reply that also states it introduces a second source of truth for one fact, and the
+    # only thing a disagreement can mean is that the model got it wrong. Stamping it here
+    # is therefore a derivation, not a repair, and it is done before schema validation so
+    # the ``Literal`` still refuses a question type the selected model does not serve.
+    #
+    # M1-205 shipped without this and every discrete forecast died for it: the prompt does
+    # not mention discrete, so the model returned "numeric" for a discrete question; the
+    # widened ``Literal["numeric", "discrete"]`` accepted that, and then the pairing check
+    # in ``validate.output_problems`` refused it because "discrete" != "numeric". The reply
+    # was billed, unrepairable (the pairing check *raises* rather than returning a problem,
+    # so the repair turn never engaged) and discarded, once per five-minute cycle.
+    payload["question_type"] = question.qtype
     try:
         forecast = validate_forecast_response(payload, model)
     except ForecastSchemaError as exc:
@@ -154,7 +168,9 @@ def _parse(
     # Cannot raise **when the caller is ``generate_forecast``**, and that qualifier is the
     # correction round 1 forced. The response is provably the model this dispatch selected,
     # so its ``question_type`` is a validated Literal the registry covers and it agrees with
-    # ``question.qtype`` because the model was selected *from* that field; the member
+    # ``question.qtype`` because it is *stamped from* that field above -- selection alone
+    # never established this, since ``NumericForecastResponse`` serves both "numeric" and
+    # "discrete" and the model chose between them (M1-323); the member
     # checkers cannot meet a response of the wrong category; and the inverted bounds pair
     # and the unsatisfiable ``zero_point`` are both refused in that function's preflight,
     # before anything is spent.
