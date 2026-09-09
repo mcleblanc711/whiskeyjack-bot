@@ -5,6 +5,17 @@ Production activation requires owner authorization for the reviewed account, pro
 service, or passing tests does not activate the bot. Use testing project **32977** for
 rehearsals, with separate SQLite and artifact paths.
 
+**A second tournament is a second, fully independent profile — never a shared ledger.**
+`config/tournament-cup.yaml` targets the Metaculus Cup Fall 2026 alongside MiniBench, with
+its own SQLite path, artifact root, log file, and `deploy/systemd/whiskeyjack-tournament-cup.*`
+units. Activation in `tournament_state.py` is scoped to one ledger/account/project at a time,
+so the two tournaments can never share storage — this is the same shape as the rehearsal
+(production) split below, just two live profiles instead of one live and one test. Verify
+`metaculus.tournament.id` in that file against the live API before first use (D31); the file
+ships with the URL slug, unconfirmed. Everything else in this runbook (deployment, rehearsal,
+stop/inspect, uncertain-forecast recovery, backup/restore) applies per profile — substitute
+`config/tournament-cup.yaml` and the `-cup` unit names throughout.
+
 ## Deployment
 
 The supplied files target `/home/cleblanc/projects/whiskeyjack-bot`. First check out the
@@ -32,6 +43,14 @@ systemctl --user list-timers whiskeyjack-tournament.timer
 journalctl --user -u whiskeyjack-tournament.service -n 100
 .venv/bin/whiskeyjack-bot tournament status --config config/tournament.yaml
 ```
+
+**Watching multiple profiles at once**: `scripts/watch-tournaments.py` tails
+`data/logs/tournament.jsonl` and `data/logs/tournament-cup.jsonl` together, tagging each line
+by profile and de-emphasizing routine question-discovery/fetch chatter so a `Posted
+prediction`/`Posted comment` line (or any `WARNING`/`ERROR`) stands out instead of scrolling
+past in the same weight as everything else. Run with no arguments for the two profiles this
+repo currently runs, or `LABEL=path/to.jsonl` pairs for others. A plain `tail -f` on one log
+file still works fine for a single profile; this is for watching more than one at a time.
 
 The timer polls every five minutes; a file lock prevents overlapping workers. The service
 has a 40-minute total bound, each question's paid phase has an eight-minute bound, and

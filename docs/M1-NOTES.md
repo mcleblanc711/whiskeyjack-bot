@@ -8620,3 +8620,76 @@ neither the ledger nor the log, and every member of the caught exception tuple i
 both failure sites, which makes the *next* incident diagnosable from the journal — but it is
 a log line, not a ledger row, so it is outside the attribution instrument. Giving a refused
 generation a durable identity is `M1-317`'s neighbouring problem and is not solved here.
+
+## Metaculus Cup Fall 2026 — second tournament profile
+
+Added `config/tournament-cup.yaml` alongside `config/tournament.yaml` (MiniBench): a
+fully separate profile (own SQLite ledger, artifact root, logs, systemd units) targeting
+https://www.metaculus.com/notebooks/45384/announcing-the-metaculus-cup-fall-2026-with-kiko-llaneras/.
+No code change was needed — `TournamentConfig.id` and every downstream call site were
+already config-driven per profile, and `tournament_state.py` activation is scoped to one
+ledger/account/project at a time, so two tournaments run as two independent profiles rather
+than one process polling both.
+
+Verified 2026-09-08, live, against the account's existing `METACULUS_TOKEN`: the URL slug
+`metaculus-cup-fall-2026` resolves directly through `questions fetch --live --tournament`,
+returning 5 open questions (binary, multiple_choice, numeric) — no separate numeric project
+ID was needed. `config/tournament-cup.yaml` now carries that slug as a verified value, not a
+placeholder (D31: verify tournament ids at runtime, never hardcode blind).
+
+Bots may forecast the Metaculus Cup via the API but are not prize-eligible there — fine for
+whiskeyjack's purpose (the attribution instrument, not prize-hunting), just recorded here so
+it isn't rediscovered as a surprise later.
+
+Not yet done: rehearsal (`docs/TOURNAMENT-OPERATIONS.md`) and owner-authorized `tournament
+enable` against this profile — both still require a deliberate operator act, same as
+MiniBench's launch.
+
+## Metaculus Cup Fall 2026 — rehearsal passed
+
+Ran the rehearsal from `docs/TOURNAMENT-OPERATIONS.md` for the Cup profile, 2026-09-08:
+`config/tournament-cup-rehearsal.yaml`, sandbox project 32977, environment `test`, capped at
+$5 (operator request, to conserve OpenRouter credits pending the Metaculus credit grant),
+its own ledger at `data/cup-rehearsal/`.
+
+**Found and fixed before rehearsing**: `config/tournament-cup.yaml` and the first draft of
+the rehearsal config both put their SQLite ledger in `data/` alongside MiniBench's live
+ledger, just under a different filename. `tournament_state.py`'s posting guard
+(`check_storage`/`guard_root`) is scoped by the ledger's **parent directory**, not its
+filename, so activating either would have collided against MiniBench's `.posting-guard`
+witnesses and refused with "storage restore detected" -- which is exactly what the first
+`tournament enable` attempt did. Fixed by giving both Cup profiles their own subdirectory
+(`data/cup/`, `data/cup-rehearsal/`), matching the existing `data/launch-rehearsal/`
+precedent. Worth a line in `docs/TOURNAMENT-OPERATIONS.md` for the next second-tournament
+profile someone adds.
+
+**First run-once attempt used question 43330** (a Forbes-sourced net-worth subquestion) and
+failed both times with `TournamentError("question research or generation failed")`, silently
+-- no ledger row, no error log, just `tournament_events` kind `question_failure` recording
+only `error_type`. Traced (not a bug): `research/quality.py`'s `quality_problem` correctly
+refuses when the question's resolution criteria name a specific domain (`forbes.com`, via a
+Wayback-archived URL in the group's fine print) and neither AskNews nor Exa returned a
+document from that domain -- the pipeline's own evidence-quality gate working as designed,
+just an unlucky first pick. This failure mode's near-total silence (no `pipeline_failure_events`
+row, since the raise happens before `_record_pre_forecast` is reachable, and no `_LOGGER.error`
+at that site) is worth filing as a follow-up alongside M1-323/M1-317's existing observation
+about `TournamentError`'s message being dropped at `tournament.py`'s outer catch-all.
+
+**Second attempt used question 45708** (no resolution criteria/fine print at all, so the
+domain gate can't fire) and passed cleanly: run 1 produced one confirmed forecast and one
+completed comment ($0.049 actual spend); run 2 made no new paid call and left both counts
+unchanged (`skipped: 1`, `processed: 0`). Activation disabled afterward per the runbook.
+
+Not yet done: owner-authorized `tournament enable` against `config/tournament-cup.yaml`
+(production) and starting the `whiskeyjack-tournament-cup.timer`.
+
+## Metaculus Cup Fall 2026 — production activated
+
+Owner-authorized 2026-09-08, 16:32 UTC: `tournament enable --config config/tournament-cup.yaml
+--project-id 33108 --starts 2026-09-08T16:32:22Z --ends 2027-01-01T00:00:00Z --budget-usd 10`
+(account 305299, activation `51b412f9c2094a9bacdd9080a7159454`). Window runs through the
+tournament's own `forecasting_end_date`; $10 of the $20 project ceiling, capped low
+deliberately while OpenRouter credits from Metaculus are still pending. `deploy/systemd/
+whiskeyjack-tournament-cup.{service,timer}` installed and started the same session
+(`systemctl --user enable --now whiskeyjack-tournament-cup.timer`); polls every five minutes
+independently of the MiniBench timer, sharing no storage (`data/cup/`).
