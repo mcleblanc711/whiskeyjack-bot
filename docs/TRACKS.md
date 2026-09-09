@@ -44,6 +44,23 @@ to the registry, and neither is a habit you can form by reflex.
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 | M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |
 | M1-327 | feat/m1-327-named-source-evidence-gap | whiskeyjack-m1-327 | no | none | 2026-09-09 |
+| M1-407 | feat/m1-407-prompt-bounds-crosscheck | whiskeyjack-m1-407 | no | none | 2026-09-04 |
+| D-1001 | feat/d-1001-operator-runbook | whiskeyjack-d-1001 | no | none | 2026-09-04 |
+| M1-604 | feat/m1-604-ledger-exports | whiskeyjack-m1-604 | **yes** | none | 2026-09-04 |
+| M2-705 | feat/m2-705-response-capture | whiskeyjack-m2-705 | no | none | 2026-09-04 |
+*(Merged and left in place, per the rule below: **M1-326** (PR #79, round-2 approve,
+2026-09-09) and **M1-327** (PR #80, round-2 approve, 2026-09-09 — it demoted the
+named-resolution-source gate from fatal to a recorded `evidence_gap` row and scoped M1-326's
+attempt counters to `activation_id`). Their rows stay in the table above as the landed-claim
+evidence `scripts/tracks.py` needs; this note is the record of the merge, **in addition to**
+the row and never instead of it.*
+
+*The four rows added above are the **live** wave-13 lanes, written into the table on master so
+the board is readable from one place. Each row also exists on its own branch, which is what
+`scripts/tracks.py` actually reads — `M1-407`'s claim was invisible until 2026-09-09 because
+its branch had never been pushed, so the claim existed only in a local commit. Pushing a claim
+branch is what publishes the claim.*
+
 **Do not sweep a landed row out of this table into the prose below.** `scripts/tracks.py`
 proves a claim is a *stale landed* one rather than a misspelling by finding the exact row on
 `origin/master` (`live_claims`: `signature in master_rows`) — so deleting the row destroys the
