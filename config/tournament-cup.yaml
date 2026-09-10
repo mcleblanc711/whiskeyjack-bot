@@ -1,3 +1,15 @@
+# DORMANT since 2026-09-10 — withdrawn from the Metaculus Cup, owner decision.
+#
+# This file is kept, not deleted, so the entry can be resumed. It is inert on its own: the
+# `whiskeyjack-tournament-cup.timer` is stopped and disabled, and `tournament disable` has
+# appended a `disabled` event to this profile's ledger, so `tournament run-once --config`
+# against it refuses. Editing this file cannot re-enter the tournament.
+#
+# To resume: `tournament enable --config config/tournament-cup.yaml --project-id 33108
+# --starts <UTC ISO, predating the open questions> --ends <UTC ISO> --budget-usd <N>`, then
+# `systemctl --user enable --now whiskeyjack-tournament-cup.timer`. See docs/M1-NOTES.md
+# "Metaculus Cup Fall 2026 — withdrawn" for the state at withdrawal and the reasoning.
+#
 # Explicit activation in SQLite is required. Committing this profile does not activate it.
 #
 # Second tournament target: Metaculus Cup Fall 2026 (with Kiko Llaneras).
