@@ -81,6 +81,9 @@ partial batch is a non-zero exit even though the records that succeeded were wri
 | What you are looking at | Section |
 |---|---|
 | `no ledger database at ...` | [C1](#c1--no-ledger-database) |
+| `record_id does not name a stored forecast record` | [P0](#p0--two-profiles-one---config-and-the-error-that-looks-like-data-loss) — check `--config` first |
+| `Tournament refused: tournament activation is disabled` | [P1](#p1--the-cup-profile-is-dormant-its-refusals-are-correct) |
+| `operation artifact missing; platform reconciliation required` | [P2](#p2--a-ledger-copied-without-its-artifact-root-will-refuse) |
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
 | `missing env var: ...` / `environment NOT ready` | [C4](#c4--environment-not-ready) |
@@ -107,6 +110,80 @@ partial batch is a non-zero exit even though the records that succeeded were wri
 ---
 
 ## Before you start
+
+### P0 — Two profiles, one `--config`, and the error that looks like data loss
+
+There are two tournament profiles, and **every command in this document takes `--config`**.
+The ledger, artifact root, export root and log file all move with that flag. Point it at the
+wrong profile and the command reads a different database.
+
+| | MiniBench | Metaculus Cup Fall 2026 |
+|---|---|---|
+| config | `config/tournament.yaml` | `config/tournament-cup.yaml` |
+| project | 33122 | 33108 |
+| ledger | `data/whiskeyjack_bot.sqlite3` | `data/cup/ledger.sqlite3` |
+| artifacts | `data/artifacts/` | `data/cup/artifacts/` |
+| log | `data/logs/tournament.jsonl` | `data/logs/tournament-cup.jsonl` |
+| unit | `whiskeyjack-tournament.timer` | `whiskeyjack-tournament-cup.timer` |
+| state | **live** | **dormant since 2026-09-10** |
+
+They share nothing. `tournament_state.py` activation is scoped to one ledger/account/project
+at a time, which is what lets two tournaments run as two profiles rather than one process
+polling both.
+
+**The failure mode.** A record id is unique within its own ledger and simply absent from the
+other. Give a Cup record id to a MiniBench-configured command and you get:
+
+```
+refused: record_id does not name a stored forecast record
+```
+
+exit `4`. Reproduced by execution, against a *copy* of the MiniBench ledger with a real Cup
+record id.
+
+That message is telling the truth about the ledger it was pointed at. It is **not** evidence
+that the record was lost, that the ledger is corrupt, or that a migration dropped rows — and
+at 3am it reads like all three. Before you investigate anything else, check the `--config`
+you passed. The question id tells you which profile a record belongs to: Cup questions came
+from project 33108, MiniBench from 33122.
+
+Nothing in this situation needs recovery. Re-run the same command against the other profile.
+
+### P1 — The Cup profile is dormant; its refusals are correct
+
+The Cup was withdrawn on 2026-09-10 (owner decision, to concentrate the OpenRouter grant on
+MiniBench). Two things were done, both reversible: the timer was stopped and disabled, and
+`tournament disable --config config/tournament-cup.yaml` appended a `disabled` event to the
+Cup's ledger. `tournament status --config config/tournament-cup.yaml` reads `"enabled": false`.
+
+So `tournament run-once` against that profile refuses, and `require_activation` is where it
+stops (`tournament_state.py`, `ActivationInactive("tournament activation is disabled")`,
+surfaced by the CLI as `Tournament refused: ...`). *Read from the source, not run —
+demonstrating it needs a live activation this profile no longer has.*
+
+**Do not treat that refusal as a fault to clear.** It is the withdrawal working. Re-entry is
+a deliberate operator act, documented in the banner at the top of `config/tournament-cup.yaml`
+and in `docs/M1-NOTES.md` — a fresh `tournament enable` plus re-enabling the timer. Editing
+the YAML cannot re-enter the tournament; activation lives in SQLite.
+
+The 5 forecasts the Cup posted **stay on Metaculus**. Withdrawing stopped future polling; it
+did not and could not retract them. Its `reserved_cost_usd` of $3.175 stands unsettled and
+always will — that is the expected steady state for reservations, not a leak. Nothing should
+be written to tidy either number.
+
+### P2 — A ledger copied without its artifact root will refuse
+
+If you ever restore or copy a profile's ledger, **take its artifact root with it**. The
+posting guard is scoped by the ledger's parent directory, and a ledger whose artifacts are
+missing refuses with:
+
+```
+Tournament refused: operation artifact missing; platform reconciliation required
+```
+
+Found by execution while preparing P0 above — copying a ledger alone was enough to trigger
+it. This is the same guard that made both Cup profiles need their own `data/cup/`
+subdirectory rather than sharing `data/` with MiniBench under a different filename.
 
 ### The three submission flags
 
