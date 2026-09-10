@@ -8694,6 +8694,64 @@ whiskeyjack-tournament-cup.{service,timer}` installed and started the same sessi
 (`systemctl --user enable --now whiskeyjack-tournament-cup.timer`); polls every five minutes
 independently of the MiniBench timer, sharing no storage (`data/cup/`).
 
+## Metaculus Cup Fall 2026 — withdrawn
+
+Owner decision 2026-09-10: withdrew from the Cup to concentrate the newly granted OpenRouter
+credits ($100, with a stated path to $805) on MiniBench. The Cup profile was never about
+standings — bots are excluded there (`bot_leaderboard_status: exclude_and_show`, recorded in
+the profile section above). The owner entered it to benchmark **their own personal forecasts
+against the bot's** on the same questions, which is why it ran at all and why it is being
+retired rather than deleted.
+
+Two acts, both reversible, in this order:
+
+1. `systemctl --user stop whiskeyjack-tournament-cup.timer` then `disable`. The unit files
+   stay installed at `~/.config/systemd/user/` and tracked at `deploy/systemd/`.
+2. `tournament disable --config config/tournament-cup.yaml`. `tournament_state.disable()`
+   **appends** a `disabled` event against the last activation; it never mutates the
+   activation row, so the append-only ledger keeps the full activation→withdrawal history.
+
+Verified before acting: the 06:45 MDT poll had already completed (`discovered: 5,
+skipped: 5, processed: 0, failures: 0`) and no `run-once` process was in flight, so nothing
+was interrupted mid-question and no reservation was orphaned. `tournament status` after the
+disable reads `"enabled": false`.
+
+Final Cup state, from its own ledger:
+
+| | |
+|---|---|
+| forecasts confirmed | 5 |
+| comments completed | 5 |
+| unresolved | 0 |
+| actual spend | $0.18596 |
+| reserved (unsettled) | $3.175 |
+| budget | $10.00 |
+| activation | `51b412f9c2094a9bacdd9080a7159454`, project 33108, account 305299 |
+
+**The 5 posted forecasts remain on Metaculus.** Withdrawing stops future polling; it does not
+and cannot retract what was already submitted. That is the point for the owner's comparison —
+the five questions the bot did forecast stay resolvable against the owner's own predictions on
+the same questions, so the benchmark that motivated the entry survives the withdrawal.
+
+`reserved_cost_usd` of $3.175 stands unsettled and always will. Per the AskNews-quota lesson,
+reservations that never settle are the expected steady state here, not a leak — the withdrawal
+does not settle them and nothing should be written to make the number tidy.
+
+**MiniBench (project 33122, `whiskeyjack-tournament.timer`) was untouched and stayed live
+throughout.** The two profiles share no ledger, artifact root, or log, so disabling one cannot
+reach the other — that separation, forced by the `check_storage` collision found during the
+Cup rehearsal above, is exactly what made this a two-command withdrawal instead of a risk to
+the live tournament.
+
+### Re-entry, if the owner wants the comparison back
+
+`config/tournament-cup.yaml` is kept, marked dormant in its own header. Re-entry is a fresh
+`tournament enable --config config/tournament-cup.yaml --project-id 33108 --starts … --ends …
+--budget-usd …` followed by `systemctl --user enable --now whiskeyjack-tournament-cup.timer`.
+Note that `--starts` must predate the open questions, and that any `AppConfig` field added
+between now and then changes `config_sha256` and so would retire the new activation too
+(M1-334).
+
 ## M1-326 — Do not re-buy research for a deterministic verdict
 
 ### Decision — the gate reads `question_blocked`, not `pipeline_failure_events`, and why
