@@ -122,6 +122,19 @@ logging:
   redact_secrets: true
   include_provider_costs: true
 
+notify:
+  # Operational push alerts to an ntfy topic (M1-329). Disabled by default: a bot that
+  # nobody has configured a topic for must still forecast.
+  #
+  # The topic URL is a bearer credential in a URL. Only the environment variable NAME
+  # appears here, exactly like every *_env field above; the value belongs in the
+  # environment and is scrubbed from logs via secret_env_var_names().
+  enabled: false
+  topic_url_env: "NTFY_TOPIC_URL"
+  # Bounded by config.MAX_NOTIFY_TIMEOUT_SECONDS (30). A notification exists to report
+  # that the worker is in trouble; one that can stall the worker has become the incident.
+  timeout_seconds: 10.0
+
 run_limits:
   max_questions: 1
   max_cost_usd: 10.00

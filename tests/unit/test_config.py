@@ -68,12 +68,73 @@ def test_example_config_loads_after_placeholder_replaced(tmp_path: Path, valid_d
 def test_secret_env_var_names_excludes_social_until_enabled(valid_data: dict) -> None:
     config = validate_config_data(valid_data)
     names = config.secret_env_var_names()
-    assert names == ["METACULUS_TOKEN", "OPENROUTER_API_KEY", "ASKNEWS_API_KEY", "EXA_API_KEY"]
+    assert names == [
+        "METACULUS_TOKEN",
+        "OPENROUTER_API_KEY",
+        "ASKNEWS_API_KEY",
+        "EXA_API_KEY",
+        # Present although ``notify.enabled`` is false -- see the next test for why the
+        # ntfy variable is the one name that does not follow the social gate.
+        "NTFY_TOPIC_URL",
+    ]
 
     valid_data["retrieval"]["social"]["enabled"] = True
     valid_data["retrieval"]["social"]["agent_model"] = "grok-fixture"
     config = validate_config_data(valid_data)
     assert config.secret_env_var_names()[-1] == "XAI_API_KEY"
+
+
+def test_the_ntfy_topic_is_scrubbed_even_while_notifications_are_off(valid_data: dict) -> None:
+    """Redaction of the topic URL does not depend on ``notify.enabled`` (M1-329).
+
+    The unit files pass the whole ``.env`` through ``EnvironmentFile=``, so the value is in
+    the worker's environment whether the adapter runs or not. Gating the scrub on the
+    feature flag would stop redacting a live bearer token the moment someone set
+    ``enabled: false`` without clearing the variable -- that is, in exactly the
+    configuration an operator would assume was the safest one.
+    """
+    for enabled in (False, True):
+        valid_data["notify"] = {"enabled": enabled, "topic_url_env": "NTFY_TOPIC_URL"}
+        assert "NTFY_TOPIC_URL" in validate_config_data(valid_data).secret_env_var_names()
+
+
+def test_required_env_var_names_track_whether_notifications_are_on(valid_data: dict) -> None:
+    """Presence and redaction are different questions, and M1-329 is where they split.
+
+    ``secret_env_var_names`` asks "what may hold a credential, so the logging filter can
+    scrub it". ``required_env_var_names`` asks "what must be set, so verify-env can refuse
+    a half-configured machine". Before the ntfy topic every name answered both. Collapsing
+    them again in either direction gets one wrong: verify-env would call a machine with no
+    notifications configured "not ready", or the filter would stop scrubbing a live token.
+    """
+    valid_data["notify"] = {"enabled": False, "topic_url_env": "NTFY_TOPIC_URL"}
+    off = validate_config_data(valid_data)
+    assert "NTFY_TOPIC_URL" in off.secret_env_var_names()
+    assert "NTFY_TOPIC_URL" not in off.required_env_var_names()
+
+    valid_data["notify"] = {"enabled": True, "topic_url_env": "NTFY_TOPIC_URL"}
+    on = validate_config_data(valid_data)
+    assert "NTFY_TOPIC_URL" in on.required_env_var_names()
+    # Required is always a subset of secret; a name that must be set but is never scrubbed
+    # would be a credential leaking through every log line.
+    assert set(on.required_env_var_names()) <= set(on.secret_env_var_names())
+
+
+def test_a_topic_url_pasted_where_the_variable_name_goes_is_refused(valid_data: dict) -> None:
+    """And the pasted URL never appears in the diagnostic (M1-329).
+
+    An ntfy topic URL is a bearer credential. If an operator pastes one into
+    ``topic_url_env`` by mistake, the error that tells them so must not repeat it -- config
+    errors are printed, logged and pasted into issues.
+    """
+    pasted = "https://ntfy.example/wj-fake-topic-0001"
+    valid_data["notify"] = {"enabled": True, "topic_url_env": pasted}
+    with pytest.raises(ConfigError) as caught:
+        validate_config_data(valid_data)
+    rendered = str(caught.value)
+    assert "notify.topic_url_env" in rendered
+    assert pasted not in rendered
+    assert "ntfy.example" not in rendered
 
 
 # ── unknown keys ─────────────────────────────────────────────────────────────

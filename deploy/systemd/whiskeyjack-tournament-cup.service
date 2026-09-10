@@ -1,5 +1,7 @@
 [Unit]
 Description=Whiskeyjack activated tournament poll (Metaculus Cup Fall 2026)
+# M1-329. %N is this unit's own name, so both services share one notify template.
+OnFailure=whiskeyjack-notify@%N.service
 After=network-online.target
 Wants=network-online.target
 
