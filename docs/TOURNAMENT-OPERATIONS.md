@@ -5,6 +5,11 @@ Production activation requires owner authorization for the reviewed account, pro
 service, or passing tests does not activate the bot. Use testing project **32977** for
 rehearsals, with separate SQLite and artifact paths.
 
+**The Cup profile is dormant as of 2026-09-10** (withdrawn, owner decision; see
+`docs/M1-NOTES.md`). Its timer is stopped and disabled and its activation is retired, so
+the paragraph below describes a profile that is kept for re-entry, not one that is running.
+MiniBench is the only live tournament.
+
 **A second tournament is a second, fully independent profile — never a shared ledger.**
 `config/tournament-cup.yaml` targets the Metaculus Cup Fall 2026 alongside MiniBench, with
 its own SQLite path, artifact root, log file, and `deploy/systemd/whiskeyjack-tournament-cup.*`

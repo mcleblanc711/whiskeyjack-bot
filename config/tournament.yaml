@@ -93,6 +93,15 @@ logging:
   file: /home/cleblanc/projects/whiskeyjack-bot/data/logs/tournament.jsonl
   redact_secrets: true
   include_provider_costs: true
+notify:
+  # Operational push alerts (M1-329). The topic URL is a bearer credential -- anyone
+  # holding it can push to the operator's device -- so only the variable NAME is here and
+  # the value lives in .env, which the unit files pass through with EnvironmentFile=.
+  # The name is registered in secret_env_var_names(), so the logging filter scrubs the
+  # value everywhere it might otherwise appear.
+  enabled: true
+  topic_url_env: NTFY_TOPIC_URL
+  timeout_seconds: 10.0
 run_limits:
   max_questions: 60
   max_cost_usd: 20

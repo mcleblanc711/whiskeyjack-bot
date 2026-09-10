@@ -26,6 +26,11 @@ for _credential in (
     "XAI_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
+    # An ntfy topic URL is a bearer credential (M1-329). A developer with one exported
+    # would otherwise have the suite build a real notifier -- and the network guards below
+    # would turn that into a confusing socket error instead of the "not configured" path
+    # the tests mean to exercise.
+    "NTFY_TOPIC_URL",
 ):
     os.environ.pop(_credential, None)
 

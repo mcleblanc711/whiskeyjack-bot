@@ -20,6 +20,7 @@ from whiskeyjack_bot.forecast.store import read_forecast_record
 from whiskeyjack_bot.lifecycle import current_status
 from whiskeyjack_bot.metaculus.client import SingleAttemptPoster, build_client
 from whiskeyjack_bot.metaculus.snapshots import save_snapshot
+from whiskeyjack_bot.notify import build_notifier, describe, emit, notifier_context
 from whiskeyjack_bot.pipeline_live import _attempt_question, _build_clients
 from whiskeyjack_bot.prompt import load_prompt
 from whiskeyjack_bot.questions.normalize import normalize_questions
@@ -94,6 +95,63 @@ def _confirmed(conn: sqlite3.Connection, record_id: str) -> bool:
     return bool(events(conn, "forecast_confirmed", record_id))
 
 
+def _notify_blocked(scope: str, *, reason: str, detail: str | None) -> None:
+    """Report that a question will not be attempted again under this activation (M1-329).
+
+    Called from the two places that *append* ``question_blocked``, never from the read
+    gate that skips an already-blocked question: the gate runs on every poll, so alerting
+    there would re-page every five minutes for a verdict recorded once.
+
+    This is the alert the 2026-09-08 incident actually needed. Measured on the Cup ledger:
+    question 45452 failed with ``no_evidence``, which is a deterministic code, so under
+    today's code this fires on the first attempt -- about four minutes in, against the nine
+    hours it took the vendor's cap email to arrive.
+    """
+    emit(
+        "question_blocked",
+        subject=f"{scope}-{reason}",
+        title=f"whiskeyjack: question blocked ({reason})",
+        body=(
+            f"{scope} will not be attempted again under this activation. "
+            f"reason={reason} detail={detail or 'none'}. "
+            f"Re-running `tournament enable` clears the verdict and costs one retry."
+        ),
+    )
+
+
+def _notify_poll_summary(data: dict[str, Any]) -> None:
+    """Send the daily liveness digest (M1-329).
+
+    A push per poll would be 288 a day and the channel would be muted, which is the same
+    as having no channel; the throttle window for this event is 24 hours, so this is a
+    digest. Its job is not to report a poll -- it is to be *missed*. The systemd
+    ``OnFailure`` unit fires when a unit fails, and this module fires when the code
+    notices something; neither says anything at all when the timer is disabled, the user
+    session ends, or the machine is off. A digest that stops arriving is the only signal
+    that covers those.
+    """
+    heartbeat = data.get("heartbeat") or {}
+    emit(
+        "poll_summary",
+        subject="worker",
+        title="whiskeyjack: daily worker digest",
+        body=describe(
+            [
+                ("discovered", heartbeat.get("discovered", 0)),
+                ("processed", heartbeat.get("processed", 0)),
+                ("skipped", heartbeat.get("skipped", 0)),
+                ("failures", heartbeat.get("failures", 0)),
+                ("blocked", heartbeat.get("blocked", 0)),
+                ("confirmed_total", data.get("forecast_confirmed", 0)),
+                ("unresolved", data.get("unresolved", 0)),
+                ("actual_usd", round(float(data.get("actual_cost_usd", 0.0)), 4)),
+                ("reserved_usd", round(float(data.get("reserved_cost_usd", 0.0)), 4)),
+                ("remaining_usd", round(float(data.get("remaining_budget_usd", 0.0)), 4)),
+            ]
+        ),
+    )
+
+
 def reconcile_forecast(
     conn: sqlite3.Connection, config: AppConfig, poster: Any, record_id: str
 ) -> bool:
@@ -137,6 +195,29 @@ def reconcile_forecast(
                 "question_id": intent["question_id"],
                 "payload_sha256": intent["payload_sha256"],
             },
+        )
+        # Inside the guard, not after `return True` below (M1-329). This branch is
+        # "confirmed for the first time"; the function itself runs on every poll that
+        # re-reconciles an already-confirmed record, so a hook at the return would page
+        # every five minutes for a forecast that landed days ago.
+        #
+        # CONFIRMED means what `classify_refetch` above returned, not what the POST
+        # returned: the payload was refetched from the platform and matched. And it is
+        # emitted after the ledger row is committed, so the ledger never lags a push.
+        #
+        # The body carries the question, the post and the payload hash -- all of which the
+        # platform already shows publicly -- and no rationale field. ntfy is a third party;
+        # the posted value is public the moment it lands, the reasoning is not, and it
+        # never becomes public.
+        emit(
+            "prediction_posted",
+            subject=record_id,
+            title=f"whiskeyjack: forecast confirmed on question {intent['question_id']}",
+            body=(
+                f"A forecast is live and verified by refetch. "
+                f"question={intent['question_id']} post={intent['post_id']} "
+                f"payload_sha256={intent['payload_sha256'][:12]}"
+            ),
         )
     return True
 
@@ -343,7 +424,10 @@ def run_once(
         raise TournamentError(
             "tournament model, research bounds, or no-retry policy is not configured"
         )
-    with worker_lock(config.storage.sqlite_path.with_suffix(".worker.lock")):
+    with (
+        worker_lock(config.storage.sqlite_path.with_suffix(".worker.lock")),
+        notifier_context(build_notifier(config)),
+    ):
         client = build_client(config) if client is None else client
         poster = SingleAttemptPoster(client) if poster is None else poster
         account = poster.get_current_user_id()
@@ -384,7 +468,11 @@ def run_once(
                 failures=heartbeat["failures"] + 1, complete=True, at=utcnow().isoformat()
             )
             append(conn, "heartbeat", "worker", heartbeat)
-            return status(conn, config)
+            # One of run_once's two exits. A digest hook on only the normal one would go
+            # quiet in exactly the state that most warrants a digest: a spending hold.
+            held_summary = status(conn, config)
+            _notify_poll_summary(held_summary)
+            return held_summary
         questions = client.get_all_open_questions_from_tournament(
             int(project), group_question_mode="unpack_subquestions"
         )
@@ -480,6 +568,7 @@ def run_once(
                         "attempts": attempts,
                     },
                 )
+                _notify_blocked(scope, reason="transient_attempts_exhausted", detail=None)
                 heartbeat["skipped"] += 1
                 heartbeat["exhausted"] = heartbeat.get("exhausted", 0) + 1
                 continue
@@ -579,6 +668,11 @@ def run_once(
                                 "detail_code": outcome.detail_code,
                             },
                         )
+                        _notify_blocked(
+                            scope,
+                            reason="deterministic_verdict",
+                            detail=outcome.detail_code,
+                        )
                     if outcome.status != "recorded" or outcome.record_id is None:
                         raise TournamentError("question research or generation failed")
                     record_id = outcome.record_id
@@ -636,4 +730,6 @@ def run_once(
         heartbeat["complete"] = True
         heartbeat["at"] = utcnow().isoformat()
         append(conn, "heartbeat", "worker", heartbeat)
-        return status(conn, config)
+        summary = status(conn, config)
+        _notify_poll_summary(summary)
+        return summary
