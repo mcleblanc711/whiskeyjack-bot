@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.notify import emit
 from whiskeyjack_bot.questions.model import _CanonicalQuestionBase
 from whiskeyjack_bot.research.asknews import (
     AskNewsRetrieval,
@@ -640,6 +641,32 @@ def retrieve_for_question(
                 question_id,
                 ", ".join(decision.reasons),
             )
+            if "primary_provider_failed" in decision.reasons:
+                # The reason LIST, not the bare fact of a fallback (M1-327). A fallback on
+                # `official_source_required` is the design working -- the question named a
+                # resolution authority and Exa is how we look for it -- and paging on it
+                # would train the operator to ignore this channel. Only the primary
+                # provider actually failing is an operational condition.
+                #
+                # Read what it can and cannot say. On 2026-09-08 this fired on 3 of the 17
+                # retrievals that exhausted the AskNews quota, the first 62 minutes in,
+                # because `asknews.py` discards the SDK exception rather than inspecting
+                # it: quota exhaustion is currently indistinguishable from a socket reset.
+                # Classifying it is filed separately; this alert says a provider failed and
+                # does not pretend to say why.
+                emit(
+                    "provider_failed",
+                    subject=f"{config.retrieval.primary.provider}:{question_id}",
+                    title=f"whiskeyjack: {config.retrieval.primary.provider} failed",
+                    body=(
+                        f"The primary retrieval provider "
+                        f"({config.retrieval.primary.provider}) failed on question "
+                        f"{question_id}; the run fell back to "
+                        f"{config.retrieval.fallback.provider}. The cause is not recorded "
+                        f"-- a quota exhaustion and a dropped connection look the same "
+                        f"here. Check data/logs/ and the provider dashboard."
+                    ),
+                )
             fallback = _fallback_pass(
                 conn,
                 config,

@@ -202,7 +202,12 @@ def _verify_prompt_version(config: AppConfig, report: VerificationReport) -> Non
 
 
 def _verify_env_vars(config: AppConfig, report: VerificationReport) -> None:
-    for name in config.secret_env_var_names():
+    # ``required_env_var_names`` rather than ``secret_env_var_names`` (M1-329): the ntfy
+    # topic URL is scrubbed from logs whenever it is set, but is only *required* when
+    # ``notify.enabled``. Reporting it missing on every machine that has not configured
+    # notifications would make "not ready" the normal answer, which is how a readiness
+    # check stops being read.
+    for name in config.required_env_var_names():
         # Presence and non-emptiness only; the value itself is not retained.
         if os.environ.get(name):
             report.checks_passed.append(f"env var {name} is set")

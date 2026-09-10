@@ -23,6 +23,7 @@ from uuid import uuid4
 from whiskeyjack_bot.artifacts import write_new_file
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.lifecycle import LifecycleError, transaction
+from whiskeyjack_bot.notify import budget_level_crossed, emit
 
 
 class TournamentError(Exception):
@@ -247,18 +248,53 @@ class Budget:
             raise TournamentError("billable call has no conservative cost bound")
         amount = math.ceil(estimate * 1_000_000)
         identifier = uuid4().hex
-        # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
-        with storage_transaction(self.conn):
-            require_spending_clear(self.conn, self.scope)
-            actual, held = spending(self.conn, self.scope)
-            if actual + held + amount > self.ceiling:
-                raise TournamentError("round budget exhausted; no provider call made")
-            append(
-                self.conn,
-                "cost_reserved",
-                self.scope,
-                {"reservation_id": identifier, "provider": provider, "estimate_microusd": amount},
-            )
+        # The budget level this reservation reached, if any (M1-329). Computed inside the
+        # transaction, where the numbers are already in hand and consistent, but reported
+        # outside it: this block holds BEGIN IMMEDIATE, and an HTTP POST inside it would
+        # serialize every other process's budget check behind a third party's latency.
+        crossed: int | None = None
+        try:
+            # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
+            with storage_transaction(self.conn):
+                require_spending_clear(self.conn, self.scope)
+                actual, held = spending(self.conn, self.scope)
+                if actual + held + amount > self.ceiling:
+                    # 100 rather than a configured level: the ceiling is not a threshold
+                    # that was crossed, it is the refusal itself, and it is the one budget
+                    # condition that has already stopped a paid call from happening.
+                    crossed = 100
+                    raise TournamentError("round budget exhausted; no provider call made")
+                crossed = budget_level_crossed(actual + held + amount, self.ceiling)
+                append(
+                    self.conn,
+                    "cost_reserved",
+                    self.scope,
+                    {
+                        "reservation_id": identifier,
+                        "provider": provider,
+                        "estimate_microusd": amount,
+                    },
+                )
+        finally:
+            # `finally` so the exhaustion refusal above is reported too -- that is the
+            # alert an operator most needs, and it is only reachable on the raising path.
+            if crossed is not None:
+                emit(
+                    "budget_threshold",
+                    subject=f"{self.scope}-{crossed}",
+                    title=f"whiskeyjack: budget at {crossed}%",
+                    body=(
+                        f"Spending for {self.scope} has reached {crossed}% of its "
+                        f"activation ceiling. Reserved spend counts toward this and "
+                        f"AskNews reservations never settle, so this tracks what will "
+                        f"stop the worker, not what has been billed. "
+                        + (
+                            "The ceiling is reached: paid calls are being refused."
+                            if crossed == 100
+                            else "Check `tournament status` for the split."
+                        )
+                    ),
+                )
         from whiskeyjack_bot.redaction import redact_secrets
 
         request = json.loads(redact_secrets(canonical(request), self.secret_names))

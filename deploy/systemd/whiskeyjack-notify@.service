@@ -1,0 +1,46 @@
+[Unit]
+Description=Whiskeyjack failure notification for %i
+# The half of M1-329 that runs when the program cannot (see src/whiskeyjack_bot/notify.py
+# for the other one). This unit fires when the worker process dies, times out or exits
+# non-zero -- exactly the cases where in-process code reports nothing, because it is no
+# longer running. It cannot say *why*; the in-process notifier can, and sends nothing if
+# the process dies first. Neither is a substitute for the other.
+#
+# Installed operator-locally on 2026-09-09, after the Cup worker exited 1 every five
+# minutes for nine hours unnoticed, and tracked here unchanged.
+#
+# Deliberately shell and curl, with no Python and no ledger: this unit's entire value is
+# that it still works when the interpreter, the package or the database is the thing that
+# is broken. Calling back into the CLI would make it fail in precisely the cases it exists
+# to report.
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/cleblanc/projects/whiskeyjack-bot/.env
+# Throttle: one push per failing unit per 30 minutes. The worker is a timer-driven
+# oneshot, so without this a permanently-failing unit pushes 288 times a day and the
+# channel becomes noise -- which reports exactly as much as having no channel at all.
+# State is a file because each notify run is its own process. It is under XDG_STATE_HOME
+# rather than the artifact root on purpose: this unit must not assume the repository, the
+# config or the ledger is readable.
+#
+# A push failure logs and exits 0. A notification that fails must not itself become a
+# failed unit, or OnFailure would recurse.
+ExecStart=/bin/sh -c ' \
+  unit="%i"; \
+  state="$${XDG_STATE_HOME:-$$HOME/.local/state}/whiskeyjack"; \
+  mkdir -p "$$state"; \
+  stamp="$$state/notify-$$(echo "$$unit" | tr "/@." "___")"; \
+  now=$$(date +%%s); \
+  last=0; [ -f "$$stamp" ] && last=$$(cat "$$stamp" 2>/dev/null || echo 0); \
+  if [ $$(( now - last )) -lt 1800 ]; then \
+    echo "throttled: last push for $$unit was $$(( now - last ))s ago"; exit 0; \
+  fi; \
+  res=$$(systemctl --user show "$$unit" -p Result --value 2>/dev/null); \
+  code=$$(systemctl --user show "$$unit" -p ExecMainStatus --value 2>/dev/null); \
+  body="$$unit failed: result=$${res:-unknown} exit=$${code:-unknown} at $$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ). Timers are NOT self-healing; check data/logs/."; \
+  if curl -sS --max-time 20 -H "Title: whiskeyjack: $$unit failed" -H "Priority: high" -H "Tags: rotating_light" -d "$$body" "$$NTFY_TOPIC_URL" >/dev/null; then \
+    echo "$$now" > "$$stamp"; echo "pushed failure notice for $$unit"; \
+  else \
+    echo "ntfy push failed for $$unit (not fatal)"; \
+  fi'
