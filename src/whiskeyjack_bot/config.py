@@ -55,6 +55,17 @@ MAX_MODEL_INVOCATIONS = 2
 # exists to prevent. A measured normal conversion is 7.7ms, so 60s is four orders of
 # magnitude of headroom and still bounds a hang to something a run survives.
 MAX_CONVERSION_TIMEOUT_SECONDS = 60.0
+
+# The longest wall-clock bound one operational push may be given (M1-329). Same shape and
+# the same reason as the two above: ``notify`` imports it rather than restating it.
+#
+# It is small on purpose. A notification exists to report that the worker is in trouble; a
+# notification that can itself stall the worker has become the incident. The push is already
+# wrapped so that a failure degrades, but "degrades" is only true within a bound -- an
+# operator who set 600 here would convert a hung ntfy host into a hung poll, and the poll is
+# the thing holding the worker lock. 30s is generous for a single HTTP POST of a few hundred
+# bytes and still an order of magnitude inside ``phase_timeout``'s own budget.
+MAX_NOTIFY_TIMEOUT_SECONDS = 30.0
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Question types the v1 pipeline supports; date/conditional are deferred (D20/D21).
@@ -421,6 +432,34 @@ class LoggingConfig(_StrictModel):
     include_provider_costs: bool = True
 
 
+class NotifyConfig(_StrictModel):
+    """Operational push notifications to an ntfy topic (M1-329).
+
+    ``topic_url_env`` names an environment variable; the topic URL itself never appears
+    in configuration, because an ntfy topic URL **is** a bearer credential -- anyone
+    holding it can push to the operator's device. The name is registered in
+    :meth:`AppConfig.secret_env_var_names` unconditionally, not only when ``enabled``:
+    the unit files pass the whole ``.env`` through ``EnvironmentFile=``, so the value is
+    in the worker's environment whether this adapter runs or not, and redaction that
+    depends on a feature flag would leave it unscrubbed in exactly the configuration an
+    operator would assume was the safest one.
+
+    There is deliberately no throttle knob here. The per-event windows live in
+    ``notify._WINDOW_SECONDS`` as a total mapping over the event vocabulary, because they
+    are not independent of each other: ``poll_summary`` is a daily liveness digest and
+    ``question_blocked`` is a per-incident alert, and a single number cannot be both.
+    """
+
+    enabled: bool = False
+    topic_url_env: str = "NTFY_TOPIC_URL"
+    timeout_seconds: float = Field(default=10.0, gt=0, le=MAX_NOTIFY_TIMEOUT_SECONDS)
+
+    @field_validator("topic_url_env")
+    @classmethod
+    def _topic_url_env_is_name(cls, v: str) -> str:
+        return _require_env_var_name(v, "notify.topic_url_env")
+
+
 class RunLimitsConfig(_StrictModel):
     max_questions: int = Field(1, ge=1)
     max_cost_usd: float = Field(10.0, gt=0)
@@ -438,24 +477,54 @@ class AppConfig(_StrictModel):
     storage: StorageConfig
     logging: LoggingConfig
     run_limits: RunLimitsConfig
+    # Defaulted rather than required so that a configuration written before M1-329 still
+    # loads; the default is disabled, so the adapter is opt-in even where the section is
+    # present-by-default. Note that adding this field changes ``config.model_dump()`` and
+    # therefore ``tournament_state.bindings()``'s ``config_sha256`` for byte-identical
+    # YAML, which retires every live activation -- see docs/M1-NOTES.md for the re-enable.
+    notify: NotifyConfig = NotifyConfig()
 
     def secret_env_var_names(self) -> list[str]:
         """Every environment variable name that may hold a credential.
 
         Used by verify-env (M0-004) for presence checks and by the logging
         redaction filter (M0-101) to scrub values; the social key is included
-        only when the adapter is enabled.
+        only when the adapter is enabled, while the ntfy topic URL (M1-329) is
+        included always -- see :class:`NotifyConfig` for why the two differ.
         """
         names = [
             self.metaculus.token_env,
             self.model.api_key_env,
             self.retrieval.primary.api_key_env,
             self.retrieval.fallback.api_key_env,
+            # Unconditional, unlike the social key below (M1-329). An ntfy topic URL is a
+            # bearer credential and the unit files export the whole .env regardless of
+            # ``notify.enabled``, so gating redaction on the feature flag would scrub it
+            # only in the configuration where it is already being used carefully.
+            self.notify.topic_url_env,
         ]
         if self.retrieval.social.enabled:
             names.append(self.retrieval.social.api_key_env)
         # Preserve order, drop duplicates.
         return list(dict.fromkeys(names))
+
+    def required_env_var_names(self) -> list[str]:
+        """Every environment variable that must actually be set for a run (M1-329).
+
+        A strict subset of :meth:`secret_env_var_names`, and the two are different
+        questions. That one asks "what may hold a credential, so that the logging filter
+        can scrub it"; this one asks "what must be present, so that verify-env can refuse
+        a half-configured machine". Before M1-329 every name answered both, so one list
+        served both callers; the ntfy topic URL is the first name that is a credential
+        when set and simply absent when the feature is off.
+
+        Collapsing them again in either direction gets one of the two wrong: verify-env
+        would report a machine with no notifications configured as not ready, or the
+        redaction filter would stop scrubbing a live bearer token the moment someone set
+        ``notify.enabled: false`` without clearing the variable.
+        """
+        optional = set() if self.notify.enabled else {self.notify.topic_url_env}
+        return [name for name in self.secret_env_var_names() if name not in optional]
 
 
 class ConfigError(Exception):
