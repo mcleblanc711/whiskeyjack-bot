@@ -127,7 +127,7 @@ def witness(conn: sqlite3.Connection, root: Path, scope: str, data: dict[str, An
 
 
 # The hard maximum for one activation's spending ceiling, in USD. Launch shipped 20; M1-408
-# raised it to 40 on the owner's explicit authorization (2026-09-10), when the forecaster moved
+# raised it to 40 on the owner's explicit authorization (2026-09-11), when the forecaster moved
 # to GPT-6 Astra at 5x Sol's prices. It is a code constant rather than configuration on
 # purpose: an activation binds to config_sha256, and a paid-call limit living in the same file
 # it authorizes would let one edit both raise the limit and re-authorize under it.

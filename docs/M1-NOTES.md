@@ -10059,3 +10059,13 @@ now names the constant and says why it moved.
 
 **Non-blocking, taken:** the registry-boundary paragraph above overstated the builder's role
 and is corrected.
+
+### Round 2 — APPROVE, no blocking findings
+
+Reviewed `82be602`, the request HEAD. B1 **CLOSED**: the reviewer confirmed by execution that
+$40 creates a usable activation with `budget_microusd == 40_000_000`, and that $40.01 raises the
+sanitized maximum-USD-40 error and appends nothing. Two non-blocking notes, both taken. The
+constant's comment dated the ceiling authorization 2026-09-10; it was 2026-09-11, the
+decision this item's round 1 asked for, and the comment is corrected. And the live re-activation
+is to be appended here after deploy (below). Two rounds.
+
