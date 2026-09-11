@@ -485,11 +485,20 @@ def _record_pairs(draw: st.DrawFn) -> tuple[str, ForecastRecord, ForecastRecord]
     if mode == "same payload":
         return mode, first, _multiple_choice_from(spec, "attempt-2")
     other = draw(_postable_multiple_choice_spec())
-    if other == spec:
-        labels, probabilities = spec
+    # Compared as label -> probability mappings, because that is what the payload carries:
+    # `(['a','b'], [.5,.5])` and `(['b','a'], [.5,.5])` are different specs and one payload
+    # (round-1 review, reproduced). An ordered comparison let that pair through untouched.
+    if _mapping(other) == _mapping(spec):
+        labels, _ = spec
         tilted = [0.6] + [0.4 / (len(labels) - 1)] * (len(labels) - 1)
-        other = (labels, tilted if probabilities != tilted else [1 / len(labels)] * len(labels))
+        uniform = [1 / len(labels)] * len(labels)
+        other = (labels, tilted if _mapping((labels, tilted)) != _mapping(spec) else uniform)
     return mode, first, _multiple_choice_from(other, "attempt-2")
+
+
+def _mapping(spec: tuple[list[str], list[float]]) -> dict[str, float]:
+    labels, probabilities = spec
+    return dict(zip(labels, probabilities, strict=True))
 
 
 @given(pair=_record_pairs())
@@ -526,6 +535,8 @@ def test_two_records_share_a_digest_exactly_when_they_derive_one_payload(
     event(f"reached: {mode}, same payload={left == right}")
     if mode == "same payload":
         assert left == right
+    if mode == "different payload":
+        assert left != right, "a different-payload pair must derive two payloads"
     assert (left == right) == (left_digest == right_digest)
 
 

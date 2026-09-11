@@ -10143,3 +10143,16 @@ cannot reach the branch" form.
 A filter rate that high is the evidence, not the noise. The shared-arm result above is what it
 was hiding.
 
+### Round 1 — APPROVE, no blocking findings; the one observation taken
+
+Reviewed `fe0f0cb`, the request HEAD. The reviewer independently reproduced the base's 8/50
+health-check failure, confirmed the recorded seed plus seeds 0–19 at 200 examples, killed both
+arm mutants, and confirmed that the old property survived the attempt-ID mutant on seeds 0–4.
+
+**Observation (non-blocking, reproduced, taken):** the multiple-choice "different payload" arm
+detected a collision by comparing *ordered* specs, but the payload is a label-to-probability
+mapping. So `(['a','b'], [.5,.5])` against `(['b','a'], [.5,.5])` bypassed the fallback and was
+tagged "different payload" while deriving one payload. The biconditional still judged it
+correctly; only the arm label was false. Collisions are now compared as mappings, and the
+different-payload mode asserts `left != right`. Re-swept: 21 of 21.
+
