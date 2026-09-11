@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,11 +31,18 @@ from whiskeyjack_bot.export import (
 )
 from whiskeyjack_bot.ledger import LEDGER_SCHEMA_VERSION, LedgerError, connect, connect_readonly
 from whiskeyjack_bot.ledger import initialize_ledger
+from whiskeyjack_bot.lifecycle import (
+    SubmissionAttempt,
+    record_approval,
+    record_submission_attempt,
+    record_validation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 TS = "2026-09-04T12:00:00.000000+00:00"
+WHEN = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
 SHA = "a" * 64
 PAYLOAD_SHA = "b" * 64
 SNAPSHOT = '{"prediction": 0.4}'
@@ -88,15 +96,16 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         "created_at_utc, payload_sha256) VALUES ('rec-1', 'approved', 'chris', ?, ?, ?)",
         (SHA, TS, PAYLOAD_SHA),
     ).lastrowid
-    # The response columns carry what M1-605 already redacted on the way in. Seeding the
-    # redacted form is the honest shape: this is what a real ledger holds.
+    # The response columns carry what M1-605 already redacted on the way in, in its real
+    # `<redacted:NAME>` form. The redaction path itself is driven through the writer in
+    # test_the_export_carries_the_redaction_the_ledger_already_applied.
     conn.execute(
         "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
         "requested_at_utc, completed_at_utc, request_payload_sha256, http_status, "
         "response_body, response_headers, success, verified_by_refetch, refetch_outcome, "
         "created_at_utc) "
         "VALUES ('att-ok', 'rec-1', 'idem-1', ?, ?, ?, 201, ?, ?, 1, 1, 'confirmed', ?)",
-        (TS, TS, PAYLOAD_SHA, '{"ok": true}', "[REDACTED:METACULUS_TOKEN]", TS),
+        (TS, TS, PAYLOAD_SHA, '{"ok": true}', "<redacted:METACULUS_TOKEN>", TS),
     )
     conn.execute(
         "INSERT INTO submission_verifications (submission_attempt_id, outcome, "
@@ -857,7 +866,7 @@ def test_the_export_does_not_migrate_a_ledger_it_reads(tmp_path: Path) -> None:
 
 
 def test_the_export_carries_the_redaction_the_ledger_already_applied(
-    ledger_path: Path, tmp_path: Path
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """M1-605's criterion names exports explicitly, so this branch owes it a check.
 
@@ -866,12 +875,79 @@ def test_the_export_carries_the_redaction_the_ledger_already_applied(
     must do is carry that through unaltered. It adds no second redaction pass on purpose:
     a second opinion about what counts as a secret is a second source of truth about it,
     and the two would drift.
-    """
-    destination = tmp_path / "out"
-    export_ledger(ledger_path, destination, export_format="jsonl")
-    attempts = _jsonl_rows(destination, "submission_attempts")
-    assert attempts[0]["response_headers"] == "[REDACTED:METACULUS_TOKEN]"
 
+    The secret goes in through the **real writer**, and is confirmed present in its input
+    first. The first version of this test never wrote the secret anywhere, so asserting it
+    absent from the export was true by construction. JSONL only: Parquet pages are
+    compressed, so a byte search there could miss a secret that is present.
+    """
+    variable = "FAKE_WJ_EXPORT_TOKEN"
+    monkeypatch.setenv(variable, FAKE_SECRET)
+    body = f"HTTP 401: invalid header Token {FAKE_SECRET}"
+    headers = f"Authorization: Token {FAKE_SECRET}"
+    message = f"request failed with token {FAKE_SECRET}"
+    assert all(FAKE_SECRET in text for text in (body, headers, message))
+
+    db = tmp_path / "ledger.sqlite3"
+    initialize_ledger(db)
+    conn = connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+            "started_at_utc, created_at_utc) VALUES ('run-1', 'asknews', 100, ?, ?)",
+            (TS, TS),
+        )
+        conn.execute(
+            "INSERT INTO forecast_records ("
+            "record_id, question_id, tournament_id, forecast_version, question_type, status, "
+            "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+            "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
+            "forecast_sha256, attempt_id) "
+            "VALUES ('rec-1', 100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
+            "'v1', ?, 'run-1', ?, '{}', '{}', ?, ?, 'att-rec-1')",
+            (SHA, TS, TS, SHA),
+        )
+        record_validation(conn, record_id="rec-1", occurred_at=WHEN)
+        record_approval(
+            conn,
+            record_id="rec-1",
+            decision="approved",
+            actor="chris",
+            forecast_sha256=SHA,
+            payload_sha256=PAYLOAD_SHA,
+            occurred_at=WHEN,
+        )
+        record_submission_attempt(
+            conn,
+            record_id="rec-1",
+            attempt=SubmissionAttempt(
+                attempt_id="att-1",
+                idempotency_key="idem-1",
+                requested_at_utc=WHEN,
+                completed_at_utc=WHEN,
+                request_payload_sha256=PAYLOAD_SHA,
+                success=False,
+                refetch_outcome="absent",
+                http_status=401,
+                response_body=body,
+                response_headers=headers,
+                error_message=message,
+            ),
+            occurred_at=WHEN,
+            detail_code="http_error",
+            secret_env_var_names=[variable],
+        )
+    finally:
+        conn.close()
+
+    destination = tmp_path / "out"
+    export_ledger(db, destination, export_format="jsonl")
+
+    (attempt,) = _jsonl_rows(destination, "submission_attempts")
+    marker = f"<redacted:{variable}>"
+    assert marker in attempt["response_body"]
+    assert marker in attempt["response_headers"]
+    assert marker in attempt["error_message"]
     everything = b"".join(
         path.read_bytes() for path in sorted(destination.iterdir()) if path.is_file()
     )
