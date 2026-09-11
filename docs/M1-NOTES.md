@@ -9615,3 +9615,272 @@ other than the one it claimed.
 The reviewer noted it could not run `pytest` in its read-only environment (no writable
 temporary directory) and validated by direct in-memory execution instead. The suite pass
 reported in the request is `scripts/gate.sh`'s, run locally.
+
+## M1-604 — Export JSONL and Parquet
+
+Acceptance: *exports round-trip record IDs/counts and never mutate SQLite.* Decision D29:
+the exports are **derived** artifacts, never a competing source of truth.
+
+### Delivered
+
+- `src/whiskeyjack_bot/export.py` — `export_ledger`, `EXPORTED_TABLES` (14 hand-written
+  `TableSpec`s), `read_table`, `render_jsonl`, `render_parquet`, `canonical_json`,
+  `ExportError`, `EXPORT_SCHEMA_VERSION = 1`, `MANIFEST_FILENAME`.
+- `src/whiskeyjack_bot/ledger.py` — `connect_readonly` and `_verify_schema`, a third opener.
+- `src/whiskeyjack_bot/cli.py` — `whiskeyjack-bot export --format jsonl|parquet [--output DIR]
+  [--config PATH]`, mapping `ExportError`/`LedgerError` to `refused: …` / `EXIT_REFUSED`.
+- `pyproject.toml` / `uv.lock` — `pyarrow>=24,<25` and a `pyarrow.*` mypy override (+2 lock
+  lines; see the dependency decision below).
+- `tests/unit/test_export.py` (27 tests), `tests/unit/test_cli_export.py` (7),
+  `tests/property/test_export_properties.py` (7 properties).
+- `docs/backlog/backlog.csv` — `M1-612` filed for `show --record-id` (see Deviation).
+
+**No migration.** No `AppConfig` field either: `storage.export_root` has existed since
+M1-601, so `config_sha256` is unchanged and neither live activation is retired (the M1-334
+trap).
+
+### Decision — a third opener, `connect_readonly`, on `mode=ro` and not `immutable=1`
+
+`connect()` opens read-write and its pragmas are writes. `open_verified_ledger` calls
+`_migrate`, so an export through it could migrate the database it was exporting. So there is a
+third opener: `file:<abs>?mode=ro`, schema verified without applying anything
+(`_verify_schema`), `isolation_level = None` so the caller owns one explicit transaction.
+
+`immutable=1` was rejected **by measurement**. It is the stronger-looking flag and it also
+leaves every byte alone, but against a `-wal` holding committed frames it does not error. It
+reads the stale main database and returns fewer rows than the ledger holds.
+`test_immutable_would_have_silently_read_a_stale_ledger` is the executable record, and it
+fails if `immutable=1` ever starts reading the WAL. Swapping the opener's URI to
+`immutable=1` is killed by three tests (see Teeth).
+
+`connect_readonly` also refuses a ledger **behind** this build, which `_migrate` would have
+answered by migrating: the export names columns later migrations added, so a behind ledger
+would be half-exported or fail with SQLite's own message.
+
+### Decision — the table spec is written down, not derived, and migration 012 proved why
+
+`EXPORTED_TABLES` is transcribed column by column from the migrations in DDL order, including
+appended columns. `PRAGMA table_info` would be less code and would silently reshape a
+published contract the first time a migration lands. Two tests compare the spec with the
+live schema (table set, then column names, declared types and primary key).
+
+**This caught a real change mid-branch.** `012_tournament_safety.sql` arrived through a
+master merge and added `tournament_events`. The parity test went red with `Extra items in
+the right set: 'tournament_events'`, and every other test stayed green, because every other
+test iterates the spec. A derived spec would have exported the new table without anyone
+deciding to.
+
+### Decision — every table is exported, `tournament_events` included
+
+All fourteen, none excluded. `schema_migrations` is in because it tells a consumer which schema
+produced the files. `tournament_events` is in because it holds the attribution record of the
+live runs: `activation` (account, project, window, `config_sha256`, `prompt_sha256`),
+`forecast_intent` (the exact posted payload and `payload_sha256`), `comment_intent`,
+`witness`, `evidence_gap`, and the cost journal. Approval actors of the form
+`policy:launch-v1:<hash>` resolve only against it. Its identifier is `seq`, the primary key
+and the order the runner appends in. `event_id` is UNIQUE but a random hex token, so ordering
+by it would scramble time. `data` is exported as the stored JSON string, like `record_json`.
+Parsing it would put this module's JSON reading between the ledger and the consumer.
+
+`EXPORT_SCHEMA_VERSION` stays `1`: nothing has been published under it yet, so adding a
+table before the first release changes no consumer's contract.
+
+### Decision — one snapshot, explicit order, nothing coerced
+
+- **One deferred transaction** around all fourteen reads. Without it each statement gets its
+  own snapshot, and a run committing between two tables yields an export whose
+  `forecast_records` references events its `lifecycle_events` lacks.
+- **`ORDER BY` the identifier** on every table, never natural order.
+- **`text_factory = bytes`**, decoding in `_decode_value`. `sqlite3`'s own decode failure is
+  `OperationalError: Could not decode to UTF-8 column 'x' with text '<bytes>'`, which leaks
+  content through an error the project never wrote.
+- **No coercion.** The storage class (`typeof()`, read alongside each value) must match the
+  declared type. BLOBs, non-finite REALs (SQLite stores ±inf; NaN becomes NULL) and invalid
+  UTF-8 are refused as `ExportError` naming `table.column`, never the value or row ID.
+- **Canonical JSONL**: `json.dumps(ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+  allow_nan=False)`. Row keys are alphabetical, and DDL order lives in the manifest's
+  `columns`, where it is a contract.
+
+### Decision — Parquet's determinism is version-scoped, and the manifest says which version
+
+JSONL is byte-stable, unconditionally. Parquet is byte-stable **for a fixed pyarrow**
+(measured: identical digests across repeats), not across versions: every file embeds
+`parquet-cpp-arrow version <x.y.z>`. The knobs that would strip it are undocumented writer
+behaviour. So the manifest records `writer.pyarrow`, and the two formats are asserted
+semantically equal row for row. The Arrow schema comes from the declared types, so an empty
+or all-NULL column is still typed.
+
+### Decision — render everything, then write; `manifest.json` last
+
+Every table is rendered before the first file is written, so a render refusal leaves no files.
+Rendering used to happen inside the write loop: a refusal on table k left k-1 files and no
+manifest, and a retry into the same directory was refused as `already exists`. Ordinary I/O
+can still interrupt the write loop. For that, `manifest.json` is written last and is the
+completion marker: a directory without one is not an export. Files go through
+`artifacts.write_new_file` (create-or-fail), so an export never overwrites an earlier one.
+
+### Decision — no second redaction pass
+
+M1-605 redacts at write time. A second pass here would be a second opinion about what counts as a secret, and
+the two would drift. The export carries the ledger's bytes. What that leaves uncovered is in
+Standing risk.
+
+### Decision — the dependency slot buys a declaration, not an install
+
+`pyarrow 24.0.0` was already resolved transitively (`forecasting-tools==0.2.92` → `streamlit
+1.59.2` → `pyarrow>=7.0,<25`), so declaring it adds zero bytes. It is declared because
+`export.py` imports it directly. It is imported function-locally in the Parquet writer only,
+never at module scope (~146MB). The bound stays inside streamlit's range or `uv sync --locked`
+conflicts.
+
+### Deviation — the joined per-record view is not here; it is `M1-612`'s
+
+Two earlier notes deferred it **to this item**. M1-603's Deferred list sends "Assembly of the
+handoff's full canonical record → M1-604 / `show`", and M1-606's sends "The
+`lifecycle_events` ∪ `pipeline_failure_events` merged read/export view → M1-604". This item
+ships the table-level export and not that join. A join baked into the export imposes one
+analytical reading a consumer cannot undo, and the handoff already names the per-record
+reader: `whiskeyjack-bot show --record-id ID`, a required CLI entry point that **no backlog
+row owned**. Rather than re-defer silently, this branch files **`M1-612`** for `show`, with the
+two deferrals cited in its description. `M5-804` (the grouped attribution dataset) builds on
+the export, but it is not a per-record view, so the join does not go there.
+
+### Rejected — `immutable=1`, and why not
+
+Silently stale under a live WAL (measured, and pinned by a test). See the opener decision.
+
+### Rejected — reading through `open_verified_ledger`, and why not
+
+It migrates. An export must not change the schema of what it exports. Swapping it in is killed
+by the behind-build test.
+
+### Rejected — a spec derived from `PRAGMA table_info`, and why not
+
+It would have exported `tournament_events` without anyone deciding to, and every future
+column along with it. The hand-written spec plus a parity test turns a schema change into a
+decision.
+
+### Rejected — `fastparquet` or `polars`, and why not
+
+`fastparquet` drags in pandas and numba. `polars` would be a second dataframe engine brought in
+for one write call. `pyarrow` was already installed.
+
+### Deferred (do not read the absence as an omission)
+
+- **Per-record assembly → `M1-612`** (`show --record-id`), as above.
+- **Field-level documentation of every exported column → `D-1002`**, whose acceptance
+  criterion is exactly that.
+- **The `content_sha256` lone-surrogate decision** (CLAUDE.md gotcha) stays open.
+  `test_a_lone_surrogate_cannot_be_stored_as_text_at_all` pins that the binding refuses one
+  as TEXT, so the export adds no new path for such a string to reach a file. It neither
+  closes the decision nor widens it.
+
+### Standing risk — not verifiable offline
+
+- **`tournament_events.data` is not redacted centrally.** `tournament_state.append` stores
+  `canonical(data)` as given. Redaction is applied at each call site that carries provider
+  text (the `cost_reserved` request, `model_completed`, `model_response` in
+  `forecast/sol.py`), not in `append`. The export carries `data` verbatim, so a future caller
+  that journals unredacted text would export it. **Measured on 2026-09-10 against copies of
+  both real ledgers:** none of the five secret values in the live `.env` (the ones of 8+
+  characters) appears anywhere in the exported JSONL (10.9MB). The check printed names and
+  booleans only. This is pre-existing, not introduced here: centralizing it belongs in
+  `append` and is a backlog candidate, not this item.
+- **`-shm` is touched by every reader**, this one included: SQLite records read locks there.
+  It is derived lock state regenerated from the WAL and holds no ledger content. The claim is
+  that the `.db` and `-wal` stay byte-identical, and that claim is tested.
+- **The whole ledger is held in memory** during an export (`tables = {…}`). On the live
+  MiniBench ledger (8.1MB, 3,353 rows) JSONL takes 0.13s and Parquet 0.66s, so there is no
+  pressure today. Streaming per table would break the render-before-write guarantee and is
+  not worth it at this size.
+- **Parquet bytes across pyarrow versions** are expected to differ. A lock bump changes the
+  digests. The manifest's `writer.pyarrow` is what makes that explainable.
+
+### Live-ledger smoke
+
+Both real ledgers were copied into `/dev/shm` through SQLite's backup API from a `mode=ro`
+connection (never exported in place mid-poll), then exported in both formats. Schema 13, no
+refusals:
+
+| Table | MiniBench | Cup |
+| --- | ---: | ---: |
+| approval_events | 23 | 5 |
+| forecast_records | 24 | 5 |
+| lifecycle_events | 70 | 15 |
+| pipeline_failure_events | 16 | 1 |
+| research_documents | 617 | 285 |
+| research_runs | 52 | 45 |
+| resolution_events | 0 | 0 |
+| schema_migrations | 13 | 13 |
+| score_events | 0 | 0 |
+| submission_attempts | 23 | 5 |
+| submission_key_releases | 0 | 0 |
+| submission_key_reservations | 23 | 5 |
+| submission_verifications | 0 | 0 |
+| tournament_events | 2,492 | 1,492 |
+
+The strict decoder refused nothing in 5,224 production rows. `tournament_events` is 74% of the
+MiniBench export, 1,579 of it `heartbeat`.
+
+### Teeth — the mutation pass
+
+Run against a committed tree with `PYTHONDONTWRITEBYTECODE=1` and `HYPOTHESIS_PROFILE=ci`,
+over the three export test files. **13 mutants, 13 killed**, 3 of them only after the fixes
+below.
+
+| Mutant | Killed by |
+| --- | --- |
+| opener → `ledger.connect` | missing-ledger, behind-build, CLI mistyped-config tests |
+| opener → `open_verified_ledger` | `test_a_ledger_behind_this_build_is_refused_rather_than_half_exported` |
+| `ORDER BY` dropped | `test_row_order_is_the_identifier_and_not_insertion_order` |
+| `BEGIN` dropped | `test_the_export_reads_one_snapshot_even_while_a_writer_commits` (after fix) |
+| `text_factory = bytes` dropped | 23 test cases |
+| `from None` dropped on the UTF-8 arm | `test_a_refusal_never_echoes_the_value_it_refused` (after fix) |
+| `allow_nan=True` | `test_canonical_json_refuses_a_non_finite_number_on_its_own` (new) |
+| non-finite REAL check removed | the off-contract table's non-finite case (after fix) |
+| `blob` admitted for TEXT | the off-contract table's blob case (after fix) |
+| `mode=ro` → `immutable=1` | stale-WAL, missing-ledger, CLI mistyped-config, and a real-SQLite round-trip property |
+| `mode=ro` → `mode=rw` | `test_the_read_only_connection_refuses_every_write` |
+| behind-build refusal removed | the behind-build test |
+| render inside the write loop | `test_a_render_refusal_leaves_no_partial_export_behind` (new) |
+
+The opener → `connect` mutant is **not** killed by the byte-identity test. That is correct
+rather than a gap: `connect()` on a current ledger writes nothing, so there are no changed
+bytes to see. The write-refusal and missing-ledger tests carry the structural guarantee.
+
+### Found before review: four tests that could not fail
+
+The suite was committed as unreviewed work in progress (`be056fe`). Reading it, and then the
+mutation pass, found four places where a test passed for a reason other than the one it
+claimed. Each is the project's recurring vacuity defect:
+
+1. **The snapshot test** committed a row into `forecast_records` *after* `forecast_records`
+   had been read, so the row was absent under any snapshot policy. Deleting the `BEGIN`
+   survived. It now commits after the first table, into `score_events`, which is read later,
+   and confirms the commit landed.
+2. **The redaction test** never wrote the fake secret anywhere, so "the secret is absent from
+   the export" was true by construction. Its expected marker, `[REDACTED:…]`, was not even
+   the form `redaction.py` produces. It now plants the secret through
+   `record_submission_attempt`, confirms it in the input, and finds `<redacted:NAME>` in the
+   exported row. Disabling redaction in `lifecycle.py` turns it red.
+3. **The no-leak property** false-positived on `value=b"_"`, which is inside the fixed text
+   `research_documents`, under the randomized profile. The derandomized gate never drew it.
+   The length floor guarding `str` draws was never applied to `bytes`. Values now carry a
+   canary and the canary is what is searched for. The chain check asserted `__cause__ is
+   None`, which implicit chaining also satisfies, so it could not see a dropped `from None`.
+   It now asserts `__suppress_context__`.
+4. **Two refusal layers covered for each other.** With the non-finite check deleted,
+   `canonical_json`'s `allow_nan=False` still refused the row. With `blob` admitted as
+   TEXT, the planted `x'00ff'` was still refused as invalid UTF-8. Each off-contract case now
+   asserts its own reason, and the blob is valid UTF-8.
+
+The row-order property was also **renamed**: it never called `read_table`. It pins SQLite's
+BINARY collation against a byte sort, which is an assumption the export relies on. The
+unit test is what shows the export issues the `ORDER BY`.
+
+### Process: a merge dropped the dependency claim's prose
+
+`67610aa` wrote the pyarrow case into `docs/TRACKS.md`'s dependency-additions row. The first
+master merge, `c986ca4`, resolved that row back to `*free*`. Enforcement never lapsed:
+`scripts/tracks.py` reads only the Worktrees `Adds deps?` column, which kept `**yes**`. But for
+five days the prose told the next wave the slot was free. It was restored on this branch.
