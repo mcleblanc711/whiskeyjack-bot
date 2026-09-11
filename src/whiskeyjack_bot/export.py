@@ -25,8 +25,10 @@ contract**, and three consequences follow that a dump would not have:
 **All fourteen tables are exported, and none is excluded.** ``schema_migrations`` is in
 deliberately: it is what lets a consumer tell which schema produced the files it is
 holding. The joined per-forecast view that ``lifecycle.py`` and ``forecast/record.py``
-anticipate "at read/export time" is **not** here -- see ``docs/M1-NOTES.md``, it is
-``M5-804``'s, and a join bakes in one analytical reading that a consumer cannot undo.
+anticipate "at read/export time" is **not** here: assembling one record with its history
+is ``show --record-id`` (``M1-612``), and grouping outcomes for analysis is ``M5-804``. A
+join baked into the export would impose one analytical reading a consumer cannot undo.
+See ``docs/M1-NOTES.md``.
 
 Secret hygiene is M1-605's and it is applied **at write time** (``lifecycle.py``
 redacts ``response_body``/``response_headers``/``error_message`` before the row is

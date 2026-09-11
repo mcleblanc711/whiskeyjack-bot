@@ -134,15 +134,18 @@ def test_canonical_json_never_raises_outside_its_own_error_type(payload: object)
 
 
 @given(identifiers=st.lists(st.text(min_size=1, max_size=8), min_size=1, max_size=12, unique=True))
-def test_the_exported_row_order_is_a_total_order_on_the_identifier(
+def test_sqlite_orders_text_identifiers_totally_by_their_utf8_bytes(
     identifiers: list[str],
 ) -> None:
-    """Byte-determinism rests on the ORDER BY, so the ordering must be total.
+    """Byte-determinism rests on the ORDER BY, so the ordering it uses must be total.
 
-    SQLite's BINARY collation orders on the UTF-8 bytes, which is what `sorted()` on the
-    encoded form reproduces; a Python-side `sorted()` on the `str` disagrees for anything
-    above the BMP. Getting that backwards would make the export stable only for ASCII
-    identifiers, which every fixture in the suite happens to use.
+    This pins the **assumption**, not the export's code: it never calls `read_table`, and
+    was renamed from a title that said it did. That the export actually issues the ORDER BY
+    is `test_row_order_is_the_identifier_and_not_insertion_order`'s job, and deleting the
+    clause is killed there. What this adds is that SQLite's BINARY collation orders on the
+    UTF-8 bytes, which is what `sorted()` on the encoded form reproduces; a Python-side
+    `sorted()` on the `str` disagrees for anything above the BMP, so a consumer re-sorting
+    in Python would get a different order for non-ASCII identifiers.
     """
     db_ordered = _sqlite_sorted(identifiers)
     assert db_ordered == sorted(identifiers, key=lambda value: value.encode("utf-8"))
