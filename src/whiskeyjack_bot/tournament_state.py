@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 from whiskeyjack_bot.artifacts import write_new_file
@@ -126,6 +126,14 @@ def witness(conn: sqlite3.Connection, root: Path, scope: str, data: dict[str, An
     return identifier
 
 
+# The hard maximum for one activation's spending ceiling, in USD. Launch shipped 20; M1-408
+# raised it to 40 on the owner's explicit authorization (2026-09-11), when the forecaster moved
+# to GPT-6 Astra at 5x Sol's prices. It is a code constant rather than configuration on
+# purpose: an activation binds to config_sha256, and a paid-call limit living in the same file
+# it authorizes would let one edit both raise the limit and re-authorize under it.
+MAX_ACTIVATION_BUDGET_USD: Final = 40
+
+
 def enable(
     conn: sqlite3.Connection,
     config: AppConfig,
@@ -146,9 +154,12 @@ def enable(
         or ends.tzinfo is None
         or starts >= ends
         or ends <= now
-        or not 0 < budget_usd <= 20
+        or not 0 < budget_usd <= MAX_ACTIVATION_BUDGET_USD
     ):
-        raise TournamentError("invalid activation identity, window, or budget (maximum USD 20)")
+        raise TournamentError(
+            "invalid activation identity, window, or budget "
+            f"(maximum USD {MAX_ACTIVATION_BUDGET_USD})"
+        )
     if config.metaculus.tournament.use_sdk_current_id or str(config.metaculus.tournament.id) != str(
         project_id
     ):

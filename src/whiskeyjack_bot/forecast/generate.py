@@ -245,14 +245,16 @@ def build_forecaster_client(config: AppConfig) -> Any:
     api_key = os.environ.get(config.model.api_key_env)
     if not api_key:
         raise MissingCredentialError(config.model.api_key_env)
-    if config.model.name == "openrouter/openai/gpt-5.6-sol":
+    # Imported here, as before, so the priced client's tournament_state/httpx imports stay
+    # off this module's import graph for callers that never use it.
+    from whiskeyjack_bot.forecast.priced import PRICED_MODELS, PricedClient
+
+    if config.model.name in PRICED_MODELS:
         if config.model.temperature is not None:
             raise ForecastGenerationError(
-                "Sol requires model.temperature: null; temperature is unsupported"
+                "priced models require model.temperature: null; temperature is unsupported"
             )
-        from whiskeyjack_bot.forecast.sol import SolClient
-
-        return SolClient(config)
+        return PricedClient(config)
     return GeneralLlm(
         model=config.model.name,
         temperature=config.model.temperature,
