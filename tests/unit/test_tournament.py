@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -14,6 +15,11 @@ from forecasting_tools.data_models.data_organizer import DataOrganizer
 from asknews_sdk.dto.news import SearchResponse
 
 from whiskeyjack_bot.config import validate_config_data
+from whiskeyjack_bot.forecast.priced import (
+    MAX_OUTPUT_TOKENS,
+    PRICED_MODELS,
+    reservation_estimate_usd,
+)
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot import tournament as whiskeyjack_tournament
@@ -680,7 +686,7 @@ def test_sol_price_parameters_response_recovery_and_unknown_cost(
 ) -> None:
     import asyncio
     import httpx
-    from whiskeyjack_bot.forecast.sol import SolClient
+    from whiskeyjack_bot.forecast.priced import PricedClient
     from whiskeyjack_bot.tournament_state import budget_context
 
     conn, config, *_ = case
@@ -702,11 +708,184 @@ def test_sol_price_parameters_response_recovery_and_unknown_cost(
     budget = Budget(conn, config.storage.artifact_root, "42:32977", 1_000_000)
     with budget_context(budget):
         prompt = [{"role": "user", "content": "test"}]
-        assert asyncio.run(SolClient(config).invoke(prompt)) == "saved output"
-        assert asyncio.run(SolClient(config).invoke(prompt)) == "saved output"
+        assert asyncio.run(PricedClient(config).invoke(prompt)) == "saved output"
+        assert asyncio.run(PricedClient(config).invoke(prompt)) == "saved output"
     assert len(calls) == 1
     assert spending(conn, budget.scope)[0] == 0
     assert spending(conn, budget.scope)[1] > 60_000
+
+
+def _with_model(config: Any, name: str) -> Any:
+    data = config.model_dump(mode="json")
+    data["model"]["name"] = name
+    return validate_config_data(data)
+
+
+def _fake_openrouter(monkeypatch: Any, config: Any) -> list[dict[str, Any]]:
+    """Answer every OpenRouter call with content and **no cost**, recording each body.
+
+    Patched once per test: patching again would wrap the already-patched constructor.
+    """
+    import httpx
+
+    sent: list[dict[str, Any]] = []
+
+    def request(req: Any) -> httpx.Response:
+        sent.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setenv(config.model.api_key_env, "test-secret")
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(request), **kw)
+    )
+    return sent
+
+
+def _held_for_one_unpriced_call(conn: Any, config: Any, scope: str) -> int:
+    """Make one call whose response carries no cost, and return what stays held.
+
+    With no `usage.cost` the reservation is never settled down, so what stays held is
+    exactly the reservation the client made -- the number M1-408 is about.
+    """
+    import asyncio
+    from whiskeyjack_bot.forecast.priced import PricedClient
+    from whiskeyjack_bot.tournament_state import budget_context
+
+    budget = Budget(conn, config.storage.artifact_root, scope, 10_000_000)
+    with budget_context(budget):
+        prompt = [{"role": "user", "content": "the same prompt for every model " * 40}]
+        assert asyncio.run(PricedClient(config).invoke(prompt)) == "ok"
+    actual, held = spending(conn, scope)
+    assert actual == 0
+    return held
+
+
+@pytest.mark.parametrize("name", sorted(PRICED_MODELS))
+def test_every_priced_model_pins_its_id_and_price_and_reserves_from_them(
+    case: Any, monkeypatch: Any, name: str
+) -> None:
+    """M1-408: the three numbers that must move together, checked on the wire.
+
+    The request names the registered OpenRouter ID and a `max_price` equal to the registered
+    prices, and the held reservation is the estimate derived from those same prices --
+    so a registry entry cannot raise what a call may bill without raising what it reserves.
+    """
+    conn, config, *_ = case
+    config = _with_model(config, name)
+    priced = PRICED_MODELS[name]
+    sent = _fake_openrouter(monkeypatch, config)
+    held = _held_for_one_unpriced_call(conn, config, f"42:{name}")
+    (body,) = sent
+    assert body["model"] == priced.openrouter_id
+    assert body["provider"]["max_price"] == {
+        "prompt": priced.prompt_usd_per_mtok,
+        "completion": priced.completion_usd_per_mtok,
+    }
+    assert body["provider"]["allow_fallbacks"] is False
+    assert body["max_tokens"] == MAX_OUTPUT_TOKENS and "temperature" not in body
+    assert held == math.ceil(reservation_estimate_usd(body, priced) * 1_000_000)
+
+
+def test_astra_reserves_at_least_five_times_what_sol_does_for_the_same_prompt(
+    case: Any, monkeypatch: Any
+) -> None:
+    """Astra's prices are 5x Sol's on both sides, and so must its reservation be.
+
+    This is the regression the item exists to prevent: a registry entry whose `max_price`
+    was raised to Astra's while the reservation still came from Sol's hard-coded prices
+    would hold a fifth of what the call can bill, and the budget ceiling -- which is what
+    stops the worker -- would be five times too permissive.
+    """
+    conn, config, *_ = case
+    sent = _fake_openrouter(monkeypatch, config)
+    sol = _held_for_one_unpriced_call(
+        conn, _with_model(config, "openrouter/openai/gpt-5.6-sol"), "42:sol"
+    )
+    astra = _held_for_one_unpriced_call(
+        conn, _with_model(config, "openrouter/openai/gpt-6-astra"), "42:astra"
+    )
+    assert [body["model"] for body in sent] == ["openai/gpt-5.6-sol", "openai/gpt-6-astra"]
+    assert sol > 60_000
+    # At least, not exactly: each side is ceil()ed to a whole microdollar (the -5), and
+    # Astra's request is itself a byte longer -- `"prompt":10` against `"prompt":2` -- which
+    # its own input price charges for. The exact figure per model is pinned by
+    # test_every_priced_model_pins_its_id_and_price_and_reserves_from_them.
+    assert astra >= 5 * sol - 5
+
+
+def test_a_poll_on_astra_confirms_a_forecast(case: Any) -> None:
+    """The positive half of the gate: a registered model other than Sol runs a whole poll.
+
+    Without this, reverting `run_once`'s gate to the Sol-only string would survive every
+    other test here, and the first sign would be the live worker refusing every poll.
+    """
+    conn, config, platform, news, model = case
+    astra = _with_model(config, "openrouter/openai/gpt-6-astra")
+    model.model = astra.model.name
+    enable(
+        conn,
+        astra,
+        account_id=42,
+        project_id=32977,
+        starts=utcnow() - timedelta(minutes=1),
+        ends=utcnow() + timedelta(days=1),
+    )
+    result = run_once(
+        conn,
+        astra,
+        client=platform,
+        poster=platform,
+        news_client=news,
+        web_client=object(),
+        forecaster=model,
+    )
+    assert result["refusal_reason"] is None
+    assert result["forecast_confirmed"] == 1 and model.calls == 1
+    recorded = conn.execute("SELECT model_name FROM forecast_records").fetchone()[0]
+    assert recorded == "openrouter/openai/gpt-6-astra"
+
+
+def test_a_model_outside_the_registry_is_refused_before_any_purchase(case: Any) -> None:
+    """`gpt-6-astra-pro` is real on OpenRouter and not registered, so it must not run.
+
+    Refused twice over: `run_once` will not start a poll, and the client will not build.
+    Neither falls through to `GeneralLlm`, which reserves nothing against the budget.
+    """
+    from whiskeyjack_bot.forecast.priced import PricedClient
+
+    conn, config, platform, news, model = case
+    unregistered = _with_model(config, "openrouter/openai/gpt-6-astra-pro")
+    with pytest.raises(TournamentError, match="tournament model"):
+        run_once(
+            conn,
+            unregistered,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=object(),
+            forecaster=model,
+        )
+    assert (platform.posts, news.calls, model.calls) == (0, 0, 0)
+    with pytest.raises(TournamentError, match="not a registered priced model"):
+        PricedClient(unregistered)
+
+
+@pytest.mark.parametrize("name", sorted(PRICED_MODELS))
+def test_every_registered_model_builds_the_priced_client(
+    case: Any, monkeypatch: Any, name: str
+) -> None:
+    """The wiring: `build_forecaster_client` routes every registry model to the priced
+    client, and so never to `GeneralLlm`."""
+    from whiskeyjack_bot.forecast.generate import build_forecaster_client
+    from whiskeyjack_bot.forecast.priced import PricedClient
+
+    _, config, *_ = case
+    config = _with_model(config, name)
+    monkeypatch.setenv(config.model.api_key_env, "test-secret")
+    client = build_forecaster_client(config)
+    assert type(client) is PricedClient
+    assert client.priced is PRICED_MODELS[name]
 
 
 def test_rehearsal_filter_does_not_purchase_another_question(case: Any) -> None:

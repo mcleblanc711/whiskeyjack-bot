@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from whiskeyjack_bot.approval import approve
 from whiskeyjack_bot.config import AppConfig
+from whiskeyjack_bot.forecast.priced import PRICED_MODELS
 from whiskeyjack_bot.forecast.record import record_sha256
 from whiskeyjack_bot.forecast.replay import replay_forecast
 from whiskeyjack_bot.forecast.store import read_forecast_record
@@ -412,7 +413,7 @@ def run_once(
     if not config.submission.post_private_reasoning_comment:
         raise TournamentError("tournament operation requires private reasoning comments")
     if (
-        config.model.name != "openrouter/openai/gpt-5.6-sol"
+        config.model.name not in PRICED_MODELS
         or config.model.temperature is not None
         or config.model.max_output_tokens != 6000
         or config.model.timeout_seconds != 120

@@ -122,7 +122,7 @@ THIRD_PARTY_REACHES: dict[tuple[str, str], str] = {
     # --- asknews ---
     ("research/asknews.py", "name"): "test_the_asknews_author_still_carries_a_name",
     ("forecast/generate.py", "last_cost"): (
-        "not third party -- SolClient's own attribute; the pinned GeneralLlm has no "
+        "not third party -- PricedClient's own attribute; the pinned GeneralLlm has no "
         "last_cost at all (confirmed by execution), so the getattr default is what every "
         "other Forecaster implementation actually takes"
     ),
