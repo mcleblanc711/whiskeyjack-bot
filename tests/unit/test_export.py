@@ -27,6 +27,7 @@ from whiskeyjack_bot.export import (
     EXPORTED_TABLES,
     MANIFEST_FILENAME,
     ExportError,
+    canonical_json,
     export_ledger,
 )
 from whiskeyjack_bot.ledger import LEDGER_SCHEMA_VERSION, LedgerError, connect, connect_readonly
@@ -668,8 +669,14 @@ def _corrupt(
         conn.close()
 
 
+# `problem` is each case's own refusal reason, asserted in the message. Without it every
+# case passed on *any* ExportError naming the table and column, so the export's two layers
+# covered for each other: with the non-finite check deleted, `canonical_json`'s
+# allow_nan=False still refused the row, and with 'blob' admitted as TEXT, the x'00ff' this
+# table used to plant was still refused as invalid UTF-8. Both mutants survived. The blob
+# is now valid UTF-8, so the storage-class check is the only thing standing in its way.
 @pytest.mark.parametrize(
-    ("what", "statement", "parameters", "table", "column"),
+    ("what", "statement", "parameters", "table", "column", "problem"),
     [
         (
             "a non-finite real",
@@ -678,6 +685,7 @@ def _corrupt(
             (TS,),
             "score_events",
             "value",
+            "a non-finite real has no JSON form",
         ),
         (
             "text that is not valid UTF-8",
@@ -687,14 +695,16 @@ def _corrupt(
             (TS,),
             "score_events",
             "metric",
+            "text that is not valid UTF-8",
         ),
         (
             "a blob where the schema declares text",
             "INSERT INTO score_events (forecast_record_id, metric, value, "
-            "implementation_version, computed_at_utc) VALUES ('rec-1', x'00ff', 1.0, 'v1', ?)",
+            "implementation_version, computed_at_utc) VALUES ('rec-1', x'6869', 1.0, 'v1', ?)",
             (TS,),
             "score_events",
             "metric",
+            "declared TEXT but stored as blob",
         ),
         (
             "text where the schema declares a real",
@@ -709,6 +719,7 @@ def _corrupt(
             (),
             "score_events",
             "value",
+            "declared REAL but stored as text",
         ),
     ],
 )
@@ -720,6 +731,7 @@ def test_an_off_contract_stored_value_is_refused_as_an_export_error(
     parameters: tuple[object, ...],
     table: str,
     column: str,
+    problem: str,
 ) -> None:
     """Every malformed shape arrives as this module's own error type.
 
@@ -736,7 +748,21 @@ def test_an_off_contract_stored_value_is_refused_as_an_export_error(
     with pytest.raises(ExportError) as excinfo:
         export_ledger(ledger_path, tmp_path / "out", export_format="jsonl")
     message = str(excinfo.value)
-    assert table in message and column in message, what
+    assert f"{table}.{column}" in message, what
+    assert problem in message, what
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_canonical_json_refuses_a_non_finite_number_on_its_own(value: float) -> None:
+    """The second layer, tested without the first in front of it.
+
+    `_decode_value` refuses a non-finite REAL before any row reaches `canonical_json`, so
+    no export-level test can see `allow_nan=False` -- deleting it survived the mutation
+    pass. It is still load-bearing for anything else that renders through here (the
+    manifest), and Python's default would emit a bare `Infinity` no JSON parser must accept.
+    """
+    with pytest.raises(ExportError, match="cannot render a test value as JSON"):
+        canonical_json({"x": value}, "a test value")
 
 
 def test_a_refusal_names_the_column_and_never_the_bytes(ledger_path: Path, tmp_path: Path) -> None:
