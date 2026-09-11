@@ -39,6 +39,7 @@ from whiskeyjack_bot.submission_payload import authorized_payload
 from whiskeyjack_bot.timeouts import phase_timeout
 from whiskeyjack_bot.tournament_state import (
     ActivationInactive,
+    ActivationRetired,
     Budget,
     StorageFailure,
     TournamentError,
@@ -433,7 +434,24 @@ def run_once(
         poster = SingleAttemptPoster(client) if poster is None else poster
         account = poster.get_current_user_id()
         project = str(config.metaculus.tournament.id)
-        activation = require_activation(conn, config, account_id=account, project_id=project)
+        try:
+            activation = require_activation(conn, config, account_id=account, project_id=project)
+        except ActivationRetired as retired:
+            # M1-334. The notifier is already installed here (since M1-329), so this is
+            # the ordinary `emit` and degrades exactly as every other alert does: a failed
+            # or slow push is absorbed and never changes the refusal below. Names the moved
+            # bindings, never a digest or a config value.
+            emit(
+                "activation_retired",
+                subject=project,
+                title=f"whiskeyjack: project {project} activation retired",
+                body=(
+                    f"Every poll is refusing: {', '.join(retired.changed)} changed since "
+                    "the activation was enabled. Nothing is bought or posted until "
+                    "`tournament enable` is re-run for this profile."
+                ),
+            )
+            raise
         heartbeat: dict[str, Any] = {
             "at": utcnow().isoformat(),
             "discovered": 0,
