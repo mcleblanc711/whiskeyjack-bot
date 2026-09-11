@@ -9912,3 +9912,11 @@ much it removed. This one printed `-4097`, which was the tell.
 **Non-blocking, filed: `M1-613`**, redact configured secrets centrally in
 `tournament_state.append`. This is the Standing-risk item above, with the reviewer's acceptance
 criterion.
+
+### Round 2 — APPROVE, no blocking findings
+
+Reviewed `47bbc82`, the request HEAD. B1 **CLOSED**: the reviewer confirmed by direct execution
+that the non-database file now yields a path-only `LedgerError` with context suppressed, the
+source bytes are untouched, no output is created, and the CLI returns `EXIT_REFUSED`. The prior
+opener still reproduced the raw `sqlite3.DatabaseError`. No new candidates; `M1-613` carries the
+redaction observation. Two rounds.
