@@ -113,8 +113,22 @@ def _text() -> st.SearchStrategy[str]:
     string type refuses a lone surrogate at the question boundary, so no `ForecastRecord`
     can carry one and a strategy that drew them would spend every example on a shape that
     cannot exist. Blank strings are refused by the same models.
+
+    **Constructed, not filtered** (M1-333). The first cut was
+    `ENCODABLE_TEXT.filter(lambda text: bool(text.strip()))`, and measured under
+    `--hypothesis-show-statistics` a quarter of the injectivity property's examples were
+    *aborted* inside that filter -- a second source of `filter_too_much` beside the pair
+    `assume`. Every draw now has a non-space character by construction: optional leading
+    whitespace (so padded text is still reached), one character from no whitespace-bearing
+    category, then an arbitrary encodable tail. `str.isspace` is true only for characters in
+    `Zs`/`Zl`/`Zp` and a handful of `Cc` controls, all excluded from the anchor.
     """
-    return ENCODABLE_TEXT.filter(lambda text: bool(text.strip()))
+    return st.builds(
+        lambda lead, anchor, tail: f"{lead}{anchor}{tail}",
+        st.sampled_from(["", " ", "  ", "\n", "\t "]),
+        st.characters(exclude_categories=["Cc", "Cs", "Zs", "Zl", "Zp"]),
+        ENCODABLE_TEXT,
+    )
 
 
 @st.composite
@@ -393,10 +407,104 @@ def test_the_digest_survives_the_form_the_record_is_stored_in(record: ForecastRe
 # ── invariant 4: injectivity, in both directions ─────────────────────────────
 
 
-@given(first=cheap_records(), second=cheap_records())
-@settings(max_examples=150, deadline=None)
+# The pair is drawn as a *mode* and the second record derived from the first, the way
+# `test_shared_artifact_writer_properties.py` draws its pre-existing file state (M1-333,
+# T-906). The first cut drew two records independently and `assume`d both built: a
+# conjunction of two filters, so the surviving fraction was roughly the square of one
+# record's build rate, the `filter_too_much` health check fired on unlucky seeds (reproduced
+# on master with --hypothesis-seed=37229261598144587348945677694901145758), and the examples
+# that did survive reached the shared-payload arm only when two independent draws collided.
+
+_PAIR_MODES = ("same payload", "different payload", "independent")
+
+
+@st.composite
+def _postable_binary_spec(draw: st.DrawFn) -> float:
+    # Inside Metaculus's [0.001, 0.999], so every draw builds; the out-of-range branch has its
+    # own properties above and is not what injectivity is about.
+    return draw(st.floats(min_value=0.001, max_value=0.999, allow_nan=False))
+
+
+@st.composite
+def _postable_multiple_choice_spec(draw: st.DrawFn) -> tuple[list[str], list[float]]:
+    labels = draw(st.lists(_text(), min_size=2, max_size=4, unique=True))
+    # Weights in [1, 100] normalize to probabilities in [1/301, 100/103], inside the bounds.
+    weights = draw(
+        st.lists(
+            st.floats(min_value=1.0, max_value=100.0, allow_nan=False),
+            min_size=len(labels),
+            max_size=len(labels),
+        )
+    )
+    total = sum(weights)
+    return labels, [weight / total for weight in weights]
+
+
+def _binary_from(probability: float, attempt_id: str) -> ForecastRecord:
+    return _record(
+        _binary_question(),
+        _response("Binary schema", final_prediction={"probability_yes": probability}),
+        attempt_id=attempt_id,
+    )
+
+
+def _multiple_choice_from(spec: tuple[list[str], list[float]], attempt_id: str) -> ForecastRecord:
+    labels, probabilities = spec
+    forecast = _response(
+        "Multiple-choice schema",
+        final_prediction={
+            "options": [
+                {"option": label, "probability": probability}
+                for label, probability in zip(labels, probabilities, strict=True)
+            ]
+        },
+    )
+    return _record(_multiple_choice_question(labels), forecast, attempt_id=attempt_id)
+
+
+@st.composite
+def _record_pairs(draw: st.DrawFn) -> tuple[str, ForecastRecord, ForecastRecord]:
+    mode = draw(st.sampled_from(_PAIR_MODES))
+    if mode == "independent":
+        return mode, draw(cheap_records()), draw(cheap_records())
+    kind = draw(st.sampled_from(["binary", "multiple_choice"]))
+    if kind == "binary":
+        probability = draw(_postable_binary_spec())
+        first = _binary_from(probability, "attempt-1")
+        if mode == "same payload":
+            # A different record -- another attempt produced it -- carrying the same forecast.
+            return mode, first, _binary_from(probability, "attempt-2")
+        other = draw(_postable_binary_spec())
+        if other == probability:
+            # Hypothesis favours the simplest float, so a redraw-until-different filter retried
+            # on most examples. A fixed fallback keeps the arm filter-free.
+            other = 0.5 if probability != 0.5 else 0.25
+        return mode, first, _binary_from(other, "attempt-2")
+    spec = draw(_postable_multiple_choice_spec())
+    first = _multiple_choice_from(spec, "attempt-1")
+    if mode == "same payload":
+        return mode, first, _multiple_choice_from(spec, "attempt-2")
+    other = draw(_postable_multiple_choice_spec())
+    # Compared as label -> probability mappings, because that is what the payload carries:
+    # `(['a','b'], [.5,.5])` and `(['b','a'], [.5,.5])` are different specs and one payload
+    # (round-1 review, reproduced). An ordered comparison let that pair through untouched.
+    if _mapping(other) == _mapping(spec):
+        labels, _ = spec
+        tilted = [0.6] + [0.4 / (len(labels) - 1)] * (len(labels) - 1)
+        uniform = [1 / len(labels)] * len(labels)
+        other = (labels, tilted if _mapping((labels, tilted)) != _mapping(spec) else uniform)
+    return mode, first, _multiple_choice_from(other, "attempt-2")
+
+
+def _mapping(spec: tuple[list[str], list[float]]) -> dict[str, float]:
+    labels, probabilities = spec
+    return dict(zip(labels, probabilities, strict=True))
+
+
+@given(pair=_record_pairs())
+@settings(max_examples=200, deadline=None)
 def test_two_records_share_a_digest_exactly_when_they_derive_one_payload(
-    first: ForecastRecord, second: ForecastRecord
+    pair: tuple[str, ForecastRecord, ForecastRecord],
 ) -> None:
     """The property the whole binding rests on.
 
@@ -405,14 +513,30 @@ def test_two_records_share_a_digest_exactly_when_they_derive_one_payload(
     converse matters too and is the direction a naive implementation breaks: two records
     that derive the same payload must share a digest, or an approval would stop binding to
     a forecast whose payload never changed.
+
+    Both directions are reached by construction and tagged, so the statistics show how many
+    examples exercised each rather than leaving it to how often two draws happen to agree.
+    The derived modes must build -- a refusal there is a strategy defect and fails loudly --
+    while the independent mode keeps the old unconstrained shape and tags an unbuildable pair
+    instead of filtering it.
     """
+    mode, first, second = pair
+    if mode != "independent":
+        assert first != second, "a derived pair is two records, even when they share a payload"
     left = _build(first)
     right = _build(second)
-    assume(left is not None and right is not None)
-    assert left is not None and right is not None
+    if mode != "independent":
+        assert left is not None and right is not None, f"a {mode} pair must build"
+    if left is None or right is None:
+        event("independent pair: at least one record refused")
+        return
     left_digest = payload_sha256_for_record(first, calibration=CALIBRATION)
     right_digest = payload_sha256_for_record(second, calibration=CALIBRATION)
-    event(f"same payload={left == right}")
+    event(f"reached: {mode}, same payload={left == right}")
+    if mode == "same payload":
+        assert left == right
+    if mode == "different payload":
+        assert left != right, "a different-payload pair must derive two payloads"
     assert (left == right) == (left_digest == right_digest)
 
 

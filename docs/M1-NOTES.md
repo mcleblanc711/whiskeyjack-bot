@@ -10085,3 +10085,74 @@ The first poll on Astra (05:50:00) finished `Result=success`, `ExecMainStatus=0`
 been billed yet. The first real one will show in the ledger as a `model_response` event whose
 `model` field names `openai/gpt-6-astra`.
 
+## M1-333 — Stop the payload injectivity property filtering itself red (closes T-906)
+
+Acceptance: *the property draws the digest relationship as a mode, shared versus distinct,
+and derives the second record from the first, so both arms are reached without `assume()`.
+`HealthCheck.filter_too_much` is NOT suppressed. A mutation pass shows both arms are
+load-bearing. It passes at 200 examples under the recorded seed and a sweep of at least twenty
+more.* T-906 is the same defect in the same test, filed earlier from M2-707's round-2 review.
+Its criteria are met here too (both directions tagged, reach fraction measured), and it is
+closed as a duplicate.
+
+### Delivered
+
+`tests/property/test_submission_payload_properties.py` only; no source change.
+`_record_pairs()` draws a mode from `same payload`, `different payload` and `independent`:
+
+- **same payload:** the same forecast recorded under a second `attempt_id`, so it is a
+  different record.
+- **different payload:** a derived second forecast.
+- **independent:** the old unconstrained shape. An unbuildable pair is tagged and returned,
+  never `assume`d away.
+
+`_text()` now **constructs** non-blank text (optional leading whitespace, a character from no
+whitespace-bearing category, an encodable tail) instead of filtering for it.
+
+### Measured
+
+- **The defect reproduces on master:** `FailedHealthCheck … 8 inputs were generated
+  successfully, while 50 inputs were filtered out` under
+  `--hypothesis-seed=37229261598144587348945677694901145758 -p no:randomly`.
+- **There were two filter sources, not one.** Under `--hypothesis-show-statistics`, about a
+  quarter of the examples were *aborted inside `_text()`'s own filter*, before the pair
+  `assume` ran. Fixing only the `assume` would have left the flake. Now it is 150 passing to
+  18 invalid (label-uniqueness retries and one pre-existing `assume` in the independent mode's
+  multiple-choice strategy). Arms reached: same payload about 26%, different payload about
+  28%, independent the rest.
+- **Seed sweep:** the recorded seed plus 20 more at 200 examples, **21 of 21 passed**, counted
+  by exit code. The first count read the `-q` output for a "passed" line that `-q -q` never
+  prints and reported 0 of 21. It was recounted rather than believed.
+
+### Teeth — and what the old property could not see
+
+Two mutants of `payload_sha256_for_record`, each run against the property under `ci`:
+
+- **Shared arm broken** (the digest also keys `record.attempt_id`): **killed**.
+- **Distinct arm broken** (the digest keys only `question_type`): **killed**.
+
+**The old property survived the shared-arm mutant on all five seeds tried.** It reached the
+"same payload" direction only when two independent draws collided, and a collided pair was the
+*same record*, so a digest keyed on record identity instead of the payload was invisible to
+it. The flake was the visible symptom. The vacuity it hid was half the biconditional that
+approval binding rests on (D33). This is the vacuous-property class again, in its "strategy
+cannot reach the branch" form.
+
+### Rejected — suppressing `filter_too_much`, and why not
+
+A filter rate that high is the evidence, not the noise. The shared-arm result above is what it
+was hiding.
+
+### Round 1 — APPROVE, no blocking findings; the one observation taken
+
+Reviewed `fe0f0cb`, the request HEAD. The reviewer independently reproduced the base's 8/50
+health-check failure, confirmed the recorded seed plus seeds 0–19 at 200 examples, killed both
+arm mutants, and confirmed that the old property survived the attempt-ID mutant on seeds 0–4.
+
+**Observation (non-blocking, reproduced, taken):** the multiple-choice "different payload" arm
+detected a collision by comparing *ordered* specs, but the payload is a label-to-probability
+mapping. So `(['a','b'], [.5,.5])` against `(['b','a'], [.5,.5])` bypassed the fallback and was
+tagged "different payload" while deriving one payload. The biconditional still judged it
+correctly; only the arm label was false. Collisions are now compared as mappings, and the
+different-payload mode asserts `left != right`. Re-swept: 21 of 21.
+
