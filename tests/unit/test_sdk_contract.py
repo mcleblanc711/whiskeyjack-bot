@@ -89,6 +89,10 @@ THIRD_PARTY_REACHES: dict[tuple[str, str], str] = {
     # --- forecasting-tools: guarded here, by this module ---
     ("submission_live.py", "api_json"): "test_both_readers_agree_on_one_forecast_history",
     ("questions/normalize.py", "api_json"): "test_both_readers_agree_on_one_forecast_history",
+    ("submission_policy.py", "api_json"): (
+        "test_the_numeric_scaling_shape_submission_policy_reads_is_the_sdks plus "
+        "test_the_project_membership_shape_submission_policy_reads_is_the_sdks"
+    ),
     ("submission_live.py", "state"): "test_the_open_state_is_the_string_the_refusal_compares",
     ("submission_live.py", "value"): "test_the_open_state_is_the_string_the_refusal_compares",
     ("cli.py", "question_type"): "test_the_question_type_attribute_exists_on_the_real_classes",
@@ -117,6 +121,11 @@ THIRD_PARTY_REACHES: dict[tuple[str, str], str] = {
     ("research/transport.py", "_pool"): "test_the_connection_pool_already_has_the_field_we_set",
     # --- asknews ---
     ("research/asknews.py", "name"): "test_the_asknews_author_still_carries_a_name",
+    ("forecast/generate.py", "last_cost"): (
+        "not third party -- SolClient's own attribute; the pinned GeneralLlm has no "
+        "last_cost at all (confirmed by execution), so the getattr default is what every "
+        "other Forecaster implementation actually takes"
+    ),
     # --- not third party: this project's own optional dataclass fields ---
     ("forecast/artifacts.py", "request"): "not third party",
     ("forecast/artifacts.py", "raw_responses"): "not third party",
@@ -316,6 +325,77 @@ def test_the_sdk_reader_loses_the_history_when_an_unrelated_key_is_missing() -> 
     assert question.previous_forecasts is None, "the SDK's reader gave up"
     ours = read_my_forecasts(question)
     assert ours is not None and len(ours.entries) == len(HISTORY), "the raw path did not"
+
+
+def _numeric_question_from_fixture() -> Any:
+    post = json.loads((API_POSTS / "numeric_post.json").read_text(encoding="utf-8"))
+    return DataOrganizer.get_question_from_post_json(post)
+
+
+def test_the_numeric_scaling_shape_submission_policy_reads_is_the_sdks() -> None:
+    """`submission_policy.before_post` reads `api_json["question"]["scaling"]` by hand.
+
+    A third reach into `api_json`, alongside the two `test_both_readers_agree_on_one_
+    forecast_history` already guards -- but a different sub-path, so that test passing
+    says nothing about this one. The refusal it backs (`live numeric bounds are
+    unreadable; nothing was posted`) exists specifically because this shape is read off a
+    hand-written `FakeQuestion` everywhere else in the test suite (`test_cli_submit.py`),
+    which by construction cannot detect the assumption being wrong.
+    """
+    question = _numeric_question_from_fixture()
+    raw = getattr(question, "api_json", None)
+    _requires(raw is not None, "api_json on a real NumericQuestion")
+    inner = raw.get("question", {}) if isinstance(raw, dict) else {}
+    scaling = inner.get("scaling", {})
+    assert isinstance(scaling, dict)
+    assert {"range_min", "range_max", "zero_point", "inbound_outcome_count"} <= scaling.keys()
+    assert all(type(inner.get(k)) is bool for k in ("open_lower_bound", "open_upper_bound"))
+
+
+def test_removing_a_scaling_key_makes_submission_policys_own_check_refuse() -> None:
+    """The mutation: reproduce `before_post`'s exact condition, one key short.
+
+    Copied rather than imported because the real condition lives inline inside a closure
+    factory (`build_before_post`) that needs a live ledger connection and activation to
+    construct -- this asserts the boolean expression it evaluates would flip, which is
+    the property that matters for a guard.
+    """
+    inner = {
+        "scaling": {"range_min": 0.0, "range_max": 1.0, "zero_point": None},
+        "open_lower_bound": False,
+        "open_upper_bound": True,
+    }
+    scaling = inner.get("scaling", {})
+    unreadable = (
+        not isinstance(scaling, dict)
+        or not {"range_min", "range_max", "zero_point", "inbound_outcome_count"} <= scaling.keys()
+        or any(type(inner.get(k)) is not bool for k in ("open_lower_bound", "open_upper_bound"))
+    )
+    assert unreadable, "missing inbound_outcome_count must trip the refusal"
+
+
+def test_the_project_membership_shape_submission_policy_reads_is_the_sdks() -> None:
+    """`submission_policy.before_post` also reads `api_json["projects"]` by hand.
+
+    The activated-project check (`live question is not in the activated project`) walks
+    `projects.values()` looking for a dict carrying `id`. On a real MiniBench post that id
+    lives on `projects["default_project"]`, not on the `"tournament"` list entries (those
+    carry only `slug`/`name`) -- a detail no hand-written double would surface unless it
+    happened to be written to match, which is exactly what every existing caller does.
+    """
+    question = _numeric_question_from_fixture()
+    api = getattr(question, "api_json", None)
+    _requires(api is not None, "api_json on a real NumericQuestion")
+    projects = api.get("projects", {}) if isinstance(api, dict) else {}
+    memberships = [
+        p
+        for values in projects.values()
+        for p in (values if isinstance(values, list) else [values])
+        if isinstance(p, dict)
+    ]
+    with_id = [p for p in memberships if "id" in p]
+    _requires(bool(with_id), "at least one projects entry carrying an id")
+    assert isinstance(with_id[0]["id"], int)
 
 
 def test_the_multiple_choice_reader_still_populates_nothing() -> None:

@@ -3014,7 +3014,17 @@ dependency: this item claimed neither in `docs/TRACKS.md`.
 
 ## M2-705 — Spike: exact response capture
 
-### Evidence — what the live ledger holds after 22 real submissions
+Acceptance: *decision and test evidence recorded; no private package method dependency
+without a guard.*
+
+### Decision — the refetch receipt is sufficient; no HTTP adapter is added
+
+`D28`'s revisit trigger was explicit: *"Refetch cannot establish submission outcome."* This
+spike's answer is that it can, for every cell the evidence and the driven partition together
+cover, and the residual is a live-platform behaviour this project has not yet observed rather
+than one this spike found a way to demonstrate.
+
+#### Evidence — what the live ledger holds after 22 real submissions
 
 Read from the operator's own ledgers on **2026-09-09**, after MiniBench's first batch closed
 and the Cup profile had run. This is production evidence, not fixture evidence, and it is the
@@ -3059,27 +3069,31 @@ entry counts, label order and the classified outcome** — the full input to `cl
 not merely its verdict. A reader of the ledger can therefore re-derive *why* an attempt was
 called confirmed, which is the property an attribution instrument actually needs.
 
-### What this does and does not settle
+#### What this does and does not settle
 
 It settles the **common** cell. For a first-try confirmed submission, the ledger already holds
 enough to answer "what did the platform show, and why did we call that a match?" without the
 response body. The row-count argument that an exact response is *needed* is not available on
 this evidence: 22 of 22 confirmations are already auditable.
 
-It settles **nothing** about the cells that have never occurred. `refetch_outcome` has four
-members and the live ledger has exercised **one**. `unreadable` and `mismatched` both raise in
-`verify_uncertain_attempt` rather than recording, and `absent` has never fired. The interesting
-question — whether a refetch can be *wrong* rather than merely absent — remains untested by
-production and is exactly what `tests/integration/test_receipt_sufficiency.py`'s eight-cell
-partition exists to drive.
+It settles **nothing** about the cells that have never occurred **in production** —
+`refetch_outcome` has four members and the live ledger has exercised **one**. That gap is why
+the decision does not rest on the production count alone: `tests/integration/
+test_receipt_sufficiency.py` drives the full eight-cell `(success, refetch_outcome)` partition
+directly at the writer, asserted total against the `RefetchOutcome` vocabulary, and pins by
+execution — not by reading — that an exact response would not change any verdict even where it
+exists (a confirming refetch cannot distinguish our post from any other writer's; a response
+body describing a different question does not move the outcome; the retry budget is for an
+unreachable platform, not a slow one). That driven partition, not the 22-row count, is the
+actual basis for the decision.
 
-**A caution against reading this as "the receipt is sufficient, done."** Zero occurrences of a
-cell is weak evidence about that cell; it may mean the condition is rare, or it may mean the
-tournament has not yet met the platform state that produces it. The spike's conclusion should
-rest on the driven partition, with these figures as the reason the *default* leans toward
-sufficiency rather than as proof of it.
+**A caution against reading the production count as "the receipt is sufficient, done."** Zero
+occurrences of a cell in production is weak evidence about that cell; it may mean the condition
+is rare, or it may mean the tournament has not yet met the platform state that produces it. The
+decision rests on the driven partition, with these production figures as the reason the
+*default* leans toward sufficiency rather than as proof of it on their own.
 
-### Provenance
+#### Provenance
 
 Gathered 2026-09-09 while confirming a separate claim about `submission_verifications` — which
 is empty, and correctly so: it is written only by `verify_uncertain_attempt`, the operator's
@@ -3088,3 +3102,83 @@ happy path stores its snapshot on `submission_attempts` instead. The absence of
 `submission_confirmed` lifecycle events has the same explanation: that transition is the way
 back out of `approved`, and nothing has needed recovering. Recorded here because an empty
 verification table reads like a gap and is not one.
+
+#### Found closing this item — a master-drift gap in the branch's own gate
+
+`scripts/gate.sh` had never had a clean run recorded on this branch. Running it before
+opening the PR turned up two real gaps, both caused by master merges landing *after* this
+branch's evidence/guard tests were written, neither found by the tests themselves until the
+gate was actually run:
+
+- `test_no_new_reach_escapes_this_table` failed on two reaches this table did not know
+  about: `("forecast/generate.py", "last_cost")` and `("submission_policy.py", "api_json")`.
+  Both were added by `dc3c729` ("Implement activated tournament runner...", 2026-09-06),
+  merged into this branch afterward. `last_cost` is `SolClient`'s own attribute (the pinned
+  `GeneralLlm` has none — confirmed by execution) and is filed "not third party";
+  `submission_policy.py`'s two `api_json` reaches (`scaling`, `projects`) are genuinely
+  third-party and are now guarded by two new tests, because the only existing coverage of
+  those shapes was a hand-written `FakeQuestion` in `test_cli_submit.py`, built to match the
+  assumption rather than to check it.
+- Every `test_receipt_sufficiency.py` test that posts failed with `tournament activation is
+  disabled`: `dc3c729` also put an activation precondition in front of every real post, and
+  this file's evidence tests — authored 2026-09-05, one day before that commit — never
+  acquired one. Fixed the same way its sibling `test_submission_integration.py` already
+  fixes the identical problem: an autouse fixture that monkeypatches
+  `submission_live.prepare_live_policy` to a no-op, since this module's claims are about the
+  receipt and the refetch, not about activation (the launch integration tests exercise
+  activation itself). Not a new pattern — copied from precedent already in the tree.
+
+Neither gap changes the decision above; both are the guard table and the fixture chain
+catching up to code that moved after they were written.
+
+### Deviation — the guard audit is not scoped to the submission seam
+
+The acceptance criterion's second clause — "no private package method dependency without a
+guard" — is unqualified, so `tests/unit/test_sdk_contract.py`'s `THIRD_PARTY_REACHES` table
+covers every reach into `forecasting-tools`' pinned shape found by scanning `src/`, not only
+the ones under the submission seam. The one private-*method* call in the repository,
+`NumericDistribution._get_cdf_at` in `forecast/cdf.py`, is nowhere near submission and is
+guarded and mutation-tested by the same module. Narrowing the audit to submission would have
+left that call as the one place the criterion's own words say should not exist unguarded.
+
+### Rejected — import-time assertions instead of test-module guards
+
+`metaculus/client.py`'s `__wrapped__` reach (unwrapping the SDK's blind-retrying POST) is
+already guarded by `_assert_single_post_is_reachable()`, called at import time in the module
+that owns the reach — the pattern this spike could have extended to the other guards.
+
+It was rejected for the guards that live against `submission_live.py`'s reaches (`api_json`,
+`state`/`value`, `__module__`, `__cause__` and the `response`/`status_code`/`text`/`headers`
+walk reached through it) because `submission_live.py` deliberately imports nothing from
+`forecasting_tools` — that is existing, reviewed structure, not an oversight this spike found.
+Turning an already-merged module's silent `getattr(..., None)` degradation into an import-time
+refusal would be a behaviour change (a missing attribute currently degrades a forecast rather
+than crashing the process at startup), and no acceptance criterion on this branch asks for that
+change. The guards instead live in `tests/unit/test_sdk_contract.py`, each mutation-tested by
+removing the attribute from a stand-in and asserting the guard fails — which catches the same
+drift at the next `uv sync` / CI run rather than at process start, at the cost of not catching
+it until then.
+
+### Deferred (do not read the absence as an omission)
+
+- **No HTTP adapter is filed as a follow-up backlog row.** The decision above is that the
+  refetch receipt is sufficient, not "insufficient, deferred" — so there is no adapter
+  implementation waiting on a future item. If a future platform behaviour surfaces one of the
+  cells this spike could not exercise in production (see Standing risk) and that cell turns out
+  to need an exact response body to resolve correctly, that would be new evidence against this
+  decision and the item to revisit is `D28`, not a pre-filed adapter row.
+- **The `unreachable`/`mismatched` raise paths in `verify_uncertain_attempt` are not changed
+  to record instead.** Whether an uncertain-refetch outcome should be recorded rather than
+  raised is a question about that function's contract, not about whether the ledger needs a
+  response body, and is out of scope for a spike whose job is the sufficiency decision.
+
+### Standing risk — not verifiable offline
+
+`refetch_outcome` has exercised exactly one of its four members in production
+(`confirmed`, 22/22). `unreadable` and `mismatched` have never been produced by the live
+platform and `absent` has never fired; all three are covered by `test_receipt_sufficiency.py`'s
+driven partition, but a driven test proves the code's behaviour on a constructed input, not that
+the live platform is incapable of a shape neither the fixtures nor 22 real attempts have shown.
+Sockets are blocked in this test suite by design, so no test run — driven or production-log —
+can rule out a platform response shape this spike has not seen. That residual carries forward
+against `D28` rather than being closed by this item.

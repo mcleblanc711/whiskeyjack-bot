@@ -505,3 +505,16 @@ def test_the_eight_cells_are_the_whole_partition() -> None:
         (success, outcome) for success in (True, False) for outcome in outcomes
     }
     assert len(_CELLS) == 2 * len(outcomes)
+
+
+@pytest.fixture(autouse=True)
+def isolate_activation_policy_for_receipt_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same pattern as test_submission_integration.py's isolate_activation_policy_for_
+    # transport_tests, added after "Implement activated tournament runner with durable
+    # submission and spending guards" (dc3c729) landed a day after this module's evidence
+    # tests were written and put an activation precondition in front of every real post.
+    # This module's claims are about the receipt and the refetch, independent of activation
+    # -- the launch integration tests exercise activation itself.
+    monkeypatch.setattr(
+        "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
+    )
