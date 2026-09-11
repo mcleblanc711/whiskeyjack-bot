@@ -9920,3 +9920,116 @@ that the non-database file now yields a path-only `LedgerError` with context sup
 source bytes are untouched, no output is created, and the CLI returns `EXIT_REFUSED`. The prior
 opener still reproduced the raw `sqlite3.DatabaseError`. No new candidates; `M1-613` carries the
 redaction observation. Two rounds.
+
+## M1-408 — Run the tournament forecaster on GPT-6 Astra through the priced client
+
+Acceptance: *the priced client accepts only registry models; for each, the request pins the
+model ID and a `max_price` equal to its registered prices, and the budget reservation is
+derived from those prices (Astra reserves at least 5x Sol for the same request); `run_once`
+refuses a model outside the registry; `config/tournament.yaml` names Astra; the live switch is
+recorded with a re-enabled activation.* Owner decision 2026-09-10.
+
+### Delivered
+
+- `src/whiskeyjack_bot/forecast/priced.py` (renamed from `forecast/sol.py`): `PricedModel`,
+  `PRICED_MODELS`, `MAX_OUTPUT_TOKENS`, `build_request`, `reservation_estimate_usd`, and
+  `PricedClient` (formerly `SolClient`).
+- `forecast/generate.py` and `tournament.py`: both gate on `PRICED_MODELS` instead of the
+  Sol string.
+- `config/tournament.yaml`: `model.name: openrouter/openai/gpt-6-astra`. The dormant Cup
+  profile and the Cup rehearsal profile stay on Sol.
+- Tests: six new unit tests in `tests/unit/test_tournament.py`, plus
+  `tests/property/test_priced_properties.py` (six properties). The three existing test files
+  that named `SolClient` were updated to `PricedClient`.
+
+**No migration, no dependency, no new `AppConfig` field.** The one config *value* that changes
+still changes `config_sha256`, which is the point: see the Deviation below.
+
+### What the item is actually guarding against
+
+A model switch here is three numbers, not one: the OpenRouter model ID, the `max_price`
+OpenRouter may route at, and the estimate `Budget.reserve` holds before the call. Launch
+hard-coded all three from Sol's prices. There were two tempting shortcuts, and both are wrong:
+
+- **Config only.** `run_once` refuses any model but Sol, so the worker would refuse every
+  poll. That fails safe but is useless.
+- **Config plus relaxing the gate.** `build_forecaster_client` would hand a non-Sol model to
+  `GeneralLlm`, which reserves **nothing** against the tournament budget. Model spend would
+  be uncapped, and the budget ceiling is what stops the worker.
+
+Raising `max_price` without the estimate is the quieter version of the same failure. Astra is
+5x Sol on both sides, so the old estimate would hold a fifth of what a call can bill.
+
+### Decision — one registry, and both numbers derived from its one pair of prices
+
+`PRICED_MODELS` maps the LiteLLM name to `PricedModel(openrouter_id, prompt, completion)`.
+`build_request` takes `max_price` from those prices, and `reservation_estimate_usd` takes the
+estimate from the same two fields. There is no second place to update, so the regression above
+has no line to be written on. The registry is closed: `run_once`, `build_forecaster_client`
+and `PricedClient.__init__` each refuse a name outside it.
+
+### Decision — Sol is unmoved, and that is proved rather than asserted
+
+- **The request is byte-identical to Launch's literal.** Prices are stored as ints so that
+  `"max_price":{"prompt":2,"completion":10}` renders exactly as before. The request's digest
+  keys every `model_started`/`model_completed` cache scope in the live ledger, so identical
+  bytes mean a Sol call from before the refactor is still found as the same call. It is
+  neither re-bought nor orphaned mid-outcome. Pinned by a property.
+- **The estimate is bit-identical to Launch's formula.** It keeps the two-term order of
+  operations. Measured: summing over a single `/ 1_000_000` changes the last bit for **61,894
+  of the first 300,000** request sizes. Pinned by a float-equality property.
+
+### Decision — Astra at `max_price` 10/50, and why that number
+
+OpenRouter's public listing on 2026-09-10 showed Astra endpoints at 5/25 (batch), 10/50
+(standard, OpenAI and Azure), 11/55 (Azure) and 20/100. 10/50 is the standard rate. With
+`allow_fallbacks: False` and `require_parameters: True` unchanged, it excludes the pricier
+tiers rather than paying for them. Astra's `supported_parameters` match Sol's exactly
+(`reasoning`, `max_tokens`, …), so the same request shape is valid.
+
+### Deviation — switching the model retires the live MiniBench activation, deliberately
+
+`config_sha256` digests the config, so the new `model.name` retires activation `2bfd17f3…`
+the moment the live checkout pulls it. This is the M1-334 mechanism, and here it is the
+intended behaviour: an activation authorizes spending under one exact configuration. The
+switch is therefore operational, not just a merge: pull, then `tournament enable` again.
+The re-enable is recorded below when it happens.
+
+### Rejected — relaxing the gate and letting `GeneralLlm` serve Astra, and why not
+
+It reserves nothing against the tournament budget. See above.
+
+### Rejected — an open registry read from config, and why not
+
+Prices in YAML would put the reservation's basis in the same file an operator edits to switch
+models. That would reopen "raise one number, forget the other", now as a config typo. The
+prices are code, reviewed with the tests that pin them.
+
+### Deferred (do not read the absence as an omission)
+
+- **Astra-Pro, or any third model.** Adding one is a registry line and a price, reviewed.
+- **Cup and Cup-rehearsal profiles** stay on Sol: the Cup is withdrawn and dormant.
+
+### Standing risk — not verifiable offline
+
+- **OpenRouter can change Astra's price.** If it rises above 10/50, `max_price` makes OpenRouter
+  refuse, and the call fails closed as `priced model request failed or was unavailable at the
+  authorized price`. That reads like a dead key; the M1-329 `provider_failed` alert is the
+  signal. A cut is harmless: the reservation over-holds and settles down to the actual cost.
+- **Live seam, smoke-tested 2026-09-11 00:23 MDT.** `build_forecaster_client` on the new
+  `config/tournament.yaml` returned `PricedClient` for `openai/gpt-6-astra` at `max_price`
+  10/50. One real call with no budget context (no ledger write) answered `'ok'` in 5.0s, so
+  OpenRouter accepts Astra with `require_parameters` and no fallbacks at that ceiling.
+  `usage.cost` came back `0.0`, the same counter granularity on tiny calls recorded for Sol.
+- **Budget arithmetic.** Per question, Astra's model *reservation* is roughly 5x Sol's
+  (~$0.35 against ~$0.07 for a typical prompt) before it settles to the actual cost.
+
+### Teeth — the mutation pass
+
+Against a committed tree with `PYTHONDONTWRITEBYTECODE=1` and `HYPOTHESIS_PROFILE=ci`. Each
+mutant was checked to occur exactly once and to print its size change. **11 mutants, 11 killed:**
+estimate from Sol's prompt price; estimate from Sol's completion price; estimate over one
+division; `max_price` pinned to Sol; model ID pinned to Sol; registry prices as floats (changes
+Sol's request bytes); fallbacks allowed; client admits any model; `run_once` gate back to
+Sol-only (killed only by `test_a_poll_on_astra_confirms_a_forecast`, which was written for
+exactly that); `run_once` gate admits any model; builder routes only Sol to the priced client.
