@@ -3185,3 +3185,13 @@ the live platform is incapable of a shape neither the fixtures nor 22 real attem
 Sockets are blocked in this test suite by design, so no test run — driven or production-log —
 can rule out a platform response shape this spike has not seen. That residual carries forward
 against `D28` rather than being closed by this item.
+
+### Round 1 — APPROVE, two non-blocking observations addressed before merge
+
+Reviewed at `a256701`. Zero blocking findings. Two non-blocking observations, both correct
+and both fixed rather than deferred, since neither needed a second round: the "does not
+settle" wording above overstated a measurement of current behaviour as proof an exact
+response could never help, reworded to separate the two; and
+`test_a_platform_rounded_value_is_recorded_as_a_mismatch` added `1e-6` to `0.37` and rounded
+to six places, which is a no-op at that precision — renamed and reworded to claim only the
+tolerance-exceeding drift it actually drives.
