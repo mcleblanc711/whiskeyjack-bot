@@ -9884,3 +9884,31 @@ unit test is what shows the export issues the `ORDER BY`.
 master merge, `c986ca4`, resolved that row back to `*free*`. Enforcement never lapsed:
 `scripts/tracks.py` reads only the Worktrees `Adds deps?` column, which kept `**yes**`. But for
 five days the prose told the next wave the slot was free. It was restored on this branch.
+
+### Round 1 — CHANGES REQUESTED, one blocking finding, real
+
+Reviewed `ffbea43`, the request HEAD. All nine declared risk areas were judged safe.
+
+**B1: a file that is not a database escaped as a raw `sqlite3.DatabaseError`.** Reproduced
+before any fix, by execution against `ffbea43`: `export_ledger` on a text file raised
+`sqlite3.DatabaseError: file is not a database` with `__suppress_context__` false, and
+`whiskeyjack-bot export` crashed rather than refusing. The cause is that a `mode=ro` open is
+lazy. The file opens fine, and the first statement to touch it is `_verify_schema`'s
+`sqlite_master` probe, which sat outside every sanitizing arm. `connect` never met this,
+because its guarded `journal_mode` pragma fails first. That makes it a defect **introduced
+by** the third opener: the reviewer confirmed the base's `open_verified_ledger` refuses the
+same file cleanly. The fix is one arm, `except sqlite3.Error` → path-only `LedgerError`
+`from None`, with the existing close-and-reraise kept for everything else. Regressions sit at
+both levels: the module (sanitized, context suppressed, file untouched, nothing written) and
+the CLI (`EXIT_REFUSED`).
+
+Both regressions were confirmed red with the arm removed. **The first attempt at that check
+reported green, and the mutant was the defect, not the tests.** `ledger.py` contains the
+`except BaseException: conn.close(); raise; return conn` tail twice (`open_verified_ledger`
+has the same one), so slicing to "the next occurrence" without a start offset found the
+*earlier* copy and inserted code instead of removing it. A mutation script should report how
+much it removed. This one printed `-4097`, which was the tell.
+
+**Non-blocking, filed: `M1-613`**, redact configured secrets centrally in
+`tournament_state.append`. This is the Standing-risk item above, with the reviewer's acceptance
+criterion.
