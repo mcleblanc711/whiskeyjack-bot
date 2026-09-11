@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from whiskeyjack_bot.export import (
@@ -269,11 +269,42 @@ def test_a_lone_surrogate_cannot_be_stored_as_text_at_all(
 # ---------------------------------------------------------------------------------------
 
 
+# A marker no fixed message contains. Searching the message for the drawn value itself
+# gives false positives on short draws -- b"_" is inside "research_documents", measured --
+# and the first version filtered those out with a length floor on `str` draws only, so a
+# one-byte `bytes` draw failed the property under the randomized profile while the
+# derandomized gate never drew it. Every text or bytes value carries this marker instead,
+# and the marker is what is searched for.
+LEAK_CANARY = "zQ9canary9Qz"
+
+CANARY_TEXT = st.builds(lambda a, b: f"{a}{LEAK_CANARY}{b}", HOSTILE_TEXT, HOSTILE_TEXT)
+CANARY_BYTES = st.builds(
+    lambda a, b: a + LEAK_CANARY.encode() + b, st.binary(max_size=12), st.binary(max_size=12)
+)
+
+LEAK_VALUES = st.one_of(
+    st.none(),
+    st.integers(min_value=-(2**63), max_value=2**63 - 1),
+    st.floats(allow_nan=True, allow_infinity=True),
+    CANARY_BYTES,
+    CANARY_TEXT,
+)
+
+
 @given(
     declared=DECLARED_TYPES,
     storage_class=STORAGE_CLASSES,
-    value=STORED_VALUES,
+    value=LEAK_VALUES,
 )
+# Pinned rather than left to the draw, because each refusal carrying a value is reached by
+# only a few percent of random draws: invalid UTF-8 (the one arm that raises *inside* an
+# `except`, so it is the one `from None` is about), text that did not arrive as bytes, a
+# declared/stored mismatch, and a non-finite REAL.
+@example(declared="TEXT", storage_class=b"text", value=b"\xff" + LEAK_CANARY.encode())
+@example(declared="TEXT", storage_class=b"text", value=LEAK_CANARY)
+@example(declared="TEXT", storage_class=b"integer", value=LEAK_CANARY.encode())
+@example(declared="INTEGER", storage_class=b"integer", value=LEAK_CANARY)
+@example(declared="REAL", storage_class=b"real", value=float("inf"))
 def test_a_refusal_never_echoes_the_value_it_refused(
     declared: Any, storage_class: bytes, value: object
 ) -> None:
@@ -291,26 +322,16 @@ def test_a_refusal_never_echoes_the_value_it_refused(
         rendered = f"{exc}{exc.__cause__}{exc.__context__}"
         assert "research_documents" in rendered
         assert "title" in rendered
-        # from None everywhere, so a rendered traceback cannot reprint the value.
+        # from None everywhere, so a rendered traceback cannot reprint the value. Checking
+        # `__cause__` alone is not enough: an implicitly chained raise also leaves it None,
+        # and only `__suppress_context__` tells the two apart.
         assert exc.__cause__ is None
-        if isinstance(value, str) and value.strip() and not _is_trivial(value):
-            assert value not in rendered
-        if isinstance(value, bytes) and value:
-            assert repr(value) not in rendered
-            assert value.decode("latin-1") not in rendered
+        assert exc.__context__ is None or exc.__suppress_context__
+        if isinstance(value, (str, bytes)):
+            assert LEAK_CANARY not in rendered
         if isinstance(value, float) and not math.isfinite(value):
             assert "inf" not in rendered.lower().replace("finite", "")
             assert "nan" not in rendered.lower()
-
-
-def _is_trivial(value: str) -> bool:
-    """Short fragments that legitimately occur inside the fixed message text.
-
-    Without this the property fails on a drawn value of "e" or "a", which is a false
-    positive about leakage rather than a leak -- and quietly widening the assertion to
-    make those pass is how a no-leak property becomes vacuous.
-    """
-    return len(value.strip()) <= 2
 
 
 # ---------------------------------------------------------------------------------------
