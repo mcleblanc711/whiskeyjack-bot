@@ -260,6 +260,14 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
         raise LedgerError(f"cannot open ledger database at {path}") from None
     try:
         _verify_schema(conn, path)
+    except sqlite3.Error:
+        # A read-only open is lazy: a file that is not a database at all opens fine and
+        # fails at the first statement, which is _verify_schema's `sqlite_master` probe.
+        # `connect` never reaches that probe raw -- its journal_mode pragma is guarded and
+        # fails first -- so without this arm the third opener was the one that let
+        # `file is not a database` escape unsanitized (GPT review round 1, B1).
+        conn.close()
+        raise LedgerError(f"cannot read ledger database at {path}") from None
     except BaseException:
         conn.close()
         raise

@@ -859,6 +859,26 @@ def test_a_missing_ledger_is_refused_and_not_created(tmp_path: Path) -> None:
     assert not missing.exists()
 
 
+def test_a_file_that_is_not_a_database_is_refused_as_a_ledger_error(tmp_path: Path) -> None:
+    """GPT review round 1, B1: an ordinary wrong-path mistake, not a hostile file.
+
+    A `mode=ro` open is lazy, so a non-database opens fine and fails at the first
+    statement -- `_verify_schema`'s `sqlite_master` probe, which sat outside every
+    sanitizing arm and escaped as a raw `sqlite3.DatabaseError`. `connect` never met this
+    because its guarded `journal_mode` pragma fails first.
+    """
+    not_a_ledger = tmp_path / "notes.md"
+    not_a_ledger.write_text("# not a database\n" * 64, encoding="utf-8")
+    before = not_a_ledger.read_bytes()
+    with pytest.raises(LedgerError) as excinfo:
+        export_ledger(not_a_ledger, tmp_path / "out", export_format="jsonl")
+    assert str(not_a_ledger) in str(excinfo.value)
+    assert excinfo.value.__suppress_context__
+    assert "not a database" not in str(excinfo.value).replace(str(not_a_ledger), "")
+    assert not_a_ledger.read_bytes() == before
+    assert not (tmp_path / "out").exists()
+
+
 def test_a_ledger_behind_this_build_is_refused_rather_than_half_exported(
     tmp_path: Path,
 ) -> None:

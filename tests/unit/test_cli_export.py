@@ -154,6 +154,16 @@ def test_a_mistyped_config_path_cannot_mint_a_ledger_and_export_it(
     assert not ledger_path.exists()
 
 
+def test_a_ledger_path_pointing_at_a_non_database_is_refused_not_crashed(
+    config_file: Path, tmp_path: Path
+) -> None:
+    """GPT review round 1, B1, at the operator's level: a refusal, not a traceback."""
+    ledger_path, _ = _paths(config_file)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text("definitely not sqlite\n" * 64, encoding="utf-8")
+    assert main(["export", "--config", str(config_file), "--format", "jsonl"]) == EXIT_REFUSED
+
+
 def test_an_invalid_config_is_reported_before_any_ledger_work(tmp_path: Path) -> None:
     broken = tmp_path / "config.yaml"
     broken.write_text("environment: development\n", encoding="utf-8")
