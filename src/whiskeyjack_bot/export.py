@@ -652,20 +652,29 @@ def export_ledger(
     finally:
         connection.close()
 
+    # Every table is rendered before the first file is written, so a refusal at render time
+    # (a Parquet conversion, a JSON encoding) leaves no files at all rather than k-1 of them
+    # in a directory the next attempt is then refused from. What can still interrupt the
+    # write loop is ordinary I/O, and for that `manifest.json` is written last: it is the
+    # completion marker, and a directory without one is not an export.
+    payloads: list[tuple[TableSpec, bytes]] = [
+        (
+            spec,
+            render_jsonl(tables[spec.name], spec.name)
+            if export_format == "jsonl"
+            else render_parquet(tables[spec.name], spec),
+        )
+        for spec in EXPORTED_TABLES
+    ]
     exported: list[TableExport] = []
-    for spec in EXPORTED_TABLES:
-        rows = tables[spec.name]
-        if export_format == "jsonl":
-            payload = render_jsonl(rows, spec.name)
-        else:
-            payload = render_parquet(rows, spec)
+    for spec, payload in payloads:
         filename = f"{spec.name}.{export_format}"
         write_new_file(destination / filename, payload, what=_WHAT, error=ExportError)
         exported.append(
             TableExport(
                 name=spec.name,
                 filename=filename,
-                row_count=len(rows),
+                row_count=len(tables[spec.name]),
                 sha256=hashlib.sha256(payload).hexdigest(),
             )
         )

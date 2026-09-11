@@ -752,6 +752,32 @@ def test_an_off_contract_stored_value_is_refused_as_an_export_error(
     assert problem in message, what
 
 
+def test_a_render_refusal_leaves_no_partial_export_behind(
+    ledger_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every table renders before any file is written.
+
+    Rendering used to happen inside the write loop, so a refusal on table k left k-1 files
+    and no manifest in a directory a retry is then refused from ("already exists"). The
+    refusal is simulated on the **last** table, where the old shape leaves the most debris.
+    """
+    from whiskeyjack_bot import export as export_module
+
+    last = EXPORTED_TABLES[-1].name
+    real_render = export_module.render_jsonl
+
+    def refuse_the_last(rows: Any, table: str) -> bytes:
+        if table == last:
+            raise ExportError(f"cannot render a {table} row as JSON")
+        return real_render(rows, table)
+
+    monkeypatch.setattr(export_module, "render_jsonl", refuse_the_last)
+    destination = tmp_path / "out"
+    with pytest.raises(ExportError):
+        export_ledger(ledger_path, destination, export_format="jsonl")
+    assert not destination.exists() or list(destination.iterdir()) == []
+
+
 @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
 def test_canonical_json_refuses_a_non_finite_number_on_its_own(value: float) -> None:
     """The second layer, tested without the first in front of it.
