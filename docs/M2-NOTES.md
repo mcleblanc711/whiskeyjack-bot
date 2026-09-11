@@ -3081,11 +3081,14 @@ It settles **nothing** about the cells that have never occurred **in production*
 the decision does not rest on the production count alone: `tests/integration/
 test_receipt_sufficiency.py` drives the full eight-cell `(success, refetch_outcome)` partition
 directly at the writer, asserted total against the `RefetchOutcome` vocabulary, and pins by
-execution — not by reading — that an exact response would not change any verdict even where it
-exists (a confirming refetch cannot distinguish our post from any other writer's; a response
-body describing a different question does not move the outcome; the retry budget is for an
-unreachable platform, not a slow one). That driven partition, not the 22-row count, is the
-actual basis for the decision.
+execution — not by reading — that the **current implementation** does not consult the platform's
+response body to reach any verdict, even in cases where one exists (a confirming refetch cannot
+distinguish our post from any other writer's; a response body describing a different question
+does not move the outcome; the retry budget is for an unreachable platform, not a slow one).
+That is a measurement of what the code does today, not a proof that a response body could never
+improve classification — the judgment that it isn't worth adding is the decision above, made on
+top of this measurement plus the cost argument, not derived from the measurement alone. The
+driven partition, not the 22-row count, is what the decision actually leans on.
 
 **A caution against reading the production count as "the receipt is sufficient, done."** Zero
 occurrences of a cell in production is weak evidence about that cell; it may mean the condition

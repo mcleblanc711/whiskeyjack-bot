@@ -296,7 +296,7 @@ def test_the_platform_response_cannot_move_the_verdict_whatever_it_says(
     assert recorded.event.event_type == "submitted"
 
 
-def test_a_platform_rounded_value_is_recorded_as_a_mismatch(
+def test_a_platform_value_that_drifted_is_recorded_as_a_mismatch(
     approved_record: tuple[sqlite3.Connection, str],
     live_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -304,23 +304,24 @@ def test_a_platform_rounded_value_is_recorded_as_a_mismatch(
     """**A refetch that is wrong, not merely absent** -- the second failure mode.
 
     `values_match` compares against `_VALUE_TOLERANCE = 1e-9`. A platform that stored what
-    we sent but reported it rounded to six decimal places -- or a value that lost precision
-    on a JSON round trip somewhere between the post and the read -- differs by more than
-    that, and the outcome is `mismatched`, whose meaning in
-    `verify_uncertain_attempt` is *"the platform holds a forecast that is not the one this
-    attempt sent"*. That is a stronger statement than the observation supports.
+    we sent but reports a value that has drifted by more than that -- rounding, a lossy JSON
+    round trip, or anything else that changes the number -- reaches `mismatched`, whose
+    meaning in `verify_uncertain_attempt` is *"the platform holds a forecast that is not the
+    one this attempt sent"*. This test drives a `1e-6` drift, comfortably past the tolerance;
+    it is not a claim that the platform specifically rounds to six decimal places, only that
+    *some* drift past tolerance reaches this outcome.
 
     The consequence is asserted rather than described: the record stays `approved` and
     stuck, and the one command that could resolve it **refuses**, telling the operator to
     resolve it by hand. So this cell costs a human.
 
-    Whether the platform actually rounds is unknown and is not knowable offline -- it is
-    written up under this item's standing risk. What is knowable, and is what this test
-    pins, is what *would* happen if it did.
+    Whether the platform actually drifts a stored value is unknown and is not knowable
+    offline -- it is written up under this item's standing risk. What is knowable, and is
+    what this test pins, is what *would* happen if it did.
     """
     conn, record_id = approved_record
     rounded = binary_values(PROBABILITY)
-    rounded[1] = round(rounded[1] + 1e-6, 6)
+    rounded[1] = rounded[1] + 1e-6
     transport = CountingTransport(
         post_outcomes=[api_response(200, b"{}")],
         get_outcomes=[
