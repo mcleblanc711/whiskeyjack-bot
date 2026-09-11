@@ -9965,8 +9965,13 @@ Raising `max_price` without the estimate is the quieter version of the same fail
 `PRICED_MODELS` maps the LiteLLM name to `PricedModel(openrouter_id, prompt, completion)`.
 `build_request` takes `max_price` from those prices, and `reservation_estimate_usd` takes the
 estimate from the same two fields. There is no second place to update, so the regression above
-has no line to be written on. The registry is closed: `run_once`, `build_forecaster_client`
-and `PricedClient.__init__` each refuse a name outside it.
+has no line to be written on. The registry is closed **for tournament use**: `run_once` and
+`PricedClient.__init__` each refuse a name outside it. `build_forecaster_client` does *not*
+refuse one: it routes every registry name to `PricedClient` and still builds `GeneralLlm` for
+any other name, because non-tournament callers (dry runs, rehearsals) use that path
+legitimately. The budget guarantee rests on `run_once`'s gate, which is reached before any
+client is built. (The first version of this paragraph said the builder also refused. Round 1
+corrected it.)
 
 ### Decision — Sol is unmoved, and that is proved rather than asserted
 
@@ -10033,3 +10038,24 @@ division; `max_price` pinned to Sol; model ID pinned to Sol; registry prices as 
 Sol's request bytes); fallbacks allowed; client admits any model; `run_once` gate back to
 Sol-only (killed only by `test_a_poll_on_astra_confirms_a_forecast`, which was written for
 exactly that); `run_once` gate admits any model; builder routes only Sol to the priced client.
+
+### Round 1 — CHANGES REQUESTED, one blocking finding, real
+
+Reviewed `06a7d56`, the request HEAD. All seven risk areas were judged safe.
+
+**B1: the owner-approved $40 re-activation could not complete.** `tournament_state.enable`
+hard-refused any `budget_usd` above Launch's $20 (`not 0 < budget_usd <= 20`, from
+`dc3c729`). The deploy this item describes (re-enable Astra at $40) would have retired the Sol
+activation and then been refused on its replacement. Reproduced by execution before the fix:
+`TournamentError: invalid activation identity, window, or budget (maximum USD 20)`. The
+ceiling predates the branch, but the branch depends on exceeding it, which is why it is in
+scope. The owner was asked rather than assumed, because raising it changes a paid-call control,
+and the $40 choice had been made without knowing the $20 limit existed. **Decision (owner,
+2026-09-11): raise it to exactly $40.** `MAX_ACTIVATION_BUDGET_USD = 40` stays a code constant,
+so a paid-call limit never lives in the config an activation binds to (config was the rejected
+alternative, for that reason). Boundary test: $40 activates; $40.01 is refused and appends no
+activation. Confirmed red with Launch's `<= 20` restored. `docs/TOURNAMENT-OPERATIONS.md`
+now names the constant and says why it moved.
+
+**Non-blocking, taken:** the registry-boundary paragraph above overstated the builder's role
+and is corrected.
