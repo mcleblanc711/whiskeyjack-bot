@@ -35,3 +35,45 @@ def redact_secrets(text: str, env_var_names: Sequence[str]) -> str:
         if value and len(value) >= MIN_SECRET_LENGTH and value in redacted:
             redacted = redacted.replace(value, f"<redacted:{name}>")
     return redacted
+
+
+# The process's configured secret names (M1-613), filled by `config.load_config` so that a
+# writer holding no config -- `tournament_state.append` has about thirty call sites across
+# seven modules, most without one -- still redacts what the running profile calls a secret.
+# Every live process loads its profile through `load_config` before it touches a ledger. A
+# process that never loaded one has no configured secrets, and redacting with an empty set is
+# the honest answer for it rather than an error. Additive: registering never forgets a name,
+# and redacting more names is never less safe.
+_REGISTERED: set[str] = set()
+
+
+def register_secret_env_var_names(env_var_names: Sequence[str]) -> None:
+    """Add configured secret variable names to the process registry."""
+    _REGISTERED.update(name for name in env_var_names if isinstance(name, str) and name)
+
+
+def registered_secret_env_var_names() -> tuple[str, ...]:
+    """The registry, sorted so a caller's behaviour cannot depend on set order."""
+    return tuple(sorted(_REGISTERED))
+
+
+def redact_leaves(value: object, env_var_names: Sequence[str]) -> object:
+    """Redact every string inside a JSON-shaped value, keys included, and nothing else.
+
+    Leaf by leaf rather than over the rendered JSON text: a secret whose characters also
+    occur in a number (an all-digit token, an account ID) would otherwise be substituted into
+    the middle of that number, and the result would stop being JSON -- which, behind
+    `tournament_events`' `CHECK(json_valid(data))`, is a failed write that stops the worker.
+    """
+    if isinstance(value, str):
+        return redact_secrets(value, env_var_names)
+    if isinstance(value, dict):
+        return {
+            (redact_secrets(key, env_var_names) if isinstance(key, str) else key): redact_leaves(
+                item, env_var_names
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_leaves(item, env_var_names) for item in value]
+    return value

@@ -76,6 +76,21 @@ def events(conn: sqlite3.Connection, kind: str, scope: str) -> list[dict[str, An
         raise StorageFailure("cannot read tournament journal") from None
 
 
+def journal_form(data: dict[str, Any]) -> Any:
+    """What the journal stores for `data`: every string redacted of configured secrets.
+
+    Central for every `append` caller (M1-613). Redaction used to be applied per call site
+    (the `cost_reserved` request, the model content), so any other caller journaling
+    provider text would have persisted it, and M1-604's export carries `data` verbatim.
+    Exposed because `witness` must write this exact form to its files: `check_storage`
+    compares the file's `data` with the row's for equality, so the two must never be derived
+    separately.
+    """
+    from whiskeyjack_bot.redaction import redact_leaves, registered_secret_env_var_names
+
+    return redact_leaves(data, registered_secret_env_var_names())
+
+
 def append(conn: sqlite3.Connection, kind: str, scope: str, data: dict[str, Any]) -> str:
     identifier = uuid4().hex
     try:
@@ -83,7 +98,7 @@ def append(conn: sqlite3.Connection, kind: str, scope: str, data: dict[str, Any]
             conn.execute(
                 "INSERT INTO tournament_events(event_id,kind,scope,data,created_at_utc) "
                 "VALUES(?,?,?,?,?)",
-                (identifier, kind, scope, canonical(data), utcnow().isoformat()),
+                (identifier, kind, scope, canonical(journal_form(data)), utcnow().isoformat()),
             )
     except (sqlite3.Error, LifecycleError):
         raise StorageFailure("cannot commit tournament journal") from None
@@ -115,8 +130,16 @@ def check_storage(conn: sqlite3.Connection, root: Path) -> None:
 
 def witness(conn: sqlite3.Connection, root: Path, scope: str, data: dict[str, Any]) -> str:
     identifier = append(conn, "witness", scope, data)
+    # The same journal form `append` stored, not the raw `data`: `check_storage` requires
+    # the two to be equal, and a secret redacted in one but not the other would read as a
+    # restored ledger and stop the worker.
     envelope = canonical(
-        {"schema_version": "1.1.0", "event_id": identifier, "scope": scope, "data": data}
+        {
+            "schema_version": "1.1.0",
+            "event_id": identifier,
+            "scope": scope,
+            "data": journal_form(data),
+        }
     ).encode()
     for destination in (
         root / "operations" / f"{identifier}.json",

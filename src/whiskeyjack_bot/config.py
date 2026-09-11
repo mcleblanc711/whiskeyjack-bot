@@ -617,4 +617,12 @@ def load_config(path: Path | str) -> AppConfig:
         ) from None
     if not isinstance(data, dict):
         raise ConfigError([f"config file {path} must contain a YAML mapping at the top level"])
-    return validate_config_data(data)
+    config = validate_config_data(data)
+    # M1-613: the process's configured secrets, for writers that hold no config -- above
+    # all `tournament_state.append`. Registered here because every CLI command loads its
+    # profile through this function before it touches a ledger. `redaction` imports nothing
+    # from this package, so the dependency runs one way.
+    from whiskeyjack_bot.redaction import register_secret_env_var_names
+
+    register_secret_env_var_names(config.secret_env_var_names())
+    return config
