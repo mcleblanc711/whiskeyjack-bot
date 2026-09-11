@@ -10156,3 +10156,64 @@ tagged "different payload" while deriving one payload. The biconditional still j
 correctly; only the arm label was false. Collisions are now compared as mappings, and the
 different-payload mode asserts `left != right`. Re-swept: 21 of 21.
 
+## M1-613 — Redact configured secrets centrally in `tournament_state.append`
+
+Acceptance: *`tournament_state.append` redacts configured secrets before persistence for every
+caller; a regression plants a secret through `append` and proves it absent from the stored
+event and from a derived export.* Filed from M1-604's round-1 review.
+
+### Delivered
+
+- `redaction.py`: a process registry (`register_secret_env_var_names`,
+  `registered_secret_env_var_names`) and `redact_leaves`.
+- `config.load_config` registers `config.secret_env_var_names()`.
+- `tournament_state.py`: `journal_form(data)`. `append` stores `canonical(journal_form(data))`,
+  and `witness` writes the same form to its files.
+- `tests/unit/test_journal_redaction.py` (6 tests).
+
+### Decision — a process registry filled at `load_config`, not a parameter, and why
+
+`append` has about thirty call sites across seven modules, and most hold no config, so the
+secret names had to come from somewhere other than the call. The alternatives:
+
+- **A required parameter** is explicit, but it is thirty call sites of churn, and every new call
+  site is one more place to thread names through.
+- **An ambient `ContextVar`,** like `CURRENT_BUDGET`, has no good answer when unset: `disable()`
+  holds no config, and fail-closed would break it.
+
+A registry that `load_config` fills covers every live caller, because every CLI command loads its
+profile through that function before it touches a ledger. A process that never loaded a profile
+has no configured secrets, and an empty registry is the honest answer for it. It is additive, so
+registering more names can only redact more.
+
+### Decision — redact string leaves, keys included, never the rendered JSON
+
+`Budget.reserve` redacts the rendered text and `json.loads` it back. Done centrally, that breaks on
+an all-digit secret that also occurs in a number, which is demonstrated with the account ID:
+`<redacted:…>` lands inside a number, the row fails `CHECK(json_valid(data))`, and the worker stops
+on a storage failure. `redact_leaves` walks dicts and lists and redacts only strings. The
+"redact the rendered text" mutant is killed by exactly that test.
+
+### Decision — `witness` writes the journal form, not the raw data
+
+`check_storage` requires each witness file's `data` to *equal* its row's. If `append` redacted
+and `witness` wrote raw data, the first witness carrying a secret would read as a restored ledger
+(`storage restore detected; platform reconciliation required`) and stop the worker. Both now use
+`journal_form(data)`, computed from one function. A control test shows that tampering with a
+witness is still detected.
+
+### Standing risk — not verifiable offline
+
+- **Existing rows are not rewritten.** The journal is append-only, and M1-604's measured scan of
+  both live ledgers found none of the five live secret values in 10.9MB of export. New rows are
+  covered from deploy.
+- **`load_config` gains a side effect** (the registry). It is idempotent and additive, and tests
+  isolate it with `monkeypatch`.
+- **No `AppConfig` field,** so deploying this does not retire the live activation.
+
+### Teeth — the mutation pass
+
+**6 mutants, 6 killed,** each by the test written for it: `append` stores raw data; redact the
+rendered text instead of leaves; `witness` writes raw data; keys not redacted; lists not
+recursed; `load_config` does not register.
+
