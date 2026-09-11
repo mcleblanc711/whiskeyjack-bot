@@ -10069,3 +10069,19 @@ constant's comment dated the ceiling authorization 2026-09-10; it was 2026-09-11
 decision this item's round 1 asked for, and the comment is corrected. And the live re-activation
 is to be appended here after deploy (below). Two rounds.
 
+### Live switch — 2026-09-11
+
+Deployed in the gap between two MiniBench polls, so no poll ran on a retired activation. The
+05:45:00 MDT poll completed on Sol (`refusal_reason: null`). PR #89 merged as `4ab8ad9`, and
+`finish-item.sh` fast-forwarded the live checkout at 05:45:36, retiring activation `2bfd17f3…`.
+At 05:45:55 `tournament enable --config config/tournament.yaml --project-id 33122 --starts
+2026-09-07T22:00:00Z --ends 2026-09-29T00:00:00Z --budget-usd 40` created **activation
+`14e331f6e8824a8fa26fd3fdbb27d653`** (account 305299). `tournament status` showed `enabled:
+true`, actual $1.28, reserved $3.60, **remaining $35.12**: the spend scoped to
+account:project carried over, and the cap is the new $40.
+
+The first poll on Astra (05:50:00) finished `Result=success`, `ExecMainStatus=0`,
+`refusal_reason: null`, `discovered: 0`. MiniBench was between batches, so no Astra call has
+been billed yet. The first real one will show in the ledger as a `model_response` event whose
+`model` field names `openai/gpt-6-astra`.
+
