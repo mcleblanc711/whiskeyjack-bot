@@ -50,6 +50,7 @@ to the registry, and neither is a habit you can form by reflex.
 | M2-705 | feat/m2-705-response-capture | whiskeyjack-m2-705 | no | none | 2026-09-04 |
 | M1-329 | feat/m1-329-ntfy-operational-alerts | whiskeyjack-m1-329 | no | none | 2026-09-09 |
 | M1-408 | feat/m1-408-gpt-6-astra-client | whiskeyjack-m1-408 | no | none | 2026-09-10 |
+| M1-333 | feat/m1-333-payload-property-filtering | whiskeyjack-m1-333 | no | none | 2026-09-11 |
 *(Merged and left in place, per the rule below: **M1-326** (PR #79, round-2 approve,
 2026-09-09) and **M1-327** (PR #80, round-2 approve, 2026-09-09 — it demoted the
 named-resolution-source gate from fatal to a recorded `evidence_gap` row and scoped M1-326's
