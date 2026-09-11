@@ -22,7 +22,7 @@ contract**, and three consequences follow that a dump would not have:
   type, a non-finite REAL, a BLOB, or text that is not valid UTF-8 is refused with an
   :class:`ExportError` rather than repaired into something that would no longer round-trip.
 
-**All thirteen tables are exported, and none is excluded.** ``schema_migrations`` is in
+**All fourteen tables are exported, and none is excluded.** ``schema_migrations`` is in
 deliberately: it is what lets a consumer tell which schema produced the files it is
 holding. The joined per-forecast view that ``lifecycle.py`` and ``forecast/record.py``
 anticipate "at read/export time" is **not** here -- see ``docs/M1-NOTES.md``, it is
@@ -114,7 +114,7 @@ class TableSpec:
 
     ``identifier`` is the single-column primary key, and it does double duty: it is the
     ``ORDER BY`` that makes the export byte-deterministic, and it is the key the acceptance
-    criterion's set-equality check compares. All thirteen tables have one, so no table
+    criterion's set-equality check compares. All fourteen tables have one, so no table
     needs a composite or a synthetic ordering.
     """
 
@@ -382,6 +382,24 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("outcome", "TEXT"),
             Column("observed_at_utc", "TEXT"),
             Column("refetched_forecast_snapshot", "TEXT"),
+            Column("created_at_utc", "TEXT"),
+        ),
+    ),
+    # 012_tournament_safety.sql. Arrived by a master merge after this spec was written, and
+    # the spec-vs-schema parity test is what caught it -- the reason the spec is written
+    # down rather than derived. `seq` is the primary key and the order the runner appends
+    # in; `event_id` is UNIQUE but a TEXT token, so it would order by value, not by time.
+    TableSpec(
+        name="tournament_events",
+        identifier="seq",
+        columns=(
+            Column("seq", "INTEGER"),
+            Column("event_id", "TEXT"),
+            Column("kind", "TEXT"),
+            Column("scope", "TEXT"),
+            # Exported as the stored JSON string, like record_json: parsing it would put
+            # this module's JSON reading between the ledger and the consumer.
+            Column("data", "TEXT"),
             Column("created_at_utc", "TEXT"),
         ),
     ),

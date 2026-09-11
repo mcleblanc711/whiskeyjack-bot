@@ -3,7 +3,7 @@
 The acceptance criterion is *"Exports round-trip record IDs/counts and never mutate
 SQLite"*, and both halves are stricter than they read:
 
-- **Round-trip** is set equality of primary identifiers, per table, for all thirteen --
+- **Round-trip** is set equality of primary identifiers, per table, for all fourteen --
   not a count, and not a one-sided subset. A one-sided check passes on an export that
   drops rows, which is the vacuity M1-501 lost a round to. It is also worth nothing on an
   empty table, so `test_the_seed_reaches_every_table` refuses to let that pass unnoticed.
@@ -50,7 +50,7 @@ FAKE_SECRET = "privateFAKE123456"
 
 
 def _seed_every_table(conn: sqlite3.Connection) -> None:
-    """Write at least one row into each of the thirteen exported tables.
+    """Write at least one row into each of the fourteen exported tables.
 
     Raw SQL rather than the production writers, and deliberately: the point here is the
     *schema's* full surface, including tables whose writers are still Not Started
@@ -148,6 +148,12 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         "released_by, note, released_at_utc, created_at_utc) "
         "VALUES ('wjrel-1', 'wjres-1', 'operator_abandoned', 'chris', NULL, ?, ?)",
         (TS, TS),
+    )
+    # `data` is CHECK(json_valid(data)), and the export carries it as the stored string.
+    conn.execute(
+        "INSERT INTO tournament_events (event_id, kind, scope, data, created_at_utc) "
+        "VALUES ('tev-1', 'heartbeat', 'minibench', ?, ?)",
+        ('{"polled": 3}', TS),
     )
 
 
@@ -267,7 +273,7 @@ def test_the_hand_written_spec_matches_the_schema_column_by_column(ledger_path: 
 def test_the_export_round_trips_every_identifier_in_every_table(
     ledger_path: Path, tmp_path: Path, export_format: str
 ) -> None:
-    """Set equality per table, both directions, for all thirteen.
+    """Set equality per table, both directions, for all fourteen.
 
     Equality rather than `<=` or `>=`: a subset check passes on an export that drops rows
     and a superset check passes on one that invents them, and the criterion means neither.
@@ -452,15 +458,23 @@ def test_immutable_would_have_silently_read_a_stale_ledger(
 def test_the_export_reads_one_snapshot_even_while_a_writer_commits(
     ledger_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """All thirteen tables come from one transaction, not thirteen.
+    """Every table comes from one transaction, not one per table.
 
     Without the single deferred transaction each statement takes its own snapshot, so a
     run committing mid-export could land a `forecast_records` row whose `lifecycle_events`
     are missing -- an export that is internally inconsistent while every individual query
-    was correct. The writer here commits between two table reads; the export must not see
-    it at all.
+    was correct.
+
+    The writer commits right after the *first* table is read, into a table read *later*.
+    That ordering is the whole test: a row committed into a table that has already been
+    fetched is absent under any snapshot policy, so it could not tell one transaction from
+    fourteen (the first version of this test did exactly that, and survived deleting the
+    `BEGIN`). Deleting the `BEGIN` must turn this red.
     """
     from whiskeyjack_bot import export as export_module
+
+    first, *later = (spec.name for spec in EXPORTED_TABLES)
+    assert "score_events" in later, "the concurrent row must go into a table read afterwards"
 
     writer = connect(ledger_path)
     real_read_table = export_module.read_table
@@ -468,18 +482,14 @@ def test_the_export_reads_one_snapshot_even_while_a_writer_commits(
 
     def read_table_and_commit(connection: sqlite3.Connection, spec: Any) -> Any:
         rows = real_read_table(connection, spec)
-        if spec.name == "forecast_records":
+        if spec.name == first:
             writer.execute(
-                "INSERT INTO forecast_records ("
-                "record_id, question_id, tournament_id, forecast_version, question_type, "
-                "status, model_provider, model_name, prompt_version, prompt_sha256, "
-                "retrieval_run_id, generated_at_utc, final_prediction_json, record_json, "
-                "created_at_utc, forecast_sha256, attempt_id) "
-                "VALUES ('rec-mid', 199, 'minibench', 1, 'binary', 'draft', 'anthropic', "
-                "'claude', 'v1', ?, 'run-1', ?, '{}', '{}', ?, ?, 'att-rec-mid')",
-                (SHA, TS, TS, SHA),
+                "INSERT INTO score_events (forecast_record_id, metric, value, "
+                "implementation_version, computed_at_utc) "
+                "VALUES ('rec-1', 'mid-export', 0.5, 'v1', ?)",
+                (TS,),
             )
-            committed.append("rec-mid")
+            committed.append("mid-export")
         return rows
 
     monkeypatch.setattr(export_module, "read_table", read_table_and_commit)
@@ -489,11 +499,18 @@ def test_the_export_reads_one_snapshot_even_while_a_writer_commits(
     finally:
         writer.close()
 
-    assert committed == ["rec-mid"], "the concurrent commit must actually have happened"
-    # `lifecycle_events` is read after `forecast_records` alphabetically, so an export
-    # taking a fresh snapshot per statement is exactly what would pick the new row up.
-    ids = {row["record_id"] for row in _jsonl_rows(destination, "forecast_records")}
-    assert "rec-mid" not in ids
+    assert committed == ["mid-export"], "the concurrent commit must actually have happened"
+    # The commit really landed: a reader opened after the export sees it.
+    conn = connect_readonly(ledger_path)
+    try:
+        landed = conn.execute(
+            "SELECT count(*) FROM score_events WHERE metric = 'mid-export'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert landed == 1
+    metrics = {row["metric"] for row in _jsonl_rows(destination, "score_events")}
+    assert "mid-export" not in metrics
 
 
 # --------------------------------------------------------------------------------------
