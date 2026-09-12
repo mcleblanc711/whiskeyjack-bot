@@ -341,19 +341,37 @@ def probability_bounds_violation(
     which config loaded it, so the pair checked at load time is not provably the
     pair in the ``AppConfig`` reaching generation.
 
-    **Why the spending site gets containment while the load boundary gets
-    equality**, rather than one rule everywhere: the two sites ask different
-    questions. ``load_prompt`` asks *do these two agree* -- a disagreement in
-    either direction is a misconfiguration an operator can fix before spending
-    anything. Generation asks the narrower, harder question: *would this config
-    reject a probability the prompt invites?* That is the condition under which
-    a billed call is wasted, and it is the one an ``AppConfig`` assembled some
-    other way could still produce. Equality at the load boundary means no
-    production path can reach generation with a disagreeing pair at all, so this
-    check never fires in production; making it equality too would additionally
-    refuse a *narrower* pair, which is a misconfiguration rather than a way to
-    waste a call, and generation is not one of the startup surfaces the
-    criterion names.
+    **Which direction this actually catches**, because an earlier draft of this
+    docstring had it backwards and round 1 caught the claim: containment fires
+    only when the configured pair is *wider* than the declared range -- config
+    would accept a probability the prompt forbade the model to give. It passes a
+    *narrower* pair, and a narrower pair is the one that costs a repair turn,
+    because the model is invited to answer 0.02 and config then rejects it.
+    Concretely, against a declared ``0.001``-``0.999``:
+
+    ====================  =============  ===========
+    configured pair       disagreement   violation
+    ====================  =============  ===========
+    ``(0.001, 0.999)``    none           none
+    ``(0.05, 0.95)``      reported       **none**
+    ``(0.0, 1.0)``        reported       reported
+    ====================  =============  ===========
+
+    So the repair-turn cost the row was filed for is caught by
+    ``probability_bounds_disagreement`` at the load boundary and by nothing here.
+
+    **Why the spending site keeps the weaker relation anyway**, rather than one
+    rule everywhere: equality at the load boundary already refuses every
+    disagreeing pair on every production path, so the only caller this site can
+    still receive a bad pair from is an ``AppConfig`` assembled some other way --
+    the case this module's siblings repeat their own preflights for. For that
+    caller, containment is the relation that keeps M1-403's regression test
+    expressible: ``test_a_probability_the_prompt_allows_is_refused_by_a_narrower_config``
+    is the integration proof that ``forecast.min_probability`` has a consumer,
+    and its premise is a probability the prompt allows and config does not --
+    which equality here would refuse at preflight, deleting the test. That is a
+    deliberate trade and half of it is test-preservation; it is stated plainly
+    rather than dressed as a cost argument, which is what the first draft did.
     """
     _require_bound_pair(min_probability, max_probability)
     if bounds.low <= min_probability and max_probability <= bounds.high:

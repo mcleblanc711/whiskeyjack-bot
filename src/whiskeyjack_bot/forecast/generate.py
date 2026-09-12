@@ -471,9 +471,11 @@ def generate_forecast(
         # inside the envelope the *submission path* accepts, from the spec constants. This
         # one asks whether it is inside the range *this loaded prompt* states to the model,
         # read from the file config actually names. A custom prompt separates them
-        # immediately, and a config demanding what the model was never told to supply costs
-        # a repair turn -- two billed calls -- to reject a probability no model reading
-        # that prompt would have produced.
+        # immediately. This one catches the *widening* direction only: a config that would
+        # accept a probability the prompt forbade the model to give. The narrowing
+        # direction -- which is what costs a repair turn -- is caught by the equality
+        # relation at the load boundary and deliberately not here; see
+        # `prompt.probability_bounds_violation` for the table and the trade.
         #
         # ``probability_bounds_violation``, not ``..._disagreement``: ``load_prompt``
         # enforces the stronger equality at the load boundary, so no production path

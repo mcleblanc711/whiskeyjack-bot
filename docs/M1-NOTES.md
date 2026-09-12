@@ -10512,12 +10512,30 @@ questions and each gets the relation that matches it:
 | `load_prompt` → both pipelines, `tournament.py`, `verify-env` | do config and the prompt **agree**? | equality |
 | `generate_forecast` preflight | does config demand what the prompt **forbids**? | containment |
 
-Equality at the load boundary means no production path can reach generation with a
-disagreeing pair, so the generation check never fires in production — it exists for the
-`AppConfig`-assembled-some-other-way case, the same reason that function already repeats
-`min < max`, the spec envelope, `allowed_tries` and the prompt version. What that case can
-still produce and *cost* something is a config demanding a probability the model was never
-invited to give; a merely *narrower* config wastes nothing at the call.
+**Round 1 corrected the rationale here, and the correction matters more than the code.**
+An earlier draft said generation's containment check catches "a config that rejects a
+probability the prompt invites". That is backwards, and `probability_bounds_violation`
+returns `None` for exactly that case — verified by execution, not by reading. Against a
+declared `0.001`–`0.999`:
+
+| configured pair | disagreement | violation |
+| --- | --- | --- |
+| `(0.001, 0.999)` | none | none |
+| `(0.05, 0.95)` | reported | **none** |
+| `(0.0, 1.0)` | reported | reported |
+
+So containment catches only the *widening* direction — config accepting a probability the
+prompt forbade. The narrowing direction, which is the repair-turn cost the row was filed
+for, is caught by equality at the load boundary and by nothing at the spending site. The
+claim that "a merely narrower config wastes nothing at the call" was simply false: M1-403's
+own test demonstrates a narrowed config burning a repair turn.
+
+The honest reason generation keeps the weaker relation: equality at the load boundary
+already refuses every disagreeing pair on every production path, so the only caller that can
+still hand this site a bad pair is an `AppConfig` assembled some other way. For that caller
+containment is what keeps M1-403's regression test expressible. **Half of this decision is
+test-preservation**, and saying so plainly is better than the cost argument the first draft
+reached for.
 
 `test_equality_is_strictly_stronger_than_containment` pins the ordering the split rests on:
 every pair the load boundary accepts, the spending site accepts. If it ever inverted,
@@ -10572,9 +10590,27 @@ clause outright: the check must read the prompt config names, not a copy of its 
 
 `parse_declared_probability_bounds` reads `between <low> and <high>` on lines containing
 `probabilit`. Both committed prompts satisfy it three times over, and a disagreement among
-those three is refused rather than resolved. But **a prompt reworded past that spelling stops
-loading**, and because the check is bound into `load_prompt` that is a hard startup failure,
-not a warning.
+those three is refused rather than resolved.
+
+**Round 1 disproved the first version of this note**, which said a prompt reworded past that
+spelling "stops loading" — i.e. that the failure mode is a loud one. It is not, in one
+reachable case: a declaration *wrapped across two lines* puts the range on a line with no
+`probabilit` in it, so it is skipped entirely, the surviving declarations still agree, and
+the prompt **loads with bounds that are not what it tells the model**. That is the silent
+drift M1-407 exists to catch, surviving inside M1-407. Reproduced against the shipped
+prompt; the same conflict unwrapped is correctly refused, so the defect is the wrapping.
+
+Filed as **M1-409**, characterized by
+`tests/unit/test_prompt.py::test_a_conflicting_declaration_wrapped_across_lines_is_not_seen`
+with a hand-written oracle. Paragraph-scoping is not the fix and the row says why: the
+shipped bullet list puts the percentile bound two lines below the probability bound with no
+blank line between, so a paragraph scan merges them and manufactures a false disagreement.
+
+The round also made a methodological point worth keeping: the agreement property in
+`tests/property/` derives its expectation from `_DECLARED_RANGE_RE` and `_PROBABILITY_LINE_RE`
+— the implementation's own regexes — so it is structurally incapable of detecting this class.
+An oracle that reuses the implementation can only confirm the implementation is consistent
+with itself.
 
 Three things bound the risk and none of them removes it. The failure is at startup and
 before any spend, never mid-run. `tests/unit/test_forecast_binary.py`'s canary pins the
@@ -10599,3 +10635,23 @@ to `isinstance` — survive the property suite alone and are killed only by the 
 parametrization. That is the two-part-guard shape: neutering one half of
 `type(value) is not float or not 0.0 <= value <= 1.0` leaves the other half refusing, so the
 mutant reads exactly like a vacuous test until the refusals are counted.
+
+### Round 1 — APPROVE on `21f86e7`, zero blocking findings
+
+Two non-blocking observations, both landing on *claims* rather than on code, and both
+reproduced by execution before anything was changed:
+
+1. **The containment rationale was inverted** (`prompt.py`, `generate.py`, these notes, the
+   PR body and the review request all carried it). Corrected above, with the table, and the
+   test-preservation half of the decision now stated plainly.
+2. **A conflicting declaration wrapped across two lines loads silently with the wrong
+   bounds.** Filed as **M1-409** and characterized by a test with a hand-written oracle. The
+   standing-risk note that said such a prompt "stops loading" was wrong and is corrected.
+
+Neither changed the shipped behaviour; both changed what this branch claims about it. That
+is the D-1001 pattern exactly — its three rounds were all false factual claims — and it is
+the reason the corrections are recorded here rather than quietly amended.
+
+The reviewer ran 57 tests, deselecting 35 filesystem-dependent ones: `codex exec
+--sandbox read-only` has no writable temp directory, the same limitation M1-334 and M1-613
+recorded. The request's gate report stood in for those.

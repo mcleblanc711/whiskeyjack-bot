@@ -547,3 +547,43 @@ def test_the_bounds_paths_never_echo_prompt_contents(tmp_path: Path, body: str) 
     )
     assert PLANTED not in str(caught.value)
     assert PLANTED not in rendered
+
+
+# --- The line-scoped scan's known blind spot (M1-407 round 1, filed as M1-409) ---
+
+
+def test_a_conflicting_declaration_wrapped_across_lines_is_not_seen() -> None:
+    """**Characterization, not endorsement.** This pins a known gap so it cannot widen
+    silently and so nobody reads the standing-risk note as covering it.
+
+    The scan is scoped to a line, so a declaration wrapped by an ordinary editor --
+    ``must be`` / newline / ``between 0.01 and 0.99`` -- puts the range on a line with no
+    ``probabilit`` in it. It is skipped, the two surviving declarations still agree, and
+    the prompt loads with bounds that are *not* what it tells the model for
+    ``probability_yes``. The same conflict on one line raises, which is the contrast that
+    makes this a wrapping bug rather than an agreement bug.
+
+    The oracle here is written by hand rather than reusing ``_DECLARED_RANGE_RE``: the
+    agreement property in ``tests/property/`` derives its expectation from the
+    implementation's own regexes and therefore cannot detect this class at all (round-1
+    review). M1-409 owns the fix.
+    """
+    real = REAL_PROMPT.read_text(encoding="utf-8")
+    binary_line = "`probability_yes` must be between 0.001 and 0.999 inclusive."
+    assert binary_line in real
+
+    wrapped = real.replace(
+        binary_line, "`probability_yes` must be\nbetween 0.01 and 0.99 inclusive."
+    )
+    # Hand-written oracle: the conflicting pair is present in the text, plainly.
+    assert "0.01 and 0.99" in wrapped
+    assert parse_declared_probability_bounds(wrapped) == DeclaredProbabilityBounds(
+        low=0.001, high=0.999
+    )
+
+    # The identical conflict, unwrapped, is refused -- so the gap is the newline.
+    unwrapped = real.replace(
+        binary_line, "`probability_yes` must be between 0.01 and 0.99 inclusive."
+    )
+    with pytest.raises(PromptError):
+        parse_declared_probability_bounds(unwrapped)
