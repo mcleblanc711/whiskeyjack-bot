@@ -454,7 +454,12 @@ def _prepare_version(case: Any) -> str:
         config,
         question=q,
         tournament_id="32977",
-        prompt=load_prompt(config.forecast.prompt_path, config.forecast.prompt_version),
+        prompt=load_prompt(
+            config.forecast.prompt_path,
+            config.forecast.prompt_version,
+            min_probability=config.forecast.min_probability,
+            max_probability=config.forecast.max_probability,
+        ),
         now=utcnow(),
         refresh=False,
         news_client=news,

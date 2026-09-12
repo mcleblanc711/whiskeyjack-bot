@@ -578,6 +578,46 @@ def test_matching_prompt_version_passes(config_file: Path, monkeypatch: pytest.M
     assert any("declares version" in c for c in report.checks_passed)
 
 
+def test_probability_bounds_disagreement_is_reported(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-407: a configured pair that disagrees with the range the prompt states to
+    the model is reported here, before any billable call, rather than discovered by
+    paying for a repair turn.
+
+    0.05/0.95 is the row's own motivating case -- a *narrowed* config. It is inside
+    the prompt's range, so a containment test passes it silently; and because
+    ``ForecastConfig`` clamps both bounds into ``[0.001, 0.999]``, a narrowing is the
+    only disagreement a config loaded from YAML can express at all.
+    """
+    set_all_env(monkeypatch)
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["forecast"]["min_probability"] = 0.05
+    data["forecast"]["max_probability"] = 0.95
+    bad = tmp_path / "bounds-drift.yaml"
+    bad.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    report = verify_environment(bad)
+    assert report.exit_code == EXIT_ENV_MISSING
+    problems = [p for p in report.filesystem_problems if "do not match" in p]
+    assert len(problems) == 1
+    # The declared pair is what makes it fixable; the configured pair is withheld
+    # while M1-509 is open.
+    assert "0.001" in problems[0] and "0.999" in problems[0]
+    assert "0.05" not in problems[0] and "0.95" not in problems[0]
+
+
+def test_matching_probability_bounds_pass(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The committed pair and the committed prompt agree, so ``verify-env`` says so
+    rather than staying silent about a check that ran."""
+    set_all_env(monkeypatch)
+    report = verify_environment(config_file)
+    assert report.exit_code == EXIT_OK
+    assert any("declares probabilities between" in c for c in report.checks_passed)
+
+
 # --- startup cost (round-4 review finding) ---
 
 # Provider SDKs that must not be loaded just to validate config and an allowlist. Both are

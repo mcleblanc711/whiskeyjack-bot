@@ -5,15 +5,20 @@ echo prompt contents."""
 
 import traceback
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
 from whiskeyjack_bot.prompt import (
+    DeclaredProbabilityBounds,
     LoadedPrompt,
     PromptError,
     load_prompt,
+    parse_declared_probability_bounds,
     parse_declared_version,
+    probability_bounds_disagreement,
+    probability_bounds_violation,
     prompt_sha256,
 )
 
@@ -283,3 +288,262 @@ def test_loaded_prompt_is_frozen(tmp_path: Path) -> None:
     assert isinstance(loaded, LoadedPrompt)
     with pytest.raises(AttributeError):
         loaded.version = "2.0.0"  # type: ignore[misc]
+
+
+# --- Declared probability bounds (M1-407) ----------------------------------
+
+
+def _prompt_with(body: str) -> str:
+    """A loadable v1.1.0 prompt whose body is exactly ``body``."""
+    return f"# MiniBench forecaster prompt — v1.1.0\n\n{body}\n"
+
+
+def test_the_real_prompt_declares_the_committed_range() -> None:
+    """The acceptance criterion's second clause: the check reads the file config
+    names, not a copy of its numbers. The shipped prompt states the range three
+    times, in three different sentences, and all three must agree."""
+    bounds = parse_declared_probability_bounds(REAL_PROMPT.read_text(encoding="utf-8"))
+    assert (bounds.low, bounds.high) == (0.001, 0.999)
+
+
+def test_the_tournament_prompt_declares_the_committed_range() -> None:
+    """``config/tournament.yaml`` names this file, not ``forecaster.md``. A check
+    that only ever parsed the one under test would be silent about the live one."""
+    tournament_prompt = REPO_ROOT / "prompts" / "forecaster-tournament.md"
+    bounds = parse_declared_probability_bounds(tournament_prompt.read_text(encoding="utf-8"))
+    assert (bounds.low, bounds.high) == (0.001, 0.999)
+
+
+def test_every_statement_of_the_range_is_read_not_just_the_first() -> None:
+    """Three sentences state the range; a parse that stopped at the first would
+    accept a prompt telling the model two different things where it reads them."""
+    text = _prompt_with(
+        "Use probability values between 0.001 and 0.999 for binary outcomes.\n"
+        "`probability_yes` must be between 0.001 and 0.999 inclusive.\n"
+        "Probabilities must be between 0.001 and 0.999 and sum to 1 within `1e-6`."
+    )
+    assert parse_declared_probability_bounds(text) == DeclaredProbabilityBounds(
+        low=0.001, high=0.999
+    )
+
+
+def test_disagreeing_statements_are_rejected_not_resolved() -> None:
+    """Drift, not a pick-the-narrowest situation -- the same rule
+    ``parse_declared_version`` applies to two versions in one H1."""
+    text = _prompt_with(
+        "`probability_yes` must be between 0.001 and 0.999 inclusive.\n"
+        "Probabilities must be between 0.01 and 0.99 and sum to 1."
+    )
+    with pytest.raises(PromptError) as caught:
+        parse_declared_probability_bounds(text)
+    assert "more than one probability range" in str(caught.value)
+
+
+def test_a_prompt_declaring_no_range_is_refused() -> None:
+    """Not defaulted to the shipped pair: "reported at startup" is not satisfied
+    by guessing which range an unstated prompt meant."""
+    with pytest.raises(PromptError) as caught:
+        parse_declared_probability_bounds(_prompt_with("Body text with no range at all."))
+    assert "declares no probability range" in str(caught.value)
+
+
+def test_a_range_on_a_line_that_is_not_about_probability_is_not_read() -> None:
+    """The scan is scoped by line. The prompt body carries a ``1e-6`` sum
+    tolerance and a percentile ladder; a document-wide decimal scan reads those."""
+    with pytest.raises(PromptError):
+        parse_declared_probability_bounds(
+            _prompt_with("Percentile values must be between 0.01 and 0.99 and non-decreasing.")
+        )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "Probabilities must be between 0.999 and 0.001.",  # inverted
+        "Probabilities must be between 0.5 and 0.5.",  # empty
+        "Probabilities must be between 0.001 and 2.",  # above 1
+        "Probabilities must be between 0.001 and 99999999999999999999999999999999"
+        "9999999999999999999999999999999999999999999999999999999999999999999999999"
+        "9999999999999999999999999999999999999999999999999999999999999999999999999"
+        "99999999999999999999999999999999999999999999999999999999999999999999999.",  # inf
+    ],
+)
+def test_a_range_that_cannot_bound_a_probability_is_refused(statement: str) -> None:
+    """Including the overlong digit run: ``float()`` yields ``inf`` rather than
+    raising, so the range check is what keeps it from escaping as a bound."""
+    with pytest.raises(PromptError):
+        parse_declared_probability_bounds(_prompt_with(statement))
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "Probabilities must be between .5 and .9.",  # no digit before the point
+        "Probabilities must be between 0.001 to 0.999.",  # not the 'and' spelling
+        "Probabilities must be betweenish 0.001 and 0.999.",  # \b on 'between'
+    ],
+)
+def test_a_range_the_parser_cannot_read_is_refused_not_guessed(statement: str) -> None:
+    """The parser is coupled to one prose spelling and refuses rather than guessing.
+    That coupling is the standing risk; these pin where its edge actually is."""
+    with pytest.raises(PromptError):
+        parse_declared_probability_bounds(_prompt_with(statement))
+
+
+def test_parse_is_a_fixed_point_on_its_own_input() -> None:
+    """Nothing in the parse mutates or normalizes the text, so two parses of one
+    string are one answer -- the property replay depends on."""
+    text = REAL_PROMPT.read_text(encoding="utf-8")
+    assert parse_declared_probability_bounds(text) == parse_declared_probability_bounds(text)
+
+
+# --- The two relations, which are deliberately different -------------------
+
+
+BOUNDS = DeclaredProbabilityBounds(low=0.001, high=0.999)
+
+
+def test_agreement_is_the_only_thing_disagreement_accepts() -> None:
+    assert (
+        probability_bounds_disagreement(BOUNDS, min_probability=0.001, max_probability=0.999)
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [
+        (0.05, 0.95),  # narrower on both ends -- the row's own motivating case
+        (0.05, 0.999),  # narrower on one end only
+        (0.001, 0.95),
+        (0.0005, 0.999),  # wider -- the criterion's literal reading
+        (0.001, 0.9995),
+    ],
+)
+def test_any_disagreement_in_either_direction_is_reported(minimum: float, maximum: float) -> None:
+    """Equality, not containment. A containment test passes the first three of
+    these silently, and ``ForecastConfig``'s ``ge``/``le`` clamp means the first
+    three are the only ones a config loaded from YAML can even produce."""
+    problem = probability_bounds_disagreement(
+        BOUNDS, min_probability=minimum, max_probability=maximum
+    )
+    assert problem is not None
+    assert "do not match" in problem
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [(0.001, 0.999), (0.05, 0.95), (0.05, 0.999), (0.001, 0.95)],
+)
+def test_a_contained_pair_is_no_violation_even_when_it_is_a_disagreement(
+    minimum: float, maximum: float
+) -> None:
+    """The two relations must actually differ, or splitting them bought nothing.
+    Every pair here is a disagreement and none of them is a violation."""
+    assert (
+        probability_bounds_violation(BOUNDS, min_probability=minimum, max_probability=maximum)
+        is None
+    )
+
+
+@pytest.mark.parametrize("minimum,maximum", [(0.0005, 0.999), (0.001, 0.9995), (0.0, 1.0)])
+def test_a_pair_escaping_the_declared_range_is_a_violation(minimum: float, maximum: float) -> None:
+    problem = probability_bounds_violation(BOUNDS, min_probability=minimum, max_probability=maximum)
+    assert problem is not None
+    assert "fall outside" in problem
+
+
+@pytest.mark.parametrize(
+    "relation", [probability_bounds_disagreement, probability_bounds_violation]
+)
+def test_neither_relation_names_a_configured_value(relation: Any) -> None:
+    """M1-509 is open: whether a *configured* bound may be rendered at all is not
+    settled, so neither message states one. The declared pair is named, because
+    it has matched a strict decimal pattern and been range-checked."""
+    problem = relation(BOUNDS, min_probability=0.0004, max_probability=0.9996)
+    assert problem is not None
+    assert "0.0004" not in problem
+    assert "0.9996" not in problem
+    # The declared pair is what makes the problem fixable and is named.
+    assert "0.001" in problem and "0.999" in problem
+
+
+# --- load_prompt binds the cross-check to the load -------------------------
+
+
+def test_a_disagreeing_config_is_refused_at_load(tmp_path: Path) -> None:
+    """Bound to ``load_prompt`` rather than offered as a separate function, so
+    every startup path inherits it instead of remembering to call it."""
+    path = write_prompt(tmp_path, MINIMAL_PROMPT)
+    with pytest.raises(PromptError) as caught:
+        load_prompt(path, "1.1.0", min_probability=0.05, max_probability=0.95)
+    assert "do not match" in str(caught.value)
+
+
+def test_the_version_check_still_wins_when_both_disagree(tmp_path: Path) -> None:
+    """One PromptError per load, and M1-401's checks keep the precedence they had:
+    a prompt failing both reports the version drift D04 exists to catch."""
+    path = write_prompt(tmp_path, MINIMAL_PROMPT)
+    with pytest.raises(PromptError) as caught:
+        load_prompt(path, "1.0.0", min_probability=0.05, max_probability=0.95)
+    assert "prompt_version" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum",
+    [
+        (0, 0.999),  # int, not float
+        (0.001, 1),
+        ("0.001", 0.999),  # str: would escape as a TypeError from the comparison
+        (float("nan"), 0.999),  # NaN: every comparison is False, so it passes silently
+        (0.001, float("nan")),
+        (-0.5, 0.999),  # outside [0, 1]
+        (0.001, 1.5),
+    ],
+)
+def test_a_bound_that_is_not_a_float_in_zero_to_one_is_refused(
+    tmp_path: Path, minimum: Any, maximum: Any
+) -> None:
+    """``ForecastConfig`` guarantees two floats; this is the assembled-some-other-way
+    case ``forecast.generate`` repeats its own preflights for. Every malformed shape
+    must arrive as this module's own error type, never a raw TypeError."""
+    path = write_prompt(tmp_path, MINIMAL_PROMPT)
+    with pytest.raises(PromptError) as caught:
+        load_prompt(path, "1.1.0", min_probability=minimum, max_probability=maximum)
+    assert "must be floats" in str(caught.value)
+
+
+def test_the_loaded_prompt_carries_the_declared_bounds(tmp_path: Path) -> None:
+    """They travel with the hashed text, so a caller checking them is provably
+    checking the prompt whose digest reaches the ledger."""
+    loaded = load_prompt(
+        write_prompt(tmp_path, MINIMAL_PROMPT),
+        "1.1.0",
+        min_probability=0.001,
+        max_probability=0.999,
+    )
+    assert loaded.bounds == DeclaredProbabilityBounds(low=0.001, high=0.999)
+    assert "0.001" in repr(loaded) and "0.999" in repr(loaded)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"{PLANTED} and no range at all.",  # no-range path
+        f"{PLANTED}\nProbabilities must be between 0.001 and 0.999.\n"
+        "Probabilities must be between 0.01 and 0.99.",  # disagreement path
+        f"{PLANTED}\nProbabilities must be between 0.999 and 0.001.",  # bad-range path
+        f"{PLANTED}\n{DECLARED_RANGE}",  # equality-mismatch path
+    ],
+)
+def test_the_bounds_paths_never_echo_prompt_contents(tmp_path: Path, body: str) -> None:
+    """Every new failure path, not only the ones whose message obviously quotes a
+    line: the rendered traceback quotes source and locals too."""
+    path = write_prompt(tmp_path, _prompt_with(body))
+    with pytest.raises(PromptError) as caught:
+        load_prompt(path, "1.1.0", min_probability=0.05, max_probability=0.95)
+    rendered = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert PLANTED not in str(caught.value)
+    assert PLANTED not in rendered

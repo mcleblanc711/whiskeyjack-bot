@@ -37,8 +37,9 @@ them, so a configuration outside the declared range asks for a probability the
 prompt never permits and pays a repair turn to find out. The check reads the
 prompt ``forecast.prompt_path`` actually names -- never a copy of its numbers,
 which is the whole of the acceptance criterion. It is deliberately *not* the
-same check as ``forecast.generate``'s spec-envelope preflight: see
-``probability_bounds_problem``.
+same check as ``forecast.generate``'s spec-envelope preflight, and the
+relation differs between the load boundary and the spending site: see
+``probability_bounds_disagreement`` and ``probability_bounds_violation``.
 
 Error hygiene matches ``ConfigError``/``LedgerError``/``NormalizationError``: a
 :class:`PromptError` never echoes file contents (a prompt can carry a
@@ -152,8 +153,8 @@ class LoadedPrompt:
 
     version: str
     sha256: str
-    text: str = field(repr=False)
     bounds: DeclaredProbabilityBounds
+    text: str = field(repr=False)
 
 
 def prompt_sha256(data: bytes) -> str:
@@ -249,32 +250,81 @@ def parse_declared_probability_bounds(text: str) -> DeclaredProbabilityBounds:
     return DeclaredProbabilityBounds(low=low, high=high)
 
 
-def probability_bounds_problem(
+def probability_bounds_disagreement(
     bounds: DeclaredProbabilityBounds, *, min_probability: float, max_probability: float
 ) -> str | None:
-    """Return a sanitized problem string if config falls outside ``bounds`` (M1-407).
+    """Return a sanitized problem string unless config and the prompt **agree** (M1-407).
+
+    ``None`` means the configured pair is exactly the pair the prompt states to
+    the model. This is the check ``load_prompt`` runs, so it is what every
+    startup path and ``verify-env`` enforce, and it is M1-407's acceptance
+    criterion.
+
+    **Equality, not containment, and the choice is deliberate.** The criterion
+    is written as "falls outside the range the loaded prompt declares", which
+    reads as containment; the row's own description names the opposite case --
+    "narrowing the config silently asks for a probability the prompt never
+    permits and pays for a repair turn to discover it". Containment passes that
+    case silently, and it cannot do otherwise: ``ForecastConfig`` clamps both
+    bounds to ``PROBABILITY_BOUND_FLOOR``/``CEILING`` and both committed prompts
+    declare exactly those endpoints, so for any config loaded from YAML against
+    a committed prompt a containment test **can never fail**. A check that
+    cannot fire is not a check. CLAUDE.md's stricter-reading rule settles it:
+    equality covers the criterion's case and the description's case both.
+
+    Exact float equality is correct here rather than a tolerance. Both sides are
+    IEEE doubles, ``float("0.001")`` parsed out of the prompt is bit-identical to
+    the ``0.001`` pydantic produces from YAML, and a tolerance would be a third
+    unowned number. Two bounds that differ at all are two different instructions.
+
+    **Three different questions are asked about this pair, and none of them is
+    this one twice.** ``probability_bounds_violation`` below asks whether config
+    demands something the prompt forbids -- the invariant, checked again at the
+    spending site. ``forecast.generate``'s envelope preflight asks whether the
+    pair is inside the ``0.001``-``0.999`` the *submission path* accepts, from
+    ``config.PROBABILITY_BOUND_FLOOR``/``CEILING``; giving that envelope a single
+    owner is a different open row (M1-513) and is not touched here.
+
+    The declared pair is named and the configured pair is withheld, which is what
+    ``forecast.multiple_choice``'s envelope diagnostic already does: the declared
+    values are file-derived but strictly matched and range-checked, while whether
+    a *configured* value may be rendered at all is open (M1-509).
+    """
+    if (bounds.low, bounds.high) == (min_probability, max_probability):
+        return None
+    return (
+        f"forecast.min_probability/forecast.max_probability do not match the {bounds.low!r} "
+        f"to {bounds.high!r} range the loaded forecaster prompt declares to the model; the "
+        "two must agree, or every forecast is checked against bounds the model was never "
+        "given (configured pair withheld)"
+    )
+
+
+def probability_bounds_violation(
+    bounds: DeclaredProbabilityBounds, *, min_probability: float, max_probability: float
+) -> str | None:
+    """Return a sanitized problem string if config demands what ``bounds`` forbids (M1-407).
 
     ``None`` means the configured pair is contained in the range the prompt
-    declares. This is **containment, not equality**: a configuration narrower
-    than the prompt is accepted, because the acceptance criterion is about a
-    config falling *outside* the declared range, and a narrower one is a bound
-    ``forecast.binary``'s repair turn already states to the model.
+    declares. This is the weaker of the two relations and it is the one
+    ``forecast.generate`` repeats at the spending site, for the reason that
+    module repeats its other preflights: a ``LoadedPrompt`` carries no memory of
+    which config loaded it, so the pair checked at load time is not provably the
+    pair in the ``AppConfig`` reaching generation.
 
-    **This is not ``forecast.generate``'s envelope preflight and must not be
-    fused with it.** That check asks whether the configured pair is inside the
-    ``0.001``-``0.999`` the *submission path* will accept, and its numbers come
-    from ``config.PROBABILITY_BOUND_FLOOR``/``CEILING`` for that reason. This
-    one asks whether the configured pair is inside the range *the loaded prompt
-    states to the model*. The two agree today only because the shipped prompt
-    happens to print the spec's endpoints; a custom prompt separates them
-    immediately. Collapsing them is the mistake ``bounds.py``'s docstring
-    describes for ``MAX_ACTOR_LENGTH`` and ``MAX_IDENTIFIER_LENGTH``, and giving
-    the submission envelope one owner is a different open row (M1-513).
-
-    The declared pair is named and the configured pair is withheld, which is
-    exactly what ``forecast.multiple_choice``'s envelope diagnostic already
-    does: the declared values are file-derived but strictly matched, while
-    whether a *configured* value may be rendered at all is open (M1-509).
+    **Why the spending site gets containment while the load boundary gets
+    equality**, rather than one rule everywhere: the two sites ask different
+    questions. ``load_prompt`` asks *do these two agree* -- a disagreement in
+    either direction is a misconfiguration an operator can fix before spending
+    anything. Generation asks the narrower, harder question: *would this config
+    reject a probability the prompt invites?* That is the condition under which
+    a billed call is wasted, and it is the one an ``AppConfig`` assembled some
+    other way could still produce. Equality at the load boundary means no
+    production path can reach generation with a disagreeing pair at all, so this
+    check never fires in production; making it equality too would additionally
+    refuse a *narrower* pair, which is a misconfiguration rather than a way to
+    waste a call, and generation is not one of the startup surfaces the
+    criterion names.
     """
     if bounds.low <= min_probability and max_probability <= bounds.high:
         return None
@@ -370,7 +420,7 @@ def load_prompt(
         )
 
     bounds = parse_declared_probability_bounds(text)
-    problem = probability_bounds_problem(
+    problem = probability_bounds_disagreement(
         bounds, min_probability=min_probability, max_probability=max_probability
     )
     if problem is not None:
