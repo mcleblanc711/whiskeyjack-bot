@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal, get_args
 from uuid import uuid4
 
 from whiskeyjack_bot.artifacts import write_new_file
@@ -36,6 +36,31 @@ class ActivationInactive(TournamentError):
 
 class StorageFailure(TournamentError):
     """Stop the worker; continuing could lose evidence or spend."""
+
+
+# The activation bindings a retirement can name (M1-334). Names only: an operator told
+# *which* binding moved can act on it, and none of them is a value, a digest or config
+# content, so naming them is inside the project's no-value-echo rule.
+RetiredBinding = Literal["account", "destination", "configuration", "prompt"]
+
+
+class ActivationRetired(TournamentError):
+    """The activation no longer matches this worker: something it was bound to moved.
+
+    Unlike :class:`ActivationInactive` -- disabled, or outside its window, which is an
+    ordinary resting state -- this needs an operator, because nothing but `tournament
+    enable` clears it. The 2026-09-09 outage was this, silent for 2h33m: a config field
+    added in a merge moved `config_sha256`, and every poll refused with an exit code and no
+    cause. `changed` carries which bindings moved, in `RetiredBinding` order.
+    """
+
+    def __init__(self, changed: tuple[RetiredBinding, ...]) -> None:
+        if not changed or any(key not in get_args(RetiredBinding) for key in changed):
+            raise ValueError("ActivationRetired needs at least one known binding name")
+        self.changed = changed
+        super().__init__(
+            f"activation retired: {', '.join(changed)} changed; re-run tournament enable"
+        )
 
 
 def utcnow() -> datetime:
@@ -189,6 +214,34 @@ def disable(conn: sqlite3.Connection) -> None:
         append(conn, "disabled", active[-1]["activation_id"], {})
 
 
+def retired_bindings(
+    activation: dict[str, Any], config: AppConfig, *, account_id: int, project_id: str
+) -> tuple[RetiredBinding, ...]:
+    """Which of the activation's bindings no longer hold, compared key by key.
+
+    The same four conditions `require_activation` refused on as one boolean before M1-334,
+    split so a refusal can say which moved. A stored activation missing a binding key
+    counts as moved rather than raising `KeyError`: journal rows are read back from the
+    ledger and are untrusted.
+    """
+    computed = bindings(config)
+    moved: list[RetiredBinding] = []
+    if activation.get("account_id") != account_id:
+        moved.append("account")
+    if (
+        str(activation.get("project_id")) != project_id
+        or str(config.metaculus.tournament.id) != project_id
+        or config.metaculus.tournament.use_sdk_current_id
+        or (config.environment != "production" and project_id != "32977")
+    ):
+        moved.append("destination")
+    if activation.get("config_sha256") != computed["config_sha256"]:
+        moved.append("configuration")
+    if activation.get("prompt_sha256") != computed["prompt_sha256"]:
+        moved.append("prompt")
+    return tuple(moved)
+
+
 def require_activation(
     conn: sqlite3.Connection,
     config: AppConfig,
@@ -203,19 +256,17 @@ def require_activation(
         raise ActivationInactive("tournament activation is disabled")
     data = active[-1]
     instant = now or utcnow()
-    if (
-        data["account_id"] != account_id
-        or str(data["project_id"]) != project_id
-        or str(config.metaculus.tournament.id) != project_id
-        or config.metaculus.tournament.use_sdk_current_id
-        or (config.environment != "production" and project_id != "32977")
-        or any(data[k] != v for k, v in bindings(config).items())
-    ):
-        raise TournamentError("activation account, destination, configuration, or prompt changed")
+    # M1-334: the resting states are checked *before* retirement, not after. Disabled and
+    # out-of-window are deliberate operator states, and they stay silent even when a binding
+    # has also moved -- otherwise deploying a config change against a disabled profile, or
+    # any poll after a window closes, would page about a profile nobody is running.
     if events(conn, "disabled", data["activation_id"]) or not datetime.fromisoformat(
         data["starts"]
     ) <= instant < datetime.fromisoformat(data["ends"]):
         raise ActivationInactive("tournament activation is disabled or outside its validity window")
+    changed = retired_bindings(data, config, account_id=account_id, project_id=project_id)
+    if changed:
+        raise ActivationRetired(changed)
     return data
 
 

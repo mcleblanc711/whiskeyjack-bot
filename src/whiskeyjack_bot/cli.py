@@ -1406,10 +1406,21 @@ def _run_tournament(args: argparse.Namespace) -> int:
             connection.close()
     except Exception as exc:
         # SDK exceptions may carry tokens and response bodies. Safe, stable type only.
-        from whiskeyjack_bot.tournament_state import TournamentError
+        import logging
 
-        print(
-            f"Tournament refused: {str(exc) if isinstance(exc, TournamentError) else type(exc).__name__}"
+        from whiskeyjack_bot.tournament_state import ActivationInactive, TournamentError
+
+        reason = str(exc) if isinstance(exc, TournamentError) else type(exc).__name__
+        print(f"Tournament refused: {reason}")
+        # M1-334: the same sanitized line into the JSONL log the operator tails. Before
+        # this a refusal reached only stdout (the journal), so the tail went silent -- and a
+        # silent tail reads exactly like a tournament between question batches. A disabled
+        # or out-of-window activation is an ordinary resting state and logs as a warning;
+        # anything else needs a person.
+        logging.getLogger("whiskeyjack_bot.tournament").log(
+            logging.WARNING if isinstance(exc, ActivationInactive) else logging.ERROR,
+            "tournament refused: %s",
+            reason,
         )
         return 1
     return 0
