@@ -10299,3 +10299,19 @@ Combinations of two or three independently moved keys, and a stored activation m
 are not exercised. Filed rather than built because `_retire` moves one binding at a time by
 construction and the combinatorial fixture is a real piece of work, not a parametrize line.
 
+### Round 2 — APPROVE
+
+Reviewed commit `a1b3348`, the request's pinned HEAD. Both round-1 blockers marked CLOSED, no
+new blocking findings, no new backlog candidates beyond `M1-335`. Two rounds total.
+
+The reviewer noted one validation limitation worth recording rather than burying: it could not
+run pytest, because `codex exec --sandbox read-only` gives it no writable temp directory, so it
+verified the remediation by inspection and took the request's gate report on trust. That is the
+standing shape of every round in this project — the request refuses to emit unless the four
+gates pass locally, which is exactly why that refusal exists.
+
+Process note: round 2's first launch died silently mid-exploration, producing no response file
+and no error, with memory available and no OOM. Relaunching the identical command succeeded in
+about a minute. Nothing was lost because `run-review.sh` refuses to overwrite an existing
+response, and the absent file was itself the signal that the round had not happened.
+
