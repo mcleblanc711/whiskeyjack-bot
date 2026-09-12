@@ -24,7 +24,8 @@ database.*
   "never do this" list, and a closing section naming every state whose only recovery would
   be a database edit.
 - `docs/backlog/backlog.csv` — five new rows (**M2-713**, **M2-714**, **M2-715**,
-  **M1-611**, **M0-009**), and `D-1001` flipped to `Done`.
+  **M1-611**, **M0-010**), and `D-1001` flipped to `Done`. Twenty failure states became
+  twenty-one after the pre-PR master merge — see the C5 deviation below.
 - `docs/TRACKS.md` — the claim row, committed first.
 
 No code, no migration, no dependency. Nothing in this item is reachable from the CLI
@@ -146,6 +147,43 @@ flat in `docs/`, the file is named for what it is, and `M2-712`'s notes already 
 cross-reference has been pointing at. `docs/TRACKS.md:170`, `docs/M2-NOTES.md:716` and
 `docs/M2-NOTES.md:1099` all name it.
 
+### Decision — `M0-009` was renumbered to `M0-010` before the PR opened
+
+The new `verify-env` row was filed as `M0-009`, which was free in the CSV and should not
+have been. `M0-009` already denoted something else in this project's history: it was filed
+on the M2-707 branch for the `scripts/gate.sh` exit-code defect and then **deleted** as a
+duplicate of `T-905` (`docs/M2-NOTES.md` records both the filing and the deletion, and that
+paragraph is still on master). Recycling the identifier would make the two references in
+`docs/M2-NOTES.md` and this file's runbook paragraph point at two different defects with no
+way to tell them apart. A deleted row frees the *slot*, not the *name*. Renumbered to
+`M0-010`, which has never appeared in the backlog on any branch.
+
+### Deviation — the runbook grew a twenty-first state, `C5`, in the pre-PR master merge
+
+The runbook was written against a base sixty-three commits behind the master it merged
+before this PR opened, and one of those commits added a failure state rather than changing
+an existing one: **M1-334** split `ActivationRetired` out of `ActivationInactive`, so
+`activation retired: ... changed; re-run tournament enable` is now a distinct refusal with
+its own alert and its own recovery. It is also the failure state with the worst measured
+cost in this project — the 2026-09-09 outage, 2h33m of every poll refusing because a merge
+moved `config_sha256` with the operator's YAML untouched. Omitting it would have failed the
+criterion on exactly the enumeration half this item's notes argue is the hard one, so `C5`
+was written rather than deferred: the binding table, the `P1` contrast (resting states are
+checked first and stay silent), and the "treat `tournament enable` as part of deploying"
+rule.
+
+The rest of the merge was checked and changed nothing: every error string the symptom index
+quotes was re-grepped against the merged tree and all of them still exist verbatim.
+
+### Deferred — `export` (M1-604) landed in that same merge and has no section
+
+`whiskeyjack-bot export` did not exist when the runbook was written. It gets no section
+because it has no failure state this criterion is about: it never writes to the ledger, so
+there is nothing it can leave half-done and nothing to recover from. `M1-611`'s `show` will
+change the command list anyway, and the deferred CI check below — asserting every command
+the runbook names still parses — is the thing that should catch a command *drifting*, not a
+prose section per subcommand.
+
 ### Deviation — the runbook documents a read-only probe that is a coincidence of gate ordering
 
 `submit` prints the record, question, version, type, derived status, content hash and
@@ -180,7 +218,7 @@ looks like one line in `AppConfig.secret_env_var_names()`.
 
 Refused for this branch. It changes merged, reviewed configuration behaviour and its exit
 code from a documentation item, which is the sideways fix `M1-314`, `M1-507`, `M2-709` and
-`M1-608` all exist as rows instead of. Filed as **M0-009**, and the runbook documents the
+`M1-608` all exist as rows instead of. Filed as **M0-010**, and the runbook documents the
 false red with the row number and the sentence that the paragraph is deleted when the row
 ships — so the doc patch has an expiry date rather than becoming permanent.
 

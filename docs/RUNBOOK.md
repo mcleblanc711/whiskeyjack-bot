@@ -83,6 +83,7 @@ partial batch is a non-zero exit even though the records that succeeded were wri
 | `no ledger database at ...` | [C1](#c1--no-ledger-database) |
 | `record_id does not name a stored forecast record` | [P0](#p0--two-profiles-one---config-and-the-error-that-looks-like-data-loss) — check `--config` first |
 | `Tournament refused: tournament activation is disabled` | [P1](#p1--the-cup-profile-is-dormant-its-refusals-are-correct) |
+| `activation retired: ... changed; re-run tournament enable` | [C5](#c5--activation-retired) |
 | `operation artifact missing; platform reconciliation required` | [P2](#p2--a-ledger-copied-without-its-artifact-root-will-refuse) |
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
@@ -541,10 +542,57 @@ in your environment — never in a config file, never in code.
 **optional** — its absence just marks the fallback retrieval provider unavailable and the
 run proceeds. So an install with no Exa account reports `environment NOT ready` and exits
 `3` while being perfectly runnable. If `EXA_API_KEY` is the only line in the report, you
-are not blocked. Filed as **M0-009**; when it ships, this paragraph goes away.
+are not blocked. Filed as **M0-010**; when it ships, this paragraph goes away.
 
 **Never.** Do not put a credential in `config.yaml` to satisfy this check. The config
 carries the *name* of the variable, never its value.
+
+### C5 — Activation retired
+
+**What you see.** Every `tournament run-once` poll refuses, and the worker buys and posts
+nothing:
+
+```
+activation retired: configuration changed; re-run tournament enable
+```
+
+One or more of four binding names appears — `account`, `destination`, `configuration`,
+`prompt` — in that order (`tournament_state.py`, `ActivationRetired`). Since **M1-334** this
+also pushes one alert per profile, titled `whiskeyjack: activation retired`; the body names
+the same bindings and never a digest or a config value.
+
+**Confirm.** An activation binds to the account, the destination project, a digest of the
+whole `AppConfig`, and a digest of the forecaster prompt file. Any of them moving retires it.
+The binding names tell you which:
+
+| Name | What moved |
+|---|---|
+| `account` | The token now authenticates a different Metaculus user than the one enabled. |
+| `destination` | The configured tournament is not the one enabled, or `use_sdk_current_id` is on, or a non-production profile is pointed somewhere other than the test project. |
+| `configuration` | **Any** byte of the effective config. Adding a field to `AppConfig` in a merge is enough — the YAML need not change at all. |
+| `prompt` | `forecast.prompt_path`'s bytes changed. |
+
+**`configuration` is the one that surprises people, and it has already cost real downtime.**
+On 2026-09-09 a merge that added an `AppConfig` field moved `config_sha256` with the operator's
+YAML untouched, and both live workers refused every poll for 2h33m. Nothing in-process could
+report it at the time — that gap is what M1-334's alert closes — and the only outward symptom
+was the JSONL tail going quiet. **A merge or a dependency bump can retire an activation.
+Treat `tournament enable` as part of deploying, not as one-time setup.**
+
+**This is not [P1](#p1--the-cup-profile-is-dormant-its-refusals-are-correct).** A dormant or
+out-of-window profile raises `ActivationInactive` and is a deliberate resting state; it is
+checked *first* and stays silent even when a binding has also moved, so deploying a config
+change against a disabled profile does not page anyone. `activation retired` means a profile
+you are running has stopped running.
+
+**Recovery.** Re-run `tournament enable` for the affected profile, with the `--config` that
+profile uses, and re-enable its timer. Nothing else clears it.
+
+**Never.** Do not reach into `tournament_events` to re-point the stored digests at the current
+config. That row is the evidence that a human authorized *this* configuration to spend money
+against *this* project; rewriting it to match whatever is on disk destroys the only thing it
+proves. Do not disable the alert to quiet the pages either — the refusal is already silent in
+the ledger, and the alert is the only thing that says so out loud.
 
 ---
 
@@ -1132,7 +1180,7 @@ you to edit the ledger has destroyed the thing it documents.
 | Finding a record's state, or a lost attempt id | [U](#how-to-find-the-attempt-id-if-you-lost-it) | **M1-611** | The read-only `show` command the spec requires |
 | A `not_recorded` forecast | [R4](#r4--not_recorded-the-forecast-the-ledger-never-saw) | **M1-317** | A ledger identity for a post-generation persistence failure |
 
-One further filed item is a nuisance rather than a stuck state: **M0-009**, `verify-env`
+One further filed item is a nuisance rather than a stuck state: **M0-010**, `verify-env`
 requiring the optional fallback retrieval key ([C4](#c4--environment-not-ready)).
 
 If you hit a state that is not in this document and whose only exit appears to be a
