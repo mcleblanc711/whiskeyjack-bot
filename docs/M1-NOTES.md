@@ -10156,6 +10156,165 @@ tagged "different payload" while deriving one payload. The biconditional still j
 correctly; only the arm label was false. Collisions are now compared as mappings, and the
 different-payload mode asserts `left != right`. Re-swept: 21 of 21.
 
+## M1-334 — A retired activation pages with which binding moved
+
+Acceptance: *a retired activation pages with its cause instead of an exit code, naming which
+binding moved (account, destination, configuration or prompt) by key and never by digest or
+value; the push degrades exactly as `notify.emit` does; the event joins the closed
+`NotifyEvent` vocabulary with a throttle window keyed on the profile; a disabled or
+out-of-window activation does not page; and the operator monitor gains a way to show a
+refusal.*
+
+### Delivered
+
+- `tournament_state.py`: `RetiredBinding` (closed `Literal`), `ActivationRetired(TournamentError)`
+  carrying `.changed`, and `retired_bindings()`, which compares the stored activation against
+  `bindings(config)` key by key. `require_activation` raises `ActivationRetired`; the refusal
+  message names the moved keys.
+- `tournament.py`: `run_once` emits `activation_retired` at that refusal, then re-raises.
+- `notify.py`: `activation_retired` joins `NotifyEvent`, with a window of 86400 and priority
+  `high`.
+- `cli.py`: every tournament refusal is also logged, through `whiskeyjack_bot.tournament`,
+  into the JSONL the operator tails. It logs at `ERROR`, or at `WARNING` for
+  `ActivationInactive`.
+- Tests: 12 new cases in `tests/unit/test_tournament.py`.
+
+**No `AppConfig` field, no migration, no dependency.** `NotifyConfig` has no event list, so the
+new vocabulary member cannot reach `config_sha256`, and deploying this does **not** retire the
+live activation. That is checked after the merge, not assumed (below).
+
+### Deviation — the row's premise was stale: the notifier *was* installed
+
+The row says the refusal "is reached before `run_once` installs the notifier". It is not. M1-329
+(`4599e5a`, the very merge that caused the outage) put `notifier_context(build_notifier(config))`
+*around* `require_activation`, and `git blame` shows that ordering has held ever since. During the
+2h33m outage a notifier was installed and live; the refusal simply had **no `emit()` call site**.
+So this item does not construct a separate notifier, as the criterion prescribes for a path with
+none installed. It calls the ordinary `emit`, inside the existing context. That satisfies the
+criterion's actual demand, identical degrade behaviour, by *being* the same function rather than
+by imitating it: every `Exception` is absorbed, `BaseException` re-raised, and a missing notifier
+means `"disabled"`.
+
+### Decision — split the one boolean into named bindings, with a missing key counting as moved
+
+`require_activation` refused on one `or`-chain and could not say which clause fired.
+`retired_bindings` keeps the same four conditions and names each one. A stored activation
+missing `config_sha256` or `prompt_sha256` counts as moved rather than raising a raw `KeyError`:
+journal rows come back out of the ledger and are untrusted. A test pins `bindings(config)`'s key
+set, so a new binding cannot go uncompared.
+
+### Decision — a day-long window keyed on the project
+
+Retirement is a condition, not an event: it holds until someone re-runs `tournament enable`, and
+every five-minute poll hits it again. With 30 minutes, the incident window, one retired profile
+would page about 5 times over an outage like the 9 Sep one. With 86400 it pages once. Keying on
+the project means two profiles retiring both page.
+
+### Decision — the log line covers every refusal, not just retirement
+
+The monitor half of the criterion is about silence, and silence came from *any* refusal exiting
+before the pipeline logged. So `cli.py` logs every tournament refusal with the same sanitized
+text it prints. `watch-tournaments.py` already renders `ERROR` and `WARNING` in colour, so no
+change was needed there. A resting state (`ActivationInactive`) is a `WARNING`, so a closed window
+reads differently from a retired activation.
+
+### Rejected — alerting on `ActivationInactive`, and why not
+
+A window closing is the designed end of an activation. Paging on it would page every night one
+ends, which trains the operator to ignore the channel.
+
+### Standing risk — not verifiable offline
+
+The real push goes to ntfy. The wiring is tested through a recording transport, and the
+transport contract is M1-329's, already live.
+
+### Teeth — the mutation pass
+
+Against a committed tree with `PYTHONDONTWRITEBYTECODE=1`, over `test_tournament.py` and
+`test_notify.py`. **10 mutants, 10 killed:** no page at the refusal; pages on `ActivationInactive`
+too; constant subject (killed only by the two-profile test, rewritten to drive `run_once` for
+both profiles precisely for this); body leaks a config value; window 30 minutes (killed only by
+the clock-driven twelve-poll test, rewritten for this); priority `default`; prompt binding not
+compared; destination not named; refusal not logged; every refusal logged as a warning.
+
+Two of the first-draft tests would have let mutants through, and both were caught *before* the
+pass by asking of each claim which mutant it kills. The first two-profile test drove `Notifier`
+directly, so a constant subject at the `run_once` call site was invisible to it. The first
+throttle test polled three times within seconds, where a 30-minute and a day-long window look
+identical. **One mutant was itself malformed:** it inserted `{config.logging.level}` into a
+plain string continuation of the f-string, so the braces never interpolated and it "survived"
+for the wrong reason. Re-run with the `f` prefix, it was killed by all four
+`test_a_retired_activation_pages_…` cases.
+
+### Round 1 — two blockers, both reproduced by execution, both real
+
+Reviewed commit `7cde2db`, the request's pinned HEAD. Neither finding was the pushback the
+request anticipated: the reviewer accepted that `notifier_context` already wraps
+`require_activation`, so the "build your own notifier" premise in the acceptance criterion did
+not come back. Both blockers were reproduced through `run_once` before any fix was written.
+
+**1. A resting activation paged as soon as a binding also moved.** `require_activation`
+evaluated retirement *before* the disabled/out-of-window check, so a paused profile raised
+`ActivationRetired` and pushed. Reachable without anything unusual: deploy a config change while
+a profile is disabled, or let any poll land after a window closes, and the operator is paged
+about a profile nobody is running. Fixed by checking the resting states first.
+
+The interesting part is why the existing test could not have caught it. Round 1's
+`test_a_disabled_or_out_of_window_activation_does_not_page` asserts exactly the right thing —
+resting states are silent — but it holds the bindings *intact*, so it never reaches the
+retirement branch at all. It is the project's recurring vacuous-property shape in a unit test:
+the fixture cannot reach the branch the assertion is about, so the assertion passes for a reason
+that has nothing to do with the claim. The new parametrized
+`test_a_resting_activation_stays_silent_even_when_a_binding_also_moved` puts the profile in both
+states at once, which is the only arrangement that can see the ordering.
+
+**2. The push title interpolated the configured project ID.** The title read
+`whiskeyjack: project 32977 activation retired` — three lines under a comment in the same commit
+claiming it names "the moved bindings, never a digest or a config value". The request's own risk
+area 2 made the same claim and its test checked only the *digests*, so the branch asserted the
+property it was violating. The title is static now. The project remains the throttle **subject**,
+which is safe for a reason worth writing down: `Notifier._stamp_path` sha256s the subject into a
+stamp filename and never transmits it, so one-page-per-profile survives a title that says nothing.
+
+That cost the two-profile test its discriminator — it had distinguished the pages by the project
+ID in the title. It now asserts the page *count*, which is strictly stronger: with a constant
+subject the three polls collapse to one page, so the count alone kills the mutant the title match
+used to. Verified, not assumed (below).
+
+### Teeth — round 1's remediation
+
+**3 mutants, 3 killed,** against a committed tree with `__pycache__` cleared between runs:
+
+- restore the old ordering in `require_activation` → both parametrizations of the new resting
+  test fail;
+- restore the interpolated title → four `test_a_retired_activation_pages_…` cases *and*
+  `test_two_retired_profiles_each_page` fail (5 in total);
+- constant `subject="wj"` at the `run_once` call site → `test_two_retired_profiles_each_page`
+  fails on the count alone, which is the check that the rewrite did not cost the test its teeth.
+
+### Non-blocking, filed rather than built
+
+`M1-335` (Low): `retired_bindings` is tested one moved key at a time plus the destination pair.
+Combinations of two or three independently moved keys, and a stored activation missing a key,
+are not exercised. Filed rather than built because `_retire` moves one binding at a time by
+construction and the combinatorial fixture is a real piece of work, not a parametrize line.
+
+### Round 2 — APPROVE
+
+Reviewed commit `a1b3348`, the request's pinned HEAD. Both round-1 blockers marked CLOSED, no
+new blocking findings, no new backlog candidates beyond `M1-335`. Two rounds total.
+
+The reviewer noted one validation limitation worth recording rather than burying: it could not
+run pytest, because `codex exec --sandbox read-only` gives it no writable temp directory, so it
+verified the remediation by inspection and took the request's gate report on trust. That is the
+standing shape of every round in this project — the request refuses to emit unless the four
+gates pass locally, which is exactly why that refusal exists.
+
+Process note: round 2's first launch died silently mid-exploration, producing no response file
+and no error, with memory available and no OOM. Relaunching the identical command succeeded in
+about a minute. Nothing was lost because `run-review.sh` refuses to overwrite an existing
+response, and the absent file was itself the signal that the round had not happened.
+
 ## M1-613 — Redact configured secrets centrally in `tournament_state.append`
 
 Acceptance: *`tournament_state.append` redacts configured secrets before persistence for every
