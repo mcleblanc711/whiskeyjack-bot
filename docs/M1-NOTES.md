@@ -9615,3 +9615,835 @@ other than the one it claimed.
 The reviewer noted it could not run `pytest` in its read-only environment (no writable
 temporary directory) and validated by direct in-memory execution instead. The suite pass
 reported in the request is `scripts/gate.sh`'s, run locally.
+
+## M1-604 — Export JSONL and Parquet
+
+Acceptance: *exports round-trip record IDs/counts and never mutate SQLite.* Decision D29:
+the exports are **derived** artifacts, never a competing source of truth.
+
+### Delivered
+
+- `src/whiskeyjack_bot/export.py` — `export_ledger`, `EXPORTED_TABLES` (14 hand-written
+  `TableSpec`s), `read_table`, `render_jsonl`, `render_parquet`, `canonical_json`,
+  `ExportError`, `EXPORT_SCHEMA_VERSION = 1`, `MANIFEST_FILENAME`.
+- `src/whiskeyjack_bot/ledger.py` — `connect_readonly` and `_verify_schema`, a third opener.
+- `src/whiskeyjack_bot/cli.py` — `whiskeyjack-bot export --format jsonl|parquet [--output DIR]
+  [--config PATH]`, mapping `ExportError`/`LedgerError` to `refused: …` / `EXIT_REFUSED`.
+- `pyproject.toml` / `uv.lock` — `pyarrow>=24,<25` and a `pyarrow.*` mypy override (+2 lock
+  lines; see the dependency decision below).
+- `tests/unit/test_export.py` (27 tests), `tests/unit/test_cli_export.py` (7),
+  `tests/property/test_export_properties.py` (7 properties).
+- `docs/backlog/backlog.csv` — `M1-612` filed for `show --record-id` (see Deviation).
+
+**No migration.** No `AppConfig` field either: `storage.export_root` has existed since
+M1-601, so `config_sha256` is unchanged and neither live activation is retired (the M1-334
+trap).
+
+### Decision — a third opener, `connect_readonly`, on `mode=ro` and not `immutable=1`
+
+`connect()` opens read-write and its pragmas are writes. `open_verified_ledger` calls
+`_migrate`, so an export through it could migrate the database it was exporting. So there is a
+third opener: `file:<abs>?mode=ro`, schema verified without applying anything
+(`_verify_schema`), `isolation_level = None` so the caller owns one explicit transaction.
+
+`immutable=1` was rejected **by measurement**. It is the stronger-looking flag and it also
+leaves every byte alone, but against a `-wal` holding committed frames it does not error. It
+reads the stale main database and returns fewer rows than the ledger holds.
+`test_immutable_would_have_silently_read_a_stale_ledger` is the executable record, and it
+fails if `immutable=1` ever starts reading the WAL. Swapping the opener's URI to
+`immutable=1` is killed by three tests (see Teeth).
+
+`connect_readonly` also refuses a ledger **behind** this build, which `_migrate` would have
+answered by migrating: the export names columns later migrations added, so a behind ledger
+would be half-exported or fail with SQLite's own message.
+
+### Decision — the table spec is written down, not derived, and migration 012 proved why
+
+`EXPORTED_TABLES` is transcribed column by column from the migrations in DDL order, including
+appended columns. `PRAGMA table_info` would be less code and would silently reshape a
+published contract the first time a migration lands. Two tests compare the spec with the
+live schema (table set, then column names, declared types and primary key).
+
+**This caught a real change mid-branch.** `012_tournament_safety.sql` arrived through a
+master merge and added `tournament_events`. The parity test went red with `Extra items in
+the right set: 'tournament_events'`, and every other test stayed green, because every other
+test iterates the spec. A derived spec would have exported the new table without anyone
+deciding to.
+
+### Decision — every table is exported, `tournament_events` included
+
+All fourteen, none excluded. `schema_migrations` is in because it tells a consumer which schema
+produced the files. `tournament_events` is in because it holds the attribution record of the
+live runs: `activation` (account, project, window, `config_sha256`, `prompt_sha256`),
+`forecast_intent` (the exact posted payload and `payload_sha256`), `comment_intent`,
+`witness`, `evidence_gap`, and the cost journal. Approval actors of the form
+`policy:launch-v1:<hash>` resolve only against it. Its identifier is `seq`, the primary key
+and the order the runner appends in. `event_id` is UNIQUE but a random hex token, so ordering
+by it would scramble time. `data` is exported as the stored JSON string, like `record_json`.
+Parsing it would put this module's JSON reading between the ledger and the consumer.
+
+`EXPORT_SCHEMA_VERSION` stays `1`: nothing has been published under it yet, so adding a
+table before the first release changes no consumer's contract.
+
+### Decision — one snapshot, explicit order, nothing coerced
+
+- **One deferred transaction** around all fourteen reads. Without it each statement gets its
+  own snapshot, and a run committing between two tables yields an export whose
+  `forecast_records` references events its `lifecycle_events` lacks.
+- **`ORDER BY` the identifier** on every table, never natural order.
+- **`text_factory = bytes`**, decoding in `_decode_value`. `sqlite3`'s own decode failure is
+  `OperationalError: Could not decode to UTF-8 column 'x' with text '<bytes>'`, which leaks
+  content through an error the project never wrote.
+- **No coercion.** The storage class (`typeof()`, read alongside each value) must match the
+  declared type. BLOBs, non-finite REALs (SQLite stores ±inf; NaN becomes NULL) and invalid
+  UTF-8 are refused as `ExportError` naming `table.column`, never the value or row ID.
+- **Canonical JSONL**: `json.dumps(ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+  allow_nan=False)`. Row keys are alphabetical, and DDL order lives in the manifest's
+  `columns`, where it is a contract.
+
+### Decision — Parquet's determinism is version-scoped, and the manifest says which version
+
+JSONL is byte-stable, unconditionally. Parquet is byte-stable **for a fixed pyarrow**
+(measured: identical digests across repeats), not across versions: every file embeds
+`parquet-cpp-arrow version <x.y.z>`. The knobs that would strip it are undocumented writer
+behaviour. So the manifest records `writer.pyarrow`, and the two formats are asserted
+semantically equal row for row. The Arrow schema comes from the declared types, so an empty
+or all-NULL column is still typed.
+
+### Decision — render everything, then write; `manifest.json` last
+
+Every table is rendered before the first file is written, so a render refusal leaves no files.
+Rendering used to happen inside the write loop: a refusal on table k left k-1 files and no
+manifest, and a retry into the same directory was refused as `already exists`. Ordinary I/O
+can still interrupt the write loop. For that, `manifest.json` is written last and is the
+completion marker: a directory without one is not an export. Files go through
+`artifacts.write_new_file` (create-or-fail), so an export never overwrites an earlier one.
+
+### Decision — no second redaction pass
+
+M1-605 redacts at write time. A second pass here would be a second opinion about what counts as a secret, and
+the two would drift. The export carries the ledger's bytes. What that leaves uncovered is in
+Standing risk.
+
+### Decision — the dependency slot buys a declaration, not an install
+
+`pyarrow 24.0.0` was already resolved transitively (`forecasting-tools==0.2.92` → `streamlit
+1.59.2` → `pyarrow>=7.0,<25`), so declaring it adds zero bytes. It is declared because
+`export.py` imports it directly. It is imported function-locally in the Parquet writer only,
+never at module scope (~146MB). The bound stays inside streamlit's range or `uv sync --locked`
+conflicts.
+
+### Deviation — the joined per-record view is not here; it is `M1-612`'s
+
+Two earlier notes deferred it **to this item**. M1-603's Deferred list sends "Assembly of the
+handoff's full canonical record → M1-604 / `show`", and M1-606's sends "The
+`lifecycle_events` ∪ `pipeline_failure_events` merged read/export view → M1-604". This item
+ships the table-level export and not that join. A join baked into the export imposes one
+analytical reading a consumer cannot undo, and the handoff already names the per-record
+reader: `whiskeyjack-bot show --record-id ID`, a required CLI entry point that **no backlog
+row owned**. Rather than re-defer silently, this branch files **`M1-612`** for `show`, with the
+two deferrals cited in its description. `M5-804` (the grouped attribution dataset) builds on
+the export, but it is not a per-record view, so the join does not go there.
+
+### Rejected — `immutable=1`, and why not
+
+Silently stale under a live WAL (measured, and pinned by a test). See the opener decision.
+
+### Rejected — reading through `open_verified_ledger`, and why not
+
+It migrates. An export must not change the schema of what it exports. Swapping it in is killed
+by the behind-build test.
+
+### Rejected — a spec derived from `PRAGMA table_info`, and why not
+
+It would have exported `tournament_events` without anyone deciding to, and every future
+column along with it. The hand-written spec plus a parity test turns a schema change into a
+decision.
+
+### Rejected — `fastparquet` or `polars`, and why not
+
+`fastparquet` drags in pandas and numba. `polars` would be a second dataframe engine brought in
+for one write call. `pyarrow` was already installed.
+
+### Deferred (do not read the absence as an omission)
+
+- **Per-record assembly → `M1-612`** (`show --record-id`), as above.
+- **Field-level documentation of every exported column → `D-1002`**, whose acceptance
+  criterion is exactly that.
+- **The `content_sha256` lone-surrogate decision** (CLAUDE.md gotcha) stays open.
+  `test_a_lone_surrogate_cannot_be_stored_as_text_at_all` pins that the binding refuses one
+  as TEXT, so the export adds no new path for such a string to reach a file. It neither
+  closes the decision nor widens it.
+
+### Standing risk — not verifiable offline
+
+- **`tournament_events.data` is not redacted centrally.** `tournament_state.append` stores
+  `canonical(data)` as given. Redaction is applied at each call site that carries provider
+  text (the `cost_reserved` request, `model_completed`, `model_response` in
+  `forecast/sol.py`), not in `append`. The export carries `data` verbatim, so a future caller
+  that journals unredacted text would export it. **Measured on 2026-09-10 against copies of
+  both real ledgers:** none of the five secret values in the live `.env` (the ones of 8+
+  characters) appears anywhere in the exported JSONL (10.9MB). The check printed names and
+  booleans only. This is pre-existing, not introduced here: centralizing it belongs in
+  `append` and is a backlog candidate, not this item.
+- **`-shm` is touched by every reader**, this one included: SQLite records read locks there.
+  It is derived lock state regenerated from the WAL and holds no ledger content. The claim is
+  that the `.db` and `-wal` stay byte-identical, and that claim is tested.
+- **The whole ledger is held in memory** during an export (`tables = {…}`). On the live
+  MiniBench ledger (8.1MB, 3,353 rows) JSONL takes 0.13s and Parquet 0.66s, so there is no
+  pressure today. Streaming per table would break the render-before-write guarantee and is
+  not worth it at this size.
+- **Parquet bytes across pyarrow versions** are expected to differ. A lock bump changes the
+  digests. The manifest's `writer.pyarrow` is what makes that explainable.
+
+### Live-ledger smoke
+
+Both real ledgers were copied into `/dev/shm` through SQLite's backup API from a `mode=ro`
+connection (never exported in place mid-poll), then exported in both formats. Schema 13, no
+refusals:
+
+| Table | MiniBench | Cup |
+| --- | ---: | ---: |
+| approval_events | 23 | 5 |
+| forecast_records | 24 | 5 |
+| lifecycle_events | 70 | 15 |
+| pipeline_failure_events | 16 | 1 |
+| research_documents | 617 | 285 |
+| research_runs | 52 | 45 |
+| resolution_events | 0 | 0 |
+| schema_migrations | 13 | 13 |
+| score_events | 0 | 0 |
+| submission_attempts | 23 | 5 |
+| submission_key_releases | 0 | 0 |
+| submission_key_reservations | 23 | 5 |
+| submission_verifications | 0 | 0 |
+| tournament_events | 2,492 | 1,492 |
+
+The strict decoder refused nothing in 5,224 production rows. `tournament_events` is 74% of the
+MiniBench export, 1,579 of it `heartbeat`.
+
+### Teeth — the mutation pass
+
+Run against a committed tree with `PYTHONDONTWRITEBYTECODE=1` and `HYPOTHESIS_PROFILE=ci`,
+over the three export test files. **13 mutants, 13 killed**, 3 of them only after the fixes
+below.
+
+| Mutant | Killed by |
+| --- | --- |
+| opener → `ledger.connect` | missing-ledger, behind-build, CLI mistyped-config tests |
+| opener → `open_verified_ledger` | `test_a_ledger_behind_this_build_is_refused_rather_than_half_exported` |
+| `ORDER BY` dropped | `test_row_order_is_the_identifier_and_not_insertion_order` |
+| `BEGIN` dropped | `test_the_export_reads_one_snapshot_even_while_a_writer_commits` (after fix) |
+| `text_factory = bytes` dropped | 23 test cases |
+| `from None` dropped on the UTF-8 arm | `test_a_refusal_never_echoes_the_value_it_refused` (after fix) |
+| `allow_nan=True` | `test_canonical_json_refuses_a_non_finite_number_on_its_own` (new) |
+| non-finite REAL check removed | the off-contract table's non-finite case (after fix) |
+| `blob` admitted for TEXT | the off-contract table's blob case (after fix) |
+| `mode=ro` → `immutable=1` | stale-WAL, missing-ledger, CLI mistyped-config, and a real-SQLite round-trip property |
+| `mode=ro` → `mode=rw` | `test_the_read_only_connection_refuses_every_write` |
+| behind-build refusal removed | the behind-build test |
+| render inside the write loop | `test_a_render_refusal_leaves_no_partial_export_behind` (new) |
+
+The opener → `connect` mutant is **not** killed by the byte-identity test. That is correct
+rather than a gap: `connect()` on a current ledger writes nothing, so there are no changed
+bytes to see. The write-refusal and missing-ledger tests carry the structural guarantee.
+
+### Found before review: four tests that could not fail
+
+The suite was committed as unreviewed work in progress (`be056fe`). Reading it, and then the
+mutation pass, found four places where a test passed for a reason other than the one it
+claimed. Each is the project's recurring vacuity defect:
+
+1. **The snapshot test** committed a row into `forecast_records` *after* `forecast_records`
+   had been read, so the row was absent under any snapshot policy. Deleting the `BEGIN`
+   survived. It now commits after the first table, into `score_events`, which is read later,
+   and confirms the commit landed.
+2. **The redaction test** never wrote the fake secret anywhere, so "the secret is absent from
+   the export" was true by construction. Its expected marker, `[REDACTED:…]`, was not even
+   the form `redaction.py` produces. It now plants the secret through
+   `record_submission_attempt`, confirms it in the input, and finds `<redacted:NAME>` in the
+   exported row. Disabling redaction in `lifecycle.py` turns it red.
+3. **The no-leak property** false-positived on `value=b"_"`, which is inside the fixed text
+   `research_documents`, under the randomized profile. The derandomized gate never drew it.
+   The length floor guarding `str` draws was never applied to `bytes`. Values now carry a
+   canary and the canary is what is searched for. The chain check asserted `__cause__ is
+   None`, which implicit chaining also satisfies, so it could not see a dropped `from None`.
+   It now asserts `__suppress_context__`.
+4. **Two refusal layers covered for each other.** With the non-finite check deleted,
+   `canonical_json`'s `allow_nan=False` still refused the row. With `blob` admitted as
+   TEXT, the planted `x'00ff'` was still refused as invalid UTF-8. Each off-contract case now
+   asserts its own reason, and the blob is valid UTF-8.
+
+The row-order property was also **renamed**: it never called `read_table`. It pins SQLite's
+BINARY collation against a byte sort, which is an assumption the export relies on. The
+unit test is what shows the export issues the `ORDER BY`.
+
+### Process: a merge dropped the dependency claim's prose
+
+`67610aa` wrote the pyarrow case into `docs/TRACKS.md`'s dependency-additions row. The first
+master merge, `c986ca4`, resolved that row back to `*free*`. Enforcement never lapsed:
+`scripts/tracks.py` reads only the Worktrees `Adds deps?` column, which kept `**yes**`. But for
+five days the prose told the next wave the slot was free. It was restored on this branch.
+
+### Round 1 — CHANGES REQUESTED, one blocking finding, real
+
+Reviewed `ffbea43`, the request HEAD. All nine declared risk areas were judged safe.
+
+**B1: a file that is not a database escaped as a raw `sqlite3.DatabaseError`.** Reproduced
+before any fix, by execution against `ffbea43`: `export_ledger` on a text file raised
+`sqlite3.DatabaseError: file is not a database` with `__suppress_context__` false, and
+`whiskeyjack-bot export` crashed rather than refusing. The cause is that a `mode=ro` open is
+lazy. The file opens fine, and the first statement to touch it is `_verify_schema`'s
+`sqlite_master` probe, which sat outside every sanitizing arm. `connect` never met this,
+because its guarded `journal_mode` pragma fails first. That makes it a defect **introduced
+by** the third opener: the reviewer confirmed the base's `open_verified_ledger` refuses the
+same file cleanly. The fix is one arm, `except sqlite3.Error` → path-only `LedgerError`
+`from None`, with the existing close-and-reraise kept for everything else. Regressions sit at
+both levels: the module (sanitized, context suppressed, file untouched, nothing written) and
+the CLI (`EXIT_REFUSED`).
+
+Both regressions were confirmed red with the arm removed. **The first attempt at that check
+reported green, and the mutant was the defect, not the tests.** `ledger.py` contains the
+`except BaseException: conn.close(); raise; return conn` tail twice (`open_verified_ledger`
+has the same one), so slicing to "the next occurrence" without a start offset found the
+*earlier* copy and inserted code instead of removing it. A mutation script should report how
+much it removed. This one printed `-4097`, which was the tell.
+
+**Non-blocking, filed: `M1-613`**, redact configured secrets centrally in
+`tournament_state.append`. This is the Standing-risk item above, with the reviewer's acceptance
+criterion.
+
+### Round 2 — APPROVE, no blocking findings
+
+Reviewed `47bbc82`, the request HEAD. B1 **CLOSED**: the reviewer confirmed by direct execution
+that the non-database file now yields a path-only `LedgerError` with context suppressed, the
+source bytes are untouched, no output is created, and the CLI returns `EXIT_REFUSED`. The prior
+opener still reproduced the raw `sqlite3.DatabaseError`. No new candidates; `M1-613` carries the
+redaction observation. Two rounds.
+
+## M1-408 — Run the tournament forecaster on GPT-6 Astra through the priced client
+
+Acceptance: *the priced client accepts only registry models; for each, the request pins the
+model ID and a `max_price` equal to its registered prices, and the budget reservation is
+derived from those prices (Astra reserves at least 5x Sol for the same request); `run_once`
+refuses a model outside the registry; `config/tournament.yaml` names Astra; the live switch is
+recorded with a re-enabled activation.* Owner decision 2026-09-10.
+
+### Delivered
+
+- `src/whiskeyjack_bot/forecast/priced.py` (renamed from `forecast/sol.py`): `PricedModel`,
+  `PRICED_MODELS`, `MAX_OUTPUT_TOKENS`, `build_request`, `reservation_estimate_usd`, and
+  `PricedClient` (formerly `SolClient`).
+- `forecast/generate.py` and `tournament.py`: both gate on `PRICED_MODELS` instead of the
+  Sol string.
+- `config/tournament.yaml`: `model.name: openrouter/openai/gpt-6-astra`. The dormant Cup
+  profile and the Cup rehearsal profile stay on Sol.
+- Tests: six new unit tests in `tests/unit/test_tournament.py`, plus
+  `tests/property/test_priced_properties.py` (six properties). The three existing test files
+  that named `SolClient` were updated to `PricedClient`.
+
+**No migration, no dependency, no new `AppConfig` field.** The one config *value* that changes
+still changes `config_sha256`, which is the point: see the Deviation below.
+
+### What the item is actually guarding against
+
+A model switch here is three numbers, not one: the OpenRouter model ID, the `max_price`
+OpenRouter may route at, and the estimate `Budget.reserve` holds before the call. Launch
+hard-coded all three from Sol's prices. There were two tempting shortcuts, and both are wrong:
+
+- **Config only.** `run_once` refuses any model but Sol, so the worker would refuse every
+  poll. That fails safe but is useless.
+- **Config plus relaxing the gate.** `build_forecaster_client` would hand a non-Sol model to
+  `GeneralLlm`, which reserves **nothing** against the tournament budget. Model spend would
+  be uncapped, and the budget ceiling is what stops the worker.
+
+Raising `max_price` without the estimate is the quieter version of the same failure. Astra is
+5x Sol on both sides, so the old estimate would hold a fifth of what a call can bill.
+
+### Decision — one registry, and both numbers derived from its one pair of prices
+
+`PRICED_MODELS` maps the LiteLLM name to `PricedModel(openrouter_id, prompt, completion)`.
+`build_request` takes `max_price` from those prices, and `reservation_estimate_usd` takes the
+estimate from the same two fields. There is no second place to update, so the regression above
+has no line to be written on. The registry is closed **for tournament use**: `run_once` and
+`PricedClient.__init__` each refuse a name outside it. `build_forecaster_client` does *not*
+refuse one: it routes every registry name to `PricedClient` and still builds `GeneralLlm` for
+any other name, because non-tournament callers (dry runs, rehearsals) use that path
+legitimately. The budget guarantee rests on `run_once`'s gate, which is reached before any
+client is built. (The first version of this paragraph said the builder also refused. Round 1
+corrected it.)
+
+### Decision — Sol is unmoved, and that is proved rather than asserted
+
+- **The request is byte-identical to Launch's literal.** Prices are stored as ints so that
+  `"max_price":{"prompt":2,"completion":10}` renders exactly as before. The request's digest
+  keys every `model_started`/`model_completed` cache scope in the live ledger, so identical
+  bytes mean a Sol call from before the refactor is still found as the same call. It is
+  neither re-bought nor orphaned mid-outcome. Pinned by a property.
+- **The estimate is bit-identical to Launch's formula.** It keeps the two-term order of
+  operations. Measured: summing over a single `/ 1_000_000` changes the last bit for **61,894
+  of the first 300,000** request sizes. Pinned by a float-equality property.
+
+### Decision — Astra at `max_price` 10/50, and why that number
+
+OpenRouter's public listing on 2026-09-10 showed Astra endpoints at 5/25 (batch), 10/50
+(standard, OpenAI and Azure), 11/55 (Azure) and 20/100. 10/50 is the standard rate. With
+`allow_fallbacks: False` and `require_parameters: True` unchanged, it excludes the pricier
+tiers rather than paying for them. Astra's `supported_parameters` match Sol's exactly
+(`reasoning`, `max_tokens`, …), so the same request shape is valid.
+
+### Deviation — switching the model retires the live MiniBench activation, deliberately
+
+`config_sha256` digests the config, so the new `model.name` retires activation `2bfd17f3…`
+the moment the live checkout pulls it. This is the M1-334 mechanism, and here it is the
+intended behaviour: an activation authorizes spending under one exact configuration. The
+switch is therefore operational, not just a merge: pull, then `tournament enable` again.
+The re-enable is recorded below when it happens.
+
+### Rejected — relaxing the gate and letting `GeneralLlm` serve Astra, and why not
+
+It reserves nothing against the tournament budget. See above.
+
+### Rejected — an open registry read from config, and why not
+
+Prices in YAML would put the reservation's basis in the same file an operator edits to switch
+models. That would reopen "raise one number, forget the other", now as a config typo. The
+prices are code, reviewed with the tests that pin them.
+
+### Deferred (do not read the absence as an omission)
+
+- **Astra-Pro, or any third model.** Adding one is a registry line and a price, reviewed.
+- **Cup and Cup-rehearsal profiles** stay on Sol: the Cup is withdrawn and dormant.
+
+### Standing risk — not verifiable offline
+
+- **OpenRouter can change Astra's price.** If it rises above 10/50, `max_price` makes OpenRouter
+  refuse, and the call fails closed as `priced model request failed or was unavailable at the
+  authorized price`. That reads like a dead key; the M1-329 `provider_failed` alert is the
+  signal. A cut is harmless: the reservation over-holds and settles down to the actual cost.
+- **Live seam, smoke-tested 2026-09-11 00:23 MDT.** `build_forecaster_client` on the new
+  `config/tournament.yaml` returned `PricedClient` for `openai/gpt-6-astra` at `max_price`
+  10/50. One real call with no budget context (no ledger write) answered `'ok'` in 5.0s, so
+  OpenRouter accepts Astra with `require_parameters` and no fallbacks at that ceiling.
+  `usage.cost` came back `0.0`, the same counter granularity on tiny calls recorded for Sol.
+- **Budget arithmetic.** Per question, Astra's model *reservation* is roughly 5x Sol's
+  (~$0.35 against ~$0.07 for a typical prompt) before it settles to the actual cost.
+
+### Teeth — the mutation pass
+
+Against a committed tree with `PYTHONDONTWRITEBYTECODE=1` and `HYPOTHESIS_PROFILE=ci`. Each
+mutant was checked to occur exactly once and to print its size change. **11 mutants, 11 killed:**
+estimate from Sol's prompt price; estimate from Sol's completion price; estimate over one
+division; `max_price` pinned to Sol; model ID pinned to Sol; registry prices as floats (changes
+Sol's request bytes); fallbacks allowed; client admits any model; `run_once` gate back to
+Sol-only (killed only by `test_a_poll_on_astra_confirms_a_forecast`, which was written for
+exactly that); `run_once` gate admits any model; builder routes only Sol to the priced client.
+
+### Round 1 — CHANGES REQUESTED, one blocking finding, real
+
+Reviewed `06a7d56`, the request HEAD. All seven risk areas were judged safe.
+
+**B1: the owner-approved $40 re-activation could not complete.** `tournament_state.enable`
+hard-refused any `budget_usd` above Launch's $20 (`not 0 < budget_usd <= 20`, from
+`dc3c729`). The deploy this item describes (re-enable Astra at $40) would have retired the Sol
+activation and then been refused on its replacement. Reproduced by execution before the fix:
+`TournamentError: invalid activation identity, window, or budget (maximum USD 20)`. The
+ceiling predates the branch, but the branch depends on exceeding it, which is why it is in
+scope. The owner was asked rather than assumed, because raising it changes a paid-call control,
+and the $40 choice had been made without knowing the $20 limit existed. **Decision (owner,
+2026-09-11): raise it to exactly $40.** `MAX_ACTIVATION_BUDGET_USD = 40` stays a code constant,
+so a paid-call limit never lives in the config an activation binds to (config was the rejected
+alternative, for that reason). Boundary test: $40 activates; $40.01 is refused and appends no
+activation. Confirmed red with Launch's `<= 20` restored. `docs/TOURNAMENT-OPERATIONS.md`
+now names the constant and says why it moved.
+
+**Non-blocking, taken:** the registry-boundary paragraph above overstated the builder's role
+and is corrected.
+
+### Round 2 — APPROVE, no blocking findings
+
+Reviewed `82be602`, the request HEAD. B1 **CLOSED**: the reviewer confirmed by execution that
+$40 creates a usable activation with `budget_microusd == 40_000_000`, and that $40.01 raises the
+sanitized maximum-USD-40 error and appends nothing. Two non-blocking notes, both taken. The
+constant's comment dated the ceiling authorization 2026-09-10; it was 2026-09-11, the
+decision this item's round 1 asked for, and the comment is corrected. And the live re-activation
+is to be appended here after deploy (below). Two rounds.
+
+### Live switch — 2026-09-11
+
+Deployed in the gap between two MiniBench polls, so no poll ran on a retired activation. The
+05:45:00 MDT poll completed on Sol (`refusal_reason: null`). PR #89 merged as `4ab8ad9`, and
+`finish-item.sh` fast-forwarded the live checkout at 05:45:36, retiring activation `2bfd17f3…`.
+At 05:45:55 `tournament enable --config config/tournament.yaml --project-id 33122 --starts
+2026-09-07T22:00:00Z --ends 2026-09-29T00:00:00Z --budget-usd 40` created **activation
+`14e331f6e8824a8fa26fd3fdbb27d653`** (account 305299). `tournament status` showed `enabled:
+true`, actual $1.28, reserved $3.60, **remaining $35.12**: the spend scoped to
+account:project carried over, and the cap is the new $40.
+
+The first poll on Astra (05:50:00) finished `Result=success`, `ExecMainStatus=0`,
+`refusal_reason: null`, `discovered: 0`. MiniBench was between batches, so no Astra call has
+been billed yet. The first real one will show in the ledger as a `model_response` event whose
+`model` field names `openai/gpt-6-astra`.
+
+## M1-333 — Stop the payload injectivity property filtering itself red (closes T-906)
+
+Acceptance: *the property draws the digest relationship as a mode, shared versus distinct,
+and derives the second record from the first, so both arms are reached without `assume()`.
+`HealthCheck.filter_too_much` is NOT suppressed. A mutation pass shows both arms are
+load-bearing. It passes at 200 examples under the recorded seed and a sweep of at least twenty
+more.* T-906 is the same defect in the same test, filed earlier from M2-707's round-2 review.
+Its criteria are met here too (both directions tagged, reach fraction measured), and it is
+closed as a duplicate.
+
+### Delivered
+
+`tests/property/test_submission_payload_properties.py` only; no source change.
+`_record_pairs()` draws a mode from `same payload`, `different payload` and `independent`:
+
+- **same payload:** the same forecast recorded under a second `attempt_id`, so it is a
+  different record.
+- **different payload:** a derived second forecast.
+- **independent:** the old unconstrained shape. An unbuildable pair is tagged and returned,
+  never `assume`d away.
+
+`_text()` now **constructs** non-blank text (optional leading whitespace, a character from no
+whitespace-bearing category, an encodable tail) instead of filtering for it.
+
+### Measured
+
+- **The defect reproduces on master:** `FailedHealthCheck … 8 inputs were generated
+  successfully, while 50 inputs were filtered out` under
+  `--hypothesis-seed=37229261598144587348945677694901145758 -p no:randomly`.
+- **There were two filter sources, not one.** Under `--hypothesis-show-statistics`, about a
+  quarter of the examples were *aborted inside `_text()`'s own filter*, before the pair
+  `assume` ran. Fixing only the `assume` would have left the flake. Now it is 150 passing to
+  18 invalid (label-uniqueness retries and one pre-existing `assume` in the independent mode's
+  multiple-choice strategy). Arms reached: same payload about 26%, different payload about
+  28%, independent the rest.
+- **Seed sweep:** the recorded seed plus 20 more at 200 examples, **21 of 21 passed**, counted
+  by exit code. The first count read the `-q` output for a "passed" line that `-q -q` never
+  prints and reported 0 of 21. It was recounted rather than believed.
+
+### Teeth — and what the old property could not see
+
+Two mutants of `payload_sha256_for_record`, each run against the property under `ci`:
+
+- **Shared arm broken** (the digest also keys `record.attempt_id`): **killed**.
+- **Distinct arm broken** (the digest keys only `question_type`): **killed**.
+
+**The old property survived the shared-arm mutant on all five seeds tried.** It reached the
+"same payload" direction only when two independent draws collided, and a collided pair was the
+*same record*, so a digest keyed on record identity instead of the payload was invisible to
+it. The flake was the visible symptom. The vacuity it hid was half the biconditional that
+approval binding rests on (D33). This is the vacuous-property class again, in its "strategy
+cannot reach the branch" form.
+
+### Rejected — suppressing `filter_too_much`, and why not
+
+A filter rate that high is the evidence, not the noise. The shared-arm result above is what it
+was hiding.
+
+### Round 1 — APPROVE, no blocking findings; the one observation taken
+
+Reviewed `fe0f0cb`, the request HEAD. The reviewer independently reproduced the base's 8/50
+health-check failure, confirmed the recorded seed plus seeds 0–19 at 200 examples, killed both
+arm mutants, and confirmed that the old property survived the attempt-ID mutant on seeds 0–4.
+
+**Observation (non-blocking, reproduced, taken):** the multiple-choice "different payload" arm
+detected a collision by comparing *ordered* specs, but the payload is a label-to-probability
+mapping. So `(['a','b'], [.5,.5])` against `(['b','a'], [.5,.5])` bypassed the fallback and was
+tagged "different payload" while deriving one payload. The biconditional still judged it
+correctly; only the arm label was false. Collisions are now compared as mappings, and the
+different-payload mode asserts `left != right`. Re-swept: 21 of 21.
+
+## M1-334 — A retired activation pages with which binding moved
+
+Acceptance: *a retired activation pages with its cause instead of an exit code, naming which
+binding moved (account, destination, configuration or prompt) by key and never by digest or
+value; the push degrades exactly as `notify.emit` does; the event joins the closed
+`NotifyEvent` vocabulary with a throttle window keyed on the profile; a disabled or
+out-of-window activation does not page; and the operator monitor gains a way to show a
+refusal.*
+
+### Delivered
+
+- `tournament_state.py`: `RetiredBinding` (closed `Literal`), `ActivationRetired(TournamentError)`
+  carrying `.changed`, and `retired_bindings()`, which compares the stored activation against
+  `bindings(config)` key by key. `require_activation` raises `ActivationRetired`; the refusal
+  message names the moved keys.
+- `tournament.py`: `run_once` emits `activation_retired` at that refusal, then re-raises.
+- `notify.py`: `activation_retired` joins `NotifyEvent`, with a window of 86400 and priority
+  `high`.
+- `cli.py`: every tournament refusal is also logged, through `whiskeyjack_bot.tournament`,
+  into the JSONL the operator tails. It logs at `ERROR`, or at `WARNING` for
+  `ActivationInactive`.
+- Tests: 12 new cases in `tests/unit/test_tournament.py`.
+
+**No `AppConfig` field, no migration, no dependency.** `NotifyConfig` has no event list, so the
+new vocabulary member cannot reach `config_sha256`, and deploying this does **not** retire the
+live activation. That is checked after the merge, not assumed (below).
+
+### Deviation — the row's premise was stale: the notifier *was* installed
+
+The row says the refusal "is reached before `run_once` installs the notifier". It is not. M1-329
+(`4599e5a`, the very merge that caused the outage) put `notifier_context(build_notifier(config))`
+*around* `require_activation`, and `git blame` shows that ordering has held ever since. During the
+2h33m outage a notifier was installed and live; the refusal simply had **no `emit()` call site**.
+So this item does not construct a separate notifier, as the criterion prescribes for a path with
+none installed. It calls the ordinary `emit`, inside the existing context. That satisfies the
+criterion's actual demand, identical degrade behaviour, by *being* the same function rather than
+by imitating it: every `Exception` is absorbed, `BaseException` re-raised, and a missing notifier
+means `"disabled"`.
+
+### Decision — split the one boolean into named bindings, with a missing key counting as moved
+
+`require_activation` refused on one `or`-chain and could not say which clause fired.
+`retired_bindings` keeps the same four conditions and names each one. A stored activation
+missing `config_sha256` or `prompt_sha256` counts as moved rather than raising a raw `KeyError`:
+journal rows come back out of the ledger and are untrusted. A test pins `bindings(config)`'s key
+set, so a new binding cannot go uncompared.
+
+### Decision — a day-long window keyed on the project
+
+Retirement is a condition, not an event: it holds until someone re-runs `tournament enable`, and
+every five-minute poll hits it again. With 30 minutes, the incident window, one retired profile
+would page about 5 times over an outage like the 9 Sep one. With 86400 it pages once. Keying on
+the project means two profiles retiring both page.
+
+### Decision — the log line covers every refusal, not just retirement
+
+The monitor half of the criterion is about silence, and silence came from *any* refusal exiting
+before the pipeline logged. So `cli.py` logs every tournament refusal with the same sanitized
+text it prints. `watch-tournaments.py` already renders `ERROR` and `WARNING` in colour, so no
+change was needed there. A resting state (`ActivationInactive`) is a `WARNING`, so a closed window
+reads differently from a retired activation.
+
+### Rejected — alerting on `ActivationInactive`, and why not
+
+A window closing is the designed end of an activation. Paging on it would page every night one
+ends, which trains the operator to ignore the channel.
+
+### Standing risk — not verifiable offline
+
+The real push goes to ntfy. The wiring is tested through a recording transport, and the
+transport contract is M1-329's, already live.
+
+### Teeth — the mutation pass
+
+Against a committed tree with `PYTHONDONTWRITEBYTECODE=1`, over `test_tournament.py` and
+`test_notify.py`. **10 mutants, 10 killed:** no page at the refusal; pages on `ActivationInactive`
+too; constant subject (killed only by the two-profile test, rewritten to drive `run_once` for
+both profiles precisely for this); body leaks a config value; window 30 minutes (killed only by
+the clock-driven twelve-poll test, rewritten for this); priority `default`; prompt binding not
+compared; destination not named; refusal not logged; every refusal logged as a warning.
+
+Two of the first-draft tests would have let mutants through, and both were caught *before* the
+pass by asking of each claim which mutant it kills. The first two-profile test drove `Notifier`
+directly, so a constant subject at the `run_once` call site was invisible to it. The first
+throttle test polled three times within seconds, where a 30-minute and a day-long window look
+identical. **One mutant was itself malformed:** it inserted `{config.logging.level}` into a
+plain string continuation of the f-string, so the braces never interpolated and it "survived"
+for the wrong reason. Re-run with the `f` prefix, it was killed by all four
+`test_a_retired_activation_pages_…` cases.
+
+### Round 1 — two blockers, both reproduced by execution, both real
+
+Reviewed commit `7cde2db`, the request's pinned HEAD. Neither finding was the pushback the
+request anticipated: the reviewer accepted that `notifier_context` already wraps
+`require_activation`, so the "build your own notifier" premise in the acceptance criterion did
+not come back. Both blockers were reproduced through `run_once` before any fix was written.
+
+**1. A resting activation paged as soon as a binding also moved.** `require_activation`
+evaluated retirement *before* the disabled/out-of-window check, so a paused profile raised
+`ActivationRetired` and pushed. Reachable without anything unusual: deploy a config change while
+a profile is disabled, or let any poll land after a window closes, and the operator is paged
+about a profile nobody is running. Fixed by checking the resting states first.
+
+The interesting part is why the existing test could not have caught it. Round 1's
+`test_a_disabled_or_out_of_window_activation_does_not_page` asserts exactly the right thing —
+resting states are silent — but it holds the bindings *intact*, so it never reaches the
+retirement branch at all. It is the project's recurring vacuous-property shape in a unit test:
+the fixture cannot reach the branch the assertion is about, so the assertion passes for a reason
+that has nothing to do with the claim. The new parametrized
+`test_a_resting_activation_stays_silent_even_when_a_binding_also_moved` puts the profile in both
+states at once, which is the only arrangement that can see the ordering.
+
+**2. The push title interpolated the configured project ID.** The title read
+`whiskeyjack: project 32977 activation retired` — three lines under a comment in the same commit
+claiming it names "the moved bindings, never a digest or a config value". The request's own risk
+area 2 made the same claim and its test checked only the *digests*, so the branch asserted the
+property it was violating. The title is static now. The project remains the throttle **subject**,
+which is safe for a reason worth writing down: `Notifier._stamp_path` sha256s the subject into a
+stamp filename and never transmits it, so one-page-per-profile survives a title that says nothing.
+
+That cost the two-profile test its discriminator — it had distinguished the pages by the project
+ID in the title. It now asserts the page *count*, which is strictly stronger: with a constant
+subject the three polls collapse to one page, so the count alone kills the mutant the title match
+used to. Verified, not assumed (below).
+
+### Teeth — round 1's remediation
+
+**3 mutants, 3 killed,** against a committed tree with `__pycache__` cleared between runs:
+
+- restore the old ordering in `require_activation` → both parametrizations of the new resting
+  test fail;
+- restore the interpolated title → four `test_a_retired_activation_pages_…` cases *and*
+  `test_two_retired_profiles_each_page` fail (5 in total);
+- constant `subject="wj"` at the `run_once` call site → `test_two_retired_profiles_each_page`
+  fails on the count alone, which is the check that the rewrite did not cost the test its teeth.
+
+### Non-blocking, filed rather than built
+
+`M1-335` (Low): `retired_bindings` is tested one moved key at a time plus the destination pair.
+Combinations of two or three independently moved keys, and a stored activation missing a key,
+are not exercised. Filed rather than built because `_retire` moves one binding at a time by
+construction and the combinatorial fixture is a real piece of work, not a parametrize line.
+
+### Round 2 — APPROVE
+
+Reviewed commit `a1b3348`, the request's pinned HEAD. Both round-1 blockers marked CLOSED, no
+new blocking findings, no new backlog candidates beyond `M1-335`. Two rounds total.
+
+The reviewer noted one validation limitation worth recording rather than burying: it could not
+run pytest, because `codex exec --sandbox read-only` gives it no writable temp directory, so it
+verified the remediation by inspection and took the request's gate report on trust. That is the
+standing shape of every round in this project — the request refuses to emit unless the four
+gates pass locally, which is exactly why that refusal exists.
+
+Process note: round 2's first launch died silently mid-exploration, producing no response file
+and no error, with memory available and no OOM. Relaunching the identical command succeeded in
+about a minute. Nothing was lost because `run-review.sh` refuses to overwrite an existing
+response, and the absent file was itself the signal that the round had not happened.
+
+## M1-613 — Redact configured secrets centrally in `tournament_state.append`
+
+Acceptance: *`tournament_state.append` redacts configured secrets before persistence for every
+caller; a regression plants a secret through `append` and proves it absent from the stored
+event and from a derived export.* Filed from M1-604's round-1 review.
+
+### Delivered
+
+- `redaction.py`: a process registry (`register_secret_env_var_names`,
+  `registered_secret_env_var_names`) and `redact_leaves`.
+- `config.load_config` registers `config.secret_env_var_names()`.
+- `tournament_state.py`: `journal_form(data)`. `append` stores `canonical(journal_form(data))`,
+  and `witness` writes the same form to its files.
+- `tests/unit/test_journal_redaction.py` (6 tests).
+
+### Decision — a process registry filled at `load_config`, not a parameter, and why
+
+`append` has about thirty call sites across seven modules, and most hold no config, so the
+secret names had to come from somewhere other than the call. The alternatives:
+
+- **A required parameter** is explicit, but it is thirty call sites of churn, and every new call
+  site is one more place to thread names through.
+- **An ambient `ContextVar`,** like `CURRENT_BUDGET`, has no good answer when unset: `disable()`
+  holds no config, and fail-closed would break it.
+
+A registry that `load_config` fills covers every live caller, because every CLI command loads its
+profile through that function before it touches a ledger. A process that never loaded a profile
+has no configured secrets, and an empty registry is the honest answer for it. It is additive, so
+registering more names can only redact more.
+
+### Decision — redact string leaves, keys included, never the rendered JSON
+
+`Budget.reserve` redacts the rendered text and `json.loads` it back. Done centrally, that breaks on
+an all-digit secret that also occurs in a number, which is demonstrated with the account ID:
+`<redacted:…>` lands inside a number, the row fails `CHECK(json_valid(data))`, and the worker stops
+on a storage failure. `redact_leaves` walks dicts and lists and redacts only strings. The
+"redact the rendered text" mutant is killed by exactly that test.
+
+### Decision — `witness` writes the journal form, not the raw data
+
+`check_storage` requires each witness file's `data` to *equal* its row's. If `append` redacted
+and `witness` wrote raw data, the first witness carrying a secret would read as a restored ledger
+(`storage restore detected; platform reconciliation required`) and stop the worker. Both now use
+`journal_form(data)`, computed from one function. A control test shows that tampering with a
+witness is still detected.
+
+### Standing risk — not verifiable offline
+
+- **Existing rows are not rewritten.** The journal is append-only, and M1-604's measured scan of
+  both live ledgers found none of the five live secret values in 10.9MB of export. New rows are
+  covered from deploy.
+- **`load_config` gains a side effect** (the registry). It is idempotent and additive, and tests
+  isolate it with `monkeypatch`.
+- **No `AppConfig` field,** so deploying this does not retire the live activation.
+
+### Teeth — the mutation pass
+
+**6 mutants, 6 killed,** each by the test written for it: `append` stores raw data; redact the
+rendered text instead of leaves; `witness` writes raw data; keys not redacted; lists not
+recursed; `load_config` does not register.
+
+### Round 1 — one blocker, reproduced on both trees, real
+
+Reviewed commit `f491a34`, the request's pinned HEAD.
+
+**`redact_leaves` recursed, and that lowered the nesting depth the journal accepts.** `append`'s
+contract is `dict[str, Any]` with no declared nesting limit, and the depth it actually takes is
+set by `json.dumps`' C encoder. The recursive walk spent two interpreter frames per level — one
+for the call, one for the dict comprehension — so it exhausted Python's recursion limit at
+roughly half that depth. Payloads the base had persisted started raising a raw `RecursionError`
+out of `append`.
+
+Both halves were reproduced before any fix, because a finding is only real if the base really
+did accept the input: at depth 600 and 900 the base persisted the event and the branch raised.
+Binary-searching the first failing depth on each tree put the regression at a number rather than
+an adjective — **base 993, branch ~500, and after the fix 993 again.** Exact parity, with
+`json.dumps` the binding limit once more.
+
+The fix is an explicit stack. Two details in it are decisions, not incidentals:
+
+- **Only the containers on the *current path* are tracked,** not every container ever seen. A
+  value repeated as two siblings is a DAG, which is ordinary data; tracking everything would
+  refuse it. The narrower check catches only a true cycle.
+- **A cycle raises `ValueError("Circular reference detected")` — the identical error
+  `json.dumps` already raised on the same input.** This adds no refusal the base lacked, and it
+  is deliberately not sanitized into a module error: `append` did not sanitize it before this
+  item either, so doing it here would be a behaviour change smuggled in under a remediation.
+  The alternative was worse than either — without the guard the iterative walk spins forever,
+  turning a pre-existing raised error into a hang.
+
+The finding also named the missing property coverage, which the request had itself flagged as a
+stated limitation and invited the reviewer to rule on. Five properties added to
+`tests/property/test_redaction_properties.py`: never raises; no planted secret survives;
+structure preserved; an empty registry is the identity; and nesting past the recursion limit
+survives — the blocker as a property, not only as a regression test. The no-leak property is
+guarded against this project's recurring vacuity failure by asserting the secret **present** in
+the rendered input before asserting it absent from the output.
+
+### Teeth — round 1's remediation
+
+**3 mutants, 3 killed,** committed tree, `__pycache__` cleared between runs:
+
+- restore the recursive walk → the depth regression and the cycle test fail;
+- never discard from the path set (track every container seen) → the DAG test fails, which is
+  the only test that can tell the two cycle-detection designs apart;
+- stop redacting dict keys → one unit test and two properties fail.
+
+### Non-blocking, not built
+
+The reviewer noted that two dict keys redacting to the same marker collapse into one entry.
+Left alone: the brief establishes no collision-preservation requirement, it is a property of
+the substitution rule rather than of this walk, and the strategies cannot reach it. Recorded
+here so its absence is a decision rather than an omission.
+
+### Round 2 — APPROVE
+
+Reviewed commit `00363c9`, the request's pinned HEAD. Blocker CLOSED, no new blocking findings.
+Two rounds total.
+
+Worth recording: the reviewer did not take the depth parity on trust. It ran its own in-memory
+harness against both the pinned base and this tree, across dicts, lists *and* tuples, and found
+identical first-failing depths (990 in its harness against 993 in mine — the threshold moves with
+surrounding stack depth, which is why parity between trees is the claim and not the number).
+Putting the measurement in the request, rather than the word "fixed", is what made that check
+cheap enough to perform.
+
+Both non-blocking observations are filed rather than built: `M1-338` (sanitize the
+circular-reference `ValueError`, pre-existing on the base) and `M1-339` (define redacted-key
+collision handling). The same validation limitation as M1-334 applies — `codex exec
+--sandbox read-only` has no writable temp directory, so six filesystem-dependent tests could not
+run there and the request's gate report stood in for them.
+

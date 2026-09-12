@@ -99,7 +99,7 @@ def test_phase_timeout_escapes_provider_handlers(
     from whiskeyjack_bot.timeouts import phase_timeout
     from whiskeyjack_bot.research.asknews import retrieve_news
     from whiskeyjack_bot.research.exa import retrieve_web
-    from whiskeyjack_bot.forecast.sol import SolClient
+    from whiskeyjack_bot.forecast.priced import PricedClient
 
     conn, config, platform, news, model = case
 
@@ -136,7 +136,7 @@ def test_phase_timeout_escapes_provider_handlers(
             else:
                 monkeypatch.setenv(config.model.api_key_env, "fake")
                 monkeypatch.setattr(httpx.AsyncClient, "post", expire)
-                asyncio.run(SolClient(config).invoke([]))
+                asyncio.run(PricedClient(config).invoke([]))
             pytest.fail("provider swallowed the deadline and allowed subsequent work")
     assert signal.getsignal(signal.SIGALRM) == previous
     assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
@@ -244,7 +244,7 @@ def test_retrieval_cache_counts_only_new_requests(case: Any, provider: str) -> N
 def test_completion_before_settlement_recovers_once(
     case: Any, monkeypatch: Any, provider: str
 ) -> None:
-    from whiskeyjack_bot.forecast.sol import SolClient
+    from whiskeyjack_bot.forecast.priced import PricedClient
     from whiskeyjack_bot.research.durable import begin_call, complete_call
 
     conn, config, *_ = case
@@ -275,7 +275,7 @@ def test_completion_before_settlement_recovers_once(
 
     def invoke() -> Any:
         if provider == "model":
-            return asyncio.run(SolClient(config).invoke([]))
+            return asyncio.run(PricedClient(config).invoke([]))
         scope, cached = begin_call("exa", 0.05, {"query": "a"}, 1, "cutoff")
         if cached is None:
             complete_call(scope, {"results": [], "costDollars": {"total": 0.01}}, 0.01)

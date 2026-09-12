@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from whiskeyjack_bot.approval import approve
 from whiskeyjack_bot.config import AppConfig
+from whiskeyjack_bot.forecast.priced import PRICED_MODELS
 from whiskeyjack_bot.forecast.record import record_sha256
 from whiskeyjack_bot.forecast.replay import replay_forecast
 from whiskeyjack_bot.forecast.store import read_forecast_record
@@ -38,6 +39,7 @@ from whiskeyjack_bot.submission_payload import authorized_payload
 from whiskeyjack_bot.timeouts import phase_timeout
 from whiskeyjack_bot.tournament_state import (
     ActivationInactive,
+    ActivationRetired,
     Budget,
     StorageFailure,
     TournamentError,
@@ -412,7 +414,7 @@ def run_once(
     if not config.submission.post_private_reasoning_comment:
         raise TournamentError("tournament operation requires private reasoning comments")
     if (
-        config.model.name != "openrouter/openai/gpt-5.6-sol"
+        config.model.name not in PRICED_MODELS
         or config.model.temperature is not None
         or config.model.max_output_tokens != 6000
         or config.model.timeout_seconds != 120
@@ -432,7 +434,29 @@ def run_once(
         poster = SingleAttemptPoster(client) if poster is None else poster
         account = poster.get_current_user_id()
         project = str(config.metaculus.tournament.id)
-        activation = require_activation(conn, config, account_id=account, project_id=project)
+        try:
+            activation = require_activation(conn, config, account_id=account, project_id=project)
+        except ActivationRetired as retired:
+            # M1-334. The notifier is already installed here (since M1-329), so this is
+            # the ordinary `emit` and degrades exactly as every other alert does: a failed
+            # or slow push is absorbed and never changes the refusal below. Names the moved
+            # bindings, never a digest or a config value.
+            #
+            # The project is the throttle *subject* only, which keeps one page per profile:
+            # `Notifier` sha256s the subject into a stamp filename and never transmits it.
+            # The title is static because it is transmitted, and the project ID is a config
+            # value (round 1). Which profile it was is in the operator log and the refusal.
+            emit(
+                "activation_retired",
+                subject=project,
+                title="whiskeyjack: activation retired",
+                body=(
+                    f"Every poll is refusing: {', '.join(retired.changed)} changed since "
+                    "the activation was enabled. Nothing is bought or posted until "
+                    "`tournament enable` is re-run for this profile."
+                ),
+            )
+            raise
         heartbeat: dict[str, Any] = {
             "at": utcnow().isoformat(),
             "discovered": 0,

@@ -3545,6 +3545,7 @@ dependencies = [
     { name = "httpx" },
     { name = "idna" },
     { name = "publicsuffixlist" },
+    { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -3567,6 +3568,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "idna", specifier = ">=3.4,<4" },
     { name = "publicsuffixlist", specifier = ">=1.0,<2" },
+    { name = "pyarrow", specifier = ">=24,<25" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
 ]
