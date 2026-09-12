@@ -130,16 +130,25 @@ both actively point an operator at the wrong problem:
   the database — which this runbook is trying to talk them out of — reads `draft` on an
   approved record and concludes the ledger is broken.
 
-A third joined them from reading `_run_submit`'s return paths, and **round 1 found this
-note had it backwards** — see the round-1 section below. What is true: `submit` returns
-`EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED`
-(`cli.py:735`), so it exits `4` for `submission_uncertain`, for `submission_failed`, **and
-for a confirmed post whose artifact could not be written** — the last of which is a forecast
-live on Metaculus behind a non-zero exit. The operator instruction is unchanged and is if
-anything stronger: the outcome is on the `result:` and `artifact:` lines and nowhere else.
-It is the same shape as T-905's `gate.sh` defect (trust the printed line, not `$?`) and it
-is the first entry in the runbook's "never do this" list for the same reason: it is the
-mistake that looks like diligence.
+A third joined them from reading `_run_submit`'s return paths, and **this note was wrong
+twice before it was right** — round 1 found it backwards and round 2 found the correction
+still wrong. See both round sections below. What is true, and it is simpler than either
+attempt: `submit` returns
+
+```python
+EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED
+```
+
+(`cli.py:735`), and `verified_by_refetch` is exactly `refetch_outcome == "confirmed"`
+(`lifecycle.py:397-406`). **The exit code is those two conditions and nothing else.** It does
+not track the recorded outcome in either direction: a confirmed post whose artifact failed
+exits `4` with the forecast live on Metaculus, and `submission_uncertain` exits `0` whenever
+the refetch confirmed — the ordinary lost-response recovery — with a `verify-submission` still
+owed. The operator instruction survived both corrections and is stronger for being right:
+read `result:`, `artifact:` and the instruction line, never the exit code. It is the same
+shape as T-905's `gate.sh` defect (trust the printed line, not `$?`) and it is the first
+entry in the runbook's "never do this" list for the same reason: it is the mistake that
+looks like diligence.
 
 None of the three is a defect worth a row. All three are documentation's job exactly.
 
@@ -319,9 +328,10 @@ is:
 return EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED
 ```
 
-(`cli.py:735`). So `submission_uncertain` exits `4`, `submission_failed` exits `4`, and — the
-case the runbook did not have at all — **a post confirmed by refetch whose artifact could not
-be written also exits `4`**, with the forecast live on Metaculus.
+(`cli.py:735`). So `submission_failed` exits `4`, and — the case the runbook did not have at
+all — **a post confirmed by refetch whose artifact could not be written also exits `4`**, with
+the forecast live on Metaculus. *(The round-1 remediation also asserted `submission_uncertain`
+exits `4` unconditionally. Round 2 falsified that; see below.)*
 
 **The suite already held this fact.** `tests/unit/test_cli_submit.py`'s
 `test_an_uncertain_submission_tells_the_operator_the_next_command` asserts `EXIT_REFUSED` for
@@ -329,10 +339,9 @@ be written also exits `4`**, with the forecast live on Metaculus.
 nothing could fail on it. That is the whole argument for **T-908**, filed below.
 
 Fixed in three places (`docs/RUNBOOK.md` exit-code section, its "never do this" entry, and
-this file's own earlier paragraph, which had it backwards too). The exit-code table's `4` row
-also claimed "and wrote nothing", which is false for the artifact case, and now says so. The
-operator instruction did not change and is stronger for being right: read `result:` and
-`artifact:`, never the exit code.
+this file's own earlier paragraph, which had it backwards too), and the exit-code table's `4`
+row, which claimed "and wrote nothing" — false for the artifact case. The operator instruction
+did not change: read `result:` and `artifact:`, never the exit code.
 
 ### Finding 2 — L2's read-only confirmation step did not inspect anything (closed)
 
@@ -372,3 +381,77 @@ about **behaviour** — an exit code and a call site — which no amount of stri
 reaches. The verification I ran matched the claim I was worried about rather than the claims
 most likely to be wrong. `T-908` is the durable form of the fix; the transferable lesson is
 that a document's riskiest statements are the ones about *control flow*, not about text.
+
+
+## Round 2 — CHANGES REQUESTED on `fe73f7e`, one blocking finding, closed
+
+Finding 2 closed. **Finding 1 stayed open, and the reviewer was right.** The round-1
+remediation replaced one false claim with another: it asserted `submission_uncertain` exits
+`4` unconditionally. It does not. `(success=False, refetch_outcome="confirmed")` —
+the ordinary lost-response recovery, where the POST raised and the refetch then found the
+forecast on the platform — records `submission_uncertain` **and exits `0`**.
+
+### Reproduced before fixing, as the workflow requires
+
+Not taken on the reviewer's word. The whole 2x4x2 grid was enumerated by execution against
+`fe73f7e`, driving the real `SubmissionAttempt.verified_by_refetch` property and the real
+derivation at `lifecycle.py:1103-1115`:
+
+```
+success  refetch      result:                 verified  artifact  exit
+True     confirmed    submitted               True      True      0
+False    confirmed    submission_uncertain    True      True      0     <-- the finding
+False    confirmed    submission_uncertain    True      False     4
+True     confirmed    submitted               True      False     4
+True     absent       submission_uncertain    False     *         4
+True     mismatched   submission_uncertain    False     *         4
+True     unreadable   submission_uncertain    False     *         4
+False    absent       submission_failed       False     *         4
+False    mismatched   submission_uncertain    False     *         4
+False    unreadable   submission_uncertain    False     *         4
+```
+
+### Why the round-1 fix was wrong, which is the part worth keeping
+
+The error was not a missed case. It was **partitioning the table by the wrong column.** I
+built the outcome table around the `result:` line — `submitted` / `submission_uncertain` /
+`submission_failed` — because that is what an operator reads. But the exit code is not a
+function of the event type at all. It is a function of `(refetch_outcome == "confirmed",
+artifact_path is not None)`, and those two partitions **cross**: `confirmed` appears under
+both `submitted` and `submission_uncertain` (`lifecycle.py:1035-1046` puts
+`(False, confirmed)` in the uncertain bucket deliberately, because the post and the platform
+were never observed together). Any table keyed on the event type will therefore be wrong for
+some row, no matter how many rows it has. The rewrite is keyed on the two conditions the
+return actually reads, with the event type as an output column rather than the index.
+
+That generalizes past this document: **a table is a claim about a partition, and getting the
+partition wrong cannot be fixed by adding rows.** Round 1's fix added a row and was still
+false.
+
+### Two things the reviewer corrected beyond the exit code
+
+- **`submission_uncertain` is three conditions, not one.** The section had glossed it as "the
+  refetch found nothing newer", which is only `absent`. `mismatched` ("something newer is
+  there and it is not what this attempt sent") and `unreadable` ("the platform could not be
+  read") also record uncertainty, are not interchangeable, and `mismatched` is the one with no
+  operator-closable path today — now cross-referenced to `L3` and **M2-714**.
+- **`0` does not mean there is nothing left to do.** An uncertain-but-confirmed attempt exits
+  `0` and still owes a `verify-submission`. The "never do this" entry now states the
+  misalignment in both directions rather than one.
+
+### Non-blocking observation — `T-908` extended rather than duplicated
+
+The reviewer asked that `T-908`'s exit-code checks cover a POST timeout followed by a
+confirming refetch and a successful artifact write, asserting `submission_uncertain`, exit
+`0`, and the verification instruction. Folded into the existing row's acceptance criteria
+rather than filed again — the reviewer explicitly asked for that, and two rows for one defect
+is how a backlog stops being the single source.
+
+### Standing risk, third statement
+
+Round 1's standing risk said the riskiest claims are about control flow and not text. Round 2
+proves the sharper version: **they are about how behaviour is carved up.** Both false claims
+survived a reading of the exact return expression they were about. What would have caught
+either, and what neither round-1 nor round-2 verification did until asked, is enumerating the
+input grid and reading the output — ten lines of Python, run above. `T-908` is where that
+belongs permanently; its criteria now name this case.

@@ -67,22 +67,56 @@ program runs *before* the action it refuses, so `4` normally means nothing happe
 commands break that and both are documented below: `submit`, and a live post the ledger then
 refused to record ([L4](#l4--a-live-post-the-ledger-refused-to-record)).
 
-**`submit` exits `0` only when the post was confirmed by refetch *and* its artifact was
-written. Every other outcome exits `4` — including outcomes it recorded.** The return is
-literally `EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else
-EXIT_REFUSED` (`cli.py:735`). So all three of these exit `4`:
+**`submit` exits `0` if and only if the refetch confirmed the post *and* the artifact was
+written.** The return is literally:
 
-| What happened | Recorded? | Exit |
-|---|---|---|
-| Confirmed by refetch, artifact written | yes | `0` |
-| `submission_uncertain` — the refetch found nothing newer | yes | `4` |
-| `submission_failed` | yes | `4` |
-| Confirmed by refetch, **artifact not written** ([L5](#l5--the-artifact-was-not-written)) | yes, and the post landed | `4` |
+```python
+return EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED
+```
 
-**So `4` from `submit` does not mean nothing happened, and it does not mean no post was
-made.** Read the `result:` and `artifact:` lines; never infer the outcome from the exit
-code, and never script a retry on it. The last row is the one that catches people: the
-forecast is live on Metaculus and the command exited non-zero.
+(`cli.py:735`), and `verified_by_refetch` is not an independent fact — it is exactly
+`refetch_outcome == "confirmed"` (`lifecycle.py:397-406`). **So the exit code is decided by
+those two conditions and by nothing else.** In particular it is *not* decided by the
+`result:` line: the recorded outcome and the exit code partition the same attempts
+differently, and reading either as a proxy for the other is the mistake this section exists
+to prevent.
+
+The full grid — eight `(success, refetch_outcome)` combinations, each with the artifact
+written or not (`lifecycle.py:1035-1046` derives the event; `cli.py:735` the exit):
+
+| `success` | `refetch_outcome` | `result:` | Artifact | Exit |
+|---|---|---|---|---|
+| `True` | `confirmed` | `submitted` | written | **`0`** |
+| `False` | `confirmed` | `submission_uncertain` | written | **`0`** |
+| `True` | `confirmed` | `submitted` | NOT WRITTEN | `4` |
+| `False` | `confirmed` | `submission_uncertain` | NOT WRITTEN | `4` |
+| `True` | `absent` / `mismatched` / `unreadable` | `submission_uncertain` | either | `4` |
+| `False` | `absent` | `submission_failed` | either | `4` |
+| `False` | `mismatched` / `unreadable` | `submission_uncertain` | either | `4` |
+
+Two rows are worth reading twice.
+
+**`submission_uncertain` can exit `0`.** `(success=False, refetch=confirmed)` is the ordinary
+lost-response recovery: the POST raised — a timeout, a dropped connection — and the refetch
+then *found the forecast on the platform*. The post landed, the artifact was written, the
+command exits `0`, and the outcome is still recorded as uncertain because the attempt and the
+platform were not observed together. **You still owe it a `verify-submission`**, and the
+command tells you so in its last line; a `0` here does not close the uncertainty. See
+[**U**](#the-uncertain-timeout).
+
+**A confirmed post whose artifact could not be written exits `4`.** The forecast is live on
+Metaculus behind a non-zero exit. See [L5](#l5--the-artifact-was-not-written).
+
+**So `4` from `submit` does not mean nothing happened and does not mean no post was made; `0`
+does not mean there is nothing left to do.** Read the `result:` and `artifact:` lines and the
+instruction line beneath them. Never infer the outcome from the exit code, and never script a
+retry on it.
+
+Uncertainty is also not one condition. `absent` is "the refetch looked and found nothing
+newer"; `mismatched` is "something newer is there and it is not what this attempt sent"; and
+`unreadable` is "the platform could not be read at all". All three record
+`submission_uncertain`, they are not interchangeable, and `mismatched` is the one with no
+operator-closable path today ([L3](#l3--a-mismatched-refetch), and **M2-714**).
 
 `run` is a milder version of the same thing: it exits `4` if any question failed or if it
 forecast none, so a partial batch is a non-zero exit even though the records that succeeded
@@ -848,10 +882,25 @@ result:    submission_uncertain (success=..., refetch=...)
 the outcome is unresolved; run `whiskeyjack-bot verify-submission --record-id <REC> --attempt-id <ATTEMPT>` before submitting anything else for this record
 ```
 
-A post was made, or attempted, and the platform's state with respect to *this* forecast
-could not be established as either "it is there and it is what we sent" or "nothing newer
-than the baseline is there". It is **not** a failure and **not** a success. The record
-stays `approved`, which is what keeps it resolvable.
+A post was made, or attempted, and the attempt and the platform were not observed *together*
+as either "it is there and it is what we sent" or "nothing newer than the baseline is there".
+It is **not** a failure and **not** a success. The record stays `approved`, which is what
+keeps it resolvable.
+
+Read the `refetch=` half of the `result:` line, because uncertainty covers four different
+situations and they are not interchangeable:
+
+| `refetch=` | What was observed | Exit | Resolvable? |
+|---|---|---|---|
+| `confirmed` (with `success=False`) | The POST raised, then the refetch **found the forecast on the platform**. The post landed. | `0` if the artifact was written | yes — `verify-submission` closes it |
+| `absent` (with `success=True`) | The POST returned, then the refetch found nothing newer. The two disagree. | `4` | yes |
+| `unreadable` | The platform could not be read at all. No observation was made. | `4` | yes — retryable, read again |
+| `mismatched` | Something newer is there and it is **not** what this attempt sent. | `4` | **no** — see [L3](#l3--a-mismatched-refetch) and **M2-714** |
+
+**The first row is the one that surprises people: it exits `0`.** A `0` from `submit` does not
+mean the uncertainty is closed — the command's own last line still tells you to run
+`verify-submission`, and the blind-retry gate below is still shut. Do not read the exit code
+as an all-clear; see [Exit codes](#exit-codes).
 
 **Copy the attempt id now.** You will need it, and it is not easy to get back — see
 ["How to find the attempt id"](#how-to-find-the-attempt-id-if-you-lost-it) below.
@@ -1169,9 +1218,12 @@ not evidence of what was sent.
 
 ## Never do this
 
-1. **Never trust `submit`'s exit code.** It exits `4` for an uncertain outcome, for a
-   failed one, *and* for a confirmed post whose artifact could not be written — where the
-   forecast is live on the platform. The `result:` and `artifact:` lines are the answer.
+1. **Never trust `submit`'s exit code.** It is `0` exactly when the refetch confirmed *and*
+   the artifact was written, which does not line up with the recorded outcome in either
+   direction: a confirmed post whose artifact failed exits `4` with the forecast live on the
+   platform, and an uncertain outcome whose refetch confirmed exits `0` with a
+   `verify-submission` still owed. The `result:`, `artifact:` and instruction lines are the
+   answer.
 2. **Never retry a submission whose outcome is uncertain.** Resolve it with
    `verify-submission` first. The program blocks this, and the block is the feature.
 3. **Never edit the ledger with `sqlite3`.** Not to close a state, not to fix a status, not
