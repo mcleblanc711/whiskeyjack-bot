@@ -152,3 +152,57 @@ def test_with_nothing_registered_append_stores_the_data_unchanged(
     identifier = append(conn, "heartbeat", "worker", {"text": FAKE_SECRET})
     assert events(conn, "heartbeat", "worker")[-1] == {"text": FAKE_SECRET}
     assert identifier
+
+
+def test_deeply_nested_data_the_base_accepted_is_still_accepted(
+    ledger: tuple[sqlite3.Connection, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1's blocker. `append`'s contract is `dict[str, Any]` with no nesting limit, and
+    the base persisted this payload: the depth it accepts is set by `json.dumps`' C encoder.
+
+    The first draft of `redact_leaves` recursed, spending two interpreter frames per level,
+    so it exhausted Python's recursion limit at roughly *half* that depth and turned payloads
+    the base had stored into a raw `RecursionError`. Measured on both trees, the first
+    failing depth is now identical (993 at the default recursion limit), so this asserts well
+    inside that with a secret at the bottom to prove the walk still reaches it.
+    """
+    conn, _db = ledger
+    monkeypatch.setenv(VARIABLE, FAKE_SECRET)
+    redaction.register_secret_env_var_names([VARIABLE])
+
+    data: dict[str, object] = {"text": f"Bearer {FAKE_SECRET}"}
+    for _ in range(900):
+        data = {"nested": data}
+
+    identifier = append(conn, "model_response", "deep", data)
+    stored = _stored(conn, identifier)
+    assert FAKE_SECRET not in stored
+
+    walked = json.loads(stored)
+    for _ in range(900):
+        walked = walked["nested"]
+    assert walked == {"text": f"Bearer <redacted:{VARIABLE}>"}
+
+
+def test_a_value_repeated_as_two_siblings_is_not_mistaken_for_a_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The iterative walk tracks only the containers on the *current path*. Tracking every
+    container it had ever seen would refuse this, which is ordinary data, not a cycle."""
+    monkeypatch.setenv(VARIABLE, FAKE_SECRET)
+    shared = {"token": FAKE_SECRET}
+    out = redaction.redact_leaves({"a": shared, "b": shared}, [VARIABLE])
+    marker = f"<redacted:{VARIABLE}>"
+    assert out == {"a": {"token": marker}, "b": {"token": marker}}
+
+
+def test_a_true_cycle_fails_exactly_as_json_dumps_already_did() -> None:
+    """Not a new refusal: `canonical` raised this before the item existed, and `append` did
+    not sanitize it then either. Pinned so the iterative walk cannot spin forever instead."""
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(ValueError, match="Circular reference detected"):
+        redaction.redact_leaves(cyclic, [VARIABLE])
+    with pytest.raises(ValueError, match="Circular reference detected"):
+        json.dumps(cyclic)

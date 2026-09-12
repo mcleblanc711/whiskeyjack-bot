@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+from typing import Any
 
 # Values shorter than this are never treated as redactable secrets: replacing a 1-3
 # character string would mangle unrelated text far more often than it would protect a real
@@ -64,16 +65,67 @@ def redact_leaves(value: object, env_var_names: Sequence[str]) -> object:
     occur in a number (an all-digit token, an account ID) would otherwise be substituted into
     the middle of that number, and the result would stop being JSON -- which, behind
     `tournament_events`' `CHECK(json_valid(data))`, is a failed write that stops the worker.
+
+    The walk keeps an explicit stack rather than recursing (M1-613 round 1). The obvious
+    recursive form spent two interpreter frames per level, so it exhausted Python's recursion
+    limit at roughly half the nesting depth `json.dumps` accepts -- and since `append` stores
+    `canonical(journal_form(data))`, that *lowered* the depth the journal would take. Payloads
+    the base persisted began raising a raw `RecursionError` instead. Iterating costs one list
+    entry per level and nothing else.
     """
-    if isinstance(value, str):
-        return redact_secrets(value, env_var_names)
-    if isinstance(value, dict):
-        return {
-            (redact_secrets(key, env_var_names) if isinstance(key, str) else key): redact_leaves(
-                item, env_var_names
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [redact_leaves(item, env_var_names) for item in value]
-    return value
+    names = tuple(env_var_names)
+
+    def leaf(item: object) -> object:
+        return redact_secrets(item, names) if isinstance(item, str) else item
+
+    def empty(container: dict[Any, Any] | list[Any] | tuple[Any, ...]) -> Any:
+        return {} if isinstance(container, dict) else []
+
+    def entries(container: dict[Any, Any] | list[Any] | tuple[Any, ...]) -> Any:
+        return iter(container.items()) if isinstance(container, dict) else iter(container)
+
+    if not isinstance(value, (dict, list, tuple)):
+        return leaf(value)
+
+    root = empty(value)
+    # (source container, its output, an iterator over the source, whether it is a mapping)
+    stack: list[tuple[object, Any, Any, bool]] = [
+        (value, root, entries(value), isinstance(value, dict))
+    ]
+    # Only the containers on the *current path*, so a value repeated as two siblings (a DAG,
+    # which is ordinary) is fine and only a true cycle is caught. Without this the loop would
+    # spin forever on one; raising here reproduces exactly what `json.dumps` already raises on
+    # the same input, so `append` behaves as it did before this item.
+    on_path = {id(value)}
+
+    while stack:
+        source, out, items, is_map = stack[-1]
+        try:
+            entry = next(items)
+        except StopIteration:
+            stack.pop()
+            on_path.discard(id(source))
+            continue
+
+        if is_map:
+            key, item = entry
+            key = redact_secrets(key, names) if isinstance(key, str) else key
+        else:
+            key, item = None, entry
+
+        if isinstance(item, (dict, list, tuple)):
+            if id(item) in on_path:
+                raise ValueError("Circular reference detected")
+            child = empty(item)
+            on_path.add(id(item))
+            stack.append((item, child, entries(item), isinstance(item, dict)))
+            placed: Any = child
+        else:
+            placed = leaf(item)
+
+        if is_map:
+            out[key] = placed
+        else:
+            out.append(placed)
+
+    return root
