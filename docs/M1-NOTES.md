@@ -10447,3 +10447,256 @@ collision handling). The same validation limitation as M1-334 applies — `codex
 --sandbox read-only` has no writable temp directory, so six filesystem-dependent tests could not
 run there and the request's gate report stood in for them.
 
+
+## M1-407 — Cross-check the configured probability bounds against the prompt
+
+Acceptance: *a config whose probability bounds fall outside the range the loaded prompt
+declares is reported at startup and by `verify-env`, before any billable call; the check
+reads the prompt that config actually names rather than a copy of its numbers.*
+
+The branch was built 2026-09-04 and never reviewed; it was merged forward 75 commits and
+then corrected. What follows separates what the WIP had from what this session changed,
+because the two are different arguments.
+
+### Delivered
+
+- `src/whiskeyjack_bot/prompt.py` — `_PROBABILITY_LINE_RE`, `_DECLARED_RANGE_RE`,
+  `DeclaredProbabilityBounds`, `parse_declared_probability_bounds`,
+  `_require_bound_pair`, `probability_bounds_disagreement`,
+  `probability_bounds_violation`, a `bounds` field on `LoadedPrompt`, and a
+  `load_prompt` that takes the configured pair as required keyword arguments.
+- `env_verify.py` — `_verify_prompt_version` → `_verify_prompt`, one added
+  `checks_passed` line.
+- `forecast/generate.py` — the containment repeat at the spending site.
+- `tournament.py` — the live worker's `load_prompt` call, wired and given a
+  `PromptError` → `TournamentError` translation it never had.
+- `tests/property/test_prompt_properties.py` — new, 12 properties; the package had no
+  property coverage of `prompt.py` at all.
+- `tests/unit/test_prompt.py` (+25), `test_env_verify.py` (+2),
+  `test_forecast_generate.py` (+3), `test_forecast_binary.py` (a rewritten docstring).
+
+`prompts/` is untouched. `git diff --stat -- prompts/` is empty on this branch, so
+`RELEASED_PROMPT_SHA256`, `forecast_records.prompt_sha256` and the live activation's
+`prompt_sha256` are all unaffected, and no `AppConfig` field was added, so `config_sha256`
+is unchanged too. Both are checkable claims and both were checked.
+
+### Decision — equality at the load boundary, and why the criterion had to be read against itself
+
+The WIP implemented **containment**: report only when the configured pair escapes the range
+the prompt declares. That is the criterion's literal wording, and it is very nearly a dead
+check. `ForecastConfig` clamps both bounds with
+`ge=PROBABILITY_BOUND_FLOOR, le=PROBABILITY_BOUND_CEILING` (`config.py:255-270`), and both
+committed prompts declare exactly those endpoints — so for **any** config loaded from YAML
+against **either** shipped prompt, escaping the declared range is unreachable. The check
+could only ever fire for an operator-supplied prompt narrower than the spec envelope.
+
+Meanwhile the row's own description names the opposite case as the motivating failure:
+*"narrowing the config silently asks for a probability the prompt never permits and pays for
+a repair turn to discover it."* Containment passes a narrowed config in silence, and a
+narrowed config is the only disagreement a YAML-loaded config can express at all.
+
+So the criterion and the description point in opposite directions, which puts the item under
+CLAUDE.md's stricter-reading rule. **Equality covers both.** Owner confirmed.
+
+Exact float equality rather than a tolerance: both sides are IEEE doubles, `float("0.001")`
+parsed out of the prompt is bit-identical to the `0.001` pydantic yields from YAML, and a
+tolerance would be a third unowned number in a row about there being too many already.
+
+### Decision — two relations, at two sites, and why that is not the drift it resembles
+
+Equality is **not** applied at `forecast.generate`'s repeat. The two sites ask different
+questions and each gets the relation that matches it:
+
+| site | question | relation |
+| --- | --- | --- |
+| `load_prompt` → both pipelines, `tournament.py`, `verify-env` | do config and the prompt **agree**? | equality |
+| `generate_forecast` preflight | does config demand what the prompt **forbids**? | containment |
+
+**Round 1 corrected the rationale here, and the correction matters more than the code.**
+An earlier draft said generation's containment check catches "a config that rejects a
+probability the prompt invites". That is backwards, and `probability_bounds_violation`
+returns `None` for exactly that case — verified by execution, not by reading. Against a
+declared `0.001`–`0.999`:
+
+| configured pair | disagreement | violation |
+| --- | --- | --- |
+| `(0.001, 0.999)` | none | none |
+| `(0.05, 0.95)` | reported | **none** |
+| `(0.0, 1.0)` | reported | reported |
+
+So containment catches only the *widening* direction — config accepting a probability the
+prompt forbade. The narrowing direction, which is the repair-turn cost the row was filed
+for, is caught by equality at the load boundary and by nothing at the spending site. The
+claim that "a merely narrower config wastes nothing at the call" was simply false: M1-403's
+own test demonstrates a narrowed config burning a repair turn.
+
+The honest reason generation keeps the weaker relation: equality at the load boundary
+already refuses every disagreeing pair on every production path, so the only caller that can
+still hand this site a bad pair is an `AppConfig` assembled some other way. For that caller
+containment is what keeps M1-403's regression test expressible. **Half of this decision is
+test-preservation**, and saying so plainly is better than the cost argument the first draft
+reached for.
+
+`test_equality_is_strictly_stronger_than_containment` pins the ordering the split rests on:
+every pair the load boundary accepts, the spending site accepts. If it ever inverted,
+`verify-env` would green-light a configuration that cannot make a single call.
+
+There is a concrete cost to getting this wrong, and it is what settled it:
+`test_a_probability_the_prompt_allows_is_refused_by_a_narrower_config`
+(`tests/unit/test_forecast_generate.py`) is M1-403's integration proof that
+`forecast.min_probability` has a consumer, and its premise is *a probability the prompt
+allows and config does not*. Under equality at the generation site that premise is
+inexpressible and the test dies. It survives unchanged.
+
+### Deviation — the guard moved after a mutation pass, not before
+
+The WIP validated the configured pair inside `load_prompt` only. The mutation pass showed
+that deleting that guard left the entire property suite green: equality is total, so a `str`
+bound simply compares unequal and a `NaN` simply compares unequal, and `load_prompt` refuses
+either way. But `probability_bounds_violation` is public and `forecast/generate.py` calls it
+directly, and its `<=` comparisons escaped a bare `TypeError` —
+`'<=' not supported between instances of 'float' and 'str'`, reproduced at the REPL, not
+inferred. That is the "every malformed shape arrives as the module's own error type" rule,
+which this project has taken as a review finding twice.
+
+The guard is now `_require_bound_pair`, one owner, called by `load_prompt` (ahead of the
+read, so the refusal does not depend on filesystem state) and by both relations.
+`test_both_relations_raise_only_prompt_error` is the property that had been missing, and it
+exists because a surviving mutant pointed at a real hole rather than at a weak assertion.
+
+### Rejected — folding this into `config.PROBABILITY_BOUND_FLOOR`/`CEILING`, and why not
+
+Three different questions are asked about this pair and only two of them are M1-407's. The
+third — whether the configured pair is inside the `0.001`–`0.999` the *submission path*
+accepts — reads the spec constants, and giving that envelope a single executable owner is
+**M1-513**, which is open and untouched here. `submission_live.py` still declares its own
+`_MIN_PROBABILITY`/`_MAX_PROBABILITY`; this branch neither uses nor changes them. Collapsing
+M1-407's prompt-derived range into those constants would defeat the criterion's second
+clause outright: the check must read the prompt config names, not a copy of its numbers.
+
+### Deferred (do not read the absence as an omission)
+
+- **M1-513** — one owner for the spec envelope. Above.
+- **M1-509** — whether a *configured* bound may be rendered in a diagnostic at all is
+  unsettled, so neither relation's message names one. The *declared* pair is rendered,
+  because it has matched a strict decimal pattern and been range-checked and because a
+  message without it names no fixable defect — the same argument as the M1-401 path
+  carve-out, one category weaker.
+- **`prompts/forecaster-tournament.md` is not consolidated with `prompts/forecaster.md`.**
+  They are byte-identical through line 164 apart from the H1 version. Both are pinned by a
+  test here; merging them is not this row.
+
+### Standing risk — the parser is coupled to one prose spelling
+
+`parse_declared_probability_bounds` reads `between <low> and <high>` on lines containing
+`probabilit`. Both committed prompts satisfy it three times over, and a disagreement among
+those three is refused rather than resolved.
+
+**Round 1 disproved the first version of this note**, which said a prompt reworded past that
+spelling "stops loading" — i.e. that the failure mode is a loud one. It is not, in one
+reachable case: a declaration *wrapped across two lines* puts the range on a line with no
+`probabilit` in it, so it is skipped entirely, the surviving declarations still agree, and
+the prompt **loads with bounds that are not what it tells the model**. That is the silent
+drift M1-407 exists to catch, surviving inside M1-407. Reproduced against the shipped
+prompt; the same conflict unwrapped is correctly refused, so the defect is the wrapping.
+
+Filed as **M1-409**, characterized by
+`tests/unit/test_prompt.py::test_a_conflicting_declaration_wrapped_across_lines_is_not_seen`
+with a hand-written oracle. Paragraph-scoping is not the fix and the row says why: the
+shipped bullet list puts the percentile bound two lines below the probability bound with no
+blank line between, so a paragraph scan merges them and manufactures a false disagreement.
+
+The round also made a methodological point worth keeping: the agreement property in
+`tests/property/` derives its expectation from `_DECLARED_RANGE_RE` and `_PROBABILITY_LINE_RE`
+— the implementation's own regexes — so it is structurally incapable of detecting this class.
+An oracle that reuses the implementation can only confirm the implementation is consistent
+with itself.
+
+Three things bound the risk and none of them removes it, and the first has to be stated
+carefully or it contradicts the paragraph above (round 2 caught that it did):
+
+- **When the parser *does* refuse, it refuses at startup and before any spend, never
+  mid-run** — and the refusal names the spelling required. That is a claim about *detected*
+  disagreements only. M1-409's wrapped case is not detected at all, so there is no failure to
+  be early: the run proceeds on bounds the prompt does not state. "Before any billable call"
+  is a property of the refusal path, never a guarantee that every disagreement reaches it.
+- `tests/unit/test_forecast_binary.py`'s canary pins the committed prompt's literal string,
+  so a reword that breaks the parser fails CI rather than only an operator's machine. This
+  covers the shipped prompts and nothing else.
+- The residual case is an operator's *own* prompt file, and for that the only honest
+  statement is that they must write the sentence the shipped prompt writes — on one line.
+
+Reported, not guessed: a prompt declaring no range **on a probability line** is refused
+rather than defaulted to the shipped pair, because "reported at startup" is not satisfied by
+assuming which range an unstated prompt meant. The qualifier is M1-409's: a prompt that
+declares a range the scan cannot see is, to this parser, a prompt that did not declare it.
+
+Not verifiable offline: nothing here calls a provider, and the claim that a disagreement
+would otherwise have cost a repair turn rests on `forecast/binary.py`'s repair path, which is
+exercised by `tests/unit/test_forecast_generate.py` against a fake model, not against a
+billed one.
+
+### Mutation pass
+
+Twelve mutants of `prompt.py`, each run against `tests/property/test_prompt_properties.py`
+plus `tests/unit/test_prompt.py` and `tests/unit/test_env_verify.py`; all twelve died. Two
+of them — dropping the range half of `_require_bound_pair`, and relaxing its exact-type check
+to `isinstance` — survive the property suite alone and are killed only by the unit
+parametrization. That is the two-part-guard shape: neutering one half of
+`type(value) is not float or not 0.0 <= value <= 1.0` leaves the other half refusing, so the
+mutant reads exactly like a vacuous test until the refusals are counted.
+
+### Round 1 — APPROVE on `21f86e7`, zero blocking findings
+
+Two non-blocking observations, both landing on *claims* rather than on code, and both
+reproduced by execution before anything was changed:
+
+1. **The containment rationale was inverted** (`prompt.py`, `generate.py`, these notes, the
+   PR body and the review request all carried it). Corrected above, with the table, and the
+   test-preservation half of the decision now stated plainly.
+2. **A conflicting declaration wrapped across two lines loads silently with the wrong
+   bounds.** Filed as **M1-409** and characterized by a test with a hand-written oracle. The
+   standing-risk note that said such a prompt "stops loading" was wrong and is corrected.
+
+Neither changed the shipped behaviour; both changed what this branch claims about it. That
+is the D-1001 pattern exactly — its three rounds were all false factual claims — and it is
+the reason the corrections are recorded here rather than quietly amended.
+
+The reviewer ran 57 tests, deselecting 35 filesystem-dependent ones: `codex exec
+--sandbox read-only` has no writable temp directory, the same limitation M1-334 and M1-613
+recorded. The request's gate report stood in for those.
+
+### Rounds 2 and 3 — APPROVE on `a4c4c3e` and `cd3d60b`
+
+Round 2 verified round 1's remediation: the containment rationale **closed** against
+execution, M1-409 **tracked and characterized** (the reviewer noting explicitly that
+characterizing is not fixing). Its one new observation — the standing-risk section claiming
+failure "at startup and before any spend" directly beneath the paragraph documenting a case
+with no failure — is fixed above.
+
+Round 3 approved that fix on a delta touching `docs/M1-NOTES.md` and nothing else. Its one
+remaining observation was against the *request file*, which is gitignored scaffolding: my
+author sections live in a reusable file and I had corrected one of the two superseded
+sentences in it, not both. Corrected there; nothing in the repository to change, and the
+acceptance criterion is forward-looking.
+
+**The shape of this item is worth keeping, because it is not the shape the round count
+suggests.** Three rounds, **zero findings against behaviour**. The code was approved at round
+1 and has not changed since — rounds 2 and 3 each verified, by stripping docstrings and
+comparing ASTs, that `prompt.py` and `forecast/generate.py` were byte-equivalent in
+executable content to `21f86e7`. All four findings across all three rounds were **false or
+unqualified claims I had written about code that was already correct**: an inverted
+explanation of which direction containment catches, a standing risk described as loud when
+one reachable case is silent, a universal "before any spend" that was true only of detected
+failures, and the same two sentences surviving into a later request because I spliced a
+reusable author file forward without re-reading it.
+
+That last one is the process lesson and it is cheap to avoid: **the author sections are an
+asset that goes stale the moment a review disproves one of their claims.** Re-read the file
+before splicing it into the next round, not after the reviewer finds the sentence. Round 2
+was handed two sentences round 1 had already refuted.
+
+This is the D-1001 pattern (`docs/D-1001-NOTES.md`), which also closed at round 3 with every
+finding a false factual claim. Two consecutive items now say the same thing: on this project
+the reviewer finds claims, not defects, and the cheapest round is the one where the request
+says only things that are true.

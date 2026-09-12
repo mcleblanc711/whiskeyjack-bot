@@ -154,7 +154,7 @@ from whiskeyjack_bot.forecast.schema import (
 )
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
-from whiskeyjack_bot.prompt import LoadedPrompt
+from whiskeyjack_bot.prompt import LoadedPrompt, probability_bounds_violation
 from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.questions.model import (
     BoundedQuestion,
@@ -460,6 +460,32 @@ def generate_forecast(
             "forecast.min_probability and forecast.max_probability are not within the "
             "0.001 to 0.999 envelope the submission path requires"
         )
+    prompt_bounds_problem = probability_bounds_violation(
+        prompt.bounds,
+        min_probability=config.forecast.min_probability,
+        max_probability=config.forecast.max_probability,
+    )
+    if prompt_bounds_problem is not None:
+        # M1-407, and **a different check from the one directly above** although the
+        # shipped prompt makes them agree. That one asks whether the configured pair is
+        # inside the envelope the *submission path* accepts, from the spec constants. This
+        # one asks whether it is inside the range *this loaded prompt* states to the model,
+        # read from the file config actually names. A custom prompt separates them
+        # immediately. This one catches the *widening* direction only: a config that would
+        # accept a probability the prompt forbade the model to give. The narrowing
+        # direction -- which is what costs a repair turn -- is caught by the equality
+        # relation at the load boundary and deliberately not here; see
+        # `prompt.probability_bounds_violation` for the table and the trade.
+        #
+        # ``probability_bounds_violation``, not ``..._disagreement``: ``load_prompt``
+        # enforces the stronger equality at the load boundary, so no production path
+        # reaches here with a disagreeing pair at all. What is left for this site to refuse
+        # is the narrower condition -- config demanding what the prompt forbids -- and it is
+        # repeated here for the reason the version check at the top of this function is
+        # repeated: a LoadedPrompt carries no memory of which config loaded it, so the pair
+        # checked at load time is not provably the pair in this ``config``. Refused before
+        # any billable call.
+        raise ForecastGenerationError(prompt_bounds_problem)
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(

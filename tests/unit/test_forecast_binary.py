@@ -410,10 +410,19 @@ def test_a_config_of_the_wrong_type_arrives_as_this_projects_error(
 
 
 def test_the_committed_defaults_still_match_the_range_the_prompt_prints() -> None:
-    """A canary, not a constraint. Nothing cross-checks the two (filed as M1-407).
+    """The committed pair and the prompt's declared range are the same numbers.
 
-    If the committed defaults are ever narrowed, this fails and points at the prompt --
-    which cannot be edited without bumping its version and re-pinning its digest.
+    **This is no longer the only thing comparing the two.** It was written as a canary
+    while nothing cross-checked them at all; M1-407 closed that -- ``prompt.load_prompt``
+    parses the range out of whatever file ``forecast.prompt_path`` names and refuses a
+    configured pair that disagrees, so every startup path and ``verify-env`` enforce it,
+    and ``tests/unit/test_prompt.py`` owns that behaviour.
+
+    What is left here is worth keeping and is a different statement: the executable check
+    reads the *configured* prompt, so it is silent about the file this repository actually
+    ships. This pins ``prompts/forecaster.md`` and ``config.example.yaml`` to each other,
+    on the literal string, so a prompt reworded past ``parse_declared_probability_bounds``
+    fails here rather than only on an operator's machine.
     """
     config = _committed_forecast_config()
     prompt = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")

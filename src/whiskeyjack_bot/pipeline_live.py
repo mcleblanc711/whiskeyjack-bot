@@ -1087,7 +1087,12 @@ def run_live(
     available, tournament_id = _select_questions(snapshot, question_id=question_id)
     selected = available[:ceiling]
     try:
-        prompt = load_prompt(config.forecast.prompt_path, config.forecast.prompt_version)
+        prompt = load_prompt(
+            config.forecast.prompt_path,
+            config.forecast.prompt_version,
+            min_probability=config.forecast.min_probability,
+            max_probability=config.forecast.max_probability,
+        )
     except PromptError as exc:
         raise LiveRunError(str(exc)) from None
     forecaster_client, primary, fallback = _build_clients(

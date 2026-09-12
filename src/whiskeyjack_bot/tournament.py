@@ -23,7 +23,7 @@ from whiskeyjack_bot.metaculus.client import SingleAttemptPoster, build_client
 from whiskeyjack_bot.metaculus.snapshots import save_snapshot
 from whiskeyjack_bot.notify import build_notifier, describe, emit, notifier_context
 from whiskeyjack_bot.pipeline_live import _attempt_question, _build_clients
-from whiskeyjack_bot.prompt import load_prompt
+from whiskeyjack_bot.prompt import PromptError, load_prompt
 from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot.submission_live import (
     MetaculusSubmissionGateway,
@@ -519,7 +519,21 @@ def run_once(
             activation["budget_microusd"],
             tuple(config.secret_env_var_names()),
         )
-        prompt = load_prompt(config.forecast.prompt_path, config.forecast.prompt_version)
+        try:
+            prompt = load_prompt(
+                config.forecast.prompt_path,
+                config.forecast.prompt_version,
+                min_probability=config.forecast.min_probability,
+                max_probability=config.forecast.max_probability,
+            )
+        except PromptError as exc:
+            # M1-407. This is the live worker's only prompt load, and it sits after the
+            # snapshot fetch but ahead of ``clients``, so every refusal here lands before
+            # the first billable call. Translated to this module's error type rather than
+            # left to propagate: ``PromptError`` is already sanitized, but a caller of
+            # ``run_once`` handles ``TournamentError``, and until M1-407 this was the one
+            # ``load_prompt`` call site with no translation at all.
+            raise TournamentError(str(exc)) from None
         clients: tuple[Any, Any, Any] | None = None
         for question in ordered:
             if question_id is not None and question.question_id != question_id:

@@ -396,7 +396,12 @@ def _require_settings_agree(stored: StoredModelOutput, config: AppConfig) -> Non
     the bytes change, and M1-401 exists because those are four different hashes.
     """
     try:
-        prompt = load_prompt(config.forecast.prompt_path, config.forecast.prompt_version)
+        prompt = load_prompt(
+            config.forecast.prompt_path,
+            config.forecast.prompt_version,
+            min_probability=config.forecast.min_probability,
+            max_probability=config.forecast.max_probability,
+        )
     except PromptError as exc:
         raise PipelineError(str(exc)) from None
     if (

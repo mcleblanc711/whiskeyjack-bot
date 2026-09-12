@@ -221,7 +221,12 @@ def model_settings(config: AppConfig) -> ModelSettings:
     is what the per-module fixtures use, because nothing there reads it -- would refuse every
     replay here for a reason unrelated to the test.
     """
-    prompt = load_prompt(config.forecast.prompt_path, config.forecast.prompt_version)
+    prompt = load_prompt(
+        config.forecast.prompt_path,
+        config.forecast.prompt_version,
+        min_probability=config.forecast.min_probability,
+        max_probability=config.forecast.max_probability,
+    )
     return ModelSettings(
         provider=config.model.provider,
         name=config.model.name,

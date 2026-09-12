@@ -9,6 +9,7 @@ possible here at all.
 """
 
 import copy
+import dataclasses
 import hashlib
 import json
 import logging
@@ -53,7 +54,7 @@ from whiskeyjack_bot.logging_setup import (
     configure_logging,
 )
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
-from whiskeyjack_bot.prompt import LoadedPrompt, load_prompt
+from whiskeyjack_bot.prompt import DeclaredProbabilityBounds, LoadedPrompt, load_prompt
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
     CanonicalMultipleChoiceQuestion,
@@ -85,7 +86,9 @@ def config(tmp_path: Path) -> AppConfig:
 
 @pytest.fixture()
 def prompt(config: AppConfig) -> LoadedPrompt:
-    return load_prompt(PROMPT_PATH, config.forecast.prompt_version)
+    return load_prompt(
+        PROMPT_PATH, config.forecast.prompt_version, min_probability=0.001, max_probability=0.999
+    )
 
 
 def _json_block(heading: str) -> str:
@@ -375,7 +378,9 @@ def test_a_prompt_of_another_version_is_refused(config: AppConfig, prompt: Loade
     """A LoadedPrompt carries no memory of which config loaded it, the same reason
     the Exa adapter repeats its configuration check at the spending site."""
     client = _Model(good_reply())
-    stale = LoadedPrompt(version="1.0.0", sha256=prompt.sha256, text=prompt.text)
+    stale = LoadedPrompt(
+        version="1.0.0", sha256=prompt.sha256, text=prompt.text, bounds=prompt.bounds
+    )
     with pytest.raises(ForecastGenerationError):
         _generate(client, config, prompt, prompt=stale)
     assert client.calls == []
@@ -1774,6 +1779,78 @@ def test_the_committed_envelope_still_generates(config: AppConfig, prompt: Loade
     """The committed pair IS the envelope, so the preflight must be inclusive at both ends."""
     client = _Model(good_reply())
     result = _generate(client, _narrowed(config, 0.001, 0.999), prompt)
+    assert len(client.calls) == 1
+    assert result.invocations == 1
+
+
+# --- M1-407: the range the loaded prompt states to the model ----------------------
+#
+# A different question from the spec-envelope preflight above, and it stays a different
+# question on purpose. That one asks whether the pair is inside the `0.001`-`0.999` the
+# *submission path* accepts, from `config.PROBABILITY_BOUND_FLOOR`/`CEILING`. This one asks
+# whether it is inside the range *this loaded prompt* declares, parsed from the file config
+# actually names. The shipped prompts make the two agree; a custom prompt separates them.
+#
+# `prompt.load_prompt` enforces the stronger *equality* at the load boundary, so no
+# production path reaches generation with a disagreeing pair. What this site refuses is the
+# narrower condition -- a config demanding a probability the prompt forbids -- which is why
+# the three `_narrowed` tests above still generate rather than being refused here.
+
+
+def _declaring(prompt: LoadedPrompt, low: float, high: float) -> LoadedPrompt:
+    """The same prompt, as though its body had declared ``low``-``high``.
+
+    ``dataclasses.replace`` rather than a written-out prompt file: the text and digest
+    must stay the committed ones, or the version/settings checks this function also runs
+    would refuse for a reason unrelated to the bounds.
+    """
+    return dataclasses.replace(prompt, bounds=DeclaredProbabilityBounds(low=low, high=high))
+
+
+def test_a_config_the_prompt_forbids_costs_no_billable_call(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The configured pair is the committed 0.001-0.999; the prompt declares less.
+
+    Unrefused, every binary forecast would go through the repair loop -- two billed calls
+    per question -- to reject a probability no model reading that prompt would have
+    produced, because the model was never told the bound it is being checked against.
+    """
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(client, config, _declaring(prompt, 0.05, 0.95))
+    assert client.calls == [], "refusal must happen before any billable call"
+    assert "fall outside" in str(caught.value)
+
+
+def test_the_prompt_bounds_refusal_names_no_configured_value(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """M1-509 is open, so the configured pair is withheld and the declared pair -- which
+    has matched a strict decimal pattern and been range-checked -- is what is named.
+
+    The configured pair is inside the spec envelope on purpose: a pair outside it is
+    refused by the M1-502 preflight above, which never reaches this check. Bound to names
+    rather than written at the call site for the reason
+    ``test_a_bounds_pair_admitting_no_probability_is_refused_before_any_billable_call``
+    gives -- ``_leaks`` renders the traceback, which quotes the source line that raised.
+    """
+    low, high = 0.002, 0.998
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(client, _narrowed(config, low, high), _declaring(prompt, 0.05, 0.95))
+    assert "fall outside" in str(caught.value)
+    assert not _leaks(caught.value, "0.002", "0.998")
+    assert client.calls == []
+
+
+def test_a_config_the_prompt_permits_still_generates(
+    config: AppConfig, prompt: LoadedPrompt
+) -> None:
+    """The other side of the iff, so the refusal above is not just "any non-default
+    prompt is refused". A wider declared range contains the committed pair and generates."""
+    client = _Model(good_reply())
+    result = _generate(client, config, _declaring(prompt, 0.0, 1.0))
     assert len(client.calls) == 1
     assert result.invocations == 1
 

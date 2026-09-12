@@ -180,24 +180,46 @@ def _verify_account_allowlist(config: AppConfig, report: VerificationReport) -> 
     )
 
 
-def _verify_prompt_version(config: AppConfig, report: VerificationReport) -> None:
-    """Cross-check the prompt's declared version against config (M1-401).
+def _verify_prompt(config: AppConfig, report: VerificationReport) -> None:
+    """Cross-check the prompt against config: version (M1-401) and bounds (M1-407).
 
     Catches prompt/config drift before a run rather than at the first forecast,
-    when the mismatched version would already have been recorded. Skipped when
-    the file is missing so that case reports one problem, not two.
+    when the mismatched version would already have been recorded -- and, since
+    M1-407, before the first *billable call*, which is the surface the
+    probability-range check is about: a configuration outside the range the
+    prompt states to the model buys a repair turn to discover what
+    ``verify-env`` can say for free.
+
+    Skipped when the file is missing so that case reports one problem, not two.
+
+    Both problems land in ``filesystem_problems``, which is where the version
+    mismatch has always gone: this is a claim about a *file* disagreeing with
+    config, not about config being internally invalid, and splitting the two
+    across buckets would make one config-versus-prompt disagreement exit 2 and
+    the other exit 3. ``load_prompt`` raises on the first failure, so a prompt
+    with both problems reports the version one; a re-run after fixing it reports
+    the other.
     """
     path = config.forecast.prompt_path
     if not path.is_file():
         return
     try:
-        loaded = load_prompt(path, config.forecast.prompt_version)
+        loaded = load_prompt(
+            path,
+            config.forecast.prompt_version,
+            min_probability=config.forecast.min_probability,
+            max_probability=config.forecast.max_probability,
+        )
     except PromptError as exc:
         # PromptError is already sanitized; it never echoes prompt contents.
         report.filesystem_problems.append(str(exc))
         return
     report.checks_passed.append(
         f"forecast.prompt_path declares version {loaded.version} (sha256 {loaded.sha256[:12]}…)"
+    )
+    report.checks_passed.append(
+        f"forecast.prompt_path declares probabilities between {loaded.bounds.low!r} and "
+        f"{loaded.bounds.high!r}, which is the configured pair"
     )
 
 
@@ -226,6 +248,6 @@ def verify_environment(config_path: Path | str) -> VerificationReport:
     _verify_directories(config, report)
     _verify_referenced_files(config, report)
     _verify_account_allowlist(config, report)
-    _verify_prompt_version(config, report)
+    _verify_prompt(config, report)
     _verify_env_vars(config, report)
     return report
