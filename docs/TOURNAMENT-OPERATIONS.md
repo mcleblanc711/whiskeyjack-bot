@@ -113,7 +113,9 @@ that ledger; use a separate ledger per operating profile for clear reporting.
 Budget exhaustion refuses the next purchase before calling a provider. Unknown charges
 continue to consume the conservative reservation after restart. Inspect `cost_reserved`,
 `cost_settled`, `retrieval_started`, and `model_started` events in `tournament_events` using
-a read-only SQLite connection. Do not raise the US$20 ceiling or erase charges to continue.
+a read-only SQLite connection. Do not raise the ceiling or erase charges to continue. The
+hard maximum per activation is `MAX_ACTIVATION_BUDGET_USD` (US$40; raised from US$20 by
+M1-408 on the owner's explicit authorization, through review, not to get past an exhaustion).
 Provider prices above the configured ceiling or unavailable routes cause refusal.
 
 ## Uncertain forecast or comment

@@ -196,6 +196,106 @@ def open_verified_ledger(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_readonly(path: Path) -> sqlite3.Connection:
+    """Open an **existing** ledger read-only, verify its schema, and apply nothing (M1-604).
+
+    The third opener, for a caller that derives something *from* the ledger rather than
+    recording something *in* it -- exports today, ``show`` and the attribution report
+    dataset next. Neither existing opener can serve that:
+
+    - :func:`connect` opens read-write, sets ``journal_mode = WAL`` and
+      ``synchronous = NORMAL``, and its pragmas are writes.
+    - :func:`open_verified_ledger` calls :func:`_migrate`, so reading through it would let
+      an *export* migrate a ledger -- a derived read that rewrites its own source.
+
+    ``file:...?mode=ro`` was chosen over ``immutable=1`` by measurement, and the difference
+    is not a nuance. ``immutable=1`` asserts to SQLite that no other process can be writing;
+    against a ledger whose ``-wal`` still holds committed frames it does not error, it
+    **silently reads the stale main database** -- reproduced on a two-transaction ledger,
+    where the second transaction's table came back ``no such table``. An export that
+    silently omits every uncheckpointed row is exactly the shortcut CLAUDE.md forbids.
+    ``mode=ro`` reads the WAL correctly and refuses every write: ``INSERT``, ``CREATE
+    TABLE`` and ``PRAGMA user_version`` all raise *attempt to write a readonly database*.
+
+    **What "read-only" does and does not promise about the files.** The main database and
+    the ``-wal`` are left byte-identical -- a read-only connection cannot checkpoint, so no
+    frame moves. The ``-shm`` is not: SQLite records read locks in it, and creates it (plus
+    an empty ``-wal``) if the ledger was cleanly checkpointed. That file is derived lock
+    state, regenerated from the WAL on demand, and every reader touches it, ``sqlite3``'s
+    own shell included. The guarantee this function makes is about the ledger's *content*.
+
+    Callers reading arbitrary columns should also set ``text_factory``: the default raises
+    ``sqlite3.OperationalError`` on a column that is not valid UTF-8, and that message
+    quotes the offending bytes. This function leaves the default alone because its own
+    reads are confined to ``schema_migrations``.
+
+    The schema is verified but never changed. A database written by a newer build is
+    refused as it is by :func:`_migrate`; so is one whose applied migrations no longer
+    match their packaged checksums, and one that is *behind* this build -- the columns a
+    reader names may simply not exist there, and "run ``init-ledger``" is a better answer
+    than ``no such column``.
+
+    The caller owns the returned connection and must close it. Purely local file I/O.
+    """
+    try:
+        # as_uri() percent-encodes and needs an absolute path; resolve() supplies one
+        # (non-strict, so a missing file resolves here and the refusal belongs to the
+        # open). mode=ro never creates, so the check-then-open race connect(create=False)
+        # documents cannot arise here either.
+        target = f"{path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(target, uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        # from None: the underlying error can name the file, and ValueError/OSError can
+        # come from resolve()/as_uri() rather than from SQLite.
+        raise LedgerError(f"cannot open ledger database at {path}") from None
+    try:
+        conn.row_factory = sqlite3.Row
+        # Autocommit, so a caller can open one explicit deferred transaction and hold a
+        # single snapshot across many reads. No journal_mode or synchronous pragma: both
+        # are writes, and on a read-only connection they are the wrong request anyway.
+        conn.isolation_level = None
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    except sqlite3.Error:
+        conn.close()
+        raise LedgerError(f"cannot open ledger database at {path}") from None
+    try:
+        _verify_schema(conn, path)
+    except sqlite3.Error:
+        # A read-only open is lazy: a file that is not a database at all opens fine and
+        # fails at the first statement, which is _verify_schema's `sqlite_master` probe.
+        # `connect` never reaches that probe raw -- its journal_mode pragma is guarded and
+        # fails first -- so without this arm the third opener was the one that let
+        # `file is not a database` escape unsanitized (GPT review round 1, B1).
+        conn.close()
+        raise LedgerError(f"cannot read ledger database at {path}") from None
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _verify_schema(conn: sqlite3.Connection, path: Path) -> None:
+    """Check an open ledger against the packaged migrations without applying any.
+
+    :func:`_migrate` without the writes: same newer-database refusal and the same
+    per-migration checksum re-check, plus the one case ``_migrate`` answers by applying
+    rather than refusing -- a database behind this build.
+    """
+    migrations = _load_migrations()
+    applied = _applied_migrations(conn)
+    _reject_newer_database(applied, migrations)
+    for version, _, checksum in migrations:
+        if version not in applied:
+            # The version numbers here are derived from packaged filenames, not from row
+            # content, so naming them leaks nothing (same reasoning as
+            # _reject_newer_database).
+            raise LedgerError(
+                f"ledger database at {path} is behind this build's schema "
+                f"(migration {version} has not been applied); run init-ledger first"
+            )
+        _verify_checksum(version, applied[version], checksum)
+
+
 def _migrate(conn: sqlite3.Connection) -> int:
     """Apply every pending migration on an open connection; return the schema version.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -14,6 +15,11 @@ from forecasting_tools.data_models.data_organizer import DataOrganizer
 from asknews_sdk.dto.news import SearchResponse
 
 from whiskeyjack_bot.config import validate_config_data
+from whiskeyjack_bot.forecast.priced import (
+    MAX_OUTPUT_TOKENS,
+    PRICED_MODELS,
+    reservation_estimate_usd,
+)
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot import tournament as whiskeyjack_tournament
@@ -680,7 +686,7 @@ def test_sol_price_parameters_response_recovery_and_unknown_cost(
 ) -> None:
     import asyncio
     import httpx
-    from whiskeyjack_bot.forecast.sol import SolClient
+    from whiskeyjack_bot.forecast.priced import PricedClient
     from whiskeyjack_bot.tournament_state import budget_context
 
     conn, config, *_ = case
@@ -702,11 +708,208 @@ def test_sol_price_parameters_response_recovery_and_unknown_cost(
     budget = Budget(conn, config.storage.artifact_root, "42:32977", 1_000_000)
     with budget_context(budget):
         prompt = [{"role": "user", "content": "test"}]
-        assert asyncio.run(SolClient(config).invoke(prompt)) == "saved output"
-        assert asyncio.run(SolClient(config).invoke(prompt)) == "saved output"
+        assert asyncio.run(PricedClient(config).invoke(prompt)) == "saved output"
+        assert asyncio.run(PricedClient(config).invoke(prompt)) == "saved output"
     assert len(calls) == 1
     assert spending(conn, budget.scope)[0] == 0
     assert spending(conn, budget.scope)[1] > 60_000
+
+
+def _with_model(config: Any, name: str) -> Any:
+    data = config.model_dump(mode="json")
+    data["model"]["name"] = name
+    return validate_config_data(data)
+
+
+def _fake_openrouter(monkeypatch: Any, config: Any) -> list[dict[str, Any]]:
+    """Answer every OpenRouter call with content and **no cost**, recording each body.
+
+    Patched once per test: patching again would wrap the already-patched constructor.
+    """
+    import httpx
+
+    sent: list[dict[str, Any]] = []
+
+    def request(req: Any) -> httpx.Response:
+        sent.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    original = httpx.AsyncClient
+    monkeypatch.setenv(config.model.api_key_env, "test-secret")
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(request), **kw)
+    )
+    return sent
+
+
+def _held_for_one_unpriced_call(conn: Any, config: Any, scope: str) -> int:
+    """Make one call whose response carries no cost, and return what stays held.
+
+    With no `usage.cost` the reservation is never settled down, so what stays held is
+    exactly the reservation the client made -- the number M1-408 is about.
+    """
+    import asyncio
+    from whiskeyjack_bot.forecast.priced import PricedClient
+    from whiskeyjack_bot.tournament_state import budget_context
+
+    budget = Budget(conn, config.storage.artifact_root, scope, 10_000_000)
+    with budget_context(budget):
+        prompt = [{"role": "user", "content": "the same prompt for every model " * 40}]
+        assert asyncio.run(PricedClient(config).invoke(prompt)) == "ok"
+    actual, held = spending(conn, scope)
+    assert actual == 0
+    return held
+
+
+@pytest.mark.parametrize("name", sorted(PRICED_MODELS))
+def test_every_priced_model_pins_its_id_and_price_and_reserves_from_them(
+    case: Any, monkeypatch: Any, name: str
+) -> None:
+    """M1-408: the three numbers that must move together, checked on the wire.
+
+    The request names the registered OpenRouter ID and a `max_price` equal to the registered
+    prices, and the held reservation is the estimate derived from those same prices --
+    so a registry entry cannot raise what a call may bill without raising what it reserves.
+    """
+    conn, config, *_ = case
+    config = _with_model(config, name)
+    priced = PRICED_MODELS[name]
+    sent = _fake_openrouter(monkeypatch, config)
+    held = _held_for_one_unpriced_call(conn, config, f"42:{name}")
+    (body,) = sent
+    assert body["model"] == priced.openrouter_id
+    assert body["provider"]["max_price"] == {
+        "prompt": priced.prompt_usd_per_mtok,
+        "completion": priced.completion_usd_per_mtok,
+    }
+    assert body["provider"]["allow_fallbacks"] is False
+    assert body["max_tokens"] == MAX_OUTPUT_TOKENS and "temperature" not in body
+    assert held == math.ceil(reservation_estimate_usd(body, priced) * 1_000_000)
+
+
+def test_astra_reserves_at_least_five_times_what_sol_does_for_the_same_prompt(
+    case: Any, monkeypatch: Any
+) -> None:
+    """Astra's prices are 5x Sol's on both sides, and so must its reservation be.
+
+    This is the regression the item exists to prevent: a registry entry whose `max_price`
+    was raised to Astra's while the reservation still came from Sol's hard-coded prices
+    would hold a fifth of what the call can bill, and the budget ceiling -- which is what
+    stops the worker -- would be five times too permissive.
+    """
+    conn, config, *_ = case
+    sent = _fake_openrouter(monkeypatch, config)
+    sol = _held_for_one_unpriced_call(
+        conn, _with_model(config, "openrouter/openai/gpt-5.6-sol"), "42:sol"
+    )
+    astra = _held_for_one_unpriced_call(
+        conn, _with_model(config, "openrouter/openai/gpt-6-astra"), "42:astra"
+    )
+    assert [body["model"] for body in sent] == ["openai/gpt-5.6-sol", "openai/gpt-6-astra"]
+    assert sol > 60_000
+    # At least, not exactly: each side is ceil()ed to a whole microdollar (the -5), and
+    # Astra's request is itself a byte longer -- `"prompt":10` against `"prompt":2` -- which
+    # its own input price charges for. The exact figure per model is pinned by
+    # test_every_priced_model_pins_its_id_and_price_and_reserves_from_them.
+    assert astra >= 5 * sol - 5
+
+
+def test_the_activation_ceiling_is_forty_dollars_exactly(case: Any) -> None:
+    """M1-408, round 1: the owner authorized a $40 cap for the Astra switch, and the Launch
+    hard maximum of $20 refused it (reproduced by the reviewer and again before this fix).
+
+    Both sides of the boundary, because a ceiling tested only from below is not a ceiling:
+    $40 activates, and a cent over is refused without appending an activation.
+    """
+    conn, config, *_ = case
+    window = {
+        "account_id": 42,
+        "project_id": 32977,
+        "starts": utcnow() - timedelta(minutes=1),
+        "ends": utcnow() + timedelta(days=1),
+    }
+    assert tournament_state.MAX_ACTIVATION_BUDGET_USD == 40
+    before = len(tournament_state.events(conn, "activation", "account"))
+    with pytest.raises(TournamentError, match=r"maximum USD 40\b"):
+        enable(conn, config, budget_usd=40.01, **window)
+    assert len(tournament_state.events(conn, "activation", "account")) == before
+    enable(conn, config, budget_usd=40, **window)
+    latest = tournament_state.events(conn, "activation", "account")[-1]
+    assert latest["budget_microusd"] == 40_000_000
+
+
+def test_a_poll_on_astra_confirms_a_forecast(case: Any) -> None:
+    """The positive half of the gate: a registered model other than Sol runs a whole poll.
+
+    Without this, reverting `run_once`'s gate to the Sol-only string would survive every
+    other test here, and the first sign would be the live worker refusing every poll.
+    """
+    conn, config, platform, news, model = case
+    astra = _with_model(config, "openrouter/openai/gpt-6-astra")
+    model.model = astra.model.name
+    enable(
+        conn,
+        astra,
+        account_id=42,
+        project_id=32977,
+        starts=utcnow() - timedelta(minutes=1),
+        ends=utcnow() + timedelta(days=1),
+    )
+    result = run_once(
+        conn,
+        astra,
+        client=platform,
+        poster=platform,
+        news_client=news,
+        web_client=object(),
+        forecaster=model,
+    )
+    assert result["refusal_reason"] is None
+    assert result["forecast_confirmed"] == 1 and model.calls == 1
+    recorded = conn.execute("SELECT model_name FROM forecast_records").fetchone()[0]
+    assert recorded == "openrouter/openai/gpt-6-astra"
+
+
+def test_a_model_outside_the_registry_is_refused_before_any_purchase(case: Any) -> None:
+    """`gpt-6-astra-pro` is real on OpenRouter and not registered, so it must not run.
+
+    Refused twice over: `run_once` will not start a poll, and the client will not build.
+    Neither falls through to `GeneralLlm`, which reserves nothing against the budget.
+    """
+    from whiskeyjack_bot.forecast.priced import PricedClient
+
+    conn, config, platform, news, model = case
+    unregistered = _with_model(config, "openrouter/openai/gpt-6-astra-pro")
+    with pytest.raises(TournamentError, match="tournament model"):
+        run_once(
+            conn,
+            unregistered,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=object(),
+            forecaster=model,
+        )
+    assert (platform.posts, news.calls, model.calls) == (0, 0, 0)
+    with pytest.raises(TournamentError, match="not a registered priced model"):
+        PricedClient(unregistered)
+
+
+@pytest.mark.parametrize("name", sorted(PRICED_MODELS))
+def test_every_registered_model_builds_the_priced_client(
+    case: Any, monkeypatch: Any, name: str
+) -> None:
+    """The wiring: `build_forecaster_client` routes every registry model to the priced
+    client, and so never to `GeneralLlm`."""
+    from whiskeyjack_bot.forecast.generate import build_forecaster_client
+    from whiskeyjack_bot.forecast.priced import PricedClient
+
+    _, config, *_ = case
+    config = _with_model(config, name)
+    monkeypatch.setenv(config.model.api_key_env, "test-secret")
+    client = build_forecaster_client(config)
+    assert type(client) is PricedClient
+    assert client.priced is PRICED_MODELS[name]
 
 
 def test_rehearsal_filter_does_not_purchase_another_question(case: Any) -> None:
@@ -1334,3 +1537,320 @@ def test_a_named_source_fallback_pushes_nothing(case: Any, monkeypatch: pytest.M
     assert poll(case)["heartbeat"]["failures"] == 0, "a missing resolution source is not a failure"
     assert platform.posts == 1, "and the forecast is still made"
     assert quiet.matching("failed") == []
+
+
+# M1-334: a retired activation pages, naming which binding moved. ---------------------
+
+
+def _retire(case: Any, binding: str) -> Any:
+    """Move one binding out from under the fixture's activation; return the poll config."""
+    conn, config, platform, *_ = case
+    if binding == "account":
+        platform.account = 43
+        return config
+    if binding == "prompt":
+        config.forecast.prompt_path.write_bytes(
+            config.forecast.prompt_path.read_bytes() + b"\n<!-- edited -->\n"
+        )
+        return config
+    data = config.model_dump(mode="json")
+    if binding == "configuration":
+        # A value no gate cares about: the point is the hash, as on 2026-09-09.
+        data["logging"]["level"] = "DEBUG" if data["logging"]["level"] != "DEBUG" else "INFO"
+    else:  # destination: another project, which is also a configuration change
+        data["metaculus"]["tournament"]["id"] = 32978
+    return validate_config_data(data)
+
+
+@pytest.mark.parametrize(
+    ("binding", "expected"),
+    [
+        ("account", ("account",)),
+        ("prompt", ("prompt",)),
+        ("configuration", ("configuration",)),
+        ("destination", ("destination", "configuration")),
+    ],
+)
+def test_a_retired_activation_pages_naming_what_moved_and_nothing_else(
+    case: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    binding: str,
+    expected: tuple[str, ...],
+) -> None:
+    """The 2026-09-09 outage, with the page it never sent.
+
+    The push names the moved binding by its key and carries no digest -- neither the
+    stored nor the computed one -- and no config value. The refusal itself is unchanged:
+    still a `TournamentError`, still raised, nothing bought.
+    """
+    from whiskeyjack_bot.tournament_state import ActivationRetired, bindings
+
+    conn, _config, platform, news, model = case
+    stored = tournament_state.events(conn, "activation", "account")[-1]
+    retired_config = _retire(case, binding)
+    pushes = _recording(monkeypatch, retired_config, tmp_path / "notify-state")
+    with pytest.raises(ActivationRetired) as excinfo:
+        run_once(
+            conn,
+            retired_config,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=object(),
+            forecaster=model,
+        )
+    assert excinfo.value.changed == expected
+    assert isinstance(excinfo.value, TournamentError)
+    assert (platform.posts, news.calls, model.calls) == (0, 0, 0)
+    (push,) = pushes.matching("activation retired")
+    assert push["priority"] == "high"
+    for key in expected:
+        assert key in push["body"]
+    rendered = push["title"] + push["body"] + str(excinfo.value)
+    for digest_value in (
+        stored["config_sha256"],
+        stored["prompt_sha256"],
+        *bindings(retired_config).values(),
+    ):
+        assert digest_value[:12] not in rendered
+    # The configured project ID is a config value as much as a digest is, and round 1
+    # found it interpolated into the title. Both the stored and the moved-to project.
+    assert "32977" not in rendered and "32978" not in rendered
+    assert "DEBUG" not in rendered and "INFO" not in rendered
+
+
+def test_a_disabled_or_out_of_window_activation_does_not_page(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Silent by design: both are ordinary resting states, and paging on them would page
+    every night a window closes."""
+    from whiskeyjack_bot.tournament_state import ActivationInactive
+
+    conn, config, *_ = case
+    pushes = _recording(monkeypatch, config, tmp_path / "notify-state")
+    disable(conn)
+    with pytest.raises(ActivationInactive):
+        poll(case)
+    enable(
+        conn,
+        config,
+        account_id=42,
+        project_id=32977,
+        starts=utcnow() + timedelta(hours=1),
+        ends=utcnow() + timedelta(hours=2),
+    )
+    with pytest.raises(ActivationInactive):
+        poll(case)
+    assert pushes.sent == []
+
+
+@pytest.mark.parametrize("resting", ["disabled", "out of window"])
+def test_a_resting_activation_stays_silent_even_when_a_binding_also_moved(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, resting: str
+) -> None:
+    """Round 1, finding 1: `require_activation` evaluated retirement before the resting
+    states, so a paused profile paged as soon as a binding moved.
+
+    The resting-state test above holds the bindings *intact*, which means it never reaches
+    the retirement branch at all and could not have seen the ordering. Here the profile is
+    resting *and* retired -- what an ordinary config deployment against a paused profile
+    looks like -- and it must stay silent. Restoring the old order fails this.
+    """
+    from whiskeyjack_bot.tournament_state import ActivationInactive
+
+    conn, config, platform, news, model = case
+    if resting == "disabled":
+        disable(conn)
+    else:
+        enable(
+            conn,
+            config,
+            account_id=42,
+            project_id=32977,
+            starts=utcnow() + timedelta(hours=1),
+            ends=utcnow() + timedelta(hours=2),
+        )
+    retired_config = _retire(case, "configuration")
+    pushes = _recording(monkeypatch, retired_config, tmp_path / "notify-state")
+    with pytest.raises(ActivationInactive):
+        run_once(
+            conn,
+            retired_config,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=object(),
+            forecaster=model,
+        )
+    assert pushes.sent == []
+
+
+def test_a_retired_profile_polled_every_five_minutes_pages_once(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An hour of five-minute polls on one retired profile is one page, not twelve.
+
+    The clock is injected and advanced per poll, so this distinguishes the day-long window
+    from the 30-minute incident window: under 1800 seconds the same hour pages twice.
+    """
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier
+    from whiskeyjack_bot.tournament_state import ActivationRetired
+
+    conn, _config, platform, news, model = case
+    retired_config = _retire(case, "configuration")
+    pushes = _Pushes()
+    instant = [utcnow()]
+    monkeypatch.setattr(
+        whiskeyjack_tournament,
+        "build_notifier",
+        lambda _config: Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(pushes)),
+            topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+            state_root=tmp_path / "notify-state",
+            clock=lambda: instant[0],
+        ),
+    )
+    for _ in range(12):
+        with pytest.raises(ActivationRetired):
+            run_once(
+                conn,
+                retired_config,
+                client=platform,
+                poster=platform,
+                news_client=news,
+                web_client=object(),
+                forecaster=model,
+            )
+        instant[0] += timedelta(minutes=5)
+    assert len(pushes.matching("activation retired")) == 1
+
+
+def test_two_retired_profiles_each_page(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The subject is the profile's project, so a second profile retiring in the same
+    window still pages. Driven through `run_once` for both, so it pins the wiring --
+    a constant subject at the call site would throttle the second page away."""
+    from whiskeyjack_bot.tournament_state import ActivationRetired
+
+    conn, _config, platform, news, model = case
+    one = _retire(case, "configuration")
+    other = _retire(case, "destination")
+    pushes = _recording(monkeypatch, one, tmp_path / "shared-notify-state")
+    for profile in (one, other, one):
+        with pytest.raises(ActivationRetired):
+            run_once(
+                conn,
+                profile,
+                client=platform,
+                poster=platform,
+                news_client=news,
+                web_client=object(),
+                forecaster=model,
+            )
+    pages = pushes.matching("activation retired")
+    # Two pages and not one: the subject is the profile's project, so the second profile
+    # is not throttled away by the first, and the third poll -- profile `one` again -- is.
+    # Since round 1 the title is static, so the *count* is the whole witness here: a
+    # constant subject at the call site collapses these three polls to a single page.
+    assert len(pages) == 2
+    rendered = "".join(push["title"] + push["body"] for push in pages)
+    assert "32977" not in rendered and "32978" not in rendered
+
+
+def test_a_failed_push_leaves_the_refusal_exactly_as_it_was(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The page is a side effect of the refusal, never a replacement for it."""
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier
+    from whiskeyjack_bot.tournament_state import ActivationRetired
+
+    conn, _config, platform, news, model = case
+    retired_config = _retire(case, "configuration")
+
+    def always_fails(request: Any) -> Any:
+        raise httpx.ConnectError("the topic host is gone")
+
+    monkeypatch.setattr(
+        whiskeyjack_tournament,
+        "build_notifier",
+        lambda _config: Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(always_fails)),
+            topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+            state_root=retired_config.storage.artifact_root,
+        ),
+    )
+    with pytest.raises(ActivationRetired) as excinfo:
+        run_once(
+            conn,
+            retired_config,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=object(),
+            forecaster=model,
+        )
+    assert str(excinfo.value) == (
+        "activation retired: configuration changed; re-run tournament enable"
+    )
+
+
+def test_every_binding_the_activation_stores_is_compared_by_name(case: Any) -> None:
+    """`retired_bindings` names each binding explicitly, so a new key in `bindings()` would
+    be compared by nobody. This pins the set it was written against: add a binding and this
+    fails until `retired_bindings` (and `RetiredBinding`) learn it."""
+    from typing import get_args
+
+    from whiskeyjack_bot.tournament_state import RetiredBinding, bindings
+
+    _conn, config, *_ = case
+    assert set(bindings(config)) == {"config_sha256", "prompt_sha256"}
+    assert get_args(RetiredBinding) == ("account", "destination", "configuration", "prompt")
+
+
+def test_an_activation_retired_refusal_needs_a_known_binding() -> None:
+    from whiskeyjack_bot.tournament_state import ActivationRetired
+
+    with pytest.raises(ValueError):
+        ActivationRetired(())
+    with pytest.raises(ValueError):
+        ActivationRetired(("the moon",))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("kind", ["retired", "inactive"])
+def test_a_refusal_reaches_the_log_the_operator_tails(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str, caplog: Any
+) -> None:
+    """The monitor half. A refusal used to reach only stdout, so the JSONL tail went
+    silent -- indistinguishable from a tournament between question batches."""
+    import logging
+
+    import yaml
+
+    from whiskeyjack_bot import cli, logging_setup
+    from whiskeyjack_bot.tournament_state import ActivationInactive, ActivationRetired
+
+    _conn, config, *_ = case
+    path = tmp_path / "profile.yaml"
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8")
+    refusal = (
+        ActivationRetired(("configuration",))
+        if kind == "retired"
+        else ActivationInactive("tournament activation is disabled")
+    )
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise refusal
+
+    monkeypatch.setattr(whiskeyjack_tournament, "run_once", refuse)
+    monkeypatch.setattr(logging_setup, "configure_logging", lambda _config: None)
+    with caplog.at_level(logging.INFO, logger="whiskeyjack_bot.tournament"):
+        assert cli.main(["tournament", "run-once", "--config", str(path)]) == 1
+    (record,) = [r for r in caplog.records if r.getMessage().startswith("tournament refused")]
+    assert record.levelno == (logging.ERROR if kind == "retired" else logging.WARNING)
+    assert str(refusal) in record.getMessage()

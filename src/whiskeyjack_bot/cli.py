@@ -267,6 +267,27 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--starts", required=True, help="UTC ISO timestamp")
             command.add_argument("--ends", required=True, help="UTC ISO timestamp")
             command.add_argument("--budget-usd", type=float, default=20.0)
+
+    export = subparsers.add_parser(
+        "export",
+        help="write the ledger out as derived JSONL or Parquet files; never writes to it",
+    )
+    export.add_argument("--config", default="config.yaml", type=Path)
+    export.add_argument(
+        "--format",
+        dest="export_format",
+        required=True,
+        choices=("jsonl", "parquet"),
+        help="jsonl for audit and interchange, parquet for analysis",
+    )
+    export.add_argument(
+        "--output",
+        type=Path,
+        help=(
+            "directory to create the export in; defaults to a new UTC-timestamped "
+            "directory under storage.export_root. An existing export is never overwritten"
+        ),
+    )
     return parser
 
 
@@ -1223,6 +1244,74 @@ def _run_replay(args: argparse.Namespace) -> int:
         connection.close()
 
 
+def _run_export(args: argparse.Namespace) -> int:
+    """Write the ledger out as derived JSONL or Parquet files (M1-604).
+
+    The one command in this file that opens no ledger connection of its own. Every other
+    ledger command goes through ``_open_existing_ledger``, which returns a *read-write*
+    connection with migrations applied; using it here would mean an export could migrate
+    the database it is exporting. :func:`export.export_ledger` takes the path and opens it
+    read-only itself, so "never mutates the ledger" is a property of the call rather than a
+    promise this handler makes on its behalf.
+
+    ``--output`` defaults to a new UTC-timestamped directory under ``storage.export_root``
+    -- a config field that has existed and been checked by ``verify-env`` since M1-601 with
+    nothing reading it. The timestamp is in the directory name rather than the filenames so
+    one export is one directory, and so a second export never collides with the first.
+    Should it collide anyway (an explicit ``--output`` reused), the shared atomic writer
+    refuses rather than overwriting: an export that silently replaced an earlier one would
+    destroy the audit trail it exists to provide.
+
+    Nothing here contacts a provider, and nothing writes to the ledger.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.export import ExportError, export_ledger
+    from whiskeyjack_bot.ledger import LedgerError
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    stamped = datetime.now(timezone.utc)
+    destination = args.output
+    if destination is None:
+        # Colons are legal on POSIX but not on Windows, and a directory name is not a
+        # timestamp anyone parses back, so compact the ISO form rather than embedding one.
+        suffix = stamped.strftime("%Y%m%dT%H%M%SZ")
+        destination = config.storage.export_root / f"{args.export_format}-{suffix}"
+
+    try:
+        result = export_ledger(
+            config.storage.sqlite_path,
+            destination,
+            export_format=args.export_format,
+            now=stamped,
+        )
+    except (ExportError, LedgerError) as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
+
+    print(f"ledger:    {config.storage.sqlite_path}")
+    print(f"schema:    version {result.ledger_schema_version}")
+    print(f"format:    {result.export_format}")
+    print(f"output:    {result.destination}")
+    print(f"tables:    {len(result.tables)} ({result.row_count} row(s) total)")
+    for table in result.tables:
+        print(f"  {table.row_count:>7} {table.name}")
+    return EXIT_OK
+
+
 def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
     """Open an existing ledger, or print why not and return ``None`` (M2-701).
 
@@ -1317,10 +1406,21 @@ def _run_tournament(args: argparse.Namespace) -> int:
             connection.close()
     except Exception as exc:
         # SDK exceptions may carry tokens and response bodies. Safe, stable type only.
-        from whiskeyjack_bot.tournament_state import TournamentError
+        import logging
 
-        print(
-            f"Tournament refused: {str(exc) if isinstance(exc, TournamentError) else type(exc).__name__}"
+        from whiskeyjack_bot.tournament_state import ActivationInactive, TournamentError
+
+        reason = str(exc) if isinstance(exc, TournamentError) else type(exc).__name__
+        print(f"Tournament refused: {reason}")
+        # M1-334: the same sanitized line into the JSONL log the operator tails. Before
+        # this a refusal reached only stdout (the journal), so the tail went silent -- and a
+        # silent tail reads exactly like a tournament between question batches. A disabled
+        # or out-of-window activation is an ordinary resting state and logs as a warning;
+        # anything else needs a person.
+        logging.getLogger("whiskeyjack_bot.tournament").log(
+            logging.WARNING if isinstance(exc, ActivationInactive) else logging.ERROR,
+            "tournament refused: %s",
+            reason,
         )
         return 1
     return 0
@@ -1359,6 +1459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_release_key(args)
     if args.command == "replay":
         return _run_replay(args)
+    if args.command == "export":
+        return _run_export(args)
     raise AssertionError(f"unhandled command: {args.command}")
 
 

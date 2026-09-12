@@ -77,6 +77,7 @@ NotifyEvent = Literal[
     "budget_threshold",
     "prediction_posted",
     "poll_summary",
+    "activation_retired",
 ]
 
 # What happened to one push. Closed for the same reason the outcome vocabularies in
@@ -104,12 +105,17 @@ NotifyOutcome = Literal["sent", "throttled", "disabled", "failed"]
 #   the mechanism.
 # - ``poll_summary`` is the daily liveness digest -- see :meth:`Notifier.send` for why it
 #   is a digest and not a per-poll push.
+# - ``activation_retired`` (M1-334) is a condition that holds until an operator re-runs
+#   ``tournament enable``: every five-minute poll hits it again. Keyed on the profile's
+#   project, so two profiles retiring both page; a day-long window makes one retired profile
+#   page once per incident, not 288 times a day.
 _WINDOW_SECONDS: Final[dict[str, int]] = {
     "question_blocked": 1800,
     "provider_failed": 1800,
     "budget_threshold": 86400,
     "prediction_posted": 86400,
     "poll_summary": 86400,
+    "activation_retired": 86400,
 }
 assert set(_WINDOW_SECONDS) == set(get_args(NotifyEvent))
 assert all(seconds > 0 for seconds in _WINDOW_SECONDS.values())
@@ -148,6 +154,8 @@ _PRIORITY: Final[dict[str, str]] = {
     "budget_threshold": "high",
     "prediction_posted": "default",
     "poll_summary": "low",
+    # Every poll is refusing until an operator acts, so it pages like an incident.
+    "activation_retired": "high",
 }
 assert set(_PRIORITY) == set(get_args(NotifyEvent))
 

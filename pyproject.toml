@@ -33,6 +33,14 @@ dependencies = [
     # of which hostnames are themselves public suffixes vs. registrable domains beneath
     # one. Zero mandatory runtime deps of its own (M1-311).
     "publicsuffixlist>=1.0,<2",
+    # Parquet writer for the derived ledger exports (M1-604). Already present
+    # transitively -- forecasting-tools pins streamlit, which requires
+    # pyarrow>=7.0,<25 -- so declaring it installs nothing new; it is declared
+    # for the same reason as idna and httpx below/above: export.py imports it
+    # directly, and an undeclared transitive import breaks whenever the
+    # intermediate drops it. The upper bound must stay inside streamlit's range
+    # or `uv sync --locked` conflicts, exactly as the asknews bound must.
+    "pyarrow>=24,<25",
     "pyyaml>=6,<7",
 ]
 
@@ -76,6 +84,17 @@ follow_imports = "skip"
 # and keep our own annotations as the boundary.
 module = "publicsuffixlist.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pyarrow ships a py.typed marker but its Cython-backed entry points carry no
+# annotations -- `pyarrow.parquet.write_table` has a signature and no types --
+# so under --strict every call site fails `disallow_untyped_calls` while the
+# package advertises itself as typed. Same treatment as forecasting_tools:
+# treat the interface as untyped and keep our own annotations as the boundary.
+# export.py annotates everything it hands to and takes from pyarrow.
+module = "pyarrow.*"
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [dependency-groups]
 dev = [
