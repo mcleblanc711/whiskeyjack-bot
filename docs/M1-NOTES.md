@@ -10665,3 +10665,38 @@ the reason the corrections are recorded here rather than quietly amended.
 The reviewer ran 57 tests, deselecting 35 filesystem-dependent ones: `codex exec
 --sandbox read-only` has no writable temp directory, the same limitation M1-334 and M1-613
 recorded. The request's gate report stood in for those.
+
+### Rounds 2 and 3 — APPROVE on `a4c4c3e` and `cd3d60b`
+
+Round 2 verified round 1's remediation: the containment rationale **closed** against
+execution, M1-409 **tracked and characterized** (the reviewer noting explicitly that
+characterizing is not fixing). Its one new observation — the standing-risk section claiming
+failure "at startup and before any spend" directly beneath the paragraph documenting a case
+with no failure — is fixed above.
+
+Round 3 approved that fix on a delta touching `docs/M1-NOTES.md` and nothing else. Its one
+remaining observation was against the *request file*, which is gitignored scaffolding: my
+author sections live in a reusable file and I had corrected one of the two superseded
+sentences in it, not both. Corrected there; nothing in the repository to change, and the
+acceptance criterion is forward-looking.
+
+**The shape of this item is worth keeping, because it is not the shape the round count
+suggests.** Three rounds, **zero findings against behaviour**. The code was approved at round
+1 and has not changed since — rounds 2 and 3 each verified, by stripping docstrings and
+comparing ASTs, that `prompt.py` and `forecast/generate.py` were byte-equivalent in
+executable content to `21f86e7`. All four findings across all three rounds were **false or
+unqualified claims I had written about code that was already correct**: an inverted
+explanation of which direction containment catches, a standing risk described as loud when
+one reachable case is silent, a universal "before any spend" that was true only of detected
+failures, and the same two sentences surviving into a later request because I spliced a
+reusable author file forward without re-reading it.
+
+That last one is the process lesson and it is cheap to avoid: **the author sections are an
+asset that goes stale the moment a review disproves one of their claims.** Re-read the file
+before splicing it into the next round, not after the reviewer finds the sentence. Round 2
+was handed two sentences round 1 had already refuted.
+
+This is the D-1001 pattern (`docs/D-1001-NOTES.md`), which also closed at round 3 with every
+finding a false factual claim. Two consecutive items now say the same thing: on this project
+the reviewer finds claims, not defects, and the cheapest round is the one where the request
+says only things that are true.
