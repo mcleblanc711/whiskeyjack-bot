@@ -10612,14 +10612,24 @@ The round also made a methodological point worth keeping: the agreement property
 An oracle that reuses the implementation can only confirm the implementation is consistent
 with itself.
 
-Three things bound the risk and none of them removes it. The failure is at startup and
-before any spend, never mid-run. `tests/unit/test_forecast_binary.py`'s canary pins the
-committed prompt's literal string, so a reword that breaks the parser fails CI rather than
-only an operator's machine. And the refusal says what spelling is required. The residual
-case is an operator's *own* prompt file, and for that the only honest statement is that they
-must write the sentence the shipped prompt writes. Reported, not guessed: a prompt declaring
-no range is refused rather than defaulted to the shipped pair, because "reported at startup"
-is not satisfied by assuming which range an unstated prompt meant.
+Three things bound the risk and none of them removes it, and the first has to be stated
+carefully or it contradicts the paragraph above (round 2 caught that it did):
+
+- **When the parser *does* refuse, it refuses at startup and before any spend, never
+  mid-run** — and the refusal names the spelling required. That is a claim about *detected*
+  disagreements only. M1-409's wrapped case is not detected at all, so there is no failure to
+  be early: the run proceeds on bounds the prompt does not state. "Before any billable call"
+  is a property of the refusal path, never a guarantee that every disagreement reaches it.
+- `tests/unit/test_forecast_binary.py`'s canary pins the committed prompt's literal string,
+  so a reword that breaks the parser fails CI rather than only an operator's machine. This
+  covers the shipped prompts and nothing else.
+- The residual case is an operator's *own* prompt file, and for that the only honest
+  statement is that they must write the sentence the shipped prompt writes — on one line.
+
+Reported, not guessed: a prompt declaring no range **on a probability line** is refused
+rather than defaulted to the shipped pair, because "reported at startup" is not satisfied by
+assuming which range an unstated prompt meant. The qualifier is M1-409's: a prompt that
+declares a range the scan cannot see is, to this parser, a prompt that did not declare it.
 
 Not verifiable offline: nothing here calls a provider, and the claim that a disagreement
 would otherwise have cost a repair turn rests on `forecast/binary.py`'s repair path, which is
