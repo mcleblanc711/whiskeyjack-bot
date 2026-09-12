@@ -10246,3 +10246,56 @@ plain string continuation of the f-string, so the braces never interpolated and 
 for the wrong reason. Re-run with the `f` prefix, it was killed by all four
 `test_a_retired_activation_pages_…` cases.
 
+### Round 1 — two blockers, both reproduced by execution, both real
+
+Reviewed commit `7cde2db`, the request's pinned HEAD. Neither finding was the pushback the
+request anticipated: the reviewer accepted that `notifier_context` already wraps
+`require_activation`, so the "build your own notifier" premise in the acceptance criterion did
+not come back. Both blockers were reproduced through `run_once` before any fix was written.
+
+**1. A resting activation paged as soon as a binding also moved.** `require_activation`
+evaluated retirement *before* the disabled/out-of-window check, so a paused profile raised
+`ActivationRetired` and pushed. Reachable without anything unusual: deploy a config change while
+a profile is disabled, or let any poll land after a window closes, and the operator is paged
+about a profile nobody is running. Fixed by checking the resting states first.
+
+The interesting part is why the existing test could not have caught it. Round 1's
+`test_a_disabled_or_out_of_window_activation_does_not_page` asserts exactly the right thing —
+resting states are silent — but it holds the bindings *intact*, so it never reaches the
+retirement branch at all. It is the project's recurring vacuous-property shape in a unit test:
+the fixture cannot reach the branch the assertion is about, so the assertion passes for a reason
+that has nothing to do with the claim. The new parametrized
+`test_a_resting_activation_stays_silent_even_when_a_binding_also_moved` puts the profile in both
+states at once, which is the only arrangement that can see the ordering.
+
+**2. The push title interpolated the configured project ID.** The title read
+`whiskeyjack: project 32977 activation retired` — three lines under a comment in the same commit
+claiming it names "the moved bindings, never a digest or a config value". The request's own risk
+area 2 made the same claim and its test checked only the *digests*, so the branch asserted the
+property it was violating. The title is static now. The project remains the throttle **subject**,
+which is safe for a reason worth writing down: `Notifier._stamp_path` sha256s the subject into a
+stamp filename and never transmits it, so one-page-per-profile survives a title that says nothing.
+
+That cost the two-profile test its discriminator — it had distinguished the pages by the project
+ID in the title. It now asserts the page *count*, which is strictly stronger: with a constant
+subject the three polls collapse to one page, so the count alone kills the mutant the title match
+used to. Verified, not assumed (below).
+
+### Teeth — round 1's remediation
+
+**3 mutants, 3 killed,** against a committed tree with `__pycache__` cleared between runs:
+
+- restore the old ordering in `require_activation` → both parametrizations of the new resting
+  test fail;
+- restore the interpolated title → four `test_a_retired_activation_pages_…` cases *and*
+  `test_two_retired_profiles_each_page` fail (5 in total);
+- constant `subject="wj"` at the `run_once` call site → `test_two_retired_profiles_each_page`
+  fails on the count alone, which is the check that the rewrite did not cost the test its teeth.
+
+### Non-blocking, filed rather than built
+
+`M1-335` (Low): `retired_bindings` is tested one moved key at a time plus the destination pair.
+Combinations of two or three independently moved keys, and a stored activation missing a key,
+are not exercised. Filed rather than built because `_retire` moves one binding at a time by
+construction and the combinatorial fixture is a real piece of work, not a parametrize line.
+
