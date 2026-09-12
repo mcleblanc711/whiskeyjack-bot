@@ -10217,3 +10217,56 @@ witness is still detected.
 rendered text instead of leaves; `witness` writes raw data; keys not redacted; lists not
 recursed; `load_config` does not register.
 
+### Round 1 — one blocker, reproduced on both trees, real
+
+Reviewed commit `f491a34`, the request's pinned HEAD.
+
+**`redact_leaves` recursed, and that lowered the nesting depth the journal accepts.** `append`'s
+contract is `dict[str, Any]` with no declared nesting limit, and the depth it actually takes is
+set by `json.dumps`' C encoder. The recursive walk spent two interpreter frames per level — one
+for the call, one for the dict comprehension — so it exhausted Python's recursion limit at
+roughly half that depth. Payloads the base had persisted started raising a raw `RecursionError`
+out of `append`.
+
+Both halves were reproduced before any fix, because a finding is only real if the base really
+did accept the input: at depth 600 and 900 the base persisted the event and the branch raised.
+Binary-searching the first failing depth on each tree put the regression at a number rather than
+an adjective — **base 993, branch ~500, and after the fix 993 again.** Exact parity, with
+`json.dumps` the binding limit once more.
+
+The fix is an explicit stack. Two details in it are decisions, not incidentals:
+
+- **Only the containers on the *current path* are tracked,** not every container ever seen. A
+  value repeated as two siblings is a DAG, which is ordinary data; tracking everything would
+  refuse it. The narrower check catches only a true cycle.
+- **A cycle raises `ValueError("Circular reference detected")` — the identical error
+  `json.dumps` already raised on the same input.** This adds no refusal the base lacked, and it
+  is deliberately not sanitized into a module error: `append` did not sanitize it before this
+  item either, so doing it here would be a behaviour change smuggled in under a remediation.
+  The alternative was worse than either — without the guard the iterative walk spins forever,
+  turning a pre-existing raised error into a hang.
+
+The finding also named the missing property coverage, which the request had itself flagged as a
+stated limitation and invited the reviewer to rule on. Five properties added to
+`tests/property/test_redaction_properties.py`: never raises; no planted secret survives;
+structure preserved; an empty registry is the identity; and nesting past the recursion limit
+survives — the blocker as a property, not only as a regression test. The no-leak property is
+guarded against this project's recurring vacuity failure by asserting the secret **present** in
+the rendered input before asserting it absent from the output.
+
+### Teeth — round 1's remediation
+
+**3 mutants, 3 killed,** committed tree, `__pycache__` cleared between runs:
+
+- restore the recursive walk → the depth regression and the cycle test fail;
+- never discard from the path set (track every container seen) → the DAG test fails, which is
+  the only test that can tell the two cycle-detection designs apart;
+- stop redacting dict keys → one unit test and two properties fail.
+
+### Non-blocking, not built
+
+The reviewer noted that two dict keys redacting to the same marker collapse into one entry.
+Left alone: the brief establishes no collision-preservation requirement, it is a property of
+the substitution rule rather than of this walk, and the strategies cannot reach it. Recorded
+here so its absence is a decision rather than an omission.
+
