@@ -10270,3 +10270,21 @@ Left alone: the brief establishes no collision-preservation requirement, it is a
 the substitution rule rather than of this walk, and the strategies cannot reach it. Recorded
 here so its absence is a decision rather than an omission.
 
+### Round 2 — APPROVE
+
+Reviewed commit `00363c9`, the request's pinned HEAD. Blocker CLOSED, no new blocking findings.
+Two rounds total.
+
+Worth recording: the reviewer did not take the depth parity on trust. It ran its own in-memory
+harness against both the pinned base and this tree, across dicts, lists *and* tuples, and found
+identical first-failing depths (990 in its harness against 993 in mine — the threshold moves with
+surrounding stack depth, which is why parity between trees is the claim and not the number).
+Putting the measurement in the request, rather than the word "fixed", is what made that check
+cheap enough to perform.
+
+Both non-blocking observations are filed rather than built: `M1-338` (sanitize the
+circular-reference `ValueError`, pre-existing on the base) and `M1-339` (define redacted-key
+collision handling). The same validation limitation as M1-334 applies — `codex exec
+--sandbox read-only` has no writable temp directory, so six filesystem-dependent tests could not
+run there and the request's gate report stood in for them.
+
