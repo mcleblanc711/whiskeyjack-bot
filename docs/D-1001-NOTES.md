@@ -23,9 +23,10 @@ database.*
   confirm, read-only* / *recovery* / *never*), a dedicated uncertain-timeout section, a
   "never do this" list, and a closing section naming every state whose only recovery would
   be a database edit.
-- `docs/backlog/backlog.csv` — five new rows (**M2-713**, **M2-714**, **M2-715**,
-  **M1-611**, **M0-010**), and `D-1001` flipped to `Done`. Twenty failure states became
-  twenty-one after the pre-PR master merge — see the C5 deviation below.
+- `docs/backlog/backlog.csv` — six new rows (**M2-713**, **M2-714**, **M2-715**,
+  **M1-611**, **M0-010**, and **T-908** from round 1), and `D-1001` flipped to `Done`.
+  Twenty failure states became twenty-one after the pre-PR master merge — see the C5
+  deviation below.
 - `docs/TRACKS.md` — the claim row, committed first.
 
 No code, no migration, no dependency. Nothing in this item is reachable from the CLI
@@ -129,13 +130,16 @@ both actively point an operator at the wrong problem:
   the database — which this runbook is trying to talk them out of — reads `draft` on an
   approved record and concludes the ledger is broken.
 
-A third joined them from reading `_run_submit`'s return paths: **`submit` exits `0` for
-every outcome it managed to record**, `submission_uncertain` and `submission_failed`
-included. Exit `0` means "the attempt completed and was written down", not "the forecast is
-on the platform" — the outcome is on the `result:` line and nowhere else. It is the same
-shape as T-905's `gate.sh` defect (trust the printed line, not `$?`) and it is the first
-entry in the runbook's "never do this" list for the same reason: it is the mistake that
-looks like diligence.
+A third joined them from reading `_run_submit`'s return paths, and **round 1 found this
+note had it backwards** — see the round-1 section below. What is true: `submit` returns
+`EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED`
+(`cli.py:735`), so it exits `4` for `submission_uncertain`, for `submission_failed`, **and
+for a confirmed post whose artifact could not be written** — the last of which is a forecast
+live on Metaculus behind a non-zero exit. The operator instruction is unchanged and is if
+anything stronger: the outcome is on the `result:` and `artifact:` lines and nowhere else.
+It is the same shape as T-905's `gate.sh` defect (trust the printed line, not `$?`) and it
+is the first entry in the runbook's "never do this" list for the same reason: it is the
+mistake that looks like diligence.
 
 None of the three is a defect worth a row. All three are documentation's job exactly.
 
@@ -239,11 +243,12 @@ ships — so the doc patch has an expiry date rather than becoming permanent.
   the submit section — supply a payload to check it against an approval without posting
   anything it did not cover. Driving it end to end needs a live post, which this item does
   not make.
-- **No CI check that the runbook's commands still exist.** A doc naming a subcommand that
-  gets renamed is exactly the failure this item's own research found in its brief. A test
-  asserting every command in `docs/RUNBOOK.md` parses would catch it, and it is a testing
-  item rather than a clause here — not filed, because `M1-611` will change this document's
-  command list anyway and the check is worth writing once, after.
+- **No CI check that the runbook's commands and exit codes still hold.** A doc naming a
+  subcommand that gets renamed is exactly the failure this item's own research found in its
+  brief. This was originally deferred unfiled, on the argument that `M1-611` will change the
+  command list anyway and the check is worth writing once, after. **Round 1 overturned that**
+  — it found two false behavioural claims, one of them already contradicted by a merged test —
+  so it is filed as **T-908**.
 - **README staleness.** `README.md` still says "There is no submission path in this
   codebase yet; `submission.enabled: false` and `dry_run: true` are enforced by config
   validation" and its Status section describes Milestone 0. Both predate M2-704. Left alone:
@@ -297,3 +302,73 @@ is the CI check deferred above.
 - `docs/backlog/backlog.csv` rewritten with `csv.writer(lineterminator="\r\n")`; zero lines
   without CRLF, and the diff is six rows rather than the whole file.
 - `scripts/gate.sh` — see the commit that records it; trust the last printed line (T-905).
+
+## Round 1 — CHANGES REQUESTED on `3c0f4ef`, two blocking findings, both closed
+
+Both findings were the same defect class and it is the one this item is *most* exposed to:
+a factual claim about the code that the code does not support. Both were reproduced by
+execution against the reviewed commit before anything was written, and both were **real** —
+no rebuttals this round.
+
+### Finding 1 — the documented `submit` exit codes were false (closed)
+
+The runbook said **`submit` exits `0` for every outcome it managed to record**. The return
+is:
+
+```python
+return EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED
+```
+
+(`cli.py:735`). So `submission_uncertain` exits `4`, `submission_failed` exits `4`, and — the
+case the runbook did not have at all — **a post confirmed by refetch whose artifact could not
+be written also exits `4`**, with the forecast live on Metaculus.
+
+**The suite already held this fact.** `tests/unit/test_cli_submit.py`'s
+`test_an_uncertain_submission_tells_the_operator_the_next_command` asserts `EXIT_REFUSED` for
+`submission_uncertain`, and has since M2-704. The document contradicted a merged test and
+nothing could fail on it. That is the whole argument for **T-908**, filed below.
+
+Fixed in three places (`docs/RUNBOOK.md` exit-code section, its "never do this" entry, and
+this file's own earlier paragraph, which had it backwards too). The exit-code table's `4` row
+also claimed "and wrote nothing", which is false for the artifact case, and now says so. The
+operator instruction did not change and is stronger for being right: read `result:` and
+`artifact:`, never the exit code.
+
+### Finding 2 — L2's read-only confirmation step did not inspect anything (closed)
+
+L2 said to run `submit` with submission disabled to list standing key reservations.
+`_print_standing_reservations` is called from exactly one place, the handler for a
+`post_approved_forecast` failure (`cli.py:713`); with submission disabled,
+`require_live_submission_enabled` refuses several steps earlier (`cli.py:688-691`) and returns.
+The listing is never reached.
+
+The rewritten L2 says plainly that **no read-only command lists what is standing**, and
+describes what the two near-misses actually do: `release-key` is read-only *only* in the
+multiple-reservation case, where it refuses and lists them (`cli.py:856-869`); with exactly
+one standing it prints the reservation and then releases it, which is the action and not an
+inspection. The gap is named and assigned to **M1-611**, whose acceptance criteria already
+cover standing reservations.
+
+This one is worth recording as a lesson about the shape of the mistake: the runbook
+elsewhere is careful to say that the disabled-`submit` inspection is *a coincidence of gate
+ordering rather than an interface*, and that care is what made the claim plausible. It was
+still wrong — the coincidence prints the record, the hash and the payload digest, and stops
+before the reservations. Being right about why a path is fragile is not the same as being
+right about what it prints.
+
+### Non-blocking observation — filed as **T-908**
+
+The reviewer asked for offline checks of the runbook's documented commands and exit-code
+claims against the CLI. This item's notes had deferred exactly that check on the argument
+that `M1-611` will change the command list anyway. Round 1 is the counter-argument and it is
+a good one: two false claims in one review, one of them contradicted by a test already in the
+suite. Filed as **T-908** with both instances named, depending on `D-1001` and `M1-611`.
+
+### Standing risk, restated after this round
+
+The pre-PR master merge was checked by re-grepping every *message string* the symptom index
+quotes, and that check passed and was reported in the round-1 request. Both findings were
+about **behaviour** — an exit code and a call site — which no amount of string grepping
+reaches. The verification I ran matched the claim I was worried about rather than the claims
+most likely to be wrong. `T-908` is the durable form of the fix; the transferable lesson is
+that a document's riskiest statements are the ones about *control flow*, not about text.

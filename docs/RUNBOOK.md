@@ -57,22 +57,36 @@ from the source that prints them, and each of those blocks is labelled.
 | `0` | OK |
 | `2` | Configuration invalid (or a bad command line — argparse also uses `2`) |
 | `3` | A required environment variable or file is missing |
-| `4` | Refused: the command understood you and declined, and wrote nothing |
+| `4` | Refused, or did not fully succeed. Usually nothing was written — but see `submit` below |
 
 Defined at `env_verify.py:26-28` (`EXIT_OK`, `EXIT_CONFIG_INVALID`, `EXIT_ENV_MISSING`) and
 `cli.py:31` (`EXIT_REFUSED`).
 
-**Exit code `4` is the good outcome when something is wrong.** Every refusal in this
-program runs *before* the action it refuses, with one named exception (a live post the
-ledger then refused to record — see [L4](#l4--a-live-post-the-ledger-refused-to-record)).
+**Exit code `4` is the good outcome when something is wrong.** Almost every refusal in this
+program runs *before* the action it refuses, so `4` normally means nothing happened. Two
+commands break that and both are documented below: `submit`, and a live post the ledger then
+refused to record ([L4](#l4--a-live-post-the-ledger-refused-to-record)).
 
-**`submit` exits `0` for every outcome it managed to record — including
-`submission_uncertain` and `submission_failed`.** Exit `0` from `submit` means "the attempt
-completed and was written down", *not* "the forecast is on the platform". Read the
-`result:` line, never the exit code. Do not script a retry on `submit`'s exit status.
+**`submit` exits `0` only when the post was confirmed by refetch *and* its artifact was
+written. Every other outcome exits `4` — including outcomes it recorded.** The return is
+literally `EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else
+EXIT_REFUSED` (`cli.py:735`). So all three of these exit `4`:
 
-`run` is the opposite case: it exits `4` if any question failed or if it forecast none, so a
-partial batch is a non-zero exit even though the records that succeeded were written.
+| What happened | Recorded? | Exit |
+|---|---|---|
+| Confirmed by refetch, artifact written | yes | `0` |
+| `submission_uncertain` — the refetch found nothing newer | yes | `4` |
+| `submission_failed` | yes | `4` |
+| Confirmed by refetch, **artifact not written** ([L5](#l5--the-artifact-was-not-written)) | yes, and the post landed | `4` |
+
+**So `4` from `submit` does not mean nothing happened, and it does not mean no post was
+made.** Read the `result:` and `artifact:` lines; never infer the outcome from the exit
+code, and never script a retry on it. The last row is the one that catches people: the
+forecast is live on Metaculus and the command exited non-zero.
+
+`run` is a milder version of the same thing: it exits `4` if any question failed or if it
+forecast none, so a partial batch is a non-zero exit even though the records that succeeded
+were written.
 
 ---
 
@@ -990,9 +1004,24 @@ function of tournament, question, forecast version and payload hash — the same
 the same key forever — so without a way out, one interrupted command would block that
 forecast permanently.
 
-**Confirm (read-only).** Run `submit` with submission disabled, or `release-key` when the
-record holds more than one reservation; both list what is standing rather than guessing. If
-exactly one is standing, `release-key` prints it before acting.
+**Confirm.** There is **no read-only command that lists what is standing.** Two things come
+close and neither is one:
+
+- **`release-key` with no `--reservation-id`, when the record holds more than one
+  reservation**, refuses and lists all of them with their sequence numbers and timestamps
+  (`cli.py:856-869`). That *is* read-only — but only in the multiple-reservation case, which
+  is the one you are least likely to be in.
+- **`release-key` when exactly one is standing prints it and then releases it.** It is not an
+  inspection; it is the action, with the identifier echoed on the way past.
+
+`submit` does not help here either: its reservation listing runs only in the handler for a
+`post_approved_forecast` failure (`cli.py:713`), so running `submit` with submission disabled
+refuses at the configuration gate several steps earlier (`cli.py:688-691`) and prints no
+reservation information at all.
+
+So in the single-reservation case, confirming and acting are the same command, and what makes
+that safe is the assertion `--released-by` requires of you — read the next paragraph before
+running it. A read-only inspection is a real gap and it is owned by **M1-611**.
 
 **Recovery — and read the next paragraph first.**
 
@@ -1140,8 +1169,9 @@ not evidence of what was sent.
 
 ## Never do this
 
-1. **Never trust `submit`'s exit code.** It exits `0` for an uncertain and for a failed
-   submission alike. The `result:` line is the answer.
+1. **Never trust `submit`'s exit code.** It exits `4` for an uncertain outcome, for a
+   failed one, *and* for a confirmed post whose artifact could not be written — where the
+   forecast is live on the platform. The `result:` and `artifact:` lines are the answer.
 2. **Never retry a submission whose outcome is uncertain.** Resolve it with
    `verify-submission` first. The program blocks this, and the block is the feature.
 3. **Never edit the ledger with `sqlite3`.** Not to close a state, not to fix a status, not
