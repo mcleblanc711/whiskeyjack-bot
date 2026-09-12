@@ -430,11 +430,15 @@ false.
 
 ### Two things the reviewer corrected beyond the exit code
 
-- **`submission_uncertain` is three conditions, not one.** The section had glossed it as "the
-  refetch found nothing newer", which is only `absent`. `mismatched` ("something newer is
-  there and it is not what this attempt sent") and `unreadable` ("the platform could not be
-  read") also record uncertainty, are not interchangeable, and `mismatched` is the one with no
-  operator-closable path today — now cross-referenced to `L3` and **M2-714**.
+- **Uncertainty spans all four `refetch=` outcomes, not one.** The section had glossed it as
+  "the refetch found nothing newer", which is only `absent`. `confirmed` (with
+  `success=False`), `mismatched` ("something newer is there and it is not what this attempt
+  sent") and `unreadable` ("the platform could not be read") all record uncertainty too, are
+  not interchangeable, and `mismatched` is the one with no operator-closable path today — now
+  cross-referenced to `L3` and **M2-714**. `absent` is also the one outcome that is not
+  *always* uncertainty: paired with `success=False` it is the program's only outright failure.
+  *(Round 3 flagged this bullet's original "three conditions" as inconsistent with the
+  four-row table it describes. Corrected here, non-blocking.)*
 - **`0` does not mean there is nothing left to do.** An uncertain-but-confirmed attempt exits
   `0` and still owes a `verify-submission`. The "never do this" entry now states the
   misalignment in both directions rather than one.
@@ -455,3 +459,49 @@ survived a reading of the exact return expression they were about. What would ha
 either, and what neither round-1 nor round-2 verification did until asked, is enumerating the
 input grid and reading the output — ten lines of Python, run above. `T-908` is where that
 belongs permanently; its criteria now name this case.
+
+## Round 3 — APPROVE on `db6d1df`, zero blocking findings
+
+All three prior blockers confirmed closed. The reviewer independently reproduced the
+`(success, refetch_outcome, artifact)` grid against the current source and confirmed every
+cell, verified `RefetchOutcome` has exactly four members, checked the resolvability column
+including the `unreadable`-is-retryable / `mismatched`-is-not asymmetry, resolved all five
+added line citations, and confirmed `T-908` exists exactly once with criteria covering the
+timeout/confirmation case. It explicitly declined to file a new row.
+
+Two minor non-blocking inconsistencies were named and **both are fixed in this commit**,
+because both were wrong rather than merely terse:
+
+- This file's round-2 bullet said `submission_uncertain` is "three conditions" while the table
+  it describes has four rows. It now says all four `refetch=` outcomes, and names the
+  `(success=False, confirmed)` case explicitly.
+- The exit-code section's closing paragraph said `absent`, `mismatched` and `unreadable` "all
+  record `submission_uncertain`". False for `absent`: with `success=False` it is the
+  program's one outright failure (`submission_failed`), which is row six of the table three
+  paragraphs above it. The paragraph now says so and points at the uncertain-timeout
+  breakdown.
+
+The reviewer also made one observation about the evidence itself that is worth preserving,
+because it is right and is not something a better request could have fixed: reproducing the
+grid "corroborates the results; it cannot establish when the author originally executed
+them." A claim that a check was run before a fix is not verifiable from the artifact. `T-908`
+is what converts it into something that fails on its own.
+
+### What the three rounds cost, and what actually caused it
+
+Three rounds, three blockers, zero rebuttals — every finding was real and reproduced here
+before it was fixed. All three were in the same six lines: `_run_submit`'s tail and
+`_print_standing_reservations`.
+
+The cause is not that the document was careless about that region; it is the most
+heavily-annotated part of the runbook. It is that **the region's behaviour is carved up along
+axes that do not match what an operator sees.** `result:` is the lifecycle event;
+the exit code is `(refetch_outcome == "confirmed", artifact_path is not None)`; the two
+partitions cross. Any documentation keyed on the visible axis is wrong somewhere, and reading
+the return expression confirms each row in isolation while saying nothing about the index.
+Round 1 fixed a row. Round 2 fixed another row. Only re-keying the table closed it.
+
+For `docs/LESSONS.md`: **a table is a claim about a partition. Getting the partition wrong
+cannot be fixed by adding rows, and per-row verification cannot detect it.** The check that
+does is enumerating the input grid and reading the output — ten lines of Python. That is now
+`T-908`'s job.

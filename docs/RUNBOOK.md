@@ -112,11 +112,15 @@ does not mean there is nothing left to do.** Read the `result:` and `artifact:` 
 instruction line beneath them. Never infer the outcome from the exit code, and never script a
 retry on it.
 
-Uncertainty is also not one condition. `absent` is "the refetch looked and found nothing
-newer"; `mismatched` is "something newer is there and it is not what this attempt sent"; and
-`unreadable` is "the platform could not be read at all". All three record
-`submission_uncertain`, they are not interchangeable, and `mismatched` is the one with no
-operator-closable path today ([L3](#l3--a-mismatched-refetch), and **M2-714**).
+Uncertainty is also not one condition, and the `refetch=` half of the `result:` line is
+which one. `confirmed` is "the forecast is on the platform"; `absent` is "the refetch looked
+and found nothing newer"; `mismatched` is "something newer is there and it is not what this
+attempt sent"; `unreadable` is "the platform could not be read at all". They are not
+interchangeable. **Note that `absent` is the one that is not always uncertainty** — paired
+with `success=False` it is the single combination the program calls an outright failure (row
+six above). `mismatched` is the one with no operator-closable path today
+([L3](#l3--a-mismatched-refetch), and **M2-714**); the full breakdown is at
+[the uncertain timeout](#what-it-means).
 
 `run` is a milder version of the same thing: it exits `4` if any question failed or if it
 forecast none, so a partial batch is a non-zero exit even though the records that succeeded
