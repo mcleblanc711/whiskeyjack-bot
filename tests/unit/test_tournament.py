@@ -1614,6 +1614,9 @@ def test_a_retired_activation_pages_naming_what_moved_and_nothing_else(
         *bindings(retired_config).values(),
     ):
         assert digest_value[:12] not in rendered
+    # The configured project ID is a config value as much as a digest is, and round 1
+    # found it interpolated into the title. Both the stored and the moved-to project.
+    assert "32977" not in rendered and "32978" not in rendered
     assert "DEBUG" not in rendered and "INFO" not in rendered
 
 
@@ -1639,6 +1642,47 @@ def test_a_disabled_or_out_of_window_activation_does_not_page(
     )
     with pytest.raises(ActivationInactive):
         poll(case)
+    assert pushes.sent == []
+
+
+@pytest.mark.parametrize("resting", ["disabled", "out of window"])
+def test_a_resting_activation_stays_silent_even_when_a_binding_also_moved(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, resting: str
+) -> None:
+    """Round 1, finding 1: `require_activation` evaluated retirement before the resting
+    states, so a paused profile paged as soon as a binding moved.
+
+    The resting-state test above holds the bindings *intact*, which means it never reaches
+    the retirement branch at all and could not have seen the ordering. Here the profile is
+    resting *and* retired -- what an ordinary config deployment against a paused profile
+    looks like -- and it must stay silent. Restoring the old order fails this.
+    """
+    from whiskeyjack_bot.tournament_state import ActivationInactive
+
+    conn, config, platform, news, model = case
+    if resting == "disabled":
+        disable(conn)
+    else:
+        enable(
+            conn,
+            config,
+            account_id=42,
+            project_id=32977,
+            starts=utcnow() + timedelta(hours=1),
+            ends=utcnow() + timedelta(hours=2),
+        )
+    retired_config = _retire(case, "configuration")
+    pushes = _recording(monkeypatch, retired_config, tmp_path / "notify-state")
+    with pytest.raises(ActivationInactive):
+        run_once(
+            conn,
+            retired_config,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=object(),
+            forecaster=model,
+        )
     assert pushes.sent == []
 
 
@@ -1707,9 +1751,14 @@ def test_two_retired_profiles_each_page(
                 web_client=object(),
                 forecaster=model,
             )
-    titles = [push["title"] for push in pushes.matching("activation retired")]
-    assert len(titles) == 2
-    assert any("32977" in title for title in titles) and any("32978" in title for title in titles)
+    pages = pushes.matching("activation retired")
+    # Two pages and not one: the subject is the profile's project, so the second profile
+    # is not throttled away by the first, and the third poll -- profile `one` again -- is.
+    # Since round 1 the title is static, so the *count* is the whole witness here: a
+    # constant subject at the call site collapses these three polls to a single page.
+    assert len(pages) == 2
+    rendered = "".join(push["title"] + push["body"] for push in pages)
+    assert "32977" not in rendered and "32978" not in rendered
 
 
 def test_a_failed_push_leaves_the_refusal_exactly_as_it_was(

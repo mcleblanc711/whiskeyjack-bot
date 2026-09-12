@@ -256,13 +256,17 @@ def require_activation(
         raise ActivationInactive("tournament activation is disabled")
     data = active[-1]
     instant = now or utcnow()
-    changed = retired_bindings(data, config, account_id=account_id, project_id=project_id)
-    if changed:
-        raise ActivationRetired(changed)
+    # M1-334: the resting states are checked *before* retirement, not after. Disabled and
+    # out-of-window are deliberate operator states, and they stay silent even when a binding
+    # has also moved -- otherwise deploying a config change against a disabled profile, or
+    # any poll after a window closes, would page about a profile nobody is running.
     if events(conn, "disabled", data["activation_id"]) or not datetime.fromisoformat(
         data["starts"]
     ) <= instant < datetime.fromisoformat(data["ends"]):
         raise ActivationInactive("tournament activation is disabled or outside its validity window")
+    changed = retired_bindings(data, config, account_id=account_id, project_id=project_id)
+    if changed:
+        raise ActivationRetired(changed)
     return data
 
 

@@ -441,10 +441,15 @@ def run_once(
             # the ordinary `emit` and degrades exactly as every other alert does: a failed
             # or slow push is absorbed and never changes the refusal below. Names the moved
             # bindings, never a digest or a config value.
+            #
+            # The project is the throttle *subject* only, which keeps one page per profile:
+            # `Notifier` sha256s the subject into a stamp filename and never transmits it.
+            # The title is static because it is transmitted, and the project ID is a config
+            # value (round 1). Which profile it was is in the operator log and the refusal.
             emit(
                 "activation_retired",
                 subject=project,
-                title=f"whiskeyjack: project {project} activation retired",
+                title="whiskeyjack: activation retired",
                 body=(
                     f"Every poll is refusing: {', '.join(retired.changed)} changed since "
                     "the activation was enabled. Nothing is bought or posted until "
