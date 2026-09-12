@@ -219,7 +219,7 @@ def _verify_prompt(config: AppConfig, report: VerificationReport) -> None:
     )
     report.checks_passed.append(
         f"forecast.prompt_path declares probabilities between {loaded.bounds.low!r} and "
-        f"{loaded.bounds.high!r}, which contains the configured bounds"
+        f"{loaded.bounds.high!r}, which is the configured pair"
     )
 
 

@@ -10447,3 +10447,155 @@ collision handling). The same validation limitation as M1-334 applies — `codex
 --sandbox read-only` has no writable temp directory, so six filesystem-dependent tests could not
 run there and the request's gate report stood in for them.
 
+
+## M1-407 — Cross-check the configured probability bounds against the prompt
+
+Acceptance: *a config whose probability bounds fall outside the range the loaded prompt
+declares is reported at startup and by `verify-env`, before any billable call; the check
+reads the prompt that config actually names rather than a copy of its numbers.*
+
+The branch was built 2026-09-04 and never reviewed; it was merged forward 75 commits and
+then corrected. What follows separates what the WIP had from what this session changed,
+because the two are different arguments.
+
+### Delivered
+
+- `src/whiskeyjack_bot/prompt.py` — `_PROBABILITY_LINE_RE`, `_DECLARED_RANGE_RE`,
+  `DeclaredProbabilityBounds`, `parse_declared_probability_bounds`,
+  `_require_bound_pair`, `probability_bounds_disagreement`,
+  `probability_bounds_violation`, a `bounds` field on `LoadedPrompt`, and a
+  `load_prompt` that takes the configured pair as required keyword arguments.
+- `env_verify.py` — `_verify_prompt_version` → `_verify_prompt`, one added
+  `checks_passed` line.
+- `forecast/generate.py` — the containment repeat at the spending site.
+- `tournament.py` — the live worker's `load_prompt` call, wired and given a
+  `PromptError` → `TournamentError` translation it never had.
+- `tests/property/test_prompt_properties.py` — new, 12 properties; the package had no
+  property coverage of `prompt.py` at all.
+- `tests/unit/test_prompt.py` (+25), `test_env_verify.py` (+2),
+  `test_forecast_generate.py` (+3), `test_forecast_binary.py` (a rewritten docstring).
+
+`prompts/` is untouched. `git diff --stat -- prompts/` is empty on this branch, so
+`RELEASED_PROMPT_SHA256`, `forecast_records.prompt_sha256` and the live activation's
+`prompt_sha256` are all unaffected, and no `AppConfig` field was added, so `config_sha256`
+is unchanged too. Both are checkable claims and both were checked.
+
+### Decision — equality at the load boundary, and why the criterion had to be read against itself
+
+The WIP implemented **containment**: report only when the configured pair escapes the range
+the prompt declares. That is the criterion's literal wording, and it is very nearly a dead
+check. `ForecastConfig` clamps both bounds with
+`ge=PROBABILITY_BOUND_FLOOR, le=PROBABILITY_BOUND_CEILING` (`config.py:255-270`), and both
+committed prompts declare exactly those endpoints — so for **any** config loaded from YAML
+against **either** shipped prompt, escaping the declared range is unreachable. The check
+could only ever fire for an operator-supplied prompt narrower than the spec envelope.
+
+Meanwhile the row's own description names the opposite case as the motivating failure:
+*"narrowing the config silently asks for a probability the prompt never permits and pays for
+a repair turn to discover it."* Containment passes a narrowed config in silence, and a
+narrowed config is the only disagreement a YAML-loaded config can express at all.
+
+So the criterion and the description point in opposite directions, which puts the item under
+CLAUDE.md's stricter-reading rule. **Equality covers both.** Owner confirmed.
+
+Exact float equality rather than a tolerance: both sides are IEEE doubles, `float("0.001")`
+parsed out of the prompt is bit-identical to the `0.001` pydantic yields from YAML, and a
+tolerance would be a third unowned number in a row about there being too many already.
+
+### Decision — two relations, at two sites, and why that is not the drift it resembles
+
+Equality is **not** applied at `forecast.generate`'s repeat. The two sites ask different
+questions and each gets the relation that matches it:
+
+| site | question | relation |
+| --- | --- | --- |
+| `load_prompt` → both pipelines, `tournament.py`, `verify-env` | do config and the prompt **agree**? | equality |
+| `generate_forecast` preflight | does config demand what the prompt **forbids**? | containment |
+
+Equality at the load boundary means no production path can reach generation with a
+disagreeing pair, so the generation check never fires in production — it exists for the
+`AppConfig`-assembled-some-other-way case, the same reason that function already repeats
+`min < max`, the spec envelope, `allowed_tries` and the prompt version. What that case can
+still produce and *cost* something is a config demanding a probability the model was never
+invited to give; a merely *narrower* config wastes nothing at the call.
+
+`test_equality_is_strictly_stronger_than_containment` pins the ordering the split rests on:
+every pair the load boundary accepts, the spending site accepts. If it ever inverted,
+`verify-env` would green-light a configuration that cannot make a single call.
+
+There is a concrete cost to getting this wrong, and it is what settled it:
+`test_a_probability_the_prompt_allows_is_refused_by_a_narrower_config`
+(`tests/unit/test_forecast_generate.py`) is M1-403's integration proof that
+`forecast.min_probability` has a consumer, and its premise is *a probability the prompt
+allows and config does not*. Under equality at the generation site that premise is
+inexpressible and the test dies. It survives unchanged.
+
+### Deviation — the guard moved after a mutation pass, not before
+
+The WIP validated the configured pair inside `load_prompt` only. The mutation pass showed
+that deleting that guard left the entire property suite green: equality is total, so a `str`
+bound simply compares unequal and a `NaN` simply compares unequal, and `load_prompt` refuses
+either way. But `probability_bounds_violation` is public and `forecast/generate.py` calls it
+directly, and its `<=` comparisons escaped a bare `TypeError` —
+`'<=' not supported between instances of 'float' and 'str'`, reproduced at the REPL, not
+inferred. That is the "every malformed shape arrives as the module's own error type" rule,
+which this project has taken as a review finding twice.
+
+The guard is now `_require_bound_pair`, one owner, called by `load_prompt` (ahead of the
+read, so the refusal does not depend on filesystem state) and by both relations.
+`test_both_relations_raise_only_prompt_error` is the property that had been missing, and it
+exists because a surviving mutant pointed at a real hole rather than at a weak assertion.
+
+### Rejected — folding this into `config.PROBABILITY_BOUND_FLOOR`/`CEILING`, and why not
+
+Three different questions are asked about this pair and only two of them are M1-407's. The
+third — whether the configured pair is inside the `0.001`–`0.999` the *submission path*
+accepts — reads the spec constants, and giving that envelope a single executable owner is
+**M1-513**, which is open and untouched here. `submission_live.py` still declares its own
+`_MIN_PROBABILITY`/`_MAX_PROBABILITY`; this branch neither uses nor changes them. Collapsing
+M1-407's prompt-derived range into those constants would defeat the criterion's second
+clause outright: the check must read the prompt config names, not a copy of its numbers.
+
+### Deferred (do not read the absence as an omission)
+
+- **M1-513** — one owner for the spec envelope. Above.
+- **M1-509** — whether a *configured* bound may be rendered in a diagnostic at all is
+  unsettled, so neither relation's message names one. The *declared* pair is rendered,
+  because it has matched a strict decimal pattern and been range-checked and because a
+  message without it names no fixable defect — the same argument as the M1-401 path
+  carve-out, one category weaker.
+- **`prompts/forecaster-tournament.md` is not consolidated with `prompts/forecaster.md`.**
+  They are byte-identical through line 164 apart from the H1 version. Both are pinned by a
+  test here; merging them is not this row.
+
+### Standing risk — the parser is coupled to one prose spelling
+
+`parse_declared_probability_bounds` reads `between <low> and <high>` on lines containing
+`probabilit`. Both committed prompts satisfy it three times over, and a disagreement among
+those three is refused rather than resolved. But **a prompt reworded past that spelling stops
+loading**, and because the check is bound into `load_prompt` that is a hard startup failure,
+not a warning.
+
+Three things bound the risk and none of them removes it. The failure is at startup and
+before any spend, never mid-run. `tests/unit/test_forecast_binary.py`'s canary pins the
+committed prompt's literal string, so a reword that breaks the parser fails CI rather than
+only an operator's machine. And the refusal says what spelling is required. The residual
+case is an operator's *own* prompt file, and for that the only honest statement is that they
+must write the sentence the shipped prompt writes. Reported, not guessed: a prompt declaring
+no range is refused rather than defaulted to the shipped pair, because "reported at startup"
+is not satisfied by assuming which range an unstated prompt meant.
+
+Not verifiable offline: nothing here calls a provider, and the claim that a disagreement
+would otherwise have cost a repair turn rests on `forecast/binary.py`'s repair path, which is
+exercised by `tests/unit/test_forecast_generate.py` against a fake model, not against a
+billed one.
+
+### Mutation pass
+
+Twelve mutants of `prompt.py`, each run against `tests/property/test_prompt_properties.py`
+plus `tests/unit/test_prompt.py` and `tests/unit/test_env_verify.py`; all twelve died. Two
+of them — dropping the range half of `_require_bound_pair`, and relaxing its exact-type check
+to `isinstance` — survive the property suite alone and are killed only by the unit
+parametrization. That is the two-part-guard shape: neutering one half of
+`type(value) is not float or not 0.0 <= value <= 1.0` leaves the other half refusing, so the
+mutant reads exactly like a vacuous test until the refusals are counted.

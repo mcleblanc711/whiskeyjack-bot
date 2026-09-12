@@ -250,6 +250,34 @@ def parse_declared_probability_bounds(text: str) -> DeclaredProbabilityBounds:
     return DeclaredProbabilityBounds(low=low, high=high)
 
 
+def _require_bound_pair(min_probability: float, max_probability: float) -> None:
+    """Refuse a configured pair that is not two floats in ``[0, 1]`` (M1-407).
+
+    One owner for the guard, called by ``load_prompt`` and by both relations below.
+    It was first written only inside ``load_prompt``, and a mutation pass showed why
+    that is not enough: ``probability_bounds_violation`` is public, ``generate.py``
+    calls it directly, and its ``<=`` comparisons escape this module as a raw
+    ``TypeError`` on a ``str`` -- the "every malformed shape arrives as the module's
+    own error type" rule, which this project has taken as a review finding twice.
+
+    Exact type, not ``isinstance``: ``bool`` subclasses ``int`` and ``True`` would
+    otherwise read as a bound of 1.0 an operator never wrote. The range check is
+    what catches ``NaN``, which no comparison rejects -- every ``<=`` against it is
+    False, so an unguarded containment test reports a problem for the right answer
+    and an unguarded equality test reports one for the wrong reason.
+
+    ``ForecastConfig`` already guarantees two floats in range; this is the
+    AppConfig-assembled-some-other-way case ``forecast.generate`` repeats its own
+    preflights for.
+    """
+    for value in (min_probability, max_probability):
+        if type(value) is not float or not 0.0 <= value <= 1.0:
+            raise PromptError(
+                "forecast.min_probability and forecast.max_probability must be floats "
+                "between 0 and 1 (values withheld)"
+            )
+
+
 def probability_bounds_disagreement(
     bounds: DeclaredProbabilityBounds, *, min_probability: float, max_probability: float
 ) -> str | None:
@@ -290,6 +318,7 @@ def probability_bounds_disagreement(
     values are file-derived but strictly matched and range-checked, while whether
     a *configured* value may be rendered at all is open (M1-509).
     """
+    _require_bound_pair(min_probability, max_probability)
     if (bounds.low, bounds.high) == (min_probability, max_probability):
         return None
     return (
@@ -326,6 +355,7 @@ def probability_bounds_violation(
     waste a call, and generation is not one of the startup surfaces the
     criterion names.
     """
+    _require_bound_pair(min_probability, max_probability)
     if bounds.low <= min_probability and max_probability <= bounds.high:
         return None
     return (
@@ -357,18 +387,11 @@ def load_prompt(
     site. A caller that has no configuration to check against does not exist;
     one that appears must say what it is checking.
     """
-    # Exact-type, and range-checked before use: these two reach ``<=``
-    # comparisons below, so a str or a NaN would escape this module as a raw
-    # TypeError or pass a comparison silently -- and every malformed shape must
-    # arrive as this module's own error type. ``ForecastConfig`` already
-    # guarantees floats; this is the AppConfig-assembled-some-other-way case
-    # ``forecast.generate`` repeats its own preflights for.
-    for value in (min_probability, max_probability):
-        if type(value) is not float or not 0.0 <= value <= 1.0:
-            raise PromptError(
-                "forecast.min_probability and forecast.max_probability must be floats "
-                "between 0 and 1 (values withheld)"
-            )
+    # Ahead of the read, not merely ahead of the comparison: a caller that passes a
+    # malformed pair gets the same refusal whether or not the prompt file happens to
+    # exist, so the diagnostic does not depend on filesystem state. The rule itself
+    # lives in ``_require_bound_pair``, which both relations call too.
+    _require_bound_pair(min_probability, max_probability)
 
     # fullmatch, not match: ``match`` + ``$`` accepts a terminal newline, so
     # "1.1.0\n" passed this guard and then reached the mismatch diagnostic below

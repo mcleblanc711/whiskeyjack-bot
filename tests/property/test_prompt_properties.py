@@ -177,6 +177,29 @@ def test_the_parse_raises_only_prompt_error(text: str) -> None:
     _parse(text)
 
 
+@given(declared=DECLARED, minimum=BOUND_VALUES, maximum=BOUND_VALUES)
+@settings(max_examples=120)
+def test_both_relations_raise_only_prompt_error(
+    declared: DeclaredProbabilityBounds, minimum: Any, maximum: Any
+) -> None:
+    """Both are public, and ``forecast.generate`` calls ``..._violation`` directly, so
+    neither may escape this module as something a caller does not handle.
+
+    This property is here because a mutation pass found the gap rather than the other way
+    round: with the bound guard reachable only from ``load_prompt``, deleting it left the
+    whole suite green -- equality is total, so a ``str`` bound simply compared unequal --
+    while ``probability_bounds_violation("x")`` raised a bare ``TypeError`` out of its
+    ``<=``. A ``NaN`` is the same shape without the crash: no comparison rejects it.
+    """
+    for relation in (probability_bounds_disagreement, probability_bounds_violation):
+        try:
+            relation(declared, min_probability=minimum, max_probability=maximum)
+        except PromptError:
+            continue
+        except Exception as exc:  # pragma: no cover - only reached on a real defect
+            pytest.fail(f"{relation.__name__} raised {type(exc).__name__}, not PromptError")
+
+
 @given(text=ANY_TEXT, minimum=BOUND_VALUES, maximum=BOUND_VALUES)
 @settings(max_examples=120)
 def test_load_prompt_raises_only_prompt_error(

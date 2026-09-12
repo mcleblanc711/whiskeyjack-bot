@@ -53,6 +53,13 @@ to the registry, and neither is a habit you can form by reflex.
 | M1-333 | feat/m1-333-payload-property-filtering | whiskeyjack-m1-333 | no | none | 2026-09-11 |
 | M1-334 | feat/m1-334-retired-activation-alert | whiskeyjack-m1-334 | no | none | 2026-09-11 |
 | M1-613 | feat/m1-613-central-journal-redaction | whiskeyjack-m1-613 | no | none | 2026-09-11 |
+*(Merged and left in place, per the rule below: **D-1001** (PR #95, round-3 approve,
+2026-09-12 — the operator runbook, `docs/RUNBOOK.md`, 21 failure states; it filed six rows,
+of which **M2-713** is Critical: a live post the ledger refused to record, with no
+reconciliation command). Its row stays in the table above as the landed-claim evidence
+`scripts/tracks.py` needs. The M1-407 handoff said to delete that row; the rule below says
+not to, and the rule wins — this note is the record of the merge, in addition to the row.*
+
 *(Merged and left in place, per the rule below: **M1-326** (PR #79, round-2 approve,
 2026-09-09) and **M1-327** (PR #80, round-2 approve, 2026-09-09 — it demoted the
 named-resolution-source gate from fatal to a recorded `evidence_gap` row and scoped M1-326's
