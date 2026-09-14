@@ -10889,3 +10889,14 @@ only by `name` — and is proven to fail against the pre-fix `id`-only key befor
 The reviewer's second non-blocking observation — that `M1-340` is correctly scoped and this
 branch does not worsen `submission_policy.py`'s pre-existing order-sensitivity gap — required no
 action, and is recorded here as confirmation rather than a new finding.
+
+**Process note, recorded because a verification step has to be verified too**
+(`docs/LESSONS.md` lesson 8): the fix was written, its docstring corrected, and the new property
+added -- then mutation-tested with `git checkout -- src/whiskeyjack_bot/questions/canonical.py`
+to restore after reverting to the pre-fix key, **before any of it had been committed**. The
+`checkout` restored the last *committed* state, which was the pre-fix `id`-only key, silently
+discarding the uncommitted fix -- exactly the trap this item's own brief and lesson 8 both name.
+Caught immediately by re-checking the file rather than trusting the mutation result, the fix was
+reapplied, committed, and the mutation test repeated correctly the second time (fail on the
+pre-fix mutant, `git checkout` after, still fixed). No test result in this document was produced
+under the broken sequence.
