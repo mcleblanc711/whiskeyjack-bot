@@ -20,11 +20,9 @@ def require_research_artifacts(
     from whiskeyjack_bot.research.packet import packet_sha256
     from whiskeyjack_bot.research.quality import usable_packet, without_future
     from whiskeyjack_bot.research.artifacts import ArtifactError, read_raw_responses
-    from whiskeyjack_bot.tournament_state import digest, events, StorageFailure
+    from whiskeyjack_bot.tournament_state import events, question_fingerprint, StorageFailure
 
-    checkpoints = events(
-        conn, "research_checkpoint", digest(record.question.model_dump(mode="json"))
-    )
+    checkpoints = events(conn, "research_checkpoint", question_fingerprint(record.question))
     candidates = [tuple(c["run_ids"]) for c in checkpoints]
     if not candidates:
         runs = {record.retrieval_run_id}

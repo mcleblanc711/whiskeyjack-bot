@@ -32,9 +32,9 @@ from whiskeyjack_bot.tournament_state import (
     TournamentError,
     append,
     check_storage,
-    digest,
     disable,
     enable,
+    question_fingerprint,
     require_activation,
     spending,
     utcnow,
@@ -1090,7 +1090,7 @@ def test_pre_activation_attempts_do_not_retire_a_question(case: Any) -> None:
     question = normalize_questions(
         platform.get_all_open_questions_from_tournament(32977)
     ).questions[0]
-    fingerprint = digest(question.model_dump(mode="json"))
+    fingerprint = question_fingerprint(question)
     for _ in range(MAX_TRANSIENT_ATTEMPTS + 2):
         append(
             conn,

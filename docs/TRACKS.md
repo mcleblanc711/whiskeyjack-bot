@@ -53,6 +53,7 @@ to the registry, and neither is a habit you can form by reflex.
 | M1-333 | feat/m1-333-payload-property-filtering | whiskeyjack-m1-333 | no | none | 2026-09-11 |
 | M1-334 | feat/m1-334-retired-activation-alert | whiskeyjack-m1-334 | no | none | 2026-09-11 |
 | M1-613 | feat/m1-613-central-journal-redaction | whiskeyjack-m1-613 | no | none | 2026-09-11 |
+| M1-331 | feat/m1-331-fingerprint-unordered-lists | whiskeyjack-m1-331 | no | none | 2026-09-14 |
 *(Merged and left in place, per the rule below: **D-1001** (PR #95, round-3 approve,
 2026-09-12 — the operator runbook, `docs/RUNBOOK.md`, 21 failure states; it filed six rows,
 of which **M2-713** is Critical: a live post the ledger refused to record, with no

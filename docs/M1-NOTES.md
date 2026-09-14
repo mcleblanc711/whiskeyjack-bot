@@ -10700,3 +10700,268 @@ This is the D-1001 pattern (`docs/D-1001-NOTES.md`), which also closed at round 
 finding a false factual claim. Two consecutive items now say the same thing: on this project
 the reviewer finds claims, not defects, and the cheapest round is the one where the request
 says only things that are true.
+
+## M1-331 — Prove the question fingerprint is stable under unordered API metadata
+
+M1-326's gate (`tournament.py:554`) skips a question whose recorded research verdict is
+deterministic, keyed on `digest(question.model_dump(mode="json"))`. `tournament_state.canonical()`
+does `json.dumps(..., sort_keys=True)`, which sorts dict **keys** only — it never reorders list
+**elements**. `pipeline_live.py:395` (writing `research_checkpoint`) and `submission_policy.py:26`
+(reading it back) used the identical expression. If Metaculus ever returns a list-valued field in
+a different order between two polls of the same question, the digest changes, the block silently
+stops matching, and the question is re-researched at full price — M1-326's own failure,
+reintroduced through the key rather than the gate. Both M1-326 review rounds flagged this as an
+unproven risk. MiniBench is between batches as of 2026-09-14 (every question closed), which is
+why this lands now rather than against a live poll.
+
+### Decision — every list-valued field is enumerated field by field, not by category
+
+Read `questions/model.py` in full rather than trusting the item brief's own "where to look" list.
+Exactly four list-valued fields are reachable from `CanonicalQuestion`'s persisted form, and no
+others exist on the base or any of the four discriminated leaf types (`SourceCategory`, the only
+nested model, carries no list field of its own):
+
+- `tournament_slugs: list[str]` (base, model.py:99)
+- `source_categories: list[SourceCategory]` (base, model.py:108)
+- `question_ids_of_group: list[int] | None` (base, model.py:112)
+- `options: list[str]`, multiple-choice only (model.py:133)
+
+All four are populated by straight passthrough of the pinned SDK's own field
+(`normalize.py:239,246-249,251,295`; `question_ids_of_group`'s ultimate origin is
+`groups.py:82`'s `[q["id"] for q in question_jsons]`, in raw API-payload order) — none is sorted
+anywhere in this codebase, and nothing in `model.py` carries a `field_serializer`,
+`model_serializer`, or list-touching `field_validator` that would reorder one before
+`model_dump(mode="json")`. None is stable by construction.
+
+### Decision — all four fields are classified unordered, on their own evidence
+
+- **`tournament_slugs` / `source_categories`** — already treated as order-insensitive platform
+  metadata elsewhere in this codebase: `submission_policy.py:151`'s live-question equality check
+  (a separate mechanism, not this item's digest) excludes both by name, calling them "platform
+  metadata unrelated to the resolution contract." `SourceCategory.id` is documented on the model
+  as "the only stable identifier," which is why it is the sort key rather than `name`/`slug`.
+- **`question_ids_of_group`** — group-sibling membership, built in raw API-payload order and never
+  indexed against anything downstream (only non-emptiness is checked, `normalize.py:110`).
+- **`options`** — **corrects a premise in this item's own brief**, which guessed option order is
+  "almost certainly ordered: bound to the probability vector." Verified false by reading the
+  code: `forecast/multiple_choice.py`'s own docstring states order is irrelevant to every rule
+  there — "the response may answer in any order" — backed by a named test,
+  `test_the_option_verdict_does_not_depend_on_the_order_answered`. Both the forecast response
+  (`OptionProbability.option`) and the submission payload (`submission_payload.py:225-249`, a
+  `dict[str, float]` keyed by label) match an option by **label**, never by position.
+
+No field is classified ordered.
+
+### Decision — one shared helper, all three production call sites converge on it
+
+`questions/canonical.py` (new module, mirroring the one existing precedent for this shape,
+`research/canonical.py`): `canonicalize_for_fingerprint(question) -> dict[str, Any]` takes
+`question.model_dump(mode="json")` and returns a new dict with the four fields above sorted
+(`source_categories` by `id`), every other field untouched. `tournament_state.py` adds
+`question_fingerprint(question) -> str = digest(canonicalize_for_fingerprint(question))`. All
+three production call sites (`tournament.py:554`, `pipeline_live.py:395`,
+`submission_policy.py:26`) and the one test that had hand-computed the raw formula
+(`test_tournament.py:1093`) now call `question_fingerprint` instead of
+`digest(question.model_dump(mode="json"))` directly — confirmed complete by grepping the whole
+tree for that expression before and after. No circular import: `questions/model.py` and
+`questions/canonical.py` depend only on `config.py`, which `tournament_state.py` already
+depends on, so the new dependency introduces no back-edge (verified by importing the module).
+
+Canonicalizing ahead of the hash, not on the stored question, is what keeps replayability
+intact: the persisted `CanonicalQuestion` — what a forecast record and a research packet were
+actually generated from — is untouched by this change. Only the bytes handed to `digest` differ.
+
+### Verification — permutation invariance and material-edit sensitivity, mutation-tested per field
+
+`tests/property/test_questions_canonical_properties.py`, 11 properties. Per the item's own
+warning that a strategy unable to permute a list makes half one vacuous, every permutation draw
+uses `st.permutations` plus `assume(permuted != original)`, so every accepted example is a
+genuine reorder — the same guard CLAUDE.md itself specifies for this item.
+
+**Proven to fail pre-fix**, before any test was trusted: reverting `question_fingerprint` to the
+raw `digest(question.model_dump(mode="json"))` formula (`git checkout` after) makes exactly the
+four permutation-invariance properties fail, and only those four — the other seven (material-edit
+and fixed-point properties) pass on both the fixed and the pre-fix formula, which is correct:
+they assert content-sensitivity and already-canonical-input stability, neither of which
+canonicalization was meant to change.
+
+**Mutation-tested, one property per field, committed tree, `__pycache__` cleared between runs**
+(`docs/LESSONS.md` lesson 8):
+
+| mutant | caught by |
+| --- | --- |
+| skip sorting `tournament_slugs` | `test_fingerprint_is_invariant_under_tournament_slugs_reordering`, only |
+| skip sorting `source_categories` | `test_fingerprint_is_invariant_under_source_categories_reordering`, only |
+| skip sorting `question_ids_of_group` | `test_fingerprint_is_invariant_under_question_ids_of_group_reordering`, only |
+| skip sorting `options` | `test_fingerprint_is_invariant_under_options_reordering`, only |
+| drop `tournament_slugs` from the digest input | `test_fingerprint_changes_when_tournament_slugs_membership_changes` + the sorted-binary fixed-point test |
+| drop `source_categories` from the digest input | `test_fingerprint_changes_when_source_categories_membership_changes` + the sorted-binary fixed-point test |
+| drop `question_ids_of_group` from the digest input | `test_fingerprint_changes_when_question_ids_of_group_membership_changes` + the sorted-binary fixed-point test |
+| drop `options` from the digest input | `test_fingerprint_changes_when_options_membership_changes` + both fixed-point tests |
+
+Eight mutants, eight caught, each by exactly the property (or properties) named for it — the
+first four prove per-field teeth for permutation invariance (a targeted mutation to one field
+never trips another field's property), the second four prove the material-edit half is not
+vacuously true (canonicalization cannot silently drop a field from the hash without a test
+noticing).
+
+### Decision — live-ledger quantification, not hand-waved
+
+Read `data/whiskeyjack_bot.sqlite3` and `data/cup/ledger.sqlite3` (both `mode=ro`, per
+`config/tournament.yaml`'s configured paths) rather than assuming canonicalization is free.
+
+Of 29 distinct recorded questions across both ledgers (24 main, 5 cup), **4 have a
+`source_categories` and/or `options` order that is not already canonical**: main ledger 43331
+(`options`) and 43332 (`source_categories`); cup ledger 45572 (`options`) and 45655
+(`source_categories`). `tournament_slugs` and `question_ids_of_group` happen to already be
+sorted in all 29 recorded questions. No question in either ledger has more than one
+`forecast_version`, so this data cannot show the same question's list order changing *between*
+two polls directly — it shows only that the SDK's returned order is not itself always
+ascending, which is the reachable precondition for the failure this item fixes.
+
+Cross-referencing `tournament_events`: none of the 4 affected questions has a recorded
+`question_blocked` event, so switching formulas invalidates no stored block. In the cup ledger,
+45572 and 45655 **do** have a `research_checkpoint` recorded under the pre-canonicalization
+fingerprint (joined via `run_ids` through `research_runs.question_id`) — canonicalizing orphans
+that specific checkpoint, meaning a future poll of that exact question would pay for one
+avoidable re-research rather than reusing a cache hit. Not a correctness risk (worst case is
+one extra retrieval, not a wrong forecast), and moot in practice: the Cup was withdrawn
+2026-09-10, its timer is disabled, and no question in either ledger is open to poll today. No
+`question_blocked` event in either ledger is invalidated by this change, in the main ledger or
+the cup ledger.
+
+### Rejected — sorting the persisted `CanonicalQuestion`, and why not
+
+Would fix the same instability at the model layer, but breaks the standing rule that a forecast
+record and a research packet must replay from exactly what was stored — sorting the stored
+question would make the persisted form disagree with what the pipeline actually saw and acted
+on. Canonicalization stays confined to the digest input, never the stored object.
+
+### Rejected — widening `submission_policy.py:151`'s equality check on this branch
+
+That check (`before_post`, comparing `current.model_dump(exclude=ignored) != record.question
+.model_dump(exclude=ignored)`) has the identical order-sensitivity gap for `question_ids_of_group`
+and `options` — neither is in its `ignored` set the way `tournament_slugs`/`source_categories`
+are. It is a **different mechanism** from the `digest`/fingerprint this item scopes to (a raw
+dict comparison, not a hash) and a **pre-existing** condition this branch does not touch, depend
+on, or increase the reachability of — so it is out of scope under the review contract's own
+scope test, not absorbed here.
+
+### Deferred (do not read the absence as an omission)
+
+- **M1-340** — filed for the `submission_policy.py:151` gap above (first free `M1-3xx` id,
+  checked against `backlog.csv` before filing).
+
+### Standing risk — not verifiable offline
+
+The live-ledger numbers above are evidence about what already happened in production (4 of 29
+recorded questions had non-canonical list order; the SDK's returned order is not always
+ascending), and the property suite proves the *code's* canonicalization behaves correctly under
+every reordering and every material edit it can construct. Neither proves the *future* ordering
+behavior of the Metaculus API — sockets are blocked offline, so nothing here was run against a
+live poll, and no test can show that two real, consecutive polls of the same open question will
+ever actually differ in list order. The fix is defensive against a failure mode that is plausible
+and previously flagged twice, not one this branch has directly reproduced end to end against a
+live API response.
+
+### Round 1 — APPROVE, one real (non-blocking) finding, fixed rather than deferred
+
+Reviewed `153d504`. Zero blocking findings. Unlike the last three items' rounds, this one was
+not all false claims about correct code: the reviewer found a genuine gap in the canonicalization
+itself, correctly classified non-blocking (pre-existing schema behavior, not introduced by this
+branch), but worth fixing immediately rather than filing, because it directly contradicts this
+item's own permutation-invariance claim rather than being an unrelated adjacent issue.
+
+`CanonicalQuestion`'s schema does not require `SourceCategory.id` to be unique within
+`source_categories` — nothing in `model.py` enforces it. Sorting on `id` alone therefore relies
+on Python's `sorted()` being a **stable** sort: two categories sharing one `id` keep their
+*original relative order* after sorting, so a permutation that swaps their positions produces a
+different sorted list, and therefore a different fingerprint. Reproduced before writing the fix:
+`SourceCategory(id=1, name="Economics")` and `SourceCategory(id=1, name="Politics")` in one order
+versus the other hashed to two different fingerprints.
+
+Fixed by sorting on `(id, name, slug)` — a tuple unique whenever the categories differ in any
+field, with the remaining case (two categories agreeing on all three) genuinely irrelevant to
+order. New property test (`test_fingerprint_is_invariant_under_source_categories_reordering_
+with_duplicate_ids`) drives the exact tie case — multiple categories sharing `id=1`, distinguished
+only by `name` — and is proven to fail against the pre-fix `id`-only key before the fix commit.
+
+The reviewer's second non-blocking observation — that `M1-340` is correctly scoped and this
+branch does not worsen `submission_policy.py`'s pre-existing order-sensitivity gap — required no
+action, and is recorded here as confirmation rather than a new finding.
+
+**Process note, recorded because a verification step has to be verified too**
+(`docs/LESSONS.md` lesson 8): the fix was written, its docstring corrected, and the new property
+added -- then mutation-tested with `git checkout -- src/whiskeyjack_bot/questions/canonical.py`
+to restore after reverting to the pre-fix key, **before any of it had been committed**. The
+`checkout` restored the last *committed* state, which was the pre-fix `id`-only key, silently
+discarding the uncommitted fix -- exactly the trap this item's own brief and lesson 8 both name.
+Caught immediately by re-checking the file rather than trusting the mutation result, the fix was
+reapplied, committed, and the mutation test repeated correctly the second time (fail on the
+pre-fix mutant, `git checkout` after, still fixed). No test result in this document was produced
+under the broken sequence.
+
+### Round 2 — CHANGES REQUESTED on `938376e`, one more real tie in the same key
+
+Round 1's fix was not the end of the tie-break story. The reviewer reproduced a second gap in
+`(id, name, slug)`: `SourceCategory.slug` is `str | None`, and the round-1 key folded it with
+`slug or ""` — which maps both `None` and `""` to the same key component. Two categories sharing
+`id`/`name` but differing only in `slug is None` vs `slug == ""` therefore still tied under
+`sorted`'s stability and still permuted the fingerprint, for exactly the same mechanical reason
+as round 1's finding, one field over. Reproduced with the reviewer's own case before writing the
+fix: `SourceCategory(id=1, name="A", slug=None)` and `SourceCategory(id=1, name="A", slug="")` in
+swapped order hashed to `c2be6000…` and `2447042…` respectively — matching the reviewer's own
+reported prefixes exactly.
+
+Fixed by carrying `slug is None` as its own key component ahead of `slug or ""`:
+`(id, name, slug is None, slug or "")`. `None` and `""` no longer collapse — the boolean
+component differs between them — while the key stays a total order over `(id, name, slug)`
+triples for every other case, including round 1's duplicate-`id` case (re-verified after this
+fix, still holds). New test (not hypothesis-driven — the reviewer's own two-value case is the
+entire input space that distinguishes the fixed key from the broken one) is proven to fail
+against the `slug or ""`-only key before the fix; mutation-tested with the fix already
+**committed** this time, so the `git checkout` restore after the mutant run correctly returned
+the fixed code rather than repeating round 1's near-miss.
+
+**Two rounds, two real findings on the same three-line sort key.** Worth naming plainly rather
+than only recording the fixes: a tiebreak is a total-order claim, and this item's own property
+suite drew both duplicate-`id` and null/empty-`slug` inputs *after* being told to by a reviewer,
+not before. The generative strategies in `tests/property/test_questions_canonical_properties.py`
+never generated a duplicate `id` or a `None`/`""` pair on their own — both were narrow, specific
+constructions added in response to an execution-backed finding, the same shape `docs/LESSONS.md`
+lesson 5 already names ("3 of M1-303's 10 new properties passed against broken code") one level
+up: **a property can be well-formed and still not generate the input class that breaks the
+function it tests.** The fix here was to widen the test by hand once the gap was known, not to
+claim the original `st.lists(..., unique=True)` strategies should have found it — they draw
+distinct **ids**, so a duplicate-id or duplicate-`(id,name)` tie was never in their range by
+construction.
+
+**Closed generatively before round 3**, rather than waiting for a third hand-written reaction:
+`test_fingerprint_is_invariant_under_source_categories_reordering_with_forced_collisions` draws
+`SourceCategory` from a deliberately tiny alphabet (3 ids x 2 names x 4 slugs, lists of 2-5), so
+Hypothesis hits partial- and full-field collisions by pigeonhole on most draws rather than a human
+having to name the tie case. Verified before committing that it independently catches **both**
+prior mutants: reverted to round 1's `id`-only key, it fails; reverted to round 2's `slug or ""`
+-only key, it fails and **shrinks to the exact minimal case the reviewer found**
+(`id=1, name="A", slug=None` vs `slug=""`). One property, both findings, without being told
+either one — the generative fix the "closed generatively" note above pointed at.
+
+### Round 3 — APPROVE on `e484fa5`, zero blocking findings
+
+Prior findings closed: the reviewer confirmed the injective `(id, name, slug is None, slug or
+"")` key, the null-vs-empty regression, and the forced-collision property together cover the
+tie case rounds 1 and 2 found. No new finding. Both risk areas from the request (the key's
+injectivity, and the unordered-field classification plus recorded-verdict-identity claim) were
+verified safe.
+
+**Three rounds, two real findings, zero false ones.** Both findings were genuine defects the
+reviewer reproduced by execution, not restated claims about correct code the way the last three
+items' early rounds were — the tiebreak shape (a hashing key over a multi-field record with an
+optional field) is exactly the kind of function this project's own lessons say needs a fuzzer
+finding the tie case, not a human enumerating them. Worth recording plainly: the generative
+alphabet-collision property added between rounds 2 and 3 is what should have existed from round
+1, and the reason it did not is the same one `docs/LESSONS.md` lesson 5 already names one level
+up — a property with a well-formed shape (`st.permutations` plus a non-vacuity guard) is not the
+same claim as a property whose *strategy* can reach the input class the claim is actually about.
+`CATEGORY_IDS = st.lists(..., unique=True)` was never going to draw a duplicate id no matter how
+many examples it ran.

@@ -24,6 +24,8 @@ from whiskeyjack_bot.artifacts import write_new_file
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.lifecycle import LifecycleError, transaction
 from whiskeyjack_bot.notify import budget_level_crossed, emit
+from whiskeyjack_bot.questions.canonical import canonicalize_for_fingerprint
+from whiskeyjack_bot.questions.model import CanonicalQuestion
 
 
 class TournamentError(Exception):
@@ -75,6 +77,19 @@ def canonical(data: Any) -> str:
 
 def digest(data: Any) -> str:
     return hashlib.sha256(canonical(data).encode()).hexdigest()
+
+
+def question_fingerprint(question: CanonicalQuestion) -> str:
+    """The one formula every M1-326/M1-327 call site must share (M1-331).
+
+    ``digest(question.model_dump(mode="json"))`` alone is unstable: ``canonical`` sorts dict
+    keys, never list elements, and every list-valued field on ``CanonicalQuestion`` is an
+    unordered membership set carried through from the SDK with no sort applied -- see
+    ``questions/canonical.py`` for which fields and why. Canonicalizing here, once, is what
+    keeps a question whose API-returned list order merely changed between polls from silently
+    missing its own recorded verdict and being re-researched at full price.
+    """
+    return digest(canonicalize_for_fingerprint(question))
 
 
 def bindings(config: AppConfig) -> dict[str, str]:

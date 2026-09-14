@@ -390,9 +390,9 @@ def _research(
     exactly the identity failure ``list_retrieval_run_ids`` was separated from ``load_packet``
     to prevent.
     """
-    from whiskeyjack_bot.tournament_state import append, digest, events
+    from whiskeyjack_bot.tournament_state import append, events, question_fingerprint
 
-    fingerprint = digest(question.model_dump(mode="json"))
+    fingerprint = question_fingerprint(question)
     saved = events(conn, "research_checkpoint", fingerprint)
     if not refresh and saved and saved[-1].get("retrieval_policy") == "launch-2":
         checkpoint = saved[-1]
