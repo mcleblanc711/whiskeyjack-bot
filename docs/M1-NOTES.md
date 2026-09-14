@@ -10935,3 +10935,13 @@ function it tests.** The fix here was to widen the test by hand once the gap was
 claim the original `st.lists(..., unique=True)` strategies should have found it — they draw
 distinct **ids**, so a duplicate-id or duplicate-`(id,name)` tie was never in their range by
 construction.
+
+**Closed generatively before round 3**, rather than waiting for a third hand-written reaction:
+`test_fingerprint_is_invariant_under_source_categories_reordering_with_forced_collisions` draws
+`SourceCategory` from a deliberately tiny alphabet (3 ids x 2 names x 4 slugs, lists of 2-5), so
+Hypothesis hits partial- and full-field collisions by pigeonhole on most draws rather than a human
+having to name the tie case. Verified before committing that it independently catches **both**
+prior mutants: reverted to round 1's `id`-only key, it fails; reverted to round 2's `slug or ""`
+-only key, it fails and **shrinks to the exact minimal case the reviewer found**
+(`id=1, name="A", slug=None` vs `slug=""`). One property, both findings, without being told
+either one — the generative fix the "closed generatively" note above pointed at.
