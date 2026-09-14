@@ -229,6 +229,17 @@ Nothing needed one, and any field retires the live activation.
   account's own tournament forecasts are "your own data" under the same page, but that is a
   reading, not legal advice; flagged for the owner.
 
+### Found during the gate run — filed, not fixed here
+
+- **T-909.** `test_a_retired_profile_polled_every_five_minutes_pages_once` fails whenever it
+  starts between 23:00 and 00:00 UTC: its injected clock starts at the real `utcnow()`, and
+  `notify.py`'s tumbling day window pages again across midnight. Reproduced on master
+  `a0e9faf` at 23:36 UTC; untouched by this branch.
+- **Two seeds this branch had missed**, found by the gate rather than by the earlier
+  unit/integration/acceptance run, because that run did not include `tests/property`:
+  `test_lifecycle_properties.py`'s detail-row seed wrote a bare resolution row, and
+  `test_sdk_contract.py` needed a `THIRD_PARTY_REACHES` row for the fetcher's `api_json` read.
+
 ### Mutation testing
 
 Committed before mutating (lessons 5 and 8); `__pycache__` cleared before every mutant;
