@@ -117,6 +117,20 @@ def test_fingerprint_is_invariant_under_source_categories_reordering_with_duplic
     assert question_fingerprint(original) == question_fingerprint(reordered)
 
 
+def test_fingerprint_is_invariant_under_source_categories_with_null_vs_empty_slug() -> None:
+    """Round-2 review finding: ``slug: str | None`` lets both ``None`` and ``""`` reach the
+    sort key. Folding them to one string with ``slug or ""`` alone re-creates the exact tie
+    the round-1 fix closed, one field over -- two categories sharing ``id``/``name`` but
+    differing only in ``slug is None`` vs ``slug == ""`` would still permute the fingerprint.
+    Not hypothesis-driven: the reviewer's own two-value reproduction is the whole input space
+    that distinguishes the fixed key from the broken one."""
+    none_slug = SourceCategory(id=1, name="A", slug=None)
+    empty_slug = SourceCategory(id=1, name="A", slug="")
+    original = _binary(source_categories=[none_slug, empty_slug])
+    reordered = _binary(source_categories=[empty_slug, none_slug])
+    assert question_fingerprint(original) == question_fingerprint(reordered)
+
+
 @given(GROUP_IDS, st.data())
 def test_fingerprint_is_invariant_under_question_ids_of_group_reordering(
     group_ids: list[int], data: st.DataObject
