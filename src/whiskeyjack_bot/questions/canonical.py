@@ -17,8 +17,13 @@ Every field here is classified **unordered**, each on its own evidence rather th
 * ``tournament_slugs`` / ``source_categories`` -- already treated as order-insensitive platform
   metadata elsewhere in this codebase: ``submission_policy.py``'s live-question equality check
   excludes both, calling them "platform metadata unrelated to the resolution contract."
-  ``SourceCategory.id`` is documented on the model as "the only stable identifier," which is why
-  it is the sort key rather than ``name``/``slug``.
+  ``source_categories`` sorts on ``(id, name, slug)``, not ``id`` alone (M1-331 round-1 review):
+  ``CanonicalQuestion``'s schema does not require ``id`` to be unique within the list, and a bare
+  ``id`` key makes ``sorted``'s stability leak the *original* relative order back in for any tie
+  -- two categories sharing one ``id`` but differing in ``name``/``slug`` would then still permute
+  the fingerprint. The full tuple is unique whenever the categories themselves differ in any
+  field; two categories that agree on all three are equal in every sense this function cares
+  about, so which position either ends up in is genuinely irrelevant.
 * ``question_ids_of_group`` -- built in raw API-payload order (``questions/groups.py``) and never
   indexed against anything; it names group-sibling membership, not a sequence.
 * ``options`` -- verified by reading ``forecast/multiple_choice.py``, whose own docstring states
@@ -52,7 +57,8 @@ def canonicalize_for_fingerprint(question: CanonicalQuestion) -> dict[str, Any]:
     data = question.model_dump(mode="json")
     data["tournament_slugs"] = sorted(data["tournament_slugs"])
     data["source_categories"] = sorted(
-        data["source_categories"], key=lambda category: category["id"]
+        data["source_categories"],
+        key=lambda category: (category["id"], category["name"], category["slug"] or ""),
     )
     question_ids_of_group = data.get("question_ids_of_group")
     if question_ids_of_group is not None:

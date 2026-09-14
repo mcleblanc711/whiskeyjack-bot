@@ -92,6 +92,31 @@ def test_fingerprint_is_invariant_under_source_categories_reordering(
     assert question_fingerprint(original) == question_fingerprint(reordered)
 
 
+DUPLICATE_ID_NAMES = st.lists(
+    st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=1, max_size=8),
+    min_size=2,
+    max_size=5,
+    unique=True,
+)
+
+
+@given(DUPLICATE_ID_NAMES, st.data())
+def test_fingerprint_is_invariant_under_source_categories_reordering_with_duplicate_ids(
+    names: list[str], data: st.DataObject
+) -> None:
+    """Round-1 review finding: the schema does not require ``id`` to be unique within
+    ``source_categories``, and a bare-``id`` sort key lets ``sorted``'s stability leak the
+    original relative order back in for any tie -- two categories sharing one ``id`` but
+    differing in ``name``/``slug`` would then still permute the fingerprint. This is exactly
+    that tie case: every category shares ``id=1``, distinguished only by ``name``."""
+    categories = [SourceCategory(id=1, name=name) for name in names]
+    permuted = list(data.draw(st.permutations(categories)))
+    assume(permuted != categories)
+    original = _binary(source_categories=categories)
+    reordered = _binary(source_categories=permuted)
+    assert question_fingerprint(original) == question_fingerprint(reordered)
+
+
 @given(GROUP_IDS, st.data())
 def test_fingerprint_is_invariant_under_question_ids_of_group_reordering(
     group_ids: list[int], data: st.DataObject
