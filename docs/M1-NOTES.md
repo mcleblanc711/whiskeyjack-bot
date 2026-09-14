@@ -10945,3 +10945,23 @@ prior mutants: reverted to round 1's `id`-only key, it fails; reverted to round 
 -only key, it fails and **shrinks to the exact minimal case the reviewer found**
 (`id=1, name="A", slug=None` vs `slug=""`). One property, both findings, without being told
 either one — the generative fix the "closed generatively" note above pointed at.
+
+### Round 3 — APPROVE on `e484fa5`, zero blocking findings
+
+Prior findings closed: the reviewer confirmed the injective `(id, name, slug is None, slug or
+"")` key, the null-vs-empty regression, and the forced-collision property together cover the
+tie case rounds 1 and 2 found. No new finding. Both risk areas from the request (the key's
+injectivity, and the unordered-field classification plus recorded-verdict-identity claim) were
+verified safe.
+
+**Three rounds, two real findings, zero false ones.** Both findings were genuine defects the
+reviewer reproduced by execution, not restated claims about correct code the way the last three
+items' early rounds were — the tiebreak shape (a hashing key over a multi-field record with an
+optional field) is exactly the kind of function this project's own lessons say needs a fuzzer
+finding the tie case, not a human enumerating them. Worth recording plainly: the generative
+alphabet-collision property added between rounds 2 and 3 is what should have existed from round
+1, and the reason it did not is the same one `docs/LESSONS.md` lesson 5 already names one level
+up — a property with a well-formed shape (`st.permutations` plus a non-vacuity guard) is not the
+same claim as a property whose *strategy* can reach the input class the claim is actually about.
+`CATEGORY_IDS = st.lists(..., unique=True)` was never going to draw a duplicate id no matter how
+many examples it ran.
