@@ -131,6 +131,31 @@ def test_fingerprint_is_invariant_under_source_categories_with_null_vs_empty_slu
     assert question_fingerprint(original) == question_fingerprint(reordered)
 
 
+# Deliberately tiny alphabets: with 2-5 categories drawn from 3 ids x 2 names x 4 slugs (24
+# combinations), Hypothesis hits partial- and full-field collisions by pigeonhole on most
+# draws, rather than relying on a human to spot each tie case by hand. Round 1 and round 2's
+# findings were both narrow, hand-written reactions to a specific reviewer reproduction --
+# this property is the generative fix: it would have reached both without being told either
+# one, because it does not depend on ids (or names, or slugs) being unique.
+COLLIDING_CATEGORIES = st.builds(
+    SourceCategory,
+    id=st.integers(min_value=1, max_value=3),
+    name=st.sampled_from(["A", "B"]),
+    slug=st.one_of(st.none(), st.just(""), st.just("x"), st.just("y")),
+)
+
+
+@given(st.lists(COLLIDING_CATEGORIES, min_size=2, max_size=5), st.data())
+def test_fingerprint_is_invariant_under_source_categories_reordering_with_forced_collisions(
+    categories: list[SourceCategory], data: st.DataObject
+) -> None:
+    permuted = list(data.draw(st.permutations(categories)))
+    assume(permuted != categories)
+    original = _binary(source_categories=categories)
+    reordered = _binary(source_categories=permuted)
+    assert question_fingerprint(original) == question_fingerprint(reordered)
+
+
 @given(GROUP_IDS, st.data())
 def test_fingerprint_is_invariant_under_question_ids_of_group_reordering(
     group_ids: list[int], data: st.DataObject
