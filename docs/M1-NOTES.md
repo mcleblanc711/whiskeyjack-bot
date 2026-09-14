@@ -10900,3 +10900,38 @@ Caught immediately by re-checking the file rather than trusting the mutation res
 reapplied, committed, and the mutation test repeated correctly the second time (fail on the
 pre-fix mutant, `git checkout` after, still fixed). No test result in this document was produced
 under the broken sequence.
+
+### Round 2 — CHANGES REQUESTED on `938376e`, one more real tie in the same key
+
+Round 1's fix was not the end of the tie-break story. The reviewer reproduced a second gap in
+`(id, name, slug)`: `SourceCategory.slug` is `str | None`, and the round-1 key folded it with
+`slug or ""` — which maps both `None` and `""` to the same key component. Two categories sharing
+`id`/`name` but differing only in `slug is None` vs `slug == ""` therefore still tied under
+`sorted`'s stability and still permuted the fingerprint, for exactly the same mechanical reason
+as round 1's finding, one field over. Reproduced with the reviewer's own case before writing the
+fix: `SourceCategory(id=1, name="A", slug=None)` and `SourceCategory(id=1, name="A", slug="")` in
+swapped order hashed to `c2be6000…` and `2447042…` respectively — matching the reviewer's own
+reported prefixes exactly.
+
+Fixed by carrying `slug is None` as its own key component ahead of `slug or ""`:
+`(id, name, slug is None, slug or "")`. `None` and `""` no longer collapse — the boolean
+component differs between them — while the key stays a total order over `(id, name, slug)`
+triples for every other case, including round 1's duplicate-`id` case (re-verified after this
+fix, still holds). New test (not hypothesis-driven — the reviewer's own two-value case is the
+entire input space that distinguishes the fixed key from the broken one) is proven to fail
+against the `slug or ""`-only key before the fix; mutation-tested with the fix already
+**committed** this time, so the `git checkout` restore after the mutant run correctly returned
+the fixed code rather than repeating round 1's near-miss.
+
+**Two rounds, two real findings on the same three-line sort key.** Worth naming plainly rather
+than only recording the fixes: a tiebreak is a total-order claim, and this item's own property
+suite drew both duplicate-`id` and null/empty-`slug` inputs *after* being told to by a reviewer,
+not before. The generative strategies in `tests/property/test_questions_canonical_properties.py`
+never generated a duplicate `id` or a `None`/`""` pair on their own — both were narrow, specific
+constructions added in response to an execution-backed finding, the same shape `docs/LESSONS.md`
+lesson 5 already names ("3 of M1-303's 10 new properties passed against broken code") one level
+up: **a property can be well-formed and still not generate the input class that breaks the
+function it tests.** The fix here was to widen the test by hand once the gap was known, not to
+claim the original `st.lists(..., unique=True)` strategies should have found it — they draw
+distinct **ids**, so a duplicate-id or duplicate-`(id,name)` tie was never in their range by
+construction.
