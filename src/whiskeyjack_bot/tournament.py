@@ -45,8 +45,8 @@ from whiskeyjack_bot.tournament_state import (
     TournamentError,
     append,
     budget_context,
-    digest,
     events,
+    question_fingerprint,
     require_activation,
     require_spending_clear,
     spending,
@@ -551,7 +551,7 @@ def run_once(
             # re-derived by re-buying the research it was derived from, every 30 minutes,
             # for as long as the question stayed open.
             scope = f"{project}:{question.question_id}"
-            fingerprint = digest(question.model_dump(mode="json"))
+            fingerprint = question_fingerprint(question)
             # Both counters are scoped to the CURRENT activation as well as to the
             # fingerprint (M1-327). The fingerprint alone was not enough, and the gap was
             # not hypothetical: `question_started` predates M1-326 -- it was written by
