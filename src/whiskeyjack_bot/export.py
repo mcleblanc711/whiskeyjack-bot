@@ -303,6 +303,14 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("ambiguous", "INTEGER"),
             Column("source_response", "TEXT"),
             Column("ingested_at_utc", "TEXT"),
+            # 014_resolution_ingestion.sql
+            Column("post_id", "INTEGER"),
+            Column("question_type", "TEXT"),
+            Column("resolution_kind", "TEXT"),
+            Column("scorable", "INTEGER"),
+            Column("observation_sha256", "TEXT"),
+            Column("source_response_sha256", "TEXT"),
+            Column("observed_at_utc", "TEXT"),
         ),
     ),
     TableSpec(

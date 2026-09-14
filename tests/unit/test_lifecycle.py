@@ -57,6 +57,8 @@ from whiskeyjack_bot.lifecycle import (
     unresolved_uncertainties,
 )
 
+from resolution_rows import insert_resolution_row
+
 
 def _checksum_of(name: str) -> str:
     """The checksum ledger.py records, computed the same way it computes it."""
@@ -151,15 +153,26 @@ def _seed_draft(
     # whatever the test meant to exercise. Callers that are *about* the attempt_id -- two
     # records claiming one attempt, a failure and a success sharing one -- pass it
     # explicitly.
+    # post_id is derived from question_id for the reason attempt_id is derived from
+    # record_id: 014 requires a resolution row to name the record's own post, and a shared
+    # constant would make every seeded record claim the same one.
     conn.execute(
         "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
-        "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+        "record_id, question_id, post_id, tournament_id, forecast_version, question_type, "
+        "status, model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', 'abc', "
-        "'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (record_id, question_id, TS, TS, forecast_sha256, attempt_id or f"att-{record_id}"),
+        "VALUES (?, ?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', 'v1', "
+        "'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
+        (
+            record_id,
+            question_id,
+            question_id + 1000,
+            TS,
+            TS,
+            forecast_sha256,
+            attempt_id or f"att-{record_id}",
+        ),
     )
     return record_id
 
@@ -1013,15 +1026,9 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
         )
     # The resolution has to name the record's own question: a resolution row may point at
     # the right record and still resolve a different question, which is the second thing
-    # the link probes check.
-    question_id = conn.execute(
-        "SELECT question_id FROM forecast_records WHERE record_id = ?", (record_id,)
-    ).fetchone()[0]
-    resolution = conn.execute(
-        "INSERT INTO resolution_events (question_id, forecast_record_id, ingested_at_utc) "
-        "VALUES (?, ?, ?)",
-        (question_id, record_id, TS),
-    ).lastrowid
+    # the link probes check. Since 014 it must also be a well-formed observation, and a
+    # scorable one, because the score row below needs a scorable resolution behind it.
+    resolution = insert_resolution_row(conn, record_id)
     score = conn.execute(
         "INSERT INTO score_events (forecast_record_id, metric, value, implementation_version, "
         "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
@@ -2953,11 +2960,14 @@ def test_a_resolution_for_another_question_cannot_resolve_this_forecast(
     """
     conn, record_id = draft
     detail = _walk_to(conn, record_id, "submitted")
-    foreign = conn.execute(
-        "INSERT INTO resolution_events (question_id, forecast_record_id, ingested_at_utc) "
-        "VALUES (99999, ?, ?)",
-        (record_id, TS),
-    ).lastrowid
+    # Since 014 the row itself is refused: a resolution must name its record's own question.
+    with pytest.raises(sqlite3.IntegrityError, match="must match the forecast record"):
+        insert_resolution_row(conn, record_id, question_id=99999)
+    # 003's link probe is the older of the two layers and must still hold on its own, so it
+    # is reached here with 014's row guard removed from this test's ledger. Removing it is
+    # the only way to store the row the probe exists to refuse.
+    conn.execute("DROP TRIGGER resolution_events_validate_on_insert")
+    foreign = insert_resolution_row(conn, record_id, question_id=99999)
     with pytest.raises(sqlite3.IntegrityError, match="resolves a different question"):
         _insert_event(
             conn,
@@ -4067,7 +4077,11 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # `submission_key_for_approved_record`'s "this approval predates the payload binding"
     # case rather than an approval that authorizes everything. So a v2 ledger reaching 11
     # is the same statement again.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 13
+    #
+    # 014 (M4-801) adds NULLable columns to `resolution_events` and new insert triggers, and
+    # its upgrade precondition refuses only a ledger already holding resolution or score
+    # rows. A v2 ledger holds neither, so reaching 14 is the same statement once more.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 14
 
     conn = connect(db)
     try:
@@ -4665,7 +4679,7 @@ def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
     """
     db = tmp_path / "ledger.sqlite3"
     attempt_id = _seed_v8_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 13
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 14
 
     conn = connect(db)
     try:
@@ -4762,7 +4776,7 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # COALESCE, and 010 only creates tables, so neither probes the rows a v5 ledger holds.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 13
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 14
 
 
 @pytest.mark.parametrize(
@@ -4867,7 +4881,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 13
+    assert initialize_ledger(db) == 14
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"

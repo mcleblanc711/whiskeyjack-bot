@@ -226,20 +226,25 @@ def test_research_document_triple_uniqueness_enforced(tmp_path: Path) -> None:
 
 
 def test_foreign_key_enforced(tmp_path: Path) -> None:
-    # score_events rather than approval_events: migration 003 puts a BEFORE INSERT
-    # trigger on approval_events that rejects a row naming an unknown record before the
-    # foreign key is ever reached, so an approval row can no longer reach the FK and
-    # would leave this test asserting a different mechanism than its name claims.
+    # research_documents, and matched on SQLite's own message. This test has moved twice for
+    # the same reason: a BEFORE INSERT trigger that refuses an unknown parent fires before
+    # the foreign key is reached. 003 did it to approval_events, and M4-801's 014 did it to
+    # score_events (a score needs a scorable resolution, which an unknown record cannot
+    # have) -- where the old unmatched `raises` kept passing on the trigger's refusal and
+    # asserted a different mechanism than its name. research_documents' insert trigger
+    # checks provenance, not the run, so a well-formed row reaches the key; the `match`
+    # is what stops a third move from going unnoticed.
     db = tmp_path / "ledger.db"
     initialize_ledger(db)
     conn = connect(db)
     try:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
             conn.execute(
-                "INSERT INTO score_events ("
-                "forecast_record_id, metric, value, implementation_version, computed_at_utc) "
-                "VALUES ('does-not-exist', 'brier', 0.25, 'v1', ?)",
-                (TS,),
+                "INSERT INTO research_documents (document_id, retrieval_run_id, canonical_url, "
+                "retrieved_at_utc, content_sha256, original_url, provenance, source_type) "
+                "VALUES ('doc-1', 'does-not-exist', 'https://example.org/a', ?, ?, "
+                "'https://example.org/a', 'direct_api', 'news')",
+                (TS, "a" * 64),
             )
     finally:
         conn.close()

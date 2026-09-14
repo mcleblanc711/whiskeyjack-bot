@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from resolution_rows import insert_resolution_row
 from whiskeyjack_bot.export import (
     EXPORT_SCHEMA_VERSION,
     EXPORTED_TABLES,
@@ -63,9 +64,11 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
 
     Raw SQL rather than the production writers, and deliberately: the point here is the
     *schema's* full surface, including tables whose writers are still Not Started
-    (`resolution_events` is M4-802's, `score_events` is M5-803's). A seed built only from
-    what has a writer today would leave those two empty, and an empty table makes the
-    set-equality check vacuous exactly where nobody would look for it.
+    (`score_events` is M4-802's and M4-803's). A seed built only from what has a writer
+    today would leave it empty, and an empty table makes the set-equality check vacuous
+    exactly where nobody would look for it. The resolution row is the shared
+    `resolution_rows` helper's, because 014 constrains every column of it and a score row
+    now needs a scorable resolution behind it.
 
     `schema_migrations` is not seeded here -- `initialize_ledger` fills it, which is the
     honest way for it to be populated.
@@ -84,11 +87,11 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
-        "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+        "record_id, question_id, post_id, tournament_id, forecast_version, question_type, "
+        "status, model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES ('rec-1', 100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
+        "VALUES ('rec-1', 100, 1100, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
         "'v1', ?, 'run-1', ?, '{}', '{}', ?, ?, 'att-rec-1')",
         (SHA, TS, TS, SHA),
     )
@@ -137,11 +140,7 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         "'provider_unavailable', 'run-1', ?, ?)",
         (TS, TS),
     )
-    conn.execute(
-        "INSERT INTO resolution_events (question_id, forecast_record_id, ingested_at_utc) "
-        "VALUES (100, 'rec-1', ?)",
-        (TS,),
-    )
+    insert_resolution_row(conn, "rec-1")
     conn.execute(
         "INSERT INTO score_events (forecast_record_id, metric, value, "
         "implementation_version, computed_at_utc) VALUES ('rec-1', 'brier', 0.25, 'v1', ?)",
