@@ -10863,3 +10863,29 @@ live poll, and no test can show that two real, consecutive polls of the same ope
 ever actually differ in list order. The fix is defensive against a failure mode that is plausible
 and previously flagged twice, not one this branch has directly reproduced end to end against a
 live API response.
+
+### Round 1 — APPROVE, one real (non-blocking) finding, fixed rather than deferred
+
+Reviewed `153d504`. Zero blocking findings. Unlike the last three items' rounds, this one was
+not all false claims about correct code: the reviewer found a genuine gap in the canonicalization
+itself, correctly classified non-blocking (pre-existing schema behavior, not introduced by this
+branch), but worth fixing immediately rather than filing, because it directly contradicts this
+item's own permutation-invariance claim rather than being an unrelated adjacent issue.
+
+`CanonicalQuestion`'s schema does not require `SourceCategory.id` to be unique within
+`source_categories` — nothing in `model.py` enforces it. Sorting on `id` alone therefore relies
+on Python's `sorted()` being a **stable** sort: two categories sharing one `id` keep their
+*original relative order* after sorting, so a permutation that swaps their positions produces a
+different sorted list, and therefore a different fingerprint. Reproduced before writing the fix:
+`SourceCategory(id=1, name="Economics")` and `SourceCategory(id=1, name="Politics")` in one order
+versus the other hashed to two different fingerprints.
+
+Fixed by sorting on `(id, name, slug)` — a tuple unique whenever the categories differ in any
+field, with the remaining case (two categories agreeing on all three) genuinely irrelevant to
+order. New property test (`test_fingerprint_is_invariant_under_source_categories_reordering_
+with_duplicate_ids`) drives the exact tie case — multiple categories sharing `id=1`, distinguished
+only by `name` — and is proven to fail against the pre-fix `id`-only key before the fix commit.
+
+The reviewer's second non-blocking observation — that `M1-340` is correctly scoped and this
+branch does not worsen `submission_policy.py`'s pre-existing order-sensitivity gap — required no
+action, and is recorded here as confirmation rather than a new finding.
