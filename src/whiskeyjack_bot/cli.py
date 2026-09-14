@@ -138,6 +138,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="the uncertain attempt to resolve; submit prints it when it leaves one open",
     )
 
+    ingest = subparsers.add_parser(
+        "ingest-resolutions",
+        help=(
+            "fetch the resolution state of every submitted forecast and append it to the "
+            "ledger; reads Metaculus only, posts nothing, makes no paid call"
+        ),
+    )
+    ingest.add_argument("--config", default="config.yaml", type=Path)
+    ingest.add_argument(
+        "--question-id", type=int, help="restrict to the forecast records of one question"
+    )
+
     # Two commands, and the split is the safety property: `run` spends money and
     # `run-replay` cannot. T-903 shipped the replay path under the name `run` because it was
     # the only one that existed; `CODEX_HANDOFF.md` line 274 always meant the live one. With
@@ -787,6 +799,73 @@ def _run_verify_submission(args: argparse.Namespace) -> int:
         print(f"attempt:   {args.attempt_id}")
         print(f"result:    {event.event_type} (lifecycle seq {event.event_seq})")
         return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _run_ingest_resolutions(args: argparse.Namespace) -> int:
+    """Fetch and record resolution state for submitted forecasts (M4-801).
+
+    Reads Metaculus, writes the ledger. It builds a plain client rather than a poster, so no
+    post method is reachable from here, and it reads no submission flag. Exits
+    ``EXIT_REFUSED`` when any record was skipped, after recording every one it could, so a
+    scheduled run that half-failed is not reported as a success.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_client
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.resolution_ingest import (
+        ResolutionIngestError,
+        ingest_resolutions,
+        sdk_post_fetcher,
+    )
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            client = build_client(config)
+        except MissingCredentialError as exc:
+            print(f"refused: {exc}")
+            return EXIT_ENV_MISSING
+        try:
+            results = ingest_resolutions(
+                connection, sdk_post_fetcher(client), question_id=args.question_id
+            )
+        except ResolutionIngestError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        failed = 0
+        for result in results:
+            if result.status == "failed":
+                failed += 1
+                print(
+                    f"question {result.question_id}  record {result.record_id}  failed: "
+                    f"{result.detail}"
+                )
+                continue
+            kind = "-" if result.kind is None else result.kind
+            scorable = "-" if result.scorable is None else ("yes" if result.scorable else "no")
+            moved = "  -> resolved" if result.moved_to_resolved else ""
+            print(
+                f"question {result.question_id}  record {result.record_id}  "
+                f"{result.status}  kind {kind}  scorable {scorable}{moved}"
+            )
+        print(f"records: {len(results)}  failed: {failed}")
+        return EXIT_REFUSED if failed else EXIT_OK
     finally:
         connection.close()
 
@@ -1451,6 +1530,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_submit(args)
     if args.command == "verify-submission":
         return _run_verify_submission(args)
+    if args.command == "ingest-resolutions":
+        return _run_ingest_resolutions(args)
     if args.command == "run":
         return _run_run(args)
     if args.command == "run-replay":

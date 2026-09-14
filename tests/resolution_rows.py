@@ -21,13 +21,24 @@ from __future__ import annotations
 import copy
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from whiskeyjack_bot.lifecycle import (
+    SubmissionAttempt,
+    record_approval,
+    record_submission_attempt,
+    record_validation,
+)
 from whiskeyjack_bot.resolution import canonical_json, classify_resolution, sha256_text
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "api_posts"
 OBSERVED_AT = "2026-09-17T18:00:00.000000+00:00"
+SUBMITTED_AT = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+RECORD_SHA = "b" * 64
+PAYLOAD_SHA = "d" * 64
+_TS = "2026-09-10T00:00:00.000000+00:00"
 
 _TYPE_FIXTURES = {
     "binary": "binary_post.json",
@@ -162,3 +173,83 @@ def insert_resolution_row(
     )
     assert cursor.lastrowid is not None
     return cursor.lastrowid
+
+
+def seed_record(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    question_id: int,
+    post_id: int | None,
+    question_type: str = "binary",
+    tournament_id: str = "33122",
+) -> str:
+    """A draft forecast record, raw, with the run it cites. Returns ``record_id``."""
+    conn.execute(
+        "INSERT OR IGNORE INTO research_runs (retrieval_run_id, provider, question_id, "
+        "started_at_utc, created_at_utc) VALUES ('run-resolution', 'asknews', ?, ?, ?)",
+        (question_id, _TS, _TS),
+    )
+    conn.execute(
+        "INSERT INTO forecast_records (record_id, question_id, post_id, tournament_id, "
+        "forecast_version, question_type, status, model_provider, model_name, prompt_version, "
+        "prompt_sha256, retrieval_run_id, generated_at_utc, final_prediction_json, record_json, "
+        "created_at_utc, forecast_sha256, attempt_id) VALUES (?, ?, ?, ?, 1, ?, 'draft', "
+        "'openrouter', 'model', 'v1', 'abc', 'run-resolution', ?, '{}', '{}', ?, ?, ?)",
+        (
+            record_id,
+            question_id,
+            post_id,
+            tournament_id,
+            question_type,
+            _TS,
+            _TS,
+            RECORD_SHA,
+            f"att-{record_id}",
+        ),
+    )
+    return record_id
+
+
+def walk_to_submitted(conn: sqlite3.Connection, record_id: str) -> None:
+    """Carry a draft to ``submitted`` through the production writers."""
+    record_validation(conn, record_id=record_id, occurred_at=SUBMITTED_AT)
+    record_approval(
+        conn,
+        record_id=record_id,
+        decision="approved",
+        actor="policy:test",
+        forecast_sha256=RECORD_SHA,
+        payload_sha256=PAYLOAD_SHA,
+        occurred_at=SUBMITTED_AT + timedelta(minutes=1),
+    )
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=SubmissionAttempt(
+            attempt_id=f"attempt-{record_id}",
+            idempotency_key=f"key-{record_id}",
+            requested_at_utc=SUBMITTED_AT + timedelta(minutes=2),
+            completed_at_utc=SUBMITTED_AT + timedelta(minutes=2),
+            request_payload_sha256=PAYLOAD_SHA,
+            success=True,
+            refetch_outcome="confirmed",
+        ),
+        occurred_at=SUBMITTED_AT + timedelta(minutes=2),
+        secret_env_var_names=(),
+    )
+
+
+def seed_submitted(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    question_id: int,
+    post_id: int | None,
+    question_type: str = "binary",
+) -> str:
+    seed_record(
+        conn, record_id, question_id=question_id, post_id=post_id, question_type=question_type
+    )
+    walk_to_submitted(conn, record_id)
+    return record_id
