@@ -575,3 +575,23 @@ def test_the_stored_row_replays_to_its_own_digest(conn: sqlite3.Connection, subm
     assert write.stored is not None
     assert row[1] == write.stored.observation.observation_sha256
     assert json.loads(row[2]) == _payload("resolved")
+
+
+def test_a_stored_snapshot_that_no_longer_matches_its_digest_is_refused_on_read(
+    conn: sqlite3.Connection, submitted: str
+) -> None:
+    """The snapshot half of the reader's re-verification (mutation W4 survived without it).
+
+    Only a field that keeps the snapshot valid and consistent with its indexed columns is
+    changed, so the digest comparison is the one check that can refuse it.
+    """
+    record_resolution_observation(
+        conn, record_id=submitted, source_response=_payload("resolved"), observed_at=T0
+    )
+    conn.execute("DROP TRIGGER resolution_events_block_update")
+    conn.execute(
+        "UPDATE resolution_events SET resolution_snapshot_json = json_set("
+        "resolution_snapshot_json, '$.actual_resolve_time', '2026-09-18T12:00:00.000000+00:00')"
+    )
+    with pytest.raises(LifecycleError, match="snapshot does not match its recorded digest"):
+        latest_resolution(conn, submitted)
