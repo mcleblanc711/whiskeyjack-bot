@@ -495,13 +495,13 @@ def read_intent(
     if not isinstance(parsed, dict):
         raise ReconciliationError("the durable submission intent is not a JSON object")
     if (
+        # Exact types for the integers only: JSON gives `7.0 == 7` and `true == 1`, whereas a
+        # parsed JSON string can only equal a `str`.
         parsed.get("record_id") != record_id
-        or type(parsed.get("record_id")) is not str
         or type(parsed.get("question_id")) is not int
         or parsed.get("question_id") != question_id
         or type(parsed.get("post_id")) is not int
         or parsed.get("post_id") != post_id
-        or type(parsed.get("project_id")) is not str
         or parsed.get("project_id") != tournament_id
     ):
         raise ReconciliationError(

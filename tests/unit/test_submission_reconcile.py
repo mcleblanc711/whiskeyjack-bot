@@ -391,6 +391,16 @@ def test_a_different_account_is_refused_before_the_platform_is_read(case: Any) -
     assert _rows(conn) == before and poster.reads == reads
 
 
+def test_an_account_that_only_compares_equal_is_refused(case: Any) -> None:
+    """``42.0 == 42``: the identity check is on the exact type, not on equality alone."""
+    conn, *_ = case
+    record_id, poster, _ = _refused_write(case)
+    poster.account = 42.0  # type: ignore[assignment]
+    with pytest.raises(ReconciliationError, match="not the account that made this post"):
+        _reconcile(case, record_id, poster)
+    assert conn.execute("SELECT count(*) FROM submission_reconciliations").fetchone()[0] == 0
+
+
 def test_an_unreadable_identity_is_refused(case: Any) -> None:
     conn, *_ = case
     record_id, poster, _ = _refused_write(case)
