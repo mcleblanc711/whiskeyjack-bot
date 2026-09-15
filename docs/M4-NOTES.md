@@ -589,3 +589,214 @@ docstring says why.
 and no backlog candidates; each of the nine falsifiable risk claims was marked safe. The
 reviewer ran the focused scoring suite (169 tests) and `ruff check`. This entry is the only
 change after the approved commit.
+
+## M4-805 — Schedule resolution ingestion
+
+Acceptance: *Resolutions for submitted records are ingested without an operator command at a
+documented cadence; a failed ingest surfaces through the existing alerting path; the schedule
+makes no paid call and never reaches the submission path.* Description (amended by M4-802):
+`score` belongs on the same schedule, after ingestion.
+
+### Delivered
+
+- `deploy/systemd/whiskeyjack-resolutions.service` — `Type=oneshot`,
+  `OnFailure=whiskeyjack-notify@%N.service`, the poll's `WorkingDirectory`/`EnvironmentFile`/
+  `Environment` and interpreter, and two `ExecStart=` lines: `ingest-resolutions --config
+  …/config/tournament.yaml`, then `score --config …/config/tournament.yaml`. `TimeoutStartSec=2400`.
+- `deploy/systemd/whiskeyjack-resolutions.timer` — `OnCalendar=*-*-* 00/6:23:00`,
+  `Persistent=true`, `AccuracySec=1min`.
+- `tests/unit/test_deploy_resolutions_unit.py` — the unit read as a contract (parity with
+  `whiskeyjack-tournament.service`, the ExecStart contract, the timer) and run as a measurement
+  (the unit's own argv through `cli.main`, with every paid and posting entry point refused).
+- `docs/RUNBOOK.md` — § Scheduled ingestion and scoring (cadence, what a push means, install
+  commands), a symptom-index row, and a pointer from step 6.
+- `docs/backlog/backlog.csv` — **M4-806**, **M4-807**, **M1-341** (the deferrals below).
+
+**No `src/` change, no `AppConfig` field, no migration, no dependency.** `config_sha256` and the
+live activation cannot be affected by this branch.
+
+### What was established by execution before designing
+
+**Nothing this account posted has resolved.** The live MiniBench ledger, opened `mode=ro` on
+2026-09-15 at ~04:40 UTC: schema 15, 23 records whose history reached `submitted`,
+`resolution_events` 0, `score_events` 0. The Cup ledger (`data/cup/ledger.sqlite3`): schema **13**,
+5 submitted records, last heartbeat 2026-09-10.
+
+**systemd's multi-`ExecStart` semantics, on this host's systemd 255.** A throwaway
+`wj-m4805-probe.service` in `$XDG_RUNTIME_DIR/systemd/user/`, whose `OnFailure=` pointed at a
+scratch logger rather than the ntfy pager, then removed:
+
+| lines | second line ran? | `Result` | `ExecMainStatus` | `OnFailure` fired, and saw |
+| --- | --- | --- | --- | --- |
+| `exit 4`, then `touch marker` | **no** (no marker) | `exit-code` | 4 | yes, `exit=4` |
+| `exit 0`, then `touch marker` | yes | `success` | 0 | no |
+| `true`, then `exit 4` | — | `exit-code` | 4 | yes, `exit=4` |
+
+So the notify template's `exit=` field is the failing command's own exit code, whichever line
+failed, and a failed first line keeps the second from running.
+
+**Which path fires for a non-zero exit.** The pager is systemd's `OnFailure=` →
+`whiskeyjack-notify@.service` (shell + curl, 30-minute throttle per unit). In-process `notify.py`
+is not involved: neither command builds a notifier. The watchdog (`~/.local/bin/wj-watchdog`,
+operator-local) checks only `whiskeyjack-tournament`.
+
+**Exit codes the pager catches** (from `cli.py`, pinned by the tests below): a missing
+`METACULUS_TOKEN` is `3`, before any request; a missing or unopenable ledger is `4`, with nothing
+created or rewritten; any per-record failure is `4`, after recording the rest; an unhandled
+exception is Python's `1`. All are non-zero.
+
+**Overlap with the poll.** `ingest_resolutions` does every GET outside a transaction; each record's
+write is its own `BEGIN IMMEDIATE`. Against a second connection holding the write lock, a record's
+write waited **5.0 s** (`ledger._BUSY_TIMEOUT_MS`) and came back
+`failed: the ledger could not complete this transaction (detail withheld: ...)`; after the lock was
+released the next run appended it. So an overlap costs at worst one page and one cycle's delay for
+that record, never a wrong row. An idle poll takes ~16 s wall (journal, 2026-09-15 03:40–03:55 UTC).
+
+**Live run duration.** The unit's two commands, run by hand from the main checkout (`c22994c`)
+with the unit's environment, started 2026-09-15 04:55:26 UTC between polls: `ingest-resolutions`
+**108.7 s** wall (7.4 s CPU), 23 records, all `nothing_to_retract`, none `withheld`, `failed: 0`,
+exit 0; then `score` **0.28 s**, `records: 0  failed: 0`, exit 0. About 4.7 s per post, so
+`TimeoutStartSec=2400` is ~22x today's run and leaves room for the post count to grow and for the
+SDK's read retry on a bad network.
+
+### Decision — a separate timer, not a phase of `tournament run-once`, and why
+
+See Rejected. The deciding facts are in `tournament.run_once` and `cli._run_tournament`: the poll
+refuses unless the activation is live and live submission is enabled, so it stops exactly when a
+tournament closes or is withdrawn — which is when resolutions arrive.
+
+### Decision — two `ExecStart` lines, so `score` runs only after ingestion exited 0
+
+Owner decision, 2026-09-14. systemd gives the ordering and the refusal (table above), so no new
+Python and no shell wrapper stand between the unit and the two already-reviewed commands. "Scoring
+never runs against a ledger ingestion just failed to open" follows from three pinned facts: no line
+carries a `-` prefix (test), ingestion exits non-zero whenever it cannot open the ledger (test), and
+systemd does not run a later line after a non-zero one (probe). The stricter consequence is
+accepted: **any** ingestion failure, including one bad record, skips scoring for that cycle. The
+operator is paged each time and `score` is safe to run by hand.
+
+### Decision — every six hours, at minute 23
+
+Owner decision, 2026-09-14, on these numbers: a question resolves once and nothing consumes a score
+within the day; every run is one GET per posted post at the configured spacing (3.5 s + up to 1 s
+jitter), and that count only grows because resolved posts stay polled to see a retraction — 92
+GETs/day at 23 posts against 552 hourly; and the notify throttle is 30 minutes, so a persistent
+failure pages once per run (4/day, against 24 hourly). Minute 23 is clear of the poll (`*:0/5`) and
+the watchdog (`*:2/5`). Times are host local time (MDT here), which the runbook says.
+
+### Decision — MiniBench profile only
+
+Owner decision, 2026-09-14. The Cup ledger is at schema 13 and its questions resolve months out.
+Deferred to M4-806.
+
+### Deviation — the stricter reading of the criterion
+
+- **"A failed ingest"** is read as any non-zero exit of *either* command, or a run past
+  `TimeoutStartSec`, and as including a partial failure (one record). All of them fail the unit.
+- **"The existing alerting path"** is read as the same `OnFailure=` template the poll uses, proven
+  by comparison with `whiskeyjack-tournament.service` rather than by a constant, plus the absence of
+  every unit setting that would convert a failure into success (`SuccessExitStatus`, `Restart`).
+- **"No paid call, never the submission path"** is read as a measurement of the unit's own command
+  lines, not a reading of imports: the argv is parsed out of the unit file and driven through
+  `cli.main` with refusal spies on the `requests` write verbs and `Session.request`,
+  `build_poster`, `post_approved_forecast`, `run_live`, `build_asknews_client`, `build_exa_client`,
+  `build_forecaster_client`, `PricedClient`, `litellm.completion`/`acompletion`,
+  `build_notify_client`, `httpx.Client.send` and `socket.getaddrinfo`. It also covers litellm's
+  import-time cost-map fetch: `LITELLM_LOCAL_MODEL_COST_MAP=True` is pinned in the unit.
+- **Scoring is on the schedule too**, and the end-to-end test asserts it ran (records end `scored`,
+  with both values hand-checked: Brier `(0.7 - 1)^2 = 0.09`, log `ln 0.7` by `bc -l`).
+
+### Rejected — a phase of `tournament run-once`
+
+- `run_once` raises before any work unless live submission is enabled and the activation is live
+  and in window (`require_live_submission_enabled`, `require_activation`). A disabled, retired or
+  ended tournament — the state in which resolutions arrive, and the Cup's state today — would stop
+  ingestion.
+- It runs under `worker_lock` with a `SingleAttemptPoster` built from `build_poster`, so "never
+  reaches the submission path" could not be shown by what the process constructs.
+- `_run_tournament` returns 1 on any refusal, unresolved attempt or heartbeat failure. An ingestion
+  failure folded in would fail a healthy forecasting poll, trip the watchdog's "last service run
+  FAILED", and share one throttle stamp with forecasting failures, so one would mute the other.
+- At the poll's five-minute cadence it would be 6,624 GETs/day at 23 posts without a new throttle,
+  and a new throttle means new state.
+
+### Rejected — a combined `resolutions-cycle` subcommand
+
+It could score past one bad record while still refusing after an open failure, but it is new CLI
+surface and review scope for a case the pager already reports. Owner chose the systemd form.
+
+### Rejected — a shell wrapper (`ingest && score`)
+
+It is equivalent to two `ExecStart` lines with one more interpreter in the way, and its exit code
+would have to be preserved by hand for the notify body.
+
+### Rejected — taking the tournament's `worker_lock`
+
+The poll takes it non-blocking and refuses with exit 1 when it is held, so a two-minute ingestion
+holding it would fail the polls that start meanwhile and page. SQLite's write lock plus the busy
+timeout already serialize the writes that matter (measured above).
+
+### Rejected — an `AppConfig` field for the cadence
+
+A cadence is a timer property, and any field changes `config_sha256` and retires the live
+activation.
+
+### Deferred (do not read the absence as an omission)
+
+- **The Cup profile's schedule** — needs a backup and `init-ledger` 13 → 15 on the Cup ledger.
+  Backlog: **M4-806**.
+- **A page on `withheld`** — exits 0 by M4-801's contract, so the schedule does not page on it
+  (owner decision). The runbook says to read the `kind` column. Backlog: **M4-807**.
+- **Watchdog coverage of the resolutions timer** — a disabled or stopped timer never runs, so it
+  never fails and never pages. The runbook says how to check. Backlog: **M1-341**.
+- **Installing the unit on the live host** is an operator action after merge, with owner approval
+  (runbook § Scheduled ingestion and scoring gives the commands). Not part of the diff.
+
+### Standing risk — not verifiable offline
+
+- **No real resolved payload yet**, and M4-801's unmasking risk is still open; the first scheduled
+  run after ~2026-09-17 answers both. A `withheld` there will not page (M4-807).
+- **Metaculus's rate limit is undocumented here.** A 429 is retried by the SDK's read retry; one
+  that persists becomes a per-post `failed` and a page, not a wrong row.
+- **Lock contention with a long forecasting write** could produce a spurious page. Bounded, as
+  measured above, and self-healing on the next run.
+- **The unit files hard-code `/home/cleblanc/projects/whiskeyjack-bot`**, as the existing units do;
+  the tests pin parity with the tournament unit, not that the path exists on another machine.
+- **`systemd-analyze --user verify`** accepts both files on systemd 255 here; CI does not run it.
+
+### Mutation testing
+
+Committed first (`e230cf8`); `__pycache__` cleared before every mutant; each restored with
+`git checkout` and the tree asserted clean at the end. Runner: the new test file, `-x`, baseline
+green **by exit code** (output redirected to a file). Every kill was checked against its log for the
+assertion that failed, so no kill is a collection error or an unrelated failure. Planted calls
+(C1–C8) are wrapped in `try: … except Exception: pass`, so only the spy's record can catch them.
+
+| mutant | killed by |
+| --- | --- |
+| U1 `-` prefix on the ingestion line | interpreter parity first; the prefix assertion alone also kills it |
+| U2 lines swapped | `test_exactly_ingestion_then_scoring_and_nothing_else_runs` |
+| U3 `OnFailure` dropped | `test_a_failure_starts_the_same_pager_the_tournament_poll_uses` |
+| U4 `LITELLM_LOCAL_MODEL_COST_MAP` dropped | `test_the_environment_matches_the_tournament_poll` |
+| U5 `score` → `scores` | the ExecStart contract (argparse refuses) |
+| U6 `score --config` → the Cup profile | the ExecStart contract (config parity) |
+| U7 hourly `OnCalendar` | the timer test |
+| U8 a third `ExecStart` running `tournament run-once` | the ExecStart contract (`3 == 2`) |
+| U9 `SuccessExitStatus=4` | the pager test |
+| U10 an `ExecStartPost=` | the ExecStart contract (`Exec*` keys) |
+| U11 `Persistent=false` | the timer test |
+| U12 ingestion narrowed with `--question-id 1` | the ExecStart contract |
+| U13 timer `Unit=` the tournament service | the timer test |
+| C1 ingestion builds a poster | the measured run (`['build_poster']`) |
+| C2 ingestion `requests.post` | the measured run (`['requests.post']`) |
+| C3 scoring builds the forecaster client | the measured run |
+| C4 scoring calls `litellm.completion` | the measured run |
+| C5 scoring builds an AskNews client | the measured run |
+| C6 scoring builds an Exa client | the measured run |
+| C7 ingestion calls `post_approved_forecast` | the measured run |
+| C8 ingestion sends through `httpx` | the measured run (`['httpx.Client.send']`) |
+| C9 ingestion exits 0 on an unopenable ledger | `test_scoring_does_not_run_after_an_ingestion_that_could_not_open_the_ledger` (score then ran) |
+| C10 ingestion exits 0 when a record failed | `test_a_failed_record_fails_the_unit_and_scoring_waits` |
+| C11 ingestion exits 0 on a missing token | `test_a_missing_token_fails_the_unit_before_any_request` |
+
+24 of 24 killed.

@@ -159,6 +159,7 @@ were written.
 | `verify-submission` said `resolve it by hand` | [L3](#l3--a-mismatched-refetch) |
 | `a live post was made and the ledger refused to record it` | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
 | `artifact:  NOT WRITTEN -- ...` | [L5](#l5--the-artifact-was-not-written) |
+| ntfy push `whiskeyjack: whiskeyjack-resolutions failed` | [Scheduled ingestion and scoring](#scheduled-ingestion-and-scoring) |
 
 ---
 
@@ -438,6 +439,10 @@ raise it with Metaculus.
 Exit `4` means at least one record printed `failed:`; every other record was still recorded.
 A `failed` line names a rule, never a value. Re-running is safe.
 
+This step and step 7 also run on a timer every six hours (M4-805); see
+[Scheduled ingestion and scoring](#scheduled-ingestion-and-scoring). Running them by hand is still
+safe at any time.
+
 ### 7. Score resolved forecasts
 
 ```bash
@@ -468,6 +473,67 @@ records: 4  failed: 0
 - A `failed` line names a rule. The one you may meet in practice is a multiple-choice question
   that resolved to an option the forecast never priced (an option added after forecasting),
   which is refused rather than guessed. Exit `4` if any record failed.
+
+### Scheduled ingestion and scoring
+
+Steps 6 and 7 run unattended (M4-805), from `deploy/systemd/whiskeyjack-resolutions.service` and
+its timer, against the MiniBench profile (`config/tournament.yaml`) — the same profile, `.env` and
+interpreter as the tournament poll.
+
+- **When:** every six hours, at 00:23, 06:23, 12:23 and 18:23 **host local time**. That is clear
+  of the poll (`*:0/5`) and the watchdog (`*:2/5`). `Persistent=true` means a run missed while
+  the machine was off happens at the next boot.
+- **What:** `ingest-resolutions`, then `score`. `score` runs **only if ingestion exited 0**.
+  Neither command costs money, and neither can post. Both are idempotent.
+- **How you hear about a failure:** a non-zero exit from either command, or a run past
+  `TimeoutStartSec`, fails the unit. That starts the same `whiskeyjack-notify@` pager the poll
+  uses. The push reads `whiskeyjack: whiskeyjack-resolutions failed` with
+  `result=exit-code exit=N`, and `N` is the exit code of whichever command failed (table
+  [above](#exit-codes)). Because the pager throttles to one push per unit per 30 minutes, a
+  failure that keeps happening pages once per run, four times a day.
+- **A `withheld` observation does not page.** It exits `0`, by design (step 6), so check the
+  `kind` column in the journal after questions resolve.
+- **The Cup profile is not scheduled.** Its ledger is still at schema 13.
+
+When the push arrives:
+
+```bash
+journalctl --user -u whiskeyjack-resolutions.service -n 80 --no-pager   # which command, which lines
+systemctl --user show whiskeyjack-resolutions.service -p Result -p ExecMainStatus
+```
+
+1. Read the `failed:` lines. Each names a rule (step 6 and step 7 say what the rules mean).
+   Every record not printed `failed` was still recorded.
+2. If ingestion failed, scoring did not run this cycle. Once the cause is fixed, run step 6 and
+   then step 7 by hand, or wait for the next run.
+3. A `refused:` or `no ledger database` line means nothing was written. Handle it like any other
+   configuration or ledger failure ([C1](#c1--no-ledger-database)–[C5](#c5--activation-retired)).
+   A just-merged migration refuses until `init-ledger` runs. `missing env var` / exit `3` means
+   `METACULUS_TOKEN` is missing from `.env`.
+4. `failed: the ledger could not complete this transaction (detail withheld: ...)` means another
+   writer held the ledger's write lock for more than five seconds. Usually that is a manual run
+   overlapping the scheduled one, or a forecasting poll mid-write. Nothing is corrupted: each
+   record's write is its own `BEGIN IMMEDIATE` transaction, every Metaculus GET happens outside a
+   transaction, and the refused record is simply picked up by the next run. You can also re-run
+   it by hand.
+
+**Installing or changing the unit** (the files under `deploy/systemd/` are copied, not linked):
+
+```bash
+cd ~/projects/whiskeyjack-bot && git pull --ff-only
+cp deploy/systemd/whiskeyjack-resolutions.service deploy/systemd/whiskeyjack-resolutions.timer \
+   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start whiskeyjack-resolutions.service          # one run now, in the foreground
+systemctl --user show whiskeyjack-resolutions.service -p Result -p ExecMainStatus
+systemctl --user enable --now whiskeyjack-resolutions.timer
+systemctl --user list-timers whiskeyjack-resolutions.timer
+```
+
+**Timers are not self-healing, and nothing watches this one.** A disabled or stopped
+`whiskeyjack-resolutions.timer` is silent: the watchdog checks only the tournament poll. Check
+it with `systemctl --user list-timers whiskeyjack-resolutions.timer`. To pause the schedule, run
+`systemctl --user disable --now whiskeyjack-resolutions.timer`.
 
 ### Where the lifecycle stops today
 
