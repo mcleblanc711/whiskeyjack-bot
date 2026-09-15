@@ -29,7 +29,7 @@ from typing import Any, get_args
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from resolution_rows import insert_resolution_row
+from resolution_rows import insert_resolution_row, insert_score_row
 from strategies import ENCODABLE_TEXT, HOSTILE_TEXT
 
 from whiskeyjack_bot import approval, lifecycle
@@ -914,11 +914,7 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
     # at the right record and still resolve a different question. Since 014 it must also be
     # a well-formed, scorable observation, or the score row below is refused.
     resolution = insert_resolution_row(conn, record_id)
-    score = conn.execute(
-        "INSERT INTO score_events (forecast_record_id, metric, value, implementation_version, "
-        "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
-        (record_id, TS),
-    ).lastrowid
+    score = insert_score_row(conn, record_id)
     # What a refetch of the uncertain attempt could have seen. Storable up front: the
     # verification table only requires its attempt to exist, and it is the *link* that
     # requires the uncertainty.

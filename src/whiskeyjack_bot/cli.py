@@ -150,6 +150,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--question-id", type=int, help="restrict to the forecast records of one question"
     )
 
+    score = subparsers.add_parser(
+        "score",
+        help=(
+            "compute local Brier and log scores for resolved binary and multiple-choice "
+            "forecasts and append them to the ledger; no network, no paid call"
+        ),
+    )
+    score.add_argument("--config", default="config.yaml", type=Path)
+    score.add_argument("--record-id", help="score only this forecast record")
+
     # Two commands, and the split is the safety property: `run` spends money and
     # `run-replay` cannot. T-903 shipped the replay path under the name `run` because it was
     # the only one that existed; `CODEX_HANDOFF.md` line 274 always meant the live one. With
@@ -870,6 +880,56 @@ def _run_ingest_resolutions(args: argparse.Namespace) -> int:
         connection.close()
 
 
+def _run_score(args: argparse.Namespace) -> int:
+    """Compute local Brier and log scores for resolved forecasts (M4-802).
+
+    Reads and writes the ledger only. It builds no client and imports nothing that reaches
+    the network, so there is no post method and no paid call anywhere on this path. Exits
+    ``EXIT_REFUSED`` when any record failed, after scoring every one it could.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.score_records import ScoreRecordsError, score_records
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            results = score_records(connection, record_id=args.record_id)
+        except ScoreRecordsError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        failed = 0
+        for result in results:
+            prefix = (
+                f"question {result.question_id}  record {result.record_id}  "
+                f"{result.question_type}  "
+            )
+            if result.status == "failed":
+                failed += 1
+                print(f"{prefix}failed: {result.detail}")
+                continue
+            moved = "  -> scored" if result.moved_to_scored else ""
+            print(f"{prefix}{result.status}  rows {result.rows_appended}{moved}")
+        print(f"records: {len(results)}  failed: {failed}")
+        return EXIT_REFUSED if failed else EXIT_OK
+    finally:
+        connection.close()
+
+
 def _run_release_key(args: argparse.Namespace) -> int:
     """Give up a standing key reservation, so an interrupted forecast can be retried.
 
@@ -1532,6 +1592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_verify_submission(args)
     if args.command == "ingest-resolutions":
         return _run_ingest_resolutions(args)
+    if args.command == "score":
+        return _run_score(args)
     if args.command == "run":
         return _run_run(args)
     if args.command == "run-replay":

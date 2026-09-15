@@ -57,7 +57,7 @@ from whiskeyjack_bot.lifecycle import (
     unresolved_uncertainties,
 )
 
-from resolution_rows import insert_resolution_row
+from resolution_rows import insert_resolution_row, insert_score_row
 
 
 def _checksum_of(name: str) -> str:
@@ -1029,11 +1029,7 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str, suffix: str) -> dict[
     # the link probes check. Since 014 it must also be a well-formed observation, and a
     # scorable one, because the score row below needs a scorable resolution behind it.
     resolution = insert_resolution_row(conn, record_id)
-    score = conn.execute(
-        "INSERT INTO score_events (forecast_record_id, metric, value, implementation_version, "
-        "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
-        (record_id, TS),
-    ).lastrowid
+    score = insert_score_row(conn, record_id)
     # Both observations a refetch of the uncertain attempt could have made. They are
     # storable whether or not this record ever recorded that attempt as uncertain -- the
     # verification table only requires the attempt to exist -- which is what lets the
@@ -4081,7 +4077,7 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # 014 (M4-801) adds NULLable columns to `resolution_events` and new insert triggers, and
     # its upgrade precondition refuses only a ledger already holding resolution or score
     # rows. A v2 ledger holds neither, so reaching 14 is the same statement once more.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 14
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 15
 
     conn = connect(db)
     try:
@@ -4679,7 +4675,7 @@ def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
     """
     db = tmp_path / "ledger.sqlite3"
     attempt_id = _seed_v8_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 14
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 15
 
     conn = connect(db)
     try:
@@ -4776,7 +4772,7 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # COALESCE, and 010 only creates tables, so neither probes the rows a v5 ledger holds.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 14
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 15
 
 
 @pytest.mark.parametrize(
@@ -4881,7 +4877,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 14
+    assert initialize_ledger(db) == 15
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"

@@ -253,3 +253,42 @@ def seed_submitted(
     )
     walk_to_submitted(conn, record_id)
     return record_id
+
+
+_LOCAL_BRIER = {"binary": "local_brier_binary", "multiple_choice": "local_brier_multiclass"}
+
+
+def insert_score_row(conn: sqlite3.Connection, record_id: str, **overrides: object) -> int:
+    """Raw-INSERT a local score row that satisfies 014 and 015, with any column overridden.
+
+    ``015_local_score_events.sql`` requires the row to cite the record's latest resolution
+    row, a local metric for the record's question type, a version named for that metric, no
+    comparison baseline and a computation time no earlier than the observation. Suites that
+    seed several rows for one record vary ``implementation_version`` (``local_brier_binary/2``
+    and so on), because the UNIQUE index allows one value per observation, metric and version.
+    """
+    question_type = conn.execute(
+        "SELECT question_type FROM forecast_records WHERE record_id = ?", (record_id,)
+    ).fetchone()[0]
+    latest = conn.execute(
+        "SELECT max(event_id), max(observed_at_utc) FROM resolution_events "
+        "WHERE forecast_record_id = ?",
+        (record_id,),
+    ).fetchone()
+    metric = _LOCAL_BRIER.get(question_type, "local_brier_binary")
+    columns: dict[str, object] = {
+        "forecast_record_id": record_id,
+        "metric": metric,
+        "value": 0.25,
+        "implementation_version": f"{metric}/1",
+        "computed_at_utc": latest[1] if latest[1] is not None else OBSERVED_AT,
+        "resolution_event_id": latest[0],
+    }
+    columns.update(overrides)
+    names = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    cursor = conn.execute(
+        f"INSERT INTO score_events ({names}) VALUES ({placeholders})", tuple(columns.values())
+    )
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
