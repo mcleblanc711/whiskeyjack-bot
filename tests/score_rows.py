@@ -38,7 +38,7 @@ from whiskeyjack_bot.questions.model import (
     CanonicalMultipleChoiceQuestion,
 )
 
-from resolution_rows import post_payload
+from resolution_rows import post_payload, resolve_raw, walk_to_submitted_raw
 
 # Self-contained rather than importing `tests.unit.records`: that package resolves only once
 # the SDK's import has put the working directory on sys.path, a side effect a helper should
@@ -248,6 +248,28 @@ def seed_resolved(
     )
     walk_to_submitted(conn, record_id, digest)
     resolve(conn, record_id, resolution=resolution, observed_at=observed_at)
+    return record_id
+
+
+def seed_resolved_raw(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    question_id: int,
+    post_id: int,
+    question_type: str = "binary",
+) -> str:
+    """:func:`seed_resolved` for a ledger below the current schema: a real record, then raw rows.
+
+    The record is still the real draft (``seed_forecast`` writes it raw already), so a scorer
+    run after the upgrade reads a genuine forecast. The events are raw because this build's
+    writers cannot write to an older schema; see ``resolution_rows.walk_to_submitted_raw``.
+    """
+    digest = seed_forecast(
+        conn, record_id, question_id=question_id, post_id=post_id, question_type=question_type
+    )
+    walk_to_submitted_raw(conn, record_id, forecast_sha256=digest, payload_sha256="d" * 64)
+    resolve_raw(conn, record_id)
     return record_id
 
 

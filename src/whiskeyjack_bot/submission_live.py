@@ -117,11 +117,13 @@ from whiskeyjack_bot.config import AppConfig, SupportedQuestionType
 from whiskeyjack_bot.forecast.record import ForecastRecordError
 from whiskeyjack_bot.forecast.store import read_forecast_record
 from whiskeyjack_bot.lifecycle import (
+    LIVE_ATTEMPT_TAG,
     FailureCode,
     LifecycleError,
     LifecycleEvent,
     RefetchOutcome,
     SubmissionVerification,
+    live_attempt_id_for_key,
     record_submission_verification,
     unresolved_uncertainties,
 )
@@ -146,12 +148,12 @@ from whiskeyjack_bot.submission_gateway import (
 # `submission_gateway.ARTIFACT_SCHEMA_VERSION` owns.
 VERIFICATION_SCHEMA_VERSION = "1.2.0"
 
-# The visible scheme tag on a derived live attempt id, written as a literal for
-# `submission._KEY_PREFIX`'s reason: a computed tag agrees with its version by
-# construction and proves nothing. `_assert_identity_spaces_are_distinct` checks the
-# property that matters -- it can be confused with neither an idempotency key nor a
-# dry-run attempt id, and all three are append-only claims about whether a post happened.
-_LIVE_ATTEMPT_PREFIX = "wjlive-1-"
+# The visible scheme tag on a derived live attempt id. A literal (in `lifecycle`, which owns
+# the derivation since M2-713) for `submission._KEY_PREFIX`'s reason: a computed tag agrees
+# with its version by construction and proves nothing. `_assert_identity_spaces_are_distinct`
+# checks the property that matters -- it can be confused with neither an idempotency key nor
+# a dry-run attempt id, and all three are append-only claims about whether a post happened.
+_LIVE_ATTEMPT_PREFIX = LIVE_ATTEMPT_TAG
 
 # `bounds.MAX_IDENTIFIER_LENGTH` / `MAX_BODY_LENGTH` are used here rather than restated
 # (M1-608). They are used so a receipt can be *pre-sanitized* to what the writer will
@@ -1791,7 +1793,13 @@ def live_attempt_id(idempotency_key: str) -> str:
     rehearsed one without consulting anything else.
     """
     key = _require_identifier(idempotency_key, "idempotency_key")
-    return _LIVE_ATTEMPT_PREFIX + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    # One derivation, in `lifecycle` since M2-713, whose reconciliation writer needs it and
+    # cannot import this module. The key already passed this module's identifier rule, which
+    # is `lifecycle`'s rule, so the wrap is for the error-type contract.
+    try:
+        return live_attempt_id_for_key(key)
+    except LifecycleError as exc:
+        raise LiveSubmissionError(str(exc) or "idempotency_key cannot be stored") from None
 
 
 @dataclass(frozen=True)
@@ -2006,8 +2014,11 @@ def post_approved_forecast(
             if artifact_path is not None
             else "; the artifact could not be written either"
         )
+        # M2-713: the message now names the way out as well as what not to do.
         raise LiveSubmissionError(
-            f"a live post was made and the ledger refused to record it ({exc}){where}"
+            f"a live post was made and the ledger refused to record it ({exc}){where}; do not "
+            "release the key or submit again -- once you have confirmed the forecast on "
+            "Metaculus, record the post with reconcile-submission"
         ) from None
     return LiveSubmissionRecord(
         receipt=receipt,

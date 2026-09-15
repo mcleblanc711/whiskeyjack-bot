@@ -224,6 +224,8 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("score_event_id", "INTEGER"),
             Column("occurred_at_utc", "TEXT"),
             Column("created_at_utc", "TEXT"),
+            # 016_submission_reconciliations.sql
+            Column("submission_reconciliation_id", "TEXT"),
         ),
     ),
     TableSpec(
@@ -381,6 +383,27 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("forecast_record_id", "TEXT"),
             Column("reservation_seq", "INTEGER"),
             Column("reserved_at_utc", "TEXT"),
+            Column("created_at_utc", "TEXT"),
+        ),
+    ),
+    # 016_submission_reconciliations.sql (M2-713): a post the ledger never recorded, and the
+    # evidence that it reached the platform.
+    TableSpec(
+        name="submission_reconciliations",
+        identifier="reconciliation_id",
+        columns=(
+            Column("reconciliation_id", "TEXT"),
+            Column("reservation_id", "TEXT"),
+            Column("forecast_record_id", "TEXT"),
+            Column("attempt_id", "TEXT"),
+            Column("request_payload_sha256", "TEXT"),
+            Column("intent_event_id", "TEXT"),
+            Column("artifact_path", "TEXT"),
+            Column("artifact_sha256", "TEXT"),
+            Column("observed_by", "TEXT"),
+            Column("note", "TEXT"),
+            Column("refetched_at_utc", "TEXT"),
+            Column("refetched_forecast_snapshot", "TEXT"),
             Column("created_at_utc", "TEXT"),
         ),
     ),

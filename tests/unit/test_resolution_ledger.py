@@ -27,6 +27,7 @@ from resolution_rows import (
     resolution_columns,
     seed_record,
     seed_submitted,
+    seed_submitted_raw,
 )
 from whiskeyjack_bot import ledger as ledger_module
 from whiskeyjack_bot import lifecycle
@@ -298,7 +299,8 @@ def test_a_ledger_at_013_upgrades_to_014(tmp_path: Path, monkeypatch: pytest.Mon
     _ledger_at_013(db, monkeypatch)
     connection = connect(db)
     try:
-        seed_submitted(connection, RECORD, question_id=QUESTION_ID, post_id=POST_ID)
+        # Raw: this build's lifecycle writers name 016's column, which a v13 ledger lacks.
+        seed_submitted_raw(connection, RECORD, question_id=QUESTION_ID, post_id=POST_ID)
     finally:
         connection.close()
     assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
@@ -324,7 +326,8 @@ def test_the_migration_refuses_a_ledger_already_holding_unclassified_rows(
     _ledger_at_013(db, monkeypatch)
     connection = connect(db)
     try:
-        seed_submitted(connection, RECORD, question_id=QUESTION_ID, post_id=POST_ID)
+        # Raw: this build's lifecycle writers name 016's column, which a v13 ledger lacks.
+        seed_submitted_raw(connection, RECORD, question_id=QUESTION_ID, post_id=POST_ID)
         if table == "resolution_events":
             connection.execute(
                 "INSERT INTO resolution_events (question_id, forecast_record_id, ingested_at_utc) "

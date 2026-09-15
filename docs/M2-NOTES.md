@@ -3195,3 +3195,383 @@ response could never help, reworded to separate the two; and
 `test_a_platform_rounded_value_is_recorded_as_a_mismatch` added `1e-6` to `0.37` and rounded
 to six places, which is a no-op at that precision — renamed and reworded to claim only the
 tolerance-exceeding drift it actually drives.
+
+## M2-713 — Reconcile a live post the ledger refused to record
+
+Acceptance, verbatim: *an operator can record, without editing the database, that a post
+reached the platform and was not written down: the resulting ledger state names the attempt,
+spends or releases its key reservation honestly, and cannot be produced without a human
+asserting what they observed on the platform; the append-only guarantee is not weakened and no
+receipt is invented for a response nobody captured; a test drives a ledger refusal after a
+successful post and asserts the reconciliation path leaves the record and the key in agreement
+with the platform.*
+
+The one place in `submit` where an error follows a live call. Both live ledgers were read
+`mode=ro` on 2026-09-15 before any code: MiniBench 23 reservations / 23 attempts / 0 releases,
+Cup 5 / 5 / 0, and **no reservation anywhere lacks an attempt**. A gap with no instance.
+
+### What execution established before the design
+
+Reproduced on scratch ledgers through `test_tournament.py`'s real activation, research-replay
+and submission policy, before any code was written:
+
+1. **Two shapes reach the state, and the backlog row describes the rarer one.**
+   - *The ledger refuses the write.* A second connection took `BEGIN IMMEDIATE` inside the
+     fake POST; the attempt write lost the busy timeout and `submit` raised `a live post was
+     made and the ledger refused to record it (the ledger could not complete this
+     transaction ...); the payload and receipt are at <path>`. Rows left: 1 reservation, 0
+     releases, 0 attempts, lifecycle `validated` + `approved`, 1 `forecast_intent` (with
+     `baseline: []`), 1 witness file, **1 live artifact**. The busy lock is not hypothetical
+     here: the six-hourly resolutions unit shares the ledger with the five-minute poll, and
+     M4-805 measured a resolution write waiting exactly 5.0 s against a held lock.
+   - *The process dies during the refetch.* `test_tournament.py`'s own fork-and-`os._exit(7)`
+     child, which exits after the server accepted: the same rows **minus the artifact**. One
+     poll later the tournament journal held `forecast_confirmed` 1 and `comment_completed` 1,
+     `unresolved` 0 — and the record was still `approved` with its reservation standing. That
+     existing test asserted `submission_attempts == 0` as the recovered state. Ctrl-C during
+     `submit`'s refetch (`KeyboardInterrupt` passes every `except Exception`), systemd's
+     `TimeoutStartSec=2400` on a poll with `max_questions: 60`, and the OOM killer all land
+     here, and none of them prints anything.
+2. **"When the artifact was not written there is no durable trace at all" is false on current
+   code.** Every live post passes `submission_policy.prepare_live_policy`'s `before_post`, which
+   commits a `witness` (a journal row and two files) and a `forecast_intent` — record, account,
+   project, question, post, payload, `payload_sha256`, `baseline: []` — immediately ahead of
+   the POST. With the reservation and the approval's `payload_sha256`, what was posted and
+   under which key are recoverable from rows the program wrote before posting.
+3. **On the live worker the gap is silent.** The recovery loop's `reconcile_forecast` confirms
+   the intent against a refetch and pushes `whiskeyjack: forecast confirmed`; M4-801 selects
+   records by `to_status = 'submitted'` and never sees this one.
+4. **`live_reservations_for_record` listed spent reservations as standing.** After an ordinary
+   post it returned the reservation the attempt had spent, and `_print_standing_reservations`
+   printed `release-key` for it. The writers were right only because each checks the attempt
+   first.
+
+Delivered:
+
+- `migrations/016_submission_reconciliations.sql` — the `submission_reconciliations` table, its
+  validate trigger (nineteen clauses) and append-only pair; two new BEFORE INSERT triggers
+  (`submission_key_releases_refuse_reconciled`, `submission_attempts_refuse_reconciled_key`);
+  `lifecycle_events.submission_reconciliation_id` by `ADD COLUMN` with a partial UNIQUE index;
+  and the second DROP/CREATE of `lifecycle_events_validate_on_insert`.
+- `lifecycle.py` — `SubmissionReconciliation`, `record_submission_reconciliation`, the link
+  on `LifecycleEvent` / `_EVENT_COLUMNS` / `_append_event`, and `live_attempt_id_for_key` — the
+  live attempt-id derivation, moved here from `submission_live` in round 1 so the writer can
+  derive the id it records.
+- `submission.py` — `key_is_reconciled`; a reconciled key is spent to `require_key_unused`,
+  `reserve_submission_key` and `release_submission_key`; one `_STANDING_RESERVATION` predicate
+  for both reservation readers.
+- `submission_reconcile.py` (new) — `find_unrecorded_post`, `reconcile_unrecorded_post`,
+  `unrecorded_posts`, and the two pure checks `read_intent` / `check_artifact_binds`.
+- `submission_gateway.py` — `parse_submission_artifact`, split out of
+  `read_submission_artifact` so the bytes hashed are the bytes validated.
+- `cli.py` — `reconcile-submission` and `unrecorded-posts`; the standing-reservation hint and
+  `release-key`'s preamble name `reconcile-submission`. `submission_live.py` — the L4 message
+  names it too. `export.py` — the new table and column. `ledger.py` — schema 16.
+- `tournament.py` — **untouched**. Nothing the live worker posts, or when, changes.
+
+### Decision — a reconciliation is its own detail row, never an attempt row
+
+The obvious design writes the missing `submission_attempts` row late. It cannot be done
+honestly in either shape:
+
+- **Not captured:** nobody observed the POST return or raise. `success` has been `INTEGER NOT
+  NULL CHECK (success IN (0, 1))` since `001`, so an attempt row must hold a value no one saw —
+  a guess on an append-only table — and `requested_at_utc` / `completed_at_utc` are unknown
+  too. A guessed `success = 1` is exactly the claim `CODEX_HANDOFF.md` prohibits: *"a live API
+  call succeeded without a recorded receipt"*.
+- **Captured:** the artifact holds the receipt but not its `detail_code`. For `(success=True,
+  refetch=unreadable)` that code came from the refetch's own transport error, which the
+  envelope does not store, so the uncertain event the partition requires would carry an
+  invented code. And `(success=False, absent)` transcribes to terminal `failed` for a forecast
+  the platform shows.
+
+So a reconciliation is a detail row in the claim/resolution shape `003`
+(attempts/verifications) and `010` (reservations/releases) already use, and the record moves the
+way a later refetch has always moved one. One path covers both shapes; the second shape is the
+one Ctrl-C, systemd and the OOM killer produce.
+
+**Owner decision at plan time (2026-09-15)**, taken against transcribing the captured receipt
+and refusing the no-receipt shape. Recorded as **D38**.
+
+### Decision — `submission_confirmed`, not `submitted`
+
+`submitted` claims a successful, refetch-verified *attempt*, and none exists.
+`submission_confirmed` (approved -> submitted) already means *a refetch confirmed an outcome that
+was not settled at the time* — this state exactly — and its destination is the one ingestion
+and scoring read. No `event_type` member is added, so no CHECK rebuild (`009`'s and `010`'s
+reason). The event cites the reconciliation through the new link column instead of a
+verification row, because a verification must cite an attempt.
+
+### Decision — three kinds of evidence, each required and none sufficient (the stricter reading)
+
+What the criterion's clauses were read to demand, and where each is enforced:
+
+| Clause | Read as | Enforced by |
+|---|---|---|
+| *cannot be produced without a human asserting what they observed* | a named person **and** what they saw, never defaulted | CLI `required=True` for `--observed-by` and `--note`; `_require_assertion` before any read; `_require_assertion_text` in the writer; `016`'s non-blank clauses on both columns |
+| — and a human alone is not enough | the program's own refetch must agree | only `confirmed` proceeds; `016` refuses a snapshot whose `$.outcome` is not `confirmed` |
+| — and neither is a refetch | the post must be one this program reached | the unreleased reservation, the approval's digest, and a `forecast_intent` for the record whose payload re-hashes to that digest (`016` cites the intent row; the writer checks the rest) |
+| *names the attempt* | the identity the post carried | the writer derives it from the **stored** reservation's key (`lifecycle.live_attempt_id_for_key`, which `submission_live.live_attempt_id` delegates to) and accepts none from its caller; `016` pins its shape and refuses one an attempt row holds |
+| *spends or releases its key reservation honestly* | spend when the platform shows it; release is `release-key` when it does not | a reconciled key reads as spent everywhere; `016` refuses a release of it and an attempt row under it; an `absent` refetch refuses and names `release-key` |
+| *no receipt is invented for a response nobody captured* | no attempt row in either shape | the reconciliation carries no receipt field; a captured artifact is pinned by path and sha256 |
+| *the append-only guarantee is not weakened* | new rows only; nothing existing rewritten beyond the marked hunks | block triggers on the new table; the `APPEND_ONLY_TABLES` probes include it; no existing table rebuilt |
+
+The tournament's `reconcile_forecast` already confirms a post on the program's refetch alone,
+in the journal. That is the design this criterion rules out for the attribution ledger.
+
+### Decision — nothing the operator types is evidence of what was posted
+
+M2-707's lesson: a caller-supplied digest can never establish a claim about what a record
+derives. The command takes a record id, a name and a note. The digest is the approval's, the key
+is derived from it, the reservation is the one holding that key, the payload is the intent's
+and must re-hash to the digest, and the artifact path is derived from the key. An account read
+from the token must be the intent's account by exact type (`42.0 == 42` is refused), because the
+refetch reads *that* account's forecasts.
+
+### Decision — a present artifact must bind, an unreadable one refuses, and only absence is "not captured"
+
+A file at the post's path that disagrees with the post — key, attempt, record, question, or a
+payload that does not re-hash to the approval's digest — is refused rather than skipped:
+skipping it would record "no receipt was captured" beside one that was. An unreadable file is
+refused for the same reason. The bytes are read once and hashed, and the same text is validated
+through `parse_submission_artifact`, so the pinned digest is of the bytes that were checked.
+
+### Decision — refuse locally first, read the platform outside the lock, re-derive inside it
+
+Every local refusal happens before the CLI builds a poster, so no `METACULUS_TOKEN` is needed
+to learn a record is not in this state (`verify-submission` builds the poster first; this does
+not copy that). The GET happens outside any transaction — M2-708 rejected holding a write lock
+across a network call. Then one `BEGIN IMMEDIATE` re-runs `find_unrecorded_post` and refuses
+unless the evidence is equal to what the refetch was judged against, so a release, a
+reconciliation or an attempt that lands during the read is refused rather than recorded over.
+
+### Decision — the lifecycle trigger rewrite is three hunks, and a test proves nothing else changed
+
+`016` recreates `009`'s trigger with exactly: one line in the verification-link clause
+(`AND NEW.submission_reconciliation_id IS NULL`), one new clause refusing a reconciliation link
+on any event but `submission_confirmed` or beside any other link, and one ownership clause. A
+single clause over the new link, rather than a new arm in each of the six link clauses that
+cover the eleven event types, leaves every other clause byte-identical to `009`.
+`test_016_rewrites_009s_lifecycle_trigger_only_in_its_marked_hunks` strips the marked hunks and
+asserts the remainder equals `009`'s body, and a second test asserts the trigger the database
+holds is the one the file writes.
+
+### Decision — a reconciled key is spent, and `010`'s own clause already holds it
+
+A reconciled reservation never gets a release row, so `010`'s "already reserved and not
+released" clause refuses a new claim on the key at the layer that cannot be raced, and `012`'s
+whole-question guard keeps counting it. The two new triggers close what those do not: a release
+written after the reconciliation, and an attempt row under the key or the attempt id — which
+would be two records of one post. On the live path neither can happen (nothing can claim the
+key to post); the triggers hold against a writer that did not go through that path.
+
+### Deviation — spent reservations are no longer "standing" (owner-approved)
+
+Both reservation readers now exclude a reservation spent by an attempt **or** a reconciliation,
+through one predicate. That widens a contract M2-708 published. Only the CLI's listings change:
+`release-key` says there is nothing to release for a posted forecast instead of listing the
+spent reservation and then refusing it, and `submit`'s refusal hint no longer tells an operator
+to release a key a post already spent. Both writers check the attempt before the live read, so
+their outcomes are unchanged — `test_submission.py` passes unmodified. Closed as a class because
+this branch had to touch both readers for reconciled keys anyway; excluding only reconciled ones
+would have left the two readers disagreeing about what "standing" means.
+
+### Deviation — `unrecorded-posts`, a read-only listing the criterion does not name
+
+The not-captured shape prints nothing, so an operator cannot be told a record id. A command that
+can record the post is not usable without a way to find it, and the runbook's rule is to reach
+for a command rather than `sqlite3`. The listing reads the ledger only and says it is a list of
+places to look: a process killed between the intent and the POST leaves identical rows with
+nothing posted.
+
+### Deviation — four older-ledger tests seed raw, and the artifact parser gained a `RecursionError`
+
+`test_score_ledger.py`'s two 014->015 upgrade tests and `test_resolution_ledger.py`'s two
+013->014 ones seeded an older ledger through this build's writers; `_append_event` now names
+`016`'s column, which those ledgers lack. They seed raw now
+(`resolution_rows.walk_to_submitted_raw`, `score_rows.seed_resolved_raw`), which is how
+`test_lifecycle.py`'s `_seed_v8_ledger` already builds an older ledger. Splitting
+`parse_submission_artifact` out of `read_submission_artifact` also added `RecursionError` to the
+JSON parse's except: a deeply nested document exhausts the parser's stack and is not a
+`ValueError`, and the reconciliation reads this file as untrusted.
+
+### Deviation — four commit-pinned `.gitleaksignore` entries
+
+CI's gitleaks `generic-api-key` rule read a fabricated idempotency key passed as `key=` at the end
+of four raw-SQL helper calls in `740d4d1` as a credential (entropy 3.547) — the M2-708 class, not a
+planted secret. Reproduced with the pinned gitleaks 8.30.1 against the branch range. The literal
+moved to a module constant named without the rule's keyword, a rescan of the branch range and of
+`--all` finds nothing, and the four historical findings are pinned by fingerprint because that
+commit stays reachable.
+
+### Rejected — transcribing the captured receipt into `submission_attempts`
+
+See the first decision. It also would have made two paths to `submitted` for one fact, and
+refused the shape an interrupt produces.
+
+### Rejected — an attempt row flagged `receipt_captured = 0`
+
+`success` still has to hold 0 or 1. A column whose meaning is "ignore that other column" is a
+guessed bit with a note beside it, and every reader of `success` — `AttemptSummary`, the
+exports — would read a failure nobody observed.
+
+### Rejected — a new release reason for a post that landed
+
+A release means the key is free again. That is false here, and `010`'s release trigger refuses a
+release of a consumed reservation for exactly that reason; recording the release first and the
+attempt second would sneak past the clause rather than satisfy it.
+
+### Rejected — accepting a payload digest, or a payload, from the operator
+
+M2-707: a value a caller supplies cannot establish what a record derives. Every digest here is
+read from a row the program wrote.
+
+### Rejected — refusing `policy:`-prefixed actors
+
+The automatic approval's actor is `policy:launch-v1:<hash>`, and refusing that prefix looked like
+a cheap proof that the program never reconciles on its own. A string prefix is not an identity
+check, and the boundary that actually holds — a required flag with no default, and a writer no
+program path calls — is `approve`'s and `release-key`'s. Refusing the prefix would be a guard that
+reads as more than it is.
+
+### Deferred (do not read the absence as an omission)
+
+- **Alerting on the silent route — M1-342.** The worker confirming a forecast in the journal
+  while its lifecycle record is not `submitted` should page. That is a change to what the live
+  worker does and it is not this branch's.
+- **A key released for a post that landed — M2-716.** `016` refuses to reconcile a released
+  reservation, deliberately: the ledger would hold both answers to one question. The warning
+  before every release is what prevents it; recovery needs its own correction record.
+- **The `(success=False, refetch=absent)` cell for a post that landed late.** A POST that raised,
+  whose three refetches saw nothing, and that landed afterwards is recorded terminal `failed`
+  when the ledger write *succeeds*. That is the M2-711 partition, not this state, and this item
+  does not reach it.
+- **A read-only `show` — M1-611.** `unrecorded-posts` lists record ids only.
+- **The one-event-per-reconciliation index is unreachable.** `submission_confirmed` leaves
+  `approved`, so a second event citing the same reconciliation is refused by the transition
+  clause before the index. It is kept for `003`'s reason: every link column gets the rule.
+
+### Standing risk — not verifiable offline
+
+- **The refetch reads `my_forecasts.history`.** A reconciliation is confirmed the way every
+  other refetch is (M2-704), against Metaculus returning the account's own latest forecast. It
+  has been right for all 28 live posts; nothing offline can prove the platform keeps doing it.
+- **The intent is LAUNCH's journal format.** The reconciliation reads `forecast_intent`'s `data`
+  as `submission_policy` writes it. The tests drive the real policy, so a change to that shape
+  fails them; a live ledger written by an older policy is not covered, and none holds an
+  unrecorded post.
+- **The evidence-equality branch is not reachable without hostile local state.** A release, a
+  reconciliation or an attempt landing during the refetch makes the re-derivation *refuse*
+  rather than differ; only a rewritten artifact or intent could make it differ. It is kept
+  because it is cheap and the alternative is recording against evidence nobody re-checked.
+
+### On the mutation pass
+
+106 mutants, run after the implementation was committed: every clause of `016` neutered as
+`WHERE 0 AND (<whole predicate>)` (and each arm of the two OR clauses, and each arm of the
+lifecycle hunk, separately), every Python guard in the writer, the key readers and the
+orchestrator set to `if False`, each arm of the two pure checks removed. `__pycache__` cleared
+before every run, a green baseline confirmed by exit code first and again after restoring, and
+every kill read for the assertion that failed. **91 killed, 15 survived** on the first pass,
+over `test_submission_reconciliations.py`, the property file, `test_submission_reconcile.py`,
+`test_submission.py` and `test_lifecycle.py`.
+
+The survivors, and what each one turned out to be:
+
+| Survivor | Why it survived | Resolution |
+| --- | --- | --- |
+| `submission_reconciliations_block_delete` neutered | The append-only probes seed a reconciliation its event cites, so the foreign key from `lifecycle_events` refused the DELETE before the block trigger mattered | New probe on a row no event cites, asserting the append-only message — killed |
+| outstanding-uncertainty refusal | No orchestrator test held an uncertain attempt | New test: a lost POST response recorded as `submission_uncertain` is sent to `verify-submission` — killed |
+| unbound (pre-`011`) approval refusal | No test held one | New test, the pre-`011` shape `test_submission.py` already builds — killed |
+| intent digest vs approval digest | On the live path the policy writes an intent only after the key gate, so they always agree | The intent is a stored value, so the guard stays; new test with a disagreeing raw journal row — killed |
+| `type(question_id) is not int` / `type(post_id) is not int` in `read_intent`; the same in `check_artifact_binds` | JSON gives `7.0 == 7`, and no test or draw supplied a float id | Unit cases for `7.0`/`8.0`; the property's junk strategy gained both and pins them with `@example` — killed |
+| artifact `request_payload` not an object | The canonical-hash step refused it too, with a different message | Unit case asserting this guard's message — killed |
+| the standing-reservation hint's reconcile line | The test asserted the command name, which the next line also prints | Asserts every line — killed |
+| "attempt already recorded" and "already reconciled" in `find_unrecorded_post` | **Unreachable**: an attempt under the key leaves the record `submitted`, `failed` or holding an uncertainty, and a reconciliation leaves it `submitted`, so the status and uncertainty checks refuse first | **Removed.** The writer's mirror and `016` still refuse both |
+| payload question type vs record type | **Equivalent**: a payload that re-hashes to the approval's digest is the approval's payload, type included | **Removed** |
+| "the snapshot omits its values" | **Unreachable** for a confirmed verdict: `submission_live`'s caps keep a confirming envelope under `MAX_BODY_LENGTH`, and its own property fails if a cap is removed | **Removed** |
+| `lifecycle_events_one_event_per_reconciliation` made non-unique | A second event citing a reconciliation is refused by the transition clause (the record has left `approved`) or the ownership clause first | **Kept** — `003`'s rule that every link column gets one; recorded as Deferred above |
+| the evidence-equality re-check | Only hostile local state makes the re-derived evidence *differ*; a reachable change makes it *refuse* | **Kept** — recorded as a standing risk above |
+
+A re-run of the eleven that stayed in the code: nine killed, each by the test written for it;
+the index and the equality re-check survive as documented.
+
+### On the property pass
+
+Six properties in `tests/property/test_submission_reconcile_properties.py`, 200 examples each
+under the `dev`/`ci` profiles (150 for the writer fuzz):
+
+- `read_intent` and `check_artifact_binds` are **iff**: a draw that departs from the valid
+  intent or envelope in one field — under the check's own comparison, so `7.0` departs from `7`
+  and an equal value does not — is refused, and the undeparted one is accepted. Every refusal is
+  checked for the planted secret in its message and its rendered traceback.
+- Both raise only `ReconciliationError` over arbitrary input: hostile text, bytes, a 100,000-deep
+  JSON array (a `RecursionError` unless caught), `NaN`, recursive JSON of hostile keys; no refusal
+  chains a cause or an unsuppressed context.
+- `record_submission_reconciliation`, fed junk in one field at a time over a freshly seeded
+  unrecorded post, raises only `LifecycleError`, and a refusal leaves both tables' counts
+  unchanged and no transaction open.
+- `LifecycleEvent`'s persisted form stays stable with the new link drawn as hostile text
+  (`test_lifecycle_properties.py`, widened).
+
+**Run against broken code, by itself.** The property file alone, over 29 mutants of the two checks
+and the writer's validators: every arm of both checks killed — after the discriminating draws
+(`question_id=7.0`, `post_id=8.0`, `account_id=42.0`, a well-formed unauthorized payload) were
+pinned with `@example`, because at roughly 0.4% per random draw the first run left
+`type(post_id) is not int` and the artifact re-hash alive. Eight survive by design and are killed
+by the unit tests' messages instead: the writer's six field validators (the trigger still refuses,
+so the only property the fuzz asserts — the error type — holds), and the digest-shape and
+payload-object guards in `read_intent`, which a re-hash mismatch also refuses.
+
+### Round 1 — two blocking findings, both reproduced, both closed
+
+`GPT_REVIEW_RESPONSE_M2-713_r1.md`, against `d80d100` (the request HEAD). **CHANGES REQUESTED.**
+All ten risk claims were examined; eight came back Safe, and the two that did not are the two
+findings. Both were reproduced by execution on `d80d100` before any fix was written.
+
+**B1 — the writer accepted an attempt id unrelated to the reservation's key.**
+`SubmissionReconciliation.attempt_id` was validated for shape only. Reproduced: `wjlive-1-` and
+64 zeroes was recorded, and the event returned `submitted`, against a reservation whose key derives
+`wjlive-1-e272b66f…`. The notes above had even said the writer could not check the derivation,
+because SQLite has no sha256. That was true of the schema and false of the writer, which had the
+stored key in hand. The fix is the one M2-703's round 1 settled: a value the writer can derive is a
+second source of truth if a caller may also supply it, so **the field is removed**, not
+cross-checked. `_require_reconcilable` now returns the attempt id derived from the key on the
+reservation row it read. The derivation moved to `lifecycle.live_attempt_id_for_key` because
+`lifecycle` cannot import `submission_live`, and `submission_live.live_attempt_id` now delegates to
+it, so there is still one rule.
+`test_moving_the_derivation_did_not_change_a_live_attempt_id` pins the old body's output with an
+independent oracle, because that rule names every attempt the live worker records.
+
+**B2 — `refetched_at_utc` was the command's entry time.** The CLI passed `datetime.now()` as
+`occurred_at` before the identity read and the retrying refetch. Reproduced: the stored instant
+preceded the confirming GET by about 2 ms with no retry, and by the refetch pauses with retries.
+The orchestrator now takes an injectable `clock` and reads it **after** the confirming
+classification, and the CLI passes nothing.
+
+**Non-blocking, fixed anyway:** argparse's `required=True` accepts `" "`, so a blank
+`--observed-by` or `--note` reached the ledger read and the poster construction before it was
+refused. That falsified risk claim 5's absolute ordering. `check_assertion` is now public and
+`reconcile-submission` calls it first.
+
+Five new regressions were run against `d80d100`'s four source files and **all five fail there**:
+- the field-absence test;
+- the CLI stamp-order test;
+- both parametrizations of the blank-assertion test;
+- the virtual-clock retry test.
+
+A mutation check on the fixes killed all five mutants, each by the test written for it:
+- the writer's derivation made constant;
+- the derivation's hash input altered;
+- the stamp read moved to command entry;
+- the CLI's assertion check removed;
+- the orchestrator's assertion check removed.
+
+
+### Round 2 — approved
+
+`GPT_REVIEW_RESPONSE_M2-713_r2.md`, against `c652e12` (the request HEAD): **APPROVE**. B1 and B2
+are marked CLOSED; the round found no new blocking findings and no non-blocking observations,
+and it recorded the blank-assertion observation as resolved. All five remediation risk claims
+came back Safe. The reviewer ran the affected unit modules, both property suites, ruff and strict
+mypy rather than reading them. Two rounds.

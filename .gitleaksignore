@@ -64,3 +64,18 @@
 afb71b5d01ae7a89a58daa26872570e42d7f87b7:tests/unit/test_cli_submit.py:generic-api-key:457
 37c1ecaf373b35b3e6417b80c707e80c83077b9e:tests/unit/test_submission.py:generic-api-key:917
 37c1ecaf373b35b3e6417b80c707e80c83077b9e:tests/unit/test_submission.py:generic-api-key:1314
+
+# ---------------------------------------------------------------------------
+# M2-713: four false positives of the M2-708 class.
+#
+# Not a planted secret. `generic-api-key` matched a `key=` keyword argument whose value was a
+# fabricated idempotency key, quoted, at the end of a raw-SQL test helper call -- entropy 3.547.
+# (Not quoted here: this comment would be a fifth finding.) Reproduced with
+# gitleaks 8.30.1 against the branch range, and only in the commit that introduced the calls.
+# The literal has since moved to a module constant named without the rule's keyword
+# (`SECOND_CLAIM`), and the rescan of the branch finds nothing in any later commit. As above,
+# the original commit stays reachable, so it is pinned by fingerprint: line and commit only.
+740d4d1c4672582f55a6c8391c0f2d8e88be04ca:tests/unit/test_submission_reconciliations.py:generic-api-key:397
+740d4d1c4672582f55a6c8391c0f2d8e88be04ca:tests/unit/test_submission_reconciliations.py:generic-api-key:409
+740d4d1c4672582f55a6c8391c0f2d8e88be04ca:tests/unit/test_submission_reconciliations.py:generic-api-key:764
+740d4d1c4672582f55a6c8391c0f2d8e88be04ca:tests/unit/test_submission_reconciliations.py:generic-api-key:770

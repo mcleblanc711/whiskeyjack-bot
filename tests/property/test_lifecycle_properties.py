@@ -590,6 +590,7 @@ def test_each_events_from_status_is_the_previous_events_destination(
 @given(
     record_id=HOSTILE_TEXT,
     attempt_id=st.none() | HOSTILE_TEXT,
+    reconciliation_id=st.none() | HOSTILE_TEXT,
     occurred=HOSTILE_TEXT,
     event_type=st.sampled_from(EVENT_TYPES),
     from_status=st.sampled_from(STATUSES),
@@ -598,6 +599,7 @@ def test_each_events_from_status_is_the_previous_events_destination(
 def test_events_survive_the_persisted_json_form_unchanged(
     record_id: str,
     attempt_id: str | None,
+    reconciliation_id: str | None,
     occurred: str,
     event_type: str,
     from_status: str,
@@ -633,6 +635,8 @@ def test_events_survive_the_persisted_json_form_unchanged(
         submission_verification_id=None,
         resolution_event_id=None,
         score_event_id=None,
+        # M2-713's text link, drawn like the attempt link: the other text-valued detail id.
+        submission_reconciliation_id=reconciliation_id,
         occurred_at_utc=occurred,
         created_at_utc=TS,
     )

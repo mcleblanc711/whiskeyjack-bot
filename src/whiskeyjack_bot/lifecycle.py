@@ -1,4 +1,4 @@
-"""Lifecycle state machine and atomic event writers (M1-603, M1-606).
+"""Lifecycle state machine and atomic event writers (M1-603, M1-606, M2-713).
 
 A forecast record is written once, as a ``draft``, and is never updated. Every later
 state -- validated, approved, submitted, failed, resolved, scored -- exists only as an
@@ -17,6 +17,12 @@ An uncertainty is not a resting place, though. What resolves it is a refetch --
 carries the record to ``submitted`` or to ``failed``. Recording that observation as another
 *attempt* would mean claiming a second live post, which is the retry the handoff exists to
 block; see :class:`SubmissionVerification`.
+
+A post can also go unrecorded altogether: made, and then the ledger refused the attempt row
+or the process died before writing it. :func:`record_submission_reconciliation` is the way
+out of that (M2-713). It writes no attempt -- there is no honest receipt to write -- but a
+reconciliation row carrying a person's assertion and the program's own confirming refetch,
+and the same ``submission_confirmed`` event a verification produces.
 
 Blocking that retry is **not** something this module can do, and round 4 removed the
 attempt to. Every writer here runs after the fact it records, so refusing a write cannot
@@ -64,6 +70,8 @@ Purely local file I/O: no network access on any path through here.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterator, Sequence
@@ -364,6 +372,7 @@ class LifecycleEvent:
     submission_verification_id: int | None
     resolution_event_id: int | None
     score_event_id: int | None
+    submission_reconciliation_id: str | None
     occurred_at_utc: str
     created_at_utc: str
 
@@ -455,6 +464,54 @@ class SubmissionVerification:
     outcome: VerificationOutcome
     observed_at_utc: datetime
     refetched_forecast_snapshot: str | None = None
+
+
+@dataclass(frozen=True)
+class SubmissionReconciliation:
+    """A post the ledger never recorded, and the evidence that it reached the platform (M2-713).
+
+    **Not a ``SubmissionAttempt``, and it cannot be one.** An attempt row is the receipt of a
+    request -- whether the POST returned, when it finished, what the refetch beside it saw --
+    and in this state nobody captured that. ``success`` is ``NOT NULL CHECK (0, 1)`` since
+    ``001``, so an attempt row would have to guess it, and a guessed ``success`` on an
+    append-only table is the claim ``CODEX_HANDOFF.md`` prohibits. A captured artifact does
+    not rescue it either: the artifact carries no ``detail_code``, and the one an uncertain
+    event needs is not always derivable from what it does carry.
+
+    What a reconciliation holds instead is evidence, from three owners:
+
+    - **the program, before the post** -- ``reservation_id`` (the claim the post was made
+      under) and ``intent_event_id`` (the ``forecast_intent`` journal row
+      ``submission_policy`` commits immediately ahead of every POST);
+    - **the program, now** -- ``refetched_forecast_snapshot``, a refetch whose outcome is
+      ``confirmed``, taken at ``refetched_at_utc``;
+    - **a person** -- ``observed_by`` and ``note``, both required, for ``approve``'s reason:
+      a claim about what someone saw on the platform is never inferred from the machine.
+
+    **There is no ``attempt_id`` field, and that is the round-1 fix.** The row names the
+    attempt by the identity :func:`live_attempt_id_for_key` gives a post under the reservation's
+    key -- the one its attempt row would have carried -- and the writer derives it from the
+    *stored* reservation. Accepting it as a field let a well-formed id for some other key be
+    recorded against this post (M2-703's rule: a value the writer can derive is a second source
+    of truth if a caller may also supply it). ``artifact_path`` and
+    ``artifact_sha256`` pin the captured artifact when one exists -- both or neither -- and
+    are never read into the row: the file is evidence the row points at, not a receipt the
+    row claims.
+
+    ``created_at_utc`` is absent for :class:`SubmissionAttempt`'s reason, and so is the
+    reconciliation's own identifier: the writer mints it, so no caller can supply one that
+    collides with a row it cannot see.
+    """
+
+    reservation_id: str
+    request_payload_sha256: str
+    intent_event_id: str
+    observed_by: str
+    note: str
+    refetched_at_utc: datetime
+    refetched_forecast_snapshot: str
+    artifact_path: str | None = None
+    artifact_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1389,6 +1446,142 @@ def record_submission_verification(
         )
 
 
+# A reconciliation's own identifier, minted by the writer. `wjres-`/`wjrel-` are the
+# reservation-side tags (`submission.py`); this is a third tag in the same `<tag><32 hex>`
+# shape, in a column of its own, so it is never compared with either.
+_RECONCILIATION_PREFIX = "wjrec-"
+
+# The visible scheme tag on a live attempt id. It lives here, with the one derivation below,
+# because the reconciliation writer has to derive the id and `submission_live` imports this
+# module -- the reverse import would close a cycle. `submission_live.live_attempt_id` delegates
+# to :func:`live_attempt_id_for_key`, so there is one rule, and `016` pins the same shape.
+LIVE_ATTEMPT_TAG = "wjlive-1-"
+
+
+def live_attempt_id_for_key(idempotency_key: str) -> str:
+    """The deterministic attempt id a live post under this key carries (M2-704, moved here).
+
+    ``submission_live.live_attempt_id`` documents why it is derived rather than minted and
+    hashed rather than copied; that function now calls this one. Moved for M2-713's round 1:
+    a reconciliation must name the attempt its post carried, and the only honest source for
+    that is this derivation applied to the reservation the ledger stored.
+    """
+    key = _require_identifier(idempotency_key, "idempotency_key")
+    return LIVE_ATTEMPT_TAG + hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def record_submission_reconciliation(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str,
+    reconciliation: SubmissionReconciliation,
+    occurred_at: datetime,
+) -> LifecycleEvent:
+    """Record a post the ledger never wrote down, and its ``submission_confirmed`` event (M2-713).
+
+    The state this closes: a forecast live on Metaculus, a key reservation standing, no
+    ``submission_attempts`` row and the record still ``approved`` -- because the ledger refused
+    the attempt write after the post, or the process died before making it. Nothing else in
+    the ledger could move that record without an attempt row, and an attempt row could only
+    be written by inventing the receipt nobody captured; see :class:`SubmissionReconciliation`.
+
+    One transaction, two rows: the reconciliation and the event citing it, so no caller can
+    observe one without the other -- this module's atomicity contract. The event is
+    ``submission_confirmed``, approved -> submitted, the event that already means "a refetch
+    confirmed an outcome that was not settled at the time". ``submitted`` is not used: it
+    claims a successful, refetch-verified attempt, and none exists.
+
+    **What is enforced, and where.** ``016``'s trigger is the binding check and holds against a
+    raw INSERT; the probes below restate it so a caller gets a field-level message rather than
+    ``the ledger rejected this write``. ``attempt_id`` is not accepted at all: it is derived
+    here, inside the transaction, from the key of the reservation the ledger stored
+    (:func:`live_attempt_id_for_key`). SQLite has no sha256, so ``016`` checks only its shape and
+    that no attempt row holds it; this writer is the one path that sets it, and it cannot be
+    handed a different one.
+
+    Persistence only: the refetch the snapshot records was made by the caller.
+    """
+    if type(reconciliation) is not SubmissionReconciliation:
+        # Exact type, for `record_submission_attempt`'s reason: a subclass can turn each
+        # attribute read below into a call into caller-supplied code.
+        raise LifecycleError("reconciliation must be a SubmissionReconciliation")
+    identifier = _require_identifier(record_id, "record_id")
+    occurred = _require_utc(occurred_at, "occurred_at")
+    reservation_id = _require_identifier(
+        reconciliation.reservation_id, "reconciliation.reservation_id"
+    )
+    digest = _require_sha256(
+        reconciliation.request_payload_sha256, "reconciliation.request_payload_sha256"
+    )
+    intent_event_id = _require_identifier(
+        reconciliation.intent_event_id, "reconciliation.intent_event_id"
+    )
+    observed_by = _require_assertion_text(
+        reconciliation.observed_by, "reconciliation.observed_by", max_length=MAX_ACTOR_LENGTH
+    )
+    note = _require_assertion_text(
+        reconciliation.note, "reconciliation.note", max_length=MAX_NOTE_LENGTH
+    )
+    refetched_at = _require_utc(reconciliation.refetched_at_utc, "reconciliation.refetched_at_utc")
+    snapshot = _require_confirming_snapshot(reconciliation.refetched_forecast_snapshot)
+    artifact_path = (
+        None
+        if reconciliation.artifact_path is None
+        else _require_identifier(reconciliation.artifact_path, "reconciliation.artifact_path")
+    )
+    artifact_sha256 = (
+        None
+        if reconciliation.artifact_sha256 is None
+        else _require_sha256(reconciliation.artifact_sha256, "reconciliation.artifact_sha256")
+    )
+    if (artifact_path is None) != (artifact_sha256 is None):
+        raise LifecycleError(
+            "reconciliation.artifact_path and reconciliation.artifact_sha256 are recorded "
+            "together or not at all"
+        )
+
+    reconciliation_id = _RECONCILIATION_PREFIX + uuid.uuid4().hex
+    with transaction(conn):
+        attempt_id = _require_reconcilable(
+            conn,
+            record_id=identifier,
+            reservation_id=reservation_id,
+            digest=digest,
+            intent_event_id=intent_event_id,
+            refetched_at=refetched_at,
+        )
+        _insert(
+            conn,
+            "INSERT INTO submission_reconciliations (reconciliation_id, reservation_id, "
+            "forecast_record_id, attempt_id, request_payload_sha256, intent_event_id, "
+            "artifact_path, artifact_sha256, observed_by, note, refetched_at_utc, "
+            "refetched_forecast_snapshot, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reconciliation_id,
+                reservation_id,
+                identifier,
+                attempt_id,
+                digest,
+                intent_event_id,
+                artifact_path,
+                artifact_sha256,
+                observed_by,
+                note,
+                refetched_at,
+                snapshot,
+                _utc_text(_utcnow()),
+            ),
+        )
+        return _append_event(
+            conn,
+            record_id=identifier,
+            event_type="submission_confirmed",
+            submission_reconciliation_id=reconciliation_id,
+            occurred_at_utc=occurred,
+        )
+
+
 def record_resolution_observation(
     conn: sqlite3.Connection,
     *,
@@ -1853,7 +2046,9 @@ def read_pipeline_failure_events(
 _EVENT_COLUMNS = (
     "event_id, forecast_record_id, event_seq, event_type, from_status, to_status, "
     "detail_code, approval_event_id, submission_attempt_id, submission_verification_id, "
-    "resolution_event_id, score_event_id, occurred_at_utc, created_at_utc"
+    "resolution_event_id, score_event_id, occurred_at_utc, created_at_utc, "
+    # 016 (M2-713), appended where ADD COLUMN put it: the mapper indexes positionally.
+    "submission_reconciliation_id"
 )
 
 # Spelled out rather than `SELECT *` for the reason _EVENT_COLUMNS is: the row mapper
@@ -1876,6 +2071,7 @@ def _append_event(
     submission_verification_id: int | None = None,
     resolution_event_id: int | None = None,
     score_event_id: int | None = None,
+    submission_reconciliation_id: str | None = None,
     occurred_at_utc: str,
 ) -> LifecycleEvent:
     """Append one lifecycle row, in a transaction, and return it as stored.
@@ -1911,7 +2107,8 @@ def _append_event(
             "(forecast_record_id, event_seq, event_type, from_status, to_status, "
             "detail_code, approval_event_id, submission_attempt_id, "
             "submission_verification_id, resolution_event_id, score_event_id, "
-            "occurred_at_utc, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "submission_reconciliation_id, occurred_at_utc, created_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
                 event_seq,
@@ -1924,6 +2121,7 @@ def _append_event(
                 submission_verification_id,
                 resolution_event_id,
                 score_event_id,
+                submission_reconciliation_id,
                 occurred_at_utc,
                 _utc_text(_utcnow()),
             ),
@@ -2013,6 +2211,137 @@ def _require_hash_binds(conn: sqlite3.Connection, record_id: str, digest: str) -
             "forecast_sha256 does not match the stored hash of this forecast record; "
             "the forecast changed and any prior approval no longer binds"
         )
+
+
+def _require_assertion_text(value: object, field: str, *, max_length: int) -> str:
+    """Non-blank storable text with no NUL: a person's name, or what they said they saw.
+
+    :func:`_require_text` with :func:`_require_identifier`'s two extra refusals, at a
+    caller-chosen bound. An ``approve`` note may be blank or absent; this one may not, because
+    the row it sits on exists to record an assertion, and a blank assertion is none. NUL is
+    refused for 004's reason -- SQLite's ``length()`` stops at it, so ``016``'s bound would
+    not see past one.
+    """
+    text = _require_text(value, field, max_length=max_length)
+    if not text.strip():
+        raise LifecycleError(f"{field} must not be blank")
+    if "\x00" in text:
+        raise LifecycleError(f"{field} must not contain a NUL character")
+    return text
+
+
+def _require_confirming_snapshot(value: object) -> str:
+    """Refetch evidence whose recorded outcome is ``confirmed``, or raise.
+
+    ``016``'s clause, restated: the snapshot is the program's half of the evidence and the
+    half that carries the record to ``submitted``, so a snapshot recording any other verdict,
+    or none, is refused. Parsed only to read one member; the rest is
+    ``submission_live.build_verification_snapshot``'s published shape and is not interpreted
+    here.
+    """
+    text = _require_text(
+        value, "reconciliation.refetched_forecast_snapshot", max_length=MAX_BODY_LENGTH
+    )
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        parsed = None
+    if not isinstance(parsed, dict) or parsed.get("outcome") != "confirmed":
+        raise LifecycleError(
+            "reconciliation.refetched_forecast_snapshot must record a confirming refetch; a "
+            "reconciliation is only auditable if it stores what the platform showed"
+        )
+    return text
+
+
+def _require_reconcilable(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str,
+    reservation_id: str,
+    digest: str,
+    intent_event_id: str,
+    refetched_at: str,
+) -> str:
+    """Fail readably when a reconciliation could not describe an unrecorded post; return the
+    attempt id its post carried, derived from the key on the stored reservation row.
+
+    ``016``'s probes in the trigger's order, each with a message that says what to do. The
+    trigger is the enforcement; see :func:`_require_verifiable_attempt` for why both hold.
+    Timestamps are compared as text for that function's reason: both sides are the canonical
+    fixed-width form.
+    """
+    _require_stored_record(conn, record_id)
+    reservation = _fetch_one(
+        conn,
+        "SELECT idempotency_key, reserved_at_utc FROM submission_key_reservations "
+        "WHERE reservation_id = ? AND forecast_record_id = ?",
+        (reservation_id, record_id),
+    )
+    if reservation is None:
+        raise LifecycleError(
+            "reconciliation.reservation_id does not name a key reservation held against this "
+            "forecast record"
+        )
+    attempt_id = live_attempt_id_for_key(_stored_text(reservation[0], "idempotency_key"))
+    if _fetch_one(
+        conn, "SELECT 1 FROM submission_key_releases WHERE reservation_id = ?", (reservation_id,)
+    ):
+        raise LifecycleError(
+            "this reservation was released, which records that nothing was posted under it"
+        )
+    if _fetch_one(
+        conn,
+        "SELECT 1 FROM submission_reconciliations WHERE reservation_id = ? OR attempt_id = ?",
+        (reservation_id, attempt_id),
+    ):
+        raise LifecycleError("this post has already been reconciled")
+    if _fetch_one(
+        conn,
+        "SELECT 1 FROM submission_attempts WHERE idempotency_key = ? OR attempt_id = ?",
+        (reservation[0], attempt_id),
+    ):
+        raise LifecycleError(
+            "a submission attempt already records the post made under this reservation; "
+            "there is nothing unrecorded to reconcile"
+        )
+    if not _fetch_one(
+        conn,
+        "SELECT 1 FROM approval_events WHERE forecast_record_id = ? AND decision = 'approved' "
+        "AND payload_sha256 = ?",
+        (record_id, digest),
+    ):
+        # Neither digest is printed, `_require_hash_binds`'s rule.
+        raise LifecycleError(
+            "reconciliation.request_payload_sha256 is not the payload this record's approval "
+            "authorized"
+        )
+    status = current_status(conn, record_id)
+    if status != "approved":
+        # A vetted vocabulary member, so naming it is safe and actionable.
+        raise LifecycleError(
+            f"this forecast record is {status}, not awaiting submission, so there is no "
+            "unrecorded post to reconcile"
+        )
+    if unresolved_uncertainties(conn, record_id):
+        raise LifecycleError(
+            "this record holds a submission attempt whose outcome is unresolved; resolve it "
+            "with verify-submission first"
+        )
+    if not _fetch_one(
+        conn,
+        "SELECT 1 FROM tournament_events WHERE event_id = ? AND kind = 'forecast_intent' "
+        "AND scope = ?",
+        (intent_event_id, record_id),
+    ):
+        raise LifecycleError(
+            "reconciliation.intent_event_id does not name this record's durable submission intent"
+        )
+    if refetched_at < _stored_text(reservation[1], "reserved_at_utc"):
+        raise LifecycleError(
+            "reconciliation.refetched_at_utc is earlier than the reservation it reconciles"
+        )
+    return attempt_id
 
 
 def _require_verifiable_attempt(
@@ -2126,6 +2455,9 @@ def _event_from_row(row: sqlite3.Row) -> LifecycleEvent:
         if row[10] is None
         else _stored_int(row[10], "resolution_event_id"),
         score_event_id=None if row[11] is None else _stored_int(row[11], "score_event_id"),
+        submission_reconciliation_id=(
+            None if row[14] is None else _stored_text(row[14], "submission_reconciliation_id")
+        ),
         occurred_at_utc=_stored_text(row[12], "occurred_at_utc"),
         created_at_utc=_stored_text(row[13], "created_at_utc"),
     )

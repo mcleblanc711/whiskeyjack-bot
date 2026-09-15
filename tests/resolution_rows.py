@@ -255,6 +255,86 @@ def seed_submitted(
     return record_id
 
 
+def walk_to_submitted_raw(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    forecast_sha256: str = RECORD_SHA,
+    payload_sha256: str = PAYLOAD_SHA,
+) -> None:
+    """:func:`walk_to_submitted`'s ledger, written by raw INSERTs.
+
+    For a ledger *below* the current schema. This build's writers name every column the
+    current schema has, so they cannot write to a ledger a previous build produced -- since
+    M2-713's 016, `lifecycle._append_event` names `submission_reconciliation_id`, which a v14
+    ledger does not have. `test_lifecycle.py`'s `_seed_v8_ledger` is raw for the same reason.
+    """
+    ts = _TS
+    conn.execute(
+        "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
+        "to_status, occurred_at_utc, created_at_utc) "
+        "VALUES (?, 1, 'validated', 'draft', 'validated', ?, ?)",
+        (record_id, ts, ts),
+    )
+    approval_id = conn.execute(
+        "INSERT INTO approval_events (forecast_record_id, decision, actor, forecast_sha256, "
+        "created_at_utc, payload_sha256) VALUES (?, 'approved', 'policy:test', ?, ?, ?)",
+        (record_id, forecast_sha256, ts, payload_sha256),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
+        "to_status, approval_event_id, occurred_at_utc, created_at_utc) "
+        "VALUES (?, 2, 'approved', 'validated', 'approved', ?, ?, ?)",
+        (record_id, approval_id, ts, ts),
+    )
+    conn.execute(
+        "INSERT INTO submission_attempts (attempt_id, forecast_record_id, idempotency_key, "
+        "requested_at_utc, completed_at_utc, request_payload_sha256, success, "
+        "verified_by_refetch, refetch_outcome, created_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'confirmed', ?)",
+        (f"attempt-{record_id}", record_id, f"key-{record_id}", ts, ts, payload_sha256, ts),
+    )
+    conn.execute(
+        "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
+        "to_status, submission_attempt_id, occurred_at_utc, created_at_utc) "
+        "VALUES (?, 3, 'submitted', 'approved', 'submitted', ?, ?, ?)",
+        (record_id, f"attempt-{record_id}", ts, ts),
+    )
+
+
+def seed_submitted_raw(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    question_id: int,
+    post_id: int | None,
+    question_type: str = "binary",
+) -> str:
+    """:func:`seed_submitted`, raw throughout; see :func:`walk_to_submitted_raw`."""
+    seed_record(
+        conn, record_id, question_id=question_id, post_id=post_id, question_type=question_type
+    )
+    walk_to_submitted_raw(conn, record_id)
+    return record_id
+
+
+def resolve_raw(
+    conn: sqlite3.Connection, record_id: str, *, observed_at_utc: str = OBSERVED_AT
+) -> int:
+    """A scorable resolution row and its ``resolved`` event, raw; see :func:`walk_to_submitted_raw`."""
+    resolution_id = insert_resolution_row(conn, record_id, observed_at_utc=observed_at_utc)
+    seq = conn.execute(
+        "SELECT max(event_seq) FROM lifecycle_events WHERE forecast_record_id = ?", (record_id,)
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO lifecycle_events (forecast_record_id, event_seq, event_type, from_status, "
+        "to_status, resolution_event_id, occurred_at_utc, created_at_utc) "
+        "VALUES (?, ?, 'resolved', 'submitted', 'resolved', ?, ?, ?)",
+        (record_id, seq + 1, resolution_id, observed_at_utc, observed_at_utc),
+    )
+    return resolution_id
+
+
 _LOCAL_BRIER = {"binary": "local_brier_binary", "multiple_choice": "local_brier_multiclass"}
 
 
