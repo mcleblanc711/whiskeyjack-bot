@@ -581,3 +581,11 @@ one and discard nothing on that account.
 *exactly* half the two-option Brier, because `0.999` is not exactly `1 - 0.001`; at `p = 0.001`,
 `no` they differ by ~1e-21. The assertion is now `isclose(rel_tol=1e-12, abs_tol=1e-18)`, and the
 docstring says why.
+
+### Review
+
+**Round 1 — APPROVE on `d79a7c6`** (2026-09-15, local Codex against
+`GPT_REVIEW_REQUEST_M4-802_r1.md`, all four gates green in the request). No blocking findings
+and no backlog candidates; each of the nine falsifiable risk claims was marked safe. The
+reviewer ran the focused scoring suite (169 tests) and `ruff check`. This entry is the only
+change after the approved commit.
