@@ -610,7 +610,8 @@ makes no paid call and never reaches the submission path.* Description (amended 
   (the unit's own argv through `cli.main`, with every paid and posting entry point refused).
 - `docs/RUNBOOK.md` — § Scheduled ingestion and scoring (cadence, what a push means, install
   commands), a symptom-index row, and a pointer from step 6.
-- `docs/backlog/backlog.csv` — **M4-806**, **M4-807**, **M1-341** (the deferrals below).
+- `docs/backlog/backlog.csv` — **M4-806**, **M4-807**, **M1-341** (the deferrals below);
+  `docs/backlog/decisions.csv` — **D37**.
 
 **No `src/` change, no `AppConfig` field, no migration, no dependency.** `config_sha256` and the
 live activation cannot be affected by this branch.
