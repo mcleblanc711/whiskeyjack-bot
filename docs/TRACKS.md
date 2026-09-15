@@ -56,6 +56,7 @@ to the registry, and neither is a habit you can form by reflex.
 | M1-331 | feat/m1-331-fingerprint-unordered-lists | whiskeyjack-m1-331 | no | none | 2026-09-14 |
 | M4-801 | feat/m4-801-ingest-resolution-snapshots | whiskeyjack-m4-801 | no | 014 | 2026-09-14 |
 | M4-802 | feat/m4-802-binary-multiclass-scores | whiskeyjack-m4-802 | no | 015 | 2026-09-15 |
+| M4-805 | feat/m4-805-schedule-resolution-ingestion | whiskeyjack-m4-805 | no | none | 2026-09-15 |
 *(Merged and left in place, per the rule below: **D-1001** (PR #95, round-3 approve,
 2026-09-12 — the operator runbook, `docs/RUNBOOK.md`, 21 failure states; it filed six rows,
 of which **M2-713** is Critical: a live post the ledger refused to record, with no

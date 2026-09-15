@@ -1,0 +1,40 @@
+[Unit]
+Description=Whiskeyjack resolution ingestion, then local scoring (MiniBench profile)
+# M4-805. Runs the two operator commands of runbook steps 6 and 7 on a schedule, so the
+# attribution record follows the platform's resolutions without anyone typing them.
+#
+# A separate timer rather than a phase of `tournament run-once`: the poll refuses whenever
+# its activation is disabled, retired or out of window -- which is exactly when resolutions
+# arrive -- it holds the worker lock with a poster built, and an ingestion failure inside it
+# would turn a healthy forecasting poll into a failed unit. See docs/M4-NOTES.md, M4-805.
+#
+# The same pager as the tournament poll: a non-zero exit of either command, or a timeout,
+# fails this unit and starts the notify template. %N is this unit's own name.
+OnFailure=whiskeyjack-notify@%N.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cleblanc/projects/whiskeyjack-bot
+# METACULUS_TOKEN for ingestion's GETs. Nothing on either path reads a provider key.
+EnvironmentFile=/home/cleblanc/projects/whiskeyjack-bot/.env
+Environment=PYTHON_DOTENV_DISABLED=1
+# Importing the pinned SDK imports litellm, which otherwise fetches its cost map over the
+# network at import time. Neither command needs it.
+Environment=LITELLM_LOCAL_MODEL_COST_MAP=True
+# Two commands, run in order. systemd runs a later ExecStart only if the earlier one exited 0,
+# and neither line carries a "-" prefix (which would ignore its failure): so `score` never runs
+# after an ingestion that failed -- including one that could not open the ledger -- and either
+# failure fails the unit. Verified by execution on systemd 255 (docs/M4-NOTES.md, M4-805).
+# `ingest-resolutions` makes GETs only; `score` makes no network call at all. Both are
+# idempotent, so a re-run or an overlap with a manual run writes nothing twice.
+ExecStart=/home/cleblanc/projects/whiskeyjack-bot/.venv/bin/python -m whiskeyjack_bot.cli ingest-resolutions --config /home/cleblanc/projects/whiskeyjack-bot/config/tournament.yaml
+ExecStart=/home/cleblanc/projects/whiskeyjack-bot/.venv/bin/python -m whiskeyjack_bot.cli score --config /home/cleblanc/projects/whiskeyjack-bot/config/tournament.yaml
+# Covers both lines together. One GET per posted post at the configured request spacing, plus
+# the SDK's read retry on a bad network; the same bound as the poll.
+TimeoutStartSec=2400
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
