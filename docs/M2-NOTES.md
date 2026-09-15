@@ -3253,8 +3253,10 @@ Delivered:
   (`submission_key_releases_refuse_reconciled`, `submission_attempts_refuse_reconciled_key`);
   `lifecycle_events.submission_reconciliation_id` by `ADD COLUMN` with a partial UNIQUE index;
   and the second DROP/CREATE of `lifecycle_events_validate_on_insert`.
-- `lifecycle.py` — `SubmissionReconciliation`, `record_submission_reconciliation`, and the link
-  on `LifecycleEvent` / `_EVENT_COLUMNS` / `_append_event`.
+- `lifecycle.py` — `SubmissionReconciliation`, `record_submission_reconciliation`, the link
+  on `LifecycleEvent` / `_EVENT_COLUMNS` / `_append_event`, and `live_attempt_id_for_key` — the
+  live attempt-id derivation, moved here from `submission_live` in round 1 so the writer can
+  derive the id it records.
 - `submission.py` — `key_is_reconciled`; a reconciled key is spent to `require_key_unused`,
   `reserve_submission_key` and `release_submission_key`; one `_STANDING_RESERVATION` predicate
   for both reservation readers.
@@ -3309,7 +3311,7 @@ What the criterion's clauses were read to demand, and where each is enforced:
 | *cannot be produced without a human asserting what they observed* | a named person **and** what they saw, never defaulted | CLI `required=True` for `--observed-by` and `--note`; `_require_assertion` before any read; `_require_assertion_text` in the writer; `016`'s non-blank clauses on both columns |
 | — and a human alone is not enough | the program's own refetch must agree | only `confirmed` proceeds; `016` refuses a snapshot whose `$.outcome` is not `confirmed` |
 | — and neither is a refetch | the post must be one this program reached | the unreleased reservation, the approval's digest, and a `forecast_intent` for the record whose payload re-hashes to that digest (`016` cites the intent row; the writer checks the rest) |
-| *names the attempt* | the identity the post carried | `attempt_id = live_attempt_id(key)`; `016` pins its shape and refuses one an attempt row holds |
+| *names the attempt* | the identity the post carried | the writer derives it from the **stored** reservation's key (`lifecycle.live_attempt_id_for_key`, which `submission_live.live_attempt_id` delegates to) and accepts none from its caller; `016` pins its shape and refuses one an attempt row holds |
 | *spends or releases its key reservation honestly* | spend when the platform shows it; release is `release-key` when it does not | a reconciled key reads as spent everywhere; `016` refuses a release of it and an attempt row under it; an `absent` refetch refuses and names `release-key` |
 | *no receipt is invented for a response nobody captured* | no attempt row in either shape | the reconciliation carries no receipt field; a captured artifact is pinned by path and sha256 |
 | *the append-only guarantee is not weakened* | new rows only; nothing existing rewritten beyond the marked hunks | block triggers on the new table; the `APPEND_ONLY_TABLES` probes include it; no existing table rebuilt |
@@ -3520,3 +3522,48 @@ pinned with `@example`, because at roughly 0.4% per random draw the first run le
 by the unit tests' messages instead: the writer's six field validators (the trigger still refuses,
 so the only property the fuzz asserts — the error type — holds), and the digest-shape and
 payload-object guards in `read_intent`, which a re-hash mismatch also refuses.
+
+### Round 1 — two blocking findings, both reproduced, both closed
+
+`GPT_REVIEW_RESPONSE_M2-713_r1.md`, against `d80d100` (the request HEAD). **CHANGES REQUESTED.**
+All ten risk claims were examined; eight came back Safe, and the two that did not are the two
+findings. Both were reproduced by execution on `d80d100` before any fix was written.
+
+**B1 — the writer accepted an attempt id unrelated to the reservation's key.**
+`SubmissionReconciliation.attempt_id` was validated for shape only. Reproduced: `wjlive-1-` and
+64 zeroes was recorded, and the event returned `submitted`, against a reservation whose key derives
+`wjlive-1-e272b66f…`. The notes above had even said the writer could not check the derivation,
+because SQLite has no sha256. That was true of the schema and false of the writer, which had the
+stored key in hand. The fix is the one M2-703's round 1 settled: a value the writer can derive is a
+second source of truth if a caller may also supply it, so **the field is removed**, not
+cross-checked. `_require_reconcilable` now returns the attempt id derived from the key on the
+reservation row it read. The derivation moved to `lifecycle.live_attempt_id_for_key` because
+`lifecycle` cannot import `submission_live`, and `submission_live.live_attempt_id` now delegates to
+it, so there is still one rule.
+`test_moving_the_derivation_did_not_change_a_live_attempt_id` pins the old body's output with an
+independent oracle, because that rule names every attempt the live worker records.
+
+**B2 — `refetched_at_utc` was the command's entry time.** The CLI passed `datetime.now()` as
+`occurred_at` before the identity read and the retrying refetch. Reproduced: the stored instant
+preceded the confirming GET by about 2 ms with no retry, and by the refetch pauses with retries.
+The orchestrator now takes an injectable `clock` and reads it **after** the confirming
+classification, and the CLI passes nothing.
+
+**Non-blocking, fixed anyway:** argparse's `required=True` accepts `" "`, so a blank
+`--observed-by` or `--note` reached the ledger read and the poster construction before it was
+refused. That falsified risk claim 5's absolute ordering. `check_assertion` is now public and
+`reconcile-submission` calls it first.
+
+Five new regressions were run against `d80d100`'s four source files and **all five fail there**:
+- the field-absence test;
+- the CLI stamp-order test;
+- both parametrizations of the blank-assertion test;
+- the virtual-clock retry test.
+
+A mutation check on the fixes killed all five mutants, each by the test written for it:
+- the writer's derivation made constant;
+- the derivation's hash input altered;
+- the stamp read moved to command entry;
+- the CLI's assertion check removed;
+- the orchestrator's assertion check removed.
+
