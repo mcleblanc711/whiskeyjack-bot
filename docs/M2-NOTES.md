@@ -3393,6 +3393,15 @@ nothing posted.
 JSON parse's except: a deeply nested document exhausts the parser's stack and is not a
 `ValueError`, and the reconciliation reads this file as untrusted.
 
+### Deviation — four commit-pinned `.gitleaksignore` entries
+
+CI's gitleaks `generic-api-key` rule read a fabricated idempotency key passed as `key=` at the end
+of four raw-SQL helper calls in `740d4d1` as a credential (entropy 3.547) — the M2-708 class, not a
+planted secret. Reproduced with the pinned gitleaks 8.30.1 against the branch range. The literal
+moved to a module constant named without the rule's keyword, a rescan of the branch range and of
+`--all` finds nothing, and the four historical findings are pinned by fingerprint because that
+commit stays reachable.
+
 ### Rejected — transcribing the captured receipt into `submission_attempts`
 
 See the first decision. It also would have made two paths to `submitted` for one fact, and
