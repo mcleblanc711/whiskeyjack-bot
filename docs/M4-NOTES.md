@@ -702,8 +702,11 @@ Deferred to M4-806.
   `cli.main` with refusal spies on the `requests` write verbs and `Session.request`,
   `build_poster`, `post_approved_forecast`, `run_live`, `build_asknews_client`, `build_exa_client`,
   `build_forecaster_client`, `PricedClient`, `litellm.completion`/`acompletion`,
-  `build_notify_client`, `httpx.Client.send` and `socket.getaddrinfo`. It also covers litellm's
-  import-time cost-map fetch: `LITELLM_LOCAL_MODEL_COST_MAP=True` is pinned in the unit.
+  `build_notify_client`, `httpx.Client.send` and `socket.getaddrinfo`. Those spies cannot see an
+  import that already happened, so litellm's import-time cost-map fetch (`litellm/__init__.py`
+  calls `get_model_cost_map` at import, which skips the fetch only when
+  `LITELLM_LOCAL_MODEL_COST_MAP` is `true`) is covered by the unit's environment instead, which the
+  parity test pins (mutant U4). That fetch is unpaid in any case.
 - **Scoring is on the schedule too**, and the end-to-end test asserts it ran (records end `scored`,
   with both values hand-checked: Brier `(0.7 - 1)^2 = 0.09`, log `ln 0.7` by `bc -l`).
 
