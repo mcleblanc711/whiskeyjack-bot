@@ -3382,10 +3382,11 @@ for a command rather than `sqlite3`. The listing reads the ledger only and says 
 places to look: a process killed between the intent and the POST leaves identical rows with
 nothing posted.
 
-### Deviation — two v14-ledger tests seed raw, and the artifact parser gained a `RecursionError`
+### Deviation — four older-ledger tests seed raw, and the artifact parser gained a `RecursionError`
 
-`test_score_ledger.py`'s two 014->015 upgrade tests seeded a v14 ledger through this build's
-writers; `_append_event` now names `016`'s column, which a v14 ledger lacks. They seed raw now
+`test_score_ledger.py`'s two 014->015 upgrade tests and `test_resolution_ledger.py`'s two
+013->014 ones seeded an older ledger through this build's writers; `_append_event` now names
+`016`'s column, which those ledgers lack. They seed raw now
 (`resolution_rows.walk_to_submitted_raw`, `score_rows.seed_resolved_raw`), which is how
 `test_lifecycle.py`'s `_seed_v8_ledger` already builds an older ledger. Splitting
 `parse_submission_artifact` out of `read_submission_artifact` also added `RecursionError` to the
