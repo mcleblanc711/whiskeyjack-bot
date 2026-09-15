@@ -65,7 +65,8 @@ Defined at `env_verify.py:26-28` (`EXIT_OK`, `EXIT_CONFIG_INVALID`, `EXIT_ENV_MI
 **Exit code `4` is the good outcome when something is wrong.** Almost every refusal in this
 program runs *before* the action it refuses, so `4` normally means nothing happened. Two
 commands break that and both are documented below: `submit`, and a live post the ledger then
-refused to record ([L4](#l4--a-live-post-the-ledger-refused-to-record)).
+refused to record ([L4](#l4--a-live-post-the-ledger-refused-to-record)), which
+`reconcile-submission` records.
 
 **`submit` exits `0` if and only if the refetch confirmed the post *and* the artifact was
 written.** The return is literally:
@@ -158,6 +159,8 @@ were written.
 | `a key reservation is standing for this record` | [L2](#l2--a-standing-key-reservation) |
 | `verify-submission` said `resolve it by hand` | [L3](#l3--a-mismatched-refetch) |
 | `a live post was made and the ledger refused to record it` | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
+| `unrecorded-posts` lists a record, or `submit` refused with `durable submission intent` | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
+| `reconcile-submission` refused | [L4](#l4--a-live-post-the-ledger-refused-to-record) — the refusal table |
 | `artifact:  NOT WRITTEN -- ...` | [L5](#l5--the-artifact-was-not-written) |
 | ntfy push `whiskeyjack: whiskeyjack-resolutions failed` | [Scheduled ingestion and scoring](#scheduled-ingestion-and-scoring) |
 
@@ -286,6 +289,8 @@ version: 11
 | `replay` | **read-only** | no | no |
 | `approve` / `reject` | appends one event | no | no |
 | `release-key` | appends a release row | no | no |
+| `unrecorded-posts` | **read-only** | no | no |
+| `reconcile-submission` | appends a reconciliation and an event | **GET** (no post) | no |
 | `verify-submission` | appends an event | **GET** | no |
 | `ingest-resolutions` | appends resolution rows and `resolved` events | **GET** | no |
 | `score` | appends local score rows and `scored` events | no | no |
@@ -1183,7 +1188,13 @@ attempt will be refused.
 ```
 a key reservation is standing for this record (1); if you have confirmed nothing was posted, run
   whiskeyjack-bot release-key --record-id <REC> --released-by <you>
+if the forecast IS on Metaculus, do not release; record the post with
+  whiskeyjack-bot reconcile-submission --record-id <REC> --observed-by <you> --note "<what you saw>"
 ```
+
+Since M2-713 this is printed only for a reservation that is genuinely standing — unreleased
+and spent by nothing. Before it, a reservation an ordinary post had already spent was listed
+too, so a refusal for a record that was simply `submitted` told you to release its key.
 
 **Why it exists.** `submit` claims its idempotency key in a durable row *before* any
 network I/O, so two concurrent commands for one derived key cannot both post. A process
@@ -1192,8 +1203,12 @@ function of tournament, question, forecast version and payload hash — the same
 the same key forever — so without a way out, one interrupted command would block that
 forecast permanently.
 
-**Confirm.** There is **no read-only command that lists what is standing.** Two things come
-close and neither is one:
+**Confirm.** There is **no read-only command that lists everything that is standing.**
+`unrecorded-posts` (M2-713) lists the part of it that matters most: reservations whose command
+committed a submission intent, which is to say reached the POST, so the forecast may be live —
+check each on Metaculus and go to [L4](#l4--a-live-post-the-ledger-refused-to-record) if it is
+there. A standing reservation it does *not* list never reached the POST. Beyond that, two things
+come close and neither is one:
 
 - **`release-key` with no `--reservation-id`, when the record holds more than one
   reservation**, refuses and lists all of them with their sequence numbers and timestamps
@@ -1229,7 +1244,7 @@ the ledger refused to record it, **the post landed**. Releasing invites a duplic
 before every release:
 
 ```
-releasing records that you checked Metaculus and this forecast is NOT there. If submit told you a post was made and the ledger refused to record it, the post did land -- do not release; resolve that attempt instead.
+releasing records that you checked Metaculus and this forecast is NOT there. If submit told you a post was made and the ledger refused to record it, the post did land -- do not release; record it with reconcile-submission instead.
 ```
 
 When there is nothing to release you get, harmlessly:
@@ -1277,47 +1292,91 @@ and an approval-shaped boundary; it is an item, not a clause.
 
 **This is the most serious state in this document. Read it slowly.**
 
-**What you see** (exit `4`):
+**What you see.** One of three things, and the third is nothing at all.
+
+`submit` exits `4` with:
 
 ```
-refused: a live post was made and the ledger refused to record it (<reason>); the payload and receipt are at <path>
+refused: a live post was made and the ledger refused to record it (<reason>); the payload and receipt are at <path>; do not release the key or submit again -- once you have confirmed the forecast on Metaculus, record the post with reconcile-submission
 ```
 
-or, worse:
+or the same message ending `the artifact could not be written either; do not release ...`.
 
+**Or the command was killed while it was posting** — Ctrl-C during `submit`, systemd's
+`TimeoutStartSec` on a long poll, the OOM killer, a reboot. Nothing is printed. On the live
+worker the next poll even confirms the forecast in the tournament journal, pushes
+`whiskeyjack: forecast confirmed` and posts the private comment, so the push looks like
+success. **M1-342** is the filed alert for that silent route.
+
+**What it means.** A forecast **is live on Metaculus** and the lifecycle ledger does not know:
+
+- **no `submission_attempts` row** — the post is unrecorded;
+- **a standing key reservation** — the automatic release runs only when the program proved
+  nothing was posted;
+- the forecast record still **`approved`**, so ingestion and scoring never see it.
+
+What the ledger *does* hold is the evidence that a post was reached: the reservation, the
+approval's payload digest, and the `forecast_intent` journal row the submission policy commits
+immediately before every POST. The artifact holds the receipt when the command got that far,
+and nothing does when it did not. Both shapes are recoverable the same way.
+
+**Confirm (read-only).**
+
+```bash
+uv run whiskeyjack-bot unrecorded-posts --config config.yaml
 ```
-refused: a live post was made and the ledger refused to record it (<reason>); the artifact could not be written either
+
+lists every record holding a submission intent and a standing, unspent reservation. It reads
+the ledger only: no credential, no network. It is a list of places to look, not a verdict — a
+process killed between the intent and the POST leaves the same rows with nothing posted.
+
+Then **look at the question on Metaculus** for each one.
+
+**Recovery — if the forecast IS there:**
+
+```bash
+uv run whiskeyjack-bot reconcile-submission --config config.yaml \
+  --record-id "$REC" --observed-by "you@example" --note "question page shows our 35%, posted 14:02"
 ```
 
-**What it means.** A forecast **is live on Metaculus**. Every gate in `submit` runs before
-the post; this is the single named exception where an error follows a live call.
+`--observed-by` and `--note` are required and have no default: they record that *you* looked
+and what you saw. The command then checks that against the program's own evidence and refuses,
+writing nothing, when they disagree. Before it builds a poster it prints what it found —
+record, question, reservation, key, attempt id, payload digest, intent, and the artifact path
+with its sha256, or `artifact: none` — so every local refusal needs no `METACULUS_TOKEN`.
+Then it makes **one identity read and one GET, and posts nothing**:
 
-**What state you are in.**
+| It refuses when | Message starts | What to do |
+|---|---|---|
+| The record is not `approved` | `this forecast record is <status>` | Nothing: it is not this state |
+| No reservation holds the approval's key | `no key reservation is standing` | Nothing was claimed, so nothing was posted |
+| No submission intent | `this record holds no durable submission intent` | The command never reached the POST: check, then `release-key` |
+| An artifact at the path cannot be read | `cannot read the submission artifact` | Fix its permissions and re-run; it may be the receipt |
+| The token is another account | `the configured token is not the account` | Use the account that posted |
+| The platform shows nothing | `the platform shows no forecast from this account` | Your observation and the platform disagree: look again, then `release-key` if it is not there |
+| Something else is there | `the platform holds a forecast that is not the payload` | [L3](#l3--a-mismatched-refetch) territory: resolve by hand |
+| The platform could not be read | `the question could not be refetched` | Re-run later |
 
-- A live forecast on the platform.
-- **No `submission_attempts` row** — the ledger has no record of the post.
-- **A standing key reservation**, which is *not* released (the automatic release runs only
-  when the program can prove no post was attempted).
-- The forecast record still `approved`.
+On success it prints `result: submission_confirmed -> submitted (reconciliation wjrec-…)`.
+The record is `submitted`, the key is spent (`submit`, `release-key` and a new reservation all
+refuse it), and the record is picked up by the next `ingest-resolutions`.
 
-The ledger and the platform now disagree, which is the one outcome this instrument exists
-to prevent.
+**What gets written, and what does not.** One `submission_reconciliations` row — your name and
+note, the confirming refetch, the reservation, the attempt id the post carried, the payload
+digest, the intent, and the artifact's path and sha256 when there is one — and one
+`submission_confirmed` lifecycle event citing it. **No `submission_attempts` row.** Nobody
+captured the POST's response, so no receipt is invented for it; the artifact, when it exists,
+is pinned by its digest and left where it is.
 
-**Confirm (read-only).** Open the artifact path from the message — it holds the exact
-payload that was posted and the receipt. Then look at the question on Metaculus and compare.
+**Recovery — if the forecast is NOT there:** the post did not land. That is
+[L2](#l2--a-standing-key-reservation): `release-key`.
 
-**Recovery today: there is no command for this.** Nothing in the program records a post the
-ledger missed.
-
-What to do in the meantime:
-1. **Do not release the key.** See the warning in [L2](#l2--a-standing-key-reservation).
+**Never.**
+1. **Do not release the key for a post that landed.** A released reservation cannot be
+   reconciled afterwards — the ledger would hold both answers to one question — and that
+   mistake has no recovery yet (**M2-716**).
 2. **Do not submit again for this record.** The post landed.
-3. **Preserve the artifact.** It is the only durable evidence of what was posted.
-4. **Fix why the ledger refused** — the reason is in the message, and it is usually about
-   the database rather than the forecast.
-5. Escalate. This is an owner-level reconciliation, not an operator fix.
-
-**Filed as M2-713 (Critical).**
+3. **Do not delete or rewrite the artifact.** Its sha256 goes on the reconciliation row.
 
 ### L5 — The artifact was not written
 
@@ -1371,7 +1430,8 @@ not evidence of what was sent.
    seems to need it, it is one of the filed gaps below.
 4. **Never release a key reservation after a post that may have landed.** If `submit` said
    a post was made and the ledger refused it, the post landed. Releasing invites a
-   duplicate live forecast.
+   duplicate live forecast, and a released reservation cannot be reconciled afterwards.
+   Check Metaculus: `reconcile-submission` if it is there, `release-key` only if it is not.
 5. **Never flip the submission flags to get past an error.** They gate the only command
    that can post. Flip them only when you intend a live post.
 6. **Never approve without `--forecast-sha256`.** The flag is what makes your approval a
@@ -1389,13 +1449,12 @@ not evidence of what was sent.
 
 ## When the only recovery would be a database edit
 
-Five states in this document have no complete recovery through a documented command. They
+Four states in this document have no complete recovery through a documented command. They
 are listed here rather than papered over with a SQL snippet, because a runbook that teaches
 you to edit the ledger has destroyed the thing it documents.
 
 | State | Section | Row | What is missing |
 |---|---|---|---|
-| A live post the ledger refused to record | [L4](#l4--a-live-post-the-ledger-refused-to-record) | **M2-713** (Critical) | A way to reconcile a post the ledger missed |
 | A `mismatched` refetch | [L3](#l3--a-mismatched-refetch) | **M2-714** | A way to record a human's judgement closing it |
 | An approved record needing re-approval | [A2](#a2--an-approved-record-cannot-be-re-approved-or-rejected) | **M2-715** | Either a legal path back, or a refusal that stops suggesting one |
 | Finding a record's state, or a lost attempt id | [U](#how-to-find-the-attempt-id-if-you-lost-it) | **M1-611** | The read-only `show` command the spec requires |

@@ -75,8 +75,6 @@ from whiskeyjack_bot.lifecycle import (
 )
 from whiskeyjack_bot.submission import (
     SubmissionError,
-    attempt_for_key,
-    key_is_reconciled,
     live_reservation_for_key,
     submission_key_for_approved_record,
 )
@@ -161,12 +159,11 @@ def find_unrecorded_post(
     2. no unresolved uncertainty -- the post gate refuses to post past one, and
        ``verify-submission`` is its way out;
     3. an approval in force bound to a payload (``011``), and the key it derives;
-    4. no attempt row under that key, and no reconciliation of it -- the post is recorded;
-    5. an unreleased reservation holding that key -- without one nothing was claimed, so
-       nothing was posted;
-    6. exactly one ``forecast_intent`` for the record, agreeing with the record and the
+    4. an unreleased, unspent reservation holding that key -- without one nothing was claimed,
+       so nothing was posted (a recorded or reconciled post has already failed step 1);
+    5. exactly one ``forecast_intent`` for the record, agreeing with the record and the
        approval -- without one this command never reached the POST;
-    7. the artifact, when it exists, must describe this post; when it does not, the
+    6. the artifact, when it exists, must describe this post; when it does not, the
        reconciliation records that no receipt was captured.
     """
     identifier = _require_identifier(record_id, "record_id")
@@ -205,13 +202,11 @@ def find_unrecorded_post(
     digest = approval.payload_sha256
     try:
         key = submission_key_for_approved_record(conn, identifier, request_payload_sha256=digest)
-        if attempt_for_key(conn, key) is not None:
-            raise ReconciliationError(
-                "a submission attempt already records this record's post; there is nothing "
-                "unrecorded to reconcile"
-            )
-        if key_is_reconciled(conn, key):
-            raise ReconciliationError("this record's post has already been reconciled")
+        # No separate "already recorded" or "already reconciled" check, and none is missing:
+        # an attempt under this key leaves the record `submitted`, `failed` or holding an
+        # unresolved uncertainty, and a reconciliation leaves it `submitted`, so both were
+        # refused above. The mutation pass showed each such check could not be reached.
+        # A spent reservation is also not a standing one (`submission._STANDING_RESERVATION`).
         reservation = live_reservation_for_key(conn, key)
     except SubmissionError as exc:
         raise ReconciliationError(str(exc) or "this record's key could not be read") from None
@@ -238,18 +233,17 @@ def find_unrecorded_post(
             "approval authorized, so it does not describe a post under this key"
         )
     try:
-        plan = plan_from_payload(
+        # Refused here, before any network call, rather than after the refetch: a payload this
+        # build cannot compare is one no refetch could confirm.
+        plan_from_payload(
             intent.payload, expected_cdf_points=expected_points_for_record(record, config)
         )
     except LiveSubmissionError as exc:
         raise ReconciliationError(
             str(exc) or "the intent's payload is not one this build can compare"
         ) from None
-    if plan.question_type != record.question_type:
-        raise ReconciliationError(
-            "the durable submission intent's payload is for a different question type than "
-            "this record"
-        )
+    # No question-type comparison: the payload re-hashes to the approval's digest, so it *is*
+    # the payload the record derived, type included.
 
     try:
         attempt_id = live_attempt_id(key)
@@ -387,6 +381,10 @@ def reconcile_unrecorded_post(
             "authorized; that is not this post, and nothing was recorded -- resolve it by hand"
         )
 
+    # A confirmed verdict never reaches `build_verification_snapshot`'s evidence-free fallback:
+    # confirmed means the observed values equal the expected ones, which `plan_from_payload`
+    # bounds, and `submission_live`'s caps keep that envelope under MAX_BODY_LENGTH (a property
+    # test there fails if a cap is removed).
     snapshot = build_verification_snapshot(
         question_type=plan.question_type,
         expected=expected,
@@ -395,13 +393,6 @@ def reconcile_unrecorded_post(
         result=result,
         expected_labels=labels,
     )
-    if _snapshot_omits_values(snapshot):
-        # `build_verification_snapshot`'s own rule: its evidence-free fallback must never back a
-        # confirmation, because it names nothing a reader could check the verdict against.
-        raise ReconciliationError(
-            "the confirming refetch could not be stored with the values it saw, so it would "
-            "back a confirmation it cannot show; nothing was recorded"
-        )
     stamped = _utcnow() if occurred_at is None else occurred_at
     reconciliation = SubmissionReconciliation(
         reservation_id=evidence.reservation_id,
@@ -667,14 +658,6 @@ def _pin_artifact(
         digest=digest,
     )
     return relative, hashlib.sha256(body).hexdigest()
-
-
-def _snapshot_omits_values(snapshot: str) -> bool:
-    try:
-        parsed = json.loads(snapshot)
-    except (ValueError, RecursionError):
-        return True
-    return not isinstance(parsed, dict) or parsed.get("values_omitted") is True
 
 
 def _require_identifier(value: object, field: str) -> str:

@@ -345,6 +345,81 @@ def test_a_recorded_post_is_not_reconciled(case: Any) -> None:
     assert _rows(conn) == before
 
 
+def test_a_record_with_an_unresolved_uncertainty_is_sent_to_verify_submission(case: Any) -> None:
+    """A recorded post whose outcome is open is U, not L4: the operator is pointed there."""
+    conn, config, platform, *_ = case
+    record_id = _prepare_version(case)
+    platform.lose_forecast_response = True  # the POST raises; the refetch then finds it
+    event = post_approved_forecast(
+        conn,
+        config=config,
+        record_id=record_id,
+        payload=_payload(conn, config, record_id),
+        poster=platform,
+        occurred_at=utcnow(),
+    ).event
+    assert event.event_type == "submission_uncertain"
+    before = _rows(conn)
+    with pytest.raises(ReconciliationError, match="resolve them with verify-submission first"):
+        _reconcile(case, record_id, platform)
+    assert _rows(conn) == before
+
+
+def test_an_approval_that_predates_the_payload_binding_is_not_reconciled(case: Any) -> None:
+    """A pre-011 approval authorizes no payload, so no post under it can be recorded."""
+    conn, _, platform, *_ = case
+    record_id = _prepare_version(case)
+    # `approval_events` is append-only; the pre-011 shape is made the way
+    # `test_submission.py` makes it, by clearing the column with the block trigger dropped.
+    conn.execute("DROP TRIGGER approval_events_block_update")
+    conn.execute("UPDATE approval_events SET payload_sha256 = NULL")
+    with pytest.raises(ReconciliationError, match="holds no approval bound to a payload"):
+        _reconcile(case, record_id, platform)
+
+
+def test_an_intent_for_a_payload_the_approval_did_not_authorize_is_refused(case: Any) -> None:
+    """The journal is read back from the ledger, so it is checked against the approval.
+
+    The submission policy writes an intent only after the key gate passed, so on the live path
+    the two digests always agree. The row is still a stored value, and a disagreeing one is
+    refused rather than used to decide what the refetch compares against.
+    """
+    from whiskeyjack_bot.submission_gateway import payload_sha256
+
+    conn, config, platform, *_ = case
+    record_id = _prepare_version(case)
+    reserve_submission_key(
+        conn,
+        record_id=record_id,
+        idempotency_key=_key(conn, config, record_id),
+        reserved_at=utcnow(),
+    )
+    record = read_forecast_record(conn, record_id)
+    other = {"question_type": "binary", "probability_yes": 0.4}
+    conn.execute(
+        "INSERT INTO tournament_events (event_id, kind, scope, data, created_at_utc) "
+        "VALUES ('tev-other', 'forecast_intent', ?, ?, ?)",
+        (
+            record_id,
+            json.dumps(
+                {
+                    "record_id": record_id,
+                    "account_id": 42,
+                    "project_id": record.tournament_id,
+                    "question_id": record.question_id,
+                    "post_id": record.post_id,
+                    "payload": other,
+                    "payload_sha256": payload_sha256(other),
+                    "baseline": [],
+                }
+            ),
+            utcnow().isoformat(),
+        ),
+    )
+    with pytest.raises(ReconciliationError, match="names a different payload than this record"):
+        find_unrecorded_post(conn, config, record_id)
+
+
 def test_an_approved_record_that_was_never_claimed_is_not_reconciled(case: Any) -> None:
     conn, _, platform, *_ = case
     record_id = _prepare_version(case)
@@ -537,6 +612,9 @@ def test_an_intent_that_describes_this_post_is_read() -> None:
         ({"record_id": "rec-2"}, "does not describe this record's question"),
         ({"question_id": 8}, "does not describe this record's question"),
         ({"question_id": True}, "does not describe this record's question"),
+        # JSON gives `7.0 == 7`: only the exact-type arm refuses these two.
+        ({"question_id": 7.0}, "does not describe this record's question"),
+        ({"post_id": 8.0}, "does not describe this record's question"),
         ({"post_id": 9}, "does not describe this record's question"),
         ({"project_id": 32977}, "does not describe this record's question"),
         ({"account_id": 0}, "names no account"),
@@ -615,6 +693,14 @@ def test_an_artifact_for_another_question_or_payload_is_refused() -> None:
     wrong_question["question_id"] = 8
     with pytest.raises(ReconciliationError, match="does not describe this post"):
         _binds(wrong_question)
+    float_question = _envelope()
+    float_question["question_id"] = 7.0  # `7.0 == 7`; only the exact-type arm refuses it
+    with pytest.raises(ReconciliationError, match="does not describe this post"):
+        _binds(float_question)
+    no_payload = _envelope()
+    no_payload["request_payload"] = [0.35]
+    with pytest.raises(ReconciliationError, match="holds no request payload"):
+        _binds(no_payload)
     wrong_payload = _envelope()
     wrong_payload["request_payload"] = {"question_type": "binary", "probability_yes": 0.4}
     with pytest.raises(ReconciliationError, match="not the one this record's approval authorized"):
@@ -744,4 +830,6 @@ def test_the_standing_reservation_hint_names_both_ways_out(
     capsys.readouterr()
     _print_standing_reservations(conn, record_id)
     out = capsys.readouterr().out
-    assert "release-key" in out and "reconcile-submission" in out
+    assert "if you have confirmed nothing was posted, run" in out and "release-key" in out
+    assert "if the forecast IS on Metaculus, do not release; record the post with" in out
+    assert f"reconcile-submission --record-id {record_id}" in out

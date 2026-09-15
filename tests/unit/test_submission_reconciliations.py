@@ -446,6 +446,31 @@ def test_a_reservation_is_reconciled_at_most_once(
         insert_reconciliation(ledger, post, reconciliation_id="wjrec-second")
 
 
+@pytest.mark.parametrize("statement", ["DELETE", "UPDATE"])
+def test_a_reconciliation_no_event_cites_is_still_append_only(
+    ledger: sqlite3.Connection, post: Unrecorded, statement: str
+) -> None:
+    """The block triggers, isolated from the foreign key that shadows them.
+
+    `test_lifecycle.py`'s append-only probes seed a reconciliation its event cites, and deleting
+    a cited row fails the foreign key from `lifecycle_events` before the question of the block
+    trigger arises -- the mutation pass left `submission_reconciliations_block_delete` neutered
+    and every one of those probes green. A row no event cites has only the trigger standing in
+    front of it, so the refusal is asserted by its message.
+    """
+    reconciliation_id = insert_reconciliation(ledger, post)
+    sql = (
+        "DELETE FROM submission_reconciliations WHERE reconciliation_id = ?"
+        if statement == "DELETE"
+        else "UPDATE submission_reconciliations SET note = 'rewritten' WHERE reconciliation_id = ?"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="submission_reconciliations is append-only"):
+        ledger.execute(sql, (reconciliation_id,))
+    assert (
+        ledger.execute("SELECT note FROM submission_reconciliations").fetchone()[0] != "rewritten"
+    )
+
+
 # --------------------------------------------------------------------------------------
 # A reconciled key is spent: the two new triggers.
 # --------------------------------------------------------------------------------------

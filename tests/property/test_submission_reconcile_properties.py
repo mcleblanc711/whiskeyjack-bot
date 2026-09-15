@@ -81,6 +81,11 @@ JUNK = st.one_of(
     st.just([PLANTED_SECRET]),
     st.just("7"),
     st.just(True),
+    # Equal to the valid integers under `==` and refused only by an exact-type gate. Without
+    # these the gate is unreachable: the mutation pass removed `type(...) is not int` from both
+    # checks and every property stayed green.
+    st.just(7.0),
+    st.just(8.0),
 )
 
 
