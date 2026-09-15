@@ -362,6 +362,15 @@ database-witnessed idempotency rule is expressible without a link. 003 lets a `s
 event link exactly one score row (`lifecycle_events_one_event_per_score`), and its only scoring
 transition is `resolved -> scored`.
 
+**The live records score end to end (on a copy).** The live ledger was copied with SQLite's
+backup API into a scratch directory, upgraded to 15 by `initialize_ledger`, and scored: nothing
+to score (no resolutions). One real MiniBench binary record (`probability_yes` 0.91) was then
+resolved `no` through `record_resolution_observation` with a committed post fixture, and scored:
+`local_brier_binary` 0.8281000000000001 (0.91^2) and `local_log_binary` -2.4079456086518722
+(ln 0.09 = 2 ln 0.3 = -2.40794560865187 by `bc -l`); a second run `unchanged`; the JSONL export
+carries both rows with `resolution_event_id`. So a record written by the live pipeline reads back
+through `read_forecast_record` and scores. The live ledger itself was not written.
+
 **SQLite fires the newer trigger first.** With no resolution row, a score row is refused by 015
 ("must name a resolution row") before 014 ("not scorable"). `test_a_score_needs_a_resolution`
 now asserts both layers, the second with 015's trigger dropped on its own ledger.
