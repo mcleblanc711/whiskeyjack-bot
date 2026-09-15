@@ -62,6 +62,10 @@ OTHER_SHA = "e" * 64
 TS = "2026-09-15T09:00:00.000000+00:00"
 WHEN = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 RECORD = "rec-unrecorded"
+# Another derived-key-shaped identifier, for an attempt under a key the reservation does not hold.
+# A named constant rather than a literal at the call: gitleaks' generic-api-key rule reads
+# `key="<text>"` at the end of a line as a credential (docs: the M2-708 false positive).
+SECOND_CLAIM = "wjsub-1-other"
 
 
 @pytest.fixture
@@ -394,7 +398,7 @@ def test_the_schema_refuses_a_record_that_is_not_awaiting_submission(
 ) -> None:
     # Submitted through an attempt under a different key and attempt id: neither arm of the
     # attempt clause sees it, so the status clause is the one that has to refuse.
-    _insert_attempt(ledger, RECORD, attempt_id="att-other", key="wjsub-1-other")
+    _insert_attempt(ledger, RECORD, attempt_id="att-other", key=SECOND_CLAIM)
     _event(
         ledger, RECORD, 3, "submitted", "approved", "submitted", submission_attempt_id="att-other"
     )
@@ -406,7 +410,7 @@ def test_the_schema_refuses_a_record_with_an_unresolved_uncertainty(
     ledger: sqlite3.Connection, post: Unrecorded
 ) -> None:
     _insert_attempt(
-        ledger, RECORD, attempt_id="att-uncertain", key="wjsub-1-other", refetch="unreadable"
+        ledger, RECORD, attempt_id="att-uncertain", key=SECOND_CLAIM, refetch="unreadable"
     )
     _event(
         ledger,
@@ -786,13 +790,13 @@ def test_the_writer_refuses_a_subclass(ledger: sqlite3.Connection, post: Unrecor
 
 
 def _submit_other(conn: sqlite3.Connection) -> None:
-    _insert_attempt(conn, RECORD, attempt_id="att-other", key="wjsub-1-other")
+    _insert_attempt(conn, RECORD, attempt_id="att-other", key=SECOND_CLAIM)
     _event(conn, RECORD, 3, "submitted", "approved", "submitted", submission_attempt_id="att-other")
 
 
 def _uncertain_other(conn: sqlite3.Connection) -> None:
     _insert_attempt(
-        conn, RECORD, attempt_id="att-uncertain", key="wjsub-1-other", refetch="unreadable"
+        conn, RECORD, attempt_id="att-uncertain", key=SECOND_CLAIM, refetch="unreadable"
     )
     _event(
         conn,
