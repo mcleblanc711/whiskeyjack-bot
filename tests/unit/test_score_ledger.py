@@ -15,8 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from resolution_rows import insert_resolution_row, insert_score_row, seed_submitted
-from score_rows import RESOLVED_AT, SCORED_AT, resolve, seed_resolved
+from resolution_rows import (
+    insert_resolution_row,
+    insert_score_row,
+    seed_submitted,
+    seed_submitted_raw,
+)
+from score_rows import RESOLVED_AT, SCORED_AT, resolve, seed_resolved, seed_resolved_raw
 from whiskeyjack_bot import ledger as ledger_module
 from whiskeyjack_bot import lifecycle, scoring
 from whiskeyjack_bot.ledger import LEDGER_SCHEMA_VERSION, LedgerError, connect, initialize_ledger
@@ -596,10 +601,11 @@ def test_a_ledger_at_014_with_resolutions_upgrades_to_015(
     _ledger_at_014(db, monkeypatch)
     connection = connect(db)
     try:
-        record = _binary(connection)
+        # Raw: this build's lifecycle writers name 016's column, which a v14 ledger lacks.
+        record = seed_resolved_raw(connection, "rec-b", question_id=QUESTION_ID, post_id=POST_ID)
     finally:
         connection.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 15
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 16
     connection = connect(db)
     try:
         write = record_local_scores(connection, record_id=record, computed_at=SCORED_AT)
@@ -618,7 +624,8 @@ def test_the_migration_refuses_a_ledger_already_holding_score_rows(
     _ledger_at_014(db, monkeypatch)
     connection = connect(db)
     try:
-        seed_submitted(connection, "rec-old", question_id=QUESTION_ID, post_id=POST_ID)
+        # Raw: this build's lifecycle writers name 016's column, which a v14 ledger lacks.
+        seed_submitted_raw(connection, "rec-old", question_id=QUESTION_ID, post_id=POST_ID)
         insert_resolution_row(connection, "rec-old")
         connection.execute(
             "INSERT INTO score_events (forecast_record_id, metric, value, "

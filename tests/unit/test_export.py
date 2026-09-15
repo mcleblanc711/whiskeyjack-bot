@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from reconciliation_rows import seed_reconciled_post
 from resolution_rows import insert_resolution_row, insert_score_row
 from whiskeyjack_bot.export import (
     EXPORT_SCHEMA_VERSION,
@@ -60,7 +61,7 @@ FAKE_SECRET = "privateFAKE123456"
 
 
 def _seed_every_table(conn: sqlite3.Connection) -> None:
-    """Write at least one row into each of the fourteen exported tables.
+    """Write at least one row into each of the fifteen exported tables.
 
     Raw SQL rather than the production writers, and deliberately: the point here is the
     *schema's* full surface, including tables whose writers are still Not Started
@@ -159,6 +160,16 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         "INSERT INTO tournament_events (event_id, kind, scope, data, created_at_utc) "
         "VALUES ('tev-1', 'heartbeat', 'minibench', ?, ?)",
         ('{"polled": 3}', TS),
+    )
+    # 016 (M2-713): a reconciliation belongs to a post the ledger never recorded, so it needs
+    # a second record on a question `rec-1`'s attempt does not hold (012's whole-question guard).
+    seed_reconciled_post(
+        conn,
+        "rec-2",
+        question_id=101,
+        run_id="run-1",
+        forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
     )
 
 

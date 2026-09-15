@@ -915,9 +915,27 @@ def read_submission_artifact(
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         raise GatewayError(f"cannot read submission artifact {path}") from None
+    return parse_submission_artifact(text, path, expected_mode=expected_mode)
+
+
+def parse_submission_artifact(
+    text: str, path: Path, *, expected_mode: GatewayMode
+) -> dict[str, object]:
+    """Validate an artifact's already-read text; :func:`read_submission_artifact`'s second half.
+
+    Split out for M2-713, whose reconciliation pins an artifact by the sha256 of its bytes:
+    reading the file once and handing the same text here is what makes the bytes that were
+    hashed the bytes that were validated, rather than two reads of a file that could differ.
+    ``path`` is used for messages only (the M1-401 carve-out); nothing is read from it.
+    """
+    _require_mode(expected_mode)
+    if type(text) is not str:
+        raise GatewayError(f"submission artifact is not text: {path}")
     try:
         envelope = json.loads(text, parse_constant=_reject_json_constant)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: a deeply nested document exhausts the parser's stack rather than
+        # failing to parse, and it is not a ValueError.
         raise GatewayError(f"submission artifact is not valid JSON: {path}") from None
     if not isinstance(envelope, dict):
         raise GatewayError(f"submission artifact is not a JSON object: {path}")

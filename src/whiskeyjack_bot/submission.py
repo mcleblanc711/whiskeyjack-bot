@@ -1,4 +1,4 @@
-"""Derive submission idempotency keys, and read what a key already claimed (M2-702).
+"""Derive submission idempotency keys, and read what a key already claimed (M2-702, M2-713).
 
 ``submission_attempts.idempotency_key`` has been ``TEXT NOT NULL UNIQUE`` since migration
 ``001``, and :func:`lifecycle.record_submission_attempt` has written it since M1-603 --
@@ -58,8 +58,11 @@ inside ``lifecycle.transaction``'s ``BEGIN IMMEDIATE``, writing a
 ``submission_key_reservations`` row that ``010``'s trigger will not duplicate. A key's
 state is therefore **derived, never stored**:
 
-    spent     -- a ``submission_attempts`` row exists for it. Terminal.
-    reserved  -- a reservation exists with no release row and no attempt row.
+    spent     -- a ``submission_attempts`` row exists for it, or (M2-713) a
+                 ``submission_reconciliations`` row records the post made under one of its
+                 reservations. Terminal.
+    reserved  -- a reservation exists with no release row, no attempt row and no
+                 reconciliation.
     released  -- every reservation for it carries a release row; the key is free again.
     free      -- no reservation at all.
 
@@ -69,6 +72,13 @@ with no way out does not block a retry -- it blocks that forecast, permanently, 
 append-only table. ``not_posted`` is the program reporting that it *proved* no post was
 made; ``operator_abandoned`` is a person asserting it after checking the platform. Nothing
 is released on the happy path: the attempt row spends the reservation.
+
+**A post can spend a key without an attempt row** (M2-713). When the ledger refuses the
+attempt write after a post, or the process dies before making it, the reservation stands and
+the post is live -- releasing it would invite a duplicate. ``lifecycle.
+record_submission_reconciliation`` records that post, and a reconciled reservation reads as
+spent here: every reader and both writers refuse it with the spent message, and ``016``
+refuses a release of it or an attempt row under its key.
 
 **Two derivation seams, not one.** :func:`submission_key_for_record` will mint a key for
 any stored record including a ``draft``, because that is what a dry run needs -- a dry run
@@ -183,6 +193,10 @@ _RELEASE_PREFIX = "wjrel-"
 # the reader and the claim come to disagree about what "used" means (M1-608, M2-710).
 _SPENT_KEY_REFUSAL = (
     "this idempotency key has already been used by a recorded submission attempt; "
+    "a second attempt under it would claim a second live post"
+)
+_RECONCILED_KEY_REFUSAL = (
+    "this idempotency key has already been spent by a post recorded through reconciliation; "
     "a second attempt under it would claim a second live post"
 )
 _RESERVED_KEY_REFUSAL = (
@@ -579,8 +593,44 @@ def require_key_unused(conn: sqlite3.Connection, idempotency_key: str) -> None:
     # it back would let a caller confirm a guess about stored content.
     if attempt_for_key(conn, key) is not None:
         raise SubmissionError(_SPENT_KEY_REFUSAL)
+    if key_is_reconciled(conn, key):
+        raise SubmissionError(_RECONCILED_KEY_REFUSAL)
     if live_reservation_for_key(conn, key) is not None:
         raise SubmissionError(_RESERVED_KEY_REFUSAL)
+
+
+def key_is_reconciled(conn: sqlite3.Connection, idempotency_key: str) -> bool:
+    """Whether a reconciliation records a post made under this key (M2-713).
+
+    The second way a key is spent. ``016`` joins through the reservation, because a
+    reconciliation names the claim the post was made under rather than repeating the key --
+    a second copy of the key on that row would be a second value that must agree with it.
+    Validated as a non-blank storable identifier only, for :func:`attempt_for_key`'s reason.
+    """
+    key = _require_identifier(idempotency_key, "idempotency_key")
+    row = _fetch_one(
+        conn,
+        "SELECT 1 FROM submission_reconciliations c JOIN submission_key_reservations r "
+        "ON r.reservation_id = c.reservation_id WHERE r.idempotency_key = ? LIMIT 1",
+        (key,),
+    )
+    return row is not None
+
+
+# What "standing" means to both readers below: no release row, and not spent -- neither by an
+# attempt row under the key nor by a reconciliation of the reservation. Before M2-713 the
+# readers checked the release alone, so after every ordinary post `release-key` listed the
+# spent reservation as standing and `submit`'s refusal hint told the operator to release it;
+# the writers were right only because each checks the attempt first. One predicate, so the
+# two readers cannot come to disagree about it (M1-608).
+_STANDING_RESERVATION = (
+    "NOT EXISTS (SELECT 1 FROM submission_key_releases x "
+    "WHERE x.reservation_id = r.reservation_id) "
+    "AND NOT EXISTS (SELECT 1 FROM submission_attempts a "
+    "WHERE a.idempotency_key = r.idempotency_key) "
+    "AND NOT EXISTS (SELECT 1 FROM submission_reconciliations c "
+    "WHERE c.reservation_id = r.reservation_id)"
+)
 
 
 def live_reservation_for_key(
@@ -588,8 +638,11 @@ def live_reservation_for_key(
 ) -> KeyReservation | None:
     """Return the reservation currently holding this key, or ``None``.
 
-    "Currently holding" means a ``submission_key_reservations`` row with no
-    ``submission_key_releases`` row pointing at it. ``010``'s trigger allows at most one
+    "Currently holding" means a ``submission_key_reservations`` row that is released by no
+    ``submission_key_releases`` row and spent by nothing -- no attempt under its key, no
+    reconciliation of it (M2-713; see :data:`_STANDING_RESERVATION`). A spent reservation
+    holds nothing: the key is spent, and :func:`attempt_for_key` / :func:`key_is_reconciled`
+    are what say so. ``010``'s trigger allows at most one
     such row per key, so the ``ORDER BY``/``LIMIT`` below is not how the answer is decided
     -- it is what keeps this reader **total** against a ledger some other program wrote,
     where the invariant was never enforced. A reader that raised on a ledger holding two
@@ -604,9 +657,7 @@ def live_reservation_for_key(
         conn,
         "SELECT reservation_id, idempotency_key, forecast_record_id, reservation_seq, "
         "reserved_at_utc FROM submission_key_reservations r WHERE r.idempotency_key = ? "
-        "AND NOT EXISTS ("
-        "SELECT 1 FROM submission_key_releases x WHERE x.reservation_id = r.reservation_id"
-        ") ORDER BY r.reservation_seq DESC LIMIT 1",
+        f"AND {_STANDING_RESERVATION} ORDER BY r.reservation_seq DESC LIMIT 1",
         (key,),
     )
     return None if row is None else _reservation_from_row(row)
@@ -616,6 +667,10 @@ def live_reservations_for_record(
     conn: sqlite3.Connection, record_id: str
 ) -> tuple[KeyReservation, ...]:
     """Every reservation currently held against this forecast record, oldest first.
+
+    "Held" is :func:`live_reservation_for_key`'s meaning: unreleased and unspent. Since M2-713
+    a reservation an attempt or a reconciliation spent is not listed, so ``release-key`` says
+    there is nothing to release for a posted forecast instead of offering to release it.
 
     :func:`live_reservation_for_key` is keyed by the idempotency key, and the key is a
     pure function of the tournament, question, forecast version and payload hash -- so an
@@ -639,9 +694,7 @@ def live_reservations_for_record(
         conn,
         "SELECT reservation_id, idempotency_key, forecast_record_id, reservation_seq, "
         "reserved_at_utc FROM submission_key_reservations r WHERE r.forecast_record_id = ? "
-        "AND NOT EXISTS ("
-        "SELECT 1 FROM submission_key_releases x WHERE x.reservation_id = r.reservation_id"
-        ") ORDER BY r.reservation_seq ASC",
+        f"AND {_STANDING_RESERVATION} ORDER BY r.reservation_seq ASC",
         (identifier,),
     )
     return tuple(_reservation_from_row(row) for row in rows)
@@ -717,6 +770,11 @@ def reserve_submission_key(
         with transaction(conn):
             if attempt_for_key(conn, key) is not None:
                 raise SubmissionError(_SPENT_KEY_REFUSAL)
+            if key_is_reconciled(conn, key):
+                # Ahead of the live-reservation read, which no longer counts a reconciled
+                # reservation as holding the key: without this the refusal would come from
+                # 010's "already reserved" clause, as an opaque ledger rejection.
+                raise SubmissionError(_RECONCILED_KEY_REFUSAL)
             if live_reservation_for_key(conn, key) is not None:
                 raise SubmissionError(_RESERVED_KEY_REFUSAL)
             sequence = _next_reservation_seq(conn, key)
@@ -809,6 +867,17 @@ def release_submission_key(
                 raise SubmissionError(
                     "this reservation was consumed by a recorded submission attempt and so "
                     "was not abandoned; there is nothing to release"
+                )
+            if _fetch_one(
+                conn,
+                "SELECT 1 FROM submission_reconciliations WHERE reservation_id = ?",
+                (reservation_id,),
+            ):
+                # Before the live-reservation read below, which would otherwise call this
+                # "already released" -- the opposite of what happened.
+                raise SubmissionError(
+                    "this reservation was reconciled as a post that reached the platform and "
+                    "so was not abandoned; there is nothing to release"
                 )
             if live_reservation_for_key(conn, stored_key) is None:
                 raise SubmissionError("this key reservation has already been released")

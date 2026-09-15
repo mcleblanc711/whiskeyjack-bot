@@ -2006,8 +2006,11 @@ def post_approved_forecast(
             if artifact_path is not None
             else "; the artifact could not be written either"
         )
+        # M2-713: the message now names the way out as well as what not to do.
         raise LiveSubmissionError(
-            f"a live post was made and the ledger refused to record it ({exc}){where}"
+            f"a live post was made and the ledger refused to record it ({exc}){where}; do not "
+            "release the key or submit again -- once you have confirmed the forecast on "
+            "Metaculus, record the post with reconcile-submission"
         ) from None
     return LiveSubmissionRecord(
         receipt=receipt,

@@ -34,6 +34,8 @@ LEDGER_TABLES = {
     # could hold the claim -- `submission_attempts` is written once, after the call.
     "submission_key_reservations",
     "submission_key_releases",
+    # M2-713's 016: a live post the ledger never recorded, and the evidence it landed.
+    "submission_reconciliations",
     "schema_migrations",
 }
 

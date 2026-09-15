@@ -267,6 +267,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    reconcile = subparsers.add_parser(
+        "reconcile-submission",
+        help=(
+            "record that a live post reached Metaculus and was never written to the ledger; "
+            "one refetch, no post"
+        ),
+    )
+    reconcile.add_argument("--config", default="config.yaml", type=Path)
+    reconcile.add_argument(
+        "--record-id", required=True, help="the approved forecast record whose post is unrecorded"
+    )
+    reconcile.add_argument(
+        "--observed-by",
+        required=True,
+        help=(
+            "who checked Metaculus and saw this forecast there; recorded verbatim. Required and "
+            "with no default, for `approve`'s reason: this is a claim about what a person "
+            "checked, and the program cannot make it"
+        ),
+    )
+    reconcile.add_argument(
+        "--note",
+        required=True,
+        help="what you saw on the platform; required, because an assertion with no content is none",
+    )
+
+    unrecorded = subparsers.add_parser(
+        "unrecorded-posts",
+        help=(
+            "list records holding a submission intent and a standing, unspent key reservation; "
+            "reads the ledger only"
+        ),
+    )
+    unrecorded.add_argument("--config", default="config.yaml", type=Path)
+
     replay = subparsers.add_parser(
         "replay",
         help="re-derive a stored forecast from its saved model output; makes no API call",
@@ -1027,7 +1062,7 @@ def _run_release_key(args: argparse.Namespace) -> int:
         print(
             "releasing records that you checked Metaculus and this forecast is NOT there. "
             "If submit told you a post was made and the ledger refused to record it, the "
-            "post did land -- do not release; resolve that attempt instead."
+            "post did land -- do not release; record it with reconcile-submission instead."
         )
         try:
             release_submission_key(
@@ -1045,6 +1080,142 @@ def _run_release_key(args: argparse.Namespace) -> int:
             f"released {reservation.reservation_id} (operator_abandoned, "
             f"by {args.released_by}); the key may be claimed again"
         )
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _run_reconcile_submission(args: argparse.Namespace) -> int:
+    """Record a live post the ledger never wrote down (M2-713).
+
+    **Posts nothing.** It reads the ledger and the artifact, prints the evidence it found, and
+    only then builds a poster -- so every local refusal happens without a credential, which
+    ``verify-submission`` does not manage -- and makes one identity read and one refetch.
+
+    **What the operator is asserting**, and why ``--observed-by`` and ``--note`` have no
+    default: that they looked at Metaculus and this forecast is there. The program checks that
+    claim against its own refetch and its own pre-post evidence, and refuses when they
+    disagree, but it cannot make the claim for them. The mirror of ``release-key``: that
+    command records "I checked and it is not there".
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_poster
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.submission_reconcile import (
+        ReconciliationError,
+        find_unrecorded_post,
+        reconcile_unrecorded_post,
+    )
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        print(f"record:      {args.record_id}")
+        try:
+            evidence = find_unrecorded_post(connection, config, args.record_id)
+        except ReconciliationError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(f"question:    {evidence.question_id}  post: {evidence.post_id}")
+        print(f"reservation: {evidence.reservation_id}  (reserved {evidence.reserved_at_utc})")
+        print(f"key:         {evidence.idempotency_key}")
+        print(f"attempt:     {evidence.attempt_id}")
+        print(f"payload:     sha256 {evidence.request_payload_sha256}")
+        print(f"intent:      {evidence.intent_event_id}  (account {evidence.account_id})")
+        if evidence.artifact_path is None:
+            print("artifact:    none -- the command stopped before the receipt was written")
+        else:
+            print(
+                f"artifact:    {config.storage.artifact_root / evidence.artifact_path}  "
+                f"(sha256 {evidence.artifact_sha256})"
+            )
+        print(
+            "reconciling records that you checked Metaculus and this forecast IS there. If it "
+            "is not, do not reconcile; release-key is the way out."
+        )
+        try:
+            poster = build_poster(config)
+        except MissingCredentialError as exc:
+            print(f"refused: {exc}")
+            return EXIT_ENV_MISSING
+        try:
+            event = reconcile_unrecorded_post(
+                connection,
+                config,
+                record_id=args.record_id,
+                observed_by=args.observed_by,
+                note=args.note,
+                poster=poster,
+                occurred_at=datetime.now(tz=timezone.utc),
+            )
+        except ReconciliationError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        print(
+            f"result:      {event.event_type} -> {event.to_status} "
+            f"(reconciliation {event.submission_reconciliation_id}, lifecycle seq "
+            f"{event.event_seq})"
+        )
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
+def _run_unrecorded_posts(args: argparse.Namespace) -> int:
+    """List records that look like an unrecorded post (M2-713). Ledger reads only.
+
+    Candidates, not verdicts: each is a record holding a submission intent and a standing,
+    unspent reservation. The platform decides which command applies -- ``reconcile-submission``
+    if the forecast is there, ``release-key`` if it is not.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.submission_reconcile import ReconciliationError, unrecorded_posts
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    connection = _open_existing_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            candidates = unrecorded_posts(connection)
+        except ReconciliationError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        for record_id in candidates:
+            print(f"record: {record_id}")
+        print(f"unrecorded-post candidates: {len(candidates)}")
+        if candidates:
+            print(
+                "check each on Metaculus: if the forecast is there, run reconcile-submission; "
+                "if it is not, run release-key"
+            )
         return EXIT_OK
     finally:
         connection.close()
@@ -1076,6 +1247,13 @@ def _print_standing_reservations(connection: object, record_id: str) -> None:
     for held in standing:
         suffix = f" --reservation-id {held.reservation_id}" if len(standing) > 1 else ""
         print(f"  whiskeyjack-bot release-key --record-id {record_id} --released-by <you>{suffix}")
+    # M2-713. The other answer to the same check: the forecast IS on Metaculus. Releasing then
+    # would invite a duplicate, and until reconcile-submission there was nothing to run.
+    print("if the forecast IS on Metaculus, do not release; record the post with")
+    print(
+        f"  whiskeyjack-bot reconcile-submission --record-id {record_id} "
+        '--observed-by <you> --note "<what you saw>"'
+    )
 
 
 def _read_payload_file(path: Path) -> dict[str, object] | None:
@@ -1600,6 +1778,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_run_replay(args)
     if args.command == "release-key":
         return _run_release_key(args)
+    if args.command == "reconcile-submission":
+        return _run_reconcile_submission(args)
+    if args.command == "unrecorded-posts":
+        return _run_unrecorded_posts(args)
     if args.command == "replay":
         return _run_replay(args)
     if args.command == "export":
