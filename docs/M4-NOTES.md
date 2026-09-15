@@ -293,3 +293,11 @@ nearly vacuous as first written and were fixed before commit:
 |---|---|---|
 | replay through the persisted form | 90% of draws refused; <3% classified | 0% refused; every kind reached (29% resolved, 44% unresolved, 7-8% each other) |
 | digest injectivity (tiny alphabet) | 98.6% of draws invalid (~7 useful examples) | 0% invalid; 20% equal pairs |
+
+### Review
+
+**Round 1 — APPROVE on `7163136`** (2026-09-15, local Codex against
+`GPT_REVIEW_REQUEST_M4-801_r1.md`, all four gates green in the request). No blocking findings
+and no backlog candidates; each of the eight falsifiable risk claims was marked safe. The
+reviewer could not run pytest in its environment and says so; its verdict rests on the pinned
+diff and the implementation. This entry is the only change after the approved commit.
