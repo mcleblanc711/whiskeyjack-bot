@@ -322,7 +322,6 @@ def test_the_writer_raises_only_lifecycle_error_and_a_refusal_writes_nothing(
     )
     reconciliation = SubmissionReconciliation(
         reservation_id=post.reservation_id,
-        attempt_id=post.attempt_id,
         request_payload_sha256=PAYLOAD_SHA,
         intent_event_id=post.intent_event_id,
         observed_by="chris",

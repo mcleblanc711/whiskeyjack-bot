@@ -1098,8 +1098,6 @@ def _run_reconcile_submission(args: argparse.Namespace) -> int:
     disagree, but it cannot make the claim for them. The mirror of ``release-key``: that
     command records "I checked and it is not there".
     """
-    from datetime import datetime, timezone
-
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
     from whiskeyjack_bot.logging_setup import configure_logging
@@ -1107,6 +1105,7 @@ def _run_reconcile_submission(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.submission_reconcile import (
         ReconciliationError,
+        check_assertion,
         find_unrecorded_post,
         reconcile_unrecorded_post,
     )
@@ -1120,6 +1119,13 @@ def _run_reconcile_submission(args: argparse.Namespace) -> int:
         print(exc)
         return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
     configure_logging(config)
+    # The assertion first: argparse's `required=True` accepts " ", and a blank assertion should
+    # be refused before the ledger or the artifact is read (round 1).
+    try:
+        check_assertion(args.observed_by, args.note)
+    except ReconciliationError as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
 
     connection = _open_existing_ledger(config.storage.sqlite_path)
     if connection is None:
@@ -1161,7 +1167,6 @@ def _run_reconcile_submission(args: argparse.Namespace) -> int:
                 observed_by=args.observed_by,
                 note=args.note,
                 poster=poster,
-                occurred_at=datetime.now(tz=timezone.utc),
             )
         except ReconciliationError as exc:
             print(f"refused: {exc}")

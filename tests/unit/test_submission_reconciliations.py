@@ -13,11 +13,12 @@ The orchestrator that assembles the evidence and makes the refetch is
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
@@ -117,7 +118,6 @@ def _counts(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
 def _reconciliation(post: Unrecorded, **changes: object) -> SubmissionReconciliation:
     base = SubmissionReconciliation(
         reservation_id=post.reservation_id,
-        attempt_id=post.attempt_id,
         request_payload_sha256=post.payload_sha256,
         intent_event_id=post.intent_event_id,
         observed_by="chris",
@@ -662,14 +662,46 @@ def test_the_writer_records_the_row_and_its_event_together(
     assert read_history(ledger, RECORD)[-1] == event
 
 
-def test_the_writer_accepts_the_attempt_id_the_live_minter_produces(
+def test_a_caller_cannot_name_the_attempt_the_writer_records() -> None:
+    """Round 1, B1: the writer accepted any well-formed live attempt id and stored it.
+
+    Reproduced on `d80d100`: `wjlive-1-` plus 64 zeroes was recorded against a reservation whose
+    key derives `wjlive-1-e272b66f...`. The value is derivable, so the fix removes the field
+    rather than cross-checking it (M2-703's rule); this is the assertion that fails against the
+    tree that had it.
+    """
+    assert "attempt_id" not in {f.name for f in fields(SubmissionReconciliation)}
+
+
+def test_the_writer_derives_the_attempt_id_from_the_stored_reservation(
     ledger: sqlite3.Connection, post: Unrecorded
 ) -> None:
-    """``lifecycle`` spells the live tag as a literal; the produced id is what keeps it honest."""
-    assert post.attempt_id == live_attempt_id(post.idempotency_key)
-    record_submission_reconciliation(
+    """The recorded attempt is the one a post under the *stored* reservation's key carried.
+
+    The oracle is written out independently of both `lifecycle.live_attempt_id_for_key` and
+    `submission_live.live_attempt_id`, so a change to the shared derivation -- which now also
+    names every live attempt the worker records -- fails here rather than agreeing with itself.
+    """
+    event = record_submission_reconciliation(
         ledger, record_id=RECORD, reconciliation=_reconciliation(post), occurred_at=WHEN
     )
+    stored_key = ledger.execute(
+        "SELECT idempotency_key FROM submission_key_reservations WHERE reservation_id = ?",
+        (post.reservation_id,),
+    ).fetchone()[0]
+    recorded = ledger.execute(
+        "SELECT attempt_id FROM submission_reconciliations WHERE reconciliation_id = ?",
+        (event.submission_reconciliation_id,),
+    ).fetchone()[0]
+    oracle = "wjlive-1-" + hashlib.sha256(stored_key.encode("utf-8")).hexdigest()
+    assert recorded == oracle == live_attempt_id(stored_key)
+
+
+def test_moving_the_derivation_did_not_change_a_live_attempt_id() -> None:
+    """`submission_live.live_attempt_id` now delegates to `lifecycle`; every stored live attempt
+    id was minted by the old body, so the two must agree for every key, not only this one."""
+    for key in ("wjsub-1-" + "c" * 64, "k", "wjsub-1-other"):
+        assert live_attempt_id(key) == "wjlive-1-" + hashlib.sha256(key.encode()).hexdigest()
 
 
 def test_a_reconciled_key_reads_as_spent_everywhere(
@@ -726,14 +758,6 @@ def test_a_standing_reservation_is_still_standing(
 
 _WRITER_FIELD_PROBES: list[tuple[dict[str, object], str]] = [
     ({"reservation_id": "  "}, "reconciliation.reservation_id must not be blank"),
-    (
-        {"attempt_id": "wjdry-1-" + "a" * 64},
-        "reconciliation.attempt_id must be a live attempt identifier",
-    ),
-    (
-        {"attempt_id": "wjlive-1-" + "a" * 63},
-        "reconciliation.attempt_id must be a live attempt identifier",
-    ),
     ({"request_payload_sha256": "D" * 64}, "reconciliation.request_payload_sha256 must be 64"),
     ({"intent_event_id": ""}, "reconciliation.intent_event_id must be a non-empty string"),
     ({"observed_by": " \t"}, "reconciliation.observed_by must not be blank"),

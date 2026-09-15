@@ -70,6 +70,7 @@ Purely local file I/O: no network access on any path through here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -487,8 +488,12 @@ class SubmissionReconciliation:
     - **a person** -- ``observed_by`` and ``note``, both required, for ``approve``'s reason:
       a claim about what someone saw on the platform is never inferred from the machine.
 
-    ``attempt_id`` names the attempt: the identity ``submission_live.live_attempt_id`` gives a
-    post under this key, which its attempt row would have carried. ``artifact_path`` and
+    **There is no ``attempt_id`` field, and that is the round-1 fix.** The row names the
+    attempt by the identity :func:`live_attempt_id_for_key` gives a post under the reservation's
+    key -- the one its attempt row would have carried -- and the writer derives it from the
+    *stored* reservation. Accepting it as a field let a well-formed id for some other key be
+    recorded against this post (M2-703's rule: a value the writer can derive is a second source
+    of truth if a caller may also supply it). ``artifact_path`` and
     ``artifact_sha256`` pin the captured artifact when one exists -- both or neither -- and
     are never read into the row: the file is evidence the row points at, not a receipt the
     row claims.
@@ -499,7 +504,6 @@ class SubmissionReconciliation:
     """
 
     reservation_id: str
-    attempt_id: str
     request_payload_sha256: str
     intent_event_id: str
     observed_by: str
@@ -1447,11 +1451,23 @@ def record_submission_verification(
 # shape, in a column of its own, so it is never compared with either.
 _RECONCILIATION_PREFIX = "wjrec-"
 
-# The live attempt identity's shape, spelled as `016_submission_reconciliations.sql` spells
-# it. A literal rather than an import: `submission_live` imports this module, so the reverse
-# import would close a cycle. What keeps the two in step is a test that feeds the writer an id
-# `submission_live.live_attempt_id` produced -- the produced identifier, not the constant.
-_LIVE_ATTEMPT_TAG = "wjlive-1-"
+# The visible scheme tag on a live attempt id. It lives here, with the one derivation below,
+# because the reconciliation writer has to derive the id and `submission_live` imports this
+# module -- the reverse import would close a cycle. `submission_live.live_attempt_id` delegates
+# to :func:`live_attempt_id_for_key`, so there is one rule, and `016` pins the same shape.
+LIVE_ATTEMPT_TAG = "wjlive-1-"
+
+
+def live_attempt_id_for_key(idempotency_key: str) -> str:
+    """The deterministic attempt id a live post under this key carries (M2-704, moved here).
+
+    ``submission_live.live_attempt_id`` documents why it is derived rather than minted and
+    hashed rather than copied; that function now calls this one. Moved for M2-713's round 1:
+    a reconciliation must name the attempt its post carried, and the only honest source for
+    that is this derivation applied to the reservation the ledger stored.
+    """
+    key = _require_identifier(idempotency_key, "idempotency_key")
+    return LIVE_ATTEMPT_TAG + hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 def record_submission_reconciliation(
@@ -1477,10 +1493,11 @@ def record_submission_reconciliation(
 
     **What is enforced, and where.** ``016``'s trigger is the binding check and holds against a
     raw INSERT; the probes below restate it so a caller gets a field-level message rather than
-    ``the ledger rejected this write``. What neither layer can check is that ``attempt_id`` is
-    the sha256 derivation of the reservation's key -- SQLite has no sha256, and this module
-    does not own the derivation -- so ``submission_reconcile`` derives it and the schema checks
-    its shape and that no attempt row holds it.
+    ``the ledger rejected this write``. ``attempt_id`` is not accepted at all: it is derived
+    here, inside the transaction, from the key of the reservation the ledger stored
+    (:func:`live_attempt_id_for_key`). SQLite has no sha256, so ``016`` checks only its shape and
+    that no attempt row holds it; this writer is the one path that sets it, and it cannot be
+    handed a different one.
 
     Persistence only: the refetch the snapshot records was made by the caller.
     """
@@ -1493,7 +1510,6 @@ def record_submission_reconciliation(
     reservation_id = _require_identifier(
         reconciliation.reservation_id, "reconciliation.reservation_id"
     )
-    attempt_id = _require_live_attempt_id(reconciliation.attempt_id)
     digest = _require_sha256(
         reconciliation.request_payload_sha256, "reconciliation.request_payload_sha256"
     )
@@ -1526,11 +1542,10 @@ def record_submission_reconciliation(
 
     reconciliation_id = _RECONCILIATION_PREFIX + uuid.uuid4().hex
     with transaction(conn):
-        _require_reconcilable(
+        attempt_id = _require_reconcilable(
             conn,
             record_id=identifier,
             reservation_id=reservation_id,
-            attempt_id=attempt_id,
             digest=digest,
             intent_event_id=intent_event_id,
             refetched_at=refetched_at,
@@ -2198,19 +2213,6 @@ def _require_hash_binds(conn: sqlite3.Connection, record_id: str, digest: str) -
         )
 
 
-def _require_live_attempt_id(value: object) -> str:
-    """The shape ``016`` pins on ``submission_reconciliations.attempt_id``: tag plus 64 hex."""
-    text = _require_identifier(value, "reconciliation.attempt_id")
-    digest = text[len(_LIVE_ATTEMPT_TAG) :]
-    if (
-        not text.startswith(_LIVE_ATTEMPT_TAG)
-        or len(digest) != 64
-        or not _HEX_DIGITS.issuperset(digest)
-    ):
-        raise LifecycleError("reconciliation.attempt_id must be a live attempt identifier")
-    return text
-
-
 def _require_assertion_text(value: object, field: str, *, max_length: int) -> str:
     """Non-blank storable text with no NUL: a person's name, or what they said they saw.
 
@@ -2257,12 +2259,12 @@ def _require_reconcilable(
     *,
     record_id: str,
     reservation_id: str,
-    attempt_id: str,
     digest: str,
     intent_event_id: str,
     refetched_at: str,
-) -> None:
-    """Fail readably when a reconciliation could not describe an unrecorded post.
+) -> str:
+    """Fail readably when a reconciliation could not describe an unrecorded post; return the
+    attempt id its post carried, derived from the key on the stored reservation row.
 
     ``016``'s probes in the trigger's order, each with a message that says what to do. The
     trigger is the enforcement; see :func:`_require_verifiable_attempt` for why both hold.
@@ -2281,6 +2283,7 @@ def _require_reconcilable(
             "reconciliation.reservation_id does not name a key reservation held against this "
             "forecast record"
         )
+    attempt_id = live_attempt_id_for_key(_stored_text(reservation[0], "idempotency_key"))
     if _fetch_one(
         conn, "SELECT 1 FROM submission_key_releases WHERE reservation_id = ?", (reservation_id,)
     ):
@@ -2338,6 +2341,7 @@ def _require_reconcilable(
         raise LifecycleError(
             "reconciliation.refetched_at_utc is earlier than the reservation it reconciles"
         )
+    return attempt_id
 
 
 def _require_verifiable_attempt(

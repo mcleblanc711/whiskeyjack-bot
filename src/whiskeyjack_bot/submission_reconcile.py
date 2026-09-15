@@ -285,7 +285,7 @@ def reconcile_unrecorded_post(
     observed_by: str,
     note: str,
     poster: MetaculusPoster,
-    occurred_at: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
     refetch_attempts: int = 3,
     refetch_pause_seconds: float = 2.0,
@@ -316,8 +316,7 @@ def reconcile_unrecorded_post(
         )
     if type(config) is not AppConfig:
         raise ReconciliationError("config must be an AppConfig")
-    actor = _require_assertion(observed_by, "observed_by", max_length=MAX_ACTOR_LENGTH)
-    note_text = _require_assertion(note, "note", max_length=MAX_NOTE_LENGTH)
+    actor, note_text = check_assertion(observed_by, note)
     evidence = find_unrecorded_post(conn, config, record_id)
 
     try:
@@ -393,10 +392,13 @@ def reconcile_unrecorded_post(
         result=result,
         expected_labels=labels,
     )
-    stamped = _utcnow() if occurred_at is None else occurred_at
+    # Read *after* the confirming refetch, never before the command started: the row records
+    # when the program observed the forecast, and a caller-supplied instant from command entry
+    # would date that observation before it was made (round 1, B2). `clock` is injectable so a
+    # test can drive a retrying refetch through a virtual clock.
+    stamped = (_utcnow if clock is None else clock)()
     reconciliation = SubmissionReconciliation(
         reservation_id=evidence.reservation_id,
-        attempt_id=evidence.attempt_id,
         request_payload_sha256=evidence.request_payload_sha256,
         intent_event_id=evidence.intent_event_id,
         observed_by=actor,
@@ -423,6 +425,20 @@ def reconcile_unrecorded_post(
         raise ReconciliationError(
             str(exc) or "the ledger refused to record this reconciliation"
         ) from None
+
+
+def check_assertion(observed_by: object, note: object) -> tuple[str, str]:
+    """Validate the person's assertion, or refuse, before anything else is read.
+
+    Public so ``reconcile-submission`` can refuse a blank ``--observed-by`` or ``--note`` before
+    it inspects the ledger or the artifact and before it builds a poster (round 1's non-blocking
+    observation: argparse's ``required=True`` accepts ``" "``). The orchestrator calls it again
+    as its own first check, so the rule does not depend on a caller remembering to.
+    """
+    return (
+        _require_assertion(observed_by, "observed_by", max_length=MAX_ACTOR_LENGTH),
+        _require_assertion(note, "note", max_length=MAX_NOTE_LENGTH),
+    )
 
 
 def unrecorded_posts(conn: sqlite3.Connection) -> tuple[str, ...]:

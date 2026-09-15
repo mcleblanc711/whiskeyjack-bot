@@ -164,7 +164,6 @@ def _reconcile(case: Any, record_id: str, poster: Any, **kwargs: Any) -> Any:
         observed_by=kwargs.pop("observed_by", "chris"),
         note=kwargs.pop("note", NOTE),
         poster=poster,
-        occurred_at=utcnow(),
         sleep=lambda _: None,
         **kwargs,
     )
@@ -296,6 +295,46 @@ def test_the_worker_confirming_the_journal_first_does_not_block_reconciliation(c
     again = poll(case)
     assert platform.posts == 1 and platform.comment_posts == 1
     assert again["forecast_confirmed"] == 1
+
+
+def test_the_refetch_time_is_read_after_a_retrying_refetch_confirms(case: Any) -> None:
+    """Round 1, B2: the row must not date the observation before it was made.
+
+    Two transient read failures, then the confirming read, on a virtual clock that the injected
+    sleep advances. The stored `refetched_at_utc` is the instant after the confirmation, not
+    the instant the command started.
+    """
+    from datetime import timedelta
+
+    conn, *_ = case
+    record_id, poster, _ = _refused_write(case)
+    start = utcnow()
+    now = [start]
+    failures = [2]
+    original = poster.get_question_by_post_id
+
+    def flaky(post_id: int) -> Any:
+        if failures[0]:
+            failures[0] -= 1
+            raise TimeoutError
+        return original(post_id)
+
+    def sleep(seconds: float) -> None:
+        now[0] += timedelta(seconds=seconds)
+
+    poster.get_question_by_post_id = flaky  # type: ignore[method-assign]
+    reconcile_unrecorded_post(
+        conn,
+        case[1],
+        record_id=record_id,
+        observed_by="chris",
+        note=NOTE,
+        poster=poster,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    stored = conn.execute("SELECT refetched_at_utc FROM submission_reconciliations").fetchone()[0]
+    assert stored == (start + timedelta(seconds=4)).isoformat(timespec="microseconds")
 
 
 # --------------------------------------------------------------------------------------
@@ -776,6 +815,65 @@ def test_reconcile_submission_refuses_locally_before_building_a_poster(
     )
     assert code == EXIT_REFUSED
     assert "refused: no key reservation is standing" in capsys.readouterr().out
+
+
+def test_reconcile_submission_stamps_the_refetch_after_it_confirms(
+    case: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1, B2, at the surface it was found on: the CLI passed its own entry time.
+
+    Reproduced on `d80d100`: the stored `refetched_at_utc` preceded the confirming GET by
+    about two milliseconds with no retry at all, and by the refetch pauses with them.
+    """
+    from whiskeyjack_bot.cli import main
+    from whiskeyjack_bot.env_verify import EXIT_OK
+
+    conn, config, *_ = case
+    record_id, poster, _ = _refused_write(case)
+    seen: list[str] = []
+    original = poster.get_question_by_post_id
+
+    def read(post_id: int) -> Any:
+        result = original(post_id)
+        seen.append(utcnow().isoformat(timespec="microseconds"))
+        return result
+
+    poster.get_question_by_post_id = read  # type: ignore[method-assign]
+    monkeypatch.setattr("whiskeyjack_bot.metaculus.client.build_poster", lambda _config: poster)
+    argv = ["reconcile-submission", "--config", str(_config_file(config, tmp_path))]
+    argv += ["--record-id", record_id, "--observed-by", "chris", "--note", NOTE]
+    assert main(argv) == EXIT_OK
+    stored = conn.execute("SELECT refetched_at_utc FROM submission_reconciliations").fetchone()[0]
+    assert stored >= seen[-1], "the row dates the observation before the confirming read"
+
+
+@pytest.mark.parametrize("field", ["--observed-by", "--note"])
+def test_reconcile_submission_refuses_a_blank_assertion_before_reading_anything(
+    case: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+) -> None:
+    """Round 1's non-blocking observation: argparse's `required=True` accepts " "."""
+    from whiskeyjack_bot import submission_reconcile
+    from whiskeyjack_bot.cli import EXIT_REFUSED, main
+
+    conn, config, *_ = case
+
+    def must_not_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a blank assertion must be refused before this is reached")
+
+    monkeypatch.setattr(submission_reconcile, "find_unrecorded_post", must_not_run)
+    monkeypatch.setattr("whiskeyjack_bot.metaculus.client.build_poster", must_not_run)
+    argv = ["reconcile-submission", "--config", str(_config_file(config, tmp_path))]
+    argv += ["--record-id", "rec-x", "--observed-by", "chris", "--note", NOTE]
+    argv[argv.index(field) + 1] = "   "
+    capsys.readouterr()
+    assert main(argv) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert f"refused: {field.removeprefix('--').replace('-', '_')} is required" in out
+    assert "record:" not in out
 
 
 @pytest.mark.parametrize("missing", ["--observed-by", "--note"])
