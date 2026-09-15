@@ -3452,3 +3452,61 @@ reads as more than it is.
   reconciliation or an attempt landing during the refetch makes the re-derivation *refuse*
   rather than differ; only a rewritten artifact or intent could make it differ. It is kept
   because it is cheap and the alternative is recording against evidence nobody re-checked.
+
+### On the mutation pass
+
+106 mutants, run after the implementation was committed: every clause of `016` neutered as
+`WHERE 0 AND (<whole predicate>)` (and each arm of the two OR clauses, and each arm of the
+lifecycle hunk, separately), every Python guard in the writer, the key readers and the
+orchestrator set to `if False`, each arm of the two pure checks removed. `__pycache__` cleared
+before every run, a green baseline confirmed by exit code first and again after restoring, and
+every kill read for the assertion that failed. **91 killed, 15 survived** on the first pass,
+over `test_submission_reconciliations.py`, the property file, `test_submission_reconcile.py`,
+`test_submission.py` and `test_lifecycle.py`.
+
+The survivors, and what each one turned out to be:
+
+| Survivor | Why it survived | Resolution |
+| --- | --- | --- |
+| `submission_reconciliations_block_delete` neutered | The append-only probes seed a reconciliation its event cites, so the foreign key from `lifecycle_events` refused the DELETE before the block trigger mattered | New probe on a row no event cites, asserting the append-only message — killed |
+| outstanding-uncertainty refusal | No orchestrator test held an uncertain attempt | New test: a lost POST response recorded as `submission_uncertain` is sent to `verify-submission` — killed |
+| unbound (pre-`011`) approval refusal | No test held one | New test, the pre-`011` shape `test_submission.py` already builds — killed |
+| intent digest vs approval digest | On the live path the policy writes an intent only after the key gate, so they always agree | The intent is a stored value, so the guard stays; new test with a disagreeing raw journal row — killed |
+| `type(question_id) is not int` / `type(post_id) is not int` in `read_intent`; the same in `check_artifact_binds` | JSON gives `7.0 == 7`, and no test or draw supplied a float id | Unit cases for `7.0`/`8.0`; the property's junk strategy gained both and pins them with `@example` — killed |
+| artifact `request_payload` not an object | The canonical-hash step refused it too, with a different message | Unit case asserting this guard's message — killed |
+| the standing-reservation hint's reconcile line | The test asserted the command name, which the next line also prints | Asserts every line — killed |
+| "attempt already recorded" and "already reconciled" in `find_unrecorded_post` | **Unreachable**: an attempt under the key leaves the record `submitted`, `failed` or holding an uncertainty, and a reconciliation leaves it `submitted`, so the status and uncertainty checks refuse first | **Removed.** The writer's mirror and `016` still refuse both |
+| payload question type vs record type | **Equivalent**: a payload that re-hashes to the approval's digest is the approval's payload, type included | **Removed** |
+| "the snapshot omits its values" | **Unreachable** for a confirmed verdict: `submission_live`'s caps keep a confirming envelope under `MAX_BODY_LENGTH`, and its own property fails if a cap is removed | **Removed** |
+| `lifecycle_events_one_event_per_reconciliation` made non-unique | A second event citing a reconciliation is refused by the transition clause (the record has left `approved`) or the ownership clause first | **Kept** — `003`'s rule that every link column gets one; recorded as Deferred above |
+| the evidence-equality re-check | Only hostile local state makes the re-derived evidence *differ*; a reachable change makes it *refuse* | **Kept** — recorded as a standing risk above |
+
+A re-run of the eleven that stayed in the code: nine killed, each by the test written for it;
+the index and the equality re-check survive as documented.
+
+### On the property pass
+
+Six properties in `tests/property/test_submission_reconcile_properties.py`, 200 examples each
+under the `dev`/`ci` profiles (150 for the writer fuzz):
+
+- `read_intent` and `check_artifact_binds` are **iff**: a draw that departs from the valid
+  intent or envelope in one field — under the check's own comparison, so `7.0` departs from `7`
+  and an equal value does not — is refused, and the undeparted one is accepted. Every refusal is
+  checked for the planted secret in its message and its rendered traceback.
+- Both raise only `ReconciliationError` over arbitrary input: hostile text, bytes, a 100,000-deep
+  JSON array (a `RecursionError` unless caught), `NaN`, recursive JSON of hostile keys; no refusal
+  chains a cause or an unsuppressed context.
+- `record_submission_reconciliation`, fed junk in one field at a time over a freshly seeded
+  unrecorded post, raises only `LifecycleError`, and a refusal leaves both tables' counts
+  unchanged and no transaction open.
+- `LifecycleEvent`'s persisted form stays stable with the new link drawn as hostile text
+  (`test_lifecycle_properties.py`, widened).
+
+**Run against broken code, by itself.** The property file alone, over 29 mutants of the two checks
+and the writer's validators: every arm of both checks killed — after the discriminating draws
+(`question_id=7.0`, `post_id=8.0`, `account_id=42.0`, a well-formed unauthorized payload) were
+pinned with `@example`, because at roughly 0.4% per random draw the first run left
+`type(post_id) is not int` and the artifact re-hash alive. Eight survive by design and are killed
+by the unit tests' messages instead: the writer's six field validators (the trigger still refuses,
+so the only property the fuzz asserts — the error type — holds), and the digest-shape and
+payload-object guards in `read_intent`, which a re-hash mismatch also refuses.
