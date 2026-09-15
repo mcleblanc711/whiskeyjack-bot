@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT
 
@@ -115,6 +115,12 @@ def _read(data: object) -> Any:
     value=JUNK,
     mutate=st.booleans(),
 )
+# The draws only an exact-type gate refuses, pinned rather than left to a ~0.4%-per-draw
+# chance: the property-only mutation pass saw `type(post_id) is not int` removed and 200
+# random draws never produce `post_id=8.0`.
+@example(field="question_id", value=7.0, mutate=True)
+@example(field="post_id", value=8.0, mutate=True)
+@example(field="account_id", value=42.0, mutate=True)
 def test_an_intent_is_accepted_iff_it_describes_this_post(
     field: str, value: object, mutate: bool
 ) -> None:
@@ -205,6 +211,12 @@ def _envelope() -> dict[str, object]:
     value=JUNK,
     mutate=st.booleans(),
 )
+# As above: a well-formed payload that is not the authorized one, and a question id equal to
+# the right one under `==`, are the draws the re-hash and the exact-type gate exist for.
+@example(
+    where="request_payload", value={"question_type": "binary", "probability_yes": 0.4}, mutate=True
+)
+@example(where="question_id", value=7.0, mutate=True)
 def test_an_artifact_binds_iff_it_describes_this_post(
     where: str, value: object, mutate: bool
 ) -> None:
