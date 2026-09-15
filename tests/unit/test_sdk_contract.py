@@ -96,6 +96,11 @@ THIRD_PARTY_REACHES: dict[tuple[str, str], str] = {
     ("submission_live.py", "state"): "test_the_open_state_is_the_string_the_refusal_compares",
     ("submission_live.py", "value"): "test_the_open_state_is_the_string_the_refusal_compares",
     ("cli.py", "question_type"): "test_the_question_type_attribute_exists_on_the_real_classes",
+    ("resolution_ingest.py", "api_json"): (
+        "tests/unit/test_resolution.py::test_the_pinned_sdk_parses_every_resolution_shape_and_"
+        "the_payload_survives -- drives the real get_question_by_post_id, and a missing "
+        "api_json is a ResolutionFetchError there"
+    ),
     # --- forecasting-tools: guarded elsewhere, before this item ---
     ("metaculus/client.py", "__wrapped__"): (
         "metaculus.client._assert_single_post_is_reachable, at import, plus "

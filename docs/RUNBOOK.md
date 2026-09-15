@@ -286,6 +286,7 @@ version: 11
 | `approve` / `reject` | appends one event | no | no |
 | `release-key` | appends a release row | no | no |
 | `verify-submission` | appends an event | **GET** | no |
+| `ingest-resolutions` | appends resolution rows and `resolved` events | **GET** | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 
@@ -401,6 +402,41 @@ atomic idempotency-key reservation. All of them refuse without spending anything
 If `submit` printed `result: submission_uncertain`, go to [the uncertain
 timeout](#the-uncertain-timeout). Nothing else may be submitted for that record first.
 
+### 6. Ingest resolutions
+
+```bash
+uv run whiskeyjack-bot ingest-resolutions --config config.yaml [--question-id ID]
+```
+
+Fetches every post this ledger has a `submitted` (or later) record for — one GET per post — and
+appends what the platform shows (M4-801). Safe to run at any time and as often as you like: a
+poll that sees nothing new writes nothing. One line per record, then a count:
+
+```
+question 45747  record 0192...  appended  kind resolved  scorable yes  -> resolved
+question 45748  record 0192...  unchanged  kind -  scorable -
+records: 2  failed: 0
+```
+
+`kind` is one of five, and only `resolved` can ever be scored — `score_events` refuses a row
+for anything else, whatever wrote it:
+
+| kind | means | record moves to `resolved`? |
+|---|---|---|
+| `resolved` | a definite outcome | yes (first time) |
+| `annulled` / `ambiguous` | the platform cancelled the question | yes (first time) |
+| `withheld` | status resolved, value `null` | no |
+| `unresolved` | the platform retracted an earlier resolution | no |
+
+**`withheld` is an access fact, not a bug.** Metaculus returns a resolution value only for a
+question the account predicted on (its API docs, "All Authenticated Accounts"). Every record
+this command polls was posted, so `withheld` should be rare; if every record reads `withheld`
+after questions have resolved, the account cannot see its own resolutions — do not score, and
+raise it with Metaculus.
+
+Exit `4` means at least one record printed `failed:`; every other record was still recorded.
+A `failed` line names a rule, never a value. Re-running is safe.
+
 ### Where the lifecycle stops today
 
 The legal transitions are fixed in the schema (`009_submission_refetch_outcome.sql:193-207`):
@@ -424,10 +460,12 @@ Two consequences worth knowing before you need them:
 
 - **`failed` is terminal by omission.** No transition leaves it. A failed record is never
   repaired; you make a new forecast version.
-- **`resolved` and `scored` have no writer in the shipped code.** No command and no
-  function inserts into `resolution_events` or `score_events`. In practice `submitted` is
-  where a record stops today. That is milestone work, not a fault, and not something this
-  runbook can give you a command for.
+- **`resolved` has a writer; `scored` does not yet.** `ingest-resolutions` (step 6) appends
+  resolution rows and moves a record to `resolved`. Nothing inserts into `score_events` until
+  M4-802/M4-803, so `resolved` is where a record stops today. A later re-resolution or
+  retraction is appended as a row, not as another lifecycle event (there is no
+  `resolved -> resolved` transition); the record's current resolution is always its latest
+  row.
 
 ---
 

@@ -29,6 +29,7 @@ from typing import Any, get_args
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from resolution_rows import insert_resolution_row
 from strategies import ENCODABLE_TEXT, HOSTILE_TEXT
 
 from whiskeyjack_bot import approval, lifecycle
@@ -846,13 +847,14 @@ def _new_record(conn: sqlite3.Connection, *, validated: bool = True) -> str:
     # every record in a run needs its own.
     conn.execute(
         "INSERT INTO forecast_records ("
-        "record_id, question_id, tournament_id, forecast_version, question_type, status, "
-        "model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
+        "record_id, question_id, post_id, tournament_id, forecast_version, question_type, "
+        "status, model_provider, model_name, prompt_version, prompt_sha256, retrieval_run_id, "
         "generated_at_utc, final_prediction_json, record_json, created_at_utc, "
         "forecast_sha256, attempt_id) "
-        "VALUES (?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
+        "VALUES (?, ?, ?, 'minibench', 1, 'binary', 'draft', 'anthropic', 'claude', "
         "'v1', 'abc', 'run-1', ?, '{}', '{}', ?, ?, ?)",
-        (record_id, serial, TS, TS, SHA, f"att-{serial}"),
+        # post_id: 014 requires a resolution row to name its record's own post.
+        (record_id, serial, serial + 1000, TS, TS, SHA, f"att-{serial}"),
     )
     if validated:
         record_validation(conn, record_id=record_id, occurred_at=WHEN)
@@ -909,15 +911,9 @@ def _detail_rows(conn: sqlite3.Connection, record_id: str) -> dict[str, object]:
             ),
         )
     # The resolution must name this record's own question, not a constant: a row may point
-    # at the right record and still resolve a different question.
-    question_id = conn.execute(
-        "SELECT question_id FROM forecast_records WHERE record_id = ?", (record_id,)
-    ).fetchone()[0]
-    resolution = conn.execute(
-        "INSERT INTO resolution_events (question_id, forecast_record_id, ingested_at_utc) "
-        "VALUES (?, ?, ?)",
-        (question_id, record_id, TS),
-    ).lastrowid
+    # at the right record and still resolve a different question. Since 014 it must also be
+    # a well-formed, scorable observation, or the score row below is refused.
+    resolution = insert_resolution_row(conn, record_id)
     score = conn.execute(
         "INSERT INTO score_events (forecast_record_id, metric, value, implementation_version, "
         "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",

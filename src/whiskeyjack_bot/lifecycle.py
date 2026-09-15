@@ -35,9 +35,11 @@ The module deliberately does **not** ship:
 
 - ``approve`` / ``reject`` CLI commands -- M2-701 owns those, and adding them here would
   put a reachable approval path in the tree ahead of its item;
-- resolution and score writers -- M4-802 and M5-803 own those. Their *transitions* are
-  defined (here and in the migration) because migrations are immutable and a missing
-  event type would later cost a whole migration to add;
+- score writers -- M4-802 and M4-803 own those. The ``scored`` *transition* is defined
+  (here and in the migration) because migrations are immutable and a missing event type
+  would later cost a whole migration to add. The resolution writer landed with M4-801:
+  :func:`record_resolution_observation`, whose detail rows ``014_resolution_ingestion.sql``
+  constrains;
 - assembly of the handoff's full canonical record. Approval and submission history is
   joined at read/export time (M1-604, ``show``), never written back into ``record_json``
   -- writing it back would mean updating a stored forecast version, which is the thing
@@ -78,6 +80,15 @@ from whiskeyjack_bot.bounds import (
     MAX_NOTE_LENGTH,
 )
 from whiskeyjack_bot.redaction import redact_secrets
+from whiskeyjack_bot.resolution import (
+    ResolutionError,
+    ResolutionKind,
+    ResolutionObservation,
+    canonical_json,
+    classify_resolution,
+    observation_from_snapshot,
+    sha256_text,
+)
 
 # The seven states of 001's `forecast_records.status` CHECK.
 LifecycleStatus = Literal[
@@ -464,6 +475,57 @@ class PreForecastFailure:
     retrieval_run_id: str | None
     occurred_at_utc: str
     created_at_utc: str
+
+
+# What :func:`record_resolution_observation` did with an observation. ``unchanged`` and
+# ``nothing_to_retract`` write nothing: the first is a repeated poll, the second a question
+# that is not resolved and never was, which has no state to record.
+ResolutionWriteOutcome = Literal["appended", "unchanged", "nothing_to_retract"]
+
+# Where a record must be for a resolution to be recorded against it. The API only unmasks a
+# resolution for a question the account predicted on, and in this ledger "predicted" is a
+# confirmed post; `resolved` and `scored` are where such a record goes next.
+_RESOLVABLE_STATUSES: frozenset[str] = frozenset({"submitted", "resolved", "scored"})
+
+# The largest raw post payload stored as a resolution's source response. A MiniBench post as
+# this account sees it is a few kilobytes -- aggregations are masked -- so this bounds a
+# pathological response without truncating an ordinary one.
+MAX_SOURCE_RESPONSE_LENGTH = 4 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class StoredResolution:
+    """One ``resolution_events`` row, read back and re-verified (M4-801).
+
+    ``observation`` is re-validated from the stored snapshot, and both digests are recomputed
+    from the stored text before this is constructed, so what a scorer reads is what was
+    hashed. ``scorable`` is the observation's, which the migration also pins on the row.
+    """
+
+    event_id: int
+    forecast_record_id: str
+    observation: ResolutionObservation
+    observation_sha256: str
+    source_response_sha256: str
+    observed_at_utc: str
+    ingested_at_utc: str
+
+    @property
+    def kind(self) -> ResolutionKind:
+        return self.observation.kind
+
+    @property
+    def scorable(self) -> bool:
+        return self.observation.scorable
+
+
+@dataclass(frozen=True)
+class ResolutionWrite:
+    """The result of one :func:`record_resolution_observation` call."""
+
+    outcome: ResolutionWriteOutcome
+    stored: StoredResolution | None
+    event: LifecycleEvent | None
 
 
 def _utcnow() -> datetime:
@@ -1276,6 +1338,161 @@ def record_submission_verification(
         )
 
 
+def record_resolution_observation(
+    conn: sqlite3.Connection,
+    *,
+    record_id: str,
+    source_response: object,
+    observed_at: datetime,
+) -> ResolutionWrite:
+    """Classify a fetched post payload and append it as this record's resolution, atomically.
+
+    The payload is the only input about the question: the observation is **derived** here by
+    ``resolution.classify_resolution`` against the record's own question id, post id and type,
+    so no caller can hand this writer an observation that disagrees with the evidence stored
+    beside it.
+
+    What happens next depends on the latest row already recorded for the record::
+
+        same observation as the latest row             unchanged           nothing written
+        `unresolved`, and no row yet                   nothing_to_retract  nothing written
+        anything else                                  appended            one row
+
+    An appended ``resolved``/``annulled``/``ambiguous`` observation also appends the
+    ``resolved`` lifecycle event (``submitted -> resolved``) if the record is still
+    ``submitted``. A ``withheld`` value or a retraction moves nothing, and a record already
+    ``resolved`` has no further transition to take: its current resolution is its latest row,
+    which is what ``score_events_require_scorable_resolution`` reads.
+
+    The record must be ``submitted``, ``resolved`` or ``scored``. The two skips above are this
+    writer's courtesy; ``014_resolution_ingestion.sql`` refuses the same rows against a raw
+    INSERT.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    observed = _require_utc(observed_at, "observed_at")
+
+    with transaction(conn):
+        row = _fetch_one(
+            conn,
+            "SELECT question_id, post_id, question_type FROM forecast_records WHERE record_id = ?",
+            (identifier,),
+        )
+        if row is None:
+            raise LifecycleError("record_id does not name a stored forecast record")
+        question_id = _stored_int(row[0], "question_id")
+        if row[1] is None:
+            raise LifecycleError("the forecast record has no post_id to resolve against")
+        post_id = _stored_int(row[1], "post_id")
+        question_type = _stored_text(row[2], "question_type")
+
+        status = current_status(conn, identifier)
+        if status not in _RESOLVABLE_STATUSES:
+            raise LifecycleError(
+                f"a resolution cannot be recorded for a record whose current status is {status}"
+            )
+
+        try:
+            observation = classify_resolution(
+                source_response, question_id=question_id, question_type=question_type
+            )
+            source_text = canonical_json(source_response)
+        except ResolutionError as exc:
+            # The message is resolution.py's own, which names rules and fields only.
+            raise LifecycleError(f"the source response cannot be recorded: {exc}") from None
+        if observation.post_id != post_id:
+            raise LifecycleError("the source response is for a different post than the record")
+        if len(source_text) > MAX_SOURCE_RESPONSE_LENGTH:
+            raise LifecycleError("the source response is larger than the ledger stores")
+        snapshot = observation.snapshot_json()
+        digest = sha256_text(snapshot)
+
+        latest = _fetch_one(
+            conn,
+            "SELECT observation_sha256, observed_at_utc FROM resolution_events "
+            "WHERE forecast_record_id = ? ORDER BY event_id DESC LIMIT 1",
+            (identifier,),
+        )
+        if latest is None and observation.kind == "unresolved":
+            return ResolutionWrite(outcome="nothing_to_retract", stored=None, event=None)
+        if latest is not None:
+            if _stored_text(latest[0], "observation_sha256") == digest:
+                return ResolutionWrite(outcome="unchanged", stored=None, event=None)
+            if _stored_text(latest[1], "observed_at_utc") > observed:
+                raise LifecycleError(
+                    "observed_at is earlier than the latest observation recorded for this record"
+                )
+
+        event_id = _insert(
+            conn,
+            "INSERT INTO resolution_events "
+            "(question_id, forecast_record_id, resolution_snapshot_json, outcome, annulled, "
+            "ambiguous, source_response, ingested_at_utc, post_id, question_type, "
+            "resolution_kind, scorable, observation_sha256, source_response_sha256, "
+            "observed_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                question_id,
+                identifier,
+                snapshot,
+                observation.outcome,
+                1 if observation.kind == "annulled" else 0,
+                1 if observation.kind == "ambiguous" else 0,
+                source_text,
+                _utc_text(_utcnow()),
+                post_id,
+                question_type,
+                observation.kind,
+                1 if observation.scorable else 0,
+                digest,
+                sha256_text(source_text),
+                observed,
+            ),
+        )
+        event: LifecycleEvent | None = None
+        if observation.definitive and status == "submitted":
+            event = _append_event(
+                conn,
+                record_id=identifier,
+                event_type="resolved",
+                resolution_event_id=event_id,
+                occurred_at_utc=observed,
+            )
+        stored = _read_resolution(conn, "event_id = ?", (event_id,))
+        if stored is None:  # pragma: no cover - the row was just inserted in this transaction
+            raise LifecycleError("the recorded resolution could not be read back")
+        return ResolutionWrite(outcome="appended", stored=stored, event=event)
+
+
+def latest_resolution(conn: sqlite3.Connection, record_id: str) -> StoredResolution | None:
+    """The record's current resolution -- its latest observation -- or ``None`` if it has none.
+
+    This is the read a scorer asks. It is the latest row and not the row the ``resolved``
+    lifecycle event cites, because the platform can retract or change a resolution after
+    the record has moved; ``score_events`` refuses a score on the same terms.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    return _read_resolution(
+        conn,
+        "event_id = (SELECT max(event_id) FROM resolution_events WHERE forecast_record_id = ?)",
+        (identifier,),
+    )
+
+
+def read_resolution_history(
+    conn: sqlite3.Connection, record_id: str
+) -> tuple[StoredResolution, ...]:
+    """Every recorded observation for a record, in append order."""
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    rows = _fetch_all(
+        conn,
+        f"SELECT {_RESOLUTION_COLUMNS} FROM resolution_events WHERE forecast_record_id = ? "
+        "ORDER BY event_id",
+        (identifier,),
+    )
+    return tuple(_resolution_from_row(row) for row in rows)
+
+
 def record_pre_forecast_failure(
     conn: sqlite3.Connection,
     *,
@@ -1396,6 +1613,7 @@ def _append_event(
     approval_event_id: int | None = None,
     submission_attempt_id: str | None = None,
     submission_verification_id: int | None = None,
+    resolution_event_id: int | None = None,
     occurred_at_utc: str,
 ) -> LifecycleEvent:
     """Append one lifecycle row, in a transaction, and return it as stored.
@@ -1430,8 +1648,8 @@ def _append_event(
             "INSERT INTO lifecycle_events "
             "(forecast_record_id, event_seq, event_type, from_status, to_status, "
             "detail_code, approval_event_id, submission_attempt_id, "
-            "submission_verification_id, occurred_at_utc, created_at_utc) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "submission_verification_id, resolution_event_id, occurred_at_utc, "
+            "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
                 event_seq,
@@ -1442,6 +1660,7 @@ def _append_event(
                 approval_event_id,
                 submission_attempt_id,
                 submission_verification_id,
+                resolution_event_id,
                 occurred_at_utc,
                 _utc_text(_utcnow()),
             ),
@@ -1675,6 +1894,63 @@ def _pre_forecast_failure_from_row(row: sqlite3.Row) -> PreForecastFailure:
         retrieval_run_id=(None if row[7] is None else _stored_text(row[7], "retrieval_run_id")),
         occurred_at_utc=_stored_text(row[8], "occurred_at_utc"),
         created_at_utc=_stored_text(row[9], "created_at_utc"),
+    )
+
+
+_RESOLUTION_COLUMNS = (
+    "event_id, forecast_record_id, resolution_snapshot_json, source_response, "
+    "observation_sha256, source_response_sha256, observed_at_utc, ingested_at_utc, "
+    "resolution_kind, scorable, outcome"
+)
+
+
+def _read_resolution(
+    conn: sqlite3.Connection, where: str, parameters: tuple[object, ...]
+) -> StoredResolution | None:
+    row = _fetch_one(
+        conn, f"SELECT {_RESOLUTION_COLUMNS} FROM resolution_events WHERE {where}", parameters
+    )
+    return None if row is None else _resolution_from_row(row)
+
+
+def _resolution_from_row(row: sqlite3.Row) -> StoredResolution:
+    """Rebuild and re-verify a stored resolution.
+
+    The digests are recomputed from the stored text and the snapshot is re-validated,
+    because a value read back out of the ledger is untrusted and a score computed from a row
+    whose content no longer matches its hash would be attributed to evidence nobody stored.
+    """
+    snapshot = _stored_text(row[2], "resolution_snapshot_json")
+    source = _stored_text(row[3], "source_response")
+    observation_digest = _stored_text(row[4], "observation_sha256")
+    source_digest = _stored_text(row[5], "source_response_sha256")
+    try:
+        observation = observation_from_snapshot(snapshot)
+        replayed = observation.snapshot_json()
+        snapshot_ok = sha256_text(snapshot) == observation_digest and replayed == snapshot
+        source_ok = sha256_text(source) == source_digest
+    except (ResolutionError, UnicodeEncodeError):
+        raise LifecycleError(
+            "a stored resolution snapshot is malformed (detail withheld: it can echo stored values)"
+        ) from None
+    if not snapshot_ok:
+        raise LifecycleError("a stored resolution snapshot does not match its recorded digest")
+    if not source_ok:
+        raise LifecycleError("a stored resolution source response does not match its digest")
+    if (
+        row[8] != observation.kind
+        or row[9] != (1 if observation.scorable else 0)
+        or row[10] != observation.outcome
+    ):
+        raise LifecycleError("a stored resolution row disagrees with its own snapshot")
+    return StoredResolution(
+        event_id=_stored_int(row[0], "event_id"),
+        forecast_record_id=_stored_text(row[1], "forecast_record_id"),
+        observation=observation,
+        observation_sha256=observation_digest,
+        source_response_sha256=source_digest,
+        observed_at_utc=_stored_text(row[6], "observed_at_utc"),
+        ingested_at_utc=_stored_text(row[7], "ingested_at_utc"),
     )
 
 
