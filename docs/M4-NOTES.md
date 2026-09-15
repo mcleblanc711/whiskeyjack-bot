@@ -804,3 +804,10 @@ assertion that failed, so no kill is a collection error or an unrelated failure.
 | C11 ingestion exits 0 on a missing token | `test_a_missing_token_fails_the_unit_before_any_request` |
 
 24 of 24 killed.
+
+### Review
+
+**Round 1 — APPROVE on `1dd7c72`** (2026-09-15, local Codex against
+`GPT_REVIEW_REQUEST_M4-805_r1.md`, all four gates green in the request). No blocking findings
+and no backlog candidates beyond the recorded M4-806, M4-807 and M1-341; each of the eight
+falsifiable risk claims was marked safe. This entry is the only change after the approved commit.
