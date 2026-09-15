@@ -1,0 +1,17 @@
+[Unit]
+Description=Ingest Whiskeyjack resolutions and score them every six hours
+
+[Timer]
+# M4-805. Every six hours, at minute 23: clear of the tournament poll (*:0/5) and the
+# operator-local watchdog (*:2/5). Six hours because a question resolves once and nothing
+# consumes a score within the day, while every run costs one GET per posted post -- a count
+# that only grows, since resolved posts stay polled to see a retraction -- and a failure that
+# persists pages once per run (the notify template throttles at 30 minutes, so an hourly
+# cadence would page 24 times a day). See docs/M4-NOTES.md, M4-805.
+OnCalendar=*-*-* 00/6:23:00
+Persistent=true
+AccuracySec=1min
+Unit=whiskeyjack-resolutions.service
+
+[Install]
+WantedBy=timers.target
