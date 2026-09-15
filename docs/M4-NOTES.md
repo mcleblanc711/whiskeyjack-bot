@@ -301,3 +301,291 @@ nearly vacuous as first written and were fixed before commit:
 and no backlog candidates; each of the eight falsifiable risk claims was marked safe. The
 reviewer could not run pytest in its environment and says so; its verdict rests on the pinned
 diff and the implementation. This entry is the only change after the approved commit.
+
+## M4-802 — Compute binary and multiclass scores
+
+Acceptance: *Known examples match hand calculations; extreme probabilities are handled safely.*
+Description: *Calculate Brier and log scores with versioned implementations.*
+
+### Delivered
+
+- `src/whiskeyjack_bot/scoring.py` — pure: `ScoreError`, `LocalMetric` (`local_brier_binary`,
+  `local_log_binary`, `local_brier_multiclass`, `local_log_multiclass`),
+  `IMPLEMENTATION_VERSIONS`, `LocalScore`, the four `*_v1` functions, `score_binary`,
+  `score_multiple_choice`, `recompute`.
+- `src/whiskeyjack_bot/migrations/015_local_score_events.sql` — `score_events.resolution_event_id`
+  by `ADD COLUMN`; an upgrade precondition (no pre-015 score rows);
+  `score_events_validate_local_score_on_insert`; the UNIQUE index
+  `score_events_one_per_observation_metric_version`. `LEDGER_SCHEMA_VERSION` → 15.
+- `src/whiskeyjack_bot/lifecycle.py` — `record_local_scores`, `read_local_scores`, `StoredScore`,
+  `ScoreWrite`; `_append_event` gains `score_event_id`.
+- `src/whiskeyjack_bot/score_records.py` — `score_records`, `ScoreResult`, `ScoreRecordsError`.
+- `src/whiskeyjack_bot/cli.py` — `whiskeyjack-bot score --config PATH [--record-id ID]`.
+- `src/whiskeyjack_bot/export.py` — `resolution_event_id` in the `score_events` spec.
+- `tests/unit/test_scoring.py`, `tests/unit/test_score_ledger.py`, `tests/unit/test_cli_score.py`,
+  `tests/property/test_scoring_properties.py`; shared `tests/score_rows.py` (real, hash-verified
+  records walked to `submitted` and resolved through the production writers) and
+  `resolution_rows.insert_score_row` (a 015-valid raw row).
+- `docs/backlog/decisions.csv` — **D36**.
+
+No `AppConfig` field was added, so `config_sha256` and the live activation are untouched. No
+dependency was added. `score` builds no client and makes no network or paid call; its tests
+replace `build_client` and every `requests` verb with refusals and assert none was reached.
+
+### What was established by execution before designing
+
+**Nothing this account posted had resolved.** `ingest-resolutions --config config/tournament.yaml`
+from the main checkout at 2026-09-15 00:44 UTC: 23 records polled, all `nothing_to_retract`,
+0 failed, none `withheld`. So M4-801's unmasking risk has neither fired nor been retired, and no
+real resolved payload exists to capture as a fixture.
+
+**What is posted is what the record says, for these two types.** The live ledger (schema 14,
+opened `mode=ro`): 23 successful attempts, all `refetch_outcome=confirmed`, and 23/23
+`request_payload_sha256` equal to the latest approval's `payload_sha256`. Of those, 13 are binary
+or multiple choice (11 MiniBench binary; one binary and one multiple-choice on the bot-testing
+area -- **batch 1 has no MiniBench multiple-choice question**). For all 13, `final_prediction`
+equals the refetched platform value (binary stored as `[1 - p, p]` with float noise, multiple
+choice by label under a `label_order` permutation). And `submission_payload._binary_payload` /
+`_multiple_choice_payload` are verbatim copies of `final_prediction` -- calibration touches only
+the numeric CDF.
+
+**Metaculus's scores are not Brier and not raw log.** The FAQ URL returns 403 to a fetch; the
+source is `Metaculus/metaculus@8069116` `scoring/score_math.py`. It uses `np.log` (natural log)
+throughout; the binary baseline score is `100 * ln(2p) / ln 2`, the peer score
+`100 * ln(p / geometric_mean)`, both over time-weighted coverage; there is **no Brier score**; and
+a multiple-choice forecast that lacks the resolved option falls back to `pmf[-1]`.
+
+**`score_events` could not say which outcome a score measured.** 001's columns are `metric`,
+`value`, `implementation_version`, `comparison_baseline`, `computed_at_utc`. With re-resolution
+and retraction possible (M4-801), neither "a new score against the new latest resolution" nor a
+database-witnessed idempotency rule is expressible without a link. 003 lets a `scored` lifecycle
+event link exactly one score row (`lifecycle_events_one_event_per_score`), and its only scoring
+transition is `resolved -> scored`.
+
+**The live records score end to end (on a copy).** The live ledger was copied with SQLite's
+backup API into a scratch directory, upgraded to 15 by `initialize_ledger`, and scored: nothing
+to score (no resolutions). One real MiniBench binary record (`probability_yes` 0.91) was then
+resolved `no` through `record_resolution_observation` with a committed post fixture, and scored:
+`local_brier_binary` 0.8281000000000001 (0.91^2) and `local_log_binary` -2.4079456086518722
+(ln 0.09 = 2 ln 0.3 = -2.40794560865187 by `bc -l`); a second run `unchanged`; the JSONL export
+carries both rows with `resolution_event_id`. So a record written by the live pipeline reads back
+through `read_forecast_record` and scores. The live ledger itself was not written.
+
+**SQLite fires the newer trigger first.** With no resolution row, a score row is refused by 015
+("must name a resolution row") before 014 ("not scorable"). `test_a_score_needs_a_resolution`
+now asserts both layers, the second with 015's trigger dropped on its own ledger.
+
+### Decision — score `final_prediction`; for binary and multiple choice it is the posted payload
+
+The brief asked whether to score the model's `final_prediction` or the payload actually posted.
+For these two types they are the same numbers by construction (the builder copies), bound to the
+post by D34 (the approval digest is derived from the record, and the key seam refuses any other
+request digest), and equal on all 13 live records. So there is one subject, and a second
+"payload" row would duplicate every value. The writer reads the prediction back through
+`read_forecast_record`, which re-verifies `forecast_sha256`. **Tripwire:** the existing
+`test_a_binary_record_derives_the_wire_body_and_nothing_else` and
+`test_a_multiple_choice_record_derives_one_entry_per_option` assert the payload *equals*
+`final_prediction`; mutants T1/T2 (scale the payload by 0.999) are killed by them. If a transform
+ever enters the builder, those go red and this decision has to be revisited.
+
+### Decision — natural log, single-term binary Brier, and a `local_` vocabulary
+
+`local_brier_binary` is `(p - o)^2` in [0, 1], not the two-category sum (twice that).
+`local_log_binary` is `ln(p)` on yes and `ln(1.0 - p)` on no. Multiclass Brier is
+`sum_i (f_i - [i == k])^2` in [0, 2]; multiclass log is `ln(f_k)`. Natural log because it is the
+platform's base. Nothing is scaled, shifted or compared against a baseline, so nothing resembles
+a baseline or peer score, and every metric name says `local_` (D30 by analogy). `015` pins the
+vocabulary and requires `comparison_baseline IS NULL`.
+
+### Decision — refuse a zero on the realized outcome; never clamp
+
+The logarithm of every positive double is finite (the smallest subnormal gives -744.44, pinned
+by a `bc -l` literal), so the only unsafe input is exactly 0 on what happened, and it is a
+`ScoreError`: nothing is written, not even the Brier row (property 7 asserts that across about
+ten real-ledger examples per run). A clamp would make the function total by reporting a number nobody
+forecast. The refusal is unreachable for a posted forecast (bounds ≥ 0.001 on both sides), so
+it guards a malformed stored value. `015` also refuses a non-finite value (IEEE infinity is
+storable in REAL; a Python NaN binds as NULL).
+
+### Decision — a score cites the observation it measured, and the database enforces idempotency
+
+`015` adds `resolution_event_id`, and its trigger requires it to be the record's **latest**
+resolution row (014 still decides that row is scorable). The UNIQUE index on
+`(forecast_record_id, resolution_event_id, metric, implementation_version)` is the idempotency
+rule: scoring the same observation again writes nothing, while a new observation or a new
+implementation version is a new row. The cost is operational: merging a migration stops the live worker at its next poll until
+`init-ledger` runs, so 015 was claimed in `TRACKS.md` before it was written.
+
+### Decision — the writer's only input about what is scored is the record id
+
+`record_local_scores(conn, *, record_id, computed_at)` reads the forecast and the latest
+resolution itself; no caller hands it a probability, an outcome or a score (M2-707/M4-801: a
+caller-supplied value next to the evidence is a second source of truth). The forecast stack is
+imported inside the function, the `approval.approve` precedent, because `forecast.store` imports
+`lifecycle`.
+
+### Decision — a re-resolution after `scored` appends rows and no lifecycle event
+
+003 has no `scored -> scored` transition. So the first scoring of a `resolved` record appends the
+rows **and** the `scored` event (linking the first row, the Brier), in one transaction; a later
+scoring against a new observation or a new version appends rows only. A retraction after scoring
+leaves the old rows and makes the record `not_scorable` until it resolves again. The current
+score of a record is the rows citing its latest resolution under the current versions.
+
+### Decision — the reader recomputes every row, exactly
+
+`read_local_scores` re-verifies each cited resolution (both digests), recomputes the value with
+the implementation named by the row's `implementation_version` (`scoring.recompute`), and refuses
+any difference, an unregistered version, or a metric/version mismatch. Old versions stay
+registered in `scoring._IMPLEMENTATIONS`; each registered version has a golden table in
+`test_scoring.py` keyed by its version string.
+
+### Deviation — `score --config PATH`, not `score [--record-id ID]`
+
+`CODEX_HANDOFF.md` lists `score [--record-id ID]`. The ledger path lives in the config, and every
+other ledger command takes `--config`.
+
+### Deviation — the stricter reading of the criterion
+
+"Known examples match hand calculations" is read as: every expected value is written out by hand
+(Brier as exact decimal arithmetic in a comment; logs as `bc -l` literals, so the oracle does not
+share Python's libm), never produced by the implementation. "Extreme probabilities are handled
+safely" is read as: 0, 1, 0.001, 0.999, the smallest subnormal and `1 - 2**-53` are each pinned;
+nothing non-finite can be computed or stored; and the one undefined case is a refusal rather
+than an adjusted number.
+
+### Deviation — the multiple-choice sum tolerance is a third independent constant
+
+The plan said to promote `forecast/multiple_choice.py`'s `_SUM_TOLERANCE` to `bounds.py`. That
+module's comment records that it and `submission_live._CATEGORY_SUM_TOLERANCE` are deliberately
+independent constants (one may not import the other's stack), so `scoring.py` follows the same
+rule with its own `1e-6` rather than refactoring two approved modules.
+
+### Deviation — existing seeds write score rows through a 015-valid helper
+
+Eight raw `INSERT INTO score_events` sites (export, lifecycle, resolution ledger and two property
+suites) wrote `metric='brier', implementation_version='v1'` with no resolution link; 015 refuses
+all of them. They now use `resolution_rows.insert_score_row`. `test_export.py`'s `_corrupt`
+drops 015's trigger on its own ledger before planting an off-contract value, because every shape
+it plants is now also refused at INSERT, and the export's refusal is still the thing under test.
+
+### Rejected — two score subjects (forecast and payload)
+
+Identical by construction for these types; see the first decision and its tripwire.
+
+### Rejected — recomputing the score inside the trigger
+
+A second implementation of the number, and SQLite's `ln` depends on build flags. The reader
+recomputes instead.
+
+### Rejected — an upper bound on multiclass Brier in the trigger
+
+The mathematical bound is 2 + O(tolerance), and a copy of the Python tolerance in SQL would be a
+second, divergent spelling of it. The trigger enforces the bounds that follow from the definitions
+alone (Brier ≥ 0, binary Brier ≤ 1, log ≤ 0); the property test enforces `[0, 2 + 2e-6]`.
+
+### Rejected — an input-digest column on the score row
+
+The record (`forecast_sha256`) and the resolution row (both digests) are re-verified on every
+read, and the reader recomputes from them, so a digest of the inputs would attest nothing new.
+
+### Rejected — renormalizing a distribution that does not sum to 1
+
+That scores a forecast nobody made. Outside `1e-6` is a `ScoreError`.
+
+### Rejected — replicating Metaculus's `pmf[-1]` fallback for an unpriced option
+
+It is a platform rule about options added after forecasting. Replicating it would make a local
+score claim a platform behaviour nobody has verified here (D30's spirit).
+
+### Deferred (do not read the absence as an omission)
+
+- **An option added after the forecast.** A multiple-choice outcome the forecast did not price is
+  refused (`failed` in `score`). Batch 1 has no MiniBench multiple-choice question. Backlog: none
+  until one is observed; the refusal names the rule.
+- **A `scored -> scored` lifecycle event** for a re-scoring. Same shape as M4-801's
+  `resolved -> resolved` deferral; the score rows are the record. Backlog: **M4-804**.
+- **Scheduling `score`.** Operator-run, like `ingest-resolutions`; both belong to the same timer.
+  Backlog: **M4-805**.
+- **Platform scores for numeric and discrete.** `score` reports them `out_of_scope`. Backlog:
+  **M4-803**.
+- **Summaries across records** (calibration, means). Backlog: **M5-804**.
+
+### Standing risk — not verifiable offline
+
+- **No real resolved payload has been seen**, and M4-801's unmasking risk is still open: the first
+  `ingest-resolutions` after ~2026-09-17 answers both. If a posted question comes back `withheld`,
+  nothing is scorable and the fault is access, not this code.
+- **The platform's stored value is not re-checked at score time.** Scoring trusts the D34 chain
+  and the confirmed refetch recorded at post time. A platform that later rewrote a stored
+  forecast would not be noticed here.
+- **The two scores are not directly comparable to anything the platform shows.** A reader who
+  wants Metaculus's numbers needs M4-803.
+
+### Mutation testing
+
+Committed before mutating (lessons 5 and 8); `__pycache__` cleared before every mutant; each
+restored with `git checkout` and the tree asserted clean at the end. Runner: the four new test
+files, `-x`, full `dev` hypothesis profile. The baseline (169 passed) was confirmed green
+**by exit code** before the final passes: one intermediate pass piped pytest through `tail`,
+committed a new test that was failing on the unmutated tree, and reported two "kills" that were
+really that failure. Both were re-run against a green baseline.
+
+**015 — every clause neutered whole, `WHERE 0 AND (<predicate>)`: 9 of 9 killed**, plus the
+UNIQUE index made plain (killed) and the upgrade precondition `LIMIT 1` → `LIMIT 0` (killed).
+
+| mutant | killed by |
+|---|---|
+| P1 realized option found by sorted position | hand-calculated multiclass table (`Republicans`) |
+| P2 clamp at 1e-15 instead of refusing | `test_the_smallest_positive_probability_gives_a_finite_log_score` |
+| P3 binary log ignores the outcome | binary log table (`0.7`, `no`) |
+| P4 sum check dropped | refusal table, `sum to 1` |
+| P5 multiclass Brier `sum` instead of `fsum` | **property 3 only** (option-order invariance) |
+| P6 binary Brier two-category | binary Brier table |
+| P7 log base 2 | binary log table (`0.5`) |
+| P8 int/bool accepted as a probability | refusal table (`True`) |
+| P9 `isfinite` dropped | **survived -- equivalent**: `0.0 <= value <= 1.0` already rejects NaN and ±inf |
+| P10 `recompute` metric check dropped | `test_recompute_refuses_an_unregistered_version_and_a_mismatched_metric` |
+| P11 duplicate label accepted | refusal table, `more than once` |
+| W1 writer idempotency skip dropped | `test_scoring_again_writes_nothing`; **and** property 7 alone |
+| W2 `scored` event on a re-scoring too | `test_a_re_resolution_after_scoring_appends_new_rows_and_no_lifecycle_event` |
+| W3 no `scored` event | `test_a_resolved_binary_record_is_scored_and_moves_to_scored_atomically` |
+| W4 reader skips the recompute comparison | `test_the_reader_refuses_a_stored_value_that_no_longer_recomputes` |
+| W5 non-scorable latest resolution scored anyway | `..._is_not_scorable[annulled]` |
+| W6 status check dropped | `test_a_scorable_row_on_a_record_that_never_moved_is_refused` |
+| W7 `computed_at` ordering check dropped | `test_a_score_computed_before_its_observation_is_refused` |
+| W8 event links the last row, not the first | the atomic-scoring test |
+| W9 reader reads non-local metric rows | **survived**, then `test_the_reader_leaves_rows_of_other_metrics_alone` |
+| W10 reader skips "cited row belongs to this record" | **survived**, then `test_the_reader_refuses_a_score_citing_another_records_resolution` |
+| O1 `out_of_scope` filter dropped | `test_every_record_with_a_resolution_gets_exactly_one_verdict` |
+| O2 unknown `--record-id` not refused | `test_a_malformed_or_unknown_record_id_is_refused_without_echo` |
+| O3 `score` exits 0 on a failure | `test_the_command_exits_refused_when_any_record_failed` |
+| T1/T2 payload builder scales binary / MC by 0.999 | the two existing `test_submission_payload.py` derive tests (the tripwire) |
+
+W9 and W10 were real gaps of the M4-801 W4 kind: both branches are unreachable by ordinary SQL
+once 015 is applied, so nothing exercised them; each test drops 015's trigger on its own ledger.
+
+**The property file alone** kills P1, P2, P3, P5, P6 and W1. It does not kill P4, P7, P8, P11,
+W4 or W10, and is not meant to: its strategies draw valid distributions (P4, P11), it asserts
+the sign of a log score rather than its base (P7), totality is not refusal (P8), and it does not
+tamper (W4, W10). Each of those dies on a unit test above.
+
+**Strategy reach**, `hypothesis.event`, `dev` profile (200 examples): every branch reached. The
+zero-on-outcome refusal: 2% of binary draws, 35% of multiclass draws, ~5% of ledger replay draws
+(about ten real-ledger examples per run). Ledger replay: 62% multiple choice scored, 22% binary
+scored. Option-order property: 54% of draws actually changed the order. Two strategies first used
+`.filter(sum > 0)` and discarded up to 31% of draws; they now `map` a zero vector to a non-zero
+one and discard nothing on that account.
+
+**One property was wrong as first written, and the property found it**: a binary Brier is not
+*exactly* half the two-option Brier, because `0.999` is not exactly `1 - 0.001`; at `p = 0.001`,
+`no` they differ by ~1e-21. The assertion is now `isclose(rel_tol=1e-12, abs_tol=1e-18)`, and the
+docstring says why.
+
+### Review
+
+**Round 1 — APPROVE on `d79a7c6`** (2026-09-15, local Codex against
+`GPT_REVIEW_REQUEST_M4-802_r1.md`, all four gates green in the request). No blocking findings
+and no backlog candidates; each of the nine falsifiable risk claims was marked safe. The
+reviewer ran the focused scoring suite (169 tests) and `ruff check`. This entry is the only
+change after the approved commit.

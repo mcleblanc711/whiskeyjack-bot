@@ -287,6 +287,7 @@ version: 11
 | `release-key` | appends a release row | no | no |
 | `verify-submission` | appends an event | **GET** | no |
 | `ingest-resolutions` | appends resolution rows and `resolved` events | **GET** | no |
+| `score` | appends local score rows and `scored` events | no | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 
@@ -437,6 +438,37 @@ raise it with Metaculus.
 Exit `4` means at least one record printed `failed:`; every other record was still recorded.
 A `failed` line names a rule, never a value. Re-running is safe.
 
+### 7. Score resolved forecasts
+
+```bash
+uv run whiskeyjack-bot score --config config.yaml [--record-id ID]
+```
+
+Computes **local** Brier and natural-log scores for every binary and multiple-choice record with
+a `resolved` latest observation, and appends them (M4-802, D36). No network call, no paid call.
+Run it after step 6; like step 6 it is safe to repeat — scoring an observation already scored
+writes nothing.
+
+```
+question 45747  record 0192...  binary  appended  rows 2  -> scored
+question 45748  record 0192...  multiple_choice  unchanged  rows 0
+question 45749  record 0192...  numeric  out_of_scope  rows 0
+question 45750  record 0192...  binary  not_scorable  rows 0
+records: 4  failed: 0
+```
+
+- **These are not Metaculus scores.** The metrics are `local_brier_binary`, `local_log_binary`,
+  `local_brier_multiclass` and `local_log_multiclass`; none is a baseline or peer score, and none
+  should be quoted as one. Platform scores are M4-803.
+- `not_scorable`: no observation yet, or the latest is `annulled`/`ambiguous`/`withheld`/
+  `unresolved`. `out_of_scope`: numeric and discrete are never scored locally.
+- **A re-resolution adds rows; nothing is overwritten.** Each score row names the resolution
+  row it measured (`resolution_event_id`). A record's current score is the rows citing its
+  latest resolution.
+- A `failed` line names a rule. The one you may meet in practice is a multiple-choice question
+  that resolved to an option the forecast never priced (an option added after forecasting),
+  which is refused rather than guessed. Exit `4` if any record failed.
+
 ### Where the lifecycle stops today
 
 The legal transitions are fixed in the schema (`009_submission_refetch_outcome.sql:193-207`):
@@ -460,12 +492,11 @@ Two consequences worth knowing before you need them:
 
 - **`failed` is terminal by omission.** No transition leaves it. A failed record is never
   repaired; you make a new forecast version.
-- **`resolved` has a writer; `scored` does not yet.** `ingest-resolutions` (step 6) appends
-  resolution rows and moves a record to `resolved`. Nothing inserts into `score_events` until
-  M4-802/M4-803, so `resolved` is where a record stops today. A later re-resolution or
-  retraction is appended as a row, not as another lifecycle event (there is no
-  `resolved -> resolved` transition); the record's current resolution is always its latest
-  row.
+- **`resolved` and `scored` both have writers.** `ingest-resolutions` (step 6) moves a record
+  to `resolved`; `score` (step 7) moves a binary or multiple-choice record to `scored`. A numeric
+  or discrete record stops at `resolved` until M4-803. A later re-resolution or retraction is
+  appended as a row, not as another lifecycle event (there is no `resolved -> resolved` or
+  `scored -> scored` transition); a record's current resolution is always its latest row.
 
 ---
 

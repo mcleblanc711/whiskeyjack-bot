@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from resolution_rows import insert_resolution_row
+from resolution_rows import insert_resolution_row, insert_score_row
 from whiskeyjack_bot.export import (
     EXPORT_SCHEMA_VERSION,
     EXPORTED_TABLES,
@@ -68,7 +68,7 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
     today would leave it empty, and an empty table makes the set-equality check vacuous
     exactly where nobody would look for it. The resolution row is the shared
     `resolution_rows` helper's, because 014 constrains every column of it and a score row
-    now needs a scorable resolution behind it.
+    now needs a scorable resolution behind it; so is the score row, which 015 constrains.
 
     `schema_migrations` is not seeded here -- `initialize_ledger` fills it, which is the
     honest way for it to be populated.
@@ -141,11 +141,7 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         (TS, TS),
     )
     insert_resolution_row(conn, "rec-1")
-    conn.execute(
-        "INSERT INTO score_events (forecast_record_id, metric, value, "
-        "implementation_version, computed_at_utc) VALUES ('rec-1', 'brier', 0.25, 'v1', ?)",
-        (TS,),
-    )
+    insert_score_row(conn, "rec-1")
     conn.execute(
         "INSERT INTO submission_key_reservations (reservation_id, idempotency_key, "
         "forecast_record_id, reservation_seq, reserved_at_utc, created_at_utc) "
@@ -358,10 +354,12 @@ def ledger_with_live_wal(ledger_path: Path) -> Iterator[sqlite3.Connection]:
     Holding the writer open is what stops SQLite checkpointing them away at close.
     """
     writer = connect(ledger_path)
-    writer.execute(
-        "INSERT INTO score_events (forecast_record_id, metric, value, "
-        "implementation_version, computed_at_utc) VALUES ('rec-1', 'log', -0.5, 'v1', ?)",
-        (TS,),
+    insert_score_row(
+        writer,
+        "rec-1",
+        metric="local_log_binary",
+        value=-0.5,
+        implementation_version="local_log_binary/1",
     )
     assert Path(f"{ledger_path}-wal").exists(), "the fixture must leave uncheckpointed frames"
     try:
@@ -406,10 +404,8 @@ def test_the_no_mutation_check_would_catch_a_real_write(
     this project the most rounds.
     """
     before = _sidecar_fingerprint(ledger_path)
-    ledger_with_live_wal.execute(
-        "INSERT INTO score_events (forecast_record_id, metric, value, "
-        "implementation_version, computed_at_utc) VALUES ('rec-1', 'brier2', 0.5, 'v1', ?)",
-        (TS,),
+    insert_score_row(
+        ledger_with_live_wal, "rec-1", value=0.5, implementation_version="local_brier_binary/2"
     )
     after = _sidecar_fingerprint(ledger_path)
     assert (before[".db"], before["-wal"]) != (after[".db"], after["-wal"])
@@ -492,11 +488,8 @@ def test_the_export_reads_one_snapshot_even_while_a_writer_commits(
     def read_table_and_commit(connection: sqlite3.Connection, spec: Any) -> Any:
         rows = real_read_table(connection, spec)
         if spec.name == first:
-            writer.execute(
-                "INSERT INTO score_events (forecast_record_id, metric, value, "
-                "implementation_version, computed_at_utc) "
-                "VALUES ('rec-1', 'mid-export', 0.5, 'v1', ?)",
-                (TS,),
+            insert_score_row(
+                writer, "rec-1", value=0.5, implementation_version="local_brier_binary/3"
             )
             committed.append("mid-export")
         return rows
@@ -513,13 +506,14 @@ def test_the_export_reads_one_snapshot_even_while_a_writer_commits(
     conn = connect_readonly(ledger_path)
     try:
         landed = conn.execute(
-            "SELECT count(*) FROM score_events WHERE metric = 'mid-export'"
+            "SELECT count(*) FROM score_events "
+            "WHERE implementation_version = 'local_brier_binary/3'"
         ).fetchone()[0]
     finally:
         conn.close()
     assert landed == 1
-    metrics = {row["metric"] for row in _jsonl_rows(destination, "score_events")}
-    assert "mid-export" not in metrics
+    versions = {row["implementation_version"] for row in _jsonl_rows(destination, "score_events")}
+    assert "local_brier_binary/3" not in versions
 
 
 # --------------------------------------------------------------------------------------
@@ -657,9 +651,16 @@ def _corrupt(
     that." An `INSERT OR REPLACE` from such a session skips the BEFORE DELETE block
     triggers, which is the only way an in-place type swap reaches a populated table -- and
     it is reachable by an ordinary operator with a shell, so the export owes it an answer.
+
+    Since 015, every shape planted here is also refused at INSERT by
+    `score_events_validate_local_score_on_insert` (a non-finite value, a metric outside the
+    vocabulary). The same shell that can REPLACE can drop that trigger, so this does, on the
+    test's own ledger: what is under test is the export's answer to a stored value, which is
+    the second line behind the schema and still owes one.
     """
     conn = sqlite3.connect(ledger_path)
     try:
+        conn.execute("DROP TRIGGER IF EXISTS score_events_validate_local_score_on_insert")
         if recursive_triggers:
             conn.execute("PRAGMA recursive_triggers = ON")
         conn.execute(statement, parameters)

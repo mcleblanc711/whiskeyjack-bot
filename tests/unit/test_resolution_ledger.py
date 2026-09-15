@@ -21,6 +21,7 @@ import pytest
 from resolution_rows import (
     OBSERVED_AT,
     insert_resolution_row,
+    insert_score_row,
     kind_payload,
     post_payload,
     resolution_columns,
@@ -29,7 +30,7 @@ from resolution_rows import (
 )
 from whiskeyjack_bot import ledger as ledger_module
 from whiskeyjack_bot import lifecycle
-from whiskeyjack_bot.ledger import LedgerError, connect, initialize_ledger
+from whiskeyjack_bot.ledger import LEDGER_SCHEMA_VERSION, LedgerError, connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     current_status,
@@ -71,11 +72,8 @@ def _count(conn: sqlite3.Connection, table: str) -> int:
 
 
 def _score(conn: sqlite3.Connection, record_id: str = RECORD) -> None:
-    conn.execute(
-        "INSERT INTO score_events (forecast_record_id, metric, value, implementation_version, "
-        "computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
-        (record_id, OBSERVED_AT),
-    )
+    # A row 015 accepts (it cites the latest resolution row), so what refuses it here is 014.
+    insert_score_row(conn, record_id)
 
 
 def _at(minutes: int) -> str:
@@ -236,6 +234,12 @@ def test_an_explicit_event_id_cannot_make_a_row_older_than_its_predecessors(
 
 
 def test_a_score_needs_a_resolution(conn: sqlite3.Connection, submitted: str) -> None:
+    # With no resolution row there is nothing for a score to cite, so 015 refuses it first
+    # (SQLite fires the newer trigger first). 014's own clause is asserted with 015's trigger
+    # dropped on this test's ledger, so each layer is shown to refuse on its own.
+    with pytest.raises(sqlite3.IntegrityError, match="must name a resolution row"):
+        _score(conn)
+    conn.execute("DROP TRIGGER score_events_validate_local_score_on_insert")
     with pytest.raises(sqlite3.IntegrityError, match="not scorable"):
         _score(conn)
 
@@ -297,7 +301,7 @@ def test_a_ledger_at_013_upgrades_to_014(tmp_path: Path, monkeypatch: pytest.Mon
         seed_submitted(connection, RECORD, question_id=QUESTION_ID, post_id=POST_ID)
     finally:
         connection.close()
-    assert initialize_ledger(db) == 14
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
     connection = connect(db)
     try:
         write = record_resolution_observation(
@@ -328,7 +332,12 @@ def test_the_migration_refuses_a_ledger_already_holding_unclassified_rows(
                 (QUESTION_ID, RECORD, OBSERVED_AT),
             )
         else:
-            _score(connection)
+            # 001's columns only: this ledger stops at 013, before 015's column existed.
+            connection.execute(
+                "INSERT INTO score_events (forecast_record_id, metric, value, "
+                "implementation_version, computed_at_utc) VALUES (?, 'brier', 0.25, 'v1', ?)",
+                (RECORD, OBSERVED_AT),
+            )
     finally:
         connection.close()
     with pytest.raises(LedgerError, match="failed to apply ledger migration 14"):

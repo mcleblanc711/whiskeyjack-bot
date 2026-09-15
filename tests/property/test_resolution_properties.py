@@ -33,7 +33,13 @@ import pytest
 from hypothesis import event, example, given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
-from resolution_rows import RESOLVED_VALUE, kind_payload, post_payload, seed_submitted
+from resolution_rows import (
+    RESOLVED_VALUE,
+    insert_score_row,
+    kind_payload,
+    post_payload,
+    seed_submitted,
+)
 from strategies import HOSTILE_TEXT
 
 from whiskeyjack_bot.ledger import connect, initialize_ledger
@@ -438,11 +444,7 @@ def test_appending_is_a_row_per_change_and_nothing_else(
     # The score guard agrees with the latest row, whatever came before it.
     latest_scorable = bool(expected) and expected[-1] in ("yes", "no")
     try:
-        ledger.execute(
-            "INSERT INTO score_events (forecast_record_id, metric, value, "
-            "implementation_version, computed_at_utc) VALUES (?, 'brier', 0.5, 'v1', ?)",
-            (record_id, "2026-09-18T00:00:00.000000+00:00"),
-        )
+        insert_score_row(ledger, record_id, value=0.5)
         scored = True
     except sqlite3.IntegrityError:
         scored = False

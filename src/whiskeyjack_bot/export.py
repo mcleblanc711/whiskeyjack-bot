@@ -333,6 +333,7 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("implementation_version", "TEXT"),
             Column("comparison_baseline", "TEXT"),
             Column("computed_at_utc", "TEXT"),
+            Column("resolution_event_id", "INTEGER"),
         ),
     ),
     TableSpec(

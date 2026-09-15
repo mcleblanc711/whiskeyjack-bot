@@ -35,11 +35,10 @@ The module deliberately does **not** ship:
 
 - ``approve`` / ``reject`` CLI commands -- M2-701 owns those, and adding them here would
   put a reachable approval path in the tree ahead of its item;
-- score writers -- M4-802 and M4-803 own those. The ``scored`` *transition* is defined
-  (here and in the migration) because migrations are immutable and a missing event type
-  would later cost a whole migration to add. The resolution writer landed with M4-801:
-  :func:`record_resolution_observation`, whose detail rows ``014_resolution_ingestion.sql``
-  constrains;
+- a platform score writer -- M4-803 owns that. The resolution writer landed with M4-801
+  (:func:`record_resolution_observation`, whose rows ``014_resolution_ingestion.sql``
+  constrains) and the local Brier/log writer with M4-802 (:func:`record_local_scores`,
+  whose rows ``015_local_score_events.sql`` constrains);
 - assembly of the handoff's full canonical record. Approval and submission history is
   joined at read/export time (M1-604, ``show``), never written back into ``record_json``
   -- writing it back would mean updating a stored forecast version, which is the thing
@@ -88,6 +87,15 @@ from whiskeyjack_bot.resolution import (
     classify_resolution,
     observation_from_snapshot,
     sha256_text,
+)
+from whiskeyjack_bot.scoring import (
+    LOCAL_METRICS,
+    LocalMetric,
+    LocalScore,
+    ScoreError,
+    recompute,
+    score_binary,
+    score_multiple_choice,
 )
 
 # The seven states of 001's `forecast_records.status` CHECK.
@@ -526,6 +534,49 @@ class ResolutionWrite:
     outcome: ResolutionWriteOutcome
     stored: StoredResolution | None
     event: LifecycleEvent | None
+
+
+# What :func:`record_local_scores` did. ``unchanged`` and ``not_scorable`` write nothing: the
+# first is a repeated run against an observation already scored under every current
+# implementation, the second a record with no resolution or whose latest one is not
+# ``resolved``.
+ScoreWriteOutcome = Literal["appended", "unchanged", "not_scorable"]
+
+# Where a record must be for a local score to be written. `resolved` takes the `scored`
+# event; `scored` is a re-resolution or a new implementation version, which appends rows only.
+_SCORABLE_STATUSES: frozenset[str] = frozenset({"resolved", "scored"})
+
+
+@dataclass(frozen=True)
+class StoredScore:
+    """One local ``score_events`` row, read back (M4-802).
+
+    What :func:`read_local_scores` returns has also been **recomputed**: its value is what the
+    implementation named by ``implementation_version`` gives for the stored forecast and the
+    cited resolution, exactly.
+    """
+
+    event_id: int
+    forecast_record_id: str
+    resolution_event_id: int
+    metric: LocalMetric
+    value: float
+    implementation_version: str
+    computed_at_utc: str
+
+
+@dataclass(frozen=True)
+class ScoreWrite:
+    """The result of one :func:`record_local_scores` call.
+
+    ``scores`` holds the rows this call appended (empty unless ``appended``); ``resolution``
+    is the latest resolution the call read, or ``None`` if the record has none.
+    """
+
+    outcome: ScoreWriteOutcome
+    scores: tuple[StoredScore, ...]
+    event: LifecycleEvent | None
+    resolution: StoredResolution | None
 
 
 def _utcnow() -> datetime:
@@ -1493,6 +1544,216 @@ def read_resolution_history(
     return tuple(_resolution_from_row(row) for row in rows)
 
 
+def record_local_scores(
+    conn: sqlite3.Connection, *, record_id: str, computed_at: datetime
+) -> ScoreWrite:
+    """Compute and append a record's local Brier and log scores, atomically (M4-802).
+
+    The record id is the only input about what is scored. The forecast is read back through
+    ``forecast.store.read_forecast_record`` (which re-verifies ``forecast_sha256``) and the
+    outcome through :func:`latest_resolution` (which recomputes both digests), so no caller can
+    hand this writer a probability or an outcome that disagrees with the ledger.
+
+    What is scored is the record's ``final_prediction``. For binary and multiple choice the
+    payload that was approved and posted is a verbatim copy of it
+    (``submission_payload._binary_payload``/``_multiple_choice_payload``; D34 binds the post to
+    that payload), so there is one subject and not two.
+
+    What happens depends on the latest resolution and on the rows already written::
+
+        no resolution, or latest not `resolved`          not_scorable   nothing written
+        every current metric already scored against it   unchanged      nothing written
+        otherwise                                        appended       the missing rows
+
+    Appended rows cite the latest resolution. A record still ``resolved`` also takes the
+    ``scored`` lifecycle event, linking the first row written (003 lets an event link exactly
+    one). A record already ``scored`` -- the platform re-resolved it, or an implementation
+    version changed -- gets rows only: 003 has no ``scored -> scored`` transition, and the rows
+    are the record of it (M4-804 owns the lifecycle side of a re-resolution).
+
+    ``not_scorable`` is this writer's courtesy. The refusal is the schema's:
+    ``014_resolution_ingestion.sql`` refuses a score whose latest resolution is not scorable,
+    and ``015_local_score_events.sql`` refuses one that cites a superseded observation.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    computed = _require_utc(computed_at, "computed_at")
+
+    with transaction(conn):
+        _require_stored_record(conn, identifier)
+        resolution = latest_resolution(conn, identifier)
+        if resolution is None or not resolution.scorable:
+            return ScoreWrite(outcome="not_scorable", scores=(), event=None, resolution=resolution)
+        status = current_status(conn, identifier)
+        if status not in _SCORABLE_STATUSES:
+            raise LifecycleError(
+                f"a score cannot be recorded for a record whose current status is {status}"
+            )
+
+        scores = _local_scores_for(conn, identifier, resolution.observation.outcome)
+        existing = {
+            (row[0], row[1])
+            for row in _fetch_all(
+                conn,
+                "SELECT metric, implementation_version FROM score_events "
+                "WHERE forecast_record_id = ? AND resolution_event_id = ?",
+                (identifier, resolution.event_id),
+            )
+        }
+        missing = [
+            score
+            for score in scores
+            if (score.metric, score.implementation_version) not in existing
+        ]
+        if not missing:
+            return ScoreWrite(outcome="unchanged", scores=(), event=None, resolution=resolution)
+        if computed < resolution.observed_at_utc:
+            raise LifecycleError(
+                "computed_at is earlier than the observation the score is computed against"
+            )
+
+        event_ids = [
+            _insert(
+                conn,
+                "INSERT INTO score_events (forecast_record_id, metric, value, "
+                "implementation_version, comparison_baseline, computed_at_utc, "
+                "resolution_event_id) VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                (
+                    identifier,
+                    score.metric,
+                    score.value,
+                    score.implementation_version,
+                    computed,
+                    resolution.event_id,
+                ),
+            )
+            for score in missing
+        ]
+        event: LifecycleEvent | None = None
+        if status == "resolved":
+            event = _append_event(
+                conn,
+                record_id=identifier,
+                event_type="scored",
+                score_event_id=event_ids[0],
+                occurred_at_utc=computed,
+            )
+        stored = tuple(
+            _score_from_row(row)
+            for row in _fetch_all(
+                conn,
+                f"SELECT {_SCORE_COLUMNS} FROM score_events WHERE event_id IN "
+                f"({', '.join('?' for _ in event_ids)}) ORDER BY event_id",
+                tuple(event_ids),
+            )
+        )
+        return ScoreWrite(outcome="appended", scores=stored, event=event, resolution=resolution)
+
+
+def read_local_scores(conn: sqlite3.Connection, record_id: str) -> tuple[StoredScore, ...]:
+    """Every local score row for a record, in append order, each recomputed and checked.
+
+    A value read back out of the ledger is untrusted, and a score is only an attribution claim
+    while it is what its named implementation gives for the stored forecast and the stored
+    outcome. So each row's cited resolution is re-verified (both digests) and the value is
+    recomputed by :func:`scoring.recompute` under the row's own ``implementation_version`` and
+    compared **exactly**; a mismatch, an unregistered version or a row whose metric and
+    version disagree is refused. Rows whose metric is not a local metric (M4-803's) are not
+    this reader's.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    metrics = sorted(LOCAL_METRICS)
+    rows = _fetch_all(
+        conn,
+        f"SELECT {_SCORE_COLUMNS} FROM score_events WHERE forecast_record_id = ? "
+        f"AND metric IN ({', '.join('?' for _ in metrics)}) ORDER BY event_id",
+        (identifier, *metrics),
+    )
+    if not rows:
+        return ()
+    binary, options = _prediction_inputs(conn, identifier)
+    verified: list[StoredScore] = []
+    for row in rows:
+        stored = _score_from_row(row)
+        resolution = _read_resolution(
+            conn,
+            "event_id = ? AND forecast_record_id = ?",
+            (stored.resolution_event_id, identifier),
+        )
+        if resolution is None:
+            raise LifecycleError("a stored score cites a resolution row this record does not have")
+        prediction = binary if stored.metric.endswith("_binary") else options
+        try:
+            value = recompute(
+                stored.implementation_version,
+                stored.metric,
+                prediction,
+                resolution.observation.outcome,
+            )
+        except ScoreError as exc:
+            raise LifecycleError(f"a stored score cannot be recomputed: {exc}") from None
+        if value != stored.value:
+            raise LifecycleError("a stored score does not match its recomputation")
+        verified.append(stored)
+    return tuple(verified)
+
+
+def _prediction_inputs(
+    conn: sqlite3.Connection, record_id: str
+) -> tuple[object, tuple[tuple[str, float], ...] | None]:
+    """The stored forecast's ``final_prediction`` in the shapes ``scoring`` takes.
+
+    Returns ``(probability_yes, None)`` for binary and ``(None, options)`` for multiple
+    choice. Imported here rather than at module scope because ``forecast.store`` imports this
+    module (``approval.approve`` defers its builder import for the same reason), and so that
+    reading a status never loads the forecast schema stack.
+    """
+    from whiskeyjack_bot.forecast.record import ForecastRecordError
+    from whiskeyjack_bot.forecast.schema import (
+        BinaryForecastResponse,
+        MultipleChoiceForecastResponse,
+    )
+    from whiskeyjack_bot.forecast.store import read_forecast_record
+
+    try:
+        record = read_forecast_record(conn, record_id)
+    except ForecastRecordError:
+        raise LifecycleError(
+            "the forecast record cannot be read back for scoring "
+            "(detail withheld: it can echo stored values)"
+        ) from None
+    # Dispatch on the literal, and re-check the concrete response type: DiscreteQuestion
+    # subclasses NumericQuestion, and a stored record is untrusted.
+    forecast = record.forecast
+    if record.question_type == "binary" and type(forecast) is BinaryForecastResponse:
+        return forecast.final_prediction.probability_yes, None
+    if (
+        record.question_type == "multiple_choice"
+        and type(forecast) is MultipleChoiceForecastResponse
+    ):
+        return None, tuple(
+            (entry.option, entry.probability) for entry in forecast.final_prediction.options
+        )
+    if record.question_type in ("numeric", "discrete"):
+        raise LifecycleError(
+            f"a {record.question_type} forecast has no local score (platform scores are M4-803's)"
+        )
+    raise LifecycleError("the stored forecast does not match its question type")
+
+
+def _local_scores_for(
+    conn: sqlite3.Connection, record_id: str, outcome: str | None
+) -> tuple[LocalScore, ...]:
+    binary, options = _prediction_inputs(conn, record_id)
+    try:
+        if options is None:
+            return score_binary(binary, outcome)
+        return score_multiple_choice(options, outcome)
+    except ScoreError as exc:
+        # scoring.py's messages name rules only.
+        raise LifecycleError(f"the forecast cannot be scored: {exc}") from None
+
+
 def record_pre_forecast_failure(
     conn: sqlite3.Connection,
     *,
@@ -1614,6 +1875,7 @@ def _append_event(
     submission_attempt_id: str | None = None,
     submission_verification_id: int | None = None,
     resolution_event_id: int | None = None,
+    score_event_id: int | None = None,
     occurred_at_utc: str,
 ) -> LifecycleEvent:
     """Append one lifecycle row, in a transaction, and return it as stored.
@@ -1648,8 +1910,8 @@ def _append_event(
             "INSERT INTO lifecycle_events "
             "(forecast_record_id, event_seq, event_type, from_status, to_status, "
             "detail_code, approval_event_id, submission_attempt_id, "
-            "submission_verification_id, resolution_event_id, occurred_at_utc, "
-            "created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "submission_verification_id, resolution_event_id, score_event_id, "
+            "occurred_at_utc, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identifier,
                 event_seq,
@@ -1661,6 +1923,7 @@ def _append_event(
                 submission_attempt_id,
                 submission_verification_id,
                 resolution_event_id,
+                score_event_id,
                 occurred_at_utc,
                 _utc_text(_utcnow()),
             ),
@@ -1902,6 +2165,33 @@ _RESOLUTION_COLUMNS = (
     "observation_sha256, source_response_sha256, observed_at_utc, ingested_at_utc, "
     "resolution_kind, scorable, outcome"
 )
+
+
+_SCORE_COLUMNS = (
+    "event_id, forecast_record_id, resolution_event_id, metric, value, "
+    "implementation_version, comparison_baseline, computed_at_utc"
+)
+
+
+def _score_from_row(row: sqlite3.Row) -> StoredScore:
+    """Gate one ``score_events`` row's shape. The value check is :func:`read_local_scores`'s."""
+    metric = _require_member(row[3], LOCAL_METRICS, "metric")
+    value = row[4]
+    if type(value) is not float:
+        raise LifecycleError(
+            "stored score value is not a real number (detail withheld: it can echo stored values)"
+        )
+    if row[6] is not None:
+        raise LifecycleError("a stored local score carries a comparison baseline")
+    return StoredScore(
+        event_id=_stored_int(row[0], "event_id"),
+        forecast_record_id=_stored_text(row[1], "forecast_record_id"),
+        resolution_event_id=_stored_int(row[2], "resolution_event_id"),
+        metric=cast(LocalMetric, metric),
+        value=value,
+        implementation_version=_stored_text(row[5], "implementation_version"),
+        computed_at_utc=_stored_text(row[7], "computed_at_utc"),
+    )
 
 
 def _read_resolution(
