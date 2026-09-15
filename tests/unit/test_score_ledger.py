@@ -332,6 +332,39 @@ def test_the_reader_refuses_a_version_this_build_does_not_register(
         read_local_scores(conn, record)
 
 
+def test_the_reader_refuses_a_score_citing_another_records_resolution(
+    conn: sqlite3.Connection,
+) -> None:
+    """015 refuses this at INSERT; with its trigger dropped, the reader still does."""
+    record = _binary(conn)
+    record_local_scores(conn, record_id=record, computed_at=SCORED_AT)
+    other = seed_resolved(conn, "rec-other", question_id=QUESTION_ID + 5, post_id=POST_ID + 5)
+    other_resolution = latest_resolution(conn, other)
+    assert other_resolution is not None
+    conn.execute("DROP TRIGGER score_events_validate_local_score_on_insert")
+    insert_score_row(
+        conn,
+        record,
+        value=0.09,  # the right number for "yes" at 0.7, so only the citation is wrong
+        implementation_version="local_brier_binary/1",
+        resolution_event_id=other_resolution.event_id,
+    )
+    with pytest.raises(LifecycleError, match="cites a resolution row this record does not have"):
+        read_local_scores(conn, record)
+
+
+def test_the_reader_leaves_rows_of_other_metrics_alone(conn: sqlite3.Connection) -> None:
+    """M4-803's platform rows will share the table once it widens 015's vocabulary. Simulated
+    by dropping the trigger: such a row is not this reader's to recompute or refuse."""
+    record = _binary(conn)
+    write = record_local_scores(conn, record_id=record, computed_at=SCORED_AT)
+    conn.execute("DROP TRIGGER score_events_validate_local_score_on_insert")
+    insert_score_row(
+        conn, record, metric="platform_peer", value=12.5, implementation_version="platform_peer/1"
+    )
+    assert read_local_scores(conn, record) == write.scores
+
+
 # ── 015: what a score row may claim ──────────────────────────────────────────
 
 
