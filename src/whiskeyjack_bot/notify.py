@@ -78,6 +78,7 @@ NotifyEvent = Literal[
     "prediction_posted",
     "poll_summary",
     "activation_retired",
+    "unrecorded_post",
 ]
 
 # What happened to one push. Closed for the same reason the outcome vocabularies in
@@ -109,6 +110,10 @@ NotifyOutcome = Literal["sent", "throttled", "disabled", "failed"]
 #   ``tournament enable``: every five-minute poll hits it again. Keyed on the profile's
 #   project, so two profiles retiring both page; a day-long window makes one retired profile
 #   page once per incident, not 288 times a day.
+# - ``unrecorded_post`` (M1-342) is a condition for the same reason: a forecast is live on the
+#   platform and the lifecycle ledger does not record it, and that stays true until an operator
+#   runs ``reconcile-submission``. Keyed on the record, so a second record in the same state
+#   also pages, and a day-long window makes each one page once a day rather than 288 times.
 _WINDOW_SECONDS: Final[dict[str, int]] = {
     "question_blocked": 1800,
     "provider_failed": 1800,
@@ -116,6 +121,7 @@ _WINDOW_SECONDS: Final[dict[str, int]] = {
     "prediction_posted": 86400,
     "poll_summary": 86400,
     "activation_retired": 86400,
+    "unrecorded_post": 86400,
 }
 assert set(_WINDOW_SECONDS) == set(get_args(NotifyEvent))
 assert all(seconds > 0 for seconds in _WINDOW_SECONDS.values())
@@ -156,6 +162,9 @@ _PRIORITY: Final[dict[str, str]] = {
     "poll_summary": "low",
     # Every poll is refusing until an operator acts, so it pages like an incident.
     "activation_retired": "high",
+    # A live forecast the attribution ledger does not hold: runbook L4, and the ledger is the
+    # product. It pages like an incident until someone reconciles it.
+    "unrecorded_post": "high",
 }
 assert set(_PRIORITY) == set(get_args(NotifyEvent))
 

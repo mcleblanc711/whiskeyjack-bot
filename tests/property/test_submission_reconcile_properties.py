@@ -342,3 +342,89 @@ def test_the_writer_raises_only_lifecycle_error_and_a_refusal_writes_nothing(
         assert not conn.in_transaction
         assert PLANTED_SECRET not in str(exc)
         assert PLANTED_SECRET not in _rendered(exc)
+
+
+# --------------------------------------------------------------------------------------
+# M1-342: the alert's read is exactly the partition it claims to be
+# --------------------------------------------------------------------------------------
+
+# Everything this property has seeded, and what the reader is therefore obliged to say about
+# it. The draws accumulate into one ledger on purpose: the claim is a *partition* of every
+# record in the database, and a per-draw ledger holding one record cannot tell a reader that
+# partitions correctly from one that returns whatever it last inserted. By the end of the run
+# the ledger holds well over a hundred records in four combinations at once.
+_SEEDED: dict[str, tuple[int, bool, bool]] = {}
+
+
+@given(
+    confirmed=st.booleans(),
+    recorded=st.booleans(),
+    other_kind=st.sampled_from(["comment_confirmed", "heartbeat", "question_blocked"]),
+)
+@settings(max_examples=150)
+def test_the_alert_reads_exactly_the_confirmed_posts_the_ledger_never_recorded(
+    confirmed: bool, recorded: bool, other_kind: str
+) -> None:
+    """An iff over both axes, because either one alone is a property of nothing.
+
+    "Every unrecorded confirmed post is reported" holds for a reader that reports every
+    record; "nothing recorded is reported" holds for one that reports nothing. Only the
+    equality over an accumulated ledger holds the two clauses -- the ``kind`` filter and the
+    ``NOT EXISTS`` over ``to_status`` -- up at the same time.
+
+    The unconfirmed arm plants a journal row of a *different* kind rather than no row at all,
+    so "this record has a journal row" cannot pass for "this record's forecast was confirmed".
+    The recorded arm runs the real M2-713 writer, so what clears the alert is the same
+    ``submission_confirmed`` event ``reconcile-submission`` writes and not a hand-made row.
+    """
+    from whiskeyjack_bot.submission_reconcile import (
+        UnrecordedConfirmedPost,
+        unrecorded_confirmed_posts,
+    )
+
+    conn = _conn()
+    serial = next(_COUNTER)
+    record_id, question_id = f"rec-alert-{serial}", 20_000 + serial
+    post = seed_unrecorded_post(
+        conn,
+        record_id,
+        question_id=question_id,
+        run_id="run-1",
+        forecast_sha256=SHA,
+        payload_sha256=PAYLOAD_SHA,
+    )
+    conn.execute(
+        "INSERT INTO tournament_events (event_id, kind, scope, data, created_at_utc) "
+        "VALUES (?, ?, ?, '{}', ?)",
+        (
+            f"tev-alert-{serial}",
+            "forecast_confirmed" if confirmed else other_kind,
+            record_id,
+            TS,
+        ),
+    )
+    if recorded:
+        record_submission_reconciliation(
+            conn,
+            record_id=record_id,
+            reconciliation=SubmissionReconciliation(
+                reservation_id=post.reservation_id,
+                request_payload_sha256=PAYLOAD_SHA,
+                intent_event_id=post.intent_event_id,
+                observed_by="chris",
+                note="saw it",
+                refetched_at_utc=WHEN,
+                refetched_forecast_snapshot=CONFIRMING_SNAPSHOT,
+            ),
+            occurred_at=WHEN,
+        )
+    _SEEDED[record_id] = (question_id, confirmed, recorded)
+
+    expected = tuple(
+        UnrecordedConfirmedPost(record_id=identifier, question_id=question)
+        for identifier, (question, was_confirmed, was_recorded) in sorted(_SEEDED.items())
+        if was_confirmed and not was_recorded
+    )
+    # Equality of the whole tuple, not of a set: the order is `ORDER BY t.scope`, and an
+    # operator reading `unrecorded-posts` beside a page needs the same list twice running.
+    assert unrecorded_confirmed_posts(conn) == expected

@@ -1859,3 +1859,252 @@ def test_a_refusal_reaches_the_log_the_operator_tails(
     (record,) = [r for r in caplog.records if r.getMessage().startswith("tournament refused")]
     assert record.levelno == (logging.ERROR if kind == "retired" else logging.WARNING)
     assert str(refusal) in record.getMessage()
+
+
+# ── M1-342: a live forecast the lifecycle ledger never recorded ───────────────
+#
+# The state M2-713 made recoverable and nobody could see. The poll's recovery loop confirms
+# the forecast in the *journal*, pushes "forecast confirmed" and posts the private comment,
+# while `lifecycle_events` never records the post -- so M4-801 ingestion, which selects
+# `to_status = 'submitted'`, never resolves or scores it, and the operator is told success.
+#
+# These drive the whole poll for M1-329's reason: "pages once" and "stops once someone
+# reconciles it" are claims about a *call site* and a *throttle window*, and no test of the
+# notifier in isolation can hold either up.
+
+
+def _crashed_after_acceptance(case: Any) -> str:
+    """Post for real in a child that dies after the server accepted. Returns the record."""
+    import multiprocessing
+
+    record_id = _prepare_version(case)
+    ctx = multiprocessing.get_context("fork")
+    counter, start = ctx.Value("i", 0), ctx.Event()
+    child = ctx.Process(
+        target=_process_submit, args=(case[1], case[2].raw, record_id, counter, start, True)
+    )
+    child.start()
+    start.set()
+    child.join(20)
+    assert child.exitcode == 7 and counter.value == 1
+    assert case[0].execute("SELECT count(*) FROM submission_attempts").fetchone()[0] == 0
+    case[2].posts = 1  # The platform state the child's accepted POST left behind.
+    return record_id
+
+
+def _clocked(monkeypatch: pytest.MonkeyPatch, config: Any, state: Path) -> tuple[_Pushes, list]:
+    """`_recording`, with the notifier's throttle clock under the test's control.
+
+    The clock has to be injectable rather than advanced by `monkeypatch`ing `utcnow`, because
+    the window this is about is the notifier's, and `Notifier` reads its own `clock`.
+    """
+    import httpx
+
+    from whiskeyjack_bot.notify import Notifier
+
+    pushes = _Pushes()
+    instant = [utcnow()]
+    monkeypatch.setattr(
+        whiskeyjack_tournament,
+        "build_notifier",
+        lambda _config: Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(pushes)),
+            topic_url="https://ntfy.invalid/wj-fake-topic-0001",
+            state_root=state,
+            secret_names=tuple(config.secret_env_var_names()),
+            clock=lambda: instant[0],
+        ),
+    )
+    return pushes, instant
+
+
+def test_a_live_forecast_the_ledger_never_recorded_pages_and_clears_once_reconciled(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The acceptance criterion, driven through a real process death and real polls.
+
+    The shape of the assertions is the point, and it is built against this project's recurring
+    vacuous-test defect. "The alert clears after reconciliation" is only a claim if the alert
+    would otherwise still be firing, so the middle poll -- a day later, nothing reconciled --
+    has to page *again*. Without it, the final silence is satisfied just as well by the throttle,
+    or by an alert wired to a transition that can only ever fire once, and the test would be
+    asserting nothing about reconciliation at all.
+    """
+    from whiskeyjack_bot.submission_reconcile import reconcile_unrecorded_post
+
+    conn, config, platform, *_ = case
+    record_id = _crashed_after_acceptance(case)
+    pushes, instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+
+    # One poll. The journal confirms and comments, exactly as it does on the live worker...
+    first = poll(case)
+    assert first["forecast_confirmed"] == first["comment_completed"] == 1
+    assert first["unresolved"] == 0, "the journal is satisfied; that is why this state is silent"
+    from whiskeyjack_bot.lifecycle import current_status
+
+    assert current_status(conn, record_id) == "approved"
+
+    # ...and this is what says so: a count in `tournament status`, and one push naming it.
+    assert first["unrecorded_posts"] == 1
+    paged = pushes.matching("missing from the ledger")
+    assert len(paged) == 1
+    assert record_id in paged[0]["body"]
+    assert str(platform.raw["question"]["id"]) in paged[0]["body"]
+
+    # Nothing was written to the lifecycle ledger and nothing was posted for it.
+    assert conn.execute("SELECT count(*) FROM submission_attempts").fetchone()[0] == 0
+    assert current_status(conn, record_id) == "approved"
+    assert platform.posts == 1
+
+    # A day later, still unreconciled: it pages again. This is the discriminator -- without it
+    # the silence below would be indistinguishable from a throttled or a once-only alert.
+    instant[0] += timedelta(hours=25)
+    second = poll(case)
+    assert second["unrecorded_posts"] == 1
+    assert len(pushes.matching("missing from the ledger")) == 2
+
+    # The operator records the post. One GET, no POST.
+    reconcile_unrecorded_post(
+        conn,
+        config,
+        record_id=record_id,
+        observed_by="chris",
+        note="the question page shows our 35%",
+        poster=platform,
+        sleep=lambda _: None,
+    )
+    assert current_status(conn, record_id) == "submitted"
+
+    # And the alert stops -- in a fresh window, so silence is the condition clearing.
+    instant[0] += timedelta(hours=25)
+    third = poll(case)
+    assert third["unrecorded_posts"] == 0
+    assert len(pushes.matching("missing from the ledger")) == 2
+    assert platform.posts == 1
+
+
+def test_an_unrecorded_forecast_polled_every_five_minutes_pages_once(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An hour of five-minute polls on one unrecorded post is one page, not twelve.
+
+    The clock is the notifier's and is advanced per poll, so this distinguishes the day-long
+    window from the 30-minute incident window: under 1800 seconds the same hour pages twice.
+    """
+    _conn, config, *_ = case
+    _crashed_after_acceptance(case)
+    pushes, instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+    for _ in range(12):
+        poll(case)
+        instant[0] += timedelta(minutes=5)
+    assert len(pushes.matching("missing from the ledger")) == 1
+
+
+def test_an_ordinary_confirmed_forecast_never_pages_as_unrecorded(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The happy path, through resolution and scoring, is silent -- and that is not free.
+
+    The criterion says "its lifecycle status is not submitted". Implemented literally that is a
+    false-positive generator: `_LEGAL_TRANSITIONS` moves a healthy record submitted -> resolved
+    -> scored, so the first ingest would page for every forecast the worker ever posted. Twenty
+    of them stand on the live ledger. This walks a record all the way to `scored` and asserts
+    silence at each step, which a current-status predicate fails at the second.
+    """
+    from whiskeyjack_bot.lifecycle import current_status
+    from whiskeyjack_bot.resolution_ingest import ingest_resolutions
+    from whiskeyjack_bot.score_records import score_records
+
+    conn, config, platform, *_ = case
+    pushes, instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+
+    result = poll(case)
+    assert result["forecast_confirmed"] == 1 and result["unrecorded_posts"] == 0
+    (record_id,) = [row[0] for row in conn.execute("SELECT record_id FROM forecast_records")]
+    assert current_status(conn, record_id) == "submitted"
+
+    # A copy, so the poll below still discovers the ordinary open question.
+    resolved = copy.deepcopy(platform.raw)
+    resolved["question"]["status"] = "resolved"
+    resolved["question"]["resolution"] = "yes"
+    assert [r.record_id for r in ingest_resolutions(conn, lambda _post: resolved)] == [record_id]
+    assert current_status(conn, record_id) == "resolved"
+    instant[0] += timedelta(hours=25)
+    assert poll(case)["unrecorded_posts"] == 0
+
+    assert [r.status for r in score_records(conn)] == ["appended"]
+    assert current_status(conn, record_id) == "scored"
+    instant[0] += timedelta(hours=25)
+    assert poll(case)["unrecorded_posts"] == 0
+    assert pushes.matching("missing from the ledger") == []
+
+
+def test_the_unrecorded_page_names_the_record_and_nothing_the_platform_does_not_show(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ntfy is a third party (M1-329), and a title is transmitted (M1-334 round 1).
+
+    The rationale is walked out of the stored record rather than named, so the assertion
+    survives the forecast schema growing a field; a check against one known sentence would only
+    prove that sentence is absent.
+    """
+    conn, config, *_ = case
+    record_id = _crashed_after_acceptance(case)
+    pushes, _instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+    poll(case)
+    (paged,) = pushes.matching("missing from the ledger")
+
+    assert paged["priority"] == "high"
+    assert paged["title"] == "whiskeyjack: a live forecast is missing from the ledger"
+    assert str(config.metaculus.tournament.id) not in paged["title"]
+    assert config.model.name not in paged["body"]
+    assert str(config.storage.artifact_root) not in paged["body"]
+
+    stored = json.loads(
+        conn.execute(
+            "SELECT record_json FROM forecast_records WHERE record_id = ?", (record_id,)
+        ).fetchone()[0]
+    )
+
+    def strings(value: Any) -> Any:
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from strings(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from strings(item)
+        elif isinstance(value, str) and len(value) > 24:
+            yield value
+
+    # The record id is deliberately in the body -- it is what `reconcile-submission` takes --
+    # so the walk is of everything else the record stores.
+    leaked = [text for text in strings(stored) if text != record_id and text in paged["body"]]
+    assert leaked == [], "the reasoning never becomes public and must not leave the machine"
+
+
+def test_each_unrecorded_record_pages_separately(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The throttle subject is the record, so a second record in the same window also pages.
+
+    Driven at the helper rather than through two polls because the fixture's tournament holds
+    one question: what a constant `subject=` at the call site would break is exactly this, and
+    a single-record poll cannot see it.
+    """
+    from whiskeyjack_bot.notify import notifier_context
+    from whiskeyjack_bot.submission_reconcile import UnrecordedConfirmedPost
+
+    _conn, config, *_ = case
+    pushes, _instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+    found = (
+        UnrecordedConfirmedPost(record_id="wj-record-one", question_id=45754),
+        UnrecordedConfirmedPost(record_id="wj-record-two", question_id=45764),
+    )
+    with notifier_context(whiskeyjack_tournament.build_notifier(config)):
+        whiskeyjack_tournament._notify_unrecorded_posts(found)
+        whiskeyjack_tournament._notify_unrecorded_posts(found)
+    paged = pushes.matching("missing from the ledger")
+    assert len(paged) == 2, "two records page; the same two again inside the window do not"
+    assert {"wj-record-one", "wj-record-two"} == {
+        entry.record_id for entry in found if any(entry.record_id in p["body"] for p in paged)
+    }
