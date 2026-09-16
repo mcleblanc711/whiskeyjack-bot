@@ -11350,7 +11350,7 @@ resolution around 2026-09-17, with `resolution_events` still 0.
 - `docs/RUNBOOK.md` — a `W1` section for the new page, a `The watchdog itself` section, three
   symptom-index rows, and the closing paragraph of § Scheduled ingestion and scoring rewritten
   so *"nothing watches this one"* is no longer true.
-- Tests: 45 in `tests/unit/test_watchdog.py`, 9 properties in
+- Tests: 49 in `tests/unit/test_watchdog.py`, 9 properties in
   `tests/property/test_watchdog_properties.py`.
 
 **No `AppConfig` field, no migration, no dependency, no ledger write, no post.** The watchdog
@@ -11531,7 +11531,7 @@ exit code**, with output redirected to a file. Runner: the two new suites, `-x`,
 `HYPOTHESIS_PROFILE=dev` (200 examples). Every kill was read back against its log for the
 assertion that actually failed, so no kill is a collection error or an unrelated failure.
 
-**36 of 36 killed** (28 before round 1, three for its remediation, five for round 2's). Three of the first 28
+**38 of 38 killed** (28 before round 1; three, five and two for the remediations of rounds 1, 2 and 3). Three of the first 28
 only after the run found something, which is the part worth recording:
 
 | mutant | killed by |
@@ -11572,6 +11572,8 @@ only after the run found something, which is the part worth recording:
 | W34 the tournament block keeps its own parser again | `test_an_unusable_tournament_stamp_does_not_stop_the_resolutions_check` |
 | W35 the dead-man shares the push timeout again | `test_every_outward_call_passes_the_timeout_the_budget_counts` |
 | W36 the budget forgets the dead-man | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` |
+| W37 `_last_heartbeat` keeps its own parser again | `test_an_unusable_persisted_heartbeat_does_not_stop_the_resolutions_check` *(round-3 remediation)* |
+| W38 an unusable heartbeat is treated as fresh rather than absent | the same test |
 
 **W12 is the one that mattered.** Dropping the `stored.get("key") == key` half of the
 carry-forward guard is invisible on the ordinary path, because a successful push overwrites the
@@ -11747,3 +11749,58 @@ found the same class one level in. The resolutions path had the discipline from 
 (`isinstance(stored, dict)`, the three-way stamp guard) and the tournament path — vendored,
 older, and explicitly "unchanged" — did not. **"Unchanged" made it invisible to me**: I read the
 tournament block as out of scope rather than as code my new caller now depends on.
+
+**Round 3 — CHANGES REQUESTED on `e8573e9`.** Both round-2 findings **closed**; the reviewer ran
+the watchdog suites itself (54 tests green). One new blocking finding, accepted and reproduced
+against `e8573e9` first — **and it is the same class a third time.**
+
+#### 5. The ledger's own heartbeat had a third stamp parser
+
+`_last_heartbeat` guarded only `ValueError`. `tournament_events.created_at_utc` is
+`TEXT NOT NULL`, but SQLite is dynamically typed and applies TEXT affinity, so the column holds
+whatever a writer put there — and `CLAUDE.md` classifies values read back out of the ledger as
+untrusted in as many words. A naive timestamp parses fine and raises `TypeError` at the caller,
+out of `main`, taking the resolutions check down with it because it runs **second**.
+
+```
+created_at_utc = '2026-09-17T11:55:00'   TypeError: can't subtract offset-naive and offset-aware
+created_at_utc = 20260917 (an INTEGER)   the same error -- affinity converts it to '20260917'
+                                         and fromisoformat reads that as a basic-format date
+```
+
+`_last_heartbeat` now returns `_aware_stamp(row[0])`. **There is now exactly one stamp parser
+in the file**; `grep -c datetime.fromisoformat deploy/wj-watchdog` returns 1.
+
+Two things found while writing the regression, both worth keeping:
+
+- **`012`'s `tournament_events_no_update` trigger refuses an `UPDATE` outright** ("tournament
+  events are append-only"), so the reachable path is narrower than first written: a writer
+  *appending* a row whose timestamp is not what this reader assumes. The test inserts.
+- **Every existing heartbeat fixture went through `tournament_state.append`, which always emits
+  an aware timestamp.** That is precisely why nothing here saw this for two rounds: the fixtures
+  all used the one writer that cannot produce the bad value. A fixture built from the program's
+  own writer tests the reader against the writer, not against the column.
+
+The message `no heartbeat row in the ledger at all` becomes `no usable heartbeat timestamp in
+the ledger`, true of both cases the branch now reaches. The rule is unchanged; the message had
+to stop being false about the case in front of the operator, because the runbook's symptom index
+quotes it.
+
+#### Five findings, one shape, and the thing I kept getting wrong
+
+Four of the five are *a value read back out of storage, trusted further than it had been
+checked* — and I closed them **one location at a time**: the state file's top level (round 1),
+the state file's contents (round 2), the ledger's column (round 3). Each time I enumerated the
+siblings of the *instance* and not of the *class*.
+
+The class is: **this script reads three stored values and every one of them needs the same
+parser.** What would have found it in one pass is the question "where does a value enter this
+program from outside it?" — three places: `systemctl` stdout, the state file, the ledger — and
+`systemctl`'s was already total because `_resolutions_problems` compares strings and never
+converts them. The two that convert are the two that broke.
+
+`docs/LESSONS.md` lesson 6 says to enumerate siblings by execution when a finding names one
+exception type. It has now cost three rounds here, and the refinement worth adding is that
+*siblings of a value* are not the same as *siblings of a call site*: I enumerated `[1]`, `3`,
+`1.5`, `{"a": 1}` and a naive string — all siblings of the value — while a second call site with
+the identical defect sat twenty lines away.
