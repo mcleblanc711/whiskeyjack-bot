@@ -93,6 +93,7 @@ class Harness:
     units: dict[tuple[str, ...], str]
     pushes: list[dict[str, str]]
     asked: list[tuple[str, ...]] = field(default_factory=list)
+    pings: list[datetime] = field(default_factory=list)
     instant: list[datetime] = field(default_factory=lambda: [ANCHOR])
     delivers: list[bool] = field(default_factory=lambda: [True])
 
@@ -100,6 +101,9 @@ class Harness:
         self.asked.append(args)
         assert args in self.units, f"the watchdog asked an unexpected question: {args}"
         return self.units[args]
+
+    def ping(self) -> None:
+        self.pings.append(self.instant[0])
 
     def push(self, title: str, body: str, *, priority: str, tags: str) -> bool:
         self.pushes.append({"title": title, "body": body, "priority": priority, "tags": tags})
@@ -150,7 +154,7 @@ def watchdog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     monkeypatch.setattr(module, "LEDGER", ledger)
     monkeypatch.setattr(module, "_systemctl", harness.systemctl)
     monkeypatch.setattr(module, "_push", harness.push)
-    monkeypatch.setattr(module, "_ping_deadman", lambda: None)
+    monkeypatch.setattr(module, "_ping_deadman", harness.ping)
     monkeypatch.setattr(module, "_now", lambda: harness.instant[0])
     return harness
 
@@ -409,6 +413,38 @@ def test_a_push_the_channel_refused_is_retried_on_the_next_run(watchdog: Harness
     assert "last_alert" in watchdog.state()["resolutions"]
 
 
+def test_a_refused_push_about_a_new_fault_does_not_inherit_the_old_faults_quiet(
+    watchdog: Harness,
+) -> None:
+    """The stamp is carried forward only while the fault set is unchanged.
+
+    **Found by mutation, not by design.** Dropping the `stored.get("key") == key` half of that
+    guard survived every other test here, because on the ordinary path a successful push
+    overwrites the carried stamp with `now` and nothing is observable. It is observable when the
+    push does *not* land: the new fault set would inherit the old set's stamp, be judged inside
+    a window it was never paged in, and go unmentioned for up to a day. So the case is a refused
+    push arriving exactly at a change of fault set.
+    """
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "failed"
+    watchdog.delivers[0] = False
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 2, "the attempt is made"
+    assert "last_alert" not in watchdog.state()["resolutions"], "and it did not land"
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.delivers[0] = True
+    assert watchdog.run() == 1
+    pages = watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")
+    assert len(pages) == 3, "the new fault is still owed a page that landed"
+    assert watchdog.module.RESOLUTIONS_PROBLEMS["service_failed"] in pages[2]["body"]
+    assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_inactive"
+
+
 @pytest.mark.parametrize(
     "stored",
     ["not a dict", ["not a dict"], {"key": "timer_inactive", "last_alert": "not a timestamp"}],
@@ -440,6 +476,32 @@ def test_a_naive_timestamp_in_the_state_file_pages_rather_than_raising(
 
     assert watchdog.run() == 1
     assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+
+def test_the_dead_man_ping_answers_for_the_worker_and_not_for_the_schedule(
+    watchdog: Harness,
+) -> None:
+    """A stopped resolutions timer must not withhold the ping. Also found by mutation.
+
+    `WJ_HEALTHCHECK_URL` is the only cover for a dark host -- machine off, session gone -- and
+    what it reports is "this watchdog is not running at all". Gating it on the resolutions
+    check as well would make a stopped timer raise that second alarm too, in an external
+    service's wording, about something it is not about. So the gate stays the tournament
+    result, and this pins all three cases rather than leaving the choice asserted only in a
+    comment. Deleting the ping outright survived every other test in this file.
+    """
+    assert watchdog.run() == 0
+    assert len(watchdog.pings) == 1, "healthy: the watchdog reports itself alive"
+
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 1
+    assert len(watchdog.pings) == 2, "the schedule is stopped; the watchdog is still alive"
+
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 1
+    assert len(watchdog.pings) == 2, "the worker is down; the dead-man may fall silent"
 
 
 # ── the tournament checks, characterized ─────────────────────────────────────

@@ -11321,3 +11321,289 @@ The literal current-status reading **also** returns 0 today, and the honest stat
 defect depends on saying so: it is not producing false positives now, because `resolution_events`
 is still 0 and nothing has left `submitted` yet. It becomes wrong at the first ingest. Batch 1
 resolves around 2026-09-17.
+
+---
+
+## M1-341 — Extend the out-of-process watchdog to the resolutions timer
+
+Acceptance, verbatim: *A disabled or inactive whiskeyjack-resolutions.timer, or a failed last
+run, produces a watchdog push within one watchdog interval; the tournament checks are unchanged;
+the watchdog still reads the ledger read-only and changes no AppConfig field.*
+
+M4-805 put ingestion and scoring on a six-hourly timer with an `OnFailure=` pager. A pager
+reports a run that **fails**. A timer that is disabled or stopped never runs, so it never fails,
+so nothing is said — ingestion and scoring simply stop. `docs/RUNBOOK.md` said so in as many
+words before this item: *"Timers are not self-healing, and nothing watches this one."* That is
+the 2026-09-09 outage shape (2h33m; nothing in-process could report the condition and the JSONL
+tail went quiet), on the half of the pipeline that starts mattering at MiniBench batch 1's
+resolution around 2026-09-17, with `resolution_events` still 0.
+
+### Delivered
+
+- `deploy/wj-watchdog` — the operator-local watchdog, **now tracked**, plus a second subject.
+  Three checks, no heartbeat rule: `is-active` and `is-enabled` on
+  `whiskeyjack-resolutions.timer`, `is-failed` on its service. `Result` and `ExecMainStatus` are
+  read for the push body only.
+- `deploy/systemd/whiskeyjack-watchdog.{service,timer}` — tracked, byte-identical to what has
+  been installed since 2026-09-10.
+- `pyproject.toml` — `extend-include = ["deploy/wj-watchdog"]`.
+- `docs/RUNBOOK.md` — a `W1` section for the new page, a `The watchdog itself` section, three
+  symptom-index rows, and the closing paragraph of § Scheduled ingestion and scoring rewritten
+  so *"nothing watches this one"* is no longer true.
+- Tests: 31 in `tests/unit/test_watchdog.py`, 7 properties in
+  `tests/property/test_watchdog_properties.py`.
+
+**No `AppConfig` field, no migration, no dependency, no ledger write, no post.** The watchdog
+imports nothing from `whiskeyjack_bot` at all — asserted by parsing its import list — so it
+cannot reach `AppConfig`, cannot move `config_sha256`, and cannot retire the live activation
+(M1-334; the 2h33m outage). Deploying it is a `cp`, not a program change.
+
+### Decision — the watchdog is tracked in `deploy/`, and vendored in its own commit first
+
+The row said to *consider* it. Done, for a reason stronger than tidiness: without it the item has
+no reviewable artifact. The change would live entirely in an untracked file, the PR would be
+docs-only, and the notes would be citing evidence the repository does not hold — the failure
+M1-327's notes already record once. It is also what makes the criterion a **measurement**: "a
+push within one watchdog interval" is only testable if the code is loadable by a test.
+
+It does **not** move into `src/whiskeyjack_bot`. Its whole value is that it still runs when the
+package, the venv or the ledger is the broken thing — the argument
+`whiskeyjack-notify@.service`'s header already makes for being shell and curl. It stays
+stdlib-only under `#!/usr/bin/env python3`, which is the system interpreter and not the venv.
+
+The vendoring is `035d0b1`, byte-identical (`diff -q` clean against all three installed files;
+sha256 prefixes `b5ca6f56c53a5bd1` / `ced8841a303c78b3` / `d8ea575897b3127c`). `f18cdec` is
+`ruff format` plus the `extend-include` line and nothing else. So **"the tournament checks are
+unchanged" is a `git diff` fact**: `git diff f18cdec HEAD -- deploy/wj-watchdog` removes exactly
+six lines, and all six are plumbing —
+
+```
+-def main() -> int:
+-    state = _load_state()
+-        _save_state(state)
+-        return 1
+-    _save_state(state)
+-    return 0
+```
+
+— with no line of tournament logic touched. `tests/unit/test_watchdog.py` additionally
+characterizes the rules themselves (`STALE_AFTER` 20 min, `REALERT_AFTER` 60 min, the four
+queries, the stale-but-running exemption, the hourly re-alert), named in its docstring as a
+characterization test rather than as parity evidence, because that is what it is.
+
+### Decision — the extensionless filename, and what it cost to find out
+
+`deploy/wj-watchdog` keeps the installed name, so the runbook step is
+`cp deploy/wj-watchdog ~/.local/bin/wj-watchdog` with no rename an operator can get wrong.
+
+That has a trap: **ruff discovers files by extension, so it skipped the file silently.** Both
+`ruff check .` and `ruff format --check .` reported success on a file they had not read — the
+worst of the three outcomes, because the gate says the same thing whether the file is clean or
+absent. Verified against ruff 0.15.21 by planting an unused import in a scratch copy: *"All
+checks passed!"* without `extend-include`, *"Found 1 error"* with it. `mypy` still covers
+`src` only, which matches how `scripts/*.py` and `.github/scripts/*.py` are treated; the script
+is fully annotated regardless.
+
+### Decision — separate state, separate throttle, separate push
+
+Folding the resolutions faults into the tournament's one `problems` list would have been three
+lines. It is wrong in three ways, and M4-805's own notes rejected the same shape in the other
+direction (*"an ingestion failure folded in would … share one throttle stamp with forecasting
+failures, so one would mute the other"*):
+
+1. **One `last_alert` means either fault buys the other an hour of silence.** The first page of
+   the hour wins and the second condition waits.
+2. **One `alerting` flag means `worker recovered` goes out with half the rig stopped.** Pinned
+   by `test_the_worker_recovering_says_nothing_about_a_still_stopped_schedule`.
+3. **The windows are genuinely different.** A poll missing four times is an incident worth
+   repeating hourly. A disabled timer is a condition that holds until a person acts; repeating
+   it hourly is 24 pages a day and at the watchdog's own cadence 288.
+
+So: `state["resolutions"]` is a nested key beside the existing top-level `alerting`/`last_alert`,
+which are untouched. The live state file (`{"alerting": false}`) needs no migration and the
+previous script tolerates the new key.
+
+### Decision — a rolling 24-hour window, keyed on the problem codes
+
+A day is the window M1-334 and M1-342 both settled on for a condition that holds until someone
+acts. Two details are deliberate:
+
+- **Keyed on sorted codes, not on prose.** Rewording a message must not re-page. A genuinely
+  *new* fault appearing inside the window **does** page at once, because waiting up to a day to
+  mention new information is not a throttle, it is a drop.
+- **Rolling from the last page, not `notify.py`'s tumbling `floor(epoch / 86400)`.** This file
+  already worked that way (`REALERT_AFTER`), and rolling cannot page twice at a boundary — which
+  is the entire content of T-909. The bound is asserted against the cadence read off the
+  watchdog's *own timer file* (`OnCalendar=*:2/5` → 288 runs/day → at most 2 pages/day), not
+  against a constant restated in the test.
+
+### Decision — `_ping_deadman()` stays gated on the tournament result alone
+
+It answers one question for an external service — *is this watchdog running at all* — and that
+is the only cover for a dark host. Withholding the ping because the resolutions timer is stopped
+would raise a second, differently worded alarm (healthchecks.io: "no ping") about something it
+is not about. Unchanged, and noted in the code so the omission is not read as one.
+
+### Deviation — the stricter reading of "inactive"
+
+The criterion names *disabled or inactive*. Implemented as **anything that is not exactly
+`active` / `enabled`**, which is the tournament block's existing rule and the stricter reading.
+It matters: `systemctl --user is-enabled` really answers `enabled-runtime` for a unit enabled
+only until the next reboot, and `static`, `indirect`, `linked`, `masked` and `not-found` are all
+real answers. Mutant **W04** is the looser reading (`enabled-runtime` accepted); it dies.
+
+Measured rather than assumed, because one test's docstring depends on it — `systemctl --user`
+against a unit that does not exist answers `is-active` → `inactive`, `is-enabled` → `not-found`,
+`is-failed` → `inactive`, each with exit 4 and nothing on stdout that distinguishes it from a
+unit that exists and is stopped. So a typo in `RESOLUTIONS_UNIT` does not fail loudly; it pages
+forever about a unit nobody has, and the operator who goes looking finds the timer running.
+`test_every_unit_the_watchdog_names_is_a_unit_this_repo_ships` is the guard, and the tracked
+unit files are the witness. Mutant **W18** is that typo; it dies.
+
+### Deviation — "reads the ledger read-only" is stated at the strength the measurement supports
+
+A read-only open of a WAL database **creates a 32 KiB `-shm` and a zero-length `-wal`** beside
+the ledger when they are absent. Measured, not assumed. No WAL frame is written and the database
+file's bytes are identical (sha256 before and after). On the live host the worker holds both open
+already, so the watchdog creates neither. The test asserts exactly that, rather than excluding
+the sidecars from its listing, because *"the watchdog writes nothing at all"* is a claim the
+measurement does not support. The resolutions check opens nothing at all — asserted by spying on
+`sqlite3.connect`, which records zero calls on that path and one `mode=ro` call on the other.
+
+### Rejected — a last-trigger staleness rule
+
+`systemctl show -p LastTriggerUSec` would catch a timer that is enabled and active but somehow
+not firing. Rejected: it is outside the criterion's three conditions, and it adds a false-alarm
+class the criterion does not have. A freshly installed timer reports `LastTriggerUSec=0`, and
+`Persistent=true` plus a host that was switched off for a day is a legitimate gap that clears
+itself at the next boot. Filed as a follow-up row rather than smuggled in here (**M1-343**).
+
+### Rejected — an `AppConfig` field for the unit name or the window
+
+Any new field changes `config_sha256` and retires both live activations. The unit name is a
+deployment fact and the window is a constant beside the one the tournament already uses.
+
+### Rejected — making the resolutions page `urgent`
+
+It is `high`, the tournament's is `urgent`, and the asymmetry is the point. A stopped poll loses
+forecasts against a deadline. A stopped resolutions timer loses nothing permanently: both
+commands are idempotent, `Persistent=true` catches a missed run up, and the ledger is unaffected.
+A channel where everything is urgent has no urgent.
+
+### Rejected — letting the watchdog restart the timer
+
+It has no write path by design and this is not the exception. A watchdog that repairs cannot be
+trusted to report, and `systemctl --user enable --now` is a deliberate operator act that should
+be recorded by the person who took it.
+
+### Deferred (do not read the absence as an omission)
+
+- **A last-trigger staleness rule** — see above. Backlog: **M1-343**.
+- **Watching the Cup profile's units** — the Cup is dormant (withdrawn 2026-09-10) and has no
+  schedule; watching a deliberately stopped timer would page forever by design. Covered by
+  M4-806 if the Cup is ever re-entered.
+- **Installing the updated script on the live host** is an operator action after merge, with the
+  commands in the runbook. Not part of the diff.
+- **A test that the installed copy matches the tracked one.** Nothing in the suite can see
+  `~/.local/bin`, and a test that reads an operator's home directory would pass or fail for
+  reasons outside the repository. The drift risk is real and is named under standing risk below.
+
+### Standing risk — not verifiable offline
+
+- **The installed copy can drift from the tracked one.** `deploy/systemd/` has always been
+  copied rather than linked and this file now joins it; all three were `diff -q` identical at
+  vendoring time, and nothing keeps them so. The runbook's install block is the only control.
+- **Whether a push actually reaches a phone** is untestable here: `_push` is replaced in every
+  test. What is tested is that exactly one push is *attempted* per condition per window, and
+  that a refused push does not stamp the throttle. The live proof is the post-merge exercise —
+  stop the timer, wait one interval, confirm the page, restart it, confirm the recovery notice.
+- **`systemctl --user` output is systemd's**, and the vocabulary above was read off systemd 255
+  on this host. A future systemd that answered `running` instead of `active` would page falsely
+  rather than silently — the safe direction, but still a page.
+- **The dead-man remains unset.** `WJ_HEALTHCHECK_URL` is empty on this host, so a dark host is
+  still uncovered. Unchanged by this item and not made worse by it.
+
+### Mutation testing
+
+Committed first (`5cd03ab`); `__pycache__` cleared before every mutant; each restored in a
+`finally` and `git diff --stat deploy/wj-watchdog` asserted empty afterwards. Baseline green **by
+exit code**, with output redirected to a file. Runner: the two new suites, `-x`,
+`HYPOTHESIS_PROFILE=dev` (200 examples). Every kill was read back against its log for the
+assertion that actually failed, so no kill is a collection error or an unrelated failure.
+
+**28 of 28 killed.** Three of them only after the run found something, which is the part worth
+recording:
+
+| mutant | killed by |
+| --- | --- |
+| W01 `timer_inactive` never fires | property `test_silence_means_exactly_running_enabled_and_not_failed` |
+| W02 `timer_disabled` never fires | the same property |
+| W03 `service_failed` never fires | the same property *(see below — it survived first)* |
+| W04 `enabled-runtime` accepted as enabled | the same property |
+| W05 codes returned unsorted | `test_a_timer_that_is_both_stopped_and_disabled_pages_once_naming_both` |
+| W06 a changed fault set inherits the old throttle | property `test_a_fault_set_that_has_never_been_paged_pages_whatever_the_stamp_says` |
+| W07 the window never expires | property `test_a_paged_fault_set_is_silent_for_its_window_and_never_a_second_longer` |
+| W08 the window is hourly, not daily | `test_the_resolutions_throttle_is_long_against_the_cadence_its_own_timer_declares` |
+| W09 an unusable stamp is treated as a fresh page | property `test_a_stamp_that_cannot_be_read_as_an_aware_instant_pages` |
+| W10 a naive stamp is subtracted from an aware `now` | the same property (`TypeError`) |
+| W11 a refused push still stamps the throttle | `test_a_push_the_channel_refused_is_retried_on_the_next_run` |
+| W12 the stamp is carried across a changed fault set | **survived pass 1**; `test_a_refused_push_about_a_new_fault_does_not_inherit_the_old_faults_quiet` |
+| W13 the resolutions check is skipped when the worker is down | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
+| W14 the resolutions check is not wired into `main` at all | the same |
+| W15 a stopped schedule does not fail the run | the same |
+| W16 the two subjects share one state key | `test_a_healthy_schedule_is_silent_and_the_run_exits_zero` |
+| W17 no recovery notice when the schedule comes back | `test_a_restarted_timer_clears_the_condition_and_says_so_once` |
+| W18 the wrong unit is watched (`whiskeyjack-resolution`) | `test_every_unit_the_watchdog_names_is_a_unit_this_repo_ships` |
+| W19 the resolutions check reads the ledger | `test_the_resolutions_check_does_not_open_the_ledger_at_all` |
+| W20 the watchdog imports the package it watches | `test_the_watchdog_imports_nothing_from_the_package_it_watches` |
+| W21 the push body drops the per-code prose | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
+| W22 `Result`/`ExecMainStatus` never reach the body | `test_the_failed_run_page_says_why_it_failed` |
+| W23 the tournament staleness threshold changes | `test_the_tournament_rules_are_what_they_were` |
+| W24 the tournament re-alert window changes | the same |
+| W25 a running poll no longer excuses a stale heartbeat | `test_a_stale_heartbeat_is_not_a_fault_while_the_poll_is_still_running` |
+| W26 the dead-man ping is dropped from the healthy path | **survived pass 1**; `test_the_dead_man_ping_answers_for_the_worker_and_not_for_the_schedule` |
+| W27 the fault set is never recorded in the state file | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
+| W28 the dead-man ping is gated on the resolutions check too | the dead-man test *(see below — the first version was malformed)* |
+
+**W12 is the one that mattered.** Dropping the `stored.get("key") == key` half of the
+carry-forward guard is invisible on the ordinary path, because a successful push overwrites the
+carried stamp with `now`. It is visible only when the push does **not** land: the new fault set
+would inherit the old set's stamp, be judged inside a window it was never paged in, and go
+unmentioned for up to a day. Nothing in the suite crossed "the channel refused" with "the fault
+set changed", so nothing saw it. The test added for it drives exactly that crossing.
+
+**W26 is a decision that was asserted only in a comment.** Deleting `_ping_deadman()` outright
+survived every test, because the fixture stubbed it to a no-op and nothing observed the calls.
+The dead-man's gating is a choice this item made deliberately (above); a choice nothing can
+falsify is a claim, not a decision. The fixture now records the calls and the test pins all
+three cases.
+
+**W28's first version was a malformed mutant — read what a survivor proves before believing
+it.** It patched `_ping_deadman` in `globals()` *after* `_check_tournament` had already called
+it, so it changed nothing reachable and "survived" for a reason that had nothing to do with the
+tests. M1-342 hit this exact trap (a call inserted with an empty tuple that emitted nothing) and
+M1-334 hit it with an f-string. Rebuilt as a two-part mutation that actually moves the call, it
+dies.
+
+**A second pass ran W01–W10 against the property file alone**, with the unit tests out of the
+way, so the properties would have their own kill evidence rather than inheriting the unit
+suite's. That pass is what found the vacuity below.
+
+### Deviation — a property whose strategy could not reach the branch it asserted
+
+`test_silence_means_exactly_running_enabled_and_not_failed` was correct and, against W03
+(`service_failed` never fires), **useless**. All three systemctl answers were drawn from one
+shared strategy of about sixteen words plus arbitrary text, so the single combination that
+distinguishes that rule from silence — `active`, `enabled`, and `failed` together — had
+probability around 1/32768 and 200 draws never reached it.
+
+This is the reachability form of the class `docs/LESSONS.md` calls the top recurring defect, and
+it is worth being precise about what saved it: **not** the property, **not** the full suite (the
+unit vocabulary test kills W03 outright), but running the properties on their own against a
+mutant. A property that only ever runs beside a unit suite that already covers the same rule can
+be vacuous indefinitely without anyone noticing.
+
+Fixed by splitting the shared strategy into three per-field ones, each naming its own pivotal
+value as an `st.one_of` branch: `ACTIVE_ANSWERS`, `ENABLED_ANSWERS`, `FAILED_ANSWERS`. That
+lifts the combination to roughly one draw in thirty-six. W01–W04 all die to the properties alone
+afterwards; before, only W01, W02 and W04 did.

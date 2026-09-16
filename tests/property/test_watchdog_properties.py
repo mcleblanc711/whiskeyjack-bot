@@ -56,18 +56,31 @@ UNIT_WORDS = st.sampled_from(
         "indirect",
         "linked",
         "masked",
+        # Measured on systemd 255: `is-enabled` on a unit that does not exist answers this,
+        # while `is-active` and `is-failed` both answer `inactive` -- indistinguishable from a
+        # unit that exists and is stopped.
+        "not-found",
         "unknown",
         "",
         "Active",
         "active ",
     ]
 )
-ANSWERS = st.one_of(UNIT_WORDS, st.text(max_size=40))
+# Per-field, and deliberately NOT one shared `ANSWERS` strategy. With all three fields drawn
+# uniformly from ~16 words plus arbitrary text, the combination (active, enabled, "failed") has
+# probability ~1/32768 and 200 draws never reach it -- so the one branch that distinguishes
+# `service_failed` from silence was unreachable and the mutation that deletes that rule survived
+# the property suite entirely. Found by mutation (W03, props-only pass); it is the reachability
+# form of the vacuity class docs/LESSONS.md calls the top recurring defect. Naming each field's
+# pivotal value as its own `st.one_of` branch lifts that combination to roughly 1 draw in 36.
+ACTIVE_ANSWERS = st.one_of(st.just("active"), UNIT_WORDS, st.text(max_size=40))
+ENABLED_ANSWERS = st.one_of(st.just("enabled"), UNIT_WORDS, st.text(max_size=40))
+FAILED_ANSWERS = st.one_of(st.just("failed"), st.just("inactive"), UNIT_WORDS, st.text(max_size=40))
 
 ANCHOR = datetime(2026, 9, 17, 12, 0, 0, tzinfo=timezone.utc)
 
 
-@given(active=ANSWERS, enabled=ANSWERS, failed=ANSWERS)
+@given(active=ACTIVE_ANSWERS, enabled=ENABLED_ANSWERS, failed=FAILED_ANSWERS)
 def test_the_codes_are_always_a_sorted_subset_of_the_closed_vocabulary(
     active: str, enabled: str, failed: str
 ) -> None:
@@ -80,7 +93,7 @@ def test_the_codes_are_always_a_sorted_subset_of_the_closed_vocabulary(
     assert watchdog._resolutions_problems(active, enabled, failed) == codes
 
 
-@given(active=ANSWERS, enabled=ANSWERS, failed=ANSWERS)
+@given(active=ACTIVE_ANSWERS, enabled=ENABLED_ANSWERS, failed=FAILED_ANSWERS)
 def test_silence_means_exactly_running_enabled_and_not_failed(
     active: str, enabled: str, failed: str
 ) -> None:
@@ -93,7 +106,7 @@ def test_silence_means_exactly_running_enabled_and_not_failed(
     assert quiet == (active == "active" and enabled == "enabled" and failed != "failed")
 
 
-@given(active=ANSWERS, enabled=ANSWERS, failed=ANSWERS)
+@given(active=ACTIVE_ANSWERS, enabled=ENABLED_ANSWERS, failed=FAILED_ANSWERS)
 def test_every_code_emitted_has_a_sentence_for_the_push_body(
     active: str, enabled: str, failed: str
 ) -> None:
