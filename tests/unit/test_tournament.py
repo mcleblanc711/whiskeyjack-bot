@@ -2108,3 +2108,22 @@ def test_each_unrecorded_record_pages_separately(
     assert {"wj-record-one", "wj-record-two"} == {
         entry.record_id for entry in found if any(entry.record_id in p["body"] for p in paged)
     }
+
+
+def test_the_unrecorded_alert_also_fires_on_the_spending_hold_exit(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run_once`` has two exits, and the early one does not skip the recovery loop.
+
+    A spending hold stops purchases, not the pending-intent loop that confirms a forecast in
+    the journal -- so the state this alert is about is reachable on that exit too, and an alert
+    hooked only to the normal return would be silent for it. The digest makes the same argument
+    two tests above; this is the same claim for the page that matters more.
+    """
+    _conn, config, *_ = case
+    _crashed_after_acceptance(case)
+    append(case[0], "restored_spending_hold", "42:32977", {})
+    pushes, _instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+    held = poll(case)
+    assert held["spending_held"] and held["unrecorded_posts"] == 1
+    assert len(pushes.matching("missing from the ledger")) == 1
