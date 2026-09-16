@@ -1,0 +1,16 @@
+[Unit]
+Description=Whiskeyjack out-of-process liveness watchdog
+# Deliberately NO OnFailure= pointing at the notify template: if this unit is what
+# broke, a notifier launched by this unit's failure is not independent evidence.
+# A dark host is covered by WJ_HEALTHCHECK_URL instead (see the script's docstring).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cleblanc/projects/whiskeyjack-bot
+EnvironmentFile=/home/cleblanc/projects/whiskeyjack-bot/.env
+ExecStart=/home/cleblanc/.local/bin/wj-watchdog
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
