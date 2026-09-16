@@ -214,6 +214,34 @@ def test_the_resolutions_throttle_is_long_against_the_cadence_its_own_timer_decl
     assert pages_per_day <= 2, "a stopped timer must not page once per watchdog run"
 
 
+def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares() -> None:
+    """A run systemd kills part-way reports the tournament and never the schedule.
+
+    **Round-1 blocking finding.** Every outward call carries its own timeout, and the
+    tournament half is checked first, so if the total budget exceeds `TimeoutStartSec` what
+    gets cut is always the resolutions page — the thing this item exists to send. Before
+    M1-341 the script made four systemctl queries and at most one push (75s, inside the 120s
+    the unit declared); it now makes nine and up to three, which is 190s and was not. The
+    deadline is read out of the tracked unit rather than restated here, so the constant and
+    the unit cannot drift apart, and the timer's own interval bounds the other end: a hung run
+    must be dead before the next one is due.
+    """
+    module = _load()
+    service = read_unit(WATCHDOG_SERVICE)
+    deadline = int(only(service, "Service", "TimeoutStartSec"))
+    calendar = only(read_unit(WATCHDOG_TIMER), "Timer", "OnCalendar")
+    interval = int(calendar.split(":")[1].split("/")[1]) * 60
+
+    assert module.WORST_CASE_SECONDS < deadline, (module.WORST_CASE_SECONDS, deadline)
+    assert deadline < interval, "a hung run must not still be alive when the next one starts"
+    # And the arithmetic is over the numbers the code actually passes, not over a copy.
+    assert module.WORST_CASE_SECONDS == (
+        9 * module.SYSTEMCTL_TIMEOUT_SECONDS
+        + module.LEDGER_TIMEOUT_SECONDS
+        + 3 * module.HTTP_TIMEOUT_SECONDS
+    )
+
+
 def test_the_problem_codes_and_their_prose_are_one_closed_vocabulary() -> None:
     """Every code the detector can emit has a sentence; the push body indexes by code."""
     module = _load()
@@ -443,6 +471,30 @@ def test_a_refused_push_about_a_new_fault_does_not_inherit_the_old_faults_quiet(
     assert len(pages) == 3, "the new fault is still owed a page that landed"
     assert watchdog.module.RESOLUTIONS_PROBLEMS["service_failed"] in pages[2]["body"]
     assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_inactive"
+
+
+@pytest.mark.parametrize("contents", ["[]", "null", '"text"', "3", "{", ""])
+def test_a_state_file_that_is_not_an_object_still_reports_a_stopped_schedule(
+    watchdog: Harness, contents: str
+) -> None:
+    """**Round-1 blocking finding**, reproduced by execution at `3dda485` before the fix.
+
+    `[]`, `null`, `"text"` and `3` are all valid JSON, so `_load_state`'s bare `json.loads`
+    returned them and the first `state.get(...)` raised `AttributeError` out of `main` — with
+    no resolutions query asked and no push attempted. It takes down **both** subjects, and it
+    does it silently, because the watchdog is the one unit deliberately without an `OnFailure`
+    pager. A hand-edited state file is an ordinary operator action.
+
+    `{` and `""` are the shapes that already worked (the parse itself fails); they are drawn
+    here so the test is about the top-level *shape*, not about the parse.
+    """
+    Path(watchdog.module.STATE).write_text(contents, encoding="utf-8")
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    assert watchdog.run() == 1
+    assert watchdog.asked.count(("is-active", "whiskeyjack-resolutions.timer")) == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+    assert watchdog.state()["resolutions"]["key"] == "timer_inactive"
 
 
 @pytest.mark.parametrize(

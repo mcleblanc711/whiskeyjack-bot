@@ -11,6 +11,11 @@ Type=oneshot
 WorkingDirectory=/home/cleblanc/projects/whiskeyjack-bot
 EnvironmentFile=/home/cleblanc/projects/whiskeyjack-bot/.env
 ExecStart=/home/cleblanc/.local/bin/wj-watchdog
-TimeoutStartSec=120
+# 240s, not 120s (M1-341 review round 1). One run's declared worst case -- every outward call
+# blocking to its own timeout -- is 190s, and at 120s systemd killed the run after the
+# tournament half and before the resolutions page was ever attempted. 240 clears 190 and stays
+# under the 300s timer interval, so a hung run is always dead before the next one is due.
+# WORST_CASE_SECONDS in deploy/wj-watchdog is the arithmetic; a test compares the two.
+TimeoutStartSec=240
 UMask=0077
 NoNewPrivileges=true

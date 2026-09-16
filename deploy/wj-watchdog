@@ -60,6 +60,24 @@ RECOVERY_NOTICE = True
 # The second subject (M1-341). RESOLUTIONS_UNIT names deploy/systemd/whiskeyjack-resolutions
 # .{service,timer}; tests/unit/test_watchdog.py asserts both files exist, so a rename cannot
 # leave this check silently pointed at nothing.
+# Every outward call this script makes carries its own timeout. Named rather than written
+# inline so the bound below is arithmetic over the real numbers instead of a comment.
+SYSTEMCTL_TIMEOUT_SECONDS = 15
+LEDGER_TIMEOUT_SECONDS = 10
+HTTP_TIMEOUT_SECONDS = 15
+# What one run may spend if every one of those calls blocks to its own timeout: nine systemctl
+# queries (four tournament, three resolutions, two diagnostic `show`), one ledger read, and
+# three HTTP calls (two pushes and the dead-man ping). `TimeoutStartSec` in
+# deploy/systemd/whiskeyjack-watchdog.service must exceed this, or systemd kills the run
+# part-way -- and because the tournament is checked first, what it kills is the resolutions
+# report. That could not happen before M1-341: four queries and one push is 75s, inside the
+# 120s the unit declared, while nine queries and three calls is 190s and is not. Found by
+# cross-model review, round 1. tests/unit/test_watchdog.py reads the deadline out of the unit
+# file and asserts it still exceeds this, so the two cannot drift apart.
+WORST_CASE_SECONDS = (
+    9 * SYSTEMCTL_TIMEOUT_SECONDS + LEDGER_TIMEOUT_SECONDS + 3 * HTTP_TIMEOUT_SECONDS
+)
+
 RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
 # A stopped timer is a CONDITION that holds until a person acts, not an incident that passes.
 # At the watchdog's five-minute cadence an hourly re-alert would be 24 pages a day and a
@@ -89,7 +107,7 @@ def _systemctl(*args: str) -> str:
             ["systemctl", "--user", *args],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
         )
         return out.stdout.strip()
     except Exception:
@@ -101,7 +119,7 @@ def _last_heartbeat() -> datetime | None:
     if not LEDGER.exists():
         return None
     try:
-        conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=LEDGER_TIMEOUT_SECONDS)
         try:
             row = conn.execute(
                 "select created_at_utc from tournament_events "
@@ -120,10 +138,21 @@ def _last_heartbeat() -> datetime | None:
 
 
 def _load_state() -> dict:
+    """The state file, or an empty state. Never anything a caller cannot use as a dict.
+
+    The top-level shape is validated, not just the parse (M1-341 review round 1). A state file
+    containing `[]`, `null`, `"text"` or `3` is valid JSON, so the bare parse returned it and
+    every caller's `state.get(...)` raised `AttributeError` out of `main` -- taking down BOTH
+    subjects, and doing it silently, since the watchdog is the one unit with no `OnFailure`.
+    Reproduced by execution at `3dda485`: `[]` in the file, a stopped resolutions timer, and
+    the run died before it asked a single resolutions question. A hand-edited state file is an
+    ordinary operator action, and the whole point of this file is to notice when things stop.
+    """
     try:
-        return json.loads(STATE.read_text())
+        loaded = json.loads(STATE.read_text())
     except Exception:
         return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _save_state(state: dict) -> None:
@@ -146,7 +175,7 @@ def _push(title: str, body: str, *, priority: str, tags: str) -> bool:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             return 200 <= response.status < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
@@ -163,7 +192,7 @@ def _ping_deadman() -> None:
     if not url:
         return
     try:
-        urllib.request.urlopen(url, timeout=10).close()
+        urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS).close()
     except (urllib.error.URLError, OSError, ValueError):
         pass
 

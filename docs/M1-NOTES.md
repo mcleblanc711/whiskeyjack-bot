@@ -11350,7 +11350,7 @@ resolution around 2026-09-17, with `resolution_events` still 0.
 - `docs/RUNBOOK.md` — a `W1` section for the new page, a `The watchdog itself` section, three
   symptom-index rows, and the closing paragraph of § Scheduled ingestion and scoring rewritten
   so *"nothing watches this one"* is no longer true.
-- Tests: 31 in `tests/unit/test_watchdog.py`, 7 properties in
+- Tests: 38 in `tests/unit/test_watchdog.py`, 7 properties in
   `tests/property/test_watchdog_properties.py`.
 
 **No `AppConfig` field, no migration, no dependency, no ledger write, no post.** The watchdog
@@ -11607,3 +11607,77 @@ Fixed by splitting the shared strategy into three per-field ones, each naming it
 value as an `st.one_of` branch: `ACTIVE_ANSWERS`, `ENABLED_ANSWERS`, `FAILED_ANSWERS`. That
 lifts the combination to roughly one draw in thirty-six. W01–W04 all die to the properties alone
 afterwards; before, only W01, W02 and W04 did.
+
+### Review
+
+**Round 1 — CHANGES REQUESTED on `3dda485`** (2026-09-16, local Codex against
+`GPT_REVIEW_REQUEST_M1-341_r1.md`). **Two blocking findings, both legitimate, both reproduced
+by execution against that exact commit before a line of fix code was written**, and 8 of the 10
+risk claims came back Safe. The two that did not are the two findings.
+
+#### 1. A valid non-object state file took down both subjects
+
+`_load_state` returned whatever `json.loads` produced. `[]`, `null`, `"text"` and `3` are all
+valid JSON, so the first `state.get(...)` raised `AttributeError` out of `main`.
+
+Reproduced at `3dda485` with `[]` in the file, healthy tournament units and an inactive
+resolutions timer:
+
+```
+RAISED: AttributeError: 'list' object has no attribute 'get'
+resolutions queries made: []
+pushes attempted: []
+```
+
+**The defect pre-dates this branch and is still this branch's to fix**, which is worth being
+precise about because the scope rule turns on it. Before M1-341 a corrupt state file disabled
+tournament monitoring; after it, the same file also makes the resolutions path unreachable —
+the branch materially amplifies the impact. It is also silent, because the watchdog is the one
+unit deliberately without an `OnFailure` pager. And my own round-1 risk claim 8 said the
+throttle was "total over a hand-edited state file"; it was total over a malformed
+`state["resolutions"]` and not over the file's top-level shape. The claim was wider than the
+code, which is the more useful way to state the miss.
+
+`_load_state` now returns `{}` unless the parsed value is a `dict`. Six parametrized cases
+cover `[]`, `null`, `"text"`, `3` and — so the test is about the *shape* rather than the parse
+— `{` and the empty file, which already worked.
+
+#### 2. The declared worst-case run exceeded the unit's own deadline
+
+Every outward call carries its own timeout. This branch took the script from four systemctl
+queries and at most one push to **nine queries and up to three HTTP calls**, while
+`TimeoutStartSec` stayed at the `120` it was vendored with.
+
+Measured as an accounting run over the real declared numbers:
+
+```
+systemctl calls: 9 x 15s
+total declared budget: 165s   (plus the ledger read and the dead-man ping: 190s)
+unit TimeoutStartSec:  120s
+-> systemd kills the run at 120s, before the budget completes
+```
+
+Before M1-341 the same arithmetic was 75s, comfortably inside 120. So the overrun is created
+here, not inherited. And because the tournament is checked **first**, what a part-way kill
+removes is always the resolutions page — the thing this item exists to send.
+
+Fixed by naming every timeout (`SYSTEMCTL_TIMEOUT_SECONDS`, `LEDGER_TIMEOUT_SECONDS`,
+`HTTP_TIMEOUT_SECONDS`), deriving `WORST_CASE_SECONDS = 190` from them, and raising
+`TimeoutStartSec` to `240` — clear of 190 and under the timer's own 300s interval, so a hung
+run is always dead before the next is due. The test reads the deadline **out of the tracked
+unit file** and asserts `WORST_CASE_SECONDS < TimeoutStartSec < interval`, so the constant and
+the unit cannot drift apart. Per-call timeouts are unchanged, so the tournament path's
+behaviour is untouched.
+
+**Rejected as the fix: combining the two diagnostic `show` calls into one.** It would cut a
+call, but `_systemctl` strips its output, so a property with an empty value loses its line and
+`Result`/`ExecMainStatus` could be silently transposed. One number in a unit file is the
+smaller change and the honest one.
+
+#### Non-blocking, filed rather than fixed
+
+`_save_state` swallows `OSError`, so an unwritable state file means the throttle stamp never
+persists and a standing condition pages every run — 288 a day, the outcome the window exists to
+prevent. The swallow is deliberate (a watchdog that dies because it could not write a stamp
+reports nothing at all), so the fix is to bound the volume and surface the failure, not to
+raise. Backlog: **M1-344**. Not reproduced on the live host; the state file is writable there.
