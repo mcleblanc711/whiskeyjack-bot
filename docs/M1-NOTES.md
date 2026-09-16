@@ -11350,7 +11350,7 @@ resolution around 2026-09-17, with `resolution_events` still 0.
 - `docs/RUNBOOK.md` — a `W1` section for the new page, a `The watchdog itself` section, three
   symptom-index rows, and the closing paragraph of § Scheduled ingestion and scoring rewritten
   so *"nothing watches this one"* is no longer true.
-- Tests: 49 in `tests/unit/test_watchdog.py`, 9 properties in
+- Tests: 50 in `tests/unit/test_watchdog.py`, 9 properties in
   `tests/property/test_watchdog_properties.py`.
 
 **No `AppConfig` field, no migration, no dependency, no ledger write, no post.** The watchdog
@@ -11531,7 +11531,7 @@ exit code**, with output redirected to a file. Runner: the two new suites, `-x`,
 `HYPOTHESIS_PROFILE=dev` (200 examples). Every kill was read back against its log for the
 assertion that actually failed, so no kill is a collection error or an unrelated failure.
 
-**38 of 38 killed** (28 before round 1; three, five and two for the remediations of rounds 1, 2 and 3). Three of the first 28
+**40 of 40 killed** (28 before round 1; three, five, two and two for the remediations of rounds 1-4). Three of the first 28
 only after the run found something, which is the part worth recording:
 
 | mutant | killed by |
@@ -11574,6 +11574,8 @@ only after the run found something, which is the part worth recording:
 | W36 the budget forgets the dead-man | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` |
 | W37 `_last_heartbeat` keeps its own parser again | `test_an_unusable_persisted_heartbeat_does_not_stop_the_resolutions_check` *(round-3 remediation)* |
 | W38 an unusable heartbeat is treated as fresh rather than absent | the same test |
+| W39 the ledger probe moves back outside the `try` | `test_a_ledger_directory_the_watchdog_cannot_read_does_not_stop_the_resolutions_check` *(round-4 remediation)* |
+| W40 the ledger handler stops catching `OSError` | the same test |
 
 **W12 is the one that mattered.** Dropping the `stored.get("key") == key` half of the
 carry-forward guard is invisible on the ordinary path, because a successful push overwrites the
@@ -11804,3 +11806,63 @@ exception type. It has now cost three rounds here, and the refinement worth addi
 *siblings of a value* are not the same as *siblings of a call site*: I enumerated `[1]`, `3`,
 `1.5`, `{"a": 1}` and a naive string — all siblings of the value — while a second call site with
 the identical defect sat twenty lines away.
+
+**Round 4 — CHANGES REQUESTED on `b08f01b`.** All **five** prior findings closed. One new
+blocking finding, accepted and reproduced against `b08f01b` first.
+
+#### 6. The ledger's filesystem probe sat outside its own `try`
+
+`LEDGER.exists()` was before the `try`. `Path.exists()` does **not** swallow `EACCES` — measured
+on the system interpreter the unit actually runs, 3.12.3 — so a ledger directory that loses
+search permission raised `PermissionError` out of `main` and took the resolutions check with it,
+because that check runs second. `CLAUDE.md` keeps permission failures and unreadable files
+explicitly in scope as reachable reliability conditions.
+
+Reproduced with a **real `chmod 000`** on the directory, not a monkeypatched `exists`:
+
+```
+Path.exists() -> PermissionError: [Errno 13] Permission denied
+main()        -> PermissionError; resolutions queries: []; pushes: []
+```
+
+The probe moves inside the `try` and the handler becomes `(OSError, sqlite3.Error)` —
+`sqlite3.Error` is not an `OSError` subclass, so both are needed. An unreadable ledger is a
+heartbeat this program cannot read: a fault to report, not a reason to stop reporting, and the
+worker page says exactly that.
+
+**Because this was the fifth finding of one family, the fix is an audit rather than a patch.**
+Every outward touch in the script, and what its handler catches:
+
+| touch | handler |
+| --- | --- |
+| `_systemctl` → `subprocess.run` | `except Exception` |
+| `_last_heartbeat` → `exists()` + `sqlite3.connect` | `except (OSError, sqlite3.Error)` ← this round |
+| `_load_state` → `read_text` + `json.loads` | `except Exception` |
+| `_save_state` → `mkdir` + `write_text` | `except OSError` |
+| `_push` → `urlopen` | `except (URLError, OSError, ValueError)` |
+| `_ping_deadman` → `urlopen` | `except (URLError, OSError, ValueError)` |
+
+Nothing else is unguarded. `_save_state`'s `json.dumps` cannot raise on what the state can hold,
+because every value in it came back out of `json.loads` and is serialisable by construction.
+
+#### The final tally, and the lesson that is actually transferable
+
+Six blocking findings over four rounds. **Five of them are one family** — an outward call or a
+stored value trusted further than it had been checked, in the *vendored* half of a script whose
+criterion said the tournament checks were unchanged.
+
+- Round 1: the state file's top level. Round 2: the state file's contents. Round 3: the ledger's
+  column. Round 4: the ledger's filesystem probe.
+- Each time I enumerated siblings of the **instance** and not of the **class**, and each time the
+  next round found the class one step further out.
+
+**"Unchanged" is what made the vendored half invisible to me.** I read it as out of scope rather
+than as code my new caller now depends on — and the new caller is what made every one of these
+blocking, because `_check_resolutions` runs *second* and anything escaping the first check
+removes it. A vendored block a new caller reaches is new surface, whatever the diff says, and the
+audit above is what should have been done in round 1's remediation rather than round 4's.
+
+`docs/LESSONS.md` lesson 6 already says to enumerate siblings by execution when a finding names
+one exception type. The refinement this item paid for: **enumerate the siblings of the *entry
+point*, not of the *value*.** Ask where a value enters the program from outside it — here, three
+places — and check all of them at once.
