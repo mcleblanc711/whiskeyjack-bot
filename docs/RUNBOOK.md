@@ -46,7 +46,7 @@ from the source that prints them, and each of those blocks is labelled.
 - **`forecast_records.status` is not the record's status.** That column is the status the
   row was *created* with and is pinned to `draft` forever, because the table is
   append-only and nothing can update it. The real status is derived from the last
-  `lifecycle_events` row (`lifecycle.current_status`, `lifecycle.py:829-852`). Every
+  `lifecycle_events` row (`lifecycle.current_status`, `lifecycle.py:999-1022`). Every
   command prints the derived value. A record whose `status` column reads `draft` may well
   be `approved`.
 
@@ -889,8 +889,10 @@ code.
 
 **Confirm (read-only).** The `run` output block is your evidence: it carries the question
 id, the attempt id and the detail code. A `pipeline_failure_events` row was written under
-that attempt id, but **no command can show it to you** — that is **M1-611**. The log file at
-`logging.file` has the same information.
+that attempt id, but **no command can show it to you.** `show --record-id` (**M1-611**)
+does not help here: a pre-forecast failure has no `forecast_records` row to key on at all,
+so there is nothing for it to be shown against — `pipeline_failure_events` is keyed by
+`attempt_id` alone. The log file at `logging.file` has the same information.
 
 **Recovery.** Re-run the question. A new attempt id is minted, and the earlier failure
 stays in the ledger as history — that is the point of it. If the detail code is
@@ -914,7 +916,7 @@ again.
 this is the useful part — **the raw model reply is on disk** under `storage.artifact_root`,
 keyed by question id and attempt id. The money bought that text, and it is written before
 the event precisely so it survives. A `pipeline_failure_events` row was also written; as in
-R1, no command reads it back (**M1-611**).
+R1, no command reads it back, and `show --record-id` does not apply for the same reason.
 
 **Recovery.** Read the saved reply to see what the model actually said, then re-run. If the
 detail code is `calibration_invalid` or `schema_invalid` the model produced a well-formed
@@ -1201,9 +1203,20 @@ is a new forecast version behind a fresh human approval.
 
 ### How to find the attempt id if you lost it
 
-There is no command that lists a record's open uncertainties. In order of preference:
+```bash
+uv run whiskeyjack-bot show --config config.yaml --record-id "$REC"
+```
 
-1. **The `submit` output**, which printed the full `verify-submission` command line for you.
+**`show --record-id` (M1-611) is the read-only command for this.** It reads the ledger only
+(`ledger.connect_readonly`) and lists every `unresolved uncertainties` attempt id the record
+holds, each printed with the exact `verify-submission --attempt-id` command line to resolve
+it — no artifact file, log or scrollback required. If it prints `unresolved uncertainties:
+none`, there is nothing outstanding for that record.
+
+If the ledger itself is unreachable, two fallbacks remain, in order of preference:
+
+1. **The `submit` output**, which printed the full `verify-submission` command line at the
+   time.
 2. **The live submission artifact**, which is the durable copy. Each file is
    `submissions/live/<question_id>/<idempotency_key>.json` under `storage.artifact_root`,
    and its `receipt` block carries `attempt_id`, `forecast_record_id`, `success` and
@@ -1219,12 +1232,9 @@ There is no command that lists a record's open uncertainties. In order of prefer
 
    Both were run against a real live artifact; the JSON is written on one line, so `grep`
    finds it.
-3. If neither exists — because the artifact was not written ([L5](#l5--the-artifact-was-not-written))
-   and the terminal is gone — **there is no supported way to recover the id.** The
-   submission modules do no logging, so the log file will not have it either.
 
-**Filed as M1-611**, the read-only `show` command. `CODEX_HANDOFF.md:276` lists it as a
-required entry point and it has never been built.
+If none of these work, the submission modules do no logging, so the log file will not have
+it either.
 
 ---
 
@@ -1244,8 +1254,9 @@ missing.
 
 **Confirm (read-only).** Everything `submit` printed above the refusal — record, question,
 version, type, derived status, hash, payload digest — is real and was read from the ledger
-without writing anything. **While submission is off, `submit` is the closest thing to a
-read-only inspection command this program has.**
+without writing anything. `show --record-id` (M1-611) reads the same state, and more of it
+(approval, full lifecycle history, unresolved uncertainties, standing reservations), without
+needing `submission.enabled` off to do it.
 
 **Recovery.** If you genuinely intend a live post, flip all three flags together and
 re-run. That is a deliberate act.
@@ -1260,9 +1271,10 @@ that nothing newer than the baseline is on the platform. Both halves are require
 the only cell in the partition that is an outright failure.
 
 **Confirm (read-only).** `submit`'s own output said `(success=False, refetch=absent)`.
-To check the record afterwards, probe it with `submit --record-id <REC>` while
-`submission.enabled` is `false` and read the `status:` line — `failed`. The attempt row
-itself is not readable by any command (**M1-611**).
+`show --record-id <REC>` (M1-611) now gives the same `status: failed` line without
+disabling submission first, plus the `lifecycle history` entry for the transition itself
+(attempt id, `detail_code`, timestamp). The full `submission_attempts` row — HTTP status,
+response body and headers, error text — is still not readable by any command.
 
 **Recovery.** `failed` is terminal. The forecast was not posted. Make a new forecast
 version and approve it if you still want to submit for that question.
@@ -1292,28 +1304,25 @@ function of tournament, question, forecast version and payload hash — the same
 the same key forever — so without a way out, one interrupted command would block that
 forecast permanently.
 
-**Confirm.** There is **no read-only command that lists everything that is standing.**
-`unrecorded-posts` (M2-713) lists the part of it that matters most: reservations whose command
+**Confirm.**
+
+```bash
+uv run whiskeyjack-bot show --config config.yaml --record-id "$REC"
+```
+
+`show --record-id` (M1-611) lists every standing reservation for a record — `standing key
+reservations`, with each reservation id, key, sequence number and timestamp — read-only,
+whether it is the only one or one of several. `unrecorded-posts` (M2-713) remains the command
+for the part of this that matters most across the whole ledger: reservations whose command
 committed a submission intent, which is to say reached the POST, so the forecast may be live —
 check each on Metaculus and go to [L4](#l4--a-live-post-the-ledger-refused-to-record) if it is
-there. A standing reservation it does *not* list never reached the POST. Beyond that, two things
-come close and neither is one:
+there. A standing reservation it does *not* list never reached the POST.
 
-- **`release-key` with no `--reservation-id`, when the record holds more than one
-  reservation**, refuses and lists all of them with their sequence numbers and timestamps
-  (`cli.py:856-869`). That *is* read-only — but only in the multiple-reservation case, which
-  is the one you are least likely to be in.
-- **`release-key` when exactly one is standing prints it and then releases it.** It is not an
-  inspection; it is the action, with the identifier echoed on the way past.
-
-`submit` does not help here either: its reservation listing runs only in the handler for a
-`post_approved_forecast` failure (`cli.py:713`), so running `submit` with submission disabled
-refuses at the configuration gate several steps earlier (`cli.py:688-691`) and prints no
-reservation information at all.
-
-So in the single-reservation case, confirming and acting are the same command, and what makes
-that safe is the assertion `--released-by` requires of you — read the next paragraph before
-running it. A read-only inspection is a real gap and it is owned by **M1-611**.
+Before `show` existed, two things came close to a per-record listing and neither was one:
+`release-key` with no `--reservation-id`, when the record holds more than one reservation,
+refused and listed all of them as a side effect (`cli.py:856-869`); with exactly one standing,
+`release-key` printed it and then released it in the same act. `show` replaces both as the
+inspection step — `release-key` is still the only way to act on what it shows.
 
 **Recovery — and read the next paragraph first.**
 
@@ -1521,8 +1530,10 @@ The same policy applies after a paid model call: the forecast record is still ap
 with no `raw_output_path`.
 
 **Confirm (read-only).** Check the expected path under `storage.artifact_root` —
-`submissions/live/<question_id>/<idempotency_key>.json` — and find it absent. The attempt
-row itself was written and is not readable by any command (**M1-611**); `submit`'s output at
+`submissions/live/<question_id>/<idempotency_key>.json` — and find it absent. `show
+--record-id` (M1-611) shows the lifecycle event for the attempt (attempt id, whether it
+was `submitted`, `submission_uncertain` or `submission_failed`, and its timestamp); the
+full `submission_attempts` row is still not readable by any command. `submit`'s output at
 the time is the record of what happened.
 
 **Recovery.** The ledger record stands and is authoritative for *what happened*. What is
@@ -1576,15 +1587,19 @@ not evidence of what was sent.
 
 ## When the only recovery would be a database edit
 
-Four states in this document have no complete recovery through a documented command. They
+Three states in this document have no complete recovery through a documented command. They
 are listed here rather than papered over with a SQL snippet, because a runbook that teaches
-you to edit the ledger has destroyed the thing it documents.
+you to edit the ledger has destroyed the thing it documents. (**M1-611**'s `show --record-id`
+closed a fourth: finding a record's state, or a lost attempt id, from the ledger alone — see
+[U](#how-to-find-the-attempt-id-if-you-lost-it). It does not reach a pre-forecast failure's
+`pipeline_failure_events` row — [R1](#r1--research_failed)/[R2](#r2--generation_failed) — or
+the full `submission_attempts` row behind a lifecycle event — [L1](#l1--submission_failed)/
+[L5](#l5--the-artifact-was-not-written) — neither of which this item's scope covered.)
 
 | State | Section | Row | What is missing |
 |---|---|---|---|
 | A `mismatched` refetch | [L3](#l3--a-mismatched-refetch) | **M2-714** | A way to record a human's judgement closing it |
 | An approved record needing re-approval | [A2](#a2--an-approved-record-cannot-be-re-approved-or-rejected) | **M2-715** | Either a legal path back, or a refusal that stops suggesting one |
-| Finding a record's state, or a lost attempt id | [U](#how-to-find-the-attempt-id-if-you-lost-it) | **M1-611** | The read-only `show` command the spec requires |
 | A `not_recorded` forecast | [R4](#r4--not_recorded-the-forecast-the-ledger-never-saw) | **M1-317** | A ledger identity for a post-generation persistence failure |
 
 One further filed item is a nuisance rather than a stuck state: **M0-010**, `verify-env`

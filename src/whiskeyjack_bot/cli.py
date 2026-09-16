@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from whiskeyjack_bot.config import AppConfig
     from whiskeyjack_bot.lifecycle import ApprovalDecision
+    from whiskeyjack_bot.show import RecordShow
     from whiskeyjack_bot.submission_payload import AuthorizedPayload
 
 # A command that refused to act: an unusable ledger, an unknown record, an illegal
@@ -308,6 +309,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--config", default="config.yaml", type=Path)
     replay.add_argument("--record-id", required=True, help="the forecast record to replay")
+
+    show = subparsers.add_parser(
+        "show",
+        help="render one forecast record's derived status, approval, lifecycle history, "
+        "unresolved uncertainties and standing key reservations; reads the ledger only",
+    )
+    show.add_argument("--config", default="config.yaml", type=Path)
+    show.add_argument("--record-id", required=True, help="the forecast record to show")
+
     tournament = subparsers.add_parser("tournament", help="activated tournament operation")
     commands = tournament.add_subparsers(dest="tournament_command", required=True)
     for name in ("run-once", "enable", "disable", "status", "reconcile-restored"):
@@ -1668,6 +1678,137 @@ def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _open_readonly_ledger(path: Path) -> sqlite3.Connection | None:
+    """Open an existing ledger read-only, or print why not and return ``None`` (M1-611).
+
+    Same existence check as :func:`_open_existing_ledger`, for the same reason -- a
+    mistyped ``--config`` must not report "no such record" against a ledger this command
+    just discovered rather than the one an operator meant. What differs is the opener:
+    :func:`ledger.connect_readonly` rather than :func:`ledger.open_verified_ledger`, because
+    the latter is read-write and can apply a pending migration as a side effect of
+    verifying the schema -- exactly what a read-only inspection command must not do.
+    """
+    from whiskeyjack_bot.ledger import LedgerError, connect_readonly
+
+    try:
+        exists = path.is_file()
+    except OSError:
+        print(f"cannot read the ledger database at {path}")
+        return None
+    if not exists:
+        print(f"no ledger database at {path}; nothing has been recorded there yet")
+        return None
+    try:
+        return connect_readonly(path)
+    except LedgerError as exc:
+        print(exc)
+        return None
+
+
+def _print_show(view: RecordShow) -> None:
+    summary = view.summary
+    print(f"record:    {summary.record_id}")
+    print(
+        f"question:  {summary.question_id}  tournament: {summary.tournament_id}  "
+        f"version: {summary.forecast_version}  type: {summary.question_type}"
+    )
+    print(f"status:    {summary.status}")
+    print(f"hash:      {summary.forecast_sha256 or '(none stored)'}")
+    print()
+
+    if view.effective_approval is None:
+        print("approval:  none in force")
+    else:
+        current = view.effective_approval
+        print(f"approval:  {current.decision} by {current.actor} at {current.occurred_at_utc}")
+        print(f"           payload: {current.payload_sha256 or '(none stored)'}")
+    print(f"approval history ({len(view.approval_history)}):")
+    for decision in view.approval_history:
+        print(
+            f"  - seq {decision.event_seq}: {decision.decision} by {decision.actor} "
+            f"at {decision.occurred_at_utc}  payload: {decision.payload_sha256 or '(none)'}"
+        )
+    print()
+
+    print(f"lifecycle history ({len(view.lifecycle_history)}):")
+    for event in view.lifecycle_history:
+        line = (
+            f"  - seq {event.event_seq}: {event.event_type}  "
+            f"{event.from_status} -> {event.to_status}  at {event.occurred_at_utc}"
+        )
+        if event.detail_code is not None:
+            line += f"  detail: {event.detail_code}"
+        if event.submission_attempt_id is not None:
+            line += f"  attempt: {event.submission_attempt_id}"
+        print(line)
+    print()
+
+    if view.unresolved_uncertainties:
+        print(f"unresolved uncertainties ({len(view.unresolved_uncertainties)}):")
+        for attempt_id in view.unresolved_uncertainties:
+            print(
+                f"  - attempt {attempt_id}: run `whiskeyjack-bot verify-submission "
+                f"--record-id {summary.record_id} --attempt-id {attempt_id}`"
+            )
+    else:
+        print("unresolved uncertainties: none")
+    print()
+
+    if view.standing_reservations:
+        print(f"standing key reservations ({len(view.standing_reservations)}):")
+        for reservation in view.standing_reservations:
+            print(
+                f"  - {reservation.reservation_id}  key: {reservation.idempotency_key}  "
+                f"seq: {reservation.reservation_seq}  reserved: {reservation.reserved_at_utc}"
+            )
+    else:
+        print("standing key reservations: none")
+
+
+def _run_show(args: argparse.Namespace) -> int:
+    """Render one forecast record's ledger state, read-only (M1-611).
+
+    Reads only: it opens the ledger through :func:`_open_readonly_ledger` (never
+    :func:`_open_existing_ledger`, which is read-write) and calls nothing outside
+    :mod:`whiskeyjack_bot.show`, which itself reaches no submission or provider module --
+    see ``tests/unit/test_show.py``. Makes no network call and spends nothing.
+
+    **Deliberately skips** :func:`logging_setup.configure_logging`, unlike every other
+    handler in this file. That call creates the log directory and opens ``logging.file``
+    for append -- a real filesystem write, and every other command's acceptance criterion
+    tolerates that; this one's says "it writes nothing," unqualified. Safe to skip here
+    because ``show`` reaches no code that would log anything sensitive to redact: its whole
+    import graph is confirmed provider-free by the tests named above.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.show import ShowError, assemble_show
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+
+    connection = _open_readonly_ledger(config.storage.sqlite_path)
+    if connection is None:
+        return EXIT_REFUSED
+    try:
+        try:
+            view = assemble_show(connection, args.record_id)
+        except ShowError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        _print_show(view)
+        return EXIT_OK
+    finally:
+        connection.close()
+
+
 def _run_tournament(args: argparse.Namespace) -> int:
     import json
     from datetime import datetime
@@ -1789,6 +1930,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_unrecorded_posts(args)
     if args.command == "replay":
         return _run_replay(args)
+    if args.command == "show":
+        return _run_show(args)
     if args.command == "export":
         return _run_export(args)
     raise AssertionError(f"unhandled command: {args.command}")

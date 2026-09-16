@@ -11885,3 +11885,210 @@ So it is defence in depth on the one unit with no `OnFailure` pager, not a live 
 the same family as the six findings this item closed: an outward call trusted further than it had
 been checked. Filing it rather than fixing it keeps round 5 an approval instead of a seventh
 round on a condition nothing has met.
+
+## M1-611 — Add the read-only `show` command for a record's ledger state
+
+Acceptance: *a read-only subcommand reports a forecast record's derived status, content hash,
+approval and its payload binding, lifecycle history, any unresolved submission uncertainties
+with their attempt ids, and any standing key reservations; it writes nothing, makes no network
+call and spends nothing; a test asserts it reaches no submission or provider module and that a
+record with an open uncertainty surfaces the exact attempt id `verify-submission` needs.*
+
+### Delivered
+
+- `src/whiskeyjack_bot/show.py` — `ShowError`, `RecordShow`, `assemble_show`.
+- `src/whiskeyjack_bot/cli.py` — `show` subcommand (`--config`, `--record-id`),
+  `_open_readonly_ledger`, `_print_show`, `_run_show`, dispatch.
+- `tests/unit/test_cli_show.py` — 11 tests: unknown-record refusal without echo, an
+  unapproved record's empty sections, an approved record's effective-approval/payload-binding
+  print, the acceptance criterion's core claim (an open `submission_uncertain` event's attempt
+  id is obtainable from `show` alone), a standing reservation listing, `--record-id` required,
+  a mistyped `--config` minting no ledger, no network call, ledger byte-identical before/after,
+  and two import-boundary checks (static AST and a clean-subprocess `sys.modules` delta).
+- `docs/RUNBOOK.md` — every place that told an operator to do this by hand and named M1-611 as
+  the eventual fix now points at `show --record-id` instead.
+
+Nothing here is reachable from `submission_gateway.py`, `submission_live.py`,
+`submission_policy.py`, `submission_reconcile.py` or `metaculus/client.py`; the module graph is
+checked, not just the call path (see Teeth, below).
+
+### Decision — a new `show.py` module owns the join, not `cli.py` directly
+
+Mirrors `approval.py`'s shape: one error type, one frozen dataclass, one assembling function.
+Keeps `_run_show` to opening the ledger, calling the assembler, and printing — the existing
+convention every other handler in `cli.py` already follows for its own collaborator work — and
+gives the import-boundary test one small, purpose-built file to check rather than the whole of
+`cli.py`, which legitimately imports `metaculus.client` inside other handlers' function bodies.
+
+### Decision — six existing read functions, no new SQL
+
+`assemble_show` calls exactly `approval.read_forecast_summary`, `approval.effective_approval`,
+`approval.approval_history`, `lifecycle.read_history`, `lifecycle.unresolved_uncertainties` and
+`submission.live_reservations_for_record` — all named in the backlog row's own "Source or
+Decision Reference" column. No new query is written; every value `show` prints was already
+computed by an existing writer or reader for some other command's use. `read_forecast_summary`
+runs first, because it is what actually validates `record_id` names a stored record; everything
+called after it assumes that check already happened.
+
+### Decision — `connect_readonly`, not `open_verified_ledger`
+
+Every other record-touching command in `cli.py` opens the ledger through
+`_open_existing_ledger` → `ledger.open_verified_ledger`, which is read-write and, by its own
+docstring, can apply a pending migration as a side effect of "verifying" the schema. `show`
+instead gets its own `_open_readonly_ledger` → `ledger.connect_readonly`, whose docstring
+already names `show` as its next intended caller (written at M1-604). A read-only inspection
+command migrating the ledger it is only meant to look at would be exactly the kind of shortcut
+CLAUDE.md's ledger-boundary rule forbids.
+
+`export.py`, the only other `connect_readonly` caller, additionally sets
+`connection.text_factory = bytes` because it reads raw columns itself. `show.py` never calls
+`conn.execute`; it only calls `approval.py`/`lifecycle.py`/`submission.py`'s own `_fetch_one`/
+`_fetch_all`, which already catch `sqlite3.Error`/`OverflowError`/`UnicodeEncodeError` at fetch
+time and wrap them into a sanitized, value-withholding message regardless of the connection's
+`text_factory` — confirmed by reading both implementations before writing `show.py`. So no
+`text_factory` workaround was needed here.
+
+### Decision — both the effective approval and the full approval history are printed
+
+The acceptance criterion's "approval and its payload binding" reads singular, which could mean
+only the approval currently in force. `show` prints `effective_approval` labelled as current,
+and also the full `approval_history` — every decision, including a superseded or rejected one.
+Read as the stricter of the two: this is an attribution instrument over an append-only ledger,
+and hiding a decision the ledger still holds would defeat the reason the ledger is append-only
+in the first place.
+
+### Decision — every collaborator error is re-raised as `ShowError`
+
+Mirrors `submission.py`'s own `_wrap_lifecycle`/`_wrap_approval` — a module that composes
+several collaborators' reads re-raises each one's error as its own type, with the message
+preserved rather than replaced by a constant, the same reasoning `approval.ApprovalError`'s
+docstring gives for wrapping `LifecycleError`. `_run_show` therefore handles exactly one
+exception type, matching every other handler's `except <Module>Error as exc: print(f"refused:
+{exc}")` shape.
+
+### Decision — `--config` is required despite the CLI spec's abbreviated line
+
+`CODEX_HANDOFF.md:276` lists `show --record-id ID` with no `--config`, but so does its line for
+`approve`/`reject`/`submit`, all three of which take `--config` in the actual implementation —
+it is how any of them finds `storage.sqlite_path`. Matched to what those three commands already
+do rather than to the doc's abbreviated signature listing.
+
+### Rejected — folding this into `submit`'s pre-flight print
+
+`submit` already prints identity, derived status, hash and payload digest before refusing when
+`submission.enabled=false` — which is exactly the "coincidence of gate ordering, not an
+interface" the backlog description calls out. Making `show` a mode of `submit` would keep that
+coincidence rather than remove it, and would leave inspection working only while submission is
+disabled — wrong for a command that must work regardless of the flag.
+
+### Rejected — pulling in `forecast.store.read_forecast_record` for full question content
+
+Would satisfy a broader reading of CODEX_HANDOFF.md's "canonical forecast record" (question
+text, model settings, sources, …), but the acceptance criterion doesn't ask for any of that, and
+`read_forecast_summary` already carries every identity field `show`'s output uses. Parsing and
+re-verifying the full stored record for fields nothing asked for is exactly the kind of
+unrequested feature CLAUDE.md's scope discipline forbids. Left to **M1-612** if the owner wants
+it — see Standing risk, below.
+
+### Deferred (do not read the absence as an omission)
+
+- Resolution and score events, and the full-record canonical join CODEX_HANDOFF.md describes,
+  are **M1-612**'s stated scope (dependency `M1-604`, decisions `D25`/`D29`), not this item's.
+  `lifecycle_history` here is the `lifecycle_events` table in event order only; it will include
+  a resolution or score event once M4-801/M4-802's writers record one as a lifecycle event, but
+  `show` does not separately join the `submission_attempts`/`submission_verifications`/
+  `submission_reconciliations`/`resolution_events`/`score_events` detail rows the way M1-612's
+  acceptance criterion asks for ("every linked … event").
+- No `tests/property/` pass. `assemble_show` is a pure join of already-validated, already-hashed
+  values it reads back out of the ledger — not a hash, tiebreak, canonicalizer or validator.
+  Stated here rather than omitted silently, per this item's own instructions.
+
+### Standing risk — a duplicate backlog filing, not a code risk
+
+`docs/backlog/backlog.csv` carries two open rows for the same CLI entry point: **M1-611** (this
+item) and **M1-612** ("Implement show --record-id: assemble one record's canonical history at
+read time", `Not Started`, dependency `M1-604`, decisions `D25`/`D29`, unclaimed in
+`docs/TRACKS.md`). They are not identical — M1-612's scope is strictly broader, the full
+chronological join across every linked table plus a byte-identical-ledger guarantee — but this
+item now occupies the `show --record-id` command name and CLI surface with a narrower
+implementation than M1-612 describes. Surfaced for the owner to resolve: close M1-612 as
+subsumed-in-part, rescope it to exactly the join and byte-identity gap this item leaves open, or
+leave it as filed. Not resolved on this branch, since it is a backlog-hygiene call rather than
+an implementation one.
+
+### Teeth — the import-boundary tests
+
+Two tests, deliberately different in kind, both against `show.py` specifically rather than
+`cli.py` as a whole (`cli.py` legitimately imports `metaculus.client` inside other handlers'
+bodies, so a whole-file check would be checking the wrong thing):
+
+- A static `ast.walk` over `show.py`'s own import statements, refusing any name containing
+  `submission_gateway`, `submission_live`, `submission_policy`, `submission_reconcile`,
+  `metaculus.client` or `poster` — mirrors `test_cli_ingest_resolutions.py`'s
+  `test_the_ingest_module_imports_nothing_that_can_post`, which is the closest existing
+  precedent in both phrasing and shape.
+- A clean-subprocess `sys.modules` delta after `import whiskeyjack_bot.show` alone, refusing
+  `asknews_sdk`, `httpx`, `forecasting_tools`, `requests`, `urllib.request`, `http.client` and
+  `ssl` — mirrors `test_research_store.py`'s `test_the_store_imports_no_provider_client`. This
+  is the transitive check the static one can't give, and is what actually enforces "reaches no
+  … provider module" rather than "doesn't literally write the import line."
+
+Both pass against the delivered code, and were checked against two distinct mutations, each
+temporarily added to `show.py` and then reverted:
+
+- `from whiskeyjack_bot import submission_live  # noqa` — caught by the static test only
+  (`{'whiskeyjack_bot.submission_live'}`); the subprocess test's forbidden set is the network
+  libraries a provider client pulls in, and `submission_live.py` deliberately avoids importing
+  one even for its own exception handling (it names `requests.exceptions` as a string), so
+  importing it adds nothing to that set. This is a real, documented gap between the two checks
+  rather than a redundancy — the static test is what actually forbids the sibling module.
+- `from whiskeyjack_bot.metaculus import client  # noqa` — caught by **both**: the static test
+  on the literal name, and the subprocess test on the transitive delta
+  (`asknews_sdk, forecasting_tools, http.client, httpx, requests, ssl, urllib.request` all
+  appeared), which is the class of leak a static check alone cannot see if a future import
+  reaches a provider client through an intermediate module the forbidden-name list doesn't name.
+
+### Round 1 review (Codex) — one blocking finding, reproduced; fixed
+
+Reviewed commit `714833d`, which was `HEAD`, so nothing was stale.
+
+**`_run_show` called `configure_logging(config)`, a real filesystem write.** Every other
+handler in `cli.py` calls it, and every other command's acceptance criterion tolerates that.
+`show`'s AC is the first to say "it writes nothing," unqualified, and `configure_logging`
+creates the log directory (`log_file.parent.mkdir(parents=True, exist_ok=True)`) and opens
+`logging.FileHandler` in append mode — on every successful invocation, not just under a
+simulated failure. Reproduced by reading `logging_setup.configure_logging` directly (confirmed
+the `mkdir`/`FileHandler` calls) and by running `show` against a fresh config and observing the
+log directory appear. Within the threat model (an ordinary local write, not a hypothetical
+attacker) and introduced by this branch (the write itself is pre-existing code, but this branch
+is what newly wires it into a command whose AC promises zero writes) — both scope tests the
+review-round contract asks for hold.
+
+Fixed by removing the `configure_logging(config)` call from `_run_show` specifically, not from
+`logging_setup.py` or any other handler. Safe because `show`'s entire import graph is already
+confirmed provider-free (the two import-boundary tests above), so there is nothing during a
+`show` invocation that would log a value needing redaction. Regression:
+`test_the_command_creates_no_log_file`, mutation-tested by temporarily reintroducing the call
+and confirming the test fails with the exact log path reported as existing, then reverting.
+
+**Non-blocking observation, acted on anyway.** The reviewer noted `docs/RUNBOOK.md`'s L1/L5
+promise that `show` surfaces a lifecycle event's attempt id and `detail_code`, but
+`_print_show`'s lifecycle-history loop printed neither — a documentation/implementation
+mismatch I had introduced myself while writing the RUNBOOK update. Rather than weaken the
+RUNBOOK claim, fixed the renderer: each lifecycle-history line now appends `detail: <code>`
+and `attempt: <id>` when the event carries them. Extended
+`test_a_record_with_an_open_uncertainty_surfaces_the_exact_attempt_id` to assert both appear on
+the `submission_uncertain` line.
+
+`scripts/gate.sh` re-run clean after both fixes (all four gates pass).
+
+### Round 2 review (Codex) — APPROVE
+
+Reviewed commit `a7e81a6`, which was `HEAD`, matching the request's pinned commit. Both round-1
+findings confirmed **CLOSED**: the logging-write fix ("the current call path contains no
+alternative logging setup") and the lifecycle-rendering fix ("only the two promised fields are
+appended, each when non-`None`"). No new blocking findings, no new backlog candidates. Two
+rounds: one blocking finding, one non-blocking observation acted on, then approve. The reviewer
+noted it could not execute the regression suite itself (a read-only sandbox constraint, not a
+finding) and reported against the brief's own gate output instead — consistent with this
+project's advisory-sandbox note in `scripts/run-review.sh`.
