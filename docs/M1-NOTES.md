@@ -10998,7 +10998,7 @@ look at them.
 - `docs/RUNBOOK.md` — L4's "What you see" now opens with the page and the count instead of
   "nothing at all"; the confirm block says how the count and `unrecorded-posts` differ; two new
   symptom-index rows.
-- Tests: 6 in `tests/unit/test_tournament.py`, 4 in `tests/unit/test_submission_reconcile.py`,
+- Tests: 7 in `tests/unit/test_tournament.py`, 4 in `tests/unit/test_submission_reconcile.py`,
   1 property in `tests/property/test_submission_reconcile_properties.py`.
 
 **No `AppConfig` field, no migration, no dependency, and no write of any kind.** A new alert
@@ -11249,3 +11249,35 @@ it. Recorded so the absence is not read as a gap:
 Widening the property to cover M02 was considered and not done: reaching `resolved` needs a
 resolution observation and a second writer, and the claim is about the *worker's* behaviour end
 to end, which is where the regression lives.
+
+### Round 1 — APPROVE, and the one observation was a flake worth fixing
+
+`GPT_REVIEW_RESPONSE_M1-342_r1.md`, against `fe0a8d4` (the request's pinned HEAD): **APPROVE**,
+**no blocking findings**, and all ten risk claims came back Safe. The reviewer independently
+reproduced claim 4's `config_sha256` and `prompt_sha256` rather than taking the request's word
+for it, and ran ruff, ruff format and strict mypy itself; it could not run pytest, because
+`codex exec --sandbox read-only` gives it no writable temp directory, which is the standing shape
+of every round here and exactly why `review-request.py` refuses to emit on a red branch.
+
+**One non-blocking observation, and it was right.** `test_an_unrecorded_forecast_polled_every_five_minutes_pages_once`
+started its injected clock at wall-clock `utcnow()`. `Notifier._stamp_path` keys on a *tumbling*
+window — `floor(epoch / 86400)` — so twelve five-minute polls starting in the **last 55 minutes
+of a UTC day** straddle the boundary, page twice, and fail an assertion expecting one. That is
+55/1440 of runs, about 4%, on a test in a suite whose `quality-gate` is required on master:
+the M1-333 and T-909 class, which this project has already paid for twice.
+
+Filed as a backlog candidate by the reviewer; **fixed here instead**, because a knowingly flaky
+test is a cost every future PR pays. The arithmetic was reproduced first — over twelve polls,
+a window-aligned start spans one window and a start 55 minutes before the boundary spans two —
+and then:
+
+- `_clocked` takes an explicit `start`, and `_window_start(event, offset=...)` returns the
+  instant that event's current throttle window opened. The throttle test anchors to it, so the
+  claim is about the window length and not about the hour the suite ran in.
+- `test_an_hour_of_polls_across_a_window_boundary_pages_twice` pins the other side: the same
+  twelve polls started 55 minutes before the boundary page **twice**, deliberately. The tumbling
+  window is `notify.py`'s documented choice — a sliding one needs read-then-write and
+  reintroduces the race `os.link` closes — and a duplicate alert is a better failure than a lost
+  one. What was a 4% random redden is now two deterministic tests, one of them documenting the
+  behaviour that caused it.
+- Checked for teeth: `_window_start` made to ignore its `offset` fails the new test.

@@ -6,7 +6,7 @@ import copy
 import json
 import math
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1892,18 +1892,24 @@ def _crashed_after_acceptance(case: Any) -> str:
     return record_id
 
 
-def _clocked(monkeypatch: pytest.MonkeyPatch, config: Any, state: Path) -> tuple[_Pushes, list]:
+def _clocked(
+    monkeypatch: pytest.MonkeyPatch, config: Any, state: Path, start: datetime | None = None
+) -> tuple[_Pushes, list]:
     """`_recording`, with the notifier's throttle clock under the test's control.
 
     The clock has to be injectable rather than advanced by `monkeypatch`ing `utcnow`, because
     the window this is about is the notifier's, and `Notifier` reads its own `clock`.
+
+    ``start`` defaults to now, which is right for a test that only ever steps *across* a window.
+    A test that must keep several polls *inside* one window has to say where in the window it
+    begins -- see `_window_start` below.
     """
     import httpx
 
     from whiskeyjack_bot.notify import Notifier
 
     pushes = _Pushes()
-    instant = [utcnow()]
+    instant = [utcnow() if start is None else start]
     monkeypatch.setattr(
         whiskeyjack_tournament,
         "build_notifier",
@@ -1916,6 +1922,23 @@ def _clocked(monkeypatch: pytest.MonkeyPatch, config: Any, state: Path) -> tuple
         ),
     )
     return pushes, instant
+
+
+def _window_start(event: str, *, offset: timedelta = timedelta(0)) -> datetime:
+    """The instant an event's current throttle window opened, plus ``offset``.
+
+    `Notifier._stamp_path` keys on a **tumbling** window -- `floor(epoch / seconds)` -- so where
+    in the window a test begins decides how many windows its polls span. Anchoring is what makes
+    "twelve polls, one page" a statement about the window length rather than about the hour of
+    day the suite happened to run in: from wall-clock now, a run starting in the last 55 minutes
+    of a UTC day straddles the boundary and pages twice. Round 1 caught that as a non-blocking
+    observation; the arithmetic was reproduced before this was written.
+    """
+    from whiskeyjack_bot.notify import _WINDOW_SECONDS
+
+    window = _WINDOW_SECONDS[event]
+    opened = (int(utcnow().timestamp()) // window) * window
+    return datetime.fromtimestamp(opened, tz=timezone.utc) + offset
 
 
 def test_a_live_forecast_the_ledger_never_recorded_pages_and_clears_once_reconciled(
@@ -1989,14 +2012,47 @@ def test_an_unrecorded_forecast_polled_every_five_minutes_pages_once(
 
     The clock is the notifier's and is advanced per poll, so this distinguishes the day-long
     window from the 30-minute incident window: under 1800 seconds the same hour pages twice.
+
+    Anchored to the window's own start, so the hour cannot straddle a tumbling-window boundary
+    and the claim is about the window length rather than the time of day the suite ran.
     """
     _conn, config, *_ = case
     _crashed_after_acceptance(case)
-    pushes, instant = _clocked(monkeypatch, config, tmp_path / "notify-state")
+    pushes, instant = _clocked(
+        monkeypatch, config, tmp_path / "notify-state", start=_window_start("unrecorded_post")
+    )
     for _ in range(12):
         poll(case)
         instant[0] += timedelta(minutes=5)
     assert len(pushes.matching("missing from the ledger")) == 1
+
+
+def test_an_hour_of_polls_across_a_window_boundary_pages_twice(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other side of the anchor, pinned rather than left as the flake it used to be.
+
+    A tumbling window is a deliberate choice in `notify.py` -- a sliding one would need
+    read-then-write and reintroduce the race `os.link` closes -- and its documented cost is that
+    two pushes can land either side of a boundary. Starting the same twelve polls 55 minutes
+    before the boundary makes that cost visible and deterministic, where before it arrived as a
+    ~4% chance of the test above going red for reasons that had nothing to do with the code.
+    """
+    _conn, config, *_ = case
+    _crashed_after_acceptance(case)
+    pushes, instant = _clocked(
+        monkeypatch,
+        config,
+        tmp_path / "notify-state",
+        start=_window_start("unrecorded_post", offset=timedelta(days=1) - timedelta(minutes=55)),
+    )
+    for _ in range(12):
+        poll(case)
+        instant[0] += timedelta(minutes=5)
+    assert len(pushes.matching("missing from the ledger")) == 2, (
+        "a duplicate across a boundary is the tumbling window's documented cost, and a "
+        "duplicate alert is a far better failure than a lost one"
+    )
 
 
 def test_an_ordinary_confirmed_forecast_never_pages_as_unrecorded(
