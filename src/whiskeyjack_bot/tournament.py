@@ -166,7 +166,7 @@ def _notify_unrecorded_posts(found: Sequence[UnrecordedConfirmedPost]) -> None:
     for entry in found:
         emit(
             "unrecorded_post",
-            subject=entry.record_id,
+            subject="wj",
             title="whiskeyjack: a live forecast is missing from the ledger",
             body=(
                 f"A forecast is live on the platform and the lifecycle ledger has not "

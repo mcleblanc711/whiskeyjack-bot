@@ -384,7 +384,14 @@ def test_the_alert_reads_exactly_the_confirmed_posts_the_ledger_never_recorded(
 
     conn = _conn()
     serial = next(_COUNTER)
-    record_id, question_id = f"rec-alert-{serial}", 20_000 + serial
+    # Scattered, zero-padded, and injective over this run's serials, so **insertion order is
+    # not sorted order**. The first draft numbered the records consecutively and the
+    # ORDER BY mutant survived the whole property: SQLite returns an unordered query in scan
+    # order, which for consecutive equal-width ids *is* the sorted order. The strategy could
+    # not reach the case the ordering assertion is about -- this project's recurring vacuity,
+    # found here by the mutation pass rather than by reading.
+    record_id = f"rec-alert-{(serial * 7919) % 100_000:05d}"
+    question_id = 20_000 + serial
     post = seed_unrecorded_post(
         conn,
         record_id,

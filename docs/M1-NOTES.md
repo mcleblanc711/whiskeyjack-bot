@@ -10965,3 +10965,212 @@ up — a property with a well-formed shape (`st.permutations` plus a non-vacuity
 same claim as a property whose *strategy* can reach the input class the claim is actually about.
 `CATEGORY_IDS = st.lists(..., unique=True)` was never going to draw a duplicate id no matter how
 many examples it ran.
+
+## M1-342 — Alert when a journal-confirmed forecast never reached the lifecycle ledger
+
+Acceptance, verbatim: *A poll that finds a record whose forecast_confirmed journal row exists
+while its lifecycle status is not submitted reports it -- a count in tournament status and one
+throttled push naming the record -- without writing to the lifecycle ledger or posting anything;
+the alert stops once reconcile-submission records the post; a test drives a process death after
+acceptance, one poll, and asserts the alert fires once and clears after reconciliation.*
+
+The detection half of the state M2-713 made recoverable. On the live worker it is silent: the
+poll's recovery loop runs `reconcile_forecast` on the durable `forecast_intent`, confirms the
+forecast against its own refetch, appends `forecast_confirmed`, pushes **"forecast confirmed"**
+and posts the private comment — while `lifecycle_events` keeps the record `approved` with a
+standing key reservation, and M4-801 ingestion (which selects `to_status = 'submitted'`) never
+resolves or scores it. The operator is told success. `reconcile-submission` and
+`unrecorded-posts` shipped a fortnight of nothing looking at them.
+
+### Delivered
+
+- `submission_reconcile.py` — `unrecorded_confirmed_posts` and its `UnrecordedConfirmedPost`
+  value object: a `forecast_confirmed` journal row joined to its record, with no lifecycle event
+  that ever reached `submitted`. Read-only, no network, one statement, deterministic order.
+  `_RECORDED` pins the status literal to `lifecycle.LifecycleStatus` with an import-time
+  assertion.
+- `notify.py` — `unrecorded_post` joins the closed `NotifyEvent` vocabulary, window `86400`,
+  priority `high`.
+- `tournament.py` — `status()` gains `unrecorded_posts`; `_notify_unrecorded_posts` pages once
+  per record at **both** of `run_once`'s exits, after the recovery loop. `_unrecorded` is the
+  one place `ReconciliationError` becomes `TournamentError`.
+- `docs/RUNBOOK.md` — L4's "What you see" now opens with the page and the count instead of
+  "nothing at all"; the confirm block says how the count and `unrecorded-posts` differ; two new
+  symptom-index rows.
+- Tests: 6 in `tests/unit/test_tournament.py`, 3 in `tests/unit/test_submission_reconcile.py`,
+  1 property in `tests/property/test_submission_reconcile_properties.py`.
+
+**No `AppConfig` field, no migration, no dependency, and no write of any kind.** A new alert
+kind is a `NotifyEvent` member plus a window; `NotifyConfig` has no event list, so nothing here
+can reach `config_sha256` and deploying this does not retire the live activation (the 2h33m
+outage of 2026-09-09, M1-334). Checked after the merge rather than assumed — below.
+
+### Decision — the predicate is "never reached `submitted`", not "is not `submitted` now"
+
+**The criterion's own words are a false-positive generator, and this is the one substantive
+deviation in the item.** `lifecycle._LEGAL_TRANSITIONS` admits `("resolved", "submitted",
+"resolved")` and `("scored", "resolved", "scored")`. A healthy forecast therefore *stops being*
+`submitted` the moment M4-801 ingests its resolution. Implemented literally, the first
+scheduled ingest after MiniBench batch 1 resolves would have reported all twenty live
+forecasts as unrecorded posts and paged for each one — turning the alert for the most serious
+state in the runbook into the thing that trains the operator to mute the channel.
+
+So the reader asks the append-only history — is there any `lifecycle_events` row for this
+record with `to_status = 'submitted'`? — which is the fact the criterion is about: whether the
+ledger ever recorded the post. It also survives the status vocabulary growing, because it names
+no status except the one that means *recorded*.
+
+This was found by reading `_LEGAL_TRANSITIONS`, not by a test, and the regression that pins it
+walks a record through `poll` → `ingest_resolutions` → `score_records` and asserts silence and
+a zero count at each step. Mutant **M02** is the criterion read literally; it fails that test.
+
+### Decision — the page fires from the condition, not from the transition
+
+The brief for this item said to fire from the transition — inside `reconcile_forecast`'s
+first-confirmation guard, beside `prediction_posted`. **Owner decision at plan time
+(2026-09-15), taken the other way**, and the reasons are worth keeping because the transition
+argument is a good one that M1-329 already settled for a *different* shape.
+
+`_notify_blocked`'s rule is that an alert fires where the row is appended and never at the read
+gate that replays it, because `question_blocked` records a verdict taken once: re-alerting from
+the gate would page every 30 minutes forever for a decision nobody needs to hear about twice.
+This is not that shape. A live forecast the ledger does not hold is a **condition** that holds
+until a person runs `reconcile-submission` — `activation_retired`'s shape exactly (M1-334),
+where the same argument produced a day-long window on a per-poll refusal.
+
+Three things follow from the transition hook and all three are worse:
+
+1. A record already confirmed before this shipped could never page. The live ledger holds 20
+   confirmed records; `unrecorded-posts` reports 0 candidates today, but a detector whose
+   coverage starts at deploy is a detector with a blind spot it can never close.
+2. A page missed at 04:00 is the only page there will ever be.
+3. **"The alert clears after reconciliation" becomes unfalsifiable.** A transition hook is
+   silent on the second poll whether or not anyone reconciled anything, so the criterion's own
+   test asserts nothing about reconciliation. That is this project's most expensive recurring
+   defect (`docs/LESSONS.md`; M1-334 round 1 hit it in a unit test), and here it would have been
+   designed in rather than stumbled into.
+
+What prevents the 288-a-day failure is the throttle, not the call site: keyed on the record id,
+window 86400. The acceptance test is built around the distinction — the middle poll is a day
+later with nothing reconciled and **pages again**, so the silence after reconciliation is the
+condition clearing and not the window.
+
+### Decision — the verdict, not the candidate listing
+
+`unrecorded_posts` (M2-713) and `unrecorded_confirmed_posts` are different questions and only
+the second may page:
+
+| | `unrecorded_posts` | `unrecorded_confirmed_posts` |
+| --- | --- | --- |
+| Asks | an intent, and a reservation unreleased and unspent | a `forecast_confirmed` row, and no event that ever reached `submitted` |
+| Killed **before** the POST | listed | not reported |
+| Killed **after** the POST | listed | reported |
+| Is | a list of places to look | a verdict |
+
+A process killed between the intent and the POST leaves M2-713's exact shape with **nothing
+posted**. Paging on it would page for a forecast that does not exist, and the answer to it is
+`release-key`, not `reconcile-submission`. `forecast_confirmed` is written only after
+`classify_refetch` matched the stored payload against the platform, so it is the one row in
+either ledger that means *the forecast is live*. The reported set is wider than `approved` —
+an M2-711 `failed` record whose post landed late is the same disagreement — but that is not
+what distinguishes the two predicates; only `resolved` and `scored` are.
+
+The runbook says both, and says which is which, because an operator reading a listing of 1 and
+a count of 0 needs to know that is a coherent state and not a bug.
+
+### Decision — the count is reported, never held against the poll
+
+`evidence_gaps`' precedent (M1-327), and here it is load-bearing rather than tidy.
+`cli.py` returns exit 1 when `status()["unresolved"]` is non-zero, and the tournament poll is a
+systemd `Type=oneshot` restarted every five minutes with an `OnFailure` pager. Feeding this
+count into `unresolved` would fail the unit on every poll, for days, over a condition only a
+person can clear — a second pager firing 288 times a day beside the one that is throttled to
+once. The acceptance test asserts `unresolved == 0` while `unrecorded_posts == 1`; mutant
+**M10** adds the count to `unresolved` and dies there.
+
+### Decision — both exits, after the recovery loop
+
+A spending hold stops purchases, not the pending-intent loop that confirms a forecast in the
+journal, so this state is reachable on `run_once`'s early exit too — the same argument the
+daily digest already makes for itself. And the page goes *after* the loop, so a record that
+enters the state during this poll pages in this poll rather than the next one.
+
+### Decision — the body names the record and the question, and nothing else
+
+M1-334 round 1: a title is transmitted, so it is static here, and the throttle subject is the
+record id, which `Notifier._stamp_path` sha256s into a filename and never sends. The body
+carries the record id — it is the argument `reconcile-submission` takes, so an alert without it
+is an alert an operator cannot act on — and the question id, which the platform already shows.
+No rationale, no digest, no payload, no config value. The test walks every string over 24
+characters out of the stored `record_json` and asserts none of them is in the body, so it
+survives the forecast schema growing a field.
+
+### Deviation — none beyond the predicate
+
+The push, the count, the throttle and the test shape are as the criterion asks. The predicate
+is the stricter reading of what it *means*, recorded above, and it is the only place this
+implementation does not do what the criterion literally says.
+
+### Rejected — an `unrecorded_post` journal row as the transition marker
+
+`question_blocked`'s shape, and it would have given a transition to fire from. It would also be
+a second source of truth for a fact the ledger already determines — a marker and a derivation
+that can disagree, and the derivation is the one an operator can check. The criterion says the
+poll writes nothing, and there was no reason to want to.
+
+### Rejected — reusing `current_status` per candidate
+
+The first implementation called `lifecycle.current_status` for each confirmed record, to avoid
+a second copy of "the `to_status` of the highest `event_seq`" in SQL. Once the predicate became
+"was this record ever submitted" that rule was not the question being asked, and the N+1 became
+a loop with no reuse to justify it. One statement, and the status literal pinned to the
+vocabulary instead.
+
+### Rejected — an `AppConfig` field for the window or the alert
+
+It would change `config_sha256` and retire the activation on both live workers, which is the
+2026-09-09 outage. Alert kinds live in `notify.py`.
+
+### Rejected — marking the confirmed subset in `unrecorded-posts`' output
+
+Useful, and not this criterion. `unrecorded-posts` stays the listing it is; the count in
+`tournament status` is the verdict, and the runbook explains the relationship. Filed as part of
+M1-611 (`show`) territory rather than widened here.
+
+### Deferred (do not read the absence as an omission)
+
+- **The reservation is not part of the predicate.** A confirmed post whose key was somehow
+  released would not be listed by `unrecorded_posts` and *would* be counted here. That is
+  M2-716's state and the alert is right to report it; the runbook's L4 recovery does not cover
+  it, which is M2-716's job.
+- **Nothing alerts on `unrecorded_posts`' candidate shape.** A process killed before the POST
+  leaves a standing reservation and no forecast, and nothing pages for it. It costs a key, not
+  a forecast, and `release-key` is the answer; a second alert on a state that is usually
+  nothing would dilute this one.
+- **The resolutions timer is still unwatched** — M1-341. This alert fires from the tournament
+  poll only.
+- **The number of pages per poll is not capped**, and the alternative is worse. Each record in
+  this state gets its own page on the first poll that sees it, so N records cost N pushes, each
+  bounded by `_push_deadline` at `notify.timeout_seconds`. Every one of them is throttled for a
+  day afterwards and a throttled push makes no network call at all, so the cost is paid once per
+  record per day, at the end of the poll and after every ledger write has committed. A cap would
+  have to pick which records to name, deterministically, which means the records past the cap
+  never page at all — a silent subset inside the alert that exists to end silence. The bound
+  that matters is that the state itself is rare: 0 candidates on the live ledger, and one
+  instance is the whole of the incident this alert is for.
+- **A `question_id` that is not stored as an integer refuses the whole read.** It is a
+  defensive check on a value read back out of the ledger, reachable only by a writer that did
+  not go through this program (the test plants one with a raw INSERT). Refusing is the right
+  direction — a poll that cannot answer this question must not report zero — but it does mean
+  one malformed row stops every poll, which is recorded here rather than discovered.
+
+### Standing risk — not verifiable offline
+
+- **The real push goes to ntfy.** The wiring is tested through a recording transport; the
+  transport contract is M1-329's and is already live.
+- **`forecast_confirmed` means what `classify_refetch` returned.** The alert inherits M2-704's
+  standing risk that Metaculus keeps returning the account's own forecast history. If the
+  platform stopped, `reconcile_forecast` would stop confirming and this alert would go quiet
+  along with `prediction_posted` — quiet, not wrong.
+- **The live count is asserted after the merge, not before.** `unrecorded-posts` reported 0
+  candidates on 2026-09-15, so `unrecorded_posts` must read 0 on the first poll after deploy.
