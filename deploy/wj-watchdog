@@ -155,9 +155,18 @@ def _aware_stamp(raw: object) -> datetime | None:
 
 def _last_heartbeat() -> datetime | None:
     """Newest heartbeat timestamp, or None. Read-only; never writes to the ledger."""
-    if not LEDGER.exists():
-        return None
     try:
+        # `exists()` is INSIDE the try, and `OSError` is caught beside `sqlite3.Error`
+        # (M1-341 review round 4). `Path.exists()` does not swallow `EACCES`: a ledger
+        # directory that loses search permission makes it raise `PermissionError`, which
+        # escaped `main` and took the resolutions check down with it, because that check runs
+        # second. Reproduced at `b08f01b` with a real `chmod 000` on the directory, under the
+        # system interpreter the unit runs (3.12.3), not with a monkeypatch. CLAUDE.md keeps
+        # permission failures and unreadable files explicitly in scope as reachable reliability
+        # conditions, and an unreadable ledger is a heartbeat this program cannot read -- which
+        # is a fault to report, not a reason to stop reporting.
+        if not LEDGER.exists():
+            return None
         conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=LEDGER_TIMEOUT_SECONDS)
         try:
             row = conn.execute(
@@ -166,7 +175,7 @@ def _last_heartbeat() -> datetime | None:
             ).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error:
+    except (OSError, sqlite3.Error):
         return None
     if not row:
         return None

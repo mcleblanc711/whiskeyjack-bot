@@ -28,6 +28,7 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -395,6 +396,41 @@ def test_an_unusable_persisted_heartbeat_does_not_stop_the_resolutions_check(
     assert watchdog.asked.count(("is-active", "whiskeyjack-resolutions.timer")) == 1
     assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
     # And the worker page says something true about what it found.
+    assert (
+        "no usable heartbeat timestamp in the ledger" in watchdog.titled("WORKER DOWN")[0]["body"]
+    )
+
+
+def test_a_ledger_directory_the_watchdog_cannot_read_does_not_stop_the_resolutions_check(
+    watchdog: Harness,
+) -> None:
+    """**Round-4 blocking finding**, reproduced by execution at `b08f01b` before the fix.
+
+    `Path.exists()` does not swallow `EACCES` — measured on the system interpreter the unit
+    actually runs (3.12.3) — so a ledger directory that loses search permission made it raise
+    `PermissionError` from outside `_last_heartbeat`'s `try`. That escaped `main` and took the
+    resolutions check with it, because that check runs second. `CLAUDE.md` keeps permission
+    failures and unreadable files explicitly in scope as reachable reliability conditions.
+
+    Driven with a **real `chmod 000`** rather than a monkeypatched `exists`, because the claim
+    is about what the filesystem does, not about what a stub can be told to do. Restored in a
+    `finally` so a failure here cannot leave an unreadable directory behind for pytest's
+    cleanup. Skipped as root, who ignores the mode bits.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions, so the condition is unreachable")
+    ledger = Path(watchdog.module.LEDGER)
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    ledger.parent.chmod(0o000)
+    try:
+        assert watchdog.run() == 1
+    finally:
+        ledger.parent.chmod(0o755)
+
+    assert watchdog.asked.count(("is-active", "whiskeyjack-resolutions.timer")) == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+    # And the unreadable ledger is itself reported, rather than passed over in silence.
     assert (
         "no usable heartbeat timestamp in the ledger" in watchdog.titled("WORKER DOWN")[0]["body"]
     )
