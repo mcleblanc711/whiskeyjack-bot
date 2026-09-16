@@ -11321,3 +11321,567 @@ The literal current-status reading **also** returns 0 today, and the honest stat
 defect depends on saying so: it is not producing false positives now, because `resolution_events`
 is still 0 and nothing has left `submitted` yet. It becomes wrong at the first ingest. Batch 1
 resolves around 2026-09-17.
+
+---
+
+## M1-341 — Extend the out-of-process watchdog to the resolutions timer
+
+Acceptance, verbatim: *A disabled or inactive whiskeyjack-resolutions.timer, or a failed last
+run, produces a watchdog push within one watchdog interval; the tournament checks are unchanged;
+the watchdog still reads the ledger read-only and changes no AppConfig field.*
+
+M4-805 put ingestion and scoring on a six-hourly timer with an `OnFailure=` pager. A pager
+reports a run that **fails**. A timer that is disabled or stopped never runs, so it never fails,
+so nothing is said — ingestion and scoring simply stop. `docs/RUNBOOK.md` said so in as many
+words before this item: *"Timers are not self-healing, and nothing watches this one."* That is
+the 2026-09-09 outage shape (2h33m; nothing in-process could report the condition and the JSONL
+tail went quiet), on the half of the pipeline that starts mattering at MiniBench batch 1's
+resolution around 2026-09-17, with `resolution_events` still 0.
+
+### Delivered
+
+- `deploy/wj-watchdog` — the operator-local watchdog, **now tracked**, plus a second subject.
+  Three checks, no heartbeat rule: `is-active` and `is-enabled` on
+  `whiskeyjack-resolutions.timer`, `is-failed` on its service. `Result` and `ExecMainStatus` are
+  read for the push body only.
+- `deploy/systemd/whiskeyjack-watchdog.{service,timer}` — tracked, byte-identical to what has
+  been installed since 2026-09-10.
+- `pyproject.toml` — `extend-include = ["deploy/wj-watchdog"]`.
+- `docs/RUNBOOK.md` — a `W1` section for the new page, a `The watchdog itself` section, three
+  symptom-index rows, and the closing paragraph of § Scheduled ingestion and scoring rewritten
+  so *"nothing watches this one"* is no longer true.
+- Tests: 50 in `tests/unit/test_watchdog.py`, 9 properties in
+  `tests/property/test_watchdog_properties.py`.
+
+**No `AppConfig` field, no migration, no dependency, no ledger write, no post.** The watchdog
+imports nothing from `whiskeyjack_bot` at all — asserted by parsing its import list — so it
+cannot reach `AppConfig`, cannot move `config_sha256`, and cannot retire the live activation
+(M1-334; the 2h33m outage). Deploying it is a `cp`, not a program change.
+
+### Decision — the watchdog is tracked in `deploy/`, and vendored in its own commit first
+
+The row said to *consider* it. Done, for a reason stronger than tidiness: without it the item has
+no reviewable artifact. The change would live entirely in an untracked file, the PR would be
+docs-only, and the notes would be citing evidence the repository does not hold — the failure
+M1-327's notes already record once. It is also what makes the criterion a **measurement**: "a
+push within one watchdog interval" is only testable if the code is loadable by a test.
+
+It does **not** move into `src/whiskeyjack_bot`. Its whole value is that it still runs when the
+package, the venv or the ledger is the broken thing — the argument
+`whiskeyjack-notify@.service`'s header already makes for being shell and curl. It stays
+stdlib-only under `#!/usr/bin/env python3`, which is the system interpreter and not the venv.
+
+The vendoring is `035d0b1`, byte-identical (`diff -q` clean against all three installed files;
+sha256 prefixes `b5ca6f56c53a5bd1` / `ced8841a303c78b3` / `d8ea575897b3127c`). `f18cdec` is
+`ruff format` plus the `extend-include` line and nothing else. So **"the tournament checks are
+unchanged" is a `git diff` fact**: `git diff f18cdec HEAD -- deploy/wj-watchdog` removes exactly
+six lines, and all six are plumbing —
+
+```
+-def main() -> int:
+-    state = _load_state()
+-        _save_state(state)
+-        return 1
+-    _save_state(state)
+-    return 0
+```
+
+— with no line of tournament logic touched. `tests/unit/test_watchdog.py` additionally
+characterizes the rules themselves (`STALE_AFTER` 20 min, `REALERT_AFTER` 60 min, the four
+queries, the stale-but-running exemption, the hourly re-alert), named in its docstring as a
+characterization test rather than as parity evidence, because that is what it is.
+
+### Decision — the extensionless filename, and what it cost to find out
+
+`deploy/wj-watchdog` keeps the installed name, so the runbook step is
+`cp deploy/wj-watchdog ~/.local/bin/wj-watchdog` with no rename an operator can get wrong.
+
+That has a trap: **ruff discovers files by extension, so it skipped the file silently.** Both
+`ruff check .` and `ruff format --check .` reported success on a file they had not read — the
+worst of the three outcomes, because the gate says the same thing whether the file is clean or
+absent. Verified against ruff 0.15.21 by planting an unused import in a scratch copy: *"All
+checks passed!"* without `extend-include`, *"Found 1 error"* with it. `mypy` still covers
+`src` only, which matches how `scripts/*.py` and `.github/scripts/*.py` are treated; the script
+is fully annotated regardless.
+
+### Decision — separate state, separate throttle, separate push
+
+Folding the resolutions faults into the tournament's one `problems` list would have been three
+lines. It is wrong in three ways, and M4-805's own notes rejected the same shape in the other
+direction (*"an ingestion failure folded in would … share one throttle stamp with forecasting
+failures, so one would mute the other"*):
+
+1. **One `last_alert` means either fault buys the other an hour of silence.** The first page of
+   the hour wins and the second condition waits.
+2. **One `alerting` flag means `worker recovered` goes out with half the rig stopped.** Pinned
+   by `test_the_worker_recovering_says_nothing_about_a_still_stopped_schedule`.
+3. **The windows are genuinely different.** A poll missing four times is an incident worth
+   repeating hourly. A disabled timer is a condition that holds until a person acts; repeating
+   it hourly is 24 pages a day and at the watchdog's own cadence 288.
+
+So: `state["resolutions"]` is a nested key beside the existing top-level `alerting`/`last_alert`,
+which are untouched. The live state file (`{"alerting": false}`) needs no migration and the
+previous script tolerates the new key.
+
+### Decision — a rolling 24-hour window, keyed on the problem codes
+
+A day is the window M1-334 and M1-342 both settled on for a condition that holds until someone
+acts. Two details are deliberate:
+
+- **Keyed on sorted codes, not on prose.** Rewording a message must not re-page. A genuinely
+  *new* fault appearing inside the window **does** page at once, because waiting up to a day to
+  mention new information is not a throttle, it is a drop.
+- **Rolling from the last page, not `notify.py`'s tumbling `floor(epoch / 86400)`.** This file
+  already worked that way (`REALERT_AFTER`), and rolling cannot page twice at a boundary — which
+  is the entire content of T-909. The bound is asserted against the cadence read off the
+  watchdog's *own timer file* (`OnCalendar=*:2/5` → 288 runs/day → at most 2 pages/day), not
+  against a constant restated in the test.
+
+### Decision — `_ping_deadman()` stays gated on the tournament result alone
+
+It answers one question for an external service — *is this watchdog running at all* — and that
+is the only cover for a dark host. Withholding the ping because the resolutions timer is stopped
+would raise a second, differently worded alarm (healthchecks.io: "no ping") about something it
+is not about. Unchanged, and noted in the code so the omission is not read as one.
+
+### Deviation — the stricter reading of "inactive"
+
+The criterion names *disabled or inactive*. Implemented as **anything that is not exactly
+`active` / `enabled`**, which is the tournament block's existing rule and the stricter reading.
+It matters: `systemctl --user is-enabled` really answers `enabled-runtime` for a unit enabled
+only until the next reboot, and `static`, `indirect`, `linked`, `masked` and `not-found` are all
+real answers. Mutant **W04** is the looser reading (`enabled-runtime` accepted); it dies.
+
+Measured rather than assumed, because one test's docstring depends on it — `systemctl --user`
+against a unit that does not exist answers `is-active` → `inactive`, `is-enabled` → `not-found`,
+`is-failed` → `inactive`, each with exit 4 and nothing on stdout that distinguishes it from a
+unit that exists and is stopped. So a typo in `RESOLUTIONS_UNIT` does not fail loudly; it pages
+forever about a unit nobody has, and the operator who goes looking finds the timer running.
+`test_every_unit_the_watchdog_names_is_a_unit_this_repo_ships` is the guard, and the tracked
+unit files are the witness. Mutant **W18** is that typo; it dies.
+
+### Deviation — "reads the ledger read-only" is stated at the strength the measurement supports
+
+A read-only open of a WAL database **creates a 32 KiB `-shm` and a zero-length `-wal`** beside
+the ledger when they are absent. Measured, not assumed. No WAL frame is written and the database
+file's bytes are identical (sha256 before and after). On the live host the worker holds both open
+already, so the watchdog creates neither. The test asserts exactly that, rather than excluding
+the sidecars from its listing, because *"the watchdog writes nothing at all"* is a claim the
+measurement does not support. The resolutions check opens nothing at all — asserted by spying on
+`sqlite3.connect`, which records zero calls on that path and one `mode=ro` call on the other.
+
+### Rejected — a last-trigger staleness rule
+
+`systemctl show -p LastTriggerUSec` would catch a timer that is enabled and active but somehow
+not firing. Rejected: it is outside the criterion's three conditions, and it adds a false-alarm
+class the criterion does not have. A freshly installed timer reports `LastTriggerUSec=0`, and
+`Persistent=true` plus a host that was switched off for a day is a legitimate gap that clears
+itself at the next boot. Filed as a follow-up row rather than smuggled in here (**M1-343**).
+
+### Rejected — an `AppConfig` field for the unit name or the window
+
+Any new field changes `config_sha256` and retires both live activations. The unit name is a
+deployment fact and the window is a constant beside the one the tournament already uses.
+
+### Rejected — making the resolutions page `urgent`
+
+It is `high`, the tournament's is `urgent`, and the asymmetry is the point. A stopped poll loses
+forecasts against a deadline. A stopped resolutions timer loses nothing permanently: both
+commands are idempotent, `Persistent=true` catches a missed run up, and the ledger is unaffected.
+A channel where everything is urgent has no urgent.
+
+### Rejected — letting the watchdog restart the timer
+
+It has no write path by design and this is not the exception. A watchdog that repairs cannot be
+trusted to report, and `systemctl --user enable --now` is a deliberate operator act that should
+be recorded by the person who took it.
+
+### Deferred (do not read the absence as an omission)
+
+- **A last-trigger staleness rule** — see above. Backlog: **M1-343**.
+- **Watching the Cup profile's units** — the Cup is dormant (withdrawn 2026-09-10) and has no
+  schedule; watching a deliberately stopped timer would page forever by design. Covered by
+  M4-806 if the Cup is ever re-entered.
+- **Installing the updated script on the live host** is an operator action after merge, with the
+  commands in the runbook. Not part of the diff.
+- **A test that the installed copy matches the tracked one.** Nothing in the suite can see
+  `~/.local/bin`, and a test that reads an operator's home directory would pass or fail for
+  reasons outside the repository. The drift risk is real and is named under standing risk below.
+
+### Standing risk — not verifiable offline
+
+- **The installed copy can drift from the tracked one.** `deploy/systemd/` has always been
+  copied rather than linked and this file now joins it; all three were `diff -q` identical at
+  vendoring time, and nothing keeps them so. The runbook's install block is the only control.
+- **Whether a push actually reaches a phone** is untestable here: `_push` is replaced in every
+  test. What is tested is that exactly one push is *attempted* per condition per window, and
+  that a refused push does not stamp the throttle. The live proof is the post-merge exercise —
+  stop the timer, wait one interval, confirm the page, restart it, confirm the recovery notice.
+- **`systemctl --user` output is systemd's**, and the vocabulary above was read off systemd 255
+  on this host. A future systemd that answered `running` instead of `active` would page falsely
+  rather than silently — the safe direction, but still a page.
+- **The dead-man remains unset.** `WJ_HEALTHCHECK_URL` is empty on this host, so a dark host is
+  still uncovered. Unchanged by this item and not made worse by it.
+
+### Mutation testing
+
+Committed first (`5cd03ab`); `__pycache__` cleared before every mutant; each restored in a
+`finally` and `git diff --stat deploy/wj-watchdog` asserted empty afterwards. Baseline green **by
+exit code**, with output redirected to a file. Runner: the two new suites, `-x`,
+`HYPOTHESIS_PROFILE=dev` (200 examples). Every kill was read back against its log for the
+assertion that actually failed, so no kill is a collection error or an unrelated failure.
+
+**40 of 40 killed** (28 before round 1; three, five, two and two for the remediations of rounds 1-4). Three of the first 28
+only after the run found something, which is the part worth recording:
+
+| mutant | killed by |
+| --- | --- |
+| W01 `timer_inactive` never fires | property `test_silence_means_exactly_running_enabled_and_not_failed` |
+| W02 `timer_disabled` never fires | the same property |
+| W03 `service_failed` never fires | the same property *(see below — it survived first)* |
+| W04 `enabled-runtime` accepted as enabled | the same property |
+| W05 codes returned unsorted | `test_a_timer_that_is_both_stopped_and_disabled_pages_once_naming_both` |
+| W06 a changed fault set inherits the old throttle | property `test_a_fault_set_that_has_never_been_paged_pages_whatever_the_stamp_says` |
+| W07 the window never expires | property `test_a_paged_fault_set_is_silent_for_its_window_and_never_a_second_longer` |
+| W08 the window is hourly, not daily | `test_the_resolutions_throttle_is_long_against_the_cadence_its_own_timer_declares` |
+| W09 an unusable stamp is treated as a fresh page | property `test_a_stamp_that_cannot_be_read_as_an_aware_instant_pages` |
+| W10 a naive stamp is subtracted from an aware `now` | the same property (`TypeError`) |
+| W11 a refused push still stamps the throttle | `test_a_push_the_channel_refused_is_retried_on_the_next_run` |
+| W12 the stamp is carried across a changed fault set | **survived pass 1**; `test_a_refused_push_about_a_new_fault_does_not_inherit_the_old_faults_quiet` |
+| W13 the resolutions check is skipped when the worker is down | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
+| W14 the resolutions check is not wired into `main` at all | the same |
+| W15 a stopped schedule does not fail the run | the same |
+| W16 the two subjects share one state key | `test_a_healthy_schedule_is_silent_and_the_run_exits_zero` |
+| W17 no recovery notice when the schedule comes back | `test_a_restarted_timer_clears_the_condition_and_says_so_once` |
+| W18 the wrong unit is watched (`whiskeyjack-resolution`) | `test_every_unit_the_watchdog_names_is_a_unit_this_repo_ships` |
+| W19 the resolutions check reads the ledger | `test_the_resolutions_check_does_not_open_the_ledger_at_all` |
+| W20 the watchdog imports the package it watches | `test_the_watchdog_imports_nothing_from_the_package_it_watches` |
+| W21 the push body drops the per-code prose | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
+| W22 `Result`/`ExecMainStatus` never reach the body | `test_the_failed_run_page_says_why_it_failed` |
+| W23 the tournament staleness threshold changes | `test_the_tournament_rules_are_what_they_were` |
+| W24 the tournament re-alert window changes | the same |
+| W25 a running poll no longer excuses a stale heartbeat | `test_a_stale_heartbeat_is_not_a_fault_while_the_poll_is_still_running` |
+| W26 the dead-man ping is dropped from the healthy path | **survived pass 1**; `test_the_dead_man_ping_answers_for_the_worker_and_not_for_the_schedule` |
+| W27 the fault set is never recorded in the state file | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
+| W28 the dead-man ping is gated on the resolutions check too | the dead-man test *(see below — the first version was malformed)* |
+| W29 `_load_state` stops validating the top-level shape | `test_a_state_file_that_is_not_an_object_still_reports_a_stopped_schedule[[]]` *(round-1 remediation)* |
+| W30 the unit deadline goes back under the worst case (`TimeoutStartSec=120`) | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` *(round-1 remediation; this mutant edits the **unit file**, not the script)* |
+| W31 the worst case understates the systemctl calls (9 → 4) | the same test — the bound is asserted against the real constants, not a copy |
+| W32 `_aware_stamp` accepts a non-string | `test_every_outward_call_passes_the_timeout_the_budget_counts` — `state.get("last_alert")` is `None` on a fresh state file, so this is a `TypeError` on the commonest value, not an exotic one *(round-2 remediation)* |
+| W33 `_aware_stamp` accepts a naive instant | `test_a_naive_timestamp_in_the_state_file_pages_rather_than_raising` |
+| W34 the tournament block keeps its own parser again | `test_an_unusable_tournament_stamp_does_not_stop_the_resolutions_check` |
+| W35 the dead-man shares the push timeout again | `test_every_outward_call_passes_the_timeout_the_budget_counts` |
+| W36 the budget forgets the dead-man | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` |
+| W37 `_last_heartbeat` keeps its own parser again | `test_an_unusable_persisted_heartbeat_does_not_stop_the_resolutions_check` *(round-3 remediation)* |
+| W38 an unusable heartbeat is treated as fresh rather than absent | the same test |
+| W39 the ledger probe moves back outside the `try` | `test_a_ledger_directory_the_watchdog_cannot_read_does_not_stop_the_resolutions_check` *(round-4 remediation)* |
+| W40 the ledger handler stops catching `OSError` | the same test |
+
+**W12 is the one that mattered.** Dropping the `stored.get("key") == key` half of the
+carry-forward guard is invisible on the ordinary path, because a successful push overwrites the
+carried stamp with `now`. It is visible only when the push does **not** land: the new fault set
+would inherit the old set's stamp, be judged inside a window it was never paged in, and go
+unmentioned for up to a day. Nothing in the suite crossed "the channel refused" with "the fault
+set changed", so nothing saw it. The test added for it drives exactly that crossing.
+
+**W26 is a decision that was asserted only in a comment.** Deleting `_ping_deadman()` outright
+survived every test, because the fixture stubbed it to a no-op and nothing observed the calls.
+The dead-man's gating is a choice this item made deliberately (above); a choice nothing can
+falsify is a claim, not a decision. The fixture now records the calls and the test pins all
+three cases.
+
+**W28's first version was a malformed mutant — read what a survivor proves before believing
+it.** It patched `_ping_deadman` in `globals()` *after* `_check_tournament` had already called
+it, so it changed nothing reachable and "survived" for a reason that had nothing to do with the
+tests. M1-342 hit this exact trap (a call inserted with an empty tuple that emitted nothing) and
+M1-334 hit it with an f-string. Rebuilt as a two-part mutation that actually moves the call, it
+dies.
+
+**A second pass ran W01–W10 against the property file alone**, with the unit tests out of the
+way, so the properties would have their own kill evidence rather than inheriting the unit
+suite's. That pass is what found the vacuity below.
+
+### Deviation — a property whose strategy could not reach the branch it asserted
+
+`test_silence_means_exactly_running_enabled_and_not_failed` was correct and, against W03
+(`service_failed` never fires), **useless**. All three systemctl answers were drawn from one
+shared strategy of about sixteen words plus arbitrary text, so the single combination that
+distinguishes that rule from silence — `active`, `enabled`, and `failed` together — had
+probability around 1/32768 and 200 draws never reached it.
+
+This is the reachability form of the class `docs/LESSONS.md` calls the top recurring defect, and
+it is worth being precise about what saved it: **not** the property, **not** the full suite (the
+unit vocabulary test kills W03 outright), but running the properties on their own against a
+mutant. A property that only ever runs beside a unit suite that already covers the same rule can
+be vacuous indefinitely without anyone noticing.
+
+Fixed by splitting the shared strategy into three per-field ones, each naming its own pivotal
+value as an `st.one_of` branch: `ACTIVE_ANSWERS`, `ENABLED_ANSWERS`, `FAILED_ANSWERS`. That
+lifts the combination to roughly one draw in thirty-six. W01–W04 all die to the properties alone
+afterwards; before, only W01, W02 and W04 did.
+
+### Review
+
+**Round 1 — CHANGES REQUESTED on `3dda485`** (2026-09-16, local Codex against
+`GPT_REVIEW_REQUEST_M1-341_r1.md`). **Two blocking findings, both legitimate, both reproduced
+by execution against that exact commit before a line of fix code was written**, and 8 of the 10
+risk claims came back Safe. The two that did not are the two findings.
+
+#### 1. A valid non-object state file took down both subjects
+
+`_load_state` returned whatever `json.loads` produced. `[]`, `null`, `"text"` and `3` are all
+valid JSON, so the first `state.get(...)` raised `AttributeError` out of `main`.
+
+Reproduced at `3dda485` with `[]` in the file, healthy tournament units and an inactive
+resolutions timer:
+
+```
+RAISED: AttributeError: 'list' object has no attribute 'get'
+resolutions queries made: []
+pushes attempted: []
+```
+
+**The defect pre-dates this branch and is still this branch's to fix**, which is worth being
+precise about because the scope rule turns on it. Before M1-341 a corrupt state file disabled
+tournament monitoring; after it, the same file also makes the resolutions path unreachable —
+the branch materially amplifies the impact. It is also silent, because the watchdog is the one
+unit deliberately without an `OnFailure` pager. And my own round-1 risk claim 8 said the
+throttle was "total over a hand-edited state file"; it was total over a malformed
+`state["resolutions"]` and not over the file's top-level shape. The claim was wider than the
+code, which is the more useful way to state the miss.
+
+`_load_state` now returns `{}` unless the parsed value is a `dict`. Six parametrized cases
+cover `[]`, `null`, `"text"`, `3` and — so the test is about the *shape* rather than the parse
+— `{` and the empty file, which already worked.
+
+#### 2. The declared worst-case run exceeded the unit's own deadline
+
+Every outward call carries its own timeout. This branch took the script from four systemctl
+queries and at most one push to **nine queries and up to three HTTP calls**, while
+`TimeoutStartSec` stayed at the `120` it was vendored with.
+
+Measured as an accounting run over the real declared numbers:
+
+```
+systemctl calls: 9 x 15s
+total declared budget: 165s   (plus the ledger read and the dead-man ping: 190s)
+unit TimeoutStartSec:  120s
+-> systemd kills the run at 120s, before the budget completes
+```
+
+Before M1-341 the same arithmetic was 75s, comfortably inside 120. So the overrun is created
+here, not inherited. And because the tournament is checked **first**, what a part-way kill
+removes is always the resolutions page — the thing this item exists to send.
+
+Fixed by naming every timeout (`SYSTEMCTL_TIMEOUT_SECONDS`, `LEDGER_TIMEOUT_SECONDS`,
+`HTTP_TIMEOUT_SECONDS`), deriving `WORST_CASE_SECONDS = 190` from them, and raising
+`TimeoutStartSec` to `240` — clear of 190 and under the timer's own 300s interval, so a hung
+run is always dead before the next is due. The test reads the deadline **out of the tracked
+unit file** and asserts `WORST_CASE_SECONDS < TimeoutStartSec < interval`, so the constant and
+the unit cannot drift apart. Per-call timeouts are unchanged, so the tournament path's
+behaviour is untouched.
+
+**Rejected as the fix: combining the two diagnostic `show` calls into one.** It would cut a
+call, but `_systemctl` strips its output, so a property with an empty value loses its line and
+`Result`/`ExecMainStatus` could be silently transposed. One number in a unit file is the
+smaller change and the honest one.
+
+#### Non-blocking, filed rather than fixed
+
+`_save_state` swallows `OSError`, so an unwritable state file means the throttle stamp never
+persists and a standing condition pages every run — 288 a day, the outcome the window exists to
+prevent. The swallow is deliberate (a watchdog that dies because it could not write a stamp
+reports nothing at all), so the fix is to bound the volume and surface the failure, not to
+raise. Backlog: **M1-344**. Not reproduced on the live host; the state file is writable there.
+
+**Round 2 — CHANGES REQUESTED on `624da85`.** Both round-1 findings **closed** (the reviewer
+exercised all six state-file shapes itself and re-derived `190 < 240 < 300`). Two new blocking
+findings, both accepted, both reproduced by execution against `624da85` first.
+
+#### 3. A valid JSON *object* with an unusable tournament stamp still took both subjects down
+
+Round 1's fix validated the state file's **top level**; it does not reach inside. The tournament
+block's own parser guarded only `ValueError` on a value it had truthiness-tested, so
+`{"last_alert": [1]}` reached `datetime.fromisoformat` and raised `TypeError` out of `main` —
+no resolutions query asked, no push attempted.
+
+**The siblings were enumerated by execution rather than the one named type fixed**, because a
+finding that names one escaping type usually names a class (M1-308, and it has now cost this
+project a round twice). At `624da85`:
+
+```
+{"last_alert": [1]}                    TypeError: fromisoformat: argument must be str
+{"last_alert": 3}                      TypeError: fromisoformat: argument must be str
+{"last_alert": 1.5}                    TypeError: fromisoformat: argument must be str
+{"last_alert": {"a": 1}}               TypeError: fromisoformat: argument must be str
+{"last_alert": "2026-09-17T12:00:00"}  TypeError: can't subtract offset-naive and offset-aware
+```
+
+**The last one is the sibling the review did not name.** It parses perfectly and dies at the
+subtraction instead. So "unusable" means all three of not-a-string, unparseable and *naive*.
+
+Fixed with one parser, `_aware_stamp`, used by both throttles — the resolutions throttle already
+had exactly this discipline written inline, so the fix is to share it rather than to duplicate
+it. **The tournament rule is unchanged** (a stamp the program cannot use means no prior alert);
+what changed is that it is now total over what the file can hold. Six parametrized cases drive
+all six shapes through a full `main()`; two new properties fuzz the parser for totality,
+aware-only output, subtractability, and the round trip through the JSON file — which is what
+makes the 24-hour window a window at all.
+
+#### 4. The remediation changed the dead-man ping's timeout from 10s to 15s — my error
+
+Naming the timeouts as constants, I substituted one shared `HTTP_TIMEOUT_SECONDS` into **both**
+`urlopen` sites. The dead-man went from 10 to 15, so a slow healthcheck endpoint blocked the
+tournament path five seconds longer — behaviour this item promised not to touch. **The commit
+message that introduced it claimed every literal-to-constant substitution kept its value.** It
+did not, and nothing observed the timeouts, so nothing caught it.
+
+`PUSH_TIMEOUT_SECONDS` (15) and `DEADMAN_TIMEOUT_SECONDS` (10) are now separate constants, both
+named in `WORST_CASE_SECONDS` — which is 185 and still clear of the 240s deadline and the 300s
+interval. The new test drives a full run with the **real** `_push` and `_ping_deadman`, records
+what each outward call was actually given, and asserts each equals the constant the budget
+counts. That is the test that would have caught the substitution, and it is the general lesson:
+**a constant extracted from literals is a refactor only if something observes the values.**
+
+#### What the two rounds cost, and the pattern
+
+Four blocking findings, and **three of them are the same shape**: a value read back out of a
+file, trusted further than it had been checked. Round 1 fixed the file's top level; round 2
+found the same class one level in. The resolutions path had the discipline from the start
+(`isinstance(stored, dict)`, the three-way stamp guard) and the tournament path — vendored,
+older, and explicitly "unchanged" — did not. **"Unchanged" made it invisible to me**: I read the
+tournament block as out of scope rather than as code my new caller now depends on.
+
+**Round 3 — CHANGES REQUESTED on `e8573e9`.** Both round-2 findings **closed**; the reviewer ran
+the watchdog suites itself (54 tests green). One new blocking finding, accepted and reproduced
+against `e8573e9` first — **and it is the same class a third time.**
+
+#### 5. The ledger's own heartbeat had a third stamp parser
+
+`_last_heartbeat` guarded only `ValueError`. `tournament_events.created_at_utc` is
+`TEXT NOT NULL`, but SQLite is dynamically typed and applies TEXT affinity, so the column holds
+whatever a writer put there — and `CLAUDE.md` classifies values read back out of the ledger as
+untrusted in as many words. A naive timestamp parses fine and raises `TypeError` at the caller,
+out of `main`, taking the resolutions check down with it because it runs **second**.
+
+```
+created_at_utc = '2026-09-17T11:55:00'   TypeError: can't subtract offset-naive and offset-aware
+created_at_utc = 20260917 (an INTEGER)   the same error -- affinity converts it to '20260917'
+                                         and fromisoformat reads that as a basic-format date
+```
+
+`_last_heartbeat` now returns `_aware_stamp(row[0])`. **There is now exactly one stamp parser
+in the file**; `grep -c datetime.fromisoformat deploy/wj-watchdog` returns 1.
+
+Two things found while writing the regression, both worth keeping:
+
+- **`012`'s `tournament_events_no_update` trigger refuses an `UPDATE` outright** ("tournament
+  events are append-only"), so the reachable path is narrower than first written: a writer
+  *appending* a row whose timestamp is not what this reader assumes. The test inserts.
+- **Every existing heartbeat fixture went through `tournament_state.append`, which always emits
+  an aware timestamp.** That is precisely why nothing here saw this for two rounds: the fixtures
+  all used the one writer that cannot produce the bad value. A fixture built from the program's
+  own writer tests the reader against the writer, not against the column.
+
+The message `no heartbeat row in the ledger at all` becomes `no usable heartbeat timestamp in
+the ledger`, true of both cases the branch now reaches. The rule is unchanged; the message had
+to stop being false about the case in front of the operator, because the runbook's symptom index
+quotes it.
+
+#### Five findings, one shape, and the thing I kept getting wrong
+
+Four of the five are *a value read back out of storage, trusted further than it had been
+checked* — and I closed them **one location at a time**: the state file's top level (round 1),
+the state file's contents (round 2), the ledger's column (round 3). Each time I enumerated the
+siblings of the *instance* and not of the *class*.
+
+The class is: **this script reads three stored values and every one of them needs the same
+parser.** What would have found it in one pass is the question "where does a value enter this
+program from outside it?" — three places: `systemctl` stdout, the state file, the ledger — and
+`systemctl`'s was already total because `_resolutions_problems` compares strings and never
+converts them. The two that convert are the two that broke.
+
+`docs/LESSONS.md` lesson 6 says to enumerate siblings by execution when a finding names one
+exception type. It has now cost three rounds here, and the refinement worth adding is that
+*siblings of a value* are not the same as *siblings of a call site*: I enumerated `[1]`, `3`,
+`1.5`, `{"a": 1}` and a naive string — all siblings of the value — while a second call site with
+the identical defect sat twenty lines away.
+
+**Round 4 — CHANGES REQUESTED on `b08f01b`.** All **five** prior findings closed. One new
+blocking finding, accepted and reproduced against `b08f01b` first.
+
+#### 6. The ledger's filesystem probe sat outside its own `try`
+
+`LEDGER.exists()` was before the `try`. `Path.exists()` does **not** swallow `EACCES` — measured
+on the system interpreter the unit actually runs, 3.12.3 — so a ledger directory that loses
+search permission raised `PermissionError` out of `main` and took the resolutions check with it,
+because that check runs second. `CLAUDE.md` keeps permission failures and unreadable files
+explicitly in scope as reachable reliability conditions.
+
+Reproduced with a **real `chmod 000`** on the directory, not a monkeypatched `exists`:
+
+```
+Path.exists() -> PermissionError: [Errno 13] Permission denied
+main()        -> PermissionError; resolutions queries: []; pushes: []
+```
+
+The probe moves inside the `try` and the handler becomes `(OSError, sqlite3.Error)` —
+`sqlite3.Error` is not an `OSError` subclass, so both are needed. An unreadable ledger is a
+heartbeat this program cannot read: a fault to report, not a reason to stop reporting, and the
+worker page says exactly that.
+
+**Because this was the fifth finding of one family, the fix is an audit rather than a patch.**
+Every outward touch in the script, and what its handler catches:
+
+| touch | handler |
+| --- | --- |
+| `_systemctl` → `subprocess.run` | `except Exception` |
+| `_last_heartbeat` → `exists()` + `sqlite3.connect` | `except (OSError, sqlite3.Error)` ← this round |
+| `_load_state` → `read_text` + `json.loads` | `except Exception` |
+| `_save_state` → `mkdir` + `write_text` | `except OSError` |
+| `_push` → `urlopen` | `except (URLError, OSError, ValueError)` |
+| `_ping_deadman` → `urlopen` | `except (URLError, OSError, ValueError)` |
+
+Nothing else is unguarded. `_save_state`'s `json.dumps` cannot raise on what the state can hold,
+because every value in it came back out of `json.loads` and is serialisable by construction.
+
+#### The final tally, and the lesson that is actually transferable
+
+Six blocking findings over four rounds. **Five of them are one family** — an outward call or a
+stored value trusted further than it had been checked, in the *vendored* half of a script whose
+criterion said the tournament checks were unchanged.
+
+- Round 1: the state file's top level. Round 2: the state file's contents. Round 3: the ledger's
+  column. Round 4: the ledger's filesystem probe.
+- Each time I enumerated siblings of the **instance** and not of the **class**, and each time the
+  next round found the class one step further out.
+
+**"Unchanged" is what made the vendored half invisible to me.** I read it as out of scope rather
+than as code my new caller now depends on — and the new caller is what made every one of these
+blocking, because `_check_resolutions` runs *second* and anything escaping the first check
+removes it. A vendored block a new caller reaches is new surface, whatever the diff says, and the
+audit above is what should have been done in round 1's remediation rather than round 4's.
+
+`docs/LESSONS.md` lesson 6 already says to enumerate siblings by execution when a finding names
+one exception type. The refinement this item paid for: **enumerate the siblings of the *entry
+point*, not of the *value*.** Ask where a value enters the program from outside it — here, three
+places — and check all of them at once.
+
+**Round 5 — APPROVE on `07a6990`** (2026-09-16, local Codex against
+`GPT_REVIEW_REQUEST_M1-341_r5.md`). **Zero blocking findings; all six prior findings closed**,
+and all six risk areas Safe, including the entry-point audit: *"no seventh product-path entry
+point capable of suppressing the resolutions push was found."*
+
+Five rounds, six blocking findings, none disputed. The two non-blocking observations are filed
+with acceptance criteria rather than fixed: **M1-344** (an unwritable state file defeats the
+daily bound) and **M1-345**, new this round — the per-subject `print` calls are unguarded, so a
+stdout that raises escapes `main`.
+
+**M1-345 is worth recording at the strength the reviewer measured it, not at the strength the
+headline suggests.** Against a *real* closed, normally buffered stdout pipe, `main()` completed
+both resolutions queries and delivered the resolutions push before the final flush raised —
+nothing was suppressed. Suppressing the push needed a non-product write-through stdout object.
+So it is defence in depth on the one unit with no `OnFailure` pager, not a live defect, and it is
+the same family as the six findings this item closed: an outward call trusted further than it had
+been checked. Filing it rather than fixing it keeps round 5 an approval instead of a seventh
+round on a condition nothing has met.

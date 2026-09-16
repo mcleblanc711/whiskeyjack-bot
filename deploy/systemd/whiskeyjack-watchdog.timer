@@ -1,0 +1,13 @@
+[Unit]
+Description=Check every five minutes that the whiskeyjack worker is actually polling
+
+[Timer]
+# Offset two minutes from the worker's own *:0/5 so a check never races the poll
+# it is checking on.
+OnCalendar=*:2/5
+Persistent=true
+AccuracySec=10s
+Unit=whiskeyjack-watchdog.service
+
+[Install]
+WantedBy=timers.target

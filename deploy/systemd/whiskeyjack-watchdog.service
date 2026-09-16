@@ -1,0 +1,21 @@
+[Unit]
+Description=Whiskeyjack out-of-process liveness watchdog
+# Deliberately NO OnFailure= pointing at the notify template: if this unit is what
+# broke, a notifier launched by this unit's failure is not independent evidence.
+# A dark host is covered by WJ_HEALTHCHECK_URL instead (see the script's docstring).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cleblanc/projects/whiskeyjack-bot
+EnvironmentFile=/home/cleblanc/projects/whiskeyjack-bot/.env
+ExecStart=/home/cleblanc/.local/bin/wj-watchdog
+# 240s, not 120s (M1-341 review round 1). One run's declared worst case -- every outward call
+# blocking to its own timeout -- is 190s, and at 120s systemd killed the run after the
+# tournament half and before the resolutions page was ever attempted. 240 clears 190 and stays
+# under the 300s timer interval, so a hung run is always dead before the next one is due.
+# WORST_CASE_SECONDS in deploy/wj-watchdog is the arithmetic; a test compares the two.
+TimeoutStartSec=240
+UMask=0077
+NoNewPrivileges=true

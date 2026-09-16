@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Out-of-process liveness watchdog for the whiskeyjack worker.
+
+Why this exists, and why it is NOT part of the worker: an in-process notifier cannot
+report its own death. `notify.py` fires when the code notices something; it says nothing
+at all when the timer is disabled, the activation is retired, the user session ends, or
+the process never starts. That is the 2026-09-09 outage -- 2h33m, ~28 refused polls,
+and the only page was systemd's OnFailure with a body of `result=exit-code exit=1`.
+The worker's own `poll_summary` digest is throttled to 24h, so as an AFK monitor it is
+useless: it reports a stop up to a day late.
+
+This runs as a SEPARATE systemd timer and reads the ledger READ-ONLY. It touches no
+AppConfig field, so it cannot change `config_sha256` and cannot retire an activation
+(M1-334).
+
+The detector is heartbeat staleness. Measured against the real outage: heartbeats
+stopped completely for a clean 160-minute gap (2026-09-09T23:00:19Z ->
+2026-09-10T01:40:15Z), so this signal does catch the failure that actually happened.
+
+Long forecasting runs are NOT false alarms: a poll can legitimately run for tens of
+minutes (the unit allows 2400s), and systemd will not start a second instance while one
+is running, so the heartbeat goes stale while the worker is healthy. Staleness is
+therefore only an alert when the service is not currently active.
+
+Two subjects, deliberately kept apart (M1-341). The second is the six-hourly resolution
+ingestion and scoring schedule, `whiskeyjack-resolutions.timer` (M4-805). That unit has an
+`OnFailure=` pager, and a pager reports a run that FAILS -- while a timer that is disabled
+or stopped never runs, so it never fails and nothing says a word. Ingestion and scoring
+just stop. It gets no heartbeat rule: the service writes no heartbeat and runs every six
+hours, so the only honest signals are whether the timer is enabled and active and whether
+the last run failed.
+
+The two subjects keep separate state, separate throttles and separate pushes. Folding the
+second into the first would make either fault mute the other's page through one shared
+`last_alert`, and would send "worker recovered" while the other half was still stopped --
+the failure `docs/M4-NOTES.md` (M4-805) rejected once already, in the other direction.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path("/home/cleblanc/projects/whiskeyjack-bot")
+LEDGER = ROOT / "data/whiskeyjack_bot.sqlite3"
+STATE = Path.home() / ".local/state/wj-watchdog.json"
+
+UNIT = "whiskeyjack-tournament"
+STALE_AFTER = timedelta(minutes=20)  # 4 missed polls at a 5-minute cadence
+REALERT_AFTER = timedelta(minutes=60)  # keep reminding, do not spam
+RECOVERY_NOTICE = True
+
+# The second subject (M1-341). RESOLUTIONS_UNIT names deploy/systemd/whiskeyjack-resolutions
+# .{service,timer}; tests/unit/test_watchdog.py asserts both files exist, so a rename cannot
+# leave this check silently pointed at nothing.
+# Every outward call this script makes carries its own timeout. Named rather than written
+# inline so the bound below is arithmetic over the real numbers instead of a comment.
+SYSTEMCTL_TIMEOUT_SECONDS = 15
+LEDGER_TIMEOUT_SECONDS = 10
+PUSH_TIMEOUT_SECONDS = 15
+# The dead-man ping keeps its own 10s and does NOT share the push timeout. Round 2 caught the
+# substitution that gave it 15: the tournament path then blocked five seconds longer against a
+# slow healthcheck endpoint, which is a change to behaviour this item promised not to touch.
+DEADMAN_TIMEOUT_SECONDS = 10
+# What one run may spend if every one of those calls blocks to its own timeout: nine systemctl
+# queries (four tournament, three resolutions, two diagnostic `show`), one ledger read, and
+# three HTTP calls (two pushes and the dead-man ping). `TimeoutStartSec` in
+# deploy/systemd/whiskeyjack-watchdog.service must exceed this, or systemd kills the run
+# part-way -- and because the tournament is checked first, what it kills is the resolutions
+# report. That could not happen before M1-341: four queries and one push is 75s, inside the
+# 120s the unit declared, while nine queries and three calls is 190s and is not. Found by
+# cross-model review, round 1. tests/unit/test_watchdog.py reads the deadline out of the unit
+# file and asserts it still exceeds this, so the two cannot drift apart.
+WORST_CASE_SECONDS = (
+    9 * SYSTEMCTL_TIMEOUT_SECONDS
+    + LEDGER_TIMEOUT_SECONDS
+    + 2 * PUSH_TIMEOUT_SECONDS
+    + DEADMAN_TIMEOUT_SECONDS
+)
+
+RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
+# A stopped timer is a CONDITION that holds until a person acts, not an incident that passes.
+# At the watchdog's five-minute cadence an hourly re-alert would be 24 pages a day and a
+# 60-minute one 288, and a channel that noisy reports exactly as much as no channel at all.
+# A day is the window M1-334 and M1-342 settled on for the same shape. Rolling from the last
+# page rather than notify.py's tumbling floor(epoch / 86400): rolling cannot page twice at a
+# boundary, which is the whole of T-909.
+RESOLUTIONS_REALERT_AFTER = timedelta(hours=24)
+# Closed vocabulary. The throttle is keyed on these codes and not on the prose below, so
+# rewording a message never re-pages, while a genuinely NEW fault appearing inside the
+# window does -- it is new information, and waiting up to a day to mention it is not a
+# throttle, it is a drop.
+RESOLUTIONS_PROBLEMS = {
+    "timer_inactive": "the timer is not active, so no run is scheduled",
+    "timer_disabled": "the timer is not enabled, so it will not survive a reboot",
+    "service_failed": "the last run FAILED",
+}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _systemctl(*args: str) -> str:
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _aware_stamp(raw: object) -> datetime | None:
+    """A stored timestamp, or None when it is not one this program can subtract from `now`.
+
+    One parser for both subjects (M1-341 review round 2). The tournament block had its own,
+    which guarded only `ValueError` on a value it had already truthiness-tested -- so four
+    shapes a person can leave in the state file by hand escaped as a raw `TypeError` out of
+    `main`, taking down BOTH subjects and doing it silently, since this is the one unit with no
+    `OnFailure` pager. Enumerated by execution against `624da85` rather than fixed one at a
+    time, because a finding that names one escaping type usually names a class:
+
+        {"last_alert": [1]}                     TypeError: fromisoformat: argument must be str
+        {"last_alert": 3}                       TypeError: fromisoformat: argument must be str
+        {"last_alert": 1.5}                     TypeError: fromisoformat: argument must be str
+        {"last_alert": {"a": 1}}                TypeError: fromisoformat: argument must be str
+        {"last_alert": "2026-09-17T12:00:00"}   TypeError: can't subtract offset-naive and
+                                                offset-aware datetimes
+
+    The last one is the one the review did not name: it parses perfectly and fails at the
+    subtraction instead. "Unusable" therefore means all three of not-a-string, unparseable and
+    naive, and the answer to every one is the same -- no usable record that anyone was told,
+    so tell them. The dangerous direction is silence: a throttle that trusts a bad stamp either
+    raises here or waits forever.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _last_heartbeat() -> datetime | None:
+    """Newest heartbeat timestamp, or None. Read-only; never writes to the ledger."""
+    try:
+        # `exists()` is INSIDE the try, and `OSError` is caught beside `sqlite3.Error`
+        # (M1-341 review round 4). `Path.exists()` does not swallow `EACCES`: a ledger
+        # directory that loses search permission makes it raise `PermissionError`, which
+        # escaped `main` and took the resolutions check down with it, because that check runs
+        # second. Reproduced at `b08f01b` with a real `chmod 000` on the directory, under the
+        # system interpreter the unit runs (3.12.3), not with a monkeypatch. CLAUDE.md keeps
+        # permission failures and unreadable files explicitly in scope as reachable reliability
+        # conditions, and an unreadable ledger is a heartbeat this program cannot read -- which
+        # is a fault to report, not a reason to stop reporting.
+        if not LEDGER.exists():
+            return None
+        conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=LEDGER_TIMEOUT_SECONDS)
+        try:
+            row = conn.execute(
+                "select created_at_utc from tournament_events "
+                "where kind='heartbeat' order by seq desc limit 1"
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if not row:
+        return None
+    # The THIRD stamp parser, and the third round to find the same class (M1-341 review round
+    # 3). `created_at_utc` is `TEXT NOT NULL`, but SQLite is dynamically typed and applies TEXT
+    # affinity, so what comes back is whatever a writer put there -- and CLAUDE.md classifies
+    # values read back out of the ledger as untrusted, in as many words. A naive timestamp
+    # parses fine here and then raises `TypeError: can't subtract offset-naive and offset-aware
+    # datetimes` at the caller, out of `main`, taking the resolutions check down with it
+    # because it runs second. Reproduced at `e8573e9` against a real ledger, with a heartbeat
+    # of `2026-09-17T11:55:00`; an integer written into the column reduces to the same case,
+    # because affinity converts it to `'20260917'` and `fromisoformat` reads that as a
+    # basic-format naive date. One parser, the same one both throttles use.
+    return _aware_stamp(row[0])
+
+
+def _load_state() -> dict:
+    """The state file, or an empty state. Never anything a caller cannot use as a dict.
+
+    The top-level shape is validated, not just the parse (M1-341 review round 1). A state file
+    containing `[]`, `null`, `"text"` or `3` is valid JSON, so the bare parse returned it and
+    every caller's `state.get(...)` raised `AttributeError` out of `main` -- taking down BOTH
+    subjects, and doing it silently, since the watchdog is the one unit with no `OnFailure`.
+    Reproduced by execution at `3dda485`: `[]` in the file, a stopped resolutions timer, and
+    the run died before it asked a single resolutions question. A hand-edited state file is an
+    ordinary operator action, and the whole point of this file is to notice when things stop.
+    """
+    try:
+        loaded = json.loads(STATE.read_text())
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def _push(title: str, body: str, *, priority: str, tags: str) -> bool:
+    """Send one ntfy push. Never raises -- a dead channel must not kill the watchdog."""
+    topic = os.environ.get("NTFY_TOPIC_URL", "").strip()
+    if not topic:
+        return False
+    request = urllib.request.Request(
+        topic,
+        data=body.encode("utf-8"),
+        headers={"Title": title, "Priority": priority, "Tags": tags},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=PUSH_TIMEOUT_SECONDS) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _ping_deadman() -> None:
+    """Optional external dead-man ping.
+
+    The watchdog cannot report that the MACHINE is off or the user session ended -- it
+    dies with them. Set WJ_HEALTHCHECK_URL (healthchecks.io or similar) and that service
+    alerts when these pings stop, which is the only thing that covers a dark host.
+    """
+    url = os.environ.get("WJ_HEALTHCHECK_URL", "").strip()
+    if not url:
+        return
+    try:
+        urllib.request.urlopen(url, timeout=DEADMAN_TIMEOUT_SECONDS).close()
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+
+
+def _resolutions_problems(
+    timer_active: str, timer_enabled: str, service_failed: str
+) -> tuple[str, ...]:
+    """The codes for every fault these three systemctl answers show, sorted.
+
+    Pure, and total over arbitrary strings: `_systemctl` returns whatever systemd printed,
+    "unknown" when the call itself failed, and "" for a unit that does not exist at all.
+    Anything that is not exactly "active"/"enabled" is a fault, which is the stricter
+    reading and the one the tournament block already takes -- `enabled-runtime` is a real
+    answer meaning "enabled until the next reboot", and it is not enabled.
+    """
+    codes = []
+    if timer_active != "active":
+        codes.append("timer_inactive")
+    if timer_enabled != "enabled":
+        codes.append("timer_disabled")
+    if service_failed == "failed":
+        codes.append("service_failed")
+    return tuple(sorted(codes))
+
+
+def _alert_is_due(codes: tuple[str, ...], stored: dict, now: datetime) -> bool:
+    """Whether this exact fault set has gone unpaged long enough to page again.
+
+    Pure. `stored` is read back out of a JSON file a person can edit, so every field is
+    treated as untrusted shape: a missing, non-string, unparseable or naive-datetime stamp
+    all mean "no usable record of a page", and the honest answer to that is to page.
+    """
+    if not codes:
+        return False
+    if stored.get("key") != _throttle_key(codes):
+        return True
+    last = _aware_stamp(stored.get("last_alert"))
+    if last is None:
+        return True
+    return (now - last) >= RESOLUTIONS_REALERT_AFTER
+
+
+def _throttle_key(codes: tuple[str, ...]) -> str:
+    return ",".join(codes)
+
+
+def _check_resolutions(state: dict) -> bool:
+    """The six-hourly ingest-and-score schedule. True when it has stopped.
+
+    Reads three unit states and nothing else: no ledger, no config, no network beyond the
+    one ntfy POST. `Result` and `ExecMainStatus` are read only to say WHY a failed run
+    failed, never as a fourth detection rule.
+    """
+    timer_active = _systemctl("is-active", f"{RESOLUTIONS_UNIT}.timer") or "unknown"
+    timer_enabled = _systemctl("is-enabled", f"{RESOLUTIONS_UNIT}.timer") or "unknown"
+    service_failed = _systemctl("is-failed", f"{RESOLUTIONS_UNIT}.service") or "unknown"
+    codes = _resolutions_problems(timer_active, timer_enabled, service_failed)
+
+    stored = state.get("resolutions")
+    if not isinstance(stored, dict):
+        stored = {}
+
+    if not codes:
+        if stored.get("key") and RECOVERY_NOTICE:
+            _push(
+                "whiskeyjack: resolutions schedule recovered",
+                f"{RESOLUTIONS_UNIT}.timer is {timer_active}/{timer_enabled} again. "
+                "Persistent=true, so a run missed while it was stopped happens at the next "
+                "start; both commands are idempotent.",
+                priority="default",
+                tags="white_check_mark",
+            )
+        state["resolutions"] = {}
+        print(f"OK: resolutions timer {timer_active}/{timer_enabled}")
+        return False
+
+    key = _throttle_key(codes)
+    entry: dict = {"key": key}
+    # Carry the stamp forward only while the fault set is unchanged: a different set has
+    # never been paged, and must not inherit another set's throttle.
+    previous = stored.get("last_alert")
+    if stored.get("key") == key and isinstance(previous, str):
+        entry["last_alert"] = previous
+
+    if _alert_is_due(codes, stored, _now()):
+        result = _systemctl("show", f"{RESOLUTIONS_UNIT}.service", "-p", "Result", "--value")
+        status = _systemctl(
+            "show", f"{RESOLUTIONS_UNIT}.service", "-p", "ExecMainStatus", "--value"
+        )
+        body = (
+            "Resolution ingestion and scoring are NOT scheduled.\n\n"
+            + "\n".join(f"- {RESOLUTIONS_PROBLEMS[code]}" for code in codes)
+            + f"\n\ntimer: {timer_active}/{timer_enabled}"
+            + f"\nlast run: result={result or 'unknown'} exit={status or 'unknown'}"
+            + "\n\nNothing is lost while it is stopped -- ingest-resolutions and score are "
+            "both idempotent and catch up -- but resolutions and scores stop arriving, and "
+            "the unit's own OnFailure pager cannot report this: a timer that never runs "
+            "never fails."
+            + "\n\nCheck: systemctl --user list-timers whiskeyjack-resolutions.timer"
+            + "\n       systemctl --user enable --now whiskeyjack-resolutions.timer"
+            + "\n       journalctl --user -u whiskeyjack-resolutions.service -n 80"
+        )
+        # Stamp only a push that landed, so a dead channel retries on the next run.
+        if _push(
+            "whiskeyjack: RESOLUTIONS SCHEDULE STOPPED", body, priority="high", tags="hourglass"
+        ):
+            entry["last_alert"] = _now().isoformat()
+
+    state["resolutions"] = entry
+    print("RESOLUTIONS STOPPED: " + ", ".join(codes))
+    return True
+
+
+def _check_tournament(state: dict) -> bool:
+    """The five-minute forecasting poll. True when it is not running normally.
+
+    Unchanged from the single-subject watchdog this grew out of, deliberately and to the
+    line: same four queries, same 20-minute staleness threshold, same 60-minute re-alert,
+    same `alerting`/`last_alert` keys at the top level of the state file, same dead-man
+    ping on the healthy path. Only `_load_state`/`_save_state` moved out to `main`, which
+    now owns the file for both subjects.
+    """
+    problems: list[str] = []
+
+    timer_active = _systemctl("is-active", f"{UNIT}.timer")
+    timer_enabled = _systemctl("is-enabled", f"{UNIT}.timer")
+    service_active = _systemctl("is-active", f"{UNIT}.service")
+    service_failed = _systemctl("is-failed", f"{UNIT}.service")
+
+    if timer_active != "active":
+        problems.append(f"timer is {timer_active}, not active")
+    if timer_enabled != "enabled":
+        problems.append(f"timer is {timer_enabled}, not enabled (it will not survive a reboot)")
+    if service_failed == "failed":
+        problems.append("last service run FAILED")
+
+    beat = _last_heartbeat()
+    age_text = "never"
+    if beat is None:
+        # Covers both "no row" and "a row whose timestamp this program cannot use": the
+        # message has to be true of the case the operator is actually looking at, and the
+        # runbook's symptom index quotes it.
+        problems.append("no usable heartbeat timestamp in the ledger")
+    else:
+        age = _now() - beat
+        minutes = age.total_seconds() / 60
+        age_text = f"{minutes:.0f} min ago"
+        # A run in progress legitimately holds the heartbeat still; not a fault.
+        if age > STALE_AFTER and service_active != "active":
+            problems.append(
+                f"last heartbeat was {minutes:.0f} min ago "
+                f"(threshold {STALE_AFTER.total_seconds() / 60:.0f} min) "
+                f"and the service is {service_active} -- the worker is not polling"
+            )
+
+    previously_bad = bool(state.get("alerting"))
+    # Same parser as the resolutions throttle. The RULE is unchanged -- a stamp this program
+    # cannot use means no prior alert -- but it is now total over what the file can hold.
+    last_alert = _aware_stamp(state.get("last_alert"))
+
+    if problems:
+        due = last_alert is None or (_now() - last_alert) >= REALERT_AFTER
+        if due:
+            body = (
+                "The whiskeyjack worker is NOT running normally.\n\n"
+                + "\n".join(f"- {p}" for p in problems)
+                + f"\n\nlast heartbeat: {age_text}"
+                + f"\ntimer: {timer_active}/{timer_enabled}  service: {service_active}"
+                + "\n\nCheck: systemctl --user status whiskeyjack-tournament.timer"
+                + "\n       whiskeyjack-bot tournament status --config config/tournament.yaml"
+            )
+            if _push("whiskeyjack: WORKER DOWN", body, priority="urgent", tags="rotating_light"):
+                state["last_alert"] = _now().isoformat()
+        state["alerting"] = True
+        print("DOWN: " + "; ".join(problems))
+        return True
+
+    if previously_bad and RECOVERY_NOTICE:
+        _push(
+            "whiskeyjack: worker recovered",
+            f"The worker is polling again. last heartbeat: {age_text}",
+            priority="default",
+            tags="white_check_mark",
+        )
+    state["alerting"] = False
+    state.pop("last_alert", None)
+    # Still gated on the TOURNAMENT result alone. The dead-man answers "is this watchdog
+    # running at all" for an external service that cannot see a dark host any other way;
+    # withholding the ping for a stopped resolutions timer would raise a second, differently
+    # worded alarm about the wrong thing.
+    _ping_deadman()
+    print(f"OK: heartbeat {age_text}, timer {timer_active}/{timer_enabled}")
+    return False
+
+
+def main() -> int:
+    """Both subjects, every run, whatever the other one says.
+
+    Neither check may skip because the other failed: a broken poll and a stopped resolutions
+    timer are independent conditions with independent fixes, and the day the outage of
+    2026-09-09 repeats is exactly the day the other half must still be reported.
+    """
+    state = _load_state()
+    tournament_down = _check_tournament(state)
+    resolutions_down = _check_resolutions(state)
+    _save_state(state)
+    return 1 if tournament_down or resolutions_down else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

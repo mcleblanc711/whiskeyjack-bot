@@ -164,6 +164,9 @@ were written.
 | `artifact:  NOT WRITTEN -- ...` | [L5](#l5--the-artifact-was-not-written) |
 | ntfy push `whiskeyjack: whiskeyjack-resolutions failed` | [Scheduled ingestion and scoring](#scheduled-ingestion-and-scoring) |
 | ntfy push `whiskeyjack: a live forecast is missing from the ledger` | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
+| ntfy push `whiskeyjack: RESOLUTIONS SCHEDULE STOPPED` | [W1](#w1--resolutions-schedule-stopped) |
+| ntfy push `whiskeyjack: resolutions schedule recovered` | [W1](#w1--resolutions-schedule-stopped) — the condition cleared; nothing to do |
+| ntfy push `whiskeyjack: WORKER DOWN` | [The watchdog itself](#the-watchdog-itself) |
 | `tournament status` shows `unrecorded_posts` above 0 | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
 
 ---
@@ -537,10 +540,94 @@ systemctl --user enable --now whiskeyjack-resolutions.timer
 systemctl --user list-timers whiskeyjack-resolutions.timer
 ```
 
-**Timers are not self-healing, and nothing watches this one.** A disabled or stopped
-`whiskeyjack-resolutions.timer` is silent: the watchdog checks only the tournament poll. Check
-it with `systemctl --user list-timers whiskeyjack-resolutions.timer`. To pause the schedule, run
-`systemctl --user disable --now whiskeyjack-resolutions.timer`.
+**Timers are not self-healing, and the watchdog is what now notices** (M1-341). A disabled or
+stopped `whiskeyjack-resolutions.timer` never runs, so it never fails, so the `OnFailure` pager
+above says nothing — that half of the pipeline just goes quiet. Since M1-341 the out-of-process
+watchdog checks this timer as well as the poll, and pages
+[**W1**](#w1--resolutions-schedule-stopped) within one watchdog interval (five minutes). To pause
+the schedule deliberately, `systemctl --user disable --now whiskeyjack-resolutions.timer` — and
+expect the page, once a day, until you start it again.
+
+### W1 — `RESOLUTIONS SCHEDULE STOPPED`
+
+**What you see.** An ntfy push titled `whiskeyjack: RESOLUTIONS SCHEDULE STOPPED`, priority
+`high`, listing one or more of:
+
+| line | what the watchdog asked |
+|---|---|
+| the timer is not active, so no run is scheduled | `systemctl --user is-active whiskeyjack-resolutions.timer` answered anything but `active` |
+| the timer is not enabled, so it will not survive a reboot | `is-enabled` answered anything but `enabled` |
+| the last run FAILED | `is-failed whiskeyjack-resolutions.service` answered `failed` |
+
+plus a `last run: result=… exit=…` line, which is `Result` and `ExecMainStatus` — the same two
+fields the `whiskeyjack-notify@` pager quotes. Exit codes are in the
+[table above](#exit-codes).
+
+**What it means.** Resolution ingestion and scoring are not scheduled. **Nothing is lost while
+it is stopped**: `ingest-resolutions` and `score` are both idempotent, `Persistent=true` means a
+missed run happens at the next start, and no forecast or approval is affected. What stops is
+resolutions and scores *arriving* — so `resolution_events` and `score_events` quietly stop
+growing while everything else looks healthy.
+
+**What to do.**
+
+```bash
+systemctl --user list-timers whiskeyjack-resolutions.timer
+systemctl --user enable --now whiskeyjack-resolutions.timer     # covers inactive AND disabled
+journalctl --user -u whiskeyjack-resolutions.service -n 80 --no-pager
+```
+
+For a **failed last run**, the cause is in the journal and the remedies are the ones in
+§ Scheduled ingestion and scoring above — it is the same failure the `OnFailure` pager reports,
+restated by the watchdog because a unit left in `failed` state stays there until its next run.
+A `systemctl --user reset-failed whiskeyjack-resolutions.service` clears the state once the
+cause is fixed; the next successful run clears it anyway.
+
+**When the page stops.** The watchdog re-pages a standing condition **once a day**, not once
+per five-minute run — but a *new* fault appearing alongside the old one pages at once, because
+that is new information. When the condition clears you get one
+`whiskeyjack: resolutions schedule recovered` notice and nothing further.
+
+**A page that names a timer you can see running** means the watchdog is pointed at a unit that
+does not exist: `systemctl --user is-active` answers `inactive` for a missing unit exactly as it
+does for a stopped one. Compare `RESOLUTIONS_UNIT` in `deploy/wj-watchdog` against the filenames
+in `deploy/systemd/` — `tests/unit/test_watchdog.py` asserts they agree, so this should only ever
+be reachable from a hand-edited installed copy.
+
+### The watchdog itself
+
+`deploy/wj-watchdog` runs every five minutes from `deploy/systemd/whiskeyjack-watchdog.timer`
+(`OnCalendar=*:2/5`, offset from the poll's `*:0/5` and clear of the resolutions timer's `:23`).
+It is the only liveness check that survives the program being broken, so it is **stdlib-only,
+runs under the system interpreter rather than the venv, imports nothing from the package, reads
+the ledger read-only and touches no `AppConfig` field** — it cannot change `config_sha256` and
+so cannot retire a live activation ([C5](#c5--activation-retired)).
+
+It watches two subjects with **separate state, separate throttles and separate pushes**: the
+poll (`whiskeyjack: WORKER DOWN`, heartbeat staleness, 60-minute re-alert) and
+the resolutions schedule (W1 above, no heartbeat rule, 24-hour re-alert). Neither can mute the
+other, and "worker recovered" is never sent while the schedule is still stopped.
+
+Its own unit deliberately has **no `OnFailure=`**: a notifier launched by this unit's own
+failure is not independent evidence about this unit. A dark host — machine off, user session
+gone — is covered only by setting `WJ_HEALTHCHECK_URL` to an external dead-man service, which
+alerts when the watchdog's pings stop.
+
+**Installing or changing it** (copied, not linked, like the other units):
+
+```bash
+cd ~/projects/whiskeyjack-bot && git pull --ff-only
+cp deploy/wj-watchdog ~/.local/bin/wj-watchdog && chmod +x ~/.local/bin/wj-watchdog
+cp deploy/systemd/whiskeyjack-watchdog.service deploy/systemd/whiskeyjack-watchdog.timer \
+   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start whiskeyjack-watchdog.service    # one check now, in the foreground
+journalctl --user -u whiskeyjack-watchdog.service -n 5 -o cat --no-pager
+systemctl --user enable --now whiskeyjack-watchdog.timer
+```
+
+A healthy run prints two `OK:` lines, one per subject, and exits `0`. Any fault exits `1`; the
+unit has no `OnFailure`, so that exit is visible in `systemctl --user status` and nowhere else.
 
 ### Where the lifecycle stops today
 
