@@ -21,6 +21,19 @@ Long forecasting runs are NOT false alarms: a poll can legitimately run for tens
 minutes (the unit allows 2400s), and systemd will not start a second instance while one
 is running, so the heartbeat goes stale while the worker is healthy. Staleness is
 therefore only an alert when the service is not currently active.
+
+Two subjects, deliberately kept apart (M1-341). The second is the six-hourly resolution
+ingestion and scoring schedule, `whiskeyjack-resolutions.timer` (M4-805). That unit has an
+`OnFailure=` pager, and a pager reports a run that FAILS -- while a timer that is disabled
+or stopped never runs, so it never fails and nothing says a word. Ingestion and scoring
+just stop. It gets no heartbeat rule: the service writes no heartbeat and runs every six
+hours, so the only honest signals are whether the timer is enabled and active and whether
+the last run failed.
+
+The two subjects keep separate state, separate throttles and separate pushes. Folding the
+second into the first would make either fault mute the other's page through one shared
+`last_alert`, and would send "worker recovered" while the other half was still stopped --
+the failure `docs/M4-NOTES.md` (M4-805) rejected once already, in the other direction.
 """
 
 from __future__ import annotations
@@ -43,6 +56,27 @@ UNIT = "whiskeyjack-tournament"
 STALE_AFTER = timedelta(minutes=20)  # 4 missed polls at a 5-minute cadence
 REALERT_AFTER = timedelta(minutes=60)  # keep reminding, do not spam
 RECOVERY_NOTICE = True
+
+# The second subject (M1-341). RESOLUTIONS_UNIT names deploy/systemd/whiskeyjack-resolutions
+# .{service,timer}; tests/unit/test_watchdog.py asserts both files exist, so a rename cannot
+# leave this check silently pointed at nothing.
+RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
+# A stopped timer is a CONDITION that holds until a person acts, not an incident that passes.
+# At the watchdog's five-minute cadence an hourly re-alert would be 24 pages a day and a
+# 60-minute one 288, and a channel that noisy reports exactly as much as no channel at all.
+# A day is the window M1-334 and M1-342 settled on for the same shape. Rolling from the last
+# page rather than notify.py's tumbling floor(epoch / 86400): rolling cannot page twice at a
+# boundary, which is the whole of T-909.
+RESOLUTIONS_REALERT_AFTER = timedelta(hours=24)
+# Closed vocabulary. The throttle is keyed on these codes and not on the prose below, so
+# rewording a message never re-pages, while a genuinely NEW fault appearing inside the
+# window does -- it is new information, and waiting up to a day to mention it is not a
+# throttle, it is a drop.
+RESOLUTIONS_PROBLEMS = {
+    "timer_inactive": "the timer is not active, so no run is scheduled",
+    "timer_disabled": "the timer is not enabled, so it will not survive a reboot",
+    "service_failed": "the last run FAILED",
+}
 
 
 def _now() -> datetime:
@@ -134,7 +168,130 @@ def _ping_deadman() -> None:
         pass
 
 
-def main() -> int:
+def _resolutions_problems(
+    timer_active: str, timer_enabled: str, service_failed: str
+) -> tuple[str, ...]:
+    """The codes for every fault these three systemctl answers show, sorted.
+
+    Pure, and total over arbitrary strings: `_systemctl` returns whatever systemd printed,
+    "unknown" when the call itself failed, and "" for a unit that does not exist at all.
+    Anything that is not exactly "active"/"enabled" is a fault, which is the stricter
+    reading and the one the tournament block already takes -- `enabled-runtime` is a real
+    answer meaning "enabled until the next reboot", and it is not enabled.
+    """
+    codes = []
+    if timer_active != "active":
+        codes.append("timer_inactive")
+    if timer_enabled != "enabled":
+        codes.append("timer_disabled")
+    if service_failed == "failed":
+        codes.append("service_failed")
+    return tuple(sorted(codes))
+
+
+def _alert_is_due(codes: tuple[str, ...], stored: dict, now: datetime) -> bool:
+    """Whether this exact fault set has gone unpaged long enough to page again.
+
+    Pure. `stored` is read back out of a JSON file a person can edit, so every field is
+    treated as untrusted shape: a missing, non-string, unparseable or naive-datetime stamp
+    all mean "no usable record of a page", and the honest answer to that is to page.
+    """
+    if not codes:
+        return False
+    if stored.get("key") != _throttle_key(codes):
+        return True
+    raw = stored.get("last_alert")
+    if not isinstance(raw, str):
+        return True
+    try:
+        last = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        return True
+    return (now - last) >= RESOLUTIONS_REALERT_AFTER
+
+
+def _throttle_key(codes: tuple[str, ...]) -> str:
+    return ",".join(codes)
+
+
+def _check_resolutions(state: dict) -> bool:
+    """The six-hourly ingest-and-score schedule. True when it has stopped.
+
+    Reads three unit states and nothing else: no ledger, no config, no network beyond the
+    one ntfy POST. `Result` and `ExecMainStatus` are read only to say WHY a failed run
+    failed, never as a fourth detection rule.
+    """
+    timer_active = _systemctl("is-active", f"{RESOLUTIONS_UNIT}.timer") or "unknown"
+    timer_enabled = _systemctl("is-enabled", f"{RESOLUTIONS_UNIT}.timer") or "unknown"
+    service_failed = _systemctl("is-failed", f"{RESOLUTIONS_UNIT}.service") or "unknown"
+    codes = _resolutions_problems(timer_active, timer_enabled, service_failed)
+
+    stored = state.get("resolutions")
+    if not isinstance(stored, dict):
+        stored = {}
+
+    if not codes:
+        if stored.get("key") and RECOVERY_NOTICE:
+            _push(
+                "whiskeyjack: resolutions schedule recovered",
+                f"{RESOLUTIONS_UNIT}.timer is {timer_active}/{timer_enabled} again. "
+                "Persistent=true, so a run missed while it was stopped happens at the next "
+                "start; both commands are idempotent.",
+                priority="default",
+                tags="white_check_mark",
+            )
+        state["resolutions"] = {}
+        print(f"OK: resolutions timer {timer_active}/{timer_enabled}")
+        return False
+
+    key = _throttle_key(codes)
+    entry: dict = {"key": key}
+    # Carry the stamp forward only while the fault set is unchanged: a different set has
+    # never been paged, and must not inherit another set's throttle.
+    previous = stored.get("last_alert")
+    if stored.get("key") == key and isinstance(previous, str):
+        entry["last_alert"] = previous
+
+    if _alert_is_due(codes, stored, _now()):
+        result = _systemctl("show", f"{RESOLUTIONS_UNIT}.service", "-p", "Result", "--value")
+        status = _systemctl(
+            "show", f"{RESOLUTIONS_UNIT}.service", "-p", "ExecMainStatus", "--value"
+        )
+        body = (
+            "Resolution ingestion and scoring are NOT scheduled.\n\n"
+            + "\n".join(f"- {RESOLUTIONS_PROBLEMS[code]}" for code in codes)
+            + f"\n\ntimer: {timer_active}/{timer_enabled}"
+            + f"\nlast run: result={result or 'unknown'} exit={status or 'unknown'}"
+            + "\n\nNothing is lost while it is stopped -- ingest-resolutions and score are "
+            "both idempotent and catch up -- but resolutions and scores stop arriving, and "
+            "the unit's own OnFailure pager cannot report this: a timer that never runs "
+            "never fails."
+            + "\n\nCheck: systemctl --user list-timers whiskeyjack-resolutions.timer"
+            + "\n       systemctl --user enable --now whiskeyjack-resolutions.timer"
+            + "\n       journalctl --user -u whiskeyjack-resolutions.service -n 80"
+        )
+        # Stamp only a push that landed, so a dead channel retries on the next run.
+        if _push(
+            "whiskeyjack: RESOLUTIONS SCHEDULE STOPPED", body, priority="high", tags="hourglass"
+        ):
+            entry["last_alert"] = _now().isoformat()
+
+    state["resolutions"] = entry
+    print("RESOLUTIONS STOPPED: " + ", ".join(codes))
+    return True
+
+
+def _check_tournament(state: dict) -> bool:
+    """The five-minute forecasting poll. True when it is not running normally.
+
+    Unchanged from the single-subject watchdog this grew out of, deliberately and to the
+    line: same four queries, same 20-minute staleness threshold, same 60-minute re-alert,
+    same `alerting`/`last_alert` keys at the top level of the state file, same dead-man
+    ping on the healthy path. Only `_load_state`/`_save_state` moved out to `main`, which
+    now owns the file for both subjects.
+    """
     problems: list[str] = []
 
     timer_active = _systemctl("is-active", f"{UNIT}.timer")
@@ -165,7 +322,6 @@ def main() -> int:
                 f"and the service is {service_active} -- the worker is not polling"
             )
 
-    state = _load_state()
     previously_bad = bool(state.get("alerting"))
     last_alert_raw = state.get("last_alert")
     last_alert = None
@@ -189,9 +345,8 @@ def main() -> int:
             if _push("whiskeyjack: WORKER DOWN", body, priority="urgent", tags="rotating_light"):
                 state["last_alert"] = _now().isoformat()
         state["alerting"] = True
-        _save_state(state)
         print("DOWN: " + "; ".join(problems))
-        return 1
+        return True
 
     if previously_bad and RECOVERY_NOTICE:
         _push(
@@ -202,10 +357,27 @@ def main() -> int:
         )
     state["alerting"] = False
     state.pop("last_alert", None)
-    _save_state(state)
+    # Still gated on the TOURNAMENT result alone. The dead-man answers "is this watchdog
+    # running at all" for an external service that cannot see a dark host any other way;
+    # withholding the ping for a stopped resolutions timer would raise a second, differently
+    # worded alarm about the wrong thing.
     _ping_deadman()
     print(f"OK: heartbeat {age_text}, timer {timer_active}/{timer_enabled}")
-    return 0
+    return False
+
+
+def main() -> int:
+    """Both subjects, every run, whatever the other one says.
+
+    Neither check may skip because the other failed: a broken poll and a stopped resolutions
+    timer are independent conditions with independent fixes, and the day the outage of
+    2026-09-09 repeats is exactly the day the other half must still be reported.
+    """
+    state = _load_state()
+    tournament_down = _check_tournament(state)
+    resolutions_down = _check_resolutions(state)
+    _save_state(state)
+    return 1 if tournament_down or resolutions_down else 0
 
 
 if __name__ == "__main__":
