@@ -10998,7 +10998,7 @@ look at them.
 - `docs/RUNBOOK.md` — L4's "What you see" now opens with the page and the count instead of
   "nothing at all"; the confirm block says how the count and `unrecorded-posts` differ; two new
   symptom-index rows.
-- Tests: 6 in `tests/unit/test_tournament.py`, 3 in `tests/unit/test_submission_reconcile.py`,
+- Tests: 6 in `tests/unit/test_tournament.py`, 4 in `tests/unit/test_submission_reconcile.py`,
   1 property in `tests/property/test_submission_reconcile_properties.py`.
 
 **No `AppConfig` field, no migration, no dependency, and no write of any kind.** A new alert
@@ -11172,6 +11172,10 @@ M1-611 (`show`) territory rather than widened here.
   never page at all — a silent subset inside the alert that exists to end silence. The bound
   that matters is that the state itself is rare: 0 candidates on the live ledger, and one
   instance is the whole of the incident this alert is for.
+- **Both of the reader's refusal arms are covered**, which `unrecorded_posts` (M2-713) is not:
+  its identical `sqlite3.Error` arm and its stored-type guard have no test. Not widened here —
+  it is not this branch's function and its callers are commands, not the poll — but the
+  asymmetry is deliberate and worth naming rather than leaving to be found.
 - **A `question_id` that is not stored as an integer refuses the whole read.** It is a
   defensive check on a value read back out of the ledger, reachable only by a writer that did
   not go through this program (the test plants one with a raw INSERT). Refusing is the right

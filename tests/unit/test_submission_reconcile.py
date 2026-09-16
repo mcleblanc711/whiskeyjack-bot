@@ -1033,3 +1033,29 @@ def test_the_reader_refuses_a_stored_question_id_that_is_not_an_integer(case: An
         unrecorded_confirmed_posts(conn)
     assert "45754-not-an-int" not in str(refused.value)
     assert refused.value.__cause__ is None and refused.value.__context__ is None
+
+
+def test_the_reader_refuses_a_ledger_it_cannot_read() -> None:
+    """A read failure must arrive as this module's error type, not as a raw `sqlite3.Error`.
+
+    The poll calls this every five minutes and `tournament._unrecorded` handles
+    `ReconciliationError` and nothing else, so a raw database error here would escape `run_once`
+    as an unhandled exception rather than a refusal. Driven through a connection with no schema,
+    which is the cheap reachable shape of the whole `sqlite3.Error` class. The database's own
+    text must reach neither the message nor a rendered traceback: it can echo stored values, and
+    `from None` is what keeps the suppressed context out of the render.
+    """
+    import traceback
+
+    from whiskeyjack_bot.submission_reconcile import unrecorded_confirmed_posts
+
+    schemaless = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(ReconciliationError, match="the ledger could not be read") as refused:
+            unrecorded_confirmed_posts(schemaless)
+    finally:
+        schemaless.close()
+    error = refused.value
+    assert error.__cause__ is None and error.__suppress_context__
+    rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert "no such table" not in str(error) and "no such table" not in rendered
