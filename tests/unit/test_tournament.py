@@ -1691,13 +1691,15 @@ def test_a_resting_activation_stays_silent_even_when_a_binding_also_moved(
     assert pushes.sent == []
 
 
-def test_a_retired_profile_polled_every_five_minutes_pages_once(
-    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """An hour of five-minute polls on one retired profile is one page, not twelve.
+def _retired_profile_polled_for_an_hour(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, start: datetime
+) -> _Pushes:
+    """Twelve five-minute polls of one retired profile, from ``start``, clock injected.
 
-    The clock is injected and advanced per poll, so this distinguishes the day-long window
-    from the 30-minute incident window: under 1800 seconds the same hour pages twice.
+    ``start`` is a parameter and never ``utcnow()`` (T-909): `activation_retired` throttles in
+    a **tumbling** window, so how many pages an hour of polling produces is decided by where in
+    the window it begins, and a test that begins wherever the suite happened to run asserts a
+    number it does not control. The two callers below pin both answers.
     """
     import httpx
 
@@ -1707,7 +1709,7 @@ def test_a_retired_profile_polled_every_five_minutes_pages_once(
     conn, _config, platform, news, model = case
     retired_config = _retire(case, "configuration")
     pushes = _Pushes()
-    instant = [utcnow()]
+    instant = [start]
     monkeypatch.setattr(
         whiskeyjack_tournament,
         "build_notifier",
@@ -1730,7 +1732,46 @@ def test_a_retired_profile_polled_every_five_minutes_pages_once(
                 forecaster=model,
             )
         instant[0] += timedelta(minutes=5)
+    return pushes
+
+
+def test_a_retired_profile_polled_every_five_minutes_pages_once(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An hour of five-minute polls on one retired profile is one page, not twelve.
+
+    The clock is injected and advanced per poll, so this distinguishes the day-long window
+    from the 30-minute incident window: under 1800 seconds the same hour pages twice.
+
+    Anchored at the window's own opening instant, so the fifty-five minutes these polls span
+    sit 23h05m clear of the next boundary and "once" is a statement about the window length.
+    Started at wall-clock ``utcnow()`` instead, the same body pages **twice** whenever the run
+    begins in the last hour of a UTC day -- reproduced by execution at 2026-09-15 22:36 MDT
+    (`assert 2 == 1`) before this line was written. That was T-909.
+    """
+    pushes = _retired_profile_polled_for_an_hour(
+        case, monkeypatch, tmp_path, _window_start("activation_retired")
+    )
     assert len(pushes.matching("activation retired")) == 1
+
+
+def test_a_retired_profile_polled_across_a_window_boundary_pages_twice(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same hour, begun thirty minutes before the boundary, pages exactly twice.
+
+    A tumbling window paging twice across its boundary is the documented behaviour
+    (`Notifier._stamp_path`), so it is pinned here rather than left to be met as a flake in the
+    test above. Two is the whole count and not a floor: twelve polls span fifty-five minutes,
+    which can cross one boundary and never two.
+    """
+    pushes = _retired_profile_polled_for_an_hour(
+        case,
+        monkeypatch,
+        tmp_path,
+        _window_start("activation_retired", offset=timedelta(days=1) - timedelta(minutes=30)),
+    )
+    assert len(pushes.matching("activation retired")) == 2
 
 
 def test_two_retired_profiles_each_page(
