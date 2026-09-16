@@ -11350,7 +11350,7 @@ resolution around 2026-09-17, with `resolution_events` still 0.
 - `docs/RUNBOOK.md` — a `W1` section for the new page, a `The watchdog itself` section, three
   symptom-index rows, and the closing paragraph of § Scheduled ingestion and scoring rewritten
   so *"nothing watches this one"* is no longer true.
-- Tests: 38 in `tests/unit/test_watchdog.py`, 7 properties in
+- Tests: 45 in `tests/unit/test_watchdog.py`, 9 properties in
   `tests/property/test_watchdog_properties.py`.
 
 **No `AppConfig` field, no migration, no dependency, no ledger write, no post.** The watchdog
@@ -11531,7 +11531,7 @@ exit code**, with output redirected to a file. Runner: the two new suites, `-x`,
 `HYPOTHESIS_PROFILE=dev` (200 examples). Every kill was read back against its log for the
 assertion that actually failed, so no kill is a collection error or an unrelated failure.
 
-**31 of 31 killed** (28 before round 1, three more for its remediation). Three of the first 28
+**36 of 36 killed** (28 before round 1, three for its remediation, five for round 2's). Three of the first 28
 only after the run found something, which is the part worth recording:
 
 | mutant | killed by |
@@ -11567,6 +11567,11 @@ only after the run found something, which is the part worth recording:
 | W29 `_load_state` stops validating the top-level shape | `test_a_state_file_that_is_not_an_object_still_reports_a_stopped_schedule[[]]` *(round-1 remediation)* |
 | W30 the unit deadline goes back under the worst case (`TimeoutStartSec=120`) | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` *(round-1 remediation; this mutant edits the **unit file**, not the script)* |
 | W31 the worst case understates the systemctl calls (9 → 4) | the same test — the bound is asserted against the real constants, not a copy |
+| W32 `_aware_stamp` accepts a non-string | `test_every_outward_call_passes_the_timeout_the_budget_counts` — `state.get("last_alert")` is `None` on a fresh state file, so this is a `TypeError` on the commonest value, not an exotic one *(round-2 remediation)* |
+| W33 `_aware_stamp` accepts a naive instant | `test_a_naive_timestamp_in_the_state_file_pages_rather_than_raising` |
+| W34 the tournament block keeps its own parser again | `test_an_unusable_tournament_stamp_does_not_stop_the_resolutions_check` |
+| W35 the dead-man shares the push timeout again | `test_every_outward_call_passes_the_timeout_the_budget_counts` |
+| W36 the budget forgets the dead-man | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` |
 
 **W12 is the one that mattered.** Dropping the `stored.get("key") == key` half of the
 carry-forward guard is invisible on the ordinary path, because a successful push overwrites the
@@ -11684,3 +11689,61 @@ persists and a standing condition pages every run — 288 a day, the outcome the
 prevent. The swallow is deliberate (a watchdog that dies because it could not write a stamp
 reports nothing at all), so the fix is to bound the volume and surface the failure, not to
 raise. Backlog: **M1-344**. Not reproduced on the live host; the state file is writable there.
+
+**Round 2 — CHANGES REQUESTED on `624da85`.** Both round-1 findings **closed** (the reviewer
+exercised all six state-file shapes itself and re-derived `190 < 240 < 300`). Two new blocking
+findings, both accepted, both reproduced by execution against `624da85` first.
+
+#### 3. A valid JSON *object* with an unusable tournament stamp still took both subjects down
+
+Round 1's fix validated the state file's **top level**; it does not reach inside. The tournament
+block's own parser guarded only `ValueError` on a value it had truthiness-tested, so
+`{"last_alert": [1]}` reached `datetime.fromisoformat` and raised `TypeError` out of `main` —
+no resolutions query asked, no push attempted.
+
+**The siblings were enumerated by execution rather than the one named type fixed**, because a
+finding that names one escaping type usually names a class (M1-308, and it has now cost this
+project a round twice). At `624da85`:
+
+```
+{"last_alert": [1]}                    TypeError: fromisoformat: argument must be str
+{"last_alert": 3}                      TypeError: fromisoformat: argument must be str
+{"last_alert": 1.5}                    TypeError: fromisoformat: argument must be str
+{"last_alert": {"a": 1}}               TypeError: fromisoformat: argument must be str
+{"last_alert": "2026-09-17T12:00:00"}  TypeError: can't subtract offset-naive and offset-aware
+```
+
+**The last one is the sibling the review did not name.** It parses perfectly and dies at the
+subtraction instead. So "unusable" means all three of not-a-string, unparseable and *naive*.
+
+Fixed with one parser, `_aware_stamp`, used by both throttles — the resolutions throttle already
+had exactly this discipline written inline, so the fix is to share it rather than to duplicate
+it. **The tournament rule is unchanged** (a stamp the program cannot use means no prior alert);
+what changed is that it is now total over what the file can hold. Six parametrized cases drive
+all six shapes through a full `main()`; two new properties fuzz the parser for totality,
+aware-only output, subtractability, and the round trip through the JSON file — which is what
+makes the 24-hour window a window at all.
+
+#### 4. The remediation changed the dead-man ping's timeout from 10s to 15s — my error
+
+Naming the timeouts as constants, I substituted one shared `HTTP_TIMEOUT_SECONDS` into **both**
+`urlopen` sites. The dead-man went from 10 to 15, so a slow healthcheck endpoint blocked the
+tournament path five seconds longer — behaviour this item promised not to touch. **The commit
+message that introduced it claimed every literal-to-constant substitution kept its value.** It
+did not, and nothing observed the timeouts, so nothing caught it.
+
+`PUSH_TIMEOUT_SECONDS` (15) and `DEADMAN_TIMEOUT_SECONDS` (10) are now separate constants, both
+named in `WORST_CASE_SECONDS` — which is 185 and still clear of the 240s deadline and the 300s
+interval. The new test drives a full run with the **real** `_push` and `_ping_deadman`, records
+what each outward call was actually given, and asserts each equals the constant the budget
+counts. That is the test that would have caught the substitution, and it is the general lesson:
+**a constant extracted from literals is a refactor only if something observes the values.**
+
+#### What the two rounds cost, and the pattern
+
+Four blocking findings, and **three of them are the same shape**: a value read back out of a
+file, trusted further than it had been checked. Round 1 fixed the file's top level; round 2
+found the same class one level in. The resolutions path had the discipline from the start
+(`isinstance(stored, dict)`, the three-way stamp guard) and the tournament path — vendored,
+older, and explicitly "unchanged" — did not. **"Unchanged" made it invisible to me**: I read the
+tournament block as out of scope rather than as code my new caller now depends on.
