@@ -11188,3 +11188,60 @@ M1-611 (`show`) territory rather than widened here.
   along with `prediction_posted` — quiet, not wrong.
 - **The live count is asserted after the merge, not before.** `unrecorded-posts` reported 0
   candidates on 2026-09-15, so `unrecorded_posts` must read 0 on the first poll after deploy.
+
+### Teeth — the mutation pass
+
+**17 mutants, run against a committed tree with `__pycache__` cleared before every run and a
+green baseline confirmed by exit code first**, over `tests/unit/test_tournament.py`,
+`tests/unit/test_submission_reconcile.py` and
+`tests/property/test_submission_reconcile_properties.py`. Every kill was read for the assertion
+that failed rather than counted.
+
+**15 killed on the first run.** The predicate: the `NOT EXISTS` clause dropped; the criterion
+read literally as a current-status comparison; the `kind` filter widened to any journal row; the
+status literal changed to `approved`; the literal mistyped with the vocabulary assertion
+deleted; the stored-type guard set to `if False`; the inner join widened to `LEFT JOIN`. The
+count: held constant at 0; added to `unresolved`. The page: suppressed entirely; a constant
+throttle subject; emitted only on the normal exit; the record id removed from the body; the
+window cut to 1800; the priority dropped to `default`.
+
+Two did not die on the first run, and they are different things.
+
+| Survivor | What it turned out to be | Resolution |
+| --- | --- | --- |
+| **M14** — page before the recovery loop | **A malformed mutant.** It inserted `_notify_unrecorded_posts(())` beside the real call rather than moving it, and an empty tuple emits nothing, so it "survived" for a reason that had nothing to do with the claim — M1-334's malformed-f-string mutant, in a different shape | **Rebuilt** so the call genuinely moves, and **killed**: the acceptance test's first poll counts 1 and pages 0 |
+| **M08** — `ORDER BY t.scope` dropped | **Equivalent under the current schema**, and proven so rather than assumed. `012`'s `tournament_events_scope(scope, kind, seq)` is a covering index for this query, so the plan is `SCAN t USING COVERING INDEX tournament_events_scope` and rows already arrive in `scope` order. `EXPLAIN QUERY PLAN` is **byte-identical with and without the clause** — the planner does not even add a sorter | **Kept.** A query-planner choice is not a guarantee: reorder or drop that index and the output order changes silently, and the reader states an order an operator relies on when reading a page beside `unrecorded-posts` |
+
+**M08 was still worth running, because the first attempt to kill it found a vacuity in the
+property itself.** The property seeded its records as `rec-alert-<serial>` with a shared
+counter, so by the time it ran the serials were three digits wide and consecutive — and for
+equal-width consecutive ids, scan order *is* sorted order. The ordering assertion could not fail
+whatever the code did. The ids now scatter (`(serial * 7919) % 100_000`, zero-padded and
+injective), which is the strictly stronger strategy; M08 still survives, and now for the reason
+above rather than because the draws could not reach the case. That is the project's recurring
+defect (`docs/LESSONS.md` lesson 9) caught by the pass it exists for.
+
+### Teeth — the property against broken code, by itself
+
+The eight mutants of the reader re-run over `test_submission_reconcile_properties.py` **alone**,
+with the unit suites excluded, so the property's own teeth are measured rather than inferred
+from a run the unit tests were in.
+
+**Four of the eight die to the property alone**, and each is a clause the property's two axes
+reach directly: the `NOT EXISTS` dropped, the `kind` filter widened, and both status-literal
+mutants. That is the pass's whole point — the partition assertion is what holds the `kind` clause
+and the `NOT EXISTS` clause up *at the same time*, and either one alone is a property of nothing.
+
+The other four survive the property **by design**, and each is killed by a unit test written for
+it. Recorded so the absence is not read as a gap:
+
+| Survivor (property alone) | Why the property cannot reach it | Killed by |
+| --- | --- | --- |
+| **M02** the criterion read literally | The property never walks a record past `submitted`; nothing it seeds is `resolved` or `scored`, and below that line the two readings agree | `test_an_ordinary_confirmed_forecast_never_pages_as_unrecorded` |
+| **M06** stored-type guard | Every `question_id` it seeds is a real `int`; a text one needs a raw INSERT past the append-only trigger | `test_the_reader_refuses_a_stored_question_id_that_is_not_an_integer` |
+| **M07** `LEFT JOIN` | Every scope it seeds names a stored record | `test_a_confirmed_scope_naming_no_stored_record_is_neither_reported_nor_raised_on` |
+| **M08** `ORDER BY` | Equivalent under `012`'s covering index — see above. Killed by nothing, and that is the finding | — |
+
+Widening the property to cover M02 was considered and not done: reaching `resolved` needs a
+resolution observation and a second writer, and the claim is about the *worker's* behaviour end
+to end, which is where the regression lives.

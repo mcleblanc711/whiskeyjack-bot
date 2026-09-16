@@ -1930,6 +1930,7 @@ def test_a_live_forecast_the_ledger_never_recorded_pages_and_clears_once_reconci
     or by an alert wired to a transition that can only ever fire once, and the test would be
     asserting nothing about reconciliation at all.
     """
+    from whiskeyjack_bot.lifecycle import current_status
     from whiskeyjack_bot.submission_reconcile import reconcile_unrecorded_post
 
     conn, config, platform, *_ = case
@@ -1940,8 +1941,6 @@ def test_a_live_forecast_the_ledger_never_recorded_pages_and_clears_once_reconci
     first = poll(case)
     assert first["forecast_confirmed"] == first["comment_completed"] == 1
     assert first["unresolved"] == 0, "the journal is satisfied; that is why this state is silent"
-    from whiskeyjack_bot.lifecycle import current_status
-
     assert current_status(conn, record_id) == "approved"
 
     # ...and this is what says so: a count in `tournament status`, and one push naming it.

@@ -834,7 +834,6 @@ def run_once(
         heartbeat["complete"] = True
         heartbeat["at"] = utcnow().isoformat()
         append(conn, "heartbeat", "worker", heartbeat)
-        _notify_unrecorded_posts(())
         summary = status(conn, config)
         # After the recovery loop, so a record that reaches this state during *this* poll pages
         # in this poll rather than the next one, and at both of `run_once`'s exits for the
