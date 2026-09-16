@@ -11531,8 +11531,8 @@ exit code**, with output redirected to a file. Runner: the two new suites, `-x`,
 `HYPOTHESIS_PROFILE=dev` (200 examples). Every kill was read back against its log for the
 assertion that actually failed, so no kill is a collection error or an unrelated failure.
 
-**28 of 28 killed.** Three of them only after the run found something, which is the part worth
-recording:
+**31 of 31 killed** (28 before round 1, three more for its remediation). Three of the first 28
+only after the run found something, which is the part worth recording:
 
 | mutant | killed by |
 | --- | --- |
@@ -11564,6 +11564,9 @@ recording:
 | W26 the dead-man ping is dropped from the healthy path | **survived pass 1**; `test_the_dead_man_ping_answers_for_the_worker_and_not_for_the_schedule` |
 | W27 the fault set is never recorded in the state file | `test_each_stopped_condition_pages_once_on_the_next_watchdog_run` |
 | W28 the dead-man ping is gated on the resolutions check too | the dead-man test *(see below — the first version was malformed)* |
+| W29 `_load_state` stops validating the top-level shape | `test_a_state_file_that_is_not_an_object_still_reports_a_stopped_schedule[[]]` *(round-1 remediation)* |
+| W30 the unit deadline goes back under the worst case (`TimeoutStartSec=120`) | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` *(round-1 remediation; this mutant edits the **unit file**, not the script)* |
+| W31 the worst case understates the systemctl calls (9 → 4) | the same test — the bound is asserted against the real constants, not a copy |
 
 **W12 is the one that mattered.** Dropping the `stored.get("key") == key` half of the
 carry-forward guard is invisible on the ordinary path, because a successful push overwrites the
