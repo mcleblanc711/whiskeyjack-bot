@@ -38,6 +38,10 @@ row, after the artifact is checked to describe this key, attempt, record, questi
 payload. Its receipt fields are never read into the ledger -- see
 :class:`lifecycle.SubmissionReconciliation` for why an attempt row cannot honestly be written.
 
+:func:`unrecorded_confirmed_posts` is the M1-342 addition: the read behind the alert the live
+worker now raises for this state, and the one predicate here that is a *verdict* rather than a
+list of places to look. It is read-only and its docstring says why the two differ.
+
 Every refusal writes nothing. Everything that can be refused locally is refused before the
 poster is touched, and the write happens in one ``BEGIN IMMEDIATE`` that re-derives the whole
 evidence set first, so a state that changed while the platform was being read is refused
@@ -58,6 +62,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Final, get_args
 
 from whiskeyjack_bot.approval import ApprovalError, effective_approval
 from whiskeyjack_bot.bounds import MAX_ACTOR_LENGTH, MAX_IDENTIFIER_LENGTH, MAX_NOTE_LENGTH
@@ -67,6 +72,7 @@ from whiskeyjack_bot.forecast.store import read_forecast_record
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     LifecycleEvent,
+    LifecycleStatus,
     SubmissionReconciliation,
     current_status,
     record_submission_reconciliation,
@@ -96,6 +102,14 @@ from whiskeyjack_bot.submission_live import (
     live_attempt_id,
     plan_from_payload,
 )
+
+
+# The one lifecycle status that means "this program recorded the post". Pinned to
+# `lifecycle`'s own vocabulary at import, because `unrecorded_confirmed_posts` below asks the
+# ledger whether any event ever reached it: a rename that left this string behind would make
+# that question always answer "no" and page for every forecast the worker has ever confirmed.
+_RECORDED: Final = "submitted"
+assert _RECORDED in get_args(LifecycleStatus)
 
 
 class ReconciliationError(Exception):
@@ -135,6 +149,18 @@ class UnrecordedPost:
     account_id: int
     artifact_path: str | None
     artifact_sha256: str | None
+
+
+@dataclass(frozen=True)
+class UnrecordedConfirmedPost:
+    """A forecast the platform shows and the lifecycle ledger has not recorded (M1-342).
+
+    Both fields are read from typed ledger columns, never from a journal row's JSON, because
+    the alert that carries them leaves this machine.
+    """
+
+    record_id: str
+    question_id: int
 
 
 @dataclass(frozen=True)
@@ -478,6 +504,75 @@ def unrecorded_posts(conn: sqlite3.Connection) -> tuple[str, ...]:
             )
         identifiers.append(row[0])
     return tuple(identifiers)
+
+
+def unrecorded_confirmed_posts(
+    conn: sqlite3.Connection,
+) -> tuple[UnrecordedConfirmedPost, ...]:
+    """Forecasts the journal confirms are live while the lifecycle ledger never recorded the
+    post: read-only, no network, deterministic order (M1-342).
+
+    This is the **verdict**, where :func:`unrecorded_posts` above is a list of places to look.
+    The two predicates differ deliberately, and the difference is the whole reason one of them
+    may page:
+
+    - ``unrecorded_posts`` asks for an intent and a reservation that is unreleased and unspent.
+      A process killed *between* the intent and the POST leaves exactly that shape with nothing
+      posted, so it is a candidate, not a finding -- and an alert on it would page for a
+      forecast that does not exist.
+    - This asks for a ``forecast_confirmed`` journal row, which
+      :func:`tournament.reconcile_forecast` writes only after its own refetch matched the stored
+      payload on the platform. The forecast **is** live. If the lifecycle ledger holds no event
+      that recorded the post, the ledger and the platform disagree about a forecast that was
+      made -- runbook L4, the most serious state in that document.
+
+    **"Never reached ``submitted``", not "is not ``submitted`` now".** The criterion's words are
+    the second; implemented literally they are a false-positive generator, and not a
+    hypothetical one. ``_LEGAL_TRANSITIONS`` admits ``("resolved", "submitted", "resolved")``
+    and ``("scored", "resolved", "scored")``, so every healthy forecast leaves ``submitted``
+    the moment M4-801 ingests its resolution -- twenty of them on the live ledger when MiniBench
+    batch 1 resolves. A current-status test would page for every one. Asking the append-only
+    history instead states the fact the criterion is about: whether the ledger ever recorded
+    this post. It also stays correct as the status vocabulary grows, because it names no status
+    but the one that means *recorded*.
+
+    The reported set is wider than ``approved``, and that is not what distinguishes the two
+    readings -- both would report it -- but it is worth naming because it is reachable: a record
+    the M2-711 partition left terminally ``failed``, from a POST that raised whose three
+    refetches saw nothing and that landed afterwards, is the same disagreement wearing a
+    different status. What the two readings disagree about is only ``resolved`` and ``scored``,
+    and there the current-status reading is wrong about every healthy forecast.
+
+    The join to ``forecast_records`` is inner, so a ``forecast_confirmed`` scope naming no
+    stored record is neither reported nor raised on. No path this program takes produces one:
+    ``reconcile_forecast`` reads the record through :func:`forecast.store.read_forecast_record`
+    before it appends. ``question_id`` comes from that typed column rather than from the journal
+    row's JSON, so nothing in the alert body is steered by a journal this program did not write.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT t.scope, r.question_id FROM tournament_events t "
+            "JOIN forecast_records r ON r.record_id = t.scope "
+            "WHERE t.kind = 'forecast_confirmed' "
+            "  AND NOT EXISTS (SELECT 1 FROM lifecycle_events e "
+            "                  WHERE e.forecast_record_id = t.scope AND e.to_status = ?) "
+            "ORDER BY t.scope",
+            (_RECORDED,),
+        ).fetchall()
+    except (sqlite3.Error, UnicodeDecodeError):
+        raise ReconciliationError(
+            "the ledger could not be read (detail withheld: a database message can echo stored "
+            "values)"
+        ) from None
+    found: list[UnrecordedConfirmedPost] = []
+    for record_id, question_id in rows:
+        if type(record_id) is not str or type(question_id) is not int:
+            raise ReconciliationError(
+                "a confirmed forecast names a record or question that is not stored text and an "
+                "integer (detail withheld: it can echo stored values)"
+            )
+        found.append(UnrecordedConfirmedPost(record_id=record_id, question_id=question_id))
+    return tuple(found)
 
 
 def read_intent(

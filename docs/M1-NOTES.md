@@ -10965,3 +10965,359 @@ up — a property with a well-formed shape (`st.permutations` plus a non-vacuity
 same claim as a property whose *strategy* can reach the input class the claim is actually about.
 `CATEGORY_IDS = st.lists(..., unique=True)` was never going to draw a duplicate id no matter how
 many examples it ran.
+
+## M1-342 — Alert when a journal-confirmed forecast never reached the lifecycle ledger
+
+Acceptance, verbatim: *A poll that finds a record whose forecast_confirmed journal row exists
+while its lifecycle status is not submitted reports it -- a count in tournament status and one
+throttled push naming the record -- without writing to the lifecycle ledger or posting anything;
+the alert stops once reconcile-submission records the post; a test drives a process death after
+acceptance, one poll, and asserts the alert fires once and clears after reconciliation.*
+
+The detection half of the state M2-713 made recoverable. On the live worker it is silent: the
+poll's recovery loop runs `reconcile_forecast` on the durable `forecast_intent`, confirms the
+forecast against its own refetch, appends `forecast_confirmed`, pushes **"forecast confirmed"**
+and posts the private comment — while `lifecycle_events` keeps the record `approved` with a
+standing key reservation, and M4-801 ingestion (which selects `to_status = 'submitted'`) never
+resolves or scores it. The operator is told success. `reconcile-submission` and
+`unrecorded-posts` merged the same day this item started (PR #101), and nothing made anyone
+look at them.
+
+### Delivered
+
+- `submission_reconcile.py` — `unrecorded_confirmed_posts` and its `UnrecordedConfirmedPost`
+  value object: a `forecast_confirmed` journal row joined to its record, with no lifecycle event
+  that ever reached `submitted`. Read-only, no network, one statement, deterministic order.
+  `_RECORDED` pins the status literal to `lifecycle.LifecycleStatus` with an import-time
+  assertion.
+- `notify.py` — `unrecorded_post` joins the closed `NotifyEvent` vocabulary, window `86400`,
+  priority `high`.
+- `tournament.py` — `status()` gains `unrecorded_posts`; `_notify_unrecorded_posts` pages once
+  per record at **both** of `run_once`'s exits, after the recovery loop. `_unrecorded` is the
+  one place `ReconciliationError` becomes `TournamentError`.
+- `docs/RUNBOOK.md` — L4's "What you see" now opens with the page and the count instead of
+  "nothing at all"; the confirm block says how the count and `unrecorded-posts` differ; two new
+  symptom-index rows.
+- Tests: 7 in `tests/unit/test_tournament.py`, 4 in `tests/unit/test_submission_reconcile.py`,
+  1 property in `tests/property/test_submission_reconcile_properties.py`.
+
+**No `AppConfig` field, no migration, no dependency, and no write of any kind.** A new alert
+kind is a `NotifyEvent` member plus a window; `NotifyConfig` has no event list, so nothing here
+can reach `config_sha256` and deploying this does not retire the live activation (the 2h33m
+outage of 2026-09-09, M1-334).
+
+**Measured rather than reasoned about.** `tournament_state.bindings(load_config(
+"config/tournament.yaml"))` was run on this branch and on `169f25b` (master) and the two are
+byte-identical:
+
+```
+config_sha256: 0dcc192f8779df81de641ec866e8f82e47677103329656d7e47cafb2d1906f09
+prompt_sha256: f72a6818ebe6992172a4d0b618fa6594de406bc85050b6deed623b1fb37b9cb1
+```
+
+That is the check M1-334's own notes say to do after the merge; done before it as well, because
+the failure it guards against costs 2h33m of a live tournament and the comparison costs a
+second.
+
+### Decision — the predicate is "never reached `submitted`", not "is not `submitted` now"
+
+**The criterion's own words are a false-positive generator, and this is the one substantive
+deviation in the item.** `lifecycle._LEGAL_TRANSITIONS` admits `("resolved", "submitted",
+"resolved")` and `("scored", "resolved", "scored")`. A healthy forecast therefore *stops being*
+`submitted` the moment M4-801 ingests its resolution. Implemented literally, the first
+scheduled ingest after MiniBench batch 1 resolves would have reported all twenty live
+forecasts as unrecorded posts and paged for each one — turning the alert for the most serious
+state in the runbook into the thing that trains the operator to mute the channel.
+
+So the reader asks the append-only history — is there any `lifecycle_events` row for this
+record with `to_status = 'submitted'`? — which is the fact the criterion is about: whether the
+ledger ever recorded the post. It also survives the status vocabulary growing, because it names
+no status except the one that means *recorded*.
+
+This was found by reading `_LEGAL_TRANSITIONS`, not by a test, and the regression that pins it
+walks a record through `poll` → `ingest_resolutions` → `score_records` and asserts silence and
+a zero count at each step. Mutant **M02** is the criterion read literally; it fails that test.
+
+### Decision — the page fires from the condition, not from the transition
+
+The brief for this item said to fire from the transition — inside `reconcile_forecast`'s
+first-confirmation guard, beside `prediction_posted`. **Owner decision at plan time
+(2026-09-15), taken the other way**, and the reasons are worth keeping because the transition
+argument is a good one that M1-329 already settled for a *different* shape.
+
+`_notify_blocked`'s rule is that an alert fires where the row is appended and never at the read
+gate that replays it, because `question_blocked` records a verdict taken once: re-alerting from
+the gate would page every 30 minutes forever for a decision nobody needs to hear about twice.
+This is not that shape. A live forecast the ledger does not hold is a **condition** that holds
+until a person runs `reconcile-submission` — `activation_retired`'s shape exactly (M1-334),
+where the same argument produced a day-long window on a per-poll refusal.
+
+Three things follow from the transition hook and all three are worse:
+
+1. A record already confirmed before this shipped could never page. The live ledger holds 20
+   confirmed records; `unrecorded-posts` reports 0 candidates today, but a detector whose
+   coverage starts at deploy is a detector with a blind spot it can never close.
+2. A page missed at 04:00 is the only page there will ever be.
+3. **"The alert clears after reconciliation" becomes unfalsifiable.** A transition hook is
+   silent on the second poll whether or not anyone reconciled anything, so the criterion's own
+   test asserts nothing about reconciliation. That is this project's most expensive recurring
+   defect (`docs/LESSONS.md`; M1-334 round 1 hit it in a unit test), and here it would have been
+   designed in rather than stumbled into.
+
+What prevents the 288-a-day failure is the throttle, not the call site: keyed on the record id,
+window 86400. The acceptance test is built around the distinction — the middle poll is a day
+later with nothing reconciled and **pages again**, so the silence after reconciliation is the
+condition clearing and not the window.
+
+### Decision — the verdict, not the candidate listing
+
+`unrecorded_posts` (M2-713) and `unrecorded_confirmed_posts` are different questions and only
+the second may page:
+
+| | `unrecorded_posts` | `unrecorded_confirmed_posts` |
+| --- | --- | --- |
+| Asks | an intent, and a reservation unreleased and unspent | a `forecast_confirmed` row, and no event that ever reached `submitted` |
+| Killed **before** the POST | listed | not reported |
+| Killed **after** the POST | listed | reported |
+| Is | a list of places to look | a verdict |
+
+A process killed between the intent and the POST leaves M2-713's exact shape with **nothing
+posted**. Paging on it would page for a forecast that does not exist, and the answer to it is
+`release-key`, not `reconcile-submission`. `forecast_confirmed` is written only after
+`classify_refetch` matched the stored payload against the platform, so it is the one row in
+either ledger that means *the forecast is live*. The reported set is wider than `approved` —
+an M2-711 `failed` record whose post landed late is the same disagreement — but that is not
+what distinguishes the two predicates; only `resolved` and `scored` are.
+
+The runbook says both, and says which is which, because an operator reading a listing of 1 and
+a count of 0 needs to know that is a coherent state and not a bug.
+
+### Decision — the count is reported, never held against the poll
+
+`evidence_gaps`' precedent (M1-327), and here it is load-bearing rather than tidy.
+`cli.py` returns exit 1 when `status()["unresolved"]` is non-zero, and the tournament poll is a
+systemd `Type=oneshot` restarted every five minutes with an `OnFailure` pager. Feeding this
+count into `unresolved` would fail the unit on every poll, for days, over a condition only a
+person can clear — a second pager firing 288 times a day beside the one that is throttled to
+once. The acceptance test asserts `unresolved == 0` while `unrecorded_posts == 1`; mutant
+**M10** adds the count to `unresolved` and dies there.
+
+### Decision — both exits, after the recovery loop
+
+A spending hold stops purchases, not the pending-intent loop that confirms a forecast in the
+journal, so this state is reachable on `run_once`'s early exit too — the same argument the
+daily digest already makes for itself. And the page goes *after* the loop, so a record that
+enters the state during this poll pages in this poll rather than the next one.
+
+### Decision — the body names the record and the question, and nothing else
+
+M1-334 round 1: a title is transmitted, so it is static here, and the throttle subject is the
+record id, which `Notifier._stamp_path` sha256s into a filename and never sends. The body
+carries the record id — it is the argument `reconcile-submission` takes, so an alert without it
+is an alert an operator cannot act on — and the question id, which the platform already shows.
+No rationale, no digest, no payload, no config value. The test walks every string over 24
+characters out of the stored `record_json` and asserts none of them is in the body, so it
+survives the forecast schema growing a field.
+
+### Deviation — none beyond the predicate
+
+The push, the count, the throttle and the test shape are as the criterion asks. The predicate
+is the stricter reading of what it *means*, recorded above, and it is the only place this
+implementation does not do what the criterion literally says.
+
+### Rejected — an `unrecorded_post` journal row as the transition marker
+
+`question_blocked`'s shape, and it would have given a transition to fire from. It would also be
+a second source of truth for a fact the ledger already determines — a marker and a derivation
+that can disagree, and the derivation is the one an operator can check. The criterion says the
+poll writes nothing, and there was no reason to want to.
+
+### Rejected — reusing `current_status` per candidate
+
+The first implementation called `lifecycle.current_status` for each confirmed record, to avoid
+a second copy of "the `to_status` of the highest `event_seq`" in SQL. Once the predicate became
+"was this record ever submitted" that rule was not the question being asked, and the N+1 became
+a loop with no reuse to justify it. One statement, and the status literal pinned to the
+vocabulary instead.
+
+### Rejected — an `AppConfig` field for the window or the alert
+
+It would change `config_sha256` and retire the activation on both live workers, which is the
+2026-09-09 outage. Alert kinds live in `notify.py`.
+
+### Rejected — marking the confirmed subset in `unrecorded-posts`' output
+
+Useful, and not this criterion. `unrecorded-posts` stays the listing it is; the count in
+`tournament status` is the verdict, and the runbook explains the relationship. Filed as part of
+M1-611 (`show`) territory rather than widened here.
+
+### Deferred (do not read the absence as an omission)
+
+- **The reservation is not part of the predicate.** A confirmed post whose key was somehow
+  released would not be listed by `unrecorded_posts` and *would* be counted here. That is
+  M2-716's state and the alert is right to report it; the runbook's L4 recovery does not cover
+  it, which is M2-716's job.
+- **Nothing alerts on `unrecorded_posts`' candidate shape.** A process killed before the POST
+  leaves a standing reservation and no forecast, and nothing pages for it. It costs a key, not
+  a forecast, and `release-key` is the answer; a second alert on a state that is usually
+  nothing would dilute this one.
+- **The resolutions timer is still unwatched** — M1-341. This alert fires from the tournament
+  poll only.
+- **The number of pages per poll is not capped**, and the alternative is worse. Each record in
+  this state gets its own page on the first poll that sees it, so N records cost N pushes, each
+  bounded by `_push_deadline` at `notify.timeout_seconds`. Every one of them is throttled for a
+  day afterwards and a throttled push makes no network call at all, so the cost is paid once per
+  record per day, at the end of the poll and after every ledger write has committed. A cap would
+  have to pick which records to name, deterministically, which means the records past the cap
+  never page at all — a silent subset inside the alert that exists to end silence. The bound
+  that matters is that the state itself is rare: 0 candidates on the live ledger, and one
+  instance is the whole of the incident this alert is for.
+- **Both of the reader's refusal arms are covered**, which `unrecorded_posts` (M2-713) is not:
+  its identical `sqlite3.Error` arm and its stored-type guard have no test. Not widened here —
+  it is not this branch's function and its callers are commands, not the poll — but the
+  asymmetry is deliberate and worth naming rather than leaving to be found.
+- **A `question_id` that is not stored as an integer refuses the whole read.** It is a
+  defensive check on a value read back out of the ledger, reachable only by a writer that did
+  not go through this program (the test plants one with a raw INSERT). Refusing is the right
+  direction — a poll that cannot answer this question must not report zero — but it does mean
+  one malformed row stops every poll, which is recorded here rather than discovered.
+
+### Standing risk — not verifiable offline
+
+- **The real push goes to ntfy.** The wiring is tested through a recording transport; the
+  transport contract is M1-329's and is already live.
+- **`forecast_confirmed` means what `classify_refetch` returned.** The alert inherits M2-704's
+  standing risk that Metaculus keeps returning the account's own forecast history. If the
+  platform stopped, `reconcile_forecast` would stop confirming and this alert would go quiet
+  along with `prediction_posted` — quiet, not wrong.
+- **The live count is asserted after the merge, not before.** `unrecorded-posts` reported 0
+  candidates on 2026-09-15, so `unrecorded_posts` must read 0 on the first poll after deploy.
+
+### Teeth — the mutation pass
+
+**17 mutants, run against a committed tree with `__pycache__` cleared before every run and a
+green baseline confirmed by exit code first**, over `tests/unit/test_tournament.py`,
+`tests/unit/test_submission_reconcile.py` and
+`tests/property/test_submission_reconcile_properties.py`. Every kill was read for the assertion
+that failed rather than counted.
+
+**15 killed on the first run.** The predicate: the `NOT EXISTS` clause dropped; the criterion
+read literally as a current-status comparison; the `kind` filter widened to any journal row; the
+status literal changed to `approved`; the literal mistyped with the vocabulary assertion
+deleted; the stored-type guard set to `if False`; the inner join widened to `LEFT JOIN`. The
+count: held constant at 0; added to `unresolved`. The page: suppressed entirely; a constant
+throttle subject; emitted only on the normal exit; the record id removed from the body; the
+window cut to 1800; the priority dropped to `default`.
+
+Two did not die on the first run, and they are different things.
+
+| Survivor | What it turned out to be | Resolution |
+| --- | --- | --- |
+| **M14** — page before the recovery loop | **A malformed mutant.** It inserted `_notify_unrecorded_posts(())` beside the real call rather than moving it, and an empty tuple emits nothing, so it "survived" for a reason that had nothing to do with the claim — M1-334's malformed-f-string mutant, in a different shape | **Rebuilt** so the call genuinely moves, and **killed**: the acceptance test's first poll counts 1 and pages 0 |
+| **M08** — `ORDER BY t.scope` dropped | **Equivalent under the current schema**, and proven so rather than assumed. `012`'s `tournament_events_scope(scope, kind, seq)` is a covering index for this query, so the plan is `SCAN t USING COVERING INDEX tournament_events_scope` and rows already arrive in `scope` order. `EXPLAIN QUERY PLAN` is **byte-identical with and without the clause** — the planner does not even add a sorter | **Kept.** A query-planner choice is not a guarantee: reorder or drop that index and the output order changes silently, and the reader states an order an operator relies on when reading a page beside `unrecorded-posts` |
+
+**M08 was still worth running, because the first attempt to kill it found a vacuity in the
+property itself.** The property seeded its records as `rec-alert-<serial>` with a shared
+counter, so by the time it ran the serials were three digits wide and consecutive — and for
+equal-width consecutive ids, scan order *is* sorted order. The ordering assertion could not fail
+whatever the code did. The ids now scatter (`(serial * 7919) % 100_000`, zero-padded and
+injective), which is the strictly stronger strategy; M08 still survives, and now for the reason
+above rather than because the draws could not reach the case. That is the project's recurring
+defect (`docs/LESSONS.md` lesson 9) caught by the pass it exists for.
+
+### Teeth — the property against broken code, by itself
+
+The eight mutants of the reader re-run over `test_submission_reconcile_properties.py` **alone**,
+with the unit suites excluded, so the property's own teeth are measured rather than inferred
+from a run the unit tests were in.
+
+**Four of the eight die to the property alone**, and each is a clause the property's two axes
+reach directly: the `NOT EXISTS` dropped, the `kind` filter widened, and both status-literal
+mutants. That is the pass's whole point — the partition assertion is what holds the `kind` clause
+and the `NOT EXISTS` clause up *at the same time*, and either one alone is a property of nothing.
+
+The other four survive the property **by design**, and each is killed by a unit test written for
+it. Recorded so the absence is not read as a gap:
+
+| Survivor (property alone) | Why the property cannot reach it | Killed by |
+| --- | --- | --- |
+| **M02** the criterion read literally | The property never walks a record past `submitted`; nothing it seeds is `resolved` or `scored`, and below that line the two readings agree | `test_an_ordinary_confirmed_forecast_never_pages_as_unrecorded` |
+| **M06** stored-type guard | Every `question_id` it seeds is a real `int`; a text one needs a raw INSERT past the append-only trigger | `test_the_reader_refuses_a_stored_question_id_that_is_not_an_integer` |
+| **M07** `LEFT JOIN` | Every scope it seeds names a stored record | `test_a_confirmed_scope_naming_no_stored_record_is_neither_reported_nor_raised_on` |
+| **M08** `ORDER BY` | Equivalent under `012`'s covering index — see above. Killed by nothing, and that is the finding | — |
+
+Widening the property to cover M02 was considered and not done: reaching `resolved` needs a
+resolution observation and a second writer, and the claim is about the *worker's* behaviour end
+to end, which is where the regression lives.
+
+### Round 1 — APPROVE, and the one observation was a flake worth fixing
+
+`GPT_REVIEW_RESPONSE_M1-342_r1.md`, against `fe0a8d4` (the request's pinned HEAD): **APPROVE**,
+**no blocking findings**, and all ten risk claims came back Safe. The reviewer independently
+reproduced claim 4's `config_sha256` and `prompt_sha256` rather than taking the request's word
+for it, and ran ruff, ruff format and strict mypy itself; it could not run pytest, because
+`codex exec --sandbox read-only` gives it no writable temp directory, which is the standing shape
+of every round here and exactly why `review-request.py` refuses to emit on a red branch.
+
+**One non-blocking observation, and it was right.** `test_an_unrecorded_forecast_polled_every_five_minutes_pages_once`
+started its injected clock at wall-clock `utcnow()`. `Notifier._stamp_path` keys on a *tumbling*
+window — `floor(epoch / 86400)` — so twelve five-minute polls starting in the **last 55 minutes
+of a UTC day** straddle the boundary, page twice, and fail an assertion expecting one. That is
+55/1440 of runs, about 4%, on a test in a suite whose `quality-gate` is required on master:
+the M1-333 and T-909 class, which this project has already paid for twice.
+
+Filed as a backlog candidate by the reviewer; **fixed here instead**, because a knowingly flaky
+test is a cost every future PR pays. The arithmetic was reproduced first — over twelve polls,
+a window-aligned start spans one window and a start 55 minutes before the boundary spans two —
+and then:
+
+- `_clocked` takes an explicit `start`, and `_window_start(event, offset=...)` returns the
+  instant that event's current throttle window opened. The throttle test anchors to it, so the
+  claim is about the window length and not about the hour the suite ran in.
+- `test_an_hour_of_polls_across_a_window_boundary_pages_twice` pins the other side: the same
+  twelve polls started 55 minutes before the boundary page **twice**, deliberately. The tumbling
+  window is `notify.py`'s documented choice — a sliding one needs read-then-write and
+  reintroduces the race `os.link` closes — and a duplicate alert is a better failure than a lost
+  one. What was a 4% random redden is now two deterministic tests, one of them documenting the
+  behaviour that caused it.
+- Checked for teeth: `_window_start` made to ignore its `offset` fails the new test.
+
+### Round 2 — APPROVE, and the observation was already a filed row
+
+`GPT_REVIEW_RESPONSE_M1-342_r2.md`, against `c73248b` (the request's pinned HEAD): **APPROVE**,
+no blocking findings, all five remediation risk claims Safe. Round 1's non-blocking observation
+is marked fixed. The reviewer confirmed claim 4 by running `git diff fe0a8d4..c73248b -- src/`
+itself and finding it empty, and recorded honestly that it could not reach the live ledger for
+claim 5 or start pytest in the read-only sandbox. **Two rounds.**
+
+Its own non-blocking observation was the M1-334 flake this branch disclosed rather than fixed,
+returned as a proposed backlog row — and **that row already exists as `T-909`**, filed during
+M4-801's gate run on 2026-09-14, describing the same test, the same tumbling window and the same
+23:00–00:00 UTC exposure. Nothing was filed; a duplicate would be the second one this backlog has
+carried (M0-009 duplicated T-905).
+
+**Worth recording plainly: this branch introduced a second instance of an already-filed
+defect.** `T-909`'s description is `test_a_retired_profile_polled_every_five_minutes_pages_once`
+starting its injected clock at the real `utcnow()`; the throttle test written here did exactly
+the same thing, three weeks later, in the same file, having read the brief that names T-909 as a
+reason not to run the gate between 23:00 and 00:00 UTC. The warning was read as "there is a
+midnight flake, avoid that hour" rather than as "a clock-start in a tumbling window is a defect
+shape, do not write another one". The gate for this item ran at 01:50 UTC and was never going to
+catch it.
+
+`T-909`'s acceptance criterion is, verbatim, what was implemented here — *"starts its injected
+clock at a fixed instant at least an hour before a window boundary and passes at every
+wall-clock time; a second assertion pins that starting inside the last hour of a window pages
+exactly twice"* — so `_window_start` is now the helper that closes it, and T-909 is a three-line
+change rather than an S.
+
+### Verified against the live ledger before the merge
+
+The shipped predicate, run read-only against the live MiniBench ledger (schema 16, 23
+`submission_attempts`, 20 confirmed scopes, 23 records whose history reached `submitted`):
+**0 rows**. That is the healthy reading, and it is the post-deploy check answered in advance.
+
+The literal current-status reading **also** returns 0 today, and the honest statement of the
+defect depends on saying so: it is not producing false positives now, because `resolution_events`
+is still 0 and nothing has left `submitted` yet. It becomes wrong at the first ingest. Batch 1
+resolves around 2026-09-17.

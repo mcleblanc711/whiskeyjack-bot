@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,6 +36,11 @@ from whiskeyjack_bot.submission_live import (
     require_live_submission_enabled,
 )
 from whiskeyjack_bot.submission_payload import authorized_payload
+from whiskeyjack_bot.submission_reconcile import (
+    ReconciliationError,
+    UnrecordedConfirmedPost,
+    unrecorded_confirmed_posts,
+)
 from whiskeyjack_bot.timeouts import phase_timeout
 from whiskeyjack_bot.tournament_state import (
     ActivationInactive,
@@ -119,6 +124,58 @@ def _notify_blocked(scope: str, *, reason: str, detail: str | None) -> None:
             f"Re-running `tournament enable` clears the verdict and costs one retry."
         ),
     )
+
+
+def _unrecorded(conn: sqlite3.Connection) -> tuple[UnrecordedConfirmedPost, ...]:
+    """The M1-342 read, as this module's error type.
+
+    One translation point rather than one per call site: `status` and `run_once` both ask, a
+    caller of either handles `TournamentError` and nothing else, and `ReconciliationError` is
+    already sanitized so there is nothing to strip -- only a type to change.
+    """
+    try:
+        return unrecorded_confirmed_posts(conn)
+    except ReconciliationError as exc:
+        raise TournamentError(str(exc)) from None
+
+
+def _notify_unrecorded_posts(found: Sequence[UnrecordedConfirmedPost]) -> None:
+    """Page for each forecast the platform shows and the lifecycle ledger has not recorded
+    (M1-342).
+
+    **Fired from the condition, not from the transition**, which is the opposite of
+    :func:`_notify_blocked` above and deliberately so. The two alerts are different shapes:
+    ``question_blocked`` reports a verdict *recorded once*, so alerting at the read gate that
+    replays it would re-page for a decision already taken. This reports a disagreement between
+    the platform and the attribution ledger that **holds until an operator acts**, exactly as
+    ``activation_retired`` does, and the day-long window keyed on the record is what turns a
+    five-minute poll into one page a day per record rather than 288.
+
+    The transition -- ``reconcile_forecast``'s first-confirmation guard -- was the alternative,
+    and it fires exactly once for the life of the record. Three things follow from that and all
+    three are worse: a record already confirmed before this shipped could never page; a page
+    missed at 04:00 is the only page there will ever be; and "the alert clears after
+    reconciliation" becomes unfalsifiable, because a transition hook is silent on the second
+    poll whether or not anyone reconciled anything.
+
+    Writes nothing and posts nothing. The body names the record and its question -- the platform
+    already shows the forecast publicly, and a record id is what ``reconcile-submission`` takes
+    -- and no rationale, no digest and no config value. The title is static for M1-334's reason:
+    it is transmitted, and the throttle subject is not.
+    """
+    for entry in found:
+        emit(
+            "unrecorded_post",
+            subject=entry.record_id,
+            title="whiskeyjack: a live forecast is missing from the ledger",
+            body=(
+                f"A forecast is live on the platform and the lifecycle ledger has not "
+                f"recorded the post, so it is never resolved or scored. "
+                f"record={entry.record_id} question={entry.question_id}. "
+                f"Check the question on Metaculus, then record it with `reconcile-submission` "
+                f"(runbook L4). Nothing will retry this on its own."
+            ),
+        )
 
 
 def _notify_poll_summary(data: dict[str, Any]) -> None:
@@ -336,6 +393,7 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
         "forecast_confirmed": 0,
         "comment_completed": 0,
         "unresolved": 0,
+        "unrecorded_posts": 0,
     }
     heartbeats = events(conn, "heartbeat", "worker")
     if heartbeats:
@@ -395,6 +453,13 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
     data["evidence_gaps"] = conn.execute(
         "SELECT count(DISTINCT scope) FROM tournament_events WHERE kind='evidence_gap'"
     ).fetchone()[0]
+    # Forecasts the journal confirms are live while the lifecycle ledger has not recorded the
+    # post (M1-342). Reported, like `evidence_gaps` and deliberately not added to `unresolved`:
+    # `unresolved` is the poll's own exit code (`cli.py` returns 1 for it), and a systemd unit
+    # that fails every five minutes over a condition only a person can clear would page through
+    # `whiskeyjack-notify@` on every poll and mark the timer's unit failed for days. The page
+    # for this is `_notify_unrecorded_posts`, throttled; this field is the standing count.
+    data["unrecorded_posts"] = len(_unrecorded(conn))
     data["unresolved"] += data["restored_question_holds"]
     return data
 
@@ -495,6 +560,7 @@ def run_once(
             # One of run_once's two exits. A digest hook on only the normal one would go
             # quiet in exactly the state that most warrants a digest: a spending hold.
             held_summary = status(conn, config)
+            _notify_unrecorded_posts(_unrecorded(conn))
             _notify_poll_summary(held_summary)
             return held_summary
         questions = client.get_all_open_questions_from_tournament(
@@ -769,5 +835,9 @@ def run_once(
         heartbeat["at"] = utcnow().isoformat()
         append(conn, "heartbeat", "worker", heartbeat)
         summary = status(conn, config)
+        # After the recovery loop, so a record that reaches this state during *this* poll pages
+        # in this poll rather than the next one, and at both of `run_once`'s exits for the
+        # reason the digest is: a hook on only the normal exit goes quiet under a spending hold.
+        _notify_unrecorded_posts(_unrecorded(conn))
         _notify_poll_summary(summary)
         return summary
