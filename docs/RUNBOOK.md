@@ -163,6 +163,8 @@ were written.
 | `reconcile-submission` refused | [L4](#l4--a-live-post-the-ledger-refused-to-record) — the refusal table |
 | `artifact:  NOT WRITTEN -- ...` | [L5](#l5--the-artifact-was-not-written) |
 | ntfy push `whiskeyjack: whiskeyjack-resolutions failed` | [Scheduled ingestion and scoring](#scheduled-ingestion-and-scoring) |
+| ntfy push `whiskeyjack: a live forecast is missing from the ledger` | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
+| `tournament status` shows `unrecorded_posts` above 0 | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
 
 ---
 
@@ -1303,10 +1305,37 @@ refused: a live post was made and the ledger refused to record it (<reason>); th
 or the same message ending `the artifact could not be written either; do not release ...`.
 
 **Or the command was killed while it was posting** — Ctrl-C during `submit`, systemd's
-`TimeoutStartSec` on a long poll, the OOM killer, a reboot. Nothing is printed. On the live
-worker the next poll even confirms the forecast in the tournament journal, pushes
-`whiskeyjack: forecast confirmed` and posts the private comment, so the push looks like
-success. **M1-342** is the filed alert for that silent route.
+`TimeoutStartSec` on a long poll, the OOM killer, a reboot. Nothing is printed on the command
+itself. On the live worker the next poll confirms the forecast in the tournament journal,
+pushes `whiskeyjack: forecast confirmed` and posts the private comment, so *that* push looks
+like success.
+
+**What tells you anyway (M1-342).** The same poll pages:
+
+```
+whiskeyjack: a live forecast is missing from the ledger
+A forecast is live on the platform and the lifecycle ledger has not recorded the post, so it
+is never resolved or scored. record=<record id> question=<question id>. Check the question on
+Metaculus, then record it with `reconcile-submission` (runbook L4). Nothing will retry this
+on its own.
+```
+
+and `tournament status` counts it:
+
+```json
+"unrecorded_posts": 1
+```
+
+The page repeats **once a day per record** until someone reconciles it, and it is keyed on the
+record, so two records in this state both page. It is a read: the poll writes nothing to the
+lifecycle ledger and posts nothing for it, and the count deliberately does **not** feed
+`unresolved`, so the poll's exit code and its systemd unit stay green — a unit that failed
+every five minutes over a condition only a person can clear would page through
+`whiskeyjack-notify@` on every poll for days.
+
+A **zero** count is the healthy reading, and it stays zero through resolution and scoring: the
+predicate is "the ledger never recorded the post", not "the record is not `submitted` right
+now", which every resolved forecast stops being.
 
 **What it means.** A forecast **is live on Metaculus** and the lifecycle ledger does not know:
 
@@ -1329,6 +1358,17 @@ uv run whiskeyjack-bot unrecorded-posts --config config.yaml
 lists every record holding a submission intent and a standing, unspent reservation. It reads
 the ledger only: no credential, no network. It is a list of places to look, not a verdict — a
 process killed between the intent and the POST leaves the same rows with nothing posted.
+
+`tournament status`'s `unrecorded_posts` is a different question, and it **is** a verdict: it
+counts the records whose forecast the worker's own refetch already confirmed on the platform
+and whose lifecycle ledger holds no event that ever recorded the post. The two sets usually
+overlap, and where they do not, the difference is the diagnosis:
+
+| In the listing | In the count | What it is |
+|---|---|---|
+| yes | yes | this section: a live post the ledger never recorded |
+| yes | no | the process was killed *before* the POST — check Metaculus, and if the forecast is not there, [L2](#l2--a-standing-key-reservation) |
+| no | yes | the reservation was released for a post that landed — **M2-716**, and there is no recovery for it yet |
 
 Then **look at the question on Metaculus** for each one.
 

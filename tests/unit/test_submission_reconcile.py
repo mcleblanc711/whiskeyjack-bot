@@ -931,3 +931,131 @@ def test_the_standing_reservation_hint_names_both_ways_out(
     assert "if you have confirmed nothing was posted, run" in out and "release-key" in out
     assert "if the forecast IS on Metaculus, do not release; record the post with" in out
     assert f"reconcile-submission --record-id {record_id}" in out
+
+
+# --------------------------------------------------------------------------------------
+# M1-342: the read behind the alert. The wiring, the throttle and the page's contents are
+# in `test_tournament.py`, where the notifier harness and a real poll are.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_alert_reads_the_confirmed_post_the_ledger_never_recorded(case: Any) -> None:
+    """It names the record and its question, and empties when the post is recorded.
+
+    Deliberately asserted beside `unrecorded_posts`, because the two answer different
+    questions and the alert may only ever be driven by this one.
+    """
+    from whiskeyjack_bot.submission_reconcile import (
+        UnrecordedConfirmedPost,
+        unrecorded_confirmed_posts,
+    )
+
+    conn, config, platform, *_ = case
+    assert unrecorded_confirmed_posts(conn) == ()
+
+    record_id = _killed_during_refetch(case)
+    # The candidate listing already sees it. The verdict does not: no refetch has confirmed
+    # anything yet, so at this point nothing establishes the forecast is live.
+    assert unrecorded_posts(conn) == (record_id,)
+    assert unrecorded_confirmed_posts(conn) == ()
+
+    poll(case)
+    question_id = read_forecast_record(conn, record_id).question_id
+    assert unrecorded_confirmed_posts(conn) == (
+        UnrecordedConfirmedPost(record_id=record_id, question_id=question_id),
+    )
+
+    _reconcile(case, record_id, platform)
+    assert current_status(conn, record_id) == "submitted"
+    assert unrecorded_confirmed_posts(conn) == ()
+    assert unrecorded_posts(conn) == ()
+
+
+def test_a_confirmed_scope_naming_no_stored_record_is_neither_reported_nor_raised_on(
+    case: Any,
+) -> None:
+    """The inner join's behaviour, pinned rather than left to be discovered.
+
+    No path this program takes writes one -- `reconcile_forecast` reads the record before it
+    appends -- so this is a claim about what a journal row nobody wrote does to a reader that
+    runs on the money path every five minutes. It must not make the poll refuse, and it must
+    not page for a record that does not exist.
+    """
+    from whiskeyjack_bot.submission_reconcile import unrecorded_confirmed_posts
+    from whiskeyjack_bot.tournament_state import append
+
+    conn, *_ = case
+    append(conn, "forecast_confirmed", "wj-no-such-record", {"account_id": 42})
+    assert unrecorded_confirmed_posts(conn) == ()
+
+
+def test_the_reader_refuses_a_stored_question_id_that_is_not_an_integer(case: Any) -> None:
+    """SQLite affinity converts a numeric string and stores anything else as text, so an
+    ``INTEGER NOT NULL`` column is a declaration and not an enforcement.
+
+    Reached by an INSERT rather than an UPDATE, because `forecast_records` is append-only:
+    `003`'s block trigger refuses the UPDATE first, which would have made this test pass for
+    a reason that has nothing to do with the guard. The row is a copy of the real one with a
+    new identity, so every other column and every FK is the one this program wrote.
+    """
+    from whiskeyjack_bot.submission_reconcile import unrecorded_confirmed_posts
+    from whiskeyjack_bot.tournament_state import append
+
+    conn, *_ = case
+    record_id = _killed_during_refetch(case)
+    poll(case)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(forecast_records)")]
+    stored = dict(
+        zip(
+            columns,
+            conn.execute(
+                f"SELECT {', '.join(columns)} FROM forecast_records WHERE record_id = ?",
+                (record_id,),
+            ).fetchone(),
+        )
+    )
+    stored.update(
+        record_id="wj-text-question-id",
+        question_id="45754-not-an-int",
+        forecast_version=1,
+        parent_record_id=None,
+        attempt_id="wj-text-question-id-attempt",
+        status="draft",
+    )
+    conn.execute(
+        f"INSERT INTO forecast_records ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        tuple(stored[name] for name in columns),
+    )
+    append(conn, "forecast_confirmed", "wj-text-question-id", {"account_id": 42})
+
+    with pytest.raises(ReconciliationError) as refused:
+        unrecorded_confirmed_posts(conn)
+    assert "45754-not-an-int" not in str(refused.value)
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
+
+
+def test_the_reader_refuses_a_ledger_it_cannot_read() -> None:
+    """A read failure must arrive as this module's error type, not as a raw `sqlite3.Error`.
+
+    The poll calls this every five minutes and `tournament._unrecorded` handles
+    `ReconciliationError` and nothing else, so a raw database error here would escape `run_once`
+    as an unhandled exception rather than a refusal. Driven through a connection with no schema,
+    which is the cheap reachable shape of the whole `sqlite3.Error` class. The database's own
+    text must reach neither the message nor a rendered traceback: it can echo stored values, and
+    `from None` is what keeps the suppressed context out of the render.
+    """
+    import traceback
+
+    from whiskeyjack_bot.submission_reconcile import unrecorded_confirmed_posts
+
+    schemaless = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(ReconciliationError, match="the ledger could not be read") as refused:
+            unrecorded_confirmed_posts(schemaless)
+    finally:
+        schemaless.close()
+    error = refused.value
+    assert error.__cause__ is None and error.__suppress_context__
+    rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert "no such table" not in str(error) and "no such table" not in rendered
