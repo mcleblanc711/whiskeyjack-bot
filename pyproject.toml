@@ -65,6 +65,12 @@ filterwarnings = ["error:Pydantic serializer warnings:UserWarning"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# deploy/wj-watchdog is a Python script with no .py extension -- the name systemd
+# and the runbook both use. Ruff discovers files by extension, so without this it is
+# skipped silently by both `ruff check` and `ruff format --check`, which is the worst
+# of the three outcomes: a tracked, gated file that no gate actually reads. Verified
+# against ruff 0.15.21 by planting an unused import and watching it pass, then fail.
+extend-include = ["deploy/wj-watchdog"]
 
 [tool.mypy]
 python_version = "3.11"
