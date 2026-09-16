@@ -1732,10 +1732,15 @@ def _print_show(view: RecordShow) -> None:
 
     print(f"lifecycle history ({len(view.lifecycle_history)}):")
     for event in view.lifecycle_history:
-        print(
+        line = (
             f"  - seq {event.event_seq}: {event.event_type}  "
             f"{event.from_status} -> {event.to_status}  at {event.occurred_at_utc}"
         )
+        if event.detail_code is not None:
+            line += f"  detail: {event.detail_code}"
+        if event.submission_attempt_id is not None:
+            line += f"  attempt: {event.submission_attempt_id}"
+        print(line)
     print()
 
     if view.unresolved_uncertainties:
@@ -1767,10 +1772,16 @@ def _run_show(args: argparse.Namespace) -> int:
     :func:`_open_existing_ledger`, which is read-write) and calls nothing outside
     :mod:`whiskeyjack_bot.show`, which itself reaches no submission or provider module --
     see ``tests/unit/test_show.py``. Makes no network call and spends nothing.
+
+    **Deliberately skips** :func:`logging_setup.configure_logging`, unlike every other
+    handler in this file. That call creates the log directory and opens ``logging.file``
+    for append -- a real filesystem write, and every other command's acceptance criterion
+    tolerates that; this one's says "it writes nothing," unqualified. Safe to skip here
+    because ``show`` reaches no code that would log anything sensitive to redact: its whole
+    import graph is confirmed provider-free by the tests named above.
     """
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
-    from whiskeyjack_bot.logging_setup import configure_logging
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.show import ShowError, assemble_show
 
@@ -1782,7 +1793,6 @@ def _run_show(args: argparse.Namespace) -> int:
     except AllowlistError as exc:
         print(exc)
         return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
-    configure_logging(config)
 
     connection = _open_readonly_ledger(config.storage.sqlite_path)
     if connection is None:

@@ -269,6 +269,9 @@ def test_a_record_with_an_open_uncertainty_surfaces_the_exact_attempt_id(
     assert "unresolved uncertainties (1):" in out
     assert "attempt att-uncertain-1:" in out
     assert f"verify-submission --record-id {record_id} --attempt-id att-uncertain-1" in out
+    lifecycle_line = next(line for line in out.splitlines() if "submission_uncertain" in line)
+    assert "detail: refetch_mismatch" in lifecycle_line
+    assert "attempt: att-uncertain-1" in lifecycle_line
 
 
 def test_a_record_with_a_standing_reservation_lists_it(
@@ -321,6 +324,21 @@ def test_the_command_makes_no_network_call(config_file: Path) -> None:
     """
     record_id = _seed(config_file)
     assert main(["show", "--config", str(config_file), "--record-id", record_id]) == EXIT_OK
+
+
+def test_the_command_creates_no_log_file(config_file: Path) -> None:
+    """`show` deliberately skips `configure_logging` -- round 1's blocking finding.
+
+    Every other handler calls it and that call creates the log directory and opens
+    `logging.file` for append: a real write, tolerable for every other command's
+    acceptance criterion but not for this one's unqualified "it writes nothing".
+    """
+    record_id = _seed(config_file)
+    config = load_config(config_file)
+    assert not config.logging.file.exists()
+    assert main(["show", "--config", str(config_file), "--record-id", record_id]) == EXIT_OK
+    assert not config.logging.file.exists()
+    assert not config.logging.file.parent.exists()
 
 
 def test_the_ledger_is_byte_identical_before_and_after(config_file: Path) -> None:

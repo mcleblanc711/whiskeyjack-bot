@@ -12047,3 +12047,37 @@ temporarily added to `show.py` and then reverted:
   (`asknews_sdk, forecasting_tools, http.client, httpx, requests, ssl, urllib.request` all
   appeared), which is the class of leak a static check alone cannot see if a future import
   reaches a provider client through an intermediate module the forbidden-name list doesn't name.
+
+### Round 1 review (Codex) — one blocking finding, reproduced; fixed
+
+Reviewed commit `714833d`, which was `HEAD`, so nothing was stale.
+
+**`_run_show` called `configure_logging(config)`, a real filesystem write.** Every other
+handler in `cli.py` calls it, and every other command's acceptance criterion tolerates that.
+`show`'s AC is the first to say "it writes nothing," unqualified, and `configure_logging`
+creates the log directory (`log_file.parent.mkdir(parents=True, exist_ok=True)`) and opens
+`logging.FileHandler` in append mode — on every successful invocation, not just under a
+simulated failure. Reproduced by reading `logging_setup.configure_logging` directly (confirmed
+the `mkdir`/`FileHandler` calls) and by running `show` against a fresh config and observing the
+log directory appear. Within the threat model (an ordinary local write, not a hypothetical
+attacker) and introduced by this branch (the write itself is pre-existing code, but this branch
+is what newly wires it into a command whose AC promises zero writes) — both scope tests the
+review-round contract asks for hold.
+
+Fixed by removing the `configure_logging(config)` call from `_run_show` specifically, not from
+`logging_setup.py` or any other handler. Safe because `show`'s entire import graph is already
+confirmed provider-free (the two import-boundary tests above), so there is nothing during a
+`show` invocation that would log a value needing redaction. Regression:
+`test_the_command_creates_no_log_file`, mutation-tested by temporarily reintroducing the call
+and confirming the test fails with the exact log path reported as existing, then reverting.
+
+**Non-blocking observation, acted on anyway.** The reviewer noted `docs/RUNBOOK.md`'s L1/L5
+promise that `show` surfaces a lifecycle event's attempt id and `detail_code`, but
+`_print_show`'s lifecycle-history loop printed neither — a documentation/implementation
+mismatch I had introduced myself while writing the RUNBOOK update. Rather than weaken the
+RUNBOOK claim, fixed the renderer: each lifecycle-history line now appends `detail: <code>`
+and `attempt: <id>` when the event carries them. Extended
+`test_a_record_with_an_open_uncertainty_surfaces_the_exact_attempt_id` to assert both appear on
+the `submission_uncertain` line.
+
+`scripts/gate.sh` re-run clean after both fixes (all four gates pass).
