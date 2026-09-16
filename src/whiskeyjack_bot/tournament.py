@@ -166,7 +166,7 @@ def _notify_unrecorded_posts(found: Sequence[UnrecordedConfirmedPost]) -> None:
     for entry in found:
         emit(
             "unrecorded_post",
-            subject="wj",
+            subject=entry.record_id,
             title="whiskeyjack: a live forecast is missing from the ledger",
             body=(
                 f"A forecast is live on the platform and the lifecycle ledger has not "
@@ -834,6 +834,7 @@ def run_once(
         heartbeat["complete"] = True
         heartbeat["at"] = utcnow().isoformat()
         append(conn, "heartbeat", "worker", heartbeat)
+        _notify_unrecorded_posts(())
         summary = status(conn, config)
         # After the recovery loop, so a record that reaches this state during *this* poll pages
         # in this poll rather than the next one, and at both of `run_once`'s exits for the

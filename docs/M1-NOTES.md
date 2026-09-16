@@ -10980,7 +10980,8 @@ forecast against its own refetch, appends `forecast_confirmed`, pushes **"foreca
 and posts the private comment — while `lifecycle_events` keeps the record `approved` with a
 standing key reservation, and M4-801 ingestion (which selects `to_status = 'submitted'`) never
 resolves or scores it. The operator is told success. `reconcile-submission` and
-`unrecorded-posts` shipped a fortnight of nothing looking at them.
+`unrecorded-posts` merged the same day this item started (PR #101), and nothing made anyone
+look at them.
 
 ### Delivered
 
@@ -11003,7 +11004,20 @@ resolves or scores it. The operator is told success. `reconcile-submission` and
 **No `AppConfig` field, no migration, no dependency, and no write of any kind.** A new alert
 kind is a `NotifyEvent` member plus a window; `NotifyConfig` has no event list, so nothing here
 can reach `config_sha256` and deploying this does not retire the live activation (the 2h33m
-outage of 2026-09-09, M1-334). Checked after the merge rather than assumed — below.
+outage of 2026-09-09, M1-334).
+
+**Measured rather than reasoned about.** `tournament_state.bindings(load_config(
+"config/tournament.yaml"))` was run on this branch and on `169f25b` (master) and the two are
+byte-identical:
+
+```
+config_sha256: 0dcc192f8779df81de641ec866e8f82e47677103329656d7e47cafb2d1906f09
+prompt_sha256: f72a6818ebe6992172a4d0b618fa6594de406bc85050b6deed623b1fb37b9cb1
+```
+
+That is the check M1-334's own notes say to do after the merge; done before it as well, because
+the failure it guards against costs 2h33m of a live tournament and the comparison costs a
+second.
 
 ### Decision — the predicate is "never reached `submitted`", not "is not `submitted` now"
 
