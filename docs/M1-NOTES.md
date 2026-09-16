@@ -11281,3 +11281,43 @@ and then:
   one. What was a 4% random redden is now two deterministic tests, one of them documenting the
   behaviour that caused it.
 - Checked for teeth: `_window_start` made to ignore its `offset` fails the new test.
+
+### Round 2 — APPROVE, and the observation was already a filed row
+
+`GPT_REVIEW_RESPONSE_M1-342_r2.md`, against `c73248b` (the request's pinned HEAD): **APPROVE**,
+no blocking findings, all five remediation risk claims Safe. Round 1's non-blocking observation
+is marked fixed. The reviewer confirmed claim 4 by running `git diff fe0a8d4..c73248b -- src/`
+itself and finding it empty, and recorded honestly that it could not reach the live ledger for
+claim 5 or start pytest in the read-only sandbox. **Two rounds.**
+
+Its own non-blocking observation was the M1-334 flake this branch disclosed rather than fixed,
+returned as a proposed backlog row — and **that row already exists as `T-909`**, filed during
+M4-801's gate run on 2026-09-14, describing the same test, the same tumbling window and the same
+23:00–00:00 UTC exposure. Nothing was filed; a duplicate would be the second one this backlog has
+carried (M0-009 duplicated T-905).
+
+**Worth recording plainly: this branch introduced a second instance of an already-filed
+defect.** `T-909`'s description is `test_a_retired_profile_polled_every_five_minutes_pages_once`
+starting its injected clock at the real `utcnow()`; the throttle test written here did exactly
+the same thing, three weeks later, in the same file, having read the brief that names T-909 as a
+reason not to run the gate between 23:00 and 00:00 UTC. The warning was read as "there is a
+midnight flake, avoid that hour" rather than as "a clock-start in a tumbling window is a defect
+shape, do not write another one". The gate for this item ran at 01:50 UTC and was never going to
+catch it.
+
+`T-909`'s acceptance criterion is, verbatim, what was implemented here — *"starts its injected
+clock at a fixed instant at least an hour before a window boundary and passes at every
+wall-clock time; a second assertion pins that starting inside the last hour of a window pages
+exactly twice"* — so `_window_start` is now the helper that closes it, and T-909 is a three-line
+change rather than an S.
+
+### Verified against the live ledger before the merge
+
+The shipped predicate, run read-only against the live MiniBench ledger (schema 16, 23
+`submission_attempts`, 20 confirmed scopes, 23 records whose history reached `submitted`):
+**0 rows**. That is the healthy reading, and it is the post-deploy check answered in advance.
+
+The literal current-status reading **also** returns 0 today, and the honest statement of the
+defect depends on saying so: it is not producing false positives now, because `resolution_events`
+is still 0 and nothing has left `submitted` yet. It becomes wrong at the first ingest. Batch 1
+resolves around 2026-09-17.
