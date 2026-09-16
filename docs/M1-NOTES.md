@@ -12081,3 +12081,14 @@ and `attempt: <id>` when the event carries them. Extended
 the `submission_uncertain` line.
 
 `scripts/gate.sh` re-run clean after both fixes (all four gates pass).
+
+### Round 2 review (Codex) — APPROVE
+
+Reviewed commit `a7e81a6`, which was `HEAD`, matching the request's pinned commit. Both round-1
+findings confirmed **CLOSED**: the logging-write fix ("the current call path contains no
+alternative logging setup") and the lifecycle-rendering fix ("only the two promised fields are
+appended, each when non-`None`"). No new blocking findings, no new backlog candidates. Two
+rounds: one blocking finding, one non-blocking observation acted on, then approve. The reviewer
+noted it could not execute the regression suite itself (a read-only sandbox constraint, not a
+finding) and reported against the brief's own gate output instead — consistent with this
+project's advisory-sandbox note in `scripts/run-review.sh`.
