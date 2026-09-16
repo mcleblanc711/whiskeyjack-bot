@@ -349,6 +349,57 @@ def test_an_unusable_tournament_stamp_does_not_stop_the_resolutions_check(
     assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
 
 
+@pytest.mark.parametrize(
+    ("persisted", "why"),
+    [
+        ("2026-09-17T11:55:00", "naive -- it parses, then fails at the subtraction"),
+        ("20260917", "an integer written into the TEXT column; affinity makes it basic-format"),
+        ("not a timestamp", "unparseable"),
+        ("", "empty"),
+    ],
+)
+def test_an_unusable_persisted_heartbeat_does_not_stop_the_resolutions_check(
+    watchdog: Harness, persisted: str, why: str
+) -> None:
+    """**Round-3 blocking finding**, reproduced by execution at `e8573e9` before the fix.
+
+    `_last_heartbeat` had a **third** stamp parser, guarding only `ValueError`. `created_at_utc`
+    is `TEXT NOT NULL`, but SQLite is dynamically typed and applies TEXT affinity, so the column
+    holds whatever a writer put there — and `CLAUDE.md` classifies values read back out of the
+    ledger as untrusted in as many words. A naive timestamp parses fine and then raises
+    `TypeError` at the caller, out of `main`, taking the resolutions check down with it because
+    it runs second.
+
+    Driven against a **real ledger at the real schema**, written by the real writer and then
+    updated, because the existing tests seed heartbeats through `tournament_state.append`, which
+    always emits an aware timestamp — which is exactly why nothing here saw this for two rounds.
+    """
+    # An INSERT, not an UPDATE: `012`'s `tournament_events_no_update` trigger refuses the
+    # update outright ("tournament events are append-only"), which is worth knowing because it
+    # narrows the reachable path to exactly this -- a writer appending a row whose timestamp is
+    # not what this reader assumes. Found by execution while writing this test.
+    ledger = Path(watchdog.module.LEDGER)
+    connection = sqlite3.connect(ledger)
+    try:
+        connection.execute(
+            "INSERT INTO tournament_events(event_id, kind, scope, data, created_at_utc) "
+            "VALUES ('later-heartbeat', 'heartbeat', 'worker', '{}', ?)",
+            (persisted,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    assert watchdog.run() == 1, why
+    assert watchdog.asked.count(("is-active", "whiskeyjack-resolutions.timer")) == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+    # And the worker page says something true about what it found.
+    assert (
+        "no usable heartbeat timestamp in the ledger" in watchdog.titled("WORKER DOWN")[0]["body"]
+    )
+
+
 def test_the_problem_codes_and_their_prose_are_one_closed_vocabulary() -> None:
     """Every code the detector can emit has a sentence; the push body indexes by code."""
     module = _load()

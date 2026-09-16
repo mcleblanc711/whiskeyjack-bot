@@ -121,6 +121,38 @@ def _systemctl(*args: str) -> str:
         return "unknown"
 
 
+def _aware_stamp(raw: object) -> datetime | None:
+    """A stored timestamp, or None when it is not one this program can subtract from `now`.
+
+    One parser for both subjects (M1-341 review round 2). The tournament block had its own,
+    which guarded only `ValueError` on a value it had already truthiness-tested -- so four
+    shapes a person can leave in the state file by hand escaped as a raw `TypeError` out of
+    `main`, taking down BOTH subjects and doing it silently, since this is the one unit with no
+    `OnFailure` pager. Enumerated by execution against `624da85` rather than fixed one at a
+    time, because a finding that names one escaping type usually names a class:
+
+        {"last_alert": [1]}                     TypeError: fromisoformat: argument must be str
+        {"last_alert": 3}                       TypeError: fromisoformat: argument must be str
+        {"last_alert": 1.5}                     TypeError: fromisoformat: argument must be str
+        {"last_alert": {"a": 1}}                TypeError: fromisoformat: argument must be str
+        {"last_alert": "2026-09-17T12:00:00"}   TypeError: can't subtract offset-naive and
+                                                offset-aware datetimes
+
+    The last one is the one the review did not name: it parses perfectly and fails at the
+    subtraction instead. "Unusable" therefore means all three of not-a-string, unparseable and
+    naive, and the answer to every one is the same -- no usable record that anyone was told,
+    so tell them. The dangerous direction is silence: a throttle that trusts a bad stamp either
+    raises here or waits forever.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def _last_heartbeat() -> datetime | None:
     """Newest heartbeat timestamp, or None. Read-only; never writes to the ledger."""
     if not LEDGER.exists():
@@ -138,10 +170,17 @@ def _last_heartbeat() -> datetime | None:
         return None
     if not row:
         return None
-    try:
-        return datetime.fromisoformat(row[0])
-    except ValueError:
-        return None
+    # The THIRD stamp parser, and the third round to find the same class (M1-341 review round
+    # 3). `created_at_utc` is `TEXT NOT NULL`, but SQLite is dynamically typed and applies TEXT
+    # affinity, so what comes back is whatever a writer put there -- and CLAUDE.md classifies
+    # values read back out of the ledger as untrusted, in as many words. A naive timestamp
+    # parses fine here and then raises `TypeError: can't subtract offset-naive and offset-aware
+    # datetimes` at the caller, out of `main`, taking the resolutions check down with it
+    # because it runs second. Reproduced at `e8573e9` against a real ledger, with a heartbeat
+    # of `2026-09-17T11:55:00`; an integer written into the column reduces to the same case,
+    # because affinity converts it to `'20260917'` and `fromisoformat` reads that as a
+    # basic-format naive date. One parser, the same one both throttles use.
+    return _aware_stamp(row[0])
 
 
 def _load_state() -> dict:
@@ -202,38 +241,6 @@ def _ping_deadman() -> None:
         urllib.request.urlopen(url, timeout=DEADMAN_TIMEOUT_SECONDS).close()
     except (urllib.error.URLError, OSError, ValueError):
         pass
-
-
-def _aware_stamp(raw: object) -> datetime | None:
-    """A stored timestamp, or None when it is not one this program can subtract from `now`.
-
-    One parser for both subjects (M1-341 review round 2). The tournament block had its own,
-    which guarded only `ValueError` on a value it had already truthiness-tested -- so four
-    shapes a person can leave in the state file by hand escaped as a raw `TypeError` out of
-    `main`, taking down BOTH subjects and doing it silently, since this is the one unit with no
-    `OnFailure` pager. Enumerated by execution against `624da85` rather than fixed one at a
-    time, because a finding that names one escaping type usually names a class:
-
-        {"last_alert": [1]}                     TypeError: fromisoformat: argument must be str
-        {"last_alert": 3}                       TypeError: fromisoformat: argument must be str
-        {"last_alert": 1.5}                     TypeError: fromisoformat: argument must be str
-        {"last_alert": {"a": 1}}                TypeError: fromisoformat: argument must be str
-        {"last_alert": "2026-09-17T12:00:00"}   TypeError: can't subtract offset-naive and
-                                                offset-aware datetimes
-
-    The last one is the one the review did not name: it parses perfectly and fails at the
-    subtraction instead. "Unusable" therefore means all three of not-a-string, unparseable and
-    naive, and the answer to every one is the same -- no usable record that anyone was told,
-    so tell them. The dangerous direction is silence: a throttle that trusts a bad stamp either
-    raises here or waits forever.
-    """
-    if not isinstance(raw, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
 
 
 def _resolutions_problems(
@@ -371,7 +378,10 @@ def _check_tournament(state: dict) -> bool:
     beat = _last_heartbeat()
     age_text = "never"
     if beat is None:
-        problems.append("no heartbeat row in the ledger at all")
+        # Covers both "no row" and "a row whose timestamp this program cannot use": the
+        # message has to be true of the case the operator is actually looking at, and the
+        # runbook's symptom index quotes it.
+        problems.append("no usable heartbeat timestamp in the ledger")
     else:
         age = _now() - beat
         minutes = age.total_seconds() / 60
