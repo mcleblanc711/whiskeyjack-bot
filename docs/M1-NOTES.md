@@ -11866,3 +11866,22 @@ audit above is what should have been done in round 1's remediation rather than r
 one exception type. The refinement this item paid for: **enumerate the siblings of the *entry
 point*, not of the *value*.** Ask where a value enters the program from outside it — here, three
 places — and check all of them at once.
+
+**Round 5 — APPROVE on `07a6990`** (2026-09-16, local Codex against
+`GPT_REVIEW_REQUEST_M1-341_r5.md`). **Zero blocking findings; all six prior findings closed**,
+and all six risk areas Safe, including the entry-point audit: *"no seventh product-path entry
+point capable of suppressing the resolutions push was found."*
+
+Five rounds, six blocking findings, none disputed. The two non-blocking observations are filed
+with acceptance criteria rather than fixed: **M1-344** (an unwritable state file defeats the
+daily bound) and **M1-345**, new this round — the per-subject `print` calls are unguarded, so a
+stdout that raises escapes `main`.
+
+**M1-345 is worth recording at the strength the reviewer measured it, not at the strength the
+headline suggests.** Against a *real* closed, normally buffered stdout pipe, `main()` completed
+both resolutions queries and delivered the resolutions push before the final flush raised —
+nothing was suppressed. Suppressing the push needed a non-product write-through stdout object.
+So it is defence in depth on the one unit with no `OnFailure` pager, not a live defect, and it is
+the same family as the six findings this item closed: an outward call trusted further than it had
+been checked. Filing it rather than fixing it keeps round 5 an approval instead of a seventh
+round on a condition nothing has met.
