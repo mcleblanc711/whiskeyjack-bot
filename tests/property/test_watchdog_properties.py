@@ -195,6 +195,51 @@ def test_a_fault_set_that_has_never_been_paged_pages_whatever_the_stamp_says(
 
 
 @given(
+    raw=st.one_of(
+        st.none(),
+        st.booleans(),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.lists(st.integers(), max_size=3),
+        st.dictionaries(st.text(max_size=3), st.integers(), max_size=2),
+        st.text(max_size=40),
+        st.datetimes(timezones=st.just(timezone.utc)).map(lambda moment: moment.isoformat()),
+        st.datetimes().map(lambda moment: moment.isoformat()),
+    )
+)
+def test_the_stamp_parser_is_total_and_returns_only_aware_instants(raw: object) -> None:
+    """`_aware_stamp` is the single parser both throttles use, so it has to be total.
+
+    It is the round-2 fix: the tournament block's own parser guarded only `ValueError` on a
+    value it had truthiness-tested, so a list, an int, a float, a dict or a **naive** ISO
+    string each escaped as a raw `TypeError` out of `main` and took down both subjects. The
+    draw includes aware and naive `isoformat()` output precisely so both halves are reachable
+    -- without the aware branch this degenerates into "always None", which a parser that never
+    parses anything also satisfies.
+    """
+    parsed = watchdog._aware_stamp(raw)
+    assert parsed is None or isinstance(parsed, datetime)
+    if parsed is not None:
+        assert parsed.tzinfo is not None
+        # Whatever it returns can be subtracted from an aware `now` without raising.
+        assert isinstance(ANCHOR - parsed, timedelta)
+    if not isinstance(raw, str) or isinstance(raw, bool):
+        assert parsed is None
+
+
+@given(moment=st.datetimes(timezones=st.just(timezone.utc)))
+def test_an_aware_stamp_survives_the_round_trip_through_the_state_file(moment: datetime) -> None:
+    """What the watchdog writes, it must read back as the same instant.
+
+    `_check_resolutions` stores `_now().isoformat()` and `_alert_is_due` reads it back through
+    `_aware_stamp`, with the JSON file in between -- so the throttle is only a 24-hour window
+    if that round trip is the identity.
+    """
+    stored = json.loads(json.dumps({"last_alert": moment.isoformat()}))
+    assert watchdog._aware_stamp(stored["last_alert"]) == moment
+
+
+@given(
     stamp=st.one_of(
         st.none(),
         st.booleans(),

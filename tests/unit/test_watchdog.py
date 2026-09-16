@@ -238,8 +238,115 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
     assert module.WORST_CASE_SECONDS == (
         9 * module.SYSTEMCTL_TIMEOUT_SECONDS
         + module.LEDGER_TIMEOUT_SECONDS
-        + 3 * module.HTTP_TIMEOUT_SECONDS
+        + 2 * module.PUSH_TIMEOUT_SECONDS
+        + module.DEADMAN_TIMEOUT_SECONDS
     )
+
+
+def test_every_outward_call_passes_the_timeout_the_budget_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The budget is only a bound if the code really passes those numbers.
+
+    **Round-2 blocking finding, and it was mine.** Naming the timeouts as constants, I
+    substituted one shared `HTTP_TIMEOUT_SECONDS` into both `urlopen` sites — which silently
+    took the dead-man ping from 10 seconds to 15, a change to tournament behaviour this item
+    promised not to make, in the same commit whose message claimed every substitution kept its
+    value. Nothing observed the timeouts, so nothing caught it. This does: it drives a full run
+    with the real `_push` and `_ping_deadman` and records what each outward call was given.
+    """
+    module = _load()
+    seen: dict[str, object] = {}
+
+    class _Completed:
+        stdout = "inactive"
+
+    def fake_run(argv: object, **kwargs: Any) -> _Completed:
+        seen["systemctl"] = kwargs["timeout"]
+        return _Completed()
+
+    ledger = tmp_path / "data" / "l.sqlite3"
+    seeded_ledger(ledger, heartbeat_at=ANCHOR - timedelta(hours=3))
+    real_connect = sqlite3.connect
+
+    def fake_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        seen["ledger"] = kwargs["timeout"]
+        return real_connect(*args, **kwargs)
+
+    class _Response:
+        status = 200
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def fake_urlopen(target: Any, timeout: int | None = None) -> _Response:
+        # A push sends a Request; the dead-man ping sends a bare URL string.
+        seen["push" if hasattr(target, "get_method") else "ping"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(module, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(module, "LEDGER", ledger)
+    monkeypatch.setattr(module, "_now", lambda: ANCHOR)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("NTFY_TOPIC_URL", "https://ntfy.invalid/wj-fake-topic-0001")
+
+    assert module.main() == 1, "everything is inactive, so both subjects are down"
+    assert seen["systemctl"] == module.SYSTEMCTL_TIMEOUT_SECONDS
+    assert seen["ledger"] == module.LEDGER_TIMEOUT_SECONDS
+    assert seen["push"] == module.PUSH_TIMEOUT_SECONDS
+
+    # The ping only fires on the healthy tournament path, so drive that separately.
+    seen.clear()
+    monkeypatch.setenv("WJ_HEALTHCHECK_URL", "https://hc.invalid/wj-fake-ping-0001")
+    module._ping_deadman()
+    assert seen["ping"] == module.DEADMAN_TIMEOUT_SECONDS
+    assert module.DEADMAN_TIMEOUT_SECONDS == 10, "the value the vendored script passed"
+    assert module.DEADMAN_TIMEOUT_SECONDS != module.PUSH_TIMEOUT_SECONDS, (
+        "they are separate constants precisely so one cannot be substituted for the other"
+    )
+
+
+@pytest.mark.parametrize(
+    ("stamp", "why"),
+    [
+        ([1], "a list"),
+        (3, "an integer"),
+        (1.5, "a float"),
+        ({"a": 1}, "a nested object"),
+        ("2026-09-17T12:00:00", "naive -- it parses, then fails at the subtraction"),
+        (True, "a bool, which is not a str"),
+    ],
+)
+def test_an_unusable_tournament_stamp_does_not_stop_the_resolutions_check(
+    watchdog: Harness, stamp: object, why: str
+) -> None:
+    """**Round-2 blocking finding**, reproduced by execution at `624da85` before the fix.
+
+    The state file is a valid JSON *object* here — round 1's fix does not reach this — and the
+    tournament block's own parser guarded only `ValueError` on a value it had truthiness-tested.
+    Four shapes escaped as a raw `TypeError` out of `main`, with no resolutions query asked and
+    no push attempted.
+
+    The naive-ISO case is the sibling the review did **not** name: it parses perfectly and dies
+    at `now - last` instead. Enumerating siblings by execution rather than fixing the one named
+    type is M1-308's lesson; all six shapes are driven through a full `main()` run.
+    """
+    Path(watchdog.module.STATE).write_text(
+        json.dumps({"alerting": True, "last_alert": stamp}), encoding="utf-8"
+    )
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    assert watchdog.run() == 1, why
+    assert watchdog.asked.count(("is-active", "whiskeyjack-resolutions.timer")) == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
 
 
 def test_the_problem_codes_and_their_prose_are_one_closed_vocabulary() -> None:

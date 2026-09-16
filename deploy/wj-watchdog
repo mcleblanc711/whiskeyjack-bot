@@ -64,7 +64,11 @@ RECOVERY_NOTICE = True
 # inline so the bound below is arithmetic over the real numbers instead of a comment.
 SYSTEMCTL_TIMEOUT_SECONDS = 15
 LEDGER_TIMEOUT_SECONDS = 10
-HTTP_TIMEOUT_SECONDS = 15
+PUSH_TIMEOUT_SECONDS = 15
+# The dead-man ping keeps its own 10s and does NOT share the push timeout. Round 2 caught the
+# substitution that gave it 15: the tournament path then blocked five seconds longer against a
+# slow healthcheck endpoint, which is a change to behaviour this item promised not to touch.
+DEADMAN_TIMEOUT_SECONDS = 10
 # What one run may spend if every one of those calls blocks to its own timeout: nine systemctl
 # queries (four tournament, three resolutions, two diagnostic `show`), one ledger read, and
 # three HTTP calls (two pushes and the dead-man ping). `TimeoutStartSec` in
@@ -75,7 +79,10 @@ HTTP_TIMEOUT_SECONDS = 15
 # cross-model review, round 1. tests/unit/test_watchdog.py reads the deadline out of the unit
 # file and asserts it still exceeds this, so the two cannot drift apart.
 WORST_CASE_SECONDS = (
-    9 * SYSTEMCTL_TIMEOUT_SECONDS + LEDGER_TIMEOUT_SECONDS + 3 * HTTP_TIMEOUT_SECONDS
+    9 * SYSTEMCTL_TIMEOUT_SECONDS
+    + LEDGER_TIMEOUT_SECONDS
+    + 2 * PUSH_TIMEOUT_SECONDS
+    + DEADMAN_TIMEOUT_SECONDS
 )
 
 RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
@@ -175,7 +182,7 @@ def _push(title: str, body: str, *, priority: str, tags: str) -> bool:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=PUSH_TIMEOUT_SECONDS) as response:
             return 200 <= response.status < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
@@ -192,9 +199,41 @@ def _ping_deadman() -> None:
     if not url:
         return
     try:
-        urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS).close()
+        urllib.request.urlopen(url, timeout=DEADMAN_TIMEOUT_SECONDS).close()
     except (urllib.error.URLError, OSError, ValueError):
         pass
+
+
+def _aware_stamp(raw: object) -> datetime | None:
+    """A stored timestamp, or None when it is not one this program can subtract from `now`.
+
+    One parser for both subjects (M1-341 review round 2). The tournament block had its own,
+    which guarded only `ValueError` on a value it had already truthiness-tested -- so four
+    shapes a person can leave in the state file by hand escaped as a raw `TypeError` out of
+    `main`, taking down BOTH subjects and doing it silently, since this is the one unit with no
+    `OnFailure` pager. Enumerated by execution against `624da85` rather than fixed one at a
+    time, because a finding that names one escaping type usually names a class:
+
+        {"last_alert": [1]}                     TypeError: fromisoformat: argument must be str
+        {"last_alert": 3}                       TypeError: fromisoformat: argument must be str
+        {"last_alert": 1.5}                     TypeError: fromisoformat: argument must be str
+        {"last_alert": {"a": 1}}                TypeError: fromisoformat: argument must be str
+        {"last_alert": "2026-09-17T12:00:00"}   TypeError: can't subtract offset-naive and
+                                                offset-aware datetimes
+
+    The last one is the one the review did not name: it parses perfectly and fails at the
+    subtraction instead. "Unusable" therefore means all three of not-a-string, unparseable and
+    naive, and the answer to every one is the same -- no usable record that anyone was told,
+    so tell them. The dangerous direction is silence: a throttle that trusts a bad stamp either
+    raises here or waits forever.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _resolutions_problems(
@@ -229,14 +268,8 @@ def _alert_is_due(codes: tuple[str, ...], stored: dict, now: datetime) -> bool:
         return False
     if stored.get("key") != _throttle_key(codes):
         return True
-    raw = stored.get("last_alert")
-    if not isinstance(raw, str):
-        return True
-    try:
-        last = datetime.fromisoformat(raw)
-    except ValueError:
-        return True
-    if last.tzinfo is None:
+    last = _aware_stamp(stored.get("last_alert"))
+    if last is None:
         return True
     return (now - last) >= RESOLUTIONS_REALERT_AFTER
 
@@ -352,13 +385,9 @@ def _check_tournament(state: dict) -> bool:
             )
 
     previously_bad = bool(state.get("alerting"))
-    last_alert_raw = state.get("last_alert")
-    last_alert = None
-    if last_alert_raw:
-        try:
-            last_alert = datetime.fromisoformat(last_alert_raw)
-        except ValueError:
-            last_alert = None
+    # Same parser as the resolutions throttle. The RULE is unchanged -- a stamp this program
+    # cannot use means no prior alert -- but it is now total over what the file can hold.
+    last_alert = _aware_stamp(state.get("last_alert"))
 
     if problems:
         due = last_alert is None or (_now() - last_alert) >= REALERT_AFTER
