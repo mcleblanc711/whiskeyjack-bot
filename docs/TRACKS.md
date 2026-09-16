@@ -78,6 +78,7 @@ near zero this time, with no other lane open when it started and one when it mer
 | M1-341 | feat/m1-341-watchdog-resolutions-timer | whiskeyjack-m1-341 | no | none | 2026-09-15 |
 | T-909 | feat/t-909-pin-retired-profile-clock | whiskeyjack-t-909 | no | none | 2026-09-15 |
 | M1-611 | feat/m1-611-show-record-id | whiskeyjack-m1-611 | no | none | 2026-09-16 |
+| M1-612 | feat/m1-612-show-record-history | whiskeyjack-m1-612 | no | none | 2026-09-16 |
 *(Merged and left in place, per the rule below: **D-1001** (PR #95, round-3 approve,
 2026-09-12 — the operator runbook, `docs/RUNBOOK.md`, 21 failure states; it filed six rows,
 of which **M2-713** is Critical: a live post the ledger refused to record, with no
