@@ -18,7 +18,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +36,19 @@ from whiskeyjack_bot.forecast.schema import response_model_for, validate_forecas
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     SubmissionAttempt,
+    SubmissionVerification,
+    record_local_scores,
+    record_pre_forecast_failure,
+    record_resolution_observation,
     record_submission_attempt,
+    record_submission_verification,
     record_validation,
     transaction,
 )
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 from whiskeyjack_bot.submission import reserve_submission_key
+
+from resolution_rows import kind_payload
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROMPT_TEXT = (REPO_ROOT / "prompts" / "forecaster.md").read_text(encoding="utf-8")
@@ -179,6 +186,79 @@ def _approve(config_file: Path, record_id: str) -> None:
     assert code == EXIT_OK
 
 
+POST_ID = 456
+
+
+def _seed_pre_forecast_failure(config_file: Path) -> None:
+    """One failed attempt under `ATTEMPT` before the record that later succeeds under it.
+
+    Must run before :func:`_seed`: `pipeline_failure_events_validate_on_insert` refuses a
+    failure for an `attempt_id` that already produced a successful forecast record.
+    """
+    config = load_config(config_file)
+    config.storage.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    initialize_ledger(config.storage.sqlite_path)
+    conn = connect(config.storage.sqlite_path)
+    try:
+        record_pre_forecast_failure(
+            conn,
+            attempt_id=ATTEMPT,
+            question_id=QUESTION_ID,
+            tournament_id=TOURNAMENT,
+            event_type="research_failed",
+            detail_code="provider_unavailable",
+            occurred_at=GENERATED_AT - timedelta(minutes=10),
+        )
+    finally:
+        conn.close()
+
+
+def _drive_full_history(config_file: Path, record_id: str) -> None:
+    """Approve, then push the record all the way through submission, resolution and scoring.
+
+    Exercises every category M1-612's merged history covers: an uncertain attempt (so a
+    verification is needed to resolve it), a resolution observation, and a local score.
+    """
+    _approve(config_file, record_id)
+    config = load_config(config_file)
+    conn = connect(config.storage.sqlite_path)
+    try:
+        record_submission_attempt(
+            conn,
+            record_id=record_id,
+            attempt=SubmissionAttempt(
+                attempt_id="att-live-1",
+                idempotency_key="idem-live-1",
+                requested_at_utc=WHEN,
+                completed_at_utc=WHEN,
+                request_payload_sha256="e" * 64,
+                success=True,
+                refetch_outcome="absent",
+            ),
+            occurred_at=WHEN,
+            detail_code="refetch_missing",
+            secret_env_var_names=(),
+        )
+        record_submission_verification(
+            conn,
+            record_id=record_id,
+            verification=SubmissionVerification(
+                submission_attempt_id="att-live-1",
+                outcome="confirmed",
+                observed_at_utc=WHEN,
+                refetched_forecast_snapshot="{}",
+            ),
+            occurred_at=WHEN,
+        )
+        source = kind_payload("binary", "resolved", post_id=POST_ID, question_id=QUESTION_ID)
+        record_resolution_observation(
+            conn, record_id=record_id, source_response=source, observed_at=WHEN
+        )
+        record_local_scores(conn, record_id=record_id, computed_at=WHEN)
+    finally:
+        conn.close()
+
+
 def _ledger_files(config_file: Path) -> list[Path]:
     config = load_config(config_file)
     base = config.storage.sqlite_path
@@ -294,6 +374,78 @@ def test_a_record_with_a_standing_reservation_lists_it(
     assert "standing key reservations (1):" in out
     assert reservation.reservation_id in out
     assert "idem-standing" in out
+
+
+def test_every_linked_category_appears_with_an_identifying_field(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M1-612's acceptance criterion, read literally: submission, verification,
+    pre-forecast failure, resolution and score events each get their own section."""
+    _seed_pre_forecast_failure(config_file)
+    record_id = _seed(config_file)
+    _drive_full_history(config_file, record_id)
+    capsys.readouterr()  # discard `approve`'s own printed output
+
+    assert main(["show", "--config", str(config_file), "--record-id", record_id]) == EXIT_OK
+    out = capsys.readouterr().out
+
+    assert "submission attempts (1):" in out
+    assert "att-live-1" in out
+    assert "submission verifications (1):" in out
+    assert "outcome: confirmed" in out
+    assert "resolution history (1):" in out
+    assert "outcome: yes" in out
+    assert "score history (2):" in out
+    assert "pre-forecast failures (1):" in out
+    assert "research_failed" in out
+    assert "status:    scored" in out
+
+
+def test_the_canonical_history_section_lists_every_category_in_chronological_order(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_pre_forecast_failure(config_file)
+    record_id = _seed(config_file)
+    _drive_full_history(config_file, record_id)
+    capsys.readouterr()
+
+    assert main(["show", "--config", str(config_file), "--record-id", record_id]) == EXIT_OK
+    out = capsys.readouterr().out
+
+    block = out.split("canonical history (", 1)[1]
+    count = int(block.split("):", 1)[0])
+    lines = [line for line in block.splitlines()[1:] if line.startswith("  - ")]
+    assert len(lines) == count
+    # Every category named in the acceptance criterion appears at least once.
+    for kind in (
+        "[approval]",
+        "[submission_attempt]",
+        "[submission_verification]",
+        "[lifecycle]",
+        "[pre_forecast_failure]",
+        "[resolution]",
+        "[score]",
+    ):
+        assert any(kind in line for line in lines), kind
+    # The executable form of "chronological order": parse each line's own leading
+    # timestamp back out and assert the sequence never goes backwards.
+    timestamps = [re.match(r"^\s*-\s*(\S+)\s+\[", line).group(1) for line in lines]  # type: ignore[union-attr]
+    assert timestamps == sorted(timestamps)
+
+
+def test_the_ledger_is_byte_identical_before_and_after_a_full_canonical_history(
+    config_file: Path,
+) -> None:
+    """The byte-identity acceptance criterion, against the fuller ledger M1-612 adds
+    reads for -- not a replacement for the simpler existing check above, since a new
+    reader touching a table the simpler test never populates could still write."""
+    _seed_pre_forecast_failure(config_file)
+    record_id = _seed(config_file)
+    _drive_full_history(config_file, record_id)
+    before = _ledger_hash(config_file)
+    assert main(["show", "--config", str(config_file), "--record-id", record_id]) == EXIT_OK
+    after = _ledger_hash(config_file)
+    assert before == after
 
 
 def test_the_command_requires_a_record_id(config_file: Path) -> None:

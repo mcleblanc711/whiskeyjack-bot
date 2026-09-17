@@ -42,12 +42,17 @@ from whiskeyjack_bot.lifecycle import (
     PreForecastFailure,
     PreForecastFailureCode,
     RefetchOutcome,
+    StoredSubmissionAttempt,
+    StoredSubmissionVerification,
     SubmissionAttempt,
     SubmissionVerification,
     current_status,
     read_history,
     read_pipeline_failure_events,
+    read_submission_attempts,
+    read_submission_verifications,
     record_approval,
+    record_attempt_id,
     record_failure,
     record_pre_forecast_failure,
     record_submission_attempt,
@@ -2338,6 +2343,115 @@ def test_unresolved_uncertainties_rejects_an_unknown_record(ledger: sqlite3.Conn
     # outstanding" from "no such record" would post on the strength of the second.
     with pytest.raises(LifecycleError):
         unresolved_uncertainties(ledger, "no-such-record")
+
+
+# --------------------------------------------------------------------------------------
+# read_submission_attempts / read_submission_verifications / record_attempt_id (M1-612)
+# --------------------------------------------------------------------------------------
+
+
+def test_read_submission_attempts_returns_every_attempt_in_request_order(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = draft
+    assert read_submission_attempts(conn, record_id) == ()
+    _approve(conn, record_id)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(success=True, refetch="absent"),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+        secret_env_var_names=(),
+    )
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(
+            attempt_id="att-2",
+            key="idem-2",
+            success=True,
+            refetch="absent",
+            requested_at_utc=WHEN + timedelta(minutes=5),
+            completed_at_utc=WHEN + timedelta(minutes=5),
+        ),
+        occurred_at=WHEN + timedelta(minutes=5),
+        detail_code="refetch_missing",
+        secret_env_var_names=(),
+    )
+
+    attempts = read_submission_attempts(conn, record_id)
+    assert [a.attempt_id for a in attempts] == ["att-1", "att-2"]
+    first = attempts[0]
+    assert isinstance(first, StoredSubmissionAttempt)
+    assert first.forecast_record_id == record_id
+    assert first.idempotency_key == "idem-1"
+    assert first.success is True
+    assert first.refetch_outcome == "absent"
+    assert first.http_status is None
+    assert first.error_type is None
+
+
+def test_read_submission_attempts_rejects_an_unknown_record(ledger: sqlite3.Connection) -> None:
+    with pytest.raises(LifecycleError):
+        read_submission_attempts(ledger, "no-such-record")
+
+
+def test_read_submission_verifications_joins_through_the_attempt(
+    draft: tuple[sqlite3.Connection, str],
+) -> None:
+    conn, record_id = draft
+    assert read_submission_verifications(conn, record_id) == ()
+    _approve(conn, record_id)
+    record_submission_attempt(
+        conn,
+        record_id=record_id,
+        attempt=_attempt(success=True, refetch="absent"),
+        occurred_at=WHEN,
+        detail_code="refetch_missing",
+        secret_env_var_names=(),
+    )
+    record_submission_verification(
+        conn,
+        record_id=record_id,
+        verification=_verification(refetched_forecast_snapshot="{}"),
+        occurred_at=WHEN,
+    )
+
+    verifications = read_submission_verifications(conn, record_id)
+    assert len(verifications) == 1
+    verification = verifications[0]
+    assert isinstance(verification, StoredSubmissionVerification)
+    assert verification.submission_attempt_id == "att-1"
+    assert verification.outcome == "confirmed"
+
+
+def test_read_submission_verifications_rejects_an_unknown_record(
+    ledger: sqlite3.Connection,
+) -> None:
+    with pytest.raises(LifecycleError):
+        read_submission_verifications(ledger, "no-such-record")
+
+
+def test_record_attempt_id_reads_the_stamped_value(draft: tuple[sqlite3.Connection, str]) -> None:
+    conn, record_id = draft
+    assert record_attempt_id(conn, record_id) == f"att-{record_id}"
+
+
+def test_record_attempt_id_is_none_for_a_pre_004_record(tmp_path: Path) -> None:
+    db = tmp_path / "ledger.sqlite3"
+    _seed_v2_ledger(db)
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION
+    conn = connect(db)
+    try:
+        assert record_attempt_id(conn, LEGACY_RECORD) is None
+    finally:
+        conn.close()
+
+
+def test_record_attempt_id_rejects_an_unknown_record(ledger: sqlite3.Connection) -> None:
+    with pytest.raises(LifecycleError):
+        record_attempt_id(ledger, "no-such-record")
 
 
 def test_a_refetch_cannot_resolve_an_attempt_that_was_never_uncertain(

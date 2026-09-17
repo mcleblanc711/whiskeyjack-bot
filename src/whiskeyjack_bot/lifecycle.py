@@ -467,6 +467,44 @@ class SubmissionVerification:
 
 
 @dataclass(frozen=True)
+class StoredSubmissionAttempt:
+    """A ``submission_attempts`` row, read back in full (M1-612).
+
+    Constructed only by this module, from a row the database has already accepted --
+    the same contract :class:`LifecycleEvent`/:class:`PreForecastFailure` carry.
+    Deliberately omits ``response_body``/``response_headers``/``error_message``/
+    ``refetched_forecast_snapshot``: identifying and status fields only, matching how
+    ``show`` already summarizes lifecycle detail (a ``detail_code`` and an attempt id,
+    never the full row). The raw response is available in full through M1-604's export,
+    a different tool for that job.
+    """
+
+    attempt_id: str
+    forecast_record_id: str
+    idempotency_key: str
+    requested_at_utc: str
+    completed_at_utc: str | None
+    request_payload_sha256: str
+    http_status: int | None
+    success: bool
+    error_type: str | None
+    refetch_outcome: RefetchOutcome | None
+
+
+@dataclass(frozen=True)
+class StoredSubmissionVerification:
+    """A ``submission_verifications`` row, read back in full (M1-612).
+
+    Constructed only by this module, for :class:`StoredSubmissionAttempt`'s reason.
+    """
+
+    verification_id: int
+    submission_attempt_id: str
+    outcome: VerificationOutcome
+    observed_at_utc: str
+
+
+@dataclass(frozen=True)
 class SubmissionReconciliation:
     """A post the ledger never recorded, and the evidence that it reached the platform (M2-713).
 
@@ -1076,6 +1114,24 @@ def unresolved_uncertainties(conn: sqlite3.Connection, record_id: str) -> tuple[
     return tuple(_stored_text(row[0], "submission_attempt_id") for row in rows)
 
 
+def record_attempt_id(conn: sqlite3.Connection, record_id: str) -> str | None:
+    """The ``attempt_id`` this record's ``forecast_records`` row was stamped with (M1-612).
+
+    ``004_pipeline_failure_events.sql`` adds the column and stamps every new record at
+    INSERT time; ``None`` for a pre-004 row. This is the join key
+    :func:`read_pipeline_failure_events` needs -- that table has no ``forecast_record_id``
+    column at all, because a pre-forecast failure can occur before any record exists.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    row = _fetch_one(
+        conn, "SELECT attempt_id FROM forecast_records WHERE record_id = ?", (identifier,)
+    )
+    if row is None:  # pragma: no cover - _require_stored_record already proved existence
+        raise LifecycleError("the recorded forecast record could not be read back")
+    return None if row[0] is None else _stored_text(row[0], "attempt_id")
+
+
 def record_validation(
     conn: sqlite3.Connection, *, record_id: str, occurred_at: datetime
 ) -> LifecycleEvent:
@@ -1356,6 +1412,56 @@ def record_submission_attempt(
         )
 
 
+_SUBMISSION_ATTEMPT_COLUMNS = (
+    "attempt_id, forecast_record_id, idempotency_key, requested_at_utc, "
+    "completed_at_utc, request_payload_sha256, http_status, success, error_type, "
+    "refetch_outcome"
+)
+
+
+def _submission_attempt_from_row(row: sqlite3.Row) -> StoredSubmissionAttempt:
+    """Build the value object from a stored row, gating every vocabulary field."""
+    success = row[7]
+    if type(success) is not int or success not in (0, 1):
+        raise LifecycleError(
+            "stored success is not a 0/1 flag (detail withheld: it can echo stored values)"
+        )
+    return StoredSubmissionAttempt(
+        attempt_id=_stored_text(row[0], "attempt_id"),
+        forecast_record_id=_stored_text(row[1], "forecast_record_id"),
+        idempotency_key=_stored_text(row[2], "idempotency_key"),
+        requested_at_utc=_stored_text(row[3], "requested_at_utc"),
+        completed_at_utc=(None if row[4] is None else _stored_text(row[4], "completed_at_utc")),
+        request_payload_sha256=_stored_text(row[5], "request_payload_sha256"),
+        http_status=(None if row[6] is None else _stored_int(row[6], "http_status")),
+        success=bool(success),
+        error_type=(None if row[8] is None else _stored_text(row[8], "error_type")),
+        refetch_outcome=(
+            None
+            if row[9] is None
+            else cast(RefetchOutcome, _require_member(row[9], _REFETCH_OUTCOMES, "refetch_outcome"))
+        ),
+    )
+
+
+def read_submission_attempts(
+    conn: sqlite3.Connection, record_id: str
+) -> tuple[StoredSubmissionAttempt, ...]:
+    """Every submission attempt recorded against this record, in request order (M1-612).
+
+    An unknown ``record_id`` raises, for :func:`read_forecast_summary`'s reason.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    rows = _fetch_all(
+        conn,
+        f"SELECT {_SUBMISSION_ATTEMPT_COLUMNS} FROM submission_attempts "
+        "WHERE forecast_record_id = ? ORDER BY requested_at_utc, attempt_id",
+        (identifier,),
+    )
+    return tuple(_submission_attempt_from_row(row) for row in rows)
+
+
 def record_submission_verification(
     conn: sqlite3.Connection,
     *,
@@ -1444,6 +1550,48 @@ def record_submission_verification(
             submission_verification_id=verification_id,
             occurred_at_utc=occurred,
         )
+
+
+_SUBMISSION_VERIFICATION_COLUMNS = (
+    "verification_id, submission_attempt_id, outcome, observed_at_utc"
+)
+
+
+def _submission_verification_from_row(row: sqlite3.Row) -> StoredSubmissionVerification:
+    """Build the value object from a stored row, gating every vocabulary field."""
+    return StoredSubmissionVerification(
+        verification_id=_stored_int(row[0], "verification_id"),
+        submission_attempt_id=_stored_text(row[1], "submission_attempt_id"),
+        outcome=cast(
+            VerificationOutcome, _require_member(row[2], _VERIFICATION_OUTCOMES, "outcome")
+        ),
+        observed_at_utc=_stored_text(row[3], "observed_at_utc"),
+    )
+
+
+def read_submission_verifications(
+    conn: sqlite3.Connection, record_id: str
+) -> tuple[StoredSubmissionVerification, ...]:
+    """Every refetch observation recorded against this record's attempts (M1-612).
+
+    ``submission_verifications`` has no ``forecast_record_id`` column -- an observation is
+    of an attempt, not of a record -- so this joins through ``submission_attempts`` to
+    scope it, the same join :func:`unresolved_uncertainties` avoids needing only because
+    it reads the *absence* of a verification rather than one that exists.
+
+    An unknown ``record_id`` raises, for :func:`read_forecast_summary`'s reason.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    rows = _fetch_all(
+        conn,
+        f"SELECT {_SUBMISSION_VERIFICATION_COLUMNS} FROM submission_verifications "
+        "WHERE submission_attempt_id IN "
+        "(SELECT attempt_id FROM submission_attempts WHERE forecast_record_id = ?) "
+        "ORDER BY observed_at_utc, verification_id",
+        (identifier,),
+    )
+    return tuple(_submission_verification_from_row(row) for row in rows)
 
 
 # A reconciliation's own identifier, minted by the writer. `wjres-`/`wjrel-` are the

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from whiskeyjack_bot.config import AppConfig
     from whiskeyjack_bot.lifecycle import ApprovalDecision
-    from whiskeyjack_bot.show import RecordShow
+    from whiskeyjack_bot.show import HistoryEntry, RecordShow
     from whiskeyjack_bot.submission_payload import AuthorizedPayload
 
 # A command that refused to act: an unusable ledger, an unknown record, an illegal
@@ -1705,6 +1705,50 @@ def _open_readonly_ledger(path: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _history_entry_detail(entry: HistoryEntry) -> str:
+    """One line's worth of identifying detail for a merged canonical-history entry.
+
+    Dispatches on ``entry.kind`` rather than checking each field for ``None``: exactly
+    one payload field is set per :class:`show.HistoryEntry`'s own contract, so the match
+    is total over the seven kinds :func:`show.merge_canonical_history` produces.
+    """
+    match entry.kind:
+        case "approval":
+            approval = entry.approval
+            assert approval is not None
+            return (
+                f"{approval.decision} by {approval.actor}  "
+                f"payload: {approval.payload_sha256 or '(none)'}"
+            )
+        case "submission_attempt":
+            attempt = entry.submission_attempt
+            assert attempt is not None
+            return (
+                f"attempt {attempt.attempt_id}  success: {attempt.success}  "
+                f"http: {attempt.http_status}"
+            )
+        case "submission_verification":
+            verification = entry.submission_verification
+            assert verification is not None
+            return f"attempt {verification.submission_attempt_id}  outcome: {verification.outcome}"
+        case "lifecycle":
+            event = entry.lifecycle_event
+            assert event is not None
+            return f"seq {event.event_seq}: {event.event_type}  {event.from_status} -> {event.to_status}"
+        case "pre_forecast_failure":
+            failure = entry.pre_forecast_failure
+            assert failure is not None
+            return f"{failure.event_type}  detail: {failure.detail_code}"
+        case "resolution":
+            resolution = entry.resolution
+            assert resolution is not None
+            return f"{resolution.kind}  outcome: {resolution.observation.outcome}"
+        case "score":
+            score = entry.score
+            assert score is not None
+            return f"{score.metric} = {score.value}"
+
+
 def _print_show(view: RecordShow) -> None:
     summary = view.summary
     print(f"record:    {summary.record_id}")
@@ -1763,6 +1807,64 @@ def _print_show(view: RecordShow) -> None:
             )
     else:
         print("standing key reservations: none")
+    print()
+
+    if view.submission_attempts:
+        print(f"submission attempts ({len(view.submission_attempts)}):")
+        for attempt in view.submission_attempts:
+            print(
+                f"  - {attempt.attempt_id}  requested: {attempt.requested_at_utc}  "
+                f"success: {attempt.success}  http: {attempt.http_status}  "
+                f"refetch_outcome: {attempt.refetch_outcome}"
+            )
+    else:
+        print("submission attempts: none")
+
+    if view.submission_verifications:
+        print(f"submission verifications ({len(view.submission_verifications)}):")
+        for verification in view.submission_verifications:
+            print(
+                f"  - attempt {verification.submission_attempt_id}  "
+                f"outcome: {verification.outcome}  observed: {verification.observed_at_utc}"
+            )
+    else:
+        print("submission verifications: none")
+
+    if view.resolution_history:
+        print(f"resolution history ({len(view.resolution_history)}):")
+        for resolution in view.resolution_history:
+            print(
+                f"  - seq {resolution.event_id}: {resolution.kind}  "
+                f"outcome: {resolution.observation.outcome}  scorable: {resolution.scorable}  "
+                f"observed: {resolution.observed_at_utc}"
+            )
+    else:
+        print("resolution history: none")
+
+    if view.score_history:
+        print(f"score history ({len(view.score_history)}):")
+        for score in view.score_history:
+            print(
+                f"  - seq {score.event_id}: {score.metric} = {score.value}  "
+                f"computed: {score.computed_at_utc}"
+            )
+    else:
+        print("score history: none")
+
+    if view.pre_forecast_failures:
+        print(f"pre-forecast failures ({len(view.pre_forecast_failures)}):")
+        for failure in view.pre_forecast_failures:
+            print(
+                f"  - seq {failure.event_seq}: {failure.event_type}  "
+                f"detail: {failure.detail_code}  occurred: {failure.occurred_at_utc}"
+            )
+    else:
+        print("pre-forecast failures: none")
+    print()
+
+    print(f"canonical history ({len(view.canonical_history)}):")
+    for entry in view.canonical_history:
+        print(f"  - {entry.occurred_at_utc}  [{entry.kind}]  {_history_entry_detail(entry)}")
 
 
 def _run_show(args: argparse.Namespace) -> int:

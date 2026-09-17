@@ -12092,3 +12092,115 @@ rounds: one blocking finding, one non-blocking observation acted on, then approv
 noted it could not execute the regression suite itself (a read-only sandbox constraint, not a
 finding) and reported against the brief's own gate output instead — consistent with this
 project's advisory-sandbox note in `scripts/run-review.sh`.
+
+## M1-612 — `show --record-id`'s canonical history join
+
+M1-611 built the read-only `show` command over `forecast_records`/`approval_events`/
+`lifecycle_events` summary state and explicitly deferred "the full-record canonical join
+CODEX_HANDOFF.md describes" here (its own Deferred section, above). This item is that join:
+every linked approval, submission, verification, lifecycle, pre-forecast failure, resolution
+and score event, merged into one chronological order, over a ledger opened read-only and
+byte-identical afterwards.
+
+### Decision — "every linked … event in chronological order" merges seven independent
+streams, not the subset `lifecycle_events` links to
+
+The acceptance criterion names seven categories. `lifecycle_events` carries link columns to
+five of them (`approval_event_id`, `submission_attempt_id`, `submission_verification_id`,
+`resolution_event_id`, `score_event_id`), which made "follow the links off one already-ordered
+spine" the first design considered — and rejected. `record_resolution_observation` appends a
+lifecycle event only on a record's *first* `submitted -> resolved` transition; a later
+re-resolution while already `resolved` writes a bare `resolution_events` row with no lifecycle
+event at all. `record_local_scores` links only the first row of a re-scoring batch, and only on
+the first `resolved -> scored` transition; every other scored row in the same call, and every
+row of a later re-scoring, is unlinked. A merge that only followed `lifecycle_events`' links
+would silently drop exactly those rows — which the acceptance criterion's explicit "resolution
+and score event" language (not "resolution and score event where one was linked") forbids. So
+`show.merge_canonical_history` reads all seven tables independently (`approval_history`, two
+new readers for `submission_attempts`/`submission_verifications`, `read_history`,
+`read_pipeline_failure_events`, `read_resolution_history`, `read_local_scores`) and merges them
+by timestamp, rather than walking the lifecycle spine's link columns.
+
+### Decision — submission attempt/verification rendering omits the raw response
+
+`StoredSubmissionAttempt`/`StoredSubmissionVerification` (new, `lifecycle.py`) carry
+identifying and status fields only — `attempt_id`, `idempotency_key`, `requested_at_utc`,
+`http_status`, `success`, `refetch_outcome`, `outcome` — and deliberately not
+`response_body`/`response_headers`/`error_message`/`refetched_forecast_snapshot`. `show`
+already summarizes lifecycle detail the same way (a `detail_code` and an attempt id, never the
+full row); a canonical-history line is a summary view, not a substitute for M1-604's export,
+which already carries every column of both tables in full.
+
+### Decision — the merge is safe as a plain lexicographic string sort
+
+Every timestamp compared here — `occurred_at_utc`, `requested_at_utc`, `completed_at_utc`,
+`observed_at_utc`, `computed_at_utc` — is written through `lifecycle._require_utc`/`_utc_text`,
+which renders the fixed-width canonical form `YYYY-MM-DDTHH:MM:SS.ffffff+00:00` uniformly
+across every column in the module, confirmed by reading every call site before relying on it.
+Comparing these lexicographically is exact; the `julianday()` trap this project has hit before
+(a float day-number that loses sub-microsecond ordering) does not apply to a text comparison.
+Concatenate-then-stable-sort (`show._stable_chronological`) is therefore sufficient: each
+category already comes back from its own reader in that category's own chronological order,
+and Python's `sorted` guarantees a same-instant tie keeps its input-order position rather than
+needing a bespoke tiebreak.
+
+### Rejected — folding `submission_reconciliations` (M2-713) in as an eighth category
+
+The acceptance criterion predates M2-713 (migration `016`) and names exactly seven categories
+verbatim. `lifecycle_events.submission_reconciliation_id` already exists as a link column on
+the spine this merge reads, so a reconciliation's *occurrence* is visible in the merged history
+as the lifecycle event that cites it, even though its own detail row (`reservation_id`,
+`observed_by`, `note`, …) is not separately joined in. Left as a backlog candidate if the owner
+wants an eighth category; not implemented here, to avoid deciding an unstated scope expansion
+under this item's name.
+
+### Resolves M1-611's standing risk
+
+M1-611 flagged "two backlog rows for one CLI surface" as a standing risk for the owner to
+resolve — close M1-612 as subsumed-in-part, rescope it, or leave it as filed. This item
+completing its full stated scope (the chronological join across every linked table, plus the
+byte-identical-ledger guarantee against a fuller ledger) is the resolution M1-611's own note
+already anticipated ("M1-612's scope is strictly broader … the full chronological join"). No
+separate backlog-hygiene edit was needed.
+
+### New read functions, in `lifecycle.py` rather than `show.py`
+
+`show.py`'s docstring claims "no new SQL is written here"; keeping that true meant the two
+tables with no existing per-record reader (`submission_attempts`, `submission_verifications`)
+got new readers in `lifecycle.py`, which already owns every write to both. `record_attempt_id`
+(also new, `lifecycle.py`) reads `forecast_records.attempt_id` — `approval.ForecastSummary`
+does not expose it, and it is the join key `read_pipeline_failure_events` needs, since
+`pipeline_failure_events` has no `forecast_record_id` column at all (a pre-forecast failure can
+occur before any record exists).
+
+### Teeth — `tests/property/test_show_properties.py`
+
+Fuzzes `show._stable_chronological` directly with synthetic, minimal `HistoryEntry` values
+(only `kind` and `occurred_at_utc` set) rather than full nested `ApprovalRecord`/
+`StoredResolution`/etc. payloads — the sort/tiebreak under test needs nothing else to prove.
+Asserts: never raises; the output is a permutation of the input (by object identity, not
+equality — two entries can be field-equal); non-decreasing by timestamp; replay-stable; and
+same-category ties keep their original relative order, which is the specific guarantee
+concatenate-then-sort rests on.
+
+### Unit coverage
+
+- `test_lifecycle.py`: `read_submission_attempts`, `read_submission_verifications` (including
+  the join-through-`submission_attempts` case), and `record_attempt_id`, each against the
+  unknown-record refusal and against a populated case. `record_attempt_id`'s `None` branch (a
+  pre-004 row) is exercised via the existing `_seed_v2_ledger` legacy fixture, since migration
+  004's own trigger requires `attempt_id` on every new row — there is no way to seed that case
+  through the normal writer path in a current-schema ledger.
+- `test_cli_show.py`: a fuller ledger (a pre-forecast failure under the record's own
+  `attempt_id`, an uncertain-then-confirmed submission attempt, a resolution, a score) drives
+  three new tests — every new section renders an identifying field from its category, the
+  "canonical history" section's own printed timestamps parse back out as non-decreasing (the
+  executable form of "chronological order", not a visual read), and a new sibling of the
+  existing byte-identity test against this fuller ledger (kept alongside the simpler existing
+  one rather than replacing it, since a new reader touching a table the simpler test never
+  populates could still have written).
+
+### Workflow
+
+No dependency slot, no migration — read-only, no schema change. Backlog row flipped to `Done`
+on this branch before merge, per convention.
