@@ -242,6 +242,17 @@ class Replay:
 
 
 @pytest.fixture
+def days(tmp_path: Path) -> int:
+    """The configured freshness window, read rather than transcribed.
+
+    Hard-coding 30 here would let a change to ``retrieval.freshness_days_default``
+    decouple these assertions from the window the pipeline actually applies, while both
+    kept passing.
+    """
+    return int(base_config.__wrapped__(tmp_path).retrieval.freshness_days_default)
+
+
+@pytest.fixture
 def replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     clock = {"now": AGED_OUT}
     # Both bindings: `run_once` reads `utcnow` through the `tournament` module per question
@@ -282,7 +293,7 @@ def replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 # --- the fixture reaches the branch, and only because of freshness ---------------------
 
 
-def test_the_same_stored_packet_is_forecastable_when_it_was_retrieved(replay: Any) -> None:
+def test_the_same_stored_packet_is_forecastable_when_it_was_retrieved(days: int) -> None:
     """The non-vacuity control, and it is the load-bearing test in this module.
 
     This project's top recurring defect is a test whose inputs never reach the branch the
@@ -298,7 +309,6 @@ def test_the_same_stored_packet_is_forecastable_when_it_was_retrieved(replay: An
     """
     packet = stored_packet()
     question = stored_question()
-    days = replay.config.retrieval.freshness_days_default
 
     assert quality_problem(packet, question, RETRIEVED_AT, days) is None
 
@@ -310,7 +320,7 @@ def test_the_same_stored_packet_is_forecastable_when_it_was_retrieved(replay: An
     assert len(usable_then) < len(packet.documents), "the stored packet must be mixed"
 
 
-def test_only_freshness_changes_between_the_two_instants(replay: Any) -> None:
+def test_only_freshness_changes_between_the_two_instants(days: int) -> None:
     """What moved is the window, not the evidence.
 
     Relevance is asserted at *both* instants because it is the other way this refusal could
@@ -321,7 +331,6 @@ def test_only_freshness_changes_between_the_two_instants(replay: Any) -> None:
     """
     packet = stored_packet()
     question = stored_question()
-    days = replay.config.retrieval.freshness_days_default
 
     for now in (RETRIEVED_AT, AGED_OUT):
         assert all(relevant(d, question) for d in packet.documents), now.isoformat()
@@ -335,7 +344,7 @@ def test_only_freshness_changes_between_the_two_instants(replay: Any) -> None:
     assert packet.documents
 
 
-def test_the_stored_bodies_parse_to_the_packet_the_run_recorded(replay: Any) -> None:
+def test_the_stored_bodies_parse_to_the_packet_the_run_recorded() -> None:
     """The fixture is evidence, so what it parses to is asserted, not assumed.
 
     One retrieval is two AskNews calls, never one -- two strategies per query -- and the run
@@ -353,7 +362,7 @@ def test_the_stored_bodies_parse_to_the_packet_the_run_recorded(replay: Any) -> 
     assert stored_question().question_id == QUESTION_ID
 
 
-def test_an_empty_packet_reads_as_no_evidence_not_stale_evidence(replay: Any) -> None:
+def test_an_empty_packet_reads_as_no_evidence_not_stale_evidence(days: int) -> None:
     """The discriminator between the two codes the gate stores.
 
     ``stale_evidence`` and ``no_evidence`` are both deterministic and both block, so a test
@@ -370,12 +379,12 @@ def test_an_empty_packet_reads_as_no_evidence_not_stale_evidence(replay: Any) ->
     """
     packet = stored_packet()
     empty = ResearchPacket(question_id=packet.question_id, runs=packet.runs, documents=())
-    problem = quality_problem(empty, stored_question(), AGED_OUT, 30)
+    problem = quality_problem(empty, stored_question(), AGED_OUT, days)
     assert problem is not None
     assert problem.code == "no_evidence"
 
 
-def test_the_committed_bodies_are_real_sdk_responses_that_round_trip(replay: Any) -> None:
+def test_the_committed_bodies_are_real_sdk_responses_that_round_trip() -> None:
     """ "Derived from a real stored packet" is a claim, so it is checked rather than asserted.
 
     Each committed body parses as the pinned SDK's own ``SearchResponse`` and dumps back to
@@ -416,7 +425,7 @@ def test_the_committed_fixtures_carry_no_personal_data() -> None:
     assert "aggregations" not in post["question"]
 
 
-def test_a_named_resolution_authority_is_recorded_and_not_refused(replay: Any) -> None:
+def test_a_named_resolution_authority_is_recorded_and_not_refused(days: int) -> None:
     """M1-327 against the question the argument was settled on.
 
     This packet holds no document from ``results.cik.bg`` -- the Bulgarian election
@@ -428,10 +437,10 @@ def test_a_named_resolution_authority_is_recorded_and_not_refused(replay: Any) -
     """
     packet = stored_packet()
     question = stored_question()
-    assert missing_source_domains(packet, question, RETRIEVED_AT, 30) == ("results.cik.bg",)
+    assert missing_source_domains(packet, question, RETRIEVED_AT, days) == ("results.cik.bg",)
     # And it is not the reason for the later refusal: at the retrieval instant the gap is
     # already there and `quality_problem` still returns None.
-    assert quality_problem(packet, question, RETRIEVED_AT, 30) is None
+    assert quality_problem(packet, question, RETRIEVED_AT, days) is None
 
 
 # --- the replay: a deterministic verdict costs nothing the second time ----------------
