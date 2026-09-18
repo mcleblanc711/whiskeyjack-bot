@@ -12204,3 +12204,171 @@ concatenate-then-sort rests on.
 
 No dependency slot, no migration — read-only, no schema change. Backlog row flipped to `Done`
 on this branch before merge, per convention.
+
+
+## T-908 — Make `docs/RUNBOOK.md` fail when the CLI moves underneath it
+
+`tests/unit/test_runbook.py` (new), `docs/RUNBOOK.md` (citations only).
+
+The runbook quotes command lines, flags and exit codes, and nothing in the repository could
+fail on any of it. D-1001 spent three review rounds on three false claims of exactly that
+kind, all three in `_run_submit`'s tail, and one of them was already contradicted by a merged
+test: `test_cli_submit.py`'s `test_an_uncertain_submission_tells_the_operator_the_next_command`
+has asserted `EXIT_REFUSED` for `submission_uncertain` since M2-704. The suite held the fact
+and nothing compared it to the document.
+
+### Decision — parse the runbook's own exit table rather than restate it, and why
+
+The obvious shape for the exit-code half is to drive the sixteen `(success,
+refetch_outcome, artifact)` cells through the CLI, assert them against expectations written
+in the test, and separately freeze the runbook table's text. That shape cannot catch the
+defect that made this item necessary.
+
+D-1001's round-1 remediation fixed a row of the table and the table was still false. Round 2
+fixed another row and it was still false. Neither round missed a case; the table was keyed on
+the `result:` line — the lifecycle event type — while the exit is
+`(refetch_outcome == "confirmed", artifact_path is not None)`, and the two partitions cross.
+`(success=False, refetch=confirmed)` records `submission_uncertain` and exits `0`. A table
+keyed on the visible axis is wrong somewhere no matter how many rows it has, and reading the
+return expression confirms each row in isolation while saying nothing about the index.
+
+So the table is parsed, expanded (`/`-alternatives into separate outcomes, `either` into both
+artifact states), and checked to be a **total partition** of a universe built from
+`lifecycle.RefetchOutcome` rather than from a list written here: every cell claimed exactly
+once, none missing, none claimed twice. A re-keyed table that is wrong in a new way fails
+that check; a frozen-text check passes it. This is D-1001's lesson made executable —
+*a table is a claim about a partition, and per-row verification cannot detect a wrong one.*
+
+### Decision — placeholder values are coerced from each flag's own declaration
+
+The runbook writes `--question-id ID` and `--record-id "$REC"`. Those are placeholders, and
+`ID` does not survive `type=int` — the first draft of the parse check reported
+`ingest-resolutions` as broken when it is not. Substituting a value derived from the flag's
+own `argparse` action (`int` → `"1"`, `choices` → a legal member, otherwise `"x"`) means this
+module carries no table of what each flag takes, so a flag that changes type needs no edit
+here, and a full `parse_args` still runs — which catches required-flag and `nargs` drift that
+a membership check alone would not.
+
+### Decision — the program is `argv[0]`, never a substring
+
+`grep whiskeyjack-bot docs/RUNBOOK.md` returns 21 lines, two of which are
+`cd ~/projects/whiskeyjack-bot && git pull --ff-only` — the name as a *directory*. Three more
+are the program quoted inside program *output*. The extractor reads only ` ```bash ` fences
+(the runbook's convention is rigid: a bash fence is input, the plain fence under it is
+output) and keeps a line only when `argv[0]` after `uv run` is the program. The fence pattern
+is deliberately **not** anchored to column zero: three bash blocks are indented inside list
+items, and anchoring drops them silently, which is this item's own failure mode applied to
+itself.
+
+### Decision — `file.py:symbol`, not `file.py:line`
+
+Not in the acceptance criteria; found while resolving the citations the runbook makes, and
+taken to the owner before doing it. **Ten of the eleven line-number citations were stale**,
+and `cli.py:856-869` named a function that had moved out of its range entirely
+(`_run_release_key`). `env_verify.py:26-28` was the only survivor, in the only cited file
+nobody had edited.
+
+Correcting ten numbers restores them until the next edit above any of five files. The form
+was changed instead — `` `lifecycle.py:current_status` ``, `` `cli.py:_run_submit` ``,
+`` `lifecycle.py:SubmissionAttempt.verified_by_refetch` `` — and the test resolves each
+against the file's AST. The runbook already wrote one citation this way
+(`lifecycle.py:FailureCode`), so this is the document's own convention, not a new one. A
+symbol is invalidated by the rename that actually breaks the reference and by nothing else.
+
+The one place a line number was doing real work — the quoted return — is covered by quoting
+instead: the ` ```python ` block's text must appear verbatim in `cli.py`.
+
+### Deviation — fixtures imported by bare name, not `tests.unit.X`
+
+Every other module in `tests/unit/` writes `from tests.unit.records import ...`. That form
+resolves only because importing the pinned SDK side-effects the working directory onto
+`sys.path` — an accident `tests/score_rows.py:44` already names. This module's imports are
+light enough not to trigger it, so the dotted form raised `ModuleNotFoundError` when the file
+was run on its own, which is the inner loop `CLAUDE.md` documents.
+
+`tests/unit` is on `sys.path` under pytest's prepend import mode, so the bare name is what
+pytest itself imports these modules as; the dotted form builds a *second* module object with
+a second copy of every fixture and constant. Bare name is both the working and the correct
+one here. `tests/acceptance/test_live_run_acceptance.py:181` is the existing precedent.
+
+The three fixtures are re-exported by assignment rather than `from ... import`, because a
+test takes each as a parameter — which is how pytest requests a fixture — and ruff reads an
+imported name shadowed by a parameter as `F811`. The binding pytest collects is the module
+attribute either way.
+
+### Rejected — checking the message strings the runbook quotes, and why not
+
+The runbook quotes roughly thirty literal program messages, and D-1001 re-grepped them by
+hand each round. Mechanizing that was considered and declined with the owner: the quotations
+are wrapped for the document, interpolated (`<REC>`, `<reason>`, `<path>`), and several are
+prose rather than fenced, so the extractor would be a heuristic and its failures would be
+false. One message *is* checked — the `verify-submission` instruction line — because it is
+the one the acceptance criteria name and because it is quoted whole, so it can be split at
+its two placeholders and matched segment-by-segment in order.
+
+D-1001's round-1 standing risk is the argument for the split: the string grep it ran passed
+while both findings were about control flow. Strings are the cheap half and the one already
+being checked by hand; behaviour is the half nothing could see.
+
+### Rejected — a `scripts/` linter and a CI job
+
+The check is a pytest module, so it runs inside the existing `quality-gate` `Offline pytest`
+step. A separate script plus a workflow step would be a second place to keep in sync for no
+additional coverage, and a workflow change takes the test-infrastructure slot in
+`docs/TRACKS.md`. This takes no slot: one new test file, no conftest change, no shared
+fixture change, no production code.
+
+### Deferred (do not read the absence as an omission)
+
+- **The other commands' exit-code claims.** The runbook states exit codes for `run`
+  (`4` on any failed question), `replay` (`4` on `verdict: MISMATCH`), `ingest-resolutions`,
+  `score` and `verify-submission`. Only `submit`'s are asserted, which is what the acceptance
+  criteria name and where every observed defect has been. The others are batch-summary
+  conditions that need a whole pipeline run to drive; `tests/acceptance/` is where that
+  belongs if it is wanted.
+- **`deploy/wj-watchdog`'s `exits 0` / `exits 1`** at `docs/RUNBOOK.md:629`. Not the CLI.
+- **The symptom-index links** (`[C3](#c3--configuration-refused)` and forty more). Anchor
+  validity is a markdown-link concern, not a CLI-drift one.
+
+### Standing risk — the mutant set is self-chosen
+
+Nine mutations were applied, each reverted before the next, with `__pycache__` cleared between
+them (a same-size, same-second edit is otherwise served stale). Every one was killed by the
+test it should be:
+
+| Mutation | Killed by |
+|---|---|
+| `_run_submit` always returns `EXIT_OK` | 14 grid cells (every `4` cell) + the quoted return |
+| `show --record-id` renamed to `--rec-id` | the command-line parse check |
+| runbook grid: `(True, confirmed, written)` flipped `0` → `4` | that one cell |
+| runbook grid: a row deleted | the partition check + the 4 cells it covered |
+| runbook grid: a row widened to overlap another | the partition check + the 2 cells claimed twice |
+| a fifth `RefetchOutcome` member | the partition check + its 4 uncovered cells |
+| a cited symbol renamed in the runbook | the citation check |
+| a `whiskeyjack-bot` line deleted from the runbook | the command-set/count check |
+| `submit`'s instruction line reworded | the timeout/confirmed/written case |
+
+M1-327's lesson applies and is stated rather than implied: **a self-chosen mutant set proves
+only what it covers.** Twelve of twelve died there while five others lived, one of them a live
+crash path. What these nine establish is that each check can fail for its own reason and that
+none of them is vacuous; they do not establish that no drift escapes.
+
+Two specific gaps worth naming. The extractor's command set and invocation count are constants
+in the test, so a runbook edit that adds a command *and* the constant in one commit passes
+without anyone reading the new line — the check is against silent drift, not against a
+deliberate wrong edit. And the grid drive proves the fakes produce the cell each parameter
+names (`assert driven == cell`), which is what keeps sixteen parameters from collapsing onto
+one, but the fakes are still fakes: `test_submission_live.py` is where the classification
+itself is pinned.
+
+### Standing risk — the grid drive costs 24s
+
+Sixteen `submit` runs, each building its own ledger through the real writers. That is most of
+this module's runtime and it is the price of driving the real command rather than
+`_run_submit`'s tail in isolation. Driving the tail directly would be fast and would not be a
+test of the command the runbook tells an operator to type.
+
+### Workflow
+
+No dependency slot, no migration, no workflow slot. Backlog row flipped to `Done` on this
+branch before merge, per convention.

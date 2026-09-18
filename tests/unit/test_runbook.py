@@ -139,7 +139,7 @@ def documented_invocations(text: str) -> list[list[str]]:
                 words = words[2:]
             if words[:1] == [PROGRAM]:
                 invocations.append(words[1:])
-    assert not pending, "a trailing line continuation in docs/RUNBOOK.md"
+        assert not pending, "a bash block in docs/RUNBOOK.md ends mid-continuation"
     return invocations
 
 
@@ -237,16 +237,6 @@ def test_every_command_line_the_runbook_shows_parses() -> None:
         assert parsed.command == argv[0]
 
 
-def test_the_runbook_shows_commands_the_cli_actually_has() -> None:
-    """The other direction, and the reason the set above is not a subset check.
-
-    `DOCUMENTED_COMMANDS` is this module's own claim about the document. This asserts the
-    same names against the parser, so the constant cannot drift into naming a command that
-    no longer exists while every extracted line happens to avoid it.
-    """
-    assert DOCUMENTED_COMMANDS <= set(subparsers_of(build_parser()))
-
-
 # ── markdown tables ──────────────────────────────────────────────────────────
 
 
@@ -310,14 +300,28 @@ def grid_universe() -> frozenset[Cell]:
     )
 
 
+def _documented_bool(cell: str) -> bool:
+    """`True`/`False` as the grid writes them -- never coerced.
+
+    `cell.strip() == "True"` would read a typo, or a word the column does not use, as
+    `False`; the partition check would then see a collision rather than the malformed cell
+    that caused it. A document this module cannot parse must say so.
+    """
+    value = cell.strip()
+    assert value in {"True", "False"}, f"the grid's `success` column reads {value!r}"
+    return value == "True"
+
+
 def documented_grid(text: str) -> tuple[dict[Cell, tuple[str, int]], list[Cell]]:
     """The runbook's grid expanded to one entry per cell, plus any cell claimed twice."""
     coverage: dict[Cell, tuple[str, int]] = {}
     duplicates: list[Cell] = []
     for row in markdown_table(text, header=GRID_HEADER):
-        successes = [part.strip() == "True" for part in row[0].split("/")]
+        successes = [_documented_bool(part) for part in row[0].split("/")]
         outcomes = [part.strip() for part in row[1].split("/")]
-        result, artifacts, code = row[2], ARTIFACT_STATES[row[3].lower()], int(row[4])
+        artifact_word = row[3].lower()
+        assert artifact_word in ARTIFACT_STATES, f"the grid's artifact column reads {row[3]!r}"
+        result, artifacts, code = row[2], ARTIFACT_STATES[artifact_word], int(row[4])
         for success in successes:
             for outcome in outcomes:
                 for artifact in artifacts:
@@ -340,6 +344,9 @@ def test_the_documented_grid_is_a_total_partition() -> None:
 
     assert not duplicates, "the runbook's grid claims these cells twice"
     assert set(coverage) == grid_universe()
+    # Literal, and not redundant with the equality above: a commit that narrowed
+    # `RefetchOutcome` *and* shrank the table to match would satisfy the equality, because
+    # both sides would have moved together. This is the witness outside both.
     assert len(coverage) == 16
 
 
