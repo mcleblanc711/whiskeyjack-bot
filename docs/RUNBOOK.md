@@ -46,7 +46,7 @@ from the source that prints them, and each of those blocks is labelled.
 - **`forecast_records.status` is not the record's status.** That column is the status the
   row was *created* with and is pinned to `draft` forever, because the table is
   append-only and nothing can update it. The real status is derived from the last
-  `lifecycle_events` row (`lifecycle.current_status`, `lifecycle.py:999-1022`). Every
+  `lifecycle_events` row (`lifecycle.py:current_status`). Every
   command prints the derived value. A record whose `status` column reads `draft` may well
   be `approved`.
 
@@ -59,8 +59,8 @@ from the source that prints them, and each of those blocks is labelled.
 | `3` | A required environment variable or file is missing |
 | `4` | Refused, or did not fully succeed. Usually nothing was written — but see `submit` below |
 
-Defined at `env_verify.py:26-28` (`EXIT_OK`, `EXIT_CONFIG_INVALID`, `EXIT_ENV_MISSING`) and
-`cli.py:31` (`EXIT_REFUSED`).
+Defined at `env_verify.py:EXIT_OK`, `env_verify.py:EXIT_CONFIG_INVALID`,
+`env_verify.py:EXIT_ENV_MISSING` and `cli.py:EXIT_REFUSED`.
 
 **Exit code `4` is the good outcome when something is wrong.** Almost every refusal in this
 program runs *before* the action it refuses, so `4` normally means nothing happened. Two
@@ -75,15 +75,15 @@ written.** The return is literally:
 return EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EXIT_REFUSED
 ```
 
-(`cli.py:735`), and `verified_by_refetch` is not an independent fact — it is exactly
-`refetch_outcome == "confirmed"` (`lifecycle.py:397-406`). **So the exit code is decided by
+(`cli.py:_run_submit`), and `verified_by_refetch` is not an independent fact — it is exactly
+`refetch_outcome == "confirmed"` (`lifecycle.py:SubmissionAttempt.verified_by_refetch`). **So the exit code is decided by
 those two conditions and by nothing else.** In particular it is *not* decided by the
 `result:` line: the recorded outcome and the exit code partition the same attempts
 differently, and reading either as a proxy for the other is the mistake this section exists
 to prevent.
 
 The full grid — eight `(success, refetch_outcome)` combinations, each with the artifact
-written or not (`lifecycle.py:1035-1046` derives the event; `cli.py:735` the exit):
+written or not (`lifecycle.py:record_submission_attempt` derives the event; `cli.py:_run_submit` the exit):
 
 | `success` | `refetch_outcome` | `result:` | Artifact | Exit |
 |---|---|---|---|---|
@@ -259,7 +259,7 @@ submission:
 These are the committed defaults and they are what makes a post unreachable. A live post
 requires **all three flipped together** — `enabled: true`, `dry_run: false`,
 `no_submit: false` — and configuration validation refuses any partial combination
-(`config.py:339-387`). Flipping them is a deliberate act, not something you do to get past
+(`config.py:SubmissionConfig._reject_live_submit_combinations`). Flipping them is a deliberate act, not something you do to get past
 an error message.
 
 `--dry-run` and `--no-submit` on `run` and `run-replay` are **assertions, not overrides**.
@@ -710,7 +710,7 @@ timeout  refetch_mismatch  refetch_missing  internal_error
 ### The submission partition — what `submit`'s result means
 
 The lifecycle event is **derived from the attempt**, never chosen
-(`lifecycle.py:1032-1046`). This table is the one to internalise:
+(`lifecycle.py:record_submission_attempt`). This table is the one to internalise:
 
 | `success` | `refetch_outcome` | event | record ends |
 |---|---|---|---|
@@ -731,7 +731,7 @@ later confirming refetch would have nowhere to land.
 
 ### What a refetch establishes
 
-`submission_live.classify_refetch` (`submission_live.py:901-950`) decides the outcome
+`submission_live.py:classify_refetch` decides the outcome
 against a baseline taken **before** the post:
 
 | Outcome | When |
@@ -772,7 +772,7 @@ satisfy the check. `init-ledger` is idempotent and is the only supported way to 
 
 **What you see.** Every command fails to open the ledger, with a message naming the
 migration version whose checksum no longer matches the one recorded when it was applied
-(`ledger.py:254-260`).
+(`ledger.py:_verify_checksum`).
 
 **Confirm.** This means a migration file that has already been applied to this database was
 edited afterwards. Either the file changed (a bad merge, a hand edit) or the database is
@@ -1320,7 +1320,7 @@ there. A standing reservation it does *not* list never reached the POST.
 
 Before `show` existed, two things came close to a per-record listing and neither was one:
 `release-key` with no `--reservation-id`, when the record holds more than one reservation,
-refused and listed all of them as a side effect (`cli.py:856-869`); with exactly one standing,
+refused and listed all of them as a side effect (`cli.py:_run_release_key`); with exactly one standing,
 `release-key` printed it and then released it in the same act. `show` replaces both as the
 inspection step — `release-key` is still the only way to act on what it shows.
 
