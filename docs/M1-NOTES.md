@@ -12660,7 +12660,36 @@ this module's runtime and it is the price of driving the real command rather tha
 `_run_submit`'s tail in isolation. Driving the tail directly would be fast and would not be a
 test of the command the runbook tells an operator to type.
 
+### Round 1 — APPROVE on `69876e4`, zero blocking findings
+
+Zero blocking findings and, unusually, zero non-blocking observations and no backlog
+candidates: *"None beyond the limitations already declared in the brief."*
+
+What makes the round worth recording is that the reviewer **re-derived the load-bearing claims
+rather than accepting them**. It confirmed the 16 invocations across the 13 named commands and
+that directory references and output quotations are excluded; confirmed the seven rows cover
+all 16 cells exactly once and **independently ran the row-deletion and row-duplication
+mutations**, watching the partition test fail for each; independently ran the parser
+flag-rename mutation; and resolved all 15 citations. The remaining six mutants it inspected
+rather than re-ran, and said so.
+
+It also declared its own limit honestly, which is the part to carry forward: *"the read-only
+sandbox prevented temporary-file creation, so the 16 submit cases and dedicated
+timeout/confirmed-refetch case could not be rerun here."* So the grid drive — the item's
+centre — was reviewed by reading, not by execution, and the reviewer relied on the brief's
+gate report for it. That is a real gap in the round, not a defect in the branch, and it is
+worth knowing that a review run under `--sandbox read-only` cannot execute any test that needs
+`tmp_path`. `scripts/run-review.sh` documents the sandbox as *advisory* on this host because
+bubblewrap cannot get a user namespace; whatever mechanism produced this refusal, the effect on
+what a reviewer can verify is the same and is not currently written down anywhere.
+
+The single-round close is what `docs/M1-NOTES.md:165-307` predicts: the deliberate-choices
+section and nine falsifiable risk claims were written **before** round 1, and the reviewer's
+"Risk areas" section answers them one by one in the order they were posed.
+
 ### Workflow
 
 No dependency slot, no migration, no workflow slot. Backlog row flipped to `Done` on this
-branch before merge, per convention.
+branch before merge, per convention. `origin/master` merged in at `69876e4` after PR #107
+(M1-330) landed; both conflicts were textual — each branch had appended a `docs/TRACKS.md`
+Worktrees row and an `M1-NOTES` section — and both sides were kept in both files.
