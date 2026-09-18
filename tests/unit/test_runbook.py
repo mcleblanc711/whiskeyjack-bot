@@ -464,6 +464,25 @@ def test_each_documented_grid_cell_is_what_the_cli_does(
     assert exit_code == documented_exit
 
 
+INSTRUCTION_PREFIX: Final = "the outcome is unresolved; run "
+
+
+def documented_instruction_line(text: str) -> list[str]:
+    """The runbook's quotation of `submit`'s last line, split at its placeholders.
+
+    Compared segment-by-segment in order rather than as one string, because the document
+    writes `<REC>` and `<ATTEMPT>` where the command prints real identifiers. Every segment
+    must be non-empty: `str.find("")` answers `0` for any haystack, so an empty one would
+    be a piece of the comparison that cannot fail.
+    """
+    quoted = [line for line in text.splitlines() if line.startswith(INSTRUCTION_PREFIX)]
+    assert len(quoted) == 1, "docs/RUNBOOK.md must quote the instruction line exactly once"
+    segments = re.split(r"<REC>|<ATTEMPT>", quoted[0])
+    assert len(segments) == 3, "the quoted instruction line lost its placeholders"
+    assert all(segments), "the quoted instruction line has an empty segment"
+    return segments
+
+
 def test_a_timeout_a_confirming_refetch_and_a_written_artifact_exits_zero(
     config_file: Path,
     record_id: str,
@@ -498,22 +517,6 @@ def test_a_timeout_a_confirming_refetch_and_a_written_artifact_exits_zero(
         index = remaining.find(segment)
         assert index >= 0, f"the runbook quotes {segment!r} and `submit` did not print it"
         remaining = remaining[index + len(segment) :]
-
-
-INSTRUCTION_PREFIX: Final = "the outcome is unresolved; run "
-
-
-def documented_instruction_line(text: str) -> list[str]:
-    """The runbook's quotation of `submit`'s last line, split at its placeholders.
-
-    Compared segment-by-segment in order rather than as one string, because the document
-    writes `<REC>` and `<ATTEMPT>` where the command prints real identifiers.
-    """
-    quoted = [line for line in text.splitlines() if line.startswith(INSTRUCTION_PREFIX)]
-    assert len(quoted) == 1, "docs/RUNBOOK.md must quote the instruction line exactly once"
-    segments = re.split(r"<REC>|<ATTEMPT>", quoted[0])
-    assert len(segments) == 3, "the quoted instruction line lost its placeholders"
-    return segments
 
 
 # ── the exit-code vocabulary and the quoted return ───────────────────────────

@@ -12348,6 +12348,13 @@ test it should be:
 | a `whiskeyjack-bot` line deleted from the runbook | the command-set/count check |
 | `submit`'s instruction line reworded | the timeout/confirmed/written case |
 
+The check caught one for real while this was being written. The mutation harness reverts with
+`git checkout -- <path>`, and a runbook re-wrap that had not been committed yet was clobbered
+mid-run and restored from a copy taken a second too late — so the copy carried the
+`grid-flip-a-cell` mutant's `4` where the table says `0`. The next run failed on exactly that
+cell. It is a small thing, but it is the whole item in miniature: a wrong exit code in the
+document, found by the suite rather than by a reviewer.
+
 M1-327's lesson applies and is stated rather than implied: **a self-chosen mutant set proves
 only what it covers.** Twelve of twelve died there while five others lived, one of them a live
 crash path. What these nine establish is that each check can fail for its own reason and that

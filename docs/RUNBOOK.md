@@ -46,9 +46,8 @@ from the source that prints them, and each of those blocks is labelled.
 - **`forecast_records.status` is not the record's status.** That column is the status the
   row was *created* with and is pinned to `draft` forever, because the table is
   append-only and nothing can update it. The real status is derived from the last
-  `lifecycle_events` row (`lifecycle.py:current_status`). Every
-  command prints the derived value. A record whose `status` column reads `draft` may well
-  be `approved`.
+  `lifecycle_events` row (`lifecycle.py:current_status`). Every command prints the derived
+  value. A record whose `status` column reads `draft` may well be `approved`.
 
 ## Exit codes
 
@@ -76,14 +75,16 @@ return EXIT_OK if receipt.verified_by_refetch and recorded.artifact_path else EX
 ```
 
 (`cli.py:_run_submit`), and `verified_by_refetch` is not an independent fact — it is exactly
-`refetch_outcome == "confirmed"` (`lifecycle.py:SubmissionAttempt.verified_by_refetch`). **So the exit code is decided by
+`refetch_outcome == "confirmed"`
+(`lifecycle.py:SubmissionAttempt.verified_by_refetch`). **So the exit code is decided by
 those two conditions and by nothing else.** In particular it is *not* decided by the
 `result:` line: the recorded outcome and the exit code partition the same attempts
 differently, and reading either as a proxy for the other is the mistake this section exists
 to prevent.
 
 The full grid — eight `(success, refetch_outcome)` combinations, each with the artifact
-written or not (`lifecycle.py:record_submission_attempt` derives the event; `cli.py:_run_submit` the exit):
+written or not (`lifecycle.py:record_submission_attempt` derives the event;
+`cli.py:_run_submit` the exit):
 
 | `success` | `refetch_outcome` | `result:` | Artifact | Exit |
 |---|---|---|---|---|
@@ -259,8 +260,8 @@ submission:
 These are the committed defaults and they are what makes a post unreachable. A live post
 requires **all three flipped together** — `enabled: true`, `dry_run: false`,
 `no_submit: false` — and configuration validation refuses any partial combination
-(`config.py:SubmissionConfig._reject_live_submit_combinations`). Flipping them is a deliberate act, not something you do to get past
-an error message.
+(`config.py:SubmissionConfig._reject_live_submit_combinations`). Flipping them is a
+deliberate act, not something you do to get past an error message.
 
 `--dry-run` and `--no-submit` on `run` and `run-replay` are **assertions, not overrides**.
 They check that the configuration already holds the safe value and refuse if it does not.
@@ -731,8 +732,8 @@ later confirming refetch would have nowhere to land.
 
 ### What a refetch establishes
 
-`submission_live.py:classify_refetch` decides the outcome
-against a baseline taken **before** the post:
+`submission_live.py:classify_refetch` decides the outcome against a baseline taken
+**before** the post:
 
 | Outcome | When |
 |---|---|
@@ -1320,9 +1321,10 @@ there. A standing reservation it does *not* list never reached the POST.
 
 Before `show` existed, two things came close to a per-record listing and neither was one:
 `release-key` with no `--reservation-id`, when the record holds more than one reservation,
-refused and listed all of them as a side effect (`cli.py:_run_release_key`); with exactly one standing,
-`release-key` printed it and then released it in the same act. `show` replaces both as the
-inspection step — `release-key` is still the only way to act on what it shows.
+refused and listed all of them as a side effect (`cli.py:_run_release_key`); with exactly
+one standing, `release-key` printed it and then released it in the same act. `show`
+replaces both as the inspection step — `release-key` is still the only way to act on what
+it shows.
 
 **Recovery — and read the next paragraph first.**
 
