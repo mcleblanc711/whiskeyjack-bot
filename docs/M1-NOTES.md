@@ -12450,3 +12450,43 @@ The reviewer also noted what it did **not** run: the filesystem was read-only, s
 SQLite-writing pipeline tests and the mutation matrix were not re-executed, and those results
 stand as reported in the request. Recorded rather than glossed, because "the reviewer verified it"
 and "the reviewer verified the parts it could run" are different claims.
+
+### Round 2 — APPROVE, round 1's observation closed
+
+Round 2 approved at `5af0aac`. R1 closed, and closed on the reviewer's own evidence rather than on
+the claim that it had been fixed: it re-executed the round-trip assertion, re-confirmed that an
+edited summary still passes it, and ran the generator's read-only `--check` to confirm both
+fixtures still match the operator's stored tree. R7 moved from "safe" to "verified" — `research_runs`
+appears in this module only in explanatory prose, never in an assertion.
+
+One non-blocking observation, and it is a process one worth keeping. The **review request's**
+deliberate-choices paragraph still carried the superseded fidelity claim and the old test name,
+even though the committed notes, test and generator comment had all been corrected. Nothing in the
+repository was wrong; the stale text lived in the reusable author-sections scratch file the request
+is assembled from. That is exactly the failure [[whiskeyjack-review-claims-not-defects]] records —
+**a reusable author-sections file goes stale the moment a round disproves one of its claims**, and
+the reviewer then reads a document that contradicts the code. Corrected in the scratch file so a
+later round cannot inherit it. No repository change, and no backlog candidate.
+
+Worth noting what both rounds declined to re-run: the reviewer works on a read-only filesystem, so
+the SQLite-writing pipeline tests, the four gates and the mutation matrix were never re-executed by
+it. Those results are the author's, reported in the request and reproducible from
+`docs/M1-NOTES.md`. "The reviewer approved this" and "the reviewer independently reproduced every
+claim in it" are different statements, and only the first is true here.
+
+### Filed on the way — M1-346
+
+`tests/property/test_scoring_properties.py::test_no_refusal_reprints_a_label_outcome_or_probability`
+reddened this branch's round-2 gate run. It is not this branch's: that file and `scoring.py` are
+byte-identical to `origin/master` here. The property asserts `repr(probability) not in message`
+(exempting `'0.0'` and `'1.0'`), and the refusal it checks reads *"option probabilities must sum to
+1 within 1e-06"* — so a drawn `1e-06` matches the **tolerance constant**, not a leaked value.
+Reproduced directly rather than inferred from the hypothesis output.
+
+Filed rather than fixed here, under CLAUDE.md's pre-existing-condition scope test (owner decision,
+2026-09-18), and **disclosed in the round-2 request** rather than left to look inexplicable. CI was
+green on this HEAD because the draw did not come up there; hypothesis caches the counterexample, so
+it replays deterministically in whichever worktree hits it until the local `.hypothesis` cache is
+cleared. That makes it a latent random-redness for every open branch, which is why it is a `Medium`
+rather than a housekeeping row. Same class as M1-607's finding that a substring no-leak check
+cannot distinguish a leak from a constant the message legitimately contains.
