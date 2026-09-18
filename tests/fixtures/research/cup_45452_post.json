@@ -53,7 +53,17 @@
       "type": "tournament",
       "user_permission": null,
       "visibility": "normal"
-    }
+    },
+    "category": [
+      {
+        "description": "Elections",
+        "emoji": "\ud83d\uddf3\ufe0f",
+        "id": 3685,
+        "name": "Elections",
+        "slug": "elections",
+        "type": "category"
+      }
+    ]
   },
   "question": {
     "id": 45452,

@@ -153,8 +153,13 @@ def _reduce_post(post: dict[str, Any]) -> dict[str, Any]:
     question["my_forecasts"] = {"history": None}
     reduced = {k: post[k] for k in _POST_KEYS if k in post}
     projects = post.get("projects") or {}
+    # `category` is kept alongside the two the other post fixtures carry: it is the only
+    # dropped field that reaches `CanonicalQuestion`, via `source_categories`, and so the
+    # only one whose loss would change `question_fingerprint`. Without it the replayed
+    # question is not the question the live worker keyed its verdict on -- a divergence
+    # that costs nothing to avoid and would otherwise have to be argued.
     reduced["projects"] = {
-        k: projects[k] for k in ("tournament", "default_project") if k in projects
+        k: projects[k] for k in ("tournament", "default_project", "category") if k in projects
     }
     reduced["question"] = question
     return reduced

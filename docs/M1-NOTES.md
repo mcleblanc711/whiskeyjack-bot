@@ -12292,9 +12292,16 @@ Two edits are declared in the fixture's own `provenance` block:
   verdict-neutral (`_to_document` and `_hash_source` read neither the field nor anything derived
   from it) and provably the *only* edit, because the SDK round-trips the key back as `null`
   anyway — which is why the round-trip assertion above still holds.
-- **The post reduced to the committed `api_posts` field set.** This dropped the community
-  prediction (`aggregations`), the operator-identifying fields, and — the one that mattered — the
-  operator's own `my_forecasts.history`. Shipping that verbatim would have made `run_once` skip
+- **The post reduced to the committed `api_posts` field set**, plus `projects.category`.
+  That one is kept for a specific reason: it is the only dropped field that reaches
+  `CanonicalQuestion`, through `source_categories`, and so the only one whose loss would change
+  `question_fingerprint` — which is the key M1-326's whole gate turns on. With it kept, the
+  reduced post normalizes to a `CanonicalQuestion` byte-identical to the one the live worker
+  keyed its verdict on, and to the same fingerprint. Verified by execution against the operator's
+  stored snapshot; **not assertable in the suite**, because that would require committing the
+  full post, which is the thing the reduction exists to avoid. The reduction also dropped the
+  community prediction (`aggregations`), the operator-identifying fields, and — the one that
+  mattered — the operator's own `my_forecasts.history`. Shipping that verbatim would have made `run_once` skip
   the question at `if prior.entries`, **before** the gate and before any retrieval, so both polls
   would have recorded zero provider calls for a reason with nothing to do with M1-326. A passing
   test proving nothing is the exact defect this item exists to correct, and it was found by
