@@ -302,8 +302,9 @@ def _build(source: Path) -> dict[Path, str]:
         # whole, with only `as_dicts` reduced to the selected articles. Every other field
         # is carried verbatim -- `usage`, `hit_cache`, `as_string`, `offset` -- so the body
         # is still exactly a SearchResponse and round-trips to itself through the pinned
-        # SDK, which `test_the_committed_bodies_are_real_sdk_responses_that_round_trip`
-        # asserts. `usage.credits` differs between the two strategies and is the only
+        # SDK, which `test_the_committed_bodies_round_trip_through_the_pinned_sdk` asserts.
+        # That is a schema claim, not a fidelity one -- fidelity to the stored artifacts is
+        # this script's own `--check`, which re-derives both fixtures and diffs them. `usage.credits` differs between the two strategies and is the only
         # record here that they are priced differently; it costs about forty bytes.
         "raw_responses": [
             {**responses[i], "as_dicts": [_redact_emails(a) for a in group]}

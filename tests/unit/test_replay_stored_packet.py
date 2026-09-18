@@ -384,16 +384,26 @@ def test_an_empty_packet_reads_as_no_evidence_not_stale_evidence(days: int) -> N
     assert problem.code == "no_evidence"
 
 
-def test_the_committed_bodies_are_real_sdk_responses_that_round_trip() -> None:
-    """ "Derived from a real stored packet" is a claim, so it is checked rather than asserted.
+def test_the_committed_bodies_round_trip_through_the_pinned_sdk() -> None:
+    """The bodies are still shaped like what the pinned SDK parses and emits.
 
-    Each committed body parses as the pinned SDK's own ``SearchResponse`` and dumps back to
-    exactly itself. That is what rules out the failure this fixture could quietly have: a
-    hand-edited body that still parses but is no longer what AskNews sent.
+    **This proves schema and serialization compatibility, and nothing about historical
+    fidelity.** Round-tripping is a fixed point of *any* schema-valid body: edit an article
+    summary to something AskNews never wrote and this assertion still passes. Round 1
+    demonstrated exactly that, and an earlier version of this docstring claimed the
+    assertion "rules out a hand-edited body" -- the same overstated-evidence defect that
+    created this backlog item, so it is corrected here rather than quietly dropped.
 
-    It holds *because* the one edit made to an article -- nulling ``authors[].email`` -- is
-    a value the SDK round-trips back as ``null`` anyway. Truncating a summary or dropping a
-    key would break this assertion, which is the point of having it.
+    What it does establish is worth keeping. Reducing the articles and nulling
+    ``authors[].email`` did not take the bodies outside the SDK's own schema, and the key
+    comes back as ``null`` rather than disappearing -- so the committed form is exactly what
+    the adapter parses at replay time, not a shape that happens to work because the SDK is
+    lenient today.
+
+    **Historical fidelity is established elsewhere, and cannot be established here**, because
+    the source artifacts are deliberately not committed. It is
+    ``scripts/regenerate_replay_fixture.py --check``, which re-derives both fixtures from the
+    operator's stored Cup tree read-only and exits non-zero if either has drifted.
     """
     for body in stored_bodies():
         parsed = SearchResponse.model_validate(body)

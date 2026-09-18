@@ -12227,11 +12227,20 @@ injecting them directly would replay the adapter's *conclusions* rather than its
 claim this item exists to make is about evidence the system really retrieved **and parsed**.
 
 So the fixture is two of AskNews's own response bodies, and the test drives them through
-`SearchResponse.model_validate` → `_to_document` → `validate_document` → `build_packet`. That the
-committed bodies are still real SDK responses is asserted rather than assumed
-(`test_the_committed_bodies_are_real_sdk_responses_that_round_trip`): each dumps back to itself
-byte for byte, which is what rules out a hand-edited body that still parses but is no longer what
-the provider sent.
+`SearchResponse.model_validate` → `_to_document` → `validate_document` → `build_packet`. The committed
+bodies are asserted to round-trip through the pinned SDK
+(`test_the_committed_bodies_round_trip_through_the_pinned_sdk`), which establishes that the
+reduction and the email nulling did not take them outside the schema the adapter parses at replay
+time.
+
+**That assertion proves schema compatibility, not historical fidelity, and the first draft of this
+section said otherwise.** Round-tripping is a fixed point of any schema-valid body: round 1 edited
+an article summary to something AskNews never wrote and the assertion still passed. Reproduced
+here by execution before correcting it — and it is the same overstated-evidence defect that
+created this backlog item, which is worth recording rather than quietly fixing. Fidelity to the
+stored artifacts is `scripts/regenerate_replay_fixture.py --check`, which re-derives both fixtures
+read-only and exits non-zero on any drift. It cannot be an in-suite assertion, because that would
+mean committing the source artifacts the reduction exists to avoid.
 
 `scripts/regenerate_replay_fixture.py` derives the fixtures read-only and records the selection
 rule in-band. The test deliberately does **not** import it, for the reason
@@ -12410,3 +12419,34 @@ sibling file's.
 in this list: it pins, as an executable fact, that a two-poll test that does not cross the windows
 shows zero extra calls whether or not M1-326 exists. That is what the shipped gate test does, and
 it is why this item was filed.
+
+### Round 1 — APPROVE, no blocking findings, one observation worth taking
+
+Round 1 approved at `964eaaf`, with all eight declared risk claims checked independently rather
+than taken on trust: R1, R4, R5 and R7 verified safe by execution (the reviewer re-derived the
+fixtures read-only, compared the full stored post against the reduced one, and confirmed the
+canonical JSON and fingerprints are equal), R2, R6 and R8 supported, and R3 **qualified** — which
+is the observation.
+
+**The observation was right, and it is this project's own recurring defect wearing a new hat.**
+`test_the_committed_bodies_..._round_trip` was documented as ruling out "a hand-edited body that
+still parses but is no longer what AskNews sent". It does not. Round-tripping is a fixed point of
+*any* schema-valid body, and the reviewer demonstrated it by editing an article summary in memory
+and watching the assertion still pass. Reproduced here by execution before changing anything, per
+the stale-review rule.
+
+What makes this worth more than a docstring fix: **M1-330 exists because M1-326 described evidence
+it did not have.** The correction was to the notes, the item was filed, and the test was written —
+and then this branch made a smaller version of the same mistake in the very test that was supposed
+to settle it. The claim has been narrowed to what the assertion actually supports (schema and
+serialization compatibility with the pinned SDK, which is what makes the reduction and the email
+nulling safe for the adapter to parse at replay time), and historical fidelity is attributed where
+it really lives: `scripts/regenerate_replay_fixture.py --check`, which re-derives both fixtures
+from the operator's stored tree read-only and exits non-zero on drift. It cannot be an in-suite
+assertion, because that would mean committing the source artifacts the reduction exists to avoid.
+The test was renamed to match the narrower claim.
+
+The reviewer also noted what it did **not** run: the filesystem was read-only, so the
+SQLite-writing pipeline tests and the mutation matrix were not re-executed, and those results
+stand as reported in the request. Recorded rather than glossed, because "the reviewer verified it"
+and "the reviewer verified the parts it could run" are different claims.
