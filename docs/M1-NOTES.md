@@ -12204,3 +12204,202 @@ concatenate-then-sort rests on.
 
 No dependency slot, no migration — read-only, no schema change. Backlog row flipped to `Done`
 on this branch before merge, per convention.
+
+---
+
+## M1-330 — Replay a real stored research packet and prove it is not re-purchased
+
+Acceptance: *a committed fixture derived from a real stored research packet (question 45452 or
+equivalent) is replayed at a pinned `now`; the first attempt records a deterministic
+`research_failed` verdict and the second, after checkpoint expiry and with an unchanged question
+fingerprint, issues ZERO additional billed provider calls; the assertion is on billed calls and
+never on `research_runs` rows; the fixture is self-contained; and the test is mutation-tested.*
+
+Test-only. No `src/` change, no migration, no dependency.
+
+### Decision — replay the stored raw provider bodies, not the stored documents
+
+The ledger holds 45452's normalized `research_documents` rows, and replaying *those* would have
+been a smaller fixture and less work. It would also have skipped the half that matters. A
+research packet is a derived value object and deliberately not a table (`research/packet.py:11`),
+so the documents in the ledger are the output of `asknews._to_document` and `validate_document` —
+injecting them directly would replay the adapter's *conclusions* rather than its *input*, and the
+claim this item exists to make is about evidence the system really retrieved **and parsed**.
+
+So the fixture is two of AskNews's own response bodies, and the test drives them through
+`SearchResponse.model_validate` → `_to_document` → `validate_document` → `build_packet`. That the
+committed bodies are still real SDK responses is asserted rather than assumed
+(`test_the_committed_bodies_are_real_sdk_responses_that_round_trip`): each dumps back to itself
+byte for byte, which is what rules out a hand-edited body that still parses but is no longer what
+the provider sent.
+
+`scripts/regenerate_replay_fixture.py` derives the fixtures read-only and records the selection
+rule in-band. The test deliberately does **not** import it, for the reason
+`scripts/regenerate_cdf_golden.py` gives: the assertion should be a live parse of frozen bytes,
+not a generator checked against itself.
+
+### Decision — both pinned instants are real dates off the question's own calendar
+
+Nothing here is an invented timestamp. The evidence was retrieved 2026-09-08, the freshness
+window is the configured 30 days, and the question closes 2026-10-24T22:59Z. That leaves a real
+sixteen-day interval in which this question's own real evidence has aged out while the question is
+still open — which is exactly the state in which re-buying research to re-derive a refusal is pure
+waste. The replay is pinned at 2026-10-15T12:00Z, inside it.
+
+The clock advance is **31 minutes, not 30**. Both windows compare `<= 1800`, so exactly thirty
+does not cross either. That one number is what the whole second half of the test rests on, and it
+is named in a module constant rather than left as a literal.
+
+### Deviation — the replayed verdict is `stale_evidence`, not the `no_evidence` on record
+
+Worth stating plainly, because a reviewer will reasonably ask why a replay of 45452 does not
+reproduce 45452's recorded row.
+
+The live Cup ledger holds **exactly one** `research_failed` row for this question: `no_evidence`
+at 2026-09-09T01:25:19Z. Two things about it. First, it never reached `quality_problem` at all —
+the AskNews call failed and the last run of that retrieval was Exa succeeding with zero documents,
+so it came from `pipeline_live`'s `packet is None` branch. Second, the seventeen refusals before
+it predate M1-326 and raised straight past the recorder, leaving no row; they came from the branch
+that demanded a document from the resolution authority the question names, and **M1-327 demoted
+that branch**.
+
+So replaying this packet at the instant it was retrieved correctly produces *no refusal at all*,
+which `test_the_same_stored_packet_is_forecastable_when_it_was_retrieved` asserts and which is the
+non-vacuity control. An earlier plan for this item included a pipeline-level replay of the
+01:25:19 poll; it was dropped once its branch was traced, because reproducing it needs a working
+Exa client and would exercise a different branch while saying nothing about M1-326's gate. The one
+claim it was wanted for — that an empty packet reads as `no_evidence` and not `stale_evidence` —
+is asserted directly on the pure function instead.
+
+### Deviation — the fixture is a four-article reduction, and two edits are declared
+
+The source run returned 14 articles across two responses, 82 KB. The largest fixture otherwise
+committed here is 27 KB. The committed run fixture is 31 KB: four whole articles, verbatim, no
+field truncated — truncating a `summary` would change its `content_sha256` and could change
+whether `relevant` matches it, which would make the fixture a different packet wearing the same
+name. Dropping whole articles is safe under a stated rule; mutilating the kept ones is not.
+
+Three articles (about 24 KB) would satisfy every assertion. The fourth is kept deliberately: it is
+the one article in the set that is actually *about* this question's subject rather than a generic
+global-elections roundup, and the non-vacuity control rests on the claim that this evidence is
+relevant. Six kilobytes for evidence a reviewer can recognize as evidence is the right trade.
+
+Two edits are declared in the fixture's own `provenance` block:
+
+- **`authors[].email` nulled.** The stored bodies carried working email addresses for the
+  journalists who wrote the articles — real personal data about people who are not party to this
+  project, and CI gitleaks-scans full history on every branch forever. It is provably
+  verdict-neutral (`_to_document` and `_hash_source` read neither the field nor anything derived
+  from it) and provably the *only* edit, because the SDK round-trips the key back as `null`
+  anyway — which is why the round-trip assertion above still holds.
+- **The post reduced to the committed `api_posts` field set.** This dropped the community
+  prediction (`aggregations`), the operator-identifying fields, and — the one that mattered — the
+  operator's own `my_forecasts.history`. Shipping that verbatim would have made `run_once` skip
+  the question at `if prior.entries`, **before** the gate and before any retrieval, so both polls
+  would have recorded zero provider calls for a reason with nothing to do with M1-326. A passing
+  test proving nothing is the exact defect this item exists to correct, and it was found by
+  running the test rather than by reading the fixture.
+
+### Rejected — three witnesses described as independent, and why the wording was fixed
+
+The first draft of the replay test claimed `news.calls`, the reserved budget and
+`heartbeat["blocked"]` as independent witnesses of zero billed calls. They are not. The skip
+`continue`s before the Metaculus refetch, before the clients are built and before the budget
+context exists, so all three are readings of one branch: any mutant that breaks it breaks all
+three, and none of them can disagree. The docstring says so now. They are kept because each names
+a different thing that did not happen, not because they corroborate each other.
+
+What actually makes the zero mean something is the **positive control**,
+`test_without_the_gate_the_same_second_poll_buys_the_same_evidence_again`: the same fixture, the
+same clock, the same 31-minute advance, the same fingerprint and the same provider request, with
+`DETERMINISTIC_FAILURE_CODES` emptied so no block is recorded. The calls come back — 2 to 4,
+`150_000` to `300_000` microdollars — which establishes by execution that the advance really does
+clear both windows *for this fixture at this clock*, rather than inheriting that from a synthetic
+test at wall clock. Without it, every zero in the replay test is equally consistent with a warm
+cache. Mutant M7 below is the proof that this control is load-bearing.
+
+The edited-question test was originally going to serve as that control. It cannot: editing the
+title also changes the query the adapter sends, so it moves `durable.begin_call`'s request digest
+as well as the clock and isolates neither. It is kept for what it does prove — that the
+fingerprint half of the block key is load-bearing — and the two tests now pin one half of that key
+each.
+
+### Rejected — asserting on `research_runs`, and a third reason it is wrong here
+
+The acceptance criterion already forbids it, for two reasons this project has paid for: pinned
+`started_at_utc` makes distinct timestamps undercount retrievals, and `durable.py`'s within-window
+dedup serves runs that were never billed, so the row count overcounts calls. Three of 45452's
+twenty real run rows were served that way.
+
+This fixture adds a third. The question names a resolution authority, so `decide_fallback` runs
+the Exa pass on every retrieval, and `_fallback_pass` opens a `research_runs` row *before*
+`retrieve_web` refuses the injected non-httpx client. Every retrieval here therefore leaves a
+permanently-open Exa run behind. Harmless — `load_packet` is `completed_only` — and one more
+reason the row count is not a measurement. The budget assertion is exact instead:
+`150_000` microdollars is 0.025 for the `latest news` strategy plus 0.125 for `news knowledge`,
+which pins both that two strategies were bought and that Exa billed nothing.
+
+### Deferred (do not read the absence as an omission)
+
+- **Exa's half of the retrieval is not replayed.** There is nothing to replay: all 20 of the real
+  Exa runs for this question retained zero documents.
+- **No `src/` change**, including any a review may suggest. The tournament is live; a finding that
+  pushes toward one gets a new backlog row, not a commit on this branch.
+- **`research_checkpoint` is scoped on the fingerprint alone**, unlike `question_blocked` and
+  `question_started`, which are also activation-scoped. So an operator re-running `tournament
+  enable` within thirty minutes of the last retrieval gets a re-armed question re-judged on the
+  *cached* packet rather than re-purchased. Found while tracing the two windows for this item. Not
+  M1-330's to fix, and named here rather than left unwritten.
+
+### Standing risk — not verifiable offline
+
+What this replay proves is that a deterministic verdict derived from evidence the system really
+retrieved is not bought a second time. What no offline test can prove is that a live AskNews call
+today would return these documents, or that the historical packet reproduces byte for byte.
+Sockets are blocked, so "no provider call was made" is observed at the fake client, never at the
+network.
+
+One honesty note about the assertions themselves: at the aged-out instant the `stale_evidence`
+branch needs only *"documents exist and none is contemporary"* — it never consults `relevant`. So
+the `relevant == every document` assertion is a control on the **retrieval-instant** side, where
+it is what makes `quality_problem` return `None`; it is not evidence for the stale verdict, and
+the test says so.
+
+### Verification — six of seven mutants killed, the survivor reproduced elsewhere
+
+From the committed tree, one mutation at a time, restored between runs, with
+`PYTHONDONTWRITEBYTECODE=1` so a same-size edit inside one second cannot be served back from
+stale bytecode. Neutered, never deleted.
+
+| mutant | result |
+| --- | --- |
+| baseline | 11 passed |
+| M1 skip half neutered (`if blocked:` -> `if False:`) | killed (1 failed) |
+| M2 emit half neutered (`DETERMINISTIC_FAILURE_CODES` -> `frozenset()`) | killed (2 failed) |
+| M3 fingerprint ignored in the block lookup | killed (2 failed) |
+| M4 activation ignored in the block lookup | **survived** |
+| M5 stale branch never taken (`if False and not any(contemporary(...))`) | killed (2 failed) |
+| M6 `contemporary()` -> `return True` | killed (5 failed) |
+| M7 `research_checkpoint` window 1800 -> 180000 | killed (1 failed) |
+
+Two of these are worth reading rather than counting.
+
+**M7 is the one that proves the positive control is load-bearing.** Widening the checkpoint window
+lets the second poll reuse the stored packet, so with the gate disabled it no longer re-bills —
+and the only test that notices is
+`test_without_the_gate_the_same_second_poll_buys_the_same_evidence_again`. That is the confound
+this whole module exists to remove, caught by the test written to remove it.
+
+**M4 survived, and that is a coverage boundary rather than a vacuous test.**
+[[whiskeyjack-two-part-guard-mutation]] is explicit that a survivor from neutering one half of a
+two-part guard reads exactly like a vacuous test, so it was checked by execution rather than
+argued: the same mutant applied against `tests/unit/test_tournament.py` fails
+`test_re_enabling_the_tournament_re_arms_a_blocked_question` (1 failed, 79 passed). The
+activation half is M1-327's and is covered there; this module never re-enables the tournament, so
+it cannot distinguish it. Recorded rather than papered over with a test that would duplicate the
+sibling file's.
+
+`test_a_second_poll_inside_the_window_proves_nothing_about_the_gate` is not a mutant but belongs
+in this list: it pins, as an executable fact, that a two-poll test that does not cross the windows
+shows zero extra calls whether or not M1-326 exists. That is what the shipped gate test does, and
+it is why this item was filed.
