@@ -1,0 +1,470 @@
+{
+  "provenance": {
+    "question_id": 45452,
+    "retrieval_run_id": "run-49cddd480b264fdda316ebf6667796b3",
+    "provider": "asknews",
+    "captured_at_utc": "2026-09-08T16:38:33.185524+00:00",
+    "articles_kept": 4,
+    "articles_in_run": 14,
+    "edits": [
+      "authors[].email set to null -- personal data, provably verdict-neutral",
+      "articles reduced by the selection rule below; no article field is truncated",
+      "the post fixture drops aggregations, operator-identifying fields, and the operator's own my_forecasts history"
+    ],
+    "selection_rule": "Whole articles, copied verbatim, never truncated: (1) the article both strategies returned, kept on both sides so the run's dedup collapse survives; (2) the second strategy's newest article, usable at the retrieval instant; (3) its oldest, already stale at that instant, so the packet stays mixed. See scripts/regenerate_replay_fixture.py.",
+    "regenerate_with": "uv run python scripts/regenerate_replay_fixture.py"
+  },
+  "raw_responses": [
+    {
+      "as_dicts": [
+        {
+          "article_url": "https://www.adnkronos.com/internazionale/esteri/mappa-elezioni-2026-2027-europa-occidente_15jtjG5AsnyLeKDOc4vKZi",
+          "article_id": "0a667ac2-c6de-4585-bfd0-09dc1c1a88a9",
+          "classification": "Politics",
+          "country": "Unknown",
+          "source_id": "Adnkronos",
+          "page_rank": 10000,
+          "domain_url": "adnkronos.com",
+          "eng_title": "Global Election Map: Far-Right Gains and Shifting Alliances Across Europe and the West",
+          "entities": {
+            "Person": [
+              "Benjamin Netanyahu",
+              "Vladimir Putin",
+              "Gadi Eisenkot",
+              "Donald Trump",
+              "Iliana Iotova"
+            ],
+            "Organization": [
+              "State Duma",
+              "United Russia",
+              "House",
+              "Die Linke",
+              "Christian Democratic Union",
+              "Latvia First",
+              "Alternative for Germany",
+              "Social Democrats",
+              "The Knesset",
+              "European Union",
+              "coalition government",
+              "senate"
+            ],
+            "Location": [
+              "Mecklenburg-Vorpommern",
+              "Berlin",
+              "Europe",
+              "German Democratic Republic",
+              "Saxony-Anhalt",
+              "West"
+            ],
+            "Nationality": [],
+            "Date": [],
+            "Event": [],
+            "Money": [],
+            "Law": [],
+            "Quantity": [],
+            "Time": [],
+            "Sports": [],
+            "Politics": [],
+            "Title": [
+              "president",
+              "prime minister"
+            ],
+            "Number": [],
+            "Arms": [],
+            "Product": [],
+            "Media": [],
+            "Transportation": [],
+            "Religion": [],
+            "Technology": [],
+            "Space": [],
+            "Medicine": [],
+            "Language": [],
+            "Science": []
+          },
+          "image_url": "https://img.ekkowassets.com/c_limit,w_360,f_auto,q_auto:eco/ch/images/1469835967417354179/origin_1.jpg",
+          "keywords": [
+            "European elections 2026",
+            "AfD Germany",
+            "US midterms 2026",
+            "France presidential election 2027"
+          ],
+          "language": "en",
+          "pub_date": "2026-09-07T22:02:58Z",
+          "summary": "Following the AfD's triumph in Saxony-Anhalt, where the far-right party secured 44% of the vote, a series of upcoming elections is set to test the stability of moderate parties in Europe and the West. In Germany, regional votes in Berlin and Mecklenburg-Vorpommern are scheduled for September 20, 2026; polls show a tight race between Die Linke and the CDU in Berlin (around 20%), while the AfD leads in East Germany at 28%. On September 13, 2026, Sweden holds parliamentary elections, with the Social Democrats leading at 47.9-50.6% against the government coalition at 47.3-47.9%. Russia's State Duma elections (September 18-20, 2026) are expected to yield a landslide victory for Vladimir Putin's United Russia party. On October 3, 2026, Latvia votes, where the populist 'Latvia First' party aims to double its support to become the second-largest force. Bulgaria holds presidential elections on October 25, 2026, with interim President Iliana Iotova projected to win with approximately 50% of the vote. Outside the EU, Israel votes for the Knesset on October 27, 2026; polls suggest opposition leader Gadi Eisenkot (56-59 seats) may defeat Prime Minister Benjamin Netanyahu's coalition (49-50 seats), with Eisenkot preferred as premier by 44% to Netanyahu's 34%. US midterm elections on November 3, 2026, show Democrats favored to win the House (83-87% probability) and a competitive Senate race, with Donald Trump's approval below 40%. Looking ahead to 2027, Estonia votes on March 7, with the Reformierakond party collapsing from 31% to 12-14%. France's presidential election on April 18, 2027, sees Marine Le Pen leading with 33-36% and expected to win the runoff on May 2. Finland's parliamentary election on April 18, 2027, features a contest between the Sdp (22.6%) and the rising nationalist Veri Finlandesi (over 16%). Greece votes by July 31, 2027, where Prime Minister Kyriakos Mitsotakis's New Democracy party has dropped to 29.1%. Spain holds elections by August 31, 2027, where the People's Party and Vox may exceed 50% combined. Poland votes in early November 2027, where the opposition coalition led by Donald Tusk faces a right-wing bloc projected to reach 47%. Finally, Slovakia's October 2027 election is described as the most uncertain, with the far-right Republika party (10-13%) poised to influence the government.",
+          "key_points": [
+            "Following the AfD's triumph in Saxony-Anhalt, where the far-right party secured 44% of the vote, a series of upcoming elections is set to test the stability of moderate parties in Europe and the West.",
+            "In Germany, regional votes in Berlin and Mecklenburg-Vorpommern are scheduled for September 20, 2026; polls show a tight race between Die Linke and the CDU in Berlin (around 20%), while the AfD leads in East Germany at 28%.",
+            "On September 13, 2026, Sweden holds parliamentary elections, with the Social Democrats leading at 47.9-50.6% against the government coalition at 47.3-47.9%.",
+            "Russia's State Duma elections (September 18-20, 2026) are expected to yield a landslide victory for Vladimir Putin's United Russia party.",
+            "On October 3, 2026, Latvia votes, where the populist 'Latvia First' party aims to double its support to become the second-largest force.",
+            "Bulgaria holds presidential elections on October 25, 2026, with interim President Iliana Iotova projected to win with approximately 50% of the vote.",
+            "Outside the EU, Israel votes for the Knesset on October 27, 2026; polls suggest opposition leader Gadi Eisenkot (56-59 seats) may defeat Prime Minister Benjamin Netanyahu's coalition (49-50 seats), with Eisenkot preferred as premier by 44% to Netanyahu's 34%.",
+            "US midterm elections on November 3, 2026, show Democrats favored to win the House (83-87% probability) and a competitive Senate race, with Donald Trump's approval below 40%.",
+            "Looking ahead to 2027, Estonia votes on March 7, with the Reformierakond party collapsing from 31% to 12-14%.",
+            "France's presidential election on April 18, 2027, sees Marine Le Pen leading with 33-36% and expected to win the runoff on May 2."
+          ],
+          "title": "Effetto Afd, dopo Sassonia-Anhalt la mappa delle elezioni che possono cambiare Ue e Occidente",
+          "sentiment": 0,
+          "medoid_distance": null,
+          "markdown_citation": "[A](https://www.adnkronos.com/internazionale/esteri/mappa-elezioni-2026-2027-europa-occidente_15jtjG5AsnyLeKDOc4vKZi)",
+          "provocative": "medium",
+          "reporting_voice": "Objective",
+          "entity_relation_graph": null,
+          "geo_coordinates": null,
+          "continent": "Europe",
+          "assets": null,
+          "social_embeds": null,
+          "bias": "Slant",
+          "authors": [
+            {
+              "email": null,
+              "name": "Adnkronos",
+              "url": null
+            }
+          ],
+          "full_text": null,
+          "image_description": null,
+          "original_language_summary": null,
+          "crawl_date": "2026-09-07T23:47:02Z",
+          "content_type": "news",
+          "as_string_key": "[1]"
+        }
+      ],
+      "as_string": null,
+      "offset": 8,
+      "hit_cache": false,
+      "usage": {
+        "credits": 1
+      }
+    },
+    {
+      "as_dicts": [
+        {
+          "article_url": "https://www.bta.bg/en/news/bulgaria/1143404-president-iotova-starts-consultations-with-parliamentary-forces-about-new-centra",
+          "article_id": "3e41a58c-3792-4fc2-9b77-7bee9bdbd4a2",
+          "classification": "Politics",
+          "country": "BG",
+          "source_id": "\u0411\u044a\u043b\u0433\u0430\u0440\u0441\u043a\u0430 \u0422\u0435\u043b\u0435\u0433\u0440\u0430\u0444\u043d\u0430 \u0410\u0433\u0435\u043d\u0446\u0438\u044f",
+          "page_rank": 37640,
+          "domain_url": "bta.bg",
+          "eng_title": "President Iotova Opens CEC Consultations Amidst Seat Allocation Dispute",
+          "entities": {
+            "Person": [
+              "President Iotova",
+              "President Iliana Iotova"
+            ],
+            "Organization": [
+              "CEC",
+              "Continue the Change - Democratic Bulgaria",
+              "Progressive Bulgaria",
+              "European Union",
+              "Central Election Commission",
+              "parliamentary forces",
+              "52nd National Assembly",
+              "Commission",
+              "CC-DB"
+            ],
+            "Location": [],
+            "Nationality": [
+              "Bulgarian"
+            ],
+            "Date": [
+              "Tuesday",
+              "June 9, 2026"
+            ],
+            "Event": [],
+            "Money": [],
+            "Law": [
+              "Election Code",
+              "Article 46"
+            ],
+            "Quantity": [],
+            "Time": [],
+            "Sports": [],
+            "Politics": [],
+            "Title": [],
+            "Number": [
+              "eight",
+              "seven"
+            ],
+            "Arms": [],
+            "Product": [],
+            "Media": [],
+            "Transportation": [],
+            "Religion": [],
+            "Technology": [],
+            "Space": [],
+            "Medicine": [],
+            "Language": [],
+            "Science": []
+          },
+          "image_url": "https://www.bta.bg/upload/13518062/BKK_9788+%282%29.JPG?l=750",
+          "keywords": [
+            "Iliana Iotova",
+            "Central Election Commission",
+            "Bulgaria",
+            "Election Code"
+          ],
+          "language": "en",
+          "pub_date": "2026-06-09T09:31:00Z",
+          "summary": "On June 9, 2026, President Iliana Iotova of Bulgaria initiated consultations with parliamentary forces regarding the appointment of new members to the Central Election Commission (CEC) in the 52nd National Assembly. During the meeting, representatives from parliamentary parties and coalitions presented their nominees, with President Iotova noting that the process follows the Election Code. However, the 'Continue the Change - Democratic Bulgaria' (CC-DB) party submitted an objection, alleging an inaccuracy in seat allocation. CC-DB claims that 'Progressive Bulgaria' should be allocated seven seats, with the remaining eight distributed proportionally among other groups, and has called for a review of the methodology. President Iotova stated that nominations would be published by the end of Tuesday, June 9, 2026, and a legal committee would begin reviewing candidate documents the following day. She emphasized the CEC's critical role in ensuring fair, transparent elections and maintaining public trust, citing Article 46 of the Election Code which mandates that party representation in the Commission reflects parliamentary proportions using the greatest remainder method.",
+          "key_points": [
+            "On June 9, 2026, President Iliana Iotova of Bulgaria initiated consultations with parliamentary forces regarding the appointment of new members to the Central Election Commission (CEC) in the 52nd National Assembly.",
+            "During the meeting, representatives from parliamentary parties and coalitions presented their nominees, with President Iotova noting that the process follows the Election Code.",
+            "However, the 'Continue the Change - Democratic Bulgaria' (CC-DB) party submitted an objection, alleging an inaccuracy in seat allocation.",
+            "CC-DB claims that 'Progressive Bulgaria' should be allocated seven seats, with the remaining eight distributed proportionally among other groups, and has called for a review of the methodology.",
+            "President Iotova stated that nominations would be published by the end of Tuesday, June 9, 2026, and a legal committee would begin reviewing candidate documents the following day.",
+            "She emphasized the CEC's critical role in ensuring fair, transparent elections and maintaining public trust, citing Article 46 of the Election Code which mandates that party representation in the Commission reflects parliamentary proportions using the greatest remainder method."
+          ],
+          "title": "President Iotova Starts Consultations with Parliamentary Forces about New Central Election Commission Members",
+          "sentiment": 0,
+          "medoid_distance": null,
+          "markdown_citation": "[\u0411\u0422\u0410](https://www.bta.bg/en/news/bulgaria/1143404-president-iotova-starts-consultations-with-parliamentary-forces-about-new-centra)",
+          "provocative": "low",
+          "reporting_voice": "Objective",
+          "entity_relation_graph": null,
+          "geo_coordinates": null,
+          "continent": "Europe",
+          "assets": null,
+          "social_embeds": null,
+          "bias": "None",
+          "authors": [
+            {
+              "email": null,
+              "name": "Metodi Yordanov",
+              "url": null
+            },
+            {
+              "email": null,
+              "name": "Yoana Hristova",
+              "url": null
+            }
+          ],
+          "full_text": null,
+          "image_description": "A formal meeting scene showing President Iliana Iotova seated at the head of a long conference table. She is flanked by the Bulgarian and European Union flags. Other attendees are seated along the table. In the background, a screen displays the text '\u0420\u0430\u0437\u043f\u0440\u0435\u0434\u0435\u043b\u0435\u043d\u0438\u0435 \u043d\u0430 \u043c\u0435\u0441\u0442\u0430\u0442\u0430 \u0432 \u0426\u0418\u041a' (Distribution of seats in the CEC) alongside the Presidential Seal.",
+          "original_language_summary": null,
+          "crawl_date": "2026-06-09T10:20:46Z",
+          "content_type": "news",
+          "as_string_key": "[3]"
+        },
+        {
+          "article_url": "https://www.newsy-today.com/iliana-iotova-proves-to-be-the-peoples-president/",
+          "article_id": "ace0681a-6052-4fcf-84fe-14ac1378a12d",
+          "classification": "Politics",
+          "country": "US",
+          "source_id": "Newsy Today",
+          "page_rank": 262386,
+          "domain_url": "newsy-today.com",
+          "eng_title": "President Iliana Iotova Honored at Folklore Festival Amid Rising Presidential Election Tensions",
+          "entities": {
+            "Person": [
+              "Iliana Iotova",
+              "Tzvetan Todorov",
+              "Zhivko Todorov",
+              "Mrs. Iotova",
+              "Boyko Borissov"
+            ],
+            "Organization": [
+              "Democratic Bulgaria",
+              "Bulgarian News Agency",
+              "Citizens for European Development of Bulgaria",
+              "We Continue the Change"
+            ],
+            "Location": [
+              "Mineralni bani",
+              "Stara Zagora",
+              "Bulgaria"
+            ],
+            "Nationality": [
+              "Bulgarians"
+            ],
+            "Date": [],
+            "Event": [
+              "Bogorodichna stapka",
+              "Gjirokast\u00ebr National Folklore Festival"
+            ],
+            "Money": [],
+            "Law": [],
+            "Quantity": [],
+            "Time": [],
+            "Sports": [],
+            "Politics": [],
+            "Title": [
+              "president",
+              "Lord Mayor",
+              "president of the people"
+            ],
+            "Number": [],
+            "Arms": [],
+            "Product": [],
+            "Media": [],
+            "Transportation": [],
+            "Religion": [],
+            "Technology": [],
+            "Space": [],
+            "Medicine": [],
+            "Language": [],
+            "Science": []
+          },
+          "image_url": "https://cache1.24chasa.bg/Images/Cache/521/IMAGE_23472521_4000_0.jpg",
+          "keywords": [
+            "Iliana Iotova",
+            "Bulgarian Folklore Festival",
+            "Boyko Borisov",
+            "Presidential Election 2026"
+          ],
+          "language": "en",
+          "pub_date": "2026-08-29T18:04:16Z",
+          "summary": "At the opening of the 20th edition of the National Thracian Folklore Festival 'Bogorodichna stapka' in Starozagorski mineralni bani, Stara Zagora Mayor Zhivko Todorov addressed President Iliana Iotova, calling her the 'president of the people' for respecting and honoring Bulgarian traditions, according to reports from the Bulgarian News Agency (BTA) and regional media coverage. Iotova's attendance marks the first time a sitting head of state has visited the festival since its inception, according to municipal statements. During the opening ceremonies, Mayor Todorov thanked Iotova directly for her respect toward the citizens attending the two-day cultural forum. 'Your respect is toward all these people who will go on stage or visit the holiday during these two days,' Todorov stated, as cited by BTA. President Iotova also addressed the gathered crowds, noting that folk traditions and the asymmetrical rhythms of Bulgarian music serve as a vital source of strength for the nation. 'In our folklore is the whole of Bulgaria, the entire rich palette of worlds of the human soul,' Iotova stated during her opening address. Meanwhile, political tensions surrounding the autumn presidential race intensified as GERB leader Boyko Borisov set a 10-day deadline for 'We Continue the Change' and 'Democratic Bulgaria' to nominate a joint candidate to oppose Iliana Iotova. Borisov warned that a failure to mount a unified right-wing opposition would effectively hand the election to the left, remarking that failure to cooperate means 'everyone is jointly helping Mrs. Iotova to win and we can congratulate her from now on,' according to regional reports. Political parties and coalitions intending to participate in the upcoming presidential elections must complete their registration with the Central Election Commission (CIK) by September 9, with initiative committees having until September 14 to register their nominations. The final slate of candidates running for president and vice president will become officially locked on September 22, marking the final deadline for submitting candidate lists ahead of the October 25 poll.",
+          "key_points": [
+            "At the opening of the 20th edition of the National Thracian Folklore Festival 'Bogorodichna stapka' in Starozagorski mineralni bani, Stara Zagora Mayor Zhivko Todorov addressed President Iliana Iotova, calling her the 'president of the people' for respecting and honoring Bulgarian traditions, according to reports from the Bulgarian News Agency (BTA) and regional media coverage.",
+            "Iotova's attendance marks the first time a sitting head of state has visited the festival since its inception, according to municipal statements.",
+            "During the opening ceremonies, Mayor Todorov thanked Iotova directly for her respect toward the citizens attending the two-day cultural forum. 'Your respect is toward all these people who will go on stage or visit the holiday during these two days,' Todorov stated, as cited by BTA.",
+            "President Iotova also addressed the gathered crowds, noting that folk traditions and the asymmetrical rhythms of Bulgarian music serve as a vital source of strength for the nation. 'In our folklore is the whole of Bulgaria, the entire rich palette of worlds of the human soul,' Iotova stated during her opening address.",
+            "Meanwhile, political tensions surrounding the autumn presidential race intensified as GERB leader Boyko Borisov set a 10-day deadline for 'We Continue the Change' and 'Democratic Bulgaria' to nominate a joint candidate to oppose Iliana Iotova.",
+            "Borisov warned that a failure to mount a unified right-wing opposition would effectively hand the election to the left, remarking that failure to cooperate means 'everyone is jointly helping Mrs. Iotova to win and we can congratulate her from now on,' according to regional reports.",
+            "Political parties and coalitions intending to participate in the upcoming presidential elections must complete their registration with the Central Election Commission (CIK) by September 9, with initiative committees having until September 14 to register their nominations.",
+            "The final slate of candidates running for president and vice president will become officially locked on September 22, marking the final deadline for submitting candidate lists ahead of the October 25 poll."
+          ],
+          "title": "Iliana Iotova Proves to Be the People's President - Newsy Today",
+          "sentiment": 1,
+          "medoid_distance": null,
+          "markdown_citation": "[NT](https://www.newsy-today.com/iliana-iotova-proves-to-be-the-peoples-president/)",
+          "provocative": "low",
+          "reporting_voice": "Objective",
+          "entity_relation_graph": null,
+          "geo_coordinates": null,
+          "continent": "Europe",
+          "assets": null,
+          "social_embeds": null,
+          "bias": "None",
+          "authors": null,
+          "full_text": null,
+          "image_description": "A group photograph featuring President Iliana Iotova in a green blazer standing alongside Stara Zagora Mayor Zhivko Todorov and a group of women wearing traditional Bulgarian folk costumes with red and white embroidery and floral headpieces, set outdoors in a park-like setting.",
+          "original_language_summary": null,
+          "crawl_date": "2026-08-29T19:00:59Z",
+          "content_type": "news",
+          "as_string_key": "[5]"
+        },
+        {
+          "article_url": "https://www.adnkronos.com/internazionale/esteri/mappa-elezioni-2026-2027-europa-occidente_15jtjG5AsnyLeKDOc4vKZi",
+          "article_id": "0a667ac2-c6de-4585-bfd0-09dc1c1a88a9",
+          "classification": "Politics",
+          "country": "Unknown",
+          "source_id": "Adnkronos",
+          "page_rank": 10000,
+          "domain_url": "adnkronos.com",
+          "eng_title": "Global Election Map: Far-Right Gains and Shifting Alliances Across Europe and the West",
+          "entities": {
+            "Person": [
+              "Benjamin Netanyahu",
+              "Vladimir Putin",
+              "Gadi Eisenkot",
+              "Donald Trump",
+              "Iliana Iotova"
+            ],
+            "Organization": [
+              "State Duma",
+              "United Russia",
+              "House",
+              "Die Linke",
+              "Christian Democratic Union",
+              "Latvia First",
+              "Alternative for Germany",
+              "Social Democrats",
+              "The Knesset",
+              "European Union",
+              "coalition government",
+              "senate"
+            ],
+            "Location": [
+              "Mecklenburg-Vorpommern",
+              "Berlin",
+              "Europe",
+              "German Democratic Republic",
+              "Saxony-Anhalt",
+              "West"
+            ],
+            "Nationality": [],
+            "Date": [],
+            "Event": [],
+            "Money": [],
+            "Law": [],
+            "Quantity": [],
+            "Time": [],
+            "Sports": [],
+            "Politics": [],
+            "Title": [
+              "president",
+              "prime minister"
+            ],
+            "Number": [],
+            "Arms": [],
+            "Product": [],
+            "Media": [],
+            "Transportation": [],
+            "Religion": [],
+            "Technology": [],
+            "Space": [],
+            "Medicine": [],
+            "Language": [],
+            "Science": []
+          },
+          "image_url": "https://img.ekkowassets.com/c_limit,w_360,f_auto,q_auto:eco/ch/images/1469835967417354179/origin_1.jpg",
+          "keywords": [
+            "European elections 2026",
+            "AfD Germany",
+            "US midterms 2026",
+            "France presidential election 2027"
+          ],
+          "language": "en",
+          "pub_date": "2026-09-07T22:02:58Z",
+          "summary": "Following the AfD's triumph in Saxony-Anhalt, where the far-right party secured 44% of the vote, a series of upcoming elections is set to test the stability of moderate parties in Europe and the West. In Germany, regional votes in Berlin and Mecklenburg-Vorpommern are scheduled for September 20, 2026; polls show a tight race between Die Linke and the CDU in Berlin (around 20%), while the AfD leads in East Germany at 28%. On September 13, 2026, Sweden holds parliamentary elections, with the Social Democrats leading at 47.9-50.6% against the government coalition at 47.3-47.9%. Russia's State Duma elections (September 18-20, 2026) are expected to yield a landslide victory for Vladimir Putin's United Russia party. On October 3, 2026, Latvia votes, where the populist 'Latvia First' party aims to double its support to become the second-largest force. Bulgaria holds presidential elections on October 25, 2026, with interim President Iliana Iotova projected to win with approximately 50% of the vote. Outside the EU, Israel votes for the Knesset on October 27, 2026; polls suggest opposition leader Gadi Eisenkot (56-59 seats) may defeat Prime Minister Benjamin Netanyahu's coalition (49-50 seats), with Eisenkot preferred as premier by 44% to Netanyahu's 34%. US midterm elections on November 3, 2026, show Democrats favored to win the House (83-87% probability) and a competitive Senate race, with Donald Trump's approval below 40%. Looking ahead to 2027, Estonia votes on March 7, with the Reformierakond party collapsing from 31% to 12-14%. France's presidential election on April 18, 2027, sees Marine Le Pen leading with 33-36% and expected to win the runoff on May 2. Finland's parliamentary election on April 18, 2027, features a contest between the Sdp (22.6%) and the rising nationalist Veri Finlandesi (over 16%). Greece votes by July 31, 2027, where Prime Minister Kyriakos Mitsotakis's New Democracy party has dropped to 29.1%. Spain holds elections by August 31, 2027, where the People's Party and Vox may exceed 50% combined. Poland votes in early November 2027, where the opposition coalition led by Donald Tusk faces a right-wing bloc projected to reach 47%. Finally, Slovakia's October 2027 election is described as the most uncertain, with the far-right Republika party (10-13%) poised to influence the government.",
+          "key_points": [
+            "Following the AfD's triumph in Saxony-Anhalt, where the far-right party secured 44% of the vote, a series of upcoming elections is set to test the stability of moderate parties in Europe and the West.",
+            "In Germany, regional votes in Berlin and Mecklenburg-Vorpommern are scheduled for September 20, 2026; polls show a tight race between Die Linke and the CDU in Berlin (around 20%), while the AfD leads in East Germany at 28%.",
+            "On September 13, 2026, Sweden holds parliamentary elections, with the Social Democrats leading at 47.9-50.6% against the government coalition at 47.3-47.9%.",
+            "Russia's State Duma elections (September 18-20, 2026) are expected to yield a landslide victory for Vladimir Putin's United Russia party.",
+            "On October 3, 2026, Latvia votes, where the populist 'Latvia First' party aims to double its support to become the second-largest force.",
+            "Bulgaria holds presidential elections on October 25, 2026, with interim President Iliana Iotova projected to win with approximately 50% of the vote.",
+            "Outside the EU, Israel votes for the Knesset on October 27, 2026; polls suggest opposition leader Gadi Eisenkot (56-59 seats) may defeat Prime Minister Benjamin Netanyahu's coalition (49-50 seats), with Eisenkot preferred as premier by 44% to Netanyahu's 34%.",
+            "US midterm elections on November 3, 2026, show Democrats favored to win the House (83-87% probability) and a competitive Senate race, with Donald Trump's approval below 40%.",
+            "Looking ahead to 2027, Estonia votes on March 7, with the Reformierakond party collapsing from 31% to 12-14%.",
+            "France's presidential election on April 18, 2027, sees Marine Le Pen leading with 33-36% and expected to win the runoff on May 2."
+          ],
+          "title": "Effetto Afd, dopo Sassonia-Anhalt la mappa delle elezioni che possono cambiare Ue e Occidente",
+          "sentiment": 0,
+          "medoid_distance": null,
+          "markdown_citation": "[A](https://www.adnkronos.com/internazionale/esteri/mappa-elezioni-2026-2027-europa-occidente_15jtjG5AsnyLeKDOc4vKZi)",
+          "provocative": "medium",
+          "reporting_voice": "Objective",
+          "entity_relation_graph": null,
+          "geo_coordinates": null,
+          "continent": "Europe",
+          "assets": null,
+          "social_embeds": null,
+          "bias": "Slant",
+          "authors": [
+            {
+              "email": null,
+              "name": "Adnkronos",
+              "url": null
+            }
+          ],
+          "full_text": null,
+          "image_description": null,
+          "original_language_summary": null,
+          "crawl_date": "2026-09-07T23:47:02Z",
+          "content_type": "news",
+          "as_string_key": "[7]"
+        }
+      ],
+      "as_string": null,
+      "offset": 6,
+      "hit_cache": false,
+      "usage": {
+        "credits": 5
+      }
+    }
+  ]
+}
