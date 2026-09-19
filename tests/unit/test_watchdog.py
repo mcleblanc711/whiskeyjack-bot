@@ -79,6 +79,13 @@ def rendered(moment: datetime) -> str:
     return moment.strftime("%a %Y-%m-%d %H:%M:%S UTC")
 
 
+# Nine hours before the anchor -- stale enough to page -- rendered the two ways a stamp can be
+# unusable while looking right: the host's own local zone (what an un-pinned TZ produces) and no
+# zone at all. Anchor-relative on purpose: a future-dated example is refused by the arithmetic,
+# so it would pass whether or not the zone is checked.
+STALE_IN_LOCAL_ZONE = (ANCHOR - timedelta(hours=9)).strftime("%a %Y-%m-%d %H:%M:%S MDT")
+STALE_WITHOUT_ZONE = (ANCHOR - timedelta(hours=9)).strftime("%a %Y-%m-%d %H:%M:%S")
+
 LAST_TRIGGER = ("show", "whiskeyjack-resolutions.timer", "-p", "LastTriggerUSec", "--value")
 ACTIVE_ENTER = ("show", "whiskeyjack-resolutions.timer", "-p", "ActiveEnterTimestamp", "--value")
 
@@ -606,6 +613,28 @@ def test_the_interval_the_stall_rule_uses_is_the_cadence_the_timer_declares() ->
     )
 
 
+def test_the_runbooks_w1_table_is_the_whole_vocabulary(watchdog: Harness) -> None:
+    """A table is a claim about a PARTITION, not a list of examples (T-908's lesson).
+
+    W1's table tells an operator what each line of the page means. The page is built by indexing
+    `RESOLUTIONS_PROBLEMS` by code, so a sentence the table is missing is a page an operator
+    cannot look up, and a sentence only the table has is a line nothing can ever print. Set
+    equality, so both directions fail.
+    """
+    runbook = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    section = runbook.split("### W1 — `RESOLUTIONS SCHEDULE STOPPED`", 1)[1]
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break  # the FIRST table in W1, not every table further down the runbook
+    cells = [row.split("|")[1].strip() for row in rows]
+    assert cells[:2] == ["line", "---"], cells[:2]  # the header and its separator
+    documented = set(cells[2:])
+    assert documented == set(watchdog.module.RESOLUTIONS_PROBLEMS.values())
+
+
 def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
     """The criterion's first silence, and it is guard A's -- not the arithmetic's.
 
@@ -633,8 +662,11 @@ def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
         ("unknown", "what this module substitutes when the systemctl call itself fails"),
         ("n/a", "systemd's own rendering of an unset timestamp"),
         ("infinity", "systemd's own rendering of a value that never elapses"),
-        ("Sat 2026-09-19 12:23:18 MDT", "a local zone -- what an un-pinned TZ would produce"),
-        ("Sat 2026-09-19 12:23:18", "the same instant with the zone token missing"),
+        # Stale by nine hours and rendered in a local zone: the SAME instant that pages one
+        # row above, so if the zone token stopped being checked this row would page rather than
+        # pass. A future-dated example would have been silent for the wrong reason.
+        (STALE_IN_LOCAL_ZONE, "a local zone -- what an un-pinned TZ would produce"),
+        (STALE_WITHOUT_ZONE, "the same instant with the zone token missing"),
         ("Sat 2026-13-45 99:99:99 UTC", "well-shaped and not a date"),
     ],
 )
@@ -852,7 +884,7 @@ def test_a_timer_just_restarted_is_recovering_rather_than_stalled(watchdog: Harn
     assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
 
 
-@pytest.mark.parametrize("answer", ["", "unknown", "Sat 2026-09-19 12:23:18 MDT"])
+@pytest.mark.parametrize("answer", ["", "unknown", STALE_IN_LOCAL_ZONE])
 def test_an_activation_stamp_this_program_cannot_use_is_silence_too(
     watchdog: Harness, answer: str
 ) -> None:
