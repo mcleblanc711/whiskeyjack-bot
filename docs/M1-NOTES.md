@@ -12723,8 +12723,8 @@ never allowed to invent one.
   `WORST_CASE_SECONDS` 190 → 215.
 - `docs/RUNBOOK.md` — a fourth row in W1's table, the stall's own remedy block, the three
   silences stated, and the eleven-query/`TZ=UTC` note under § The watchdog itself.
-- Tests: 16 test functions added in `tests/unit/test_watchdog.py` -- 77 collected cases, up
-  from 50 -- and 7 properties added in `tests/property/test_watchdog_properties.py` (16 total).
+- Tests: 81 collected cases in `tests/unit/test_watchdog.py`, up from 50, and 7 properties
+  added in `tests/property/test_watchdog_properties.py` (16 total).
 
 **No `src/` change, no migration, no dependency, no unit-file change, no ledger write.** The
 watchdog still imports nothing from the package and touches no `AppConfig` field, so it still
@@ -12787,20 +12787,25 @@ means a stall appearing beside a standing failure is new information and pages a
 than inheriting the other's day of silence. Same title, same body machinery, same 24-hour
 window: the page an operator already knows how to read.
 
-### Deviation — the recovery notice is withheld when a stall cannot be re-checked
+### Decision — a stall is a standing condition, and only the timer firing ends it
 
-Found while driving the throttle test across a simulated reboot, and fixed rather than left:
-`timer_stalled` is the one code whose **absence** is not evidence. The other three are read
-straight off systemd, so not-active becoming active *is* the recovery. But a stall stops being
-reported the moment guard D refuses — and guard D refuses because the host was off, which says
-nothing at all about the timer. The original code would have sent `resolutions schedule
-recovered` on that basis: a false reassurance about the one thing the operator was last told was
-broken.
+`timer_stalled` is the one code whose **absence** is not evidence. The other three are read off
+systemd every run, so not-active becoming active *is* the recovery. A stall, though, stops being
+*detectable* whenever a guard refuses — and two of those guards refuse for reasons that say
+nothing whatever about the timer: guard D because the host was off, guard A because the query
+failed.
 
-`_stall_unverified` therefore keeps the run silent in both directions when a stored stall can be
-neither confirmed nor disproved, and carries the throttle stamp forward so a stall re-confirmed
-after the record rebuilds does not page twice for one condition. Recovery is announced when the
-timer has actually fired again.
+So the code is reported when a run can see the stall, **and** when a run that could see it has
+already reported it and this one cannot re-check (`_stall_unverified`). The only thing that ends
+it is a `LastTriggerUSec` inside the window.
+
+This was written in two steps and the first was wrong, which is recorded under round 1 below:
+the carry was applied only on the path where the code set is empty, so a second standing fault
+exposed both a throttle that re-paged and a recovery notice that fired about a stall nobody had
+re-checked. Stated at full strength it is also simpler — the special-case branch that handled
+"nothing to report and nothing to celebrate" became unreachable and is gone, and an empty code
+set can now only mean every fault cleared, which is what makes the recovery notice a claim the
+run can support.
 
 ### Rejected — a `NextElapseUSecRealtime` rule, and why not
 
@@ -12868,11 +12873,11 @@ are deployment facts beside the constants the file already holds.
   which is silence rather than a wrong page.
 - **Whether a push reaches a phone** is untestable here; `_push` is replaced in every test.
 
-### Mutation pass — fifteen mutants, fifteen dead
+### Mutation pass — seventeen mutants, seventeen dead
 
-Run against the committed tree (`9cb9f61`), one mutant at a time, each applied to
-`deploy/wj-watchdog` and reverted, with `tests/unit/test_watchdog.py` and
-`tests/property/test_watchdog_properties.py` as the suite. Baseline green: **92 passed**. The
+Run against the committed tree (`cfeefd0`, after the round-1 fix), one mutant at a time, each
+applied to `deploy/wj-watchdog` and reverted, with `tests/unit/test_watchdog.py` and
+`tests/property/test_watchdog_properties.py` as the suite. Baseline green: **97 passed**. The
 count is the number of distinct tests that failed — a guard whose only witness is one test is
 noted as such, because that is the one to look at if it ever changes.
 
@@ -12880,28 +12885,72 @@ noted as such, because that is the one to look at if it ever changes.
 |---|---|---|---|
 | S01 | guard 0: `timer_active` check dropped | 1 | `test_every_guard_refuses_a_stall_on_its_own` |
 | S02 | guard 0: `timer_enabled` check dropped | 1 | `test_every_guard_refuses_a_stall_on_its_own` |
-| S03 | guard A: a never-fired timer counts as stalled | 7 | `..._has_never_fired_says_nothing`, all six unusable-stamp rows |
+| S03 | guard A: a never-fired timer counts as stalled | 8 | `..._has_never_fired_says_nothing`, every unusable-stamp row |
 | S04 | guard B: the arithmetic dropped | 6 | all four `..._fired_inside_its_own_window_says_nothing` rows |
 | S05 | guard C: the activation window dropped | 5 | `..._just_restarted_is_recovering_rather_than_stalled` + three stamp rows |
-| S06 | guard D: the observation window dropped | 4 | `..._host_that_was_off_says_nothing_until...`, the break and recovery tests |
-| S07 | `_observe` never resets (a gap always counts as watching) | 4 | the same three, plus `..._survives_a_missed_run_and_not_a_gap` |
-| S08 | `_observe` always resets (no window ever accumulates) | 10 | every test that expects a page |
-| S09 | the recovery notice is never withheld | 2 | `..._does_not_announce_a_recovery_that_did_not_happen` |
+| S06 | guard D: the observation window dropped | 3 | `..._host_that_was_off_says_nothing_until...` |
+| S07 | `_observe` never resets (a gap always counts as watching) | 4 | the break test, the host-off test, `..._survives_a_missed_run_and_not_a_gap` |
+| S08 | `_observe` always resets (no window ever accumulates) | 14 | every test that expects a page |
+| S09 | **the round-1 regression itself**: the carried stall dropped | 4 | `..._failing_timestamp_query_does_not_re_page_a_standing_stall` |
+| S16 | `_stall_unverified` never carries a stall | 5 | the same, plus `..._is_not_a_recovery_while_the_stall_stands` |
+| S17 | a stall never ends (the firing evidence ignored) | 3 | `..._timer_that_fires_again_says_so_once` |
 | S10 | the timestamp queries stop pinning `TZ`/`LC_ALL` | 1 | `..._ask_in_utc_and_the_others_are_unchanged` |
 | S11 | the parser accepts any zone token | 3 | the local-zone rows for both stamps, and the parser property |
-| S12 | the stall replaces the code set instead of joining it | 1 | `..._whose_last_run_also_failed_pages_once_naming_both` |
-| S13 | the timestamps are asked even for a stopped timer | 1 | `..._stopped_timer_is_never_also_reported_stalled` |
+| S12 | the stall replaces the code set instead of joining it | 2 | `..._whose_last_run_also_failed_pages_once_naming_both` |
+| S13 | the timestamps are asked even for a stopped timer | 2 | `..._stopped_timer_is_never_also_reported_stalled` |
 | S14 | the margin drops to zero | 3 | the interval witness, and two window rows |
-| S15 | the interval doubles to twelve hours | 8 | the interval witness, and every page test |
+| S15 | the interval doubles to twelve hours | 12 | the interval witness, and every page test |
 
-**One of these mutants survived on the first pass and is worth the record.** S11 (the parser
-accepting `MDT` as though it were UTC) was killed only by the property, because the unit tests
-fed it the literal `Sat 2026-09-19 12:23:18 MDT` — a date two days *after* the test anchor. Read
-as UTC that is a trigger in the future, which guard B refuses, so the test passed for a reason
-that had nothing to do with the zone check. Both fixtures are now anchor-relative and stale by
-nine hours, so the same string pages if the zone stops being checked, and the mutant dies three
-times over. It is the vacuity class `docs/LESSONS.md` names, in its reachability form: the
-strategy reached the branch, and the assertion was not about it.
+**One mutant survived the first pass and is worth the record.** S11 (the parser accepting `MDT`
+as though it were UTC) was killed only by the property, because the unit tests fed it the
+literal `Sat 2026-09-19 12:23:18 MDT` — a date two days *after* the test anchor. Read as UTC
+that is a trigger in the future, which guard B refuses, so the test passed for a reason that had
+nothing to do with the zone check. Both fixtures are now anchor-relative and stale by nine
+hours, so the same string pages if the zone stops being checked, and the mutant dies three times
+over. It is the vacuity class `docs/LESSONS.md` names, in its reachability form: the strategy
+reached the branch, and the assertion was not about it.
+
+### Cross-model review
+
+**Round 1 — CHANGES REQUESTED on `4232e12`.** One blocking finding, accepted, and reproduced by
+execution before any fix code was written.
+
+#### 1. An unverifiable stall lost its place in the throttle key
+
+`_stall_unverified` was consulted only on the path where the code set is **empty**. With a
+second fault standing — `service_failed` — an unreadable `LastTriggerUSec` dropped
+`timer_stalled` from the set, and the set *is* the throttle key. A changed key is a new fault
+set, which pages at once by M1-341's own rule.
+
+Reproduced at `4232e12` with the `LastTriggerUSec` query answering `unknown` on one run in three
+— an ordinary local failure, which is what `_systemctl` substitutes when the call fails, and
+squarely inside CLAUDE.md's reachable-reliability boundary:
+
+```
+run 1  trigger readable, stale   key=service_failed,timer_stalled   push 1
+run 2  query fails ("unknown")   key=service_failed                 push 2   <- owed nothing
+run 3  trigger readable, stale   key=service_failed,timer_stalled   push 3   <- owed nothing
+```
+
+Three pages inside a window that owes one; the pinned base sends one. **The reviewer also named
+the second half, and it is the worse one:** once the key no longer carried the stall, clearing
+the failed run — while the timer still had not fired — emptied the code set and sent
+`resolutions schedule recovered`. Reproduced separately: a 35-minute gap broke guard D, the key
+shrank to `service_failed`, and the next run announced a recovery about a timer whose last
+trigger was nine hours old.
+
+**Fixed by stating the rule at full strength** rather than patching the branch: a stall is
+carried whenever `_stall_unverified` says it has not been disproved, on the same line that
+detects it, so the code set never loses it while it stands. The `if not codes` special case
+became unreachable and was deleted. Both reproductions now measure one push and no recovery
+notice. Five tests added, including the review's own three-run sequence; mutants S09, S16 and
+S17 are the three ways to undo it, and all three die.
+
+**Process note.** The first version of the carry was written in response to something *I* found
+while driving a simulated reboot, and I wrote it into the one branch where I had seen it fail
+instead of asking where else the same fact applied. The finding is the general case of a fault
+I had already half-seen — the failure mode M1-341's own post-mortem names: *enumerate the
+siblings of the entry point, not of the value.*
 
 ### Live verification — read-only, against the running host
 
