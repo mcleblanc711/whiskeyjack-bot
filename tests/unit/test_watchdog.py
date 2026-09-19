@@ -807,16 +807,52 @@ def test_a_break_in_the_watchdogs_own_record_restarts_the_window(watchdog: Harne
     assert watchdog.pushes == []
 
 
-def test_a_break_in_the_record_does_not_announce_a_recovery_that_did_not_happen(
+def test_a_failing_timestamp_query_does_not_re_page_a_standing_stall(
     watchdog: Harness,
 ) -> None:
-    """The recovery notice is a claim, and a broken observation record cannot support it.
+    """**Round-1 blocking finding**, as the review's own three-run reproduction.
 
-    A stall stops being *reported* the moment guard D refuses -- but guard D refuses because
-    the host was off or this watchdog was not running, which says nothing whatever about the
-    timer. Announcing "resolutions schedule recovered" on that basis would be a false
-    reassurance about the one thing the operator was last told was broken. So the run is silent
-    in both directions and keeps the throttle it already owes.
+    A stall stops being *detectable* whenever a guard refuses, and two of those guards refuse
+    for reasons that say nothing about the timer — the host was off, or the query failed. If an
+    undetectable stall drops out of the code set, the THROTTLE KEY changes, and a changed key is
+    a new fault set that pages at once. With the service also failed and the `LastTriggerUSec`
+    query timing out on one run in three (`_systemctl` answering "unknown", an ordinary local
+    failure), the key flapped and the schedule paged three times inside a window that owes one.
+
+    Reproduced by execution at `4232e12` before the fix: one push on the pinned base, three on
+    the branch.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "failed"
+
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_stalled"
+
+    for answer in ("unknown", "", "n/a"):
+        watchdog.instant[0] += timedelta(minutes=5)
+        watchdog.units[LAST_TRIGGER] = answer
+        assert watchdog.run() == 1
+        # The key is what the throttle is keyed on, so it is the thing that must not move.
+        assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_stalled", answer
+        assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, answer
+
+    # And when the query recovers, still one page for one unchanged condition.
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+
+def test_a_break_in_the_record_does_not_re_page_or_announce_a_recovery(
+    watchdog: Harness,
+) -> None:
+    """A stall is a standing condition; only the timer firing ends it.
+
+    Guard D refuses after a gap in the watchdog's own record — the host was off — which says
+    nothing about the timer. Before the round-1 fix that dropped `timer_stalled` from the code
+    set, which both re-paged (a changed key) and, once the code was gone, let a later empty set
+    look like a recovery.
     """
     watchdog.watch_since(ANCHOR - timedelta(days=3))
     watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
@@ -824,24 +860,73 @@ def test_a_break_in_the_record_does_not_announce_a_recovery_that_did_not_happen(
     assert watchdog.run() == 1
     assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
 
-    # The machine is off for three days. The next run finds its own record broken.
-    watchdog.instant[0] += timedelta(days=3)
-    assert watchdog.run() == 0
+    # The machine is off for half an hour: longer than the gap tolerance, well inside the
+    # 24-hour window the page it already sent owes.
+    watchdog.instant[0] += timedelta(minutes=30)
+    assert watchdog.run() == 1, "the condition still stands; it has not been disproved"
+    assert watchdog.state()["observed"]["since"] == watchdog.instant[0].isoformat()
+    assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, "one condition, one page"
+    assert watchdog.titled("recovered") == []
+
+
+def test_another_fault_clearing_is_not_a_recovery_while_the_stall_stands(
+    watchdog: Harness,
+) -> None:
+    """The second half of the round-1 finding, and the one that would have misled an operator.
+
+    With the stall's code dropped, the stored key was `service_failed` alone; clearing the
+    failed run then emptied the code set and sent `resolutions schedule recovered` about a timer
+    that had still not fired. Now the stall stays in the set until the timer fires, so an empty
+    set really does mean every fault cleared.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    # A poll in progress, so the worker stays quiet while this test runs the clock on.
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "failed"
+    assert watchdog.run() == 1
+
+    watchdog.instant[0] += timedelta(minutes=35)  # a gap, so guard D can no longer see it
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "inactive"
+    assert watchdog.run() == 1
     assert watchdog.titled("recovered") == []
     assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
 
-    # The window starts again from the moment the record did: the standing stall is re-reported
-    # only once this watchdog has watched the whole of it itself, not on the first run back.
-    restarted_at = watchdog.instant[0]
-    step = timedelta(minutes=15)
-    while watchdog.instant[0] < restarted_at + stall_window(watchdog) - step:
-        watchdog.instant[0] += step
-        watchdog.run()
-        assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, watchdog.instant[0]
 
-    watchdog.instant[0] += step
-    watchdog.run()
-    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 2
+def test_only_the_timer_firing_ends_a_carried_stall(watchdog: Harness) -> None:
+    """The evidence that ends it, after a gap that made it unverifiable."""
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    # A poll in progress, so the worker stays quiet while this test runs the clock on.
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    assert watchdog.run() == 1
+
+    watchdog.instant[0] += timedelta(minutes=35)
+    assert watchdog.run() == 1, "a gap does not end it"
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[LAST_TRIGGER] = rendered(watchdog.instant[0] - timedelta(minutes=1))
+    assert watchdog.run() == 0
+    assert len(watchdog.titled("resolutions schedule recovered")) == 1
+    assert watchdog.state()["resolutions"] == {}
+
+
+def test_a_stopped_timer_supersedes_a_carried_stall(watchdog: Harness) -> None:
+    """A timer somebody stopped is described by its own code, and the queries are not asked.
+
+    The carried stall must not survive as a phantom beside `timer_inactive`: the three existing
+    codes are read off systemd every run and are the stronger statement.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "timer_inactive"
     assert watchdog.titled("recovered") == []
 
 

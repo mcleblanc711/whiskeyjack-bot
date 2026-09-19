@@ -434,21 +434,22 @@ def _throttle_key(codes: tuple[str, ...]) -> str:
 
 
 def _stall_unverified(stored: dict, last_trigger: datetime | None, now: datetime) -> bool:
-    """Whether a stall already paged has neither been confirmed nor disproved on this run.
+    """Whether a stall already paged is still standing as far as this run can tell.
 
-    The recovery notice is a claim, and `timer_stalled` is the one code whose absence does not
-    establish it. The other three are read straight off systemd: not-active becoming active IS
-    the recovery. A stall, though, stops being reported the moment any of its guards refuses --
-    and guard D refuses for a reason that says nothing about the timer at all: the host was off,
-    or this watchdog was not running, so the window it would measure has a hole in it. Sending
-    "resolutions schedule recovered" on the strength of that would be a false reassurance about
-    the thing the operator was last told was broken.
+    `timer_stalled` is the one code whose absence is not evidence. The other three are read
+    straight off systemd every run, so not-active becoming active IS the recovery. A stall,
+    though, stops being *detectable* the moment any of its guards refuses -- and two of those
+    guards refuse for reasons that say nothing whatever about the timer: guard D because the
+    host was off, guard A because the query failed. The only thing that genuinely ends a stall
+    is the timer firing again.
 
-    So: if a stored page named a stall and the timer's last trigger is still older than the
-    window -- or cannot be read at all -- this run knows nothing new. The caller then stays
-    silent in both directions and keeps the stored throttle, rather than announcing a recovery
-    it cannot support. A trigger inside the window is the timer firing again, which is exactly
-    the evidence a recovery needs.
+    So: a stored page that named a stall keeps naming it while the last trigger is still older
+    than the window, or cannot be read at all. A trigger inside the window is the timer firing,
+    which is the evidence -- and the only evidence -- that ends it.
+
+    This is what keeps the throttle key stable across a failed query (round-1 finding: a key
+    that loses a code is a new fault set, and a new fault set pages at once), and what keeps
+    the recovery notice honest, since an empty code set can then only mean every fault cleared.
 
     `stored` came back out of a JSON file a person can edit, so `key` is read as untrusted
     shape: anything that is not a string carries no stall.
@@ -480,6 +481,10 @@ def _check_resolutions(state: dict, observed_since: datetime) -> bool:
     service_failed = _systemctl("is-failed", f"{RESOLUTIONS_UNIT}.service") or "unknown"
     codes = _resolutions_problems(timer_active, timer_enabled, service_failed)
 
+    stored = state.get("resolutions")
+    if not isinstance(stored, dict):
+        stored = {}
+
     now = _now()
     last_trigger: datetime | None = None
     if timer_active == "active" and timer_enabled == "enabled":
@@ -489,25 +494,33 @@ def _check_resolutions(state: dict, observed_since: datetime) -> bool:
         active_since = _unit_timestamp(
             "show", f"{RESOLUTIONS_UNIT}.timer", "-p", "ActiveEnterTimestamp", "--value"
         )
+        # A stall is a STANDING condition, and the only thing that ends it is the timer firing
+        # again. So it is reported when this run can see it, and equally when a run that could
+        # see it has already reported it and this one cannot re-check (`_stall_unverified`).
+        #
+        # Round-1 blocking finding, and the second clause is the whole of the fix. Dropping an
+        # unverifiable stall from the code set changes the THROTTLE KEY, and a changed key is a
+        # new fault set that pages at once. Reproduced by execution at `4232e12`: with the
+        # service also failed and the `LastTriggerUSec` query timing out on one run in three --
+        # an ordinary local failure, `_systemctl` answering "unknown" -- the key flapped
+        # `service_failed,timer_stalled` -> `service_failed` -> `service_failed,timer_stalled`
+        # and the schedule paged THREE times inside a window that owes one. Worse, the shrunken
+        # key no longer carried the stall, so clearing the failed run while the timer was still
+        # not firing sent `resolutions schedule recovered` about a stall nobody had re-checked.
         if _timer_stalled(
             timer_active, timer_enabled, last_trigger, active_since, observed_since, now
-        ):
+        ) or _stall_unverified(stored, last_trigger, now):
             # ADDED to the set, not substituted for it: a timer that is stalled and whose last
             # run also failed is two faults, and the throttle is keyed on the whole set, so
             # naming both is what makes the second one new information rather than a drop.
             codes = tuple(sorted({*codes, "timer_stalled"}))
 
-    stored = state.get("resolutions")
-    if not isinstance(stored, dict):
-        stored = {}
-
     if not codes:
-        if _stall_unverified(stored, last_trigger, now):
-            # Nothing to report and nothing to celebrate: keep the throttle stamp so that a
-            # stall re-confirmed inside its window does not page twice for one condition.
-            state["resolutions"] = stored
-            print(f"OK: resolutions timer {timer_active}/{timer_enabled} (stall unverified)")
-            return False
+        # Reaching here with a stall stored is impossible by construction: an active, enabled
+        # timer whose stall has not been disproved has just put `timer_stalled` back into
+        # `codes`, and an inactive or disabled one has a code of its own. So an empty set really
+        # does mean every fault cleared, which is what makes the recovery notice below a claim
+        # this run can support.
         if stored.get("key") and RECOVERY_NOTICE:
             _push(
                 "whiskeyjack: resolutions schedule recovered",

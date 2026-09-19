@@ -599,9 +599,13 @@ than by luck: a timer that has *never* fired (a fresh install answers an empty
 stalled), and a window the watchdog did not watch end to end — a host that was off, asleep or
 logged out. The last is why a stall is reported some hours *after* a reboot rather than at once:
 the watchdog keeps its own observation record in `~/.local/state/wj-watchdog.json`
-(`observed.since`) and will not claim a gap it did not see. For the same reason it does **not**
-send `resolutions schedule recovered` when that record breaks under a standing stall — it says
-nothing until the timer has actually fired again.
+(`observed.since`) and will not claim a gap it did not see.
+
+Once reported, a stall **stays** reported until the timer is seen to fire again — a failed
+`systemctl` query or a reboot stops the watchdog re-checking it, and neither is evidence about
+the timer. So a page is not repeated when the check goes blind, and
+`resolutions schedule recovered` is never sent while a stall is standing: the only thing that
+clears one is a `LastTriggerUSec` inside the window.
 
 For a **failed last run**, the cause is in the journal and the remedies are the ones in
 § Scheduled ingestion and scoring above — it is the same failure the `OnFailure` pager reports,
