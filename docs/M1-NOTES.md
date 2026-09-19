@@ -12723,8 +12723,8 @@ never allowed to invent one.
   `WORST_CASE_SECONDS` 190 → 215.
 - `docs/RUNBOOK.md` — a fourth row in W1's table, the stall's own remedy block, the three
   silences stated, and the eleven-query/`TZ=UTC` note under § The watchdog itself.
-- Tests: 26 added in `tests/unit/test_watchdog.py` (76 total), 7 properties added in
-  `tests/property/test_watchdog_properties.py` (16 total).
+- Tests: 16 test functions added in `tests/unit/test_watchdog.py` -- 77 collected cases, up
+  from 50 -- and 7 properties added in `tests/property/test_watchdog_properties.py` (16 total).
 
 **No `src/` change, no migration, no dependency, no unit-file change, no ledger write.** The
 watchdog still imports nothing from the package and touches no `AppConfig` field, so it still
