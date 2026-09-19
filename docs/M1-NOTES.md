@@ -12952,6 +12952,19 @@ instead of asking where else the same fact applied. The finding is the general c
 I had already half-seen — the failure mode M1-341's own post-mortem names: *enumerate the
 siblings of the entry point, not of the value.*
 
+**Round 2 — APPROVE on `40596d0`, zero blocking findings.** The reviewer re-ran both
+reproductions against the prior and current commits itself and confirmed the closure: three
+pages became one with `service_failed,timer_stalled` retained; the false recovery became no
+recovery with `timer_stalled` retained; a fresh trigger clears the carried stall and sends
+exactly one recovery; a stopped timer supersedes it. No new candidates — M1-344 and M1-345
+remain the deferred work.
+
+It recorded one validation limitation worth carrying: **it could not run `pytest`**, because the
+read-only sandbox gives it no writable temporary directory, so the gate results in the request
+are the author's and not an independent rerun. `tests/conftest.py` puts pytest's temp root on
+tmpfs and every ledger fixture needs a writable path, so this will be true of every round on
+this project, not just this one.
+
 ### Live verification — read-only, against the running host
 
 The offline suite feeds the parser strings the suite itself wrote, so it cannot show that
