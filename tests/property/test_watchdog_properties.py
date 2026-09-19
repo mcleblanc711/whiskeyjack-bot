@@ -277,3 +277,241 @@ def _parses_as_aware(text: str) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None
+
+
+# ── the stall rule's three new pure functions (M1-343) ───────────────────────
+#
+# `_parse_unit_timestamp` reads a string systemd rendered, `_observe` reads a JSON object a
+# person can edit, and `_timer_stalled` decides over both. Every one of them sits on the path
+# that decides whether an operator hears that ingestion has stopped firing, so the properties
+# are the same three the file already asserts of the others -- total, exact rather than
+# approximate, and silent only where silence is the contract -- plus one this rule needs of its
+# own: **each guard is decisive on its own**, because a stall refused by the arithmetic when it
+# should have been refused by the never-fired guard is a test that passes for the wrong reason.
+
+WINDOW = watchdog.RESOLUTIONS_INTERVAL + watchdog.RESOLUTIONS_STALE_MARGIN
+# Older than the window, and younger than it: both halves of every guard must be reachable.
+STALE_ENOUGH = ANCHOR - WINDOW - timedelta(hours=2)
+RECENT = ANCHOR - timedelta(minutes=30)
+STAMPS = st.one_of(
+    st.none(),
+    st.just(STALE_ENOUGH),
+    st.just(RECENT),
+    st.just(ANCHOR - WINDOW),  # the boundary itself
+    st.datetimes(
+        min_value=datetime(2020, 1, 1),
+        max_value=datetime(2030, 1, 1),
+        timezones=st.just(timezone.utc),
+    ),
+)
+# What `systemctl show` can hand the parser, including the local-zone rendering an un-pinned TZ
+# would produce -- the one string that looks exactly right and must not parse.
+RENDERINGS = st.one_of(
+    st.just(""),
+    st.just("unknown"),
+    st.just("n/a"),
+    st.just("infinity"),
+    st.just("Sat 2026-09-19 12:23:18 UTC"),
+    st.just("Sat 2026-09-19 12:23:18 MDT"),
+    st.just("Sat 2026-09-19 12:23:18"),
+    st.just("Sat 2026-13-45 99:99:99 UTC"),
+    st.just("   Sat  2026-09-19   12:23:18   UTC  "),
+    st.datetimes(timezones=st.just(timezone.utc)).map(
+        lambda moment: moment.strftime("%a %Y-%m-%d %H:%M:%S UTC")
+    ),
+    st.text(max_size=40),
+)
+
+
+@given(raw=RENDERINGS)
+def test_the_unit_timestamp_parser_is_total_and_returns_only_aware_instants(raw: str) -> None:
+    parsed = watchdog._parse_unit_timestamp(raw)
+    assert parsed is None or isinstance(parsed, datetime)
+    if parsed is not None:
+        assert parsed.tzinfo is not None
+        assert isinstance(ANCHOR - parsed, timedelta)
+        # Only a UTC rendering parses: an abbreviated local zone is a value this program cannot
+        # place on the timeline, and reading `MDT` as UTC would be wrong by hours in silence.
+        assert raw.split()[-1] == "UTC"
+
+
+@given(
+    # Bounded to years systemd's own four-digit `%Y` rendering round-trips: a year before 1000
+    # renders three digits and does not read back, which is a shape no host clock produces and
+    # which the parser correctly refuses rather than guesses at.
+    moment=st.datetimes(
+        min_value=datetime(1000, 1, 1),
+        max_value=datetime(9999, 12, 31),
+        timezones=st.just(timezone.utc),
+    ).map(lambda m: m.replace(microsecond=0))
+)
+def test_what_systemd_renders_is_what_the_parser_reads_back(moment: datetime) -> None:
+    """The round trip is the identity, at the one-second resolution systemd prints.
+
+    Measured against the live host before it was asserted here: the real
+    `LastTriggerUSec` of `whiskeyjack-resolutions.timer` read back as the instant
+    `systemctl --user list-timers` reports for it.
+    """
+    rendered = moment.strftime("%a %Y-%m-%d %H:%M:%S UTC")
+    assert watchdog._parse_unit_timestamp(rendered) == moment
+
+
+@given(
+    active=ACTIVE_ANSWERS,
+    enabled=ENABLED_ANSWERS,
+    last_trigger=STAMPS,
+    active_since=STAMPS,
+    observed_since=st.one_of(st.just(STALE_ENOUGH), st.just(RECENT), st.just(ANCHOR - WINDOW)),
+    drift=st.integers(min_value=0, max_value=200_000),
+)
+def test_the_stall_decision_is_total_and_monotone_in_time(
+    active: str,
+    enabled: str,
+    last_trigger: datetime | None,
+    active_since: datetime | None,
+    observed_since: datetime,
+    drift: int,
+) -> None:
+    """Never raises, always a bool, and a stall does not un-stall as the clock runs.
+
+    Monotonicity is the property that makes the throttle meaningful: every age this decides on
+    grows with `now`, so a condition reported once stays reported until something about the
+    timer changes, rather than flickering across the boundary run by run.
+    """
+    stalled = watchdog._timer_stalled(
+        active, enabled, last_trigger, active_since, observed_since, ANCHOR
+    )
+    assert isinstance(stalled, bool)
+    later = watchdog._timer_stalled(
+        active,
+        enabled,
+        last_trigger,
+        active_since,
+        observed_since,
+        ANCHOR + timedelta(seconds=drift),
+    )
+    if stalled:
+        assert later is True
+
+
+@given(
+    guard=st.sampled_from(
+        ["active", "enabled", "never_fired", "fired_recently", "restarted", "unwatched"]
+    ),
+    unusable=st.booleans(),
+    other=UNIT_WORDS,
+)
+def test_every_guard_refuses_a_stall_on_its_own(guard: str, unusable: bool, other: str) -> None:
+    """Break one condition at a time, from a case that really does stall.
+
+    The base case is asserted to stall first, so this cannot degenerate into "a detector that
+    never fires refuses everything" -- the vacuity class docs/LESSONS.md calls the top recurring
+    defect, and the reason this file draws each pivotal value as its own branch.
+    """
+    case = {
+        "timer_active": "active",
+        "timer_enabled": "enabled",
+        "last_trigger": STALE_ENOUGH,
+        "active_since": STALE_ENOUGH,
+        "observed_since": STALE_ENOUGH,
+    }
+    assert watchdog._timer_stalled(now=ANCHOR, **case) is True, "the base case must stall"
+
+    if guard == "active":
+        case["timer_active"] = other if other != "active" else "inactive"
+    elif guard == "enabled":
+        case["timer_enabled"] = other if other != "enabled" else "disabled"
+    elif guard == "never_fired":
+        case["last_trigger"] = None
+    elif guard == "fired_recently":
+        case["last_trigger"] = RECENT
+    elif guard == "restarted":
+        case["active_since"] = None if unusable else RECENT
+    else:
+        case["observed_since"] = RECENT
+
+    assert watchdog._timer_stalled(now=ANCHOR, **case) is False, guard
+
+
+@given(
+    stored=st.one_of(
+        st.none(),
+        st.booleans(),
+        st.integers(),
+        st.text(max_size=20),
+        st.lists(st.integers(), max_size=3),
+        st.dictionaries(
+            st.sampled_from(["since", "last_seen", "unexpected"]),
+            st.one_of(
+                st.none(),
+                st.integers(),
+                st.text(max_size=30),
+                st.just("2026-09-17T12:00:00"),
+                st.just(ANCHOR.isoformat()),
+                st.just((ANCHOR - timedelta(days=3)).isoformat()),
+                st.just((ANCHOR - timedelta(minutes=5)).isoformat()),
+                st.just((ANCHOR + timedelta(days=1)).isoformat()),
+            ),
+            max_size=3,
+        ),
+    )
+)
+def test_the_observation_record_is_total_and_never_claims_more_than_it_has(
+    stored: object,
+) -> None:
+    """Untrusted shape in, a usable instant out, and never one in the future.
+
+    The direction that matters: this may lose a window it had, never invent one. A `since` this
+    program cannot read, or one that post-dates `now`, means the record starts here -- which
+    costs a page it might have sent and can never manufacture one.
+    """
+    state: dict = {"observed": stored}
+    since = watchdog._observe(state, ANCHOR)
+    assert isinstance(since, datetime) and since.tzinfo is not None
+    assert since <= ANCHOR
+    # What it wrote back is what it will read next run: JSON, and the same parser.
+    written = json.loads(json.dumps(state["observed"]))
+    assert watchdog._aware_stamp(written["since"]) == since
+    assert watchdog._aware_stamp(written["last_seen"]) == ANCHOR
+
+
+@given(
+    gap=st.integers(min_value=0, max_value=7200), age=st.integers(min_value=0, max_value=200_000)
+)
+def test_the_record_survives_a_missed_run_and_not_a_gap(gap: int, age: int) -> None:
+    """Two-sided on the tolerance: it accumulates inside it, and restarts outside it."""
+    since = ANCHOR - timedelta(seconds=age)
+    last_seen = ANCHOR - timedelta(seconds=gap)
+    if last_seen < since:
+        since = last_seen
+    state = {"observed": {"since": since.isoformat(), "last_seen": last_seen.isoformat()}}
+    kept = watchdog._observe(state, ANCHOR)
+    assert kept == (since if gap <= watchdog.WATCHDOG_GAP_TOLERANCE.total_seconds() else ANCHOR)
+
+
+@given(
+    key=st.one_of(
+        st.none(),
+        st.integers(),
+        st.text(max_size=30),
+        st.just("timer_stalled"),
+        st.just("service_failed,timer_stalled"),
+        st.just("timer_disabled,timer_inactive"),
+    ),
+    last_trigger=STAMPS,
+)
+def test_only_a_stored_stall_can_leave_a_recovery_unverified(
+    key: object, last_trigger: datetime | None
+) -> None:
+    """Total over an edited state file, and silent about the other three codes.
+
+    Those three are read straight off systemd, so their absence IS the recovery. Only
+    `timer_stalled` can stop being reported for a reason that says nothing about the timer.
+    """
+    unverified = watchdog._stall_unverified({"key": key}, last_trigger, ANCHOR)
+    assert isinstance(unverified, bool)
+    carries_stall = isinstance(key, str) and "timer_stalled" in key.split(",")
+    if not carries_stall:
+        assert unverified is False
+    else:
+        assert unverified == (last_trigger is None or ANCHOR - last_trigger >= WINDOW)

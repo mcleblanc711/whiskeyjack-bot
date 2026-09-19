@@ -559,10 +559,14 @@ expect the page, once a day, until you start it again.
 | the timer is not active, so no run is scheduled | `systemctl --user is-active whiskeyjack-resolutions.timer` answered anything but `active` |
 | the timer is not enabled, so it will not survive a reboot | `is-enabled` answered anything but `enabled` |
 | the last run FAILED | `is-failed whiskeyjack-resolutions.service` answered `failed` |
+| the timer is active and enabled but has not fired within its own interval | `show -p LastTriggerUSec` on the timer is more than **seven hours** old — its six-hour interval plus a one-hour margin (M1-343) |
 
-plus a `last run: result=… exit=…` line, which is `Result` and `ExecMainStatus` — the same two
-fields the `whiskeyjack-notify@` pager quotes. Exit codes are in the
-[table above](#exit-codes).
+Those four lines are the whole vocabulary: the body is built by indexing that table's codes, so
+a line you see is one of these and nothing else.
+
+There is also a `last run: result=… exit=…` line, which is `Result` and `ExecMainStatus` — the
+same two fields the `whiskeyjack-notify@` pager quotes — and, for a stall only, a `last fired:
+N h ago (interval 6 h + margin 1 h)` line. Exit codes are in the [table above](#exit-codes).
 
 **What it means.** Resolution ingestion and scoring are not scheduled. **Nothing is lost while
 it is stopped**: `ingest-resolutions` and `score` are both idempotent, `Persistent=true` means a
@@ -577,6 +581,31 @@ systemctl --user list-timers whiskeyjack-resolutions.timer
 systemctl --user enable --now whiskeyjack-resolutions.timer     # covers inactive AND disabled
 journalctl --user -u whiskeyjack-resolutions.service -n 80 --no-pager
 ```
+
+For a **timer that is running but has not fired**, the schedule itself is what to look at —
+the unit is active and enabled, so nothing about its *state* is wrong:
+
+```bash
+systemctl --user show whiskeyjack-resolutions.timer -p TimersCalendar -p NextElapseUSecRealtime
+systemd-analyze calendar '*-*-* 00/6:23:00'      # does the expression still match anything?
+timedatectl                                      # did the clock move?
+systemctl --user restart whiskeyjack-resolutions.timer
+```
+
+`Persistent=true`, so a restart fires the missed run within a minute and the condition clears
+itself. **Three things deliberately do not page this way**, each refused by its own rule rather
+than by luck: a timer that has *never* fired (a fresh install answers an empty
+`LastTriggerUSec`), a timer restarted inside the last seven hours (it is recovering, not
+stalled), and a window the watchdog did not watch end to end — a host that was off, asleep or
+logged out. The last is why a stall is reported some hours *after* a reboot rather than at once:
+the watchdog keeps its own observation record in `~/.local/state/wj-watchdog.json`
+(`observed.since`) and will not claim a gap it did not see.
+
+Once reported, a stall **stays** reported until the timer is seen to fire again — a failed
+`systemctl` query or a reboot stops the watchdog re-checking it, and neither is evidence about
+the timer. So a page is not repeated when the check goes blind, and
+`resolutions schedule recovered` is never sent while a stall is standing: the only thing that
+clears one is a `LastTriggerUSec` inside the window.
 
 For a **failed last run**, the cause is in the journal and the remedies are the ones in
 § Scheduled ingestion and scoring above — it is the same failure the `OnFailure` pager reports,
@@ -608,6 +637,11 @@ It watches two subjects with **separate state, separate throttles and separate p
 poll (`whiskeyjack: WORKER DOWN`, heartbeat staleness, 60-minute re-alert) and
 the resolutions schedule (W1 above, no heartbeat rule, 24-hour re-alert). Neither can mute the
 other, and "worker recovered" is never sent while the schedule is still stopped.
+
+A run makes eleven `systemctl` queries at most and prints two `OK:` lines. The resolutions half
+asks its two timestamp queries (`LastTriggerUSec`, `ActiveEnterTimestamp`) only while the timer
+is active and enabled, and asks them under `TZ=UTC LC_ALL=C`, because `systemctl show` renders
+timestamps in the client's local zone and `--timestamp=` does not change that.
 
 Its own unit deliberately has **no `OnFailure=`**: a notifier launched by this unit's own
 failure is not independent evidence about this unit. A dark host — machine off, user session

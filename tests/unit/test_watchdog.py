@@ -71,6 +71,25 @@ def _load() -> ModuleType:
 # ── the fake systemd, and the fake channel ───────────────────────────────────
 
 
+def rendered(moment: datetime) -> str:
+    """A UTC instant the way `systemctl show` renders one under `TZ=UTC LC_ALL=C`.
+
+    Measured on the live host at systemd 255, not invented: `Sat 2026-09-19 12:23:18 UTC`.
+    """
+    return moment.strftime("%a %Y-%m-%d %H:%M:%S UTC")
+
+
+# Nine hours before the anchor -- stale enough to page -- rendered the two ways a stamp can be
+# unusable while looking right: the host's own local zone (what an un-pinned TZ produces) and no
+# zone at all. Anchor-relative on purpose: a future-dated example is refused by the arithmetic,
+# so it would pass whether or not the zone is checked.
+STALE_IN_LOCAL_ZONE = (ANCHOR - timedelta(hours=9)).strftime("%a %Y-%m-%d %H:%M:%S MDT")
+STALE_WITHOUT_ZONE = (ANCHOR - timedelta(hours=9)).strftime("%a %Y-%m-%d %H:%M:%S")
+
+LAST_TRIGGER = ("show", "whiskeyjack-resolutions.timer", "-p", "LastTriggerUSec", "--value")
+ACTIVE_ENTER = ("show", "whiskeyjack-resolutions.timer", "-p", "ActiveEnterTimestamp", "--value")
+
+
 def healthy_units() -> dict[tuple[str, ...], str]:
     """What `systemctl --user` answers on a host where both schedules are running."""
     return {
@@ -83,6 +102,9 @@ def healthy_units() -> dict[tuple[str, ...], str]:
         ("is-failed", "whiskeyjack-resolutions.service"): "inactive",
         ("show", "whiskeyjack-resolutions.service", "-p", "Result", "--value"): "success",
         ("show", "whiskeyjack-resolutions.service", "-p", "ExecMainStatus", "--value"): "0",
+        # Fired an hour ago, and active for a month -- a timer doing exactly what it declares.
+        LAST_TRIGGER: rendered(ANCHOR - timedelta(hours=1)),
+        ACTIVE_ENTER: rendered(ANCHOR - timedelta(days=30)),
     }
 
 
@@ -94,14 +116,32 @@ class Harness:
     units: dict[tuple[str, ...], str]
     pushes: list[dict[str, str]]
     asked: list[tuple[str, ...]] = field(default_factory=list)
+    envs: list[dict[str, str] | None] = field(default_factory=list)
     pings: list[datetime] = field(default_factory=list)
     instant: list[datetime] = field(default_factory=lambda: [ANCHOR])
     delivers: list[bool] = field(default_factory=lambda: [True])
 
-    def systemctl(self, *args: str) -> str:
+    def systemctl(self, *args: str, env: dict[str, str] | None = None) -> str:
+        # `env` is recorded, not honoured: what it must CONTAIN is asserted against the real
+        # `subprocess.run` in `test_the_timestamp_queries_ask_in_utc_and_the_others_are_unchanged`,
+        # which is the only place that can see it.
         self.asked.append(args)
+        self.envs.append(env)
         assert args in self.units, f"the watchdog asked an unexpected question: {args}"
         return self.units[args]
+
+    def watch_since(self, moment: datetime, *, last_seen: datetime | None = None) -> None:
+        """Seed the watchdog's own observation record (M1-343).
+
+        `moment` is when the unbroken run of observations began. `last_seen` defaults to one
+        watchdog interval ago, which is what an unbroken record looks like; passing an older
+        instant is how a test says "this host was off in between".
+        """
+        seen = self.instant[0] - timedelta(minutes=5) if last_seen is None else last_seen
+        path = Path(self.module.STATE)
+        stored = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        stored["observed"] = {"since": moment.isoformat(), "last_seen": seen.isoformat()}
+        path.write_text(json.dumps(stored), encoding="utf-8")
 
     def ping(self) -> None:
         self.pings.append(self.instant[0])
@@ -222,7 +262,8 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
     tournament half is checked first, so if the total budget exceeds `TimeoutStartSec` what
     gets cut is always the resolutions page — the thing this item exists to send. Before
     M1-341 the script made four systemctl queries and at most one push (75s, inside the 120s
-    the unit declared); it now makes nine and up to three, which is 190s and was not. The
+    the unit declared); it made nine and up to three at M1-341, which is 190s and was not, and
+    makes eleven at M1-343 (the two timestamp queries the stall rule adds), which is 215s. The
     deadline is read out of the tracked unit rather than restated here, so the constant and
     the unit cannot drift apart, and the timer's own interval bounds the other end: a hung run
     must be dead before the next one is due.
@@ -237,7 +278,7 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
     assert deadline < interval, "a hung run must not still be alive when the next one starts"
     # And the arithmetic is over the numbers the code actually passes, not over a copy.
     assert module.WORST_CASE_SECONDS == (
-        9 * module.SYSTEMCTL_TIMEOUT_SECONDS
+        11 * module.SYSTEMCTL_TIMEOUT_SECONDS
         + module.LEDGER_TIMEOUT_SECONDS
         + 2 * module.PUSH_TIMEOUT_SECONDS
         + module.DEADMAN_TIMEOUT_SECONDS
@@ -437,13 +478,22 @@ def test_a_ledger_directory_the_watchdog_cannot_read_does_not_stop_the_resolutio
 
 
 def test_the_problem_codes_and_their_prose_are_one_closed_vocabulary() -> None:
-    """Every code the detector can emit has a sentence; the push body indexes by code."""
+    """Every code the detector can emit has a sentence; the push body indexes by code.
+
+    The enumeration covers **both** detectors, because `RESOLUTIONS_PROBLEMS` is one vocabulary
+    shared by them: `_resolutions_problems` over its three answers, and `_timer_stalled` over
+    the one code it contributes (M1-343). A code with no sentence is a `KeyError` in the body,
+    and a sentence no detector can emit is prose nobody will ever read.
+    """
     module = _load()
     reachable = set()
     for active in ("active", "inactive"):
         for enabled in ("enabled", "disabled"):
             for failed in ("failed", "inactive"):
                 reachable.update(module._resolutions_problems(active, enabled, failed))
+                stale = ANCHOR - timedelta(days=7)
+                if module._timer_stalled(active, enabled, stale, stale, stale, ANCHOR):
+                    reachable.add("timer_stalled")
     assert reachable == set(module.RESOLUTIONS_PROBLEMS)
 
 
@@ -521,6 +571,503 @@ def test_a_restarted_timer_clears_the_condition_and_says_so_once(watchdog: Harne
     watchdog.instant[0] += timedelta(minutes=5)
     assert watchdog.run() == 0
     assert len(watchdog.titled("resolutions schedule recovered")) == 1
+
+
+# ── the stall rule: enabled, active, and not firing (M1-343) ─────────────────
+#
+# Every test here drives the watchdog through `main()` rather than calling the predicate, so
+# what is measured is a page, and every silence is checked to be its OWN guard's silence: the
+# setup is one that WOULD page, and the single field under test is the only thing changed.
+
+
+def stall_window(harness: Harness) -> timedelta:
+    window: timedelta = (
+        harness.module.RESOLUTIONS_INTERVAL + harness.module.RESOLUTIONS_STALE_MARGIN
+    )
+    return window
+
+
+def test_the_interval_the_stall_rule_uses_is_the_cadence_the_timer_declares() -> None:
+    """Read off the tracked unit file, so the constant and the schedule cannot drift apart.
+
+    This is the same witness `test_the_resolutions_throttle_is_long_against_the_cadence_its_own
+    _timer_declares` uses for the throttle: the number is not restated here, it is derived from
+    `OnCalendar=*-*-* 00/6:23:00`, whose hour field `00/6` is what "every six hours" means.
+    """
+    module = _load()
+    timer = read_unit(UNITS / f"{module.RESOLUTIONS_UNIT}.timer")
+    calendar = only(timer, "Timer", "OnCalendar")
+    hour_field = calendar.split()[1].split(":")[0]
+    assert "/" in hour_field, calendar
+    assert timedelta(hours=int(hour_field.split("/")[1])) == module.RESOLUTIONS_INTERVAL
+
+    # And the margin is genuinely a margin: bigger than the slack the timer itself declares.
+    accuracy = only(timer, "Timer", "AccuracySec")
+    assert accuracy.endswith("min"), accuracy
+    assert module.RESOLUTIONS_STALE_MARGIN > timedelta(minutes=int(accuracy[: -len("min")]))
+    # A stall must be reportable well inside the window that re-pages it, or the first page of
+    # a standing stall would arrive after the throttle had already come round.
+    assert (
+        module.RESOLUTIONS_INTERVAL + module.RESOLUTIONS_STALE_MARGIN
+        < module.RESOLUTIONS_REALERT_AFTER
+    )
+
+
+def test_the_runbooks_w1_table_is_the_whole_vocabulary(watchdog: Harness) -> None:
+    """A table is a claim about a PARTITION, not a list of examples (T-908's lesson).
+
+    W1's table tells an operator what each line of the page means. The page is built by indexing
+    `RESOLUTIONS_PROBLEMS` by code, so a sentence the table is missing is a page an operator
+    cannot look up, and a sentence only the table has is a line nothing can ever print. Set
+    equality, so both directions fail.
+    """
+    runbook = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    section = runbook.split("### W1 — `RESOLUTIONS SCHEDULE STOPPED`", 1)[1]
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break  # the FIRST table in W1, not every table further down the runbook
+    cells = [row.split("|")[1].strip() for row in rows]
+    assert cells[:2] == ["line", "---"], cells[:2]  # the header and its separator
+    documented = set(cells[2:])
+    assert documented == set(watchdog.module.RESOLUTIONS_PROBLEMS.values())
+
+
+def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
+    """The criterion's first silence, and it is guard A's -- not the arithmetic's.
+
+    `systemctl show -P LastTriggerUSec` answers the empty string for a timer that has never
+    fired (measured, systemd 255). Everything else in this run is set up to page: the watchdog
+    has watched for a month, the timer has been active for a month. Only the stamp is missing.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = ""
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+    # The same run, with the stamp present and stale, pages -- so the silence above was the
+    # never-fired guard refusing, and nothing else.
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+
+@pytest.mark.parametrize(
+    ("answer", "why"),
+    [
+        ("", "a timer that has never fired, and a unit that does not exist"),
+        ("unknown", "what this module substitutes when the systemctl call itself fails"),
+        ("n/a", "systemd's own rendering of an unset timestamp"),
+        ("infinity", "systemd's own rendering of a value that never elapses"),
+        # Stale by nine hours and rendered in a local zone: the SAME instant that pages one
+        # row above, so if the zone token stopped being checked this row would page rather than
+        # pass. A future-dated example would have been silent for the wrong reason.
+        (STALE_IN_LOCAL_ZONE, "a local zone -- what an un-pinned TZ would produce"),
+        (STALE_WITHOUT_ZONE, "the same instant with the zone token missing"),
+        ("Sat 2026-13-45 99:99:99 UTC", "well-shaped and not a date"),
+    ],
+)
+def test_a_trigger_stamp_this_program_cannot_use_is_silence_not_a_page(
+    watchdog: Harness, answer: str, why: str
+) -> None:
+    """Unreadable means no usable record, and for a stall the honest answer to that is silence.
+
+    The opposite of `_alert_is_due`'s rule, deliberately: an unusable *throttle* stamp means
+    nobody has been told and the safe direction is to tell them, while an unusable *trigger*
+    stamp is the program not knowing whether anything is wrong at all. Inventing a page from
+    that would make a coverage rule with no observed occurrence into a source of false alarms.
+
+    The `MDT` row is the one that pins `_unit_timestamp`'s environment: it is exactly what this
+    host's systemd prints without `TZ=UTC`, and it must not parse by accident.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = answer
+
+    assert watchdog.run() == 0, why
+    assert watchdog.pushes == []
+
+
+@pytest.mark.parametrize("hours", [0.0, 1.0, 5.9, 6.9])
+def test_a_timer_that_fired_inside_its_own_window_says_nothing(
+    watchdog: Harness, hours: float
+) -> None:
+    """Everything up to the interval plus the margin is a timer doing its job."""
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=hours))
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+
+def test_a_stale_timer_pages_once_and_says_how_long_it_has_been(watchdog: Harness) -> None:
+    """The criterion's page: enabled, active, and nine hours without firing."""
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+
+    assert watchdog.run() == 1
+    pages = watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")
+    assert len(pages) == 1
+    body = pages[0]["body"]
+    assert watchdog.module.RESOLUTIONS_PROBLEMS["timer_stalled"] in body
+    # An age computed here, never the timestamp systemd printed.
+    assert "last fired: 9 h ago (interval 6 h + margin 1 h)" in body
+    assert rendered(ANCHOR - timedelta(hours=9)) not in body
+    assert "systemd-analyze calendar" in body, "the stall has its own thing to look at"
+    assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
+    # The worker is healthy throughout and says nothing.
+    assert watchdog.titled("WORKER DOWN") == []
+
+    # One page, not one per five-minute run.
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+
+def test_a_standing_stall_pages_again_only_after_the_days_throttle(watchdog: Harness) -> None:
+    """Driven at the watchdog's own cadence, because the continuity record is at that cadence.
+
+    A test that jumped the clock 24 hours in one step would find the observation record broken
+    and prove nothing about the throttle -- which is itself the point of guard D.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    # A poll in progress: the tournament's stale-heartbeat exemption, so the worker stays quiet
+    # while the clock runs (`test_a_stale_heartbeat_is_not_a_fault_while_the_poll_is_running`).
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+
+    assert watchdog.run() == 1
+    # Fifteen minutes is inside the gap tolerance, so the record the stall rule depends on is
+    # never broken by the test's own clock -- a 24-hour jump would break it and prove nothing.
+    step = timedelta(minutes=15)
+    elapsed = timedelta(0)
+    while elapsed < watchdog.module.RESOLUTIONS_REALERT_AFTER:
+        watchdog.instant[0] += step
+        elapsed += step
+        watchdog.run()
+        if elapsed < watchdog.module.RESOLUTIONS_REALERT_AFTER:
+            assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, elapsed
+
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 2
+    assert watchdog.titled("WORKER DOWN") == []
+
+
+def test_a_host_that_was_off_says_nothing_until_the_watchdog_has_watched_the_window(
+    watchdog: Harness,
+) -> None:
+    """The criterion's second silence, and it is guard D's.
+
+    The timer answers a nine-hour-old trigger throughout, so the arithmetic would page on the
+    very first run. What holds it is the watchdog's own record: its last observation is three
+    days old, which is a gap in the record rather than nine hours of watching a timer fail to
+    fire. The page arrives when -- and only when -- it has watched the whole window itself.
+    """
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.watch_since(ANCHOR - timedelta(days=3), last_seen=ANCHOR - timedelta(days=3))
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+    window = stall_window(watchdog)
+    step = timedelta(minutes=15)
+    first_page_at: datetime | None = None
+    while watchdog.instant[0] < ANCHOR + window + timedelta(hours=1):
+        watchdog.instant[0] += step
+        watchdog.run()
+        if first_page_at is None and watchdog.titled("RESOLUTIONS SCHEDULE STOPPED"):
+            first_page_at = watchdog.instant[0]
+
+    # Two-sided: it does page, and not one run before the window it claims to measure.
+    assert first_page_at is not None, "the silence must end once the window has been watched"
+    assert ANCHOR + window <= first_page_at < ANCHOR + window + step
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+    assert watchdog.titled("WORKER DOWN") == []
+
+
+def test_a_break_in_the_watchdogs_own_record_restarts_the_window(watchdog: Harness) -> None:
+    """A gap longer than four missed runs is not watching, and a stall may not span one."""
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.watch_since(ANCHOR - timedelta(days=3), last_seen=ANCHOR - timedelta(days=3))
+    # A poll in progress, so the worker's own staleness rule stays quiet while the clock runs.
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    assert watchdog.run() == 0
+
+    # Just inside the tolerance the record survives, so the window keeps accumulating...
+    watchdog.instant[0] += watchdog.module.WATCHDOG_GAP_TOLERANCE
+    watchdog.run()
+    assert watchdog.state()["observed"]["since"] == ANCHOR.isoformat()
+
+    # ...and one second past it, the record starts again from now.
+    watchdog.instant[0] += watchdog.module.WATCHDOG_GAP_TOLERANCE + timedelta(seconds=1)
+    watchdog.run()
+    assert watchdog.state()["observed"]["since"] == watchdog.instant[0].isoformat()
+    assert watchdog.pushes == []
+
+
+def test_a_failing_timestamp_query_does_not_re_page_a_standing_stall(
+    watchdog: Harness,
+) -> None:
+    """**Round-1 blocking finding**, as the review's own three-run reproduction.
+
+    A stall stops being *detectable* whenever a guard refuses, and two of those guards refuse
+    for reasons that say nothing about the timer — the host was off, or the query failed. If an
+    undetectable stall drops out of the code set, the THROTTLE KEY changes, and a changed key is
+    a new fault set that pages at once. With the service also failed and the `LastTriggerUSec`
+    query timing out on one run in three (`_systemctl` answering "unknown", an ordinary local
+    failure), the key flapped and the schedule paged three times inside a window that owes one.
+
+    Reproduced by execution at `4232e12` before the fix: one push on the pinned base, three on
+    the branch.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "failed"
+
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_stalled"
+
+    for answer in ("unknown", "", "n/a"):
+        watchdog.instant[0] += timedelta(minutes=5)
+        watchdog.units[LAST_TRIGGER] = answer
+        assert watchdog.run() == 1
+        # The key is what the throttle is keyed on, so it is the thing that must not move.
+        assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_stalled", answer
+        assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, answer
+
+    # And when the query recovers, still one page for one unchanged condition.
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+
+def test_a_break_in_the_record_does_not_re_page_or_announce_a_recovery(
+    watchdog: Harness,
+) -> None:
+    """A stall is a standing condition; only the timer firing ends it.
+
+    Guard D refuses after a gap in the watchdog's own record — the host was off — which says
+    nothing about the timer. Before the round-1 fix that dropped `timer_stalled` from the code
+    set, which both re-paged (a changed key) and, once the code was gone, let a later empty set
+    look like a recovery.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+    # The machine is off for half an hour: longer than the gap tolerance, well inside the
+    # 24-hour window the page it already sent owes.
+    watchdog.instant[0] += timedelta(minutes=30)
+    assert watchdog.run() == 1, "the condition still stands; it has not been disproved"
+    assert watchdog.state()["observed"]["since"] == watchdog.instant[0].isoformat()
+    assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, "one condition, one page"
+    assert watchdog.titled("recovered") == []
+
+
+def test_another_fault_clearing_is_not_a_recovery_while_the_stall_stands(
+    watchdog: Harness,
+) -> None:
+    """The second half of the round-1 finding, and the one that would have misled an operator.
+
+    With the stall's code dropped, the stored key was `service_failed` alone; clearing the
+    failed run then emptied the code set and sent `resolutions schedule recovered` about a timer
+    that had still not fired. Now the stall stays in the set until the timer fires, so an empty
+    set really does mean every fault cleared.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    # A poll in progress, so the worker stays quiet while this test runs the clock on.
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "failed"
+    assert watchdog.run() == 1
+
+    watchdog.instant[0] += timedelta(minutes=35)  # a gap, so guard D can no longer see it
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "inactive"
+    assert watchdog.run() == 1
+    assert watchdog.titled("recovered") == []
+    assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
+
+
+def test_only_the_timer_firing_ends_a_carried_stall(watchdog: Harness) -> None:
+    """The evidence that ends it, after a gap that made it unverifiable."""
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    # A poll in progress, so the worker stays quiet while this test runs the clock on.
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    assert watchdog.run() == 1
+
+    watchdog.instant[0] += timedelta(minutes=35)
+    assert watchdog.run() == 1, "a gap does not end it"
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[LAST_TRIGGER] = rendered(watchdog.instant[0] - timedelta(minutes=1))
+    assert watchdog.run() == 0
+    assert len(watchdog.titled("resolutions schedule recovered")) == 1
+    assert watchdog.state()["resolutions"] == {}
+
+
+def test_a_stopped_timer_supersedes_a_carried_stall(watchdog: Harness) -> None:
+    """A timer somebody stopped is described by its own code, and the queries are not asked.
+
+    The carried stall must not survive as a phantom beside `timer_inactive`: the three existing
+    codes are read off systemd every run and are the stronger statement.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "timer_stalled"
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "timer_inactive"
+    assert watchdog.titled("recovered") == []
+
+
+def test_a_timer_that_fires_again_says_so_once(watchdog: Harness) -> None:
+    """The evidence a recovery needs is the timer firing, and that is what clears the stall."""
+    watchdog.watch_since(ANCHOR - timedelta(days=3))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    assert watchdog.run() == 1
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.units[LAST_TRIGGER] = rendered(watchdog.instant[0] - timedelta(minutes=1))
+    assert watchdog.run() == 0
+    assert len(watchdog.titled("resolutions schedule recovered")) == 1
+    assert watchdog.state()["resolutions"] == {}
+
+    # Once, not on every later healthy run.
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 0
+    assert len(watchdog.titled("resolutions schedule recovered")) == 1
+
+
+def test_a_timer_just_restarted_is_recovering_rather_than_stalled(watchdog: Harness) -> None:
+    """Guard C, and the false page it exists to prevent.
+
+    `Persistent=true` means a timer started after a stop fires within `AccuracySec`. So the
+    minute after an operator runs `systemctl --user enable --now` on a timer that had been
+    stopped for a week, its last trigger is a week old and it is not stalled -- it is the fix
+    working. Paging then would be a false alarm on the path the runbook tells them to take.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(days=7))
+    watchdog.units[ACTIVE_ENTER] = rendered(ANCHOR - timedelta(minutes=1))
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+    # The only field that changes: the timer has now been active for the whole window.
+    watchdog.units[ACTIVE_ENTER] = rendered(ANCHOR - timedelta(hours=8))
+    assert watchdog.run() == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+
+@pytest.mark.parametrize("answer", ["", "unknown", STALE_IN_LOCAL_ZONE])
+def test_an_activation_stamp_this_program_cannot_use_is_silence_too(
+    watchdog: Harness, answer: str
+) -> None:
+    """Guard C has no opinion it can defend without the stamp, so it refuses."""
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.units[ACTIVE_ENTER] = answer
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+
+def test_a_stopped_timer_is_never_also_reported_stalled(watchdog: Harness) -> None:
+    """The criterion is scoped to a timer that is running; a stopped one is already described.
+
+    And the two timestamp queries are not even asked, which is what keeps the declared worst
+    case honest: they are on the path where their answer can matter and nowhere else.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    assert watchdog.run() == 1
+    assert watchdog.state()["resolutions"]["key"] == "timer_inactive"
+    assert LAST_TRIGGER not in watchdog.asked
+    assert ACTIVE_ENTER not in watchdog.asked
+
+
+def test_a_stalled_timer_whose_last_run_also_failed_pages_once_naming_both(
+    watchdog: Harness,
+) -> None:
+    """The stall is ADDED to the code set, not substituted for it (the stricter reading).
+
+    Two faults are two lines in one page and one throttle key, so the second is new information
+    the moment it appears rather than something a standing key buys silence for.
+    """
+    watchdog.watch_since(ANCHOR - timedelta(days=30))
+    watchdog.units[LAST_TRIGGER] = rendered(ANCHOR - timedelta(hours=9))
+    watchdog.units[("is-failed", "whiskeyjack-resolutions.service")] = "failed"
+
+    assert watchdog.run() == 1
+    pages = watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")
+    assert len(pages) == 1
+    assert watchdog.module.RESOLUTIONS_PROBLEMS["timer_stalled"] in pages[0]["body"]
+    assert watchdog.module.RESOLUTIONS_PROBLEMS["service_failed"] in pages[0]["body"]
+    assert watchdog.state()["resolutions"]["key"] == "service_failed,timer_stalled"
+
+
+def test_the_timestamp_queries_ask_in_utc_and_the_others_are_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The environment is the whole of why the stamps parse, so observe it at `subprocess.run`.
+
+    `systemctl show` renders timestamps in the client's local zone and locale, and
+    `--timestamp=` does not change that for `show` (measured, systemd 255). The timestamp calls
+    therefore pass an environment; **every other call passes `env=None`**, which is what
+    `subprocess.run` was already given -- so this is also the witness that M1-341's four
+    tournament queries and three resolutions queries are invoked exactly as they were.
+    """
+    module = _load()
+    calls: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
+    answers = {
+        ("is-active", "whiskeyjack-resolutions.timer"): "active",
+        ("is-enabled", "whiskeyjack-resolutions.timer"): "enabled",
+    }
+
+    class _Completed:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    def fake_run(argv: Any, **kwargs: Any) -> _Completed:
+        args = tuple(argv[2:])
+        calls.append((args, kwargs["env"]))
+        return _Completed(answers.get(args, "inactive"))
+
+    ledger = tmp_path / "data" / "l.sqlite3"
+    seeded_ledger(ledger, heartbeat_at=ANCHOR - timedelta(minutes=2))
+    monkeypatch.setattr(module, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(module, "LEDGER", ledger)
+    monkeypatch.setattr(module, "_now", lambda: ANCHOR)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setenv("WJ_WATCHDOG_ENV_WITNESS", "carried-through-0001")
+
+    module.main()
+
+    timestamps = [(args, env) for args, env in calls if args in (LAST_TRIGGER, ACTIVE_ENTER)]
+    assert len(timestamps) == 2, [args for args, _ in calls]
+    for args, env in timestamps:
+        assert env is not None
+        assert env["TZ"] == "UTC" and env["LC_ALL"] == "C", args
+        # The rest of the environment is carried through: systemctl --user needs the session's
+        # own variables (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS) to reach the user manager.
+        assert env["WJ_WATCHDOG_ENV_WITNESS"] == "carried-through-0001"
+    others = [
+        args for args, env in calls if env is not None and args not in (LAST_TRIGGER, ACTIVE_ENTER)
+    ]
+    assert others == [], "every other systemctl call must be invoked exactly as it was"
+    assert len(calls) > 2
 
 
 # ── isolation in both directions ─────────────────────────────────────────────
@@ -846,7 +1393,7 @@ def test_the_resolutions_check_does_not_open_the_ledger_at_all(
     state: dict[str, Any] = {}
     watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
 
-    assert watchdog.module._check_resolutions(state) is True
+    assert watchdog.module._check_resolutions(state, ANCHOR - timedelta(days=30)) is True
     assert opened == []
     # The tournament check is the one that reads, and it reads read-only.
     assert watchdog.module._check_tournament(state) is False
