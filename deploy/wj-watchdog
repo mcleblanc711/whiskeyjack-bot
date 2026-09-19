@@ -69,17 +69,21 @@ PUSH_TIMEOUT_SECONDS = 15
 # substitution that gave it 15: the tournament path then blocked five seconds longer against a
 # slow healthcheck endpoint, which is a change to behaviour this item promised not to touch.
 DEADMAN_TIMEOUT_SECONDS = 10
-# What one run may spend if every one of those calls blocks to its own timeout: nine systemctl
-# queries (four tournament, three resolutions, two diagnostic `show`), one ledger read, and
+# What one run may spend if every one of those calls blocks to its own timeout: eleven systemctl
+# queries (four tournament, three resolutions, two timestamp `show` and two diagnostic
+# `show`), one ledger read, and
 # three HTTP calls (two pushes and the dead-man ping). `TimeoutStartSec` in
 # deploy/systemd/whiskeyjack-watchdog.service must exceed this, or systemd kills the run
 # part-way -- and because the tournament is checked first, what it kills is the resolutions
 # report. That could not happen before M1-341: four queries and one push is 75s, inside the
 # 120s the unit declared, while nine queries and three calls is 190s and is not. Found by
 # cross-model review, round 1. tests/unit/test_watchdog.py reads the deadline out of the unit
-# file and asserts it still exceeds this, so the two cannot drift apart.
+# file and asserts it still exceeds this, so the two cannot drift apart. M1-343 adds the two
+# timestamp queries its stall rule needs, taking the declared worst case to 215s -- still inside
+# the 240s the unit already declares and under the timer's own 300s interval, so no unit file
+# changes there.
 WORST_CASE_SECONDS = (
-    9 * SYSTEMCTL_TIMEOUT_SECONDS
+    11 * SYSTEMCTL_TIMEOUT_SECONDS
     + LEDGER_TIMEOUT_SECONDS
     + 2 * PUSH_TIMEOUT_SECONDS
     + DEADMAN_TIMEOUT_SECONDS
@@ -101,24 +105,88 @@ RESOLUTIONS_PROBLEMS = {
     "timer_inactive": "the timer is not active, so no run is scheduled",
     "timer_disabled": "the timer is not enabled, so it will not survive a reboot",
     "service_failed": "the last run FAILED",
+    "timer_stalled": "the timer is active and enabled but has not fired within its own interval",
 }
+
+# The first three codes all describe a timer somebody STOPPED. `timer_stalled` (M1-343) is the
+# fourth case: enabled, active, and simply not firing -- a bad `OnCalendar` edit that never
+# matches, a clock jump, or a service left in a state systemd will not restart. The unit's own
+# `OnFailure=` pager cannot see it either, because a timer that never runs never fails.
+#
+# M1-341 rejected this rule rather than smuggling it in, because it carries a false-alarm class
+# the other three do not: a timer that has never fired, and a host that was switched off. Both
+# are refused here by their OWN guard rather than by the arithmetic happening to come out under
+# the margin -- see `_timer_stalled`.
+#
+# The interval is the cadence `deploy/systemd/whiskeyjack-resolutions.timer` declares
+# (`OnCalendar=*-*-* 00/6:23:00`); tests/unit/test_watchdog.py reads it off that file, so the
+# constant and the unit cannot drift apart. The margin is stated rather than derived: it absorbs
+# `AccuracySec=1min`, a run that starts late, and a watchdog run that is itself late.
+RESOLUTIONS_INTERVAL = timedelta(hours=6)
+RESOLUTIONS_STALE_MARGIN = timedelta(hours=1)
+# A THIRD clock, kept explicit rather than folded into either of the two above -- T-909's lesson
+# is that two clocks sharing one constant become one clock by accident. This one answers "was
+# this watchdog watching for the whole window?": at a five-minute cadence four missed runs is a
+# break in the record, and a stall claimed across a break is really a claim about a host that
+# was off.
+WATCHDOG_GAP_TOLERANCE = timedelta(minutes=20)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _systemctl(*args: str) -> str:
+def _systemctl(*args: str, env: dict[str, str] | None = None) -> str:
+    """One systemctl question. `env` is None for every caller but the timestamp reader.
+
+    `env=None` is what `subprocess.run` was already given -- inherit -- so the four tournament
+    queries and the three resolutions ones pass exactly what they passed before (M1-343). The
+    alternative was a second copy of this block for the new calls, which would have been a
+    second timeout and a second exception handler to keep in step with this one.
+    """
     try:
         out = subprocess.run(
             ["systemctl", "--user", *args],
             capture_output=True,
             text=True,
             timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+            env=env,
         )
         return out.stdout.strip()
     except Exception:
         return "unknown"
+
+
+def _unit_timestamp(*args: str) -> datetime | None:
+    """A systemd timestamp property as an aware instant, or None when it is not one.
+
+    `systemctl show` renders timestamp properties in the CLIENT's local time and locale, and
+    `--timestamp=unix|utc|us|us+utc|pretty` does **not** change that for `show` -- measured on
+    systemd 255, where all five printed `Sat 2026-09-19 06:23:18 MDT`. An abbreviated zone name
+    cannot be parsed back reliably, so the answer is to ask in a controlled environment instead:
+    under `TZ=UTC` and `LC_ALL=C` the same property renders `Sat 2026-09-19 12:23:18 UTC`. Only
+    the two middle tokens are parsed -- the weekday is ignored precisely so that `%a`'s locale
+    dependence cannot matter, and the zone token must be exactly `UTC` or nothing is parsed.
+
+    Total by construction. A timer that has never fired and a unit that does not exist BOTH print
+    the empty string; `_systemctl` substitutes "unknown" when the call itself fails; systemd
+    prints "n/a" and "infinity" for unset and never-elapsing values. Every one of those, and
+    arbitrary text, returns None -- which every caller reads as "no usable record", and which
+    means silence rather than a page.
+    """
+    return _parse_unit_timestamp(_systemctl(*args, env={**os.environ, "TZ": "UTC", "LC_ALL": "C"}))
+
+
+def _parse_unit_timestamp(raw: str) -> datetime | None:
+    """The parsing half of `_unit_timestamp`, split out so it can be fuzzed without a subprocess."""
+    parts = raw.split()
+    if len(parts) != 4 or parts[3] != "UTC":
+        return None
+    try:
+        parsed = datetime.strptime(f"{parts[1]} {parts[2]}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 def _aware_stamp(raw: object) -> datetime | None:
@@ -252,6 +320,77 @@ def _ping_deadman() -> None:
         pass
 
 
+def _observe(state: dict, now: datetime) -> datetime:
+    """The instant since which this watchdog has been watching without a break.
+
+    Guard D of the stall rule, and the honest witness for "the host was off" (M1-343). The
+    watchdog runs every five minutes, so it is the one thing here that KNOWS whether it was
+    running: a gap in its own observations is a period during which the resolutions timer could
+    not be observed failing to fire, and a stall may not be claimed across one.
+
+    `/proc/uptime` was the obvious alternative and is wrong twice: its first field is measured
+    against a clock that keeps counting across suspend, so a laptop asleep for three hours looks
+    like three hours of uptime, and it cannot see a user session that ended while the machine
+    stayed up. Both are exactly the case this guard exists for.
+
+    Untrusted shape throughout -- this is a file a person can edit -- so both stamps go through
+    `_aware_stamp`, and a missing, unusable or future stamp resets the record rather than
+    extending it. Resetting is the silent direction, which is the right one for a rule with no
+    observed occurrence: it can lose a page it should have sent, never invent one.
+    """
+    stored = state.get("observed")
+    if not isinstance(stored, dict):
+        stored = {}
+    since = _aware_stamp(stored.get("since"))
+    last_seen = _aware_stamp(stored.get("last_seen"))
+    if since is None or last_seen is None:
+        since = now
+    elif not timedelta(0) <= now - last_seen <= WATCHDOG_GAP_TOLERANCE:
+        # Too long to be a missed run, or a clock that moved backwards under us.
+        since = now
+    elif since > now:
+        since = now
+    state["observed"] = {"since": since.isoformat(), "last_seen": now.isoformat()}
+    return since
+
+
+def _timer_stalled(
+    timer_active: str,
+    timer_enabled: str,
+    last_trigger: datetime | None,
+    active_since: datetime | None,
+    observed_since: datetime,
+    now: datetime,
+) -> bool:
+    """Whether an enabled, active timer has gone its interval plus the margin without firing.
+
+    Pure, and total over arbitrary strings and over every stamp `_unit_timestamp` can return.
+    Five conditions, and each one refuses a DIFFERENT false alarm, so neutering any single one
+    changes what this reports:
+
+    0. Not active, or not enabled -- the three existing codes already describe that timer, and
+       the criterion is scoped to one that is running.
+    A. No usable `LastTriggerUSec`: a timer that has **never fired**. Silent, per the criterion.
+    B. The arithmetic: the last firing is older than the interval plus the stated margin.
+    C. The timer itself has been active for that whole window. `Persistent=true` means a timer
+       started after a stop fires within `AccuracySec`, so a timer restarted one minute ago has
+       a week-old last trigger and is not stalled -- it is recovering, and paging then would be
+       a false alarm on the path an operator has just fixed.
+    D. This watchdog has been watching for that whole window (`_observe`): a host that was off,
+       suspended or logged out is a gap in the record, not a fault in the timer.
+    """
+    window = RESOLUTIONS_INTERVAL + RESOLUTIONS_STALE_MARGIN
+    if timer_active != "active" or timer_enabled != "enabled":
+        return False
+    if last_trigger is None:
+        return False
+    if now - last_trigger < window:
+        return False
+    if active_since is None or now - active_since < window:
+        return False
+    return now - observed_since >= window
+
+
 def _resolutions_problems(
     timer_active: str, timer_enabled: str, service_failed: str
 ) -> tuple[str, ...]:
@@ -294,23 +433,81 @@ def _throttle_key(codes: tuple[str, ...]) -> str:
     return ",".join(codes)
 
 
-def _check_resolutions(state: dict) -> bool:
+def _stall_unverified(stored: dict, last_trigger: datetime | None, now: datetime) -> bool:
+    """Whether a stall already paged has neither been confirmed nor disproved on this run.
+
+    The recovery notice is a claim, and `timer_stalled` is the one code whose absence does not
+    establish it. The other three are read straight off systemd: not-active becoming active IS
+    the recovery. A stall, though, stops being reported the moment any of its guards refuses --
+    and guard D refuses for a reason that says nothing about the timer at all: the host was off,
+    or this watchdog was not running, so the window it would measure has a hole in it. Sending
+    "resolutions schedule recovered" on the strength of that would be a false reassurance about
+    the thing the operator was last told was broken.
+
+    So: if a stored page named a stall and the timer's last trigger is still older than the
+    window -- or cannot be read at all -- this run knows nothing new. The caller then stays
+    silent in both directions and keeps the stored throttle, rather than announcing a recovery
+    it cannot support. A trigger inside the window is the timer firing again, which is exactly
+    the evidence a recovery needs.
+
+    `stored` came back out of a JSON file a person can edit, so `key` is read as untrusted
+    shape: anything that is not a string carries no stall.
+    """
+    key = stored.get("key")
+    if not isinstance(key, str) or "timer_stalled" not in key.split(","):
+        return False
+    if last_trigger is None:
+        return True
+    return now - last_trigger >= RESOLUTIONS_INTERVAL + RESOLUTIONS_STALE_MARGIN
+
+
+def _check_resolutions(state: dict, observed_since: datetime) -> bool:
     """The six-hourly ingest-and-score schedule. True when it has stopped.
 
-    Reads three unit states and nothing else: no ledger, no config, no network beyond the
-    one ntfy POST. `Result` and `ExecMainStatus` are read only to say WHY a failed run
-    failed, never as a fourth detection rule.
+    Reads three unit states, and -- only for a timer that is active and enabled -- two of its
+    timestamps (M1-343). No ledger, no config, no network beyond the one ntfy POST. `Result` and
+    `ExecMainStatus` are still read only to say WHY a failed run failed, never as a detection
+    rule of their own.
+
+    The two timestamps are asked one property per call. Combining them into one `show` is what
+    M1-341's round-1 review rejected for the diagnostic pair, and the reason holds here: this
+    module strips systemctl's output, so a property with an empty value loses its line and the
+    two can transpose silently -- and "empty" is exactly what a timer that has never fired
+    answers.
     """
     timer_active = _systemctl("is-active", f"{RESOLUTIONS_UNIT}.timer") or "unknown"
     timer_enabled = _systemctl("is-enabled", f"{RESOLUTIONS_UNIT}.timer") or "unknown"
     service_failed = _systemctl("is-failed", f"{RESOLUTIONS_UNIT}.service") or "unknown"
     codes = _resolutions_problems(timer_active, timer_enabled, service_failed)
 
+    now = _now()
+    last_trigger: datetime | None = None
+    if timer_active == "active" and timer_enabled == "enabled":
+        last_trigger = _unit_timestamp(
+            "show", f"{RESOLUTIONS_UNIT}.timer", "-p", "LastTriggerUSec", "--value"
+        )
+        active_since = _unit_timestamp(
+            "show", f"{RESOLUTIONS_UNIT}.timer", "-p", "ActiveEnterTimestamp", "--value"
+        )
+        if _timer_stalled(
+            timer_active, timer_enabled, last_trigger, active_since, observed_since, now
+        ):
+            # ADDED to the set, not substituted for it: a timer that is stalled and whose last
+            # run also failed is two faults, and the throttle is keyed on the whole set, so
+            # naming both is what makes the second one new information rather than a drop.
+            codes = tuple(sorted({*codes, "timer_stalled"}))
+
     stored = state.get("resolutions")
     if not isinstance(stored, dict):
         stored = {}
 
     if not codes:
+        if _stall_unverified(stored, last_trigger, now):
+            # Nothing to report and nothing to celebrate: keep the throttle stamp so that a
+            # stall re-confirmed inside its window does not page twice for one condition.
+            state["resolutions"] = stored
+            print(f"OK: resolutions timer {timer_active}/{timer_enabled} (stall unverified)")
+            return False
         if stored.get("key") and RECOVERY_NOTICE:
             _push(
                 "whiskeyjack: resolutions schedule recovered",
@@ -332,16 +529,29 @@ def _check_resolutions(state: dict) -> bool:
     if stored.get("key") == key and isinstance(previous, str):
         entry["last_alert"] = previous
 
-    if _alert_is_due(codes, stored, _now()):
+    if _alert_is_due(codes, stored, now):
         result = _systemctl("show", f"{RESOLUTIONS_UNIT}.service", "-p", "Result", "--value")
         status = _systemctl(
             "show", f"{RESOLUTIONS_UNIT}.service", "-p", "ExecMainStatus", "--value"
         )
+        # An AGE in hours, computed here, rather than the timestamp systemd printed: the push
+        # carries no value read out of anything, which is the project's error-hygiene rule and
+        # M1-334's lesson about a subject line that is hashed.
+        stalled_line = ""
+        if "timer_stalled" in codes and last_trigger is not None:
+            hours = (now - last_trigger).total_seconds() / 3600
+            interval_hours = RESOLUTIONS_INTERVAL.total_seconds() / 3600
+            margin_hours = RESOLUTIONS_STALE_MARGIN.total_seconds() / 3600
+            stalled_line = (
+                f"\nlast fired: {hours:.0f} h ago "
+                f"(interval {interval_hours:.0f} h + margin {margin_hours:.0f} h)"
+            )
         body = (
             "Resolution ingestion and scoring are NOT scheduled.\n\n"
             + "\n".join(f"- {RESOLUTIONS_PROBLEMS[code]}" for code in codes)
             + f"\n\ntimer: {timer_active}/{timer_enabled}"
             + f"\nlast run: result={result or 'unknown'} exit={status or 'unknown'}"
+            + stalled_line
             + "\n\nNothing is lost while it is stopped -- ingest-resolutions and score are "
             "both idempotent and catch up -- but resolutions and scores stop arriving, and "
             "the unit's own OnFailure pager cannot report this: a timer that never runs "
@@ -349,6 +559,16 @@ def _check_resolutions(state: dict) -> bool:
             + "\n\nCheck: systemctl --user list-timers whiskeyjack-resolutions.timer"
             + "\n       systemctl --user enable --now whiskeyjack-resolutions.timer"
             + "\n       journalctl --user -u whiskeyjack-resolutions.service -n 80"
+            + (
+                "\n\nFor a timer that IS running but has not fired, the schedule itself is "
+                "what to look at -- a calendar expression that no longer matches, or a clock "
+                "that moved:"
+                "\n       systemctl --user show whiskeyjack-resolutions.timer -p TimersCalendar"
+                "\n       systemd-analyze calendar '*-*-* 00/6:23:00'"
+                "\n       systemctl --user restart whiskeyjack-resolutions.timer"
+                if "timer_stalled" in codes
+                else ""
+            )
         )
         # Stamp only a push that landed, so a dead channel retries on the next run.
         if _push(
@@ -451,8 +671,12 @@ def main() -> int:
     2026-09-09 repeats is exactly the day the other half must still be reported.
     """
     state = _load_state()
+    # Before either check, and at the top level of the state file: the record of whether this
+    # watchdog was running is about the watchdog, not about either subject, and both checks
+    # rewrite their own keys wholesale (M1-343).
+    observed_since = _observe(state, _now())
     tournament_down = _check_tournament(state)
-    resolutions_down = _check_resolutions(state)
+    resolutions_down = _check_resolutions(state, observed_since)
     _save_state(state)
     return 1 if tournament_down or resolutions_down else 0
 

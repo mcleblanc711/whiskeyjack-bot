@@ -12693,3 +12693,229 @@ No dependency slot, no migration, no workflow slot. Backlog row flipped to `Done
 branch before merge, per convention. `origin/master` merged in at `69876e4` after PR #107
 (M1-330) landed; both conflicts were textual — each branch had appended a `docs/TRACKS.md`
 Worktrees row and an `M1-NOTES` section — and both sides were kept in both files.
+
+---
+
+## M1-343 — Page when the resolutions timer is enabled, active and not firing
+
+*Criterion: a timer that is enabled and active but whose last trigger is older than its own
+declared interval by a stated margin produces one throttled watchdog push; a timer that has
+never fired and a host that was off do not; the existing three checks, their throttle and the
+tournament checks are unchanged; a test drives a never-fired timer, a freshly-triggered one and
+a stale one and asserts silence, silence and one page.*
+
+M1-341 gave the watchdog three conditions on `whiskeyjack-resolutions.timer`, and all three
+describe a timer **somebody stopped**: `is-active`, `is-enabled`, `is-failed`. A timer that is
+enabled and active and simply never fires is invisible to every one of them — a bad `OnCalendar`
+edit that no longer matches, a clock jump, a service left in a state systemd will not restart —
+and the unit's own `OnFailure=` pager cannot see it either, because a timer that never runs
+never fails.
+
+**Nothing has been observed failing this way.** This is a gap in coverage, not a defect, and
+that shapes every decision below: the rule is allowed to miss a page it should have sent, and is
+never allowed to invent one.
+
+### Delivered
+
+- `deploy/wj-watchdog` — a fourth code, `timer_stalled`, in the existing closed vocabulary;
+  `_unit_timestamp`/`_parse_unit_timestamp`, `_observe`, `_timer_stalled` and
+  `_stall_unverified`; an `env` keyword on `_systemctl`; two new `show` queries on the timer;
+  `WORST_CASE_SECONDS` 190 → 215.
+- `docs/RUNBOOK.md` — a fourth row in W1's table, the stall's own remedy block, the three
+  silences stated, and the eleven-query/`TZ=UTC` note under § The watchdog itself.
+- Tests: 16 test functions added in `tests/unit/test_watchdog.py` -- 77 collected cases, up
+  from 50 -- and 7 properties added in `tests/property/test_watchdog_properties.py` (16 total).
+
+**No `src/` change, no migration, no dependency, no unit-file change, no ledger write.** The
+watchdog still imports nothing from the package and touches no `AppConfig` field, so it still
+cannot move `config_sha256` (M1-334).
+
+### Decision — five guards, each refusing a different false alarm
+
+`_timer_stalled` is a conjunction, and the conjunction is the item. The arithmetic alone is two
+lines; what M1-341 rejected was the arithmetic alone, because it pages for things that are not
+faults.
+
+| guard | refuses | evidence it reads |
+|---|---|---|
+| 0 | a timer somebody stopped — already described by the other three codes | `is-active`, `is-enabled` |
+| A | a timer that has **never fired** | `LastTriggerUSec` is empty, so the parser returns `None` |
+| B | a timer that fired inside its interval plus the margin | the arithmetic |
+| C | a timer restarted inside that window — `Persistent=true` fires it within `AccuracySec`, so it is recovering, not stalled | `ActiveEnterTimestamp` |
+| D | a window this watchdog did not watch end to end: a **host that was off**, asleep, or logged out | its own observation record |
+
+Both members of the false-alarm class M1-341 named are refused by their **own** guard, not by the
+arithmetic happening to come out under the margin. That distinction is testable and is tested:
+every silence test sets up a case that *would* page and changes exactly one field, and the
+mutation pass below neuters each guard separately.
+
+### Decision — the watchdog's own observation record is the "host was off" witness
+
+`_observe` keeps `observed.since` / `observed.last_seen` at the **top level** of the state file
+(both checks rewrite their own keys wholesale) and resets `since` on any gap longer than
+`WATCHDOG_GAP_TOLERANCE` — four missed runs at the five-minute cadence — or on a stamp it cannot
+read, or one in the future. A stall can then only be claimed over a window the watchdog observed
+itself.
+
+This is the third clock in the file and it is deliberately its own constant: the tournament's
+`STALE_AFTER`, the 24-hour re-alert, and this. T-909's lesson is that two clocks sharing one
+number become one clock by accident.
+
+### Decision — `TZ=UTC LC_ALL=C` on exactly two queries, `env=None` on the other nine
+
+`systemctl show` renders timestamp properties in the **client's** local zone and locale, and
+`--timestamp=unix|utc|us|us+utc|pretty` does not change that for `show`. Measured on systemd 255
+on the live host: all five printed `Sat 2026-09-19 06:23:18 MDT`. `MDT` is not a zone this
+program can place on the timeline, and reading it as UTC would be wrong by hours in silence.
+With `TZ=UTC LC_ALL=C` the same property renders `Sat 2026-09-19 12:23:18 UTC`, and only the two
+middle tokens are parsed — the weekday is discarded precisely so `%a`'s locale dependence cannot
+matter, and the zone token must be exactly `UTC` or nothing is parsed.
+
+The environment is carried on a keyword-only `env` parameter of the existing `_systemctl` rather
+than in a second subprocess helper: one timeout, one exception handler, one seam the tests
+replace. Every pre-existing call site passes `env=None`, which is what `subprocess.run` was
+already given — so "the existing checks are unchanged" is a property observed at
+`subprocess.run` (`test_the_timestamp_queries_ask_in_utc_and_the_others_are_unchanged`), not a
+claim.
+
+### Deviation — the stricter reading: the stall is added to the code set, not substituted
+
+The criterion describes one condition, but a timer can be stalled *and* have failed its last
+run. Rather than let one displace the other, `timer_stalled` joins the sorted code tuple, so
+that case pages once naming both and the throttle key is `service_failed,timer_stalled` — which
+means a stall appearing beside a standing failure is new information and pages at once, rather
+than inheriting the other's day of silence. Same title, same body machinery, same 24-hour
+window: the page an operator already knows how to read.
+
+### Deviation — the recovery notice is withheld when a stall cannot be re-checked
+
+Found while driving the throttle test across a simulated reboot, and fixed rather than left:
+`timer_stalled` is the one code whose **absence** is not evidence. The other three are read
+straight off systemd, so not-active becoming active *is* the recovery. But a stall stops being
+reported the moment guard D refuses — and guard D refuses because the host was off, which says
+nothing at all about the timer. The original code would have sent `resolutions schedule
+recovered` on that basis: a false reassurance about the one thing the operator was last told was
+broken.
+
+`_stall_unverified` therefore keeps the run silent in both directions when a stored stall can be
+neither confirmed nor disproved, and carries the throttle stamp forward so a stall re-confirmed
+after the record rebuilds does not page twice for one condition. Recovery is announced when the
+timer has actually fired again.
+
+### Rejected — a `NextElapseUSecRealtime` rule, and why not
+
+An empty `NextElapseUSecRealtime` on an active timer is a real signal — it is what a calendar
+expression that matches nothing leaves behind — and it would catch the bad-`OnCalendar` case on
+a *fresh* install, which guard A deliberately does not. Rejected here because it is a second
+detection rule with its own false-alarm class (a purely monotonic timer sets only
+`NextElapseUSecMonotonic`; `wethr-export.timer` on this host answers empty for exactly that
+reason) and the criterion names one rule. The diagnostic value is kept without the alarm: the
+stall page tells the operator to look at `TimersCalendar` and `NextElapseUSecRealtime`.
+
+### Rejected — `/proc/uptime` or the manager's start time as the host-off witness
+
+The obvious witness, and wrong twice. Its first field counts across suspend, so a laptop asleep
+for three hours reports three hours of uptime — and suspend is precisely a period in which the
+timer could not fire and the watchdog could not watch. It also cannot see a user session that
+ended while the machine stayed up, which is the 2026-09-09 shape. The watchdog's own five-minute
+record has neither hole.
+
+### Rejected — deriving the interval from `NextElapse - LastTrigger`
+
+It looks elegant — systemd declaring its own cadence — and it inverts the detector. A timer
+stale by three days whose next elapse is an hour away yields a derived "interval" of three days,
+so the staler it gets the less stalled it looks. The interval is a constant, checked against
+`OnCalendar` in the tracked unit file by a test.
+
+### Rejected — a stall rule on the tournament timer
+
+The poll already has a stronger signal: a heartbeat row per run, with a 20-minute staleness rule
+and the in-progress exemption. A second rule over the same fault would page twice for one
+condition, on the subject whose page is already `urgent`.
+
+### Rejected — combining the two timestamp queries into one `show`
+
+M1-341's round-1 review rejected this for the diagnostic pair, and the reason is stronger here:
+`_systemctl` strips its output, so a property with an empty value loses its line and the two
+transpose silently — and "empty" is exactly what a timer that has never fired answers. Two
+calls, one property each, 25s of declared budget, and the deadline already covers it.
+
+### Rejected — an `AppConfig` field for the interval, the margin or the tolerance
+
+Any new field changes `config_sha256` and retires both live activations (M1-334, 2h33m). These
+are deployment facts beside the constants the file already holds.
+
+### Deferred (do not read the absence as an omission)
+
+- **A never-fired timer with a broken `OnCalendar`** is still not reported: guard A is silent by
+  criterion. The `NextElapse` rule above is what would cover it; filed nowhere yet because it has
+  never occurred and its false-alarm class is not yet characterised.
+- **M1-344 and M1-345** touch this file next, in that order, and are separately filed: an
+  unwritable state file bounding alert volume, and making the diagnostic prints non-fatal.
+- **Installing the updated script on the live host** is an operator action after merge — the
+  repo copy and `~/.local/bin/wj-watchdog` are two files, `diff`-identical before this branch.
+
+### Standing risk — not verifiable offline
+
+- **Every guard fails closed to silence.** An unreadable property, a `systemctl` that times out,
+  an unwritable state file (M1-344) — each yields no page. For a rule with no observed
+  occurrence that is the right direction, but it does mean a stall can go unreported for a
+  reason unrelated to the timer, and nothing reports *that*.
+- **Guard D is silent for seven hours after every reboot**, by construction. A host that reboots
+  more often than that would never page this way at all.
+- **`systemctl show`'s rendering is systemd's.** The `TZ=UTC` behaviour was measured on systemd
+  255 on this host; a future version that changes the format makes the parser return `None`,
+  which is silence rather than a wrong page.
+- **Whether a push reaches a phone** is untestable here; `_push` is replaced in every test.
+
+### Mutation pass — fifteen mutants, fifteen dead
+
+Run against the committed tree (`9cb9f61`), one mutant at a time, each applied to
+`deploy/wj-watchdog` and reverted, with `tests/unit/test_watchdog.py` and
+`tests/property/test_watchdog_properties.py` as the suite. Baseline green: **92 passed**. The
+count is the number of distinct tests that failed — a guard whose only witness is one test is
+noted as such, because that is the one to look at if it ever changes.
+
+| # | mutant | dead | first witnesses |
+|---|---|---|---|
+| S01 | guard 0: `timer_active` check dropped | 1 | `test_every_guard_refuses_a_stall_on_its_own` |
+| S02 | guard 0: `timer_enabled` check dropped | 1 | `test_every_guard_refuses_a_stall_on_its_own` |
+| S03 | guard A: a never-fired timer counts as stalled | 7 | `..._has_never_fired_says_nothing`, all six unusable-stamp rows |
+| S04 | guard B: the arithmetic dropped | 6 | all four `..._fired_inside_its_own_window_says_nothing` rows |
+| S05 | guard C: the activation window dropped | 5 | `..._just_restarted_is_recovering_rather_than_stalled` + three stamp rows |
+| S06 | guard D: the observation window dropped | 4 | `..._host_that_was_off_says_nothing_until...`, the break and recovery tests |
+| S07 | `_observe` never resets (a gap always counts as watching) | 4 | the same three, plus `..._survives_a_missed_run_and_not_a_gap` |
+| S08 | `_observe` always resets (no window ever accumulates) | 10 | every test that expects a page |
+| S09 | the recovery notice is never withheld | 2 | `..._does_not_announce_a_recovery_that_did_not_happen` |
+| S10 | the timestamp queries stop pinning `TZ`/`LC_ALL` | 1 | `..._ask_in_utc_and_the_others_are_unchanged` |
+| S11 | the parser accepts any zone token | 3 | the local-zone rows for both stamps, and the parser property |
+| S12 | the stall replaces the code set instead of joining it | 1 | `..._whose_last_run_also_failed_pages_once_naming_both` |
+| S13 | the timestamps are asked even for a stopped timer | 1 | `..._stopped_timer_is_never_also_reported_stalled` |
+| S14 | the margin drops to zero | 3 | the interval witness, and two window rows |
+| S15 | the interval doubles to twelve hours | 8 | the interval witness, and every page test |
+
+**One of these mutants survived on the first pass and is worth the record.** S11 (the parser
+accepting `MDT` as though it were UTC) was killed only by the property, because the unit tests
+fed it the literal `Sat 2026-09-19 12:23:18 MDT` — a date two days *after* the test anchor. Read
+as UTC that is a trigger in the future, which guard B refuses, so the test passed for a reason
+that had nothing to do with the zone check. Both fixtures are now anchor-relative and stale by
+nine hours, so the same string pages if the zone stops being checked, and the mutant dies three
+times over. It is the vacuity class `docs/LESSONS.md` names, in its reachability form: the
+strategy reached the branch, and the assertion was not about it.
+
+### Live verification — read-only, against the running host
+
+The offline suite feeds the parser strings the suite itself wrote, so it cannot show that
+systemd renders what the parser expects. Run against the live `whiskeyjack-resolutions.timer` on
+2026-09-19, read-only:
+
+```
+_unit_timestamp(LastTriggerUSec)      -> 2026-09-19 12:23:18+00:00   (age 1:14:37)
+_unit_timestamp(ActiveEnterTimestamp) -> 2026-09-16 07:12:43+00:00   (age 3 days, 6:25:12)
+systemctl --user list-timers          -> Sat 2026-09-19 06:23:18 MDT  1h 14min ago
+_timer_stalled(...)                   -> False
+_unit_timestamp(a unit that does not exist) -> None
+```
+
+The parsed instant is the one `list-timers` reports, in UTC, and the healthy timer does not
+stall. `WORST_CASE_SECONDS` reads 215 against the unit's `TimeoutStartSec=240`.
