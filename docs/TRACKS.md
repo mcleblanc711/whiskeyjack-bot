@@ -80,7 +80,15 @@ near zero this time, with no other lane open when it started and one when it mer
 | M1-611 | feat/m1-611-show-record-id | whiskeyjack-m1-611 | no | none | 2026-09-16 |
 | M1-612 | feat/m1-612-show-record-history | whiskeyjack-m1-612 | no | none | 2026-09-16 |
 | M1-330 | feat/m1-330-replay-stored-packet | whiskeyjack-m1-330 | no | none | 2026-09-18 |
-| T-908 | feat/t-908-runbook-cli-drift | whiskeyjack-t-908 | no | none | 2026-09-18 |
+| M1-343 | feat/m1-343-watchdog-stale-timer | whiskeyjack-m1-343 | no | none | 2026-09-19 |
+
+*(Swept the **T-908** row (merged PR #108, round-1 approve with zero blocking findings,
+2026-09-18 — the runbook/CLI drift check), which is the one drop `finish-item.sh` asked for.
+Checked before making it, not assumed: at the moment of the edit `origin` held `master` alone,
+and `origin/master` carried that row, so it is a landed claim rather than a live one and nothing
+now references a deleted branch. `scripts/tracks.py claims` was run after the edit and exits 0.
+**M1-330's row is left in place** — it is the next branch's one sweep, not this one's.)*
+
 *(Merged and left in place, per the rule below: **D-1001** (PR #95, round-3 approve,
 2026-09-12 — the operator runbook, `docs/RUNBOOK.md`, 21 failure states; it filed six rows,
 of which **M2-713** is Critical: a live post the ledger refused to record, with no
