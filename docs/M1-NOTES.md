@@ -13082,6 +13082,14 @@ fails the test until its probe is added and the canaries are re-checked against 
 the step nobody had to take before. It is also where `nan`/`inf`/`-inf` are covered: their
 reprs are short, so their collision-freedom rests on this inventory rather than on their shape.
 
+It also carries the completeness argument as an assertion rather than a comment. Every finite
+float's repr contains a `.` or an `e`, and the rest are `inf`, `-inf` and `nan`. **Exactly one of
+the 15 messages carries such a token at all** — the tolerance — and no message contains a `.`
+anywhere (both measured, 2026-09-20). So `1e-06` was not one colliding value among many: it was
+the *only* float whose repr could ever be a substring of a refusal this module emits, which is
+also why the exemption list could never have been the fix. A message that starts rendering a
+second number fails that line.
+
 ### Mutation matrix — and the site it found uncovered
 
 Bytecode cleared between mutants; each applied to `src/whiskeyjack_bot/scoring.py`, the tree

@@ -27,6 +27,7 @@ import inspect
 import itertools
 import json
 import math
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 
@@ -385,6 +386,13 @@ def test_no_canary_repr_collides_with_any_refusal_message() -> None:
         assert SENTINEL not in message
         for probability in PROBABILITY_CANARIES:
             assert repr(probability) not in message
+    # And the completeness argument behind the canary set, as an assertion rather than a
+    # comment: every finite float's repr carries a "." or an "e", and the rest are 'inf',
+    # '-inf' and 'nan'. Exactly one message carries such a token at all, and it is the
+    # tolerance -- so `1e-06` was the only float whose repr could ever have been a substring
+    # of a refusal here. A message that starts rendering a second number fails this line.
+    carrying_a_number = {m for m in messages if re.search(r"[0-9]\.|[0-9]e|inf|nan", m)}
+    assert carrying_a_number == {"option probabilities must sum to 1 within 1e-06"}
 
 
 # ── 7. what is stored replays, through the real ledger ───────────────────────
