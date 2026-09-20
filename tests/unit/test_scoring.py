@@ -344,3 +344,28 @@ def test_no_refusal_message_carries_a_probability_label_or_outcome() -> None:
         message = str(excinfo.value)
         assert PROBE_LABEL not in message and "Zanzibar" not in message
         assert "0.123" not in message and "123456789" not in message
+
+
+def test_the_sum_refusal_renders_the_tolerance_and_not_the_forecast() -> None:
+    """M1-346: *"sum to 1 within 1e-06"* carries `_SUM_TOLERANCE`, not a probability.
+
+    The string is invariant to the probabilities passed in, which is what makes it a
+    constant and not a leak -- and it is why a no-leak check written as
+    ``repr(probability) not in message`` fails on a drawn ``1e-06`` for a reason that has
+    nothing to do with leaking. That failure reddened a *required* gate on branches
+    touching neither `scoring.py` nor the property (2 of 40 fresh runs of
+    `tests/property/test_scoring_properties.py::test_no_refusal_reprints_a_label_outcome_or_probability`,
+    2026-09-20), so the property now draws canary probabilities. This pins the fact that
+    made it necessary: if the tolerance ever stops being rendered, or starts being rendered
+    beside the value, the canary set has to be re-checked against the new text.
+    """
+    messages = []
+    for probability in (1e-06, PROBE_PROBABILITY):
+        with pytest.raises(ScoreError) as excinfo:
+            multiclass_brier_v1(((PROBE_LABEL, probability), ("b", 0.5)), PROBE_LABEL)
+        messages.append(str(excinfo.value))
+    colliding, canary = messages
+    assert colliding == canary  # same text for two different probabilities: a constant
+    assert "option probabilities must sum to 1 within 1e-06" == colliding
+    assert repr(1e-06) in colliding  # the tolerance's own repr, character for character
+    assert repr(PROBE_PROBABILITY) not in canary

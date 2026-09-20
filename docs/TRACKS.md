@@ -79,15 +79,17 @@ near zero this time, with no other lane open when it started and one when it mer
 | T-909 | feat/t-909-pin-retired-profile-clock | whiskeyjack-t-909 | no | none | 2026-09-15 |
 | M1-611 | feat/m1-611-show-record-id | whiskeyjack-m1-611 | no | none | 2026-09-16 |
 | M1-612 | feat/m1-612-show-record-history | whiskeyjack-m1-612 | no | none | 2026-09-16 |
-| M1-330 | feat/m1-330-replay-stored-packet | whiskeyjack-m1-330 | no | none | 2026-09-18 |
 | M1-343 | feat/m1-343-watchdog-stale-timer | whiskeyjack-m1-343 | no | none | 2026-09-19 |
+| M1-346 | feat/m1-346-scoring-noleak-constant | whiskeyjack-m1-346 | no | none | 2026-09-20 |
 
-*(Swept the **T-908** row (merged PR #108, round-1 approve with zero blocking findings,
-2026-09-18 — the runbook/CLI drift check), which is the one drop `finish-item.sh` asked for.
-Checked before making it, not assumed: at the moment of the edit `origin` held `master` alone,
-and `origin/master` carried that row, so it is a landed claim rather than a live one and nothing
-now references a deleted branch. `scripts/tracks.py claims` was run after the edit and exits 0.
-**M1-330's row is left in place** — it is the next branch's one sweep, not this one's.)*
+*(Swept the **M1-330** row (merged PR #107, rounds 1 and 2 approve with zero blockers,
+2026-09-18 — the stored-packet replay path), which is the one drop the previous sweep note left
+for this branch. Checked before making it, not assumed: at the moment of the edit `origin` held
+`master` alone, `origin/master` carried that row, and `whiskeyjack-m1-330` is gone, so it is a
+landed claim rather than a live one and nothing now references a deleted branch.
+`scripts/tracks.py claims` was run before and after the edit and exits 0 with no live claims.
+**M1-343's row is left in place** — it is the next branch's one sweep, not this one's. The
+previous sweep took **T-908**'s row (PR #108, round-1 approve, 2026-09-18) on the same rule.)*
 
 *(Merged and left in place, per the rule below: **D-1001** (PR #95, round-3 approve,
 2026-09-12 — the operator runbook, `docs/RUNBOOK.md`, 21 failure states; it filed six rows,

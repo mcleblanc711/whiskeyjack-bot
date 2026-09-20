@@ -10,7 +10,9 @@ The CLAUDE.md pre-review fuzz pass over ``scoring.py`` and ``lifecycle.record_lo
    (the single-term against the two-category convention) up to the rounding of ``1.0 - p``.
 5. Both scores are proper over a grid: the expected score under belief ``q`` is best at
    ``p = q``.
-6. No refusal reprints a label, an outcome or a probability.
+6. No refusal reprints a label, an outcome or a probability -- checked on canary values,
+   because a substring check over an unconstrained draw cannot tell a leak from a constant
+   the message legitimately contains (M1-346).
 7. What the writer stores replays: read back through the real ledger and recomputed, and
    through the persisted JSON form. A zero on the realized outcome writes no row at all.
 
@@ -21,9 +23,11 @@ nearly vacuous as first written).
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import itertools
 import json
 import math
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 
@@ -33,6 +37,7 @@ from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT
 
 from score_rows import MC_LABELS, SCORED_AT, seed_resolved
+from whiskeyjack_bot import scoring
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
@@ -224,19 +229,47 @@ def test_both_binary_scores_are_proper(q: float, p: float) -> None:
 
 
 # ── 6. no value in any refusal ───────────────────────────────────────────────
-
-
-@given(
-    label=HOSTILE_TEXT.map(lambda text: f"{SENTINEL}{text}"),
-    probability=st.one_of(
-        st.floats(allow_nan=True, allow_infinity=True), st.just(0.0), st.just(1.7)
-    ),
-    shape=st.sampled_from(["duplicate", "unpriced", "zero", "range", "sum", "binary"]),
+#
+# The probability is drawn from canaries, not from unconstrained floats (M1-346). The
+# assertion below used to read ``repr(probability) not in message or repr(probability) in
+# ("0.0", "1.0")``, and it failed whenever hypothesis drew ``1e-06``: the sum refusal reads
+# *"option probabilities must sum to 1 within 1e-06"*, and that ``1e-06`` is
+# ``scoring._SUM_TOLERANCE`` -- a constant the message legitimately carries, not a value it
+# leaked. Measured 2 failures in 40 fresh runs of this one property on the pre-fix tree
+# (2026-09-20), so it reddened a *required* gate on branches that touch neither file, and
+# hypothesis's example database then replayed it deterministically in that worktree.
+#
+# A substring check over an unconstrained draw cannot tell those two apart, which is
+# M1-607's finding restated. The exemption tuple was the same patch already made once, and
+# extending it to ``"1e-06"`` would be the third; it was also *dead* -- no message this
+# module can emit contains ``"0.0"`` or ``"1.0"``, which
+# ``test_no_canary_repr_collides_with_any_refusal_message`` now pins rather than assumes.
+#
+# So the check moves to canary values, which is what ``tests/unit/test_scoring.py``'s
+# ``PROBE_PROBABILITY`` already is for the same module's messages, and what
+# ``test_submission_properties.py``'s planted token is for its own: a value whose repr
+# cannot appear in a message for any reason except a leak. Each entry below is one branch
+# class reached *through* the probability, and the rule each one actually reaches is pinned
+# in ``test_every_shape_and_canary_reaches_a_refusal`` -- the shape names name the *call*,
+# not the refusal, and an in-range probability reaches the sum rule rather than the range
+# one. ``0.0`` and ``1.0`` leave the drawn set for the reason ``1e-06`` must stay out of it
+# (a two- or three-character repr is a substring of things for reasons unrelated to
+# leaking) and they cost no coverage: the zero-probability branch is reached by the "zero"
+# shape's own literal, and the bounds at 0 and 1 are property 2's claim, not this one's.
+PROBABILITY_CANARIES: tuple[float, ...] = (
+    0.123456789,  # in range, so the range rule passes and the *sum* rule refuses
+    1.123456789,  # above 1
+    -0.123456789,  # below 0
+    float("nan"),  # the non-finite half of the same rule. Short reprs -- 'nan', 'inf',
+    float("inf"),  # '-inf' -- so their collision-freedom rests on the inventory test
+    -float("inf"),  # below, not on their shape.
 )
-def test_no_refusal_reprints_a_label_outcome_or_probability(
-    label: str, probability: float, shape: str
-) -> None:
-    calls = {
+REFUSAL_SHAPES: tuple[str, ...] = ("duplicate", "unpriced", "zero", "range", "sum", "binary")
+
+
+def refusal_calls(label: str, probability: float) -> dict[str, Callable[[], float]]:
+    """One call per shape, all of which refuse for every canary (pinned below)."""
+    return {
         "duplicate": lambda: multiclass_log_v1(((label, 0.5), (label, 0.5)), label),
         "unpriced": lambda: multiclass_brier_v1(((label, 1.0),), f"{label}x"),
         "zero": lambda: multiclass_log_v1(((label, 0.0), ("b", 1.0)), label),
@@ -244,15 +277,122 @@ def test_no_refusal_reprints_a_label_outcome_or_probability(
         "sum": lambda: multiclass_brier_v1(((label, 0.25), ("b", 0.25)), label),
         "binary": lambda: binary_log_v1(probability, label),
     }
+
+
+@given(
+    label=HOSTILE_TEXT.map(lambda text: f"{SENTINEL}{text}"),
+    probability=st.sampled_from(PROBABILITY_CANARIES),
+    shape=st.sampled_from(REFUSAL_SHAPES),
+)
+def test_no_refusal_reprints_a_label_outcome_or_probability(
+    label: str, probability: float, shape: str
+) -> None:
     try:
-        calls[shape]()
+        refusal_calls(label, probability)[shape]()
     except ScoreError as exc:
         event(f"refused {shape}")
         message = str(exc)
         assert SENTINEL not in message
-        assert repr(probability) not in message or repr(probability) in ("0.0", "1.0")
+        assert repr(probability) not in message
         return
     event(f"accepted {shape}")
+
+
+def test_every_shape_and_canary_reaches_a_refusal() -> None:
+    """The property above is not vacuous, and cannot fail for a collision.
+
+    Every one of the 36 (shape, canary) pairs refuses, so the assertion runs on every
+    draw -- the failure mode a narrowed strategy invites is that a shape starts *accepting*
+    and the assertion silently stops running. It also pins which rules the narrowed draws
+    still reach: every rule a probability can reach at all -- both spellings of the range
+    rule, the sum rule, and the binary-outcome rule -- is still reached by some canary.
+    """
+    label = f"{SENTINEL}-shape-probe"
+    reached: set[str] = set()
+    for probability in PROBABILITY_CANARIES:
+        calls = refusal_calls(label, probability)
+        assert tuple(calls) == REFUSAL_SHAPES
+        for call in calls.values():
+            with pytest.raises(ScoreError) as excinfo:
+                call()
+            reached.add(str(excinfo.value))
+    for rule in (
+        "option probabilities must sum to 1 within",
+        "an option probability must be a finite probability in [0, 1]",
+        "probability_yes must be a finite probability in [0, 1]",
+        "a binary outcome must be yes or no",
+    ):
+        assert any(rule in message for message in reached), rule
+    for message in reached:
+        assert SENTINEL not in message
+        for probability in PROBABILITY_CANARIES:
+            assert repr(probability) not in message
+
+
+# One probe per ``raise ScoreError`` in ``scoring.py``, in source order -- 16 for 14 sites,
+# because the two that interpolate a field name get one probe each. The inventory is what makes
+# "these canaries cannot collide with a constant" a measurement instead of a claim -- the
+# property above only visits the rules its own six shapes reach.
+# Every input each probe passes carries a canary too -- the label sentinel for anything
+# textual, `CANARY` for a probability, `NOT_A_FLOAT` for the type rule -- so this test also
+# fails on a message that echoes its *input* at any of the 14 sites, not only on one that
+# collides. Two rules are out of the property's reach entirely, and a mutation run is how
+# that was found rather than argued: with literal probe inputs, a "{field} must be a float"
+# message rewritten to echo `{value!r}` survived the whole suite, because the property draws
+# only floats and nothing else checked that site's text.
+CANARY = PROBABILITY_CANARIES[0]
+NOT_A_FLOAT = f"{SENTINEL}-not-a-float"
+PROBE_LABEL = f"{SENTINEL}-probe-label"
+MESSAGE_PROBES: tuple[Callable[[], object], ...] = (
+    lambda: binary_brier_v1(NOT_A_FLOAT, "yes"),  # probability_yes must be a float
+    lambda: multiclass_brier_v1(((PROBE_LABEL, NOT_A_FLOAT),), PROBE_LABEL),  # an option ... float
+    lambda: binary_brier_v1(1.123456789, "yes"),  # probability_yes ... finite probability
+    lambda: multiclass_brier_v1(((PROBE_LABEL, 1.123456789),), PROBE_LABEL),  # an option ... finite
+    lambda: binary_brier_v1(CANARY, [SENTINEL]),  # outcome must be a non-empty string
+    lambda: binary_brier_v1(CANARY, f"{SENTINEL}-maybe"),  # a binary outcome must be yes or no
+    lambda: multiclass_brier_v1(SENTINEL, PROBE_LABEL),  # options must be a sequence ... (str)
+    lambda: multiclass_brier_v1(([PROBE_LABEL, CANARY],), PROBE_LABEL),  # ... sequence (entry)
+    lambda: multiclass_brier_v1((([SENTINEL], CANARY),), PROBE_LABEL),  # an option label must be
+    lambda: multiclass_brier_v1(  # an option label appears more than once
+        ((PROBE_LABEL, 0.5), (PROBE_LABEL, 0.5)), PROBE_LABEL
+    ),
+    lambda: multiclass_brier_v1((), PROBE_LABEL),  # options must not be empty
+    lambda: multiclass_brier_v1(((PROBE_LABEL, CANARY), ("b", 0.5)), PROBE_LABEL),  # ... sum to 1
+    lambda: multiclass_brier_v1(  # the outcome is not an option this forecast priced
+        ((PROBE_LABEL, 0.5), ("b", 0.5)), f"{PROBE_LABEL}-other"
+    ),
+    lambda: multiclass_log_v1(((PROBE_LABEL, 0.0), ("b", 1.0)), PROBE_LABEL),  # log undefined
+    lambda: recompute(f"{SENTINEL}/1", "local_log_binary", CANARY, "yes"),  # not registered
+    lambda: recompute("local_log_binary/1", f"{SENTINEL}-metric", CANARY, "yes"),  # metric mismatch
+)
+
+
+def test_no_canary_repr_collides_with_any_refusal_message() -> None:
+    """No canary's repr, and no probe input, is a substring of *any* message the module emits.
+
+    The counts are the tripwire: a new ``raise ScoreError`` fails this test until its probe
+    is added here and the canaries are re-checked against its text, which is the step
+    M1-346 existed because nobody had to take. 14 raise sites, 15 distinct messages -- two
+    sites share the sequence-shape text, and two interpolate a field name.
+    """
+    messages: set[str] = set()
+    for probe in MESSAGE_PROBES:
+        with pytest.raises(ScoreError) as excinfo:
+            probe()
+        messages.add(str(excinfo.value))
+    assert inspect.getsource(scoring).count("raise ScoreError") == 14
+    assert len(messages) == 15
+    for message in messages:
+        assert SENTINEL not in message
+        for probability in PROBABILITY_CANARIES:
+            assert repr(probability) not in message
+    # And the completeness argument behind the canary set, as an assertion rather than a
+    # comment: every finite float's repr carries a "." or an "e", and the rest are 'inf',
+    # '-inf' and 'nan'. Exactly one message carries such a token at all, and it is the
+    # tolerance -- so `1e-06` was the only float whose repr could ever have been a substring
+    # of a refusal here. A message that starts rendering a second number fails this line.
+    carrying_a_number = {m for m in messages if re.search(r"[0-9]\.|[0-9]e|inf|nan", m)}
+    assert carrying_a_number == {"option probabilities must sum to 1 within 1e-06"}
 
 
 # ── 7. what is stored replays, through the real ledger ───────────────────────
