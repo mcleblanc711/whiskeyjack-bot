@@ -13168,3 +13168,27 @@ The inventory test pins counts (14 raise sites, 15 messages). That is deliberate
 tripwire — but it means a purely cosmetic refactor of `scoring.py`'s raise sites reddens a
 test that is not about the refactor. The failure message says which count moved, and the fix is
 one probe.
+
+### Round 1 review (GPT) — APPROVE on `0e9dee5`, zero blocking findings
+
+The reviewer re-ran the suite itself (88 tests, 200 examples per property, hypothesis
+persistence disabled) and checked each of the seven risk claims by execution, including the two
+that matter most: all 36 shape/canary pairs refuse, and the inventory holds across 14 raise sites
+and 15 distinct messages. It could not run the ledger replay test — the read-only sandbox gives it
+no writable temp directory — and it did not rerun the full gate, so the gate result in the request
+is the author's, as it is on every round on this project.
+
+**One non-blocking observation, and it is correct:** a randomized mutation run of the sum-echo
+mutant can *miss*, because the property reaches the sum rule only when the in-range canary is
+drawn with the "range" shape — roughly 1 draw in 36. The mutant was caught here (the matrix
+records it dying against the property as well as the unit tests), but the detection is
+probabilistic where the mutation evidence is concerned.
+
+That is exactly the gap `test_every_shape_and_canary_reaches_a_refusal` exists to fill: it visits
+all 36 pairs deterministically and asserts no reached message carries a canary repr, so a leak in
+the sum rule fails a test on every run, not on 1 draw in 36. The reviewer's own matrix confirms
+it. **No row filed and no code change made in response:** pinning the three probability-carrying
+combinations as `@example`s on the property would make the property self-sufficient rather than
+backstopped, which is a two-line change any later round can make — and making it now would
+invalidate an approval that names this commit, for a case that is already covered deterministically.
+Recorded here so the choice is visible rather than silent.
