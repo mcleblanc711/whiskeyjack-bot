@@ -332,28 +332,42 @@ def test_every_shape_and_canary_reaches_a_refusal() -> None:
 # because the two that interpolate a field name get one probe each. The inventory is what makes
 # "these canaries cannot collide with a constant" a measurement instead of a claim -- the
 # property above only visits the rules its own six shapes reach.
+# Every input each probe passes carries a canary too -- the label sentinel for anything
+# textual, `CANARY` for a probability, `NOT_A_FLOAT` for the type rule -- so this test also
+# fails on a message that echoes its *input* at any of the 14 sites, not only on one that
+# collides. Two rules are out of the property's reach entirely, and a mutation run is how
+# that was found rather than argued: with literal probe inputs, a "{field} must be a float"
+# message rewritten to echo `{value!r}` survived the whole suite, because the property draws
+# only floats and nothing else checked that site's text.
+CANARY = PROBABILITY_CANARIES[0]
+NOT_A_FLOAT = f"{SENTINEL}-not-a-float"
+PROBE_LABEL = f"{SENTINEL}-probe-label"
 MESSAGE_PROBES: tuple[Callable[[], object], ...] = (
-    lambda: binary_brier_v1("0.5", "yes"),  # probability_yes must be a float
-    lambda: multiclass_brier_v1((("a", "x"),), "a"),  # an option probability must be a float
-    lambda: binary_brier_v1(1.7, "yes"),  # probability_yes ... finite probability
-    lambda: multiclass_brier_v1((("a", 1.7),), "a"),  # an option probability ... finite
-    lambda: binary_brier_v1(0.5, 3),  # outcome must be a non-empty string
-    lambda: binary_brier_v1(0.5, "maybe"),  # a binary outcome must be yes or no
-    lambda: multiclass_brier_v1("ab", "a"),  # options must be a sequence of ... (str)
-    lambda: multiclass_brier_v1(([1, 2],), "a"),  # options must be a sequence of ... (entry)
-    lambda: multiclass_brier_v1(((1, 0.5),), "a"),  # an option label must be a non-empty string
-    lambda: multiclass_brier_v1((("a", 0.5), ("a", 0.5)), "a"),  # ... appears more than once
-    lambda: multiclass_brier_v1((), "a"),  # options must not be empty
-    lambda: multiclass_brier_v1((("a", 0.25), ("b", 0.25)), "a"),  # ... sum to 1 within
-    lambda: multiclass_brier_v1((("a", 0.5), ("b", 0.5)), "c"),  # not an option ... priced
-    lambda: multiclass_log_v1((("a", 0.0), ("b", 1.0)), "a"),  # the log score is undefined
-    lambda: recompute("nope/1", "local_log_binary", 0.5, "yes"),  # not a registered version
-    lambda: recompute("local_log_binary/1", "local_brier_binary", 0.5, "yes"),  # metric mismatch
+    lambda: binary_brier_v1(NOT_A_FLOAT, "yes"),  # probability_yes must be a float
+    lambda: multiclass_brier_v1(((PROBE_LABEL, NOT_A_FLOAT),), PROBE_LABEL),  # an option ... float
+    lambda: binary_brier_v1(1.123456789, "yes"),  # probability_yes ... finite probability
+    lambda: multiclass_brier_v1(((PROBE_LABEL, 1.123456789),), PROBE_LABEL),  # an option ... finite
+    lambda: binary_brier_v1(CANARY, [SENTINEL]),  # outcome must be a non-empty string
+    lambda: binary_brier_v1(CANARY, f"{SENTINEL}-maybe"),  # a binary outcome must be yes or no
+    lambda: multiclass_brier_v1(SENTINEL, PROBE_LABEL),  # options must be a sequence ... (str)
+    lambda: multiclass_brier_v1(([PROBE_LABEL, CANARY],), PROBE_LABEL),  # ... sequence (entry)
+    lambda: multiclass_brier_v1((([SENTINEL], CANARY),), PROBE_LABEL),  # an option label must be
+    lambda: multiclass_brier_v1(  # an option label appears more than once
+        ((PROBE_LABEL, 0.5), (PROBE_LABEL, 0.5)), PROBE_LABEL
+    ),
+    lambda: multiclass_brier_v1((), PROBE_LABEL),  # options must not be empty
+    lambda: multiclass_brier_v1(((PROBE_LABEL, CANARY), ("b", 0.5)), PROBE_LABEL),  # ... sum to 1
+    lambda: multiclass_brier_v1(  # the outcome is not an option this forecast priced
+        ((PROBE_LABEL, 0.5), ("b", 0.5)), f"{PROBE_LABEL}-other"
+    ),
+    lambda: multiclass_log_v1(((PROBE_LABEL, 0.0), ("b", 1.0)), PROBE_LABEL),  # log undefined
+    lambda: recompute(f"{SENTINEL}/1", "local_log_binary", CANARY, "yes"),  # not registered
+    lambda: recompute("local_log_binary/1", f"{SENTINEL}-metric", CANARY, "yes"),  # metric mismatch
 )
 
 
 def test_no_canary_repr_collides_with_any_refusal_message() -> None:
-    """No canary's repr is a substring of *any* message the module can emit.
+    """No canary's repr, and no probe input, is a substring of *any* message the module emits.
 
     The counts are the tripwire: a new ``raise ScoreError`` fails this test until its probe
     is added here and the canaries are re-checked against its text, which is the step
