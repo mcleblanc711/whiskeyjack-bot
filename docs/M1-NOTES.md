@@ -12981,3 +12981,182 @@ _unit_timestamp(a unit that does not exist) -> None
 
 The parsed instant is the one `list-timers` reports, in UTC, and the healthy timer does not
 stall. `WORST_CASE_SECONDS` reads 215 against the unit's `TimeoutStartSec=240`.
+
+## M1-346 — Stop the scoring no-leak property failing on the tolerance constant
+
+Acceptance: *the property distinguishes a leaked value from a constant the message
+legitimately contains … the exemption list (`'0.0'`, `'1.0'`) is revisited in the same pass …
+a regression test pins `probability=1e-06` explicitly … and the property is mutation-tested:
+a scoring refusal that really does echo a drawn probability must still fail it.*
+
+Test-only. `src/` is byte-identical to `origin/master` on this branch.
+
+### Delivered
+
+- `tests/property/test_scoring_properties.py` — property 6 draws its probability from
+  `PROBABILITY_CANARIES` instead of `st.floats(allow_nan=True, allow_infinity=True)`; the
+  `("0.0", "1.0")` exemption is gone; the call table moves into `refusal_calls` so two new
+  deterministic tests can use it. `test_every_shape_and_canary_reaches_a_refusal` (36 pairs,
+  every rule a probability can reach) and `test_no_canary_repr_collides_with_any_refusal_message`
+  (16 probes over 14 raise sites, 15 distinct messages).
+- `tests/unit/test_scoring.py` — `test_the_sum_refusal_renders_the_tolerance_and_not_the_forecast`,
+  the regression for the exact call from the ticket.
+- `docs/TRACKS.md` — this item's Worktrees row, and M1-330's row swept.
+
+### The defect, reproduced by execution before any fix
+
+`multiclass_brier_v1((("LEAKCANARY7x", 1e-06), ("b", 0.5)), "LEAKCANARY7x")` refuses with
+
+```
+option probabilities must sum to 1 within 1e-06
+```
+
+built at `scoring.py:156` from `_SUM_TOLERANCE`. `repr(1e-06)` is `'1e-06'`, which is a
+substring of that message, so the old assertion
+`repr(probability) not in message or repr(probability) in ("0.0", "1.0")` was false with no
+leak anywhere in the program.
+
+Rate, measured on this branch's base tree (2026-09-20) by running the one property 40 times
+in-process with a fresh hypothesis seed each time and `database=None`: **2 of 40 failed**,
+falsifying example `probability=1e-06, shape='range'` both times. After the fix, **0 of 40**.
+The earlier measurement on `feat/m1-330-replay-stored-packet` was 3 of 40; the mechanism is
+the same and the rate is the same order. Because the failing example lands in `.hypothesis`,
+it then replays deterministically in that worktree, and `scripts/review-request.py` refuses to
+emit on a red suite — so this blocked the review workflow, not only CI.
+
+### Decision — canary values, because the suite had already settled on them twice
+
+A substring check over an unconstrained draw cannot tell a value the message *leaked* from a
+value the message *legitimately contains*. That is M1-607's finding restated, and the project
+had already written both the diagnosis and the remedy down:
+
+- `tests/unit/test_scoring.py:278` probes **this same module's** messages with
+  `PROBE_PROBABILITY = 0.123456789` and asserts `"0.123" not in message`.
+- `tests/property/test_submission_properties.py:116-124` says it outright: for a short repr
+  "that substring is in every traceback already … Planting a distinctive token … is the only
+  version of this property that means what it says" — and pairs the property with
+  `test_the_leaky_shapes_are_all_actually_refused`, a deterministic non-vacuity pin.
+
+So the property was the outlier, not the pattern, and the fix makes it consistent rather than
+inventing a third mechanism. `PROBABILITY_CANARIES` keeps one value per branch class reached
+*through* the probability: `0.123456789` (in range, so the range rule passes and the sum rule
+refuses), `1.123456789` and `-0.123456789` (out of range), and `nan`/`inf`/`-inf` (the
+non-finite half of the same rule).
+
+**The exemption list was dead, which is a different finding from a live one.** No message this
+module can emit contains `"0.0"` or `"1.0"` — established by executing a probe per raise site
+and reading the 15 distinct messages back, not by reading the source. `0.0` and `1.0` leave
+the *drawn set* for the reason `1e-06` must stay out of it, and they cost no coverage: the
+zero-probability branch is reached by the "zero" shape's own literal `0.0`, the "unpriced"
+shape's is `1.0`, and the bounds at 0 and 1 are property 2's claim.
+
+### Decision — the narrowing is pinned deterministically, not measured in a scratch run
+
+Narrowing a strategy is how a property goes vacuous, and this project's top recurring defect
+is exactly that. Two facts are needed and neither belongs in a scratch run whose output is not
+persisted, so both are tests:
+
+`test_every_shape_and_canary_reaches_a_refusal` — all 36 (shape, canary) pairs refuse, so the
+assertion runs on every draw, and every rule a probability can reach is reached: both spellings
+of the range rule (`probability_yes` and `an option probability`), the sum rule, and the
+binary-outcome rule. The pre-fix strategy was *worse* here, not better: `0.5` was **accepted**
+in the "range" shape and asserted nothing at all.
+
+Reach, `--hypothesis-show-statistics`, 200 examples, before → after (percentages are of all
+cases, valid and invalid):
+
+| shape | before | after |
+| --- | --- | --- |
+| duplicate | 34.60% | 22.07% |
+| unpriced | 18.48% | 10.80% |
+| range | 12.80% | 11.74% |
+| binary | 10.43% | 17.37% |
+| zero | 9.95% | 12.21% |
+| sum | 8.53% | 19.72% |
+| accepted | reached | never (all 36 pairs refuse) |
+
+`test_no_canary_repr_collides_with_any_refusal_message` — the collision claim is a measurement,
+not a comment: 16 probes over the module's 14 `raise ScoreError` sites yield 15 distinct
+messages, and no canary repr appears in any of them. Both counts are asserted, so a new raise
+fails the test until its probe is added and the canaries are re-checked against its text —
+the step nobody had to take before. It is also where `nan`/`inf`/`-inf` are covered: their
+reprs are short, so their collision-freedom rests on this inventory rather than on their shape.
+
+### Mutation matrix — and the site it found uncovered
+
+Bytecode cleared between mutants; each applied to `src/whiskeyjack_bot/scoring.py`, the tree
+restored afterwards. "Before" is commit `83a93df` (canary property, literal probe inputs);
+"now" is `982f99c`.
+
+| Mutant | Before | Now |
+| --- | --- | --- |
+| range message echoes `{value!r}` | killed | killed — property, and the 36-pair test |
+| range message echoes `{value}` (format, not `repr`) | killed | killed — property |
+| sum message echoes the first probability | killed | killed — property and both unit tests |
+| `"{field} must be a float"` echoes `{value!r}` | **survived the whole suite** | killed — inventory |
+| sum message echoes the derived `fsum` | killed | killed — unit tests |
+| option-label message echoes `{option!r}` | **survived the whole suite** | killed — inventory |
+| outcome message echoes `{value!r}` | **survived the whole suite** | killed — inventory |
+| control: the ticket's `1e-06` call, unmutated | n/a | passes |
+
+The fourth row is why the probes now carry canary inputs of their own. The property draws only
+floats, so it can never reach the type rule, and nothing else read that message — a leak there
+would have shipped. The last two were then chosen because a finding that names one raise site
+is usually a class (M1-341), and both were measured surviving before, not assumed.
+
+### Rejected — extend the exemption tuple to `"1e-06"`
+
+The tuple is that patch made once already; this would be the third. It also treats the symptom
+the ticket names: the list has to grow with every constant any message ever renders, and
+nothing fails when it does not.
+
+### Rejected — `assume()` or a filter that skips `1e-06`
+
+It deletes the counterexample rather than the defect, and `filter_too_much` is its own flake
+class on this project (M1-333) — trading a 5% flake for a different one.
+
+### Rejected — assert the message is a member of a restated message set
+
+This is a *total* claim, and strictly stronger in one way: it would catch a leak written
+`f"…{p}"` through `float.__format__`, which a repr check can miss. It was rejected because it
+makes every wording change in `scoring.py` a property failure, and because it is the
+enumeration the exemption tuple already shows the cost of. Its useful half is kept:
+`test_no_canary_repr_collides_with_any_refusal_message` builds the inventory by execution and
+checks the canaries against all of it. The residual — the format path — is covered by the
+second mutant above, which dies, because for a float `repr` and `format(p, "")` are the same
+string.
+
+### Rejected — a `float` subclass whose `__repr__`/`__format__` carry the sentinel
+
+Refused by the code, not by taste. `_require_probability` (`scoring.py:108`) gates on
+`type(value) is not float`, so a subclass is refused as *"must be a float"* and the range and
+sum rules become unreachable — the vacuity trap, arrived at by being clever. Worth recording
+because it is the first design that comes to mind.
+
+### Deferred (do not read the absence as an omission)
+
+`tests/property/test_discrete_cdf_properties.py:257` asserts `repr(value) not in joined` over
+percentile values, which is the same shape on a different module. Checked rather than assumed:
+every problem string in `forecast/cdf.py` (`_WRONG_LENGTH`, `_NOT_IN_UNIT_INTERVAL`,
+`_NOT_MONOTONE`, `_STEP_TOO_TALL`, `_NOT_WELL_FORMED`, `_LOWER_ENDPOINT`, `_UPPER_ENDPOINT`,
+`_CONVERSION_TIMED_OUT`) carries no numeric literal with a `.` or an exponent, and
+`PercentilePoint.value` is a `float` with `allow_inf_nan=False`, whose repr therefore always
+contains `.` or `e`. So no draw can collide there today. No row filed: the condition is not
+reachable. If that module ever renders a numeric constant in a problem string, the inventory
+test here is the pattern to copy.
+
+`scoring.py` itself is untouched and no `src/` change is proposed. The tolerance is rendered
+deliberately — it is the one number that makes the refusal actionable and it is a configured
+constant, not forecast content.
+
+### Standing risk
+
+A refusal that leaked a *derived* value — the computed `fsum`, say, rather than a drawn
+probability — is caught only where a test happens to compare the whole message (the fifth
+mutant died in `tests/unit/test_scoring.py`, not in the property). The property's claim is
+about the values it passes in, and it cannot be about values the module computes.
+
+The inventory test pins counts (14 raise sites, 15 messages). That is deliberate — it is the
+tripwire — but it means a purely cosmetic refactor of `scoring.py`'s raise sites reddens a
+test that is not about the refactor. The failure message says which count moved, and the fix is
+one probe.
