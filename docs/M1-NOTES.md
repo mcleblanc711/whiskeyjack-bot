@@ -14121,6 +14121,13 @@ the constant would have made the code unable to describe its own history.
   the live `evidence_gap` count and the share of questions that fall through to Exa; both are
   in `tournament status`.
 
+### Round 1 (APPROVE, 0 blockers) — the one observation, applied
+
+The adapter's own docstrings still said "current and historical" and bounded a run at
+``max_queries_per_question * 2``. Both now describe latest-only retrieval and derive the bound
+from ``_STRATEGIES``, and they say that stored runs from before the change record both passes.
+`research/store.py` carried the same stale arithmetic and is fixed with it.
+
 ### Mutation pass — four mutants, four dead
 
 | Mutant | Killed by |

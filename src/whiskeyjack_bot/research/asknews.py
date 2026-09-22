@@ -69,10 +69,9 @@ from whiskeyjack_bot.research.model import (
 from whiskeyjack_bot.research.preflight import require_run_metadata, string_list
 from whiskeyjack_bot.research.transport import apply_connection_retries
 
-# The two passes that together satisfy "current and historical news". AskNews
-# scopes each by strategy rather than by endpoint. Typed as the SDK's own
+# The passes AskNews scopes by strategy rather than by endpoint. Typed as the SDK's own
 # Literal so a rename in a future asknews release is a type error here, not a
-# silently rejected request.
+# silently rejected request. Only the current pass is issued; see `_STRATEGIES`.
 _Strategy = Literal["latest news", "news knowledge"]
 
 _STRATEGY_CURRENT: _Strategy = "latest news"
@@ -242,7 +241,10 @@ def retrieve_news(
     retrieval_run_id: str,
     now: datetime,
 ) -> AskNewsRetrieval:
-    """Retrieve current and historical news for ``queries`` as normalized documents.
+    """Retrieve current news for ``queries`` as normalized documents.
+
+    **Current only since M1-352.** The historical ("news knowledge") pass is no longer
+    issued; see ``_STRATEGIES``. Stored runs from before that change still record both.
 
     Refuses, before any network use and therefore before any billing, a caller mistake
     the run record would otherwise only catch after every call had already been paid
@@ -266,7 +268,7 @@ def retrieve_news(
     ``OverflowError`` with no recordable run (cross-model review round 1).
 
     **Never raises on provider failure.** A run makes up to
-    ``max_queries_per_question * 2`` billable calls; raising partway through would
+    ``max_queries_per_question * len(_STRATEGIES)`` billable calls; raising partway through would
     discard the record of every call already paid for, which is precisely the kind
     of shortcut that weakens the ledger. On failure this stops early, sets
     ``provider_failed``, records the failure in ``run.error_summary``, and returns
