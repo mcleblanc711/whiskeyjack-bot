@@ -2373,3 +2373,53 @@ def test_a_closed_stdout_pipe_never_changes_the_exit_code(
     and a real fault loses its own code. `_quiet_shutdown` is what makes this test pass.
     """
     assert _run_with_closed_stdout(SCRIPT, Path(watchdog.module.LEDGER), faulty) == expected
+
+
+def test_the_entry_point_flushes_before_it_exits() -> None:
+    """The `__main__` block is the one line the in-process tests cannot reach.
+
+    `_run_with_closed_stdout` has to patch the boundaries before `main` runs, so it calls
+    `main` and `_quiet_shutdown` itself -- which means it would pass even if the script's own
+    entry point had dropped the flush. Read the shape out of the source instead, the same way
+    the budget test reads the deadline out of the unit file: `_quiet_shutdown()` is called,
+    and it is called before the `sys.exit` that carries `main`'s status.
+    """
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    guard = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'"
+    ]
+    assert len(guard) == 1, "one entry point"
+    body = [ast.unparse(statement) for statement in guard[0].body]
+    assert "_quiet_shutdown()" in body, body
+    exits = [line for line in body if line.startswith("sys.exit(")]
+    assert len(exits) == 1, body
+    assert body.index("_quiet_shutdown()") < body.index(exits[0]), (
+        "flushing after the exit would never run"
+    )
+    assert exits[0] != "sys.exit(main())", "main must run before the flush, not inside the exit"
+
+
+def test_a_diagnostic_guard_never_swallows_an_interrupt(watchdog: Harness) -> None:
+    """`_say` catches what a broken stream raises, and nothing else.
+
+    A bare `except Exception` -- or worse, `BaseException` -- would make Ctrl-C and a
+    `SystemExit` raised inside `print` disappear into a status line, which is how a guard
+    stops being defence in depth and starts being a way to lose control of the process.
+    """
+
+    class _Interrupting:
+        def write(self, text: str) -> int:
+            raise KeyboardInterrupt
+
+        def flush(self) -> None:
+            raise KeyboardInterrupt
+
+    original = sys.stdout
+    sys.stdout = _Interrupting()  # type: ignore[assignment]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            watchdog.module._say("anything")
+    finally:
+        sys.stdout = original
