@@ -172,6 +172,7 @@ were written.
 | ntfy push `whiskeyjack: RESOLUTIONS SCHEDULE STOPPED` | [W1](#w1--resolutions-schedule-stopped) |
 | ntfy push `whiskeyjack: resolutions schedule recovered` | [W1](#w1--resolutions-schedule-stopped) — the condition cleared; nothing to do |
 | ntfy push `whiskeyjack: WORKER DOWN` | [The watchdog itself](#the-watchdog-itself) |
+| ntfy push `whiskeyjack: watchdog state unwritable`, or a `STATE:` line in the watchdog's journal | [W2](#w2--watchdog-state-unwritable) — every check still runs |
 | `tournament status` shows `unrecorded_posts` above 0 | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
 
 ---
@@ -715,6 +716,28 @@ does not exist: `systemctl --user is-active` answers `inactive` for a missing un
 does for a stopped one. Compare `RESOLUTIONS_UNIT` in `deploy/wj-watchdog` against the filenames
 in `deploy/systemd/` — `tests/unit/test_watchdog.py` asserts they agree, so this should only ever
 be reachable from a hand-edited installed copy.
+
+### W2 — `watchdog state unwritable`
+
+**What you see.** An ntfy push titled `whiskeyjack: watchdog state unwritable`, priority
+`default`, at most once a day. It names the state file (`~/.local/state/wj-watchdog.json`) and
+an errno name (`EACCES`, `EROFS`, `ENOSPC`...). Every run's journal also carries a `STATE:`
+line for as long as the condition holds.
+
+**What it means.** The watchdog could not write its state file. Every check still ran, and
+this is **not** why a run exits `1`. The throttle stamps went to
+`$XDG_RUNTIME_DIR/wj-watchdog.json` instead (a tmpfs, `/run/user/1000`), and the next run
+reads them back from there, so each subject still pages at its documented rate. That tmpfs is
+cleared at reboot, so after a restart each standing fault may page once more.
+
+If the line reads `... or the runtime-directory fallback; throttle windows cannot hold`, then
+neither file could be written. No bound is possible then: standing faults page on **every** run
+until one of the two is writable again. This push is not sent in that case, because it would
+repeat every run too.
+
+**What to do.** `ls -l ~/.local/state/wj-watchdog.json` and `df -h ~/.local/state`. Fix the
+mode or free the space. The next run writes the file, removes the fallback and prints
+`STATE: ... is writable again`. Nothing needs restarting.
 
 ### The watchdog itself
 

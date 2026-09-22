@@ -13907,3 +13907,136 @@ logged. The live config sets it `true`. The `[live-gate]` variant sets it and re
 M13's first pattern did not match, because the formatter had wrapped the line. It was re-run,
 not counted as a kill.
 
+
+## M1-344 — Bound watchdog alert volume when its state file cannot be written
+
+Raised as a non-blocking observation by M1-341's review round 1 and never reproduced live: the
+state file is writable today. Wave 21 brief, run after M1-347 landed, so it is written against
+the three-subject watchdog (`_check_rollover`, `WORST_CASE_SECONDS` 238 of 240).
+
+### Delivered
+
+- **An atomic write** (`_write_atomic`: sibling temp file, `fsync`, `os.replace`, and the temp
+  file is removed on any failure). `write_text` truncated first, so a full disk mid-write left
+  invalid JSON, which `_load_state` reads as an EMPTY state: every throttle stamp lost at once.
+- **A fallback stamp location**, `$XDG_RUNTIME_DIR/wj-watchdog.json`. `_save_state` tries
+  `STATE`, then the fallback, and still never raises. `_load_state` reads both and prefers the
+  fallback only when it is usable and strictly newer by `st_mtime_ns`; a tie goes to `STATE`.
+  When `STATE` is writable again the fallback is deleted, and if that deletion fails `STATE` is
+  the newer file anyway.
+- **The failure is reported** by `_report_persistence`, after the save because only the save
+  knows. It prints a `STATE:` status line on every run, with the path and an errno name. When
+  the fallback held the stamps it also sends one push a day (`whiskeyjack: watchdog state
+  unwritable`, priority `default`), throttled under its own top-level `persistence` key.
+- **The exit code is unchanged by it.** `main` still returns 1 only for the three subjects.
+- **`TimeoutStartSec` 240 → 260** for the one extra push (8s, `PERSISTENCE_PUSH_TIMEOUT_SECONDS`).
+  The worst case moves from 238s to 246s. That is still under the 300s timer interval, and the
+  existing test reads both ends from the unit files.
+- **RUNBOOK W2** and a symptom-index row.
+
+### Decision — a fallback location, plus the atomic write, plus a once-a-day report
+
+The criterion's two halves pull against each other: you cannot bound repeats without a durable
+stamp, and the file that holds the stamps is the one that cannot be written. The fallback is
+what supplies the bound. `$XDG_RUNTIME_DIR` is set by the user manager for every user unit
+(`systemctl --user show-environment` reads `XDG_RUNTIME_DIR=/run/user/1000` on this host), is a
+tmpfs on a different filesystem from `~/.local/state`, and is already the pattern M4-805 used.
+So `ENOSPC`, `EROFS` or a bad mode on the home filesystem does not reach it.
+
+**The rate this gives is "documented rate, plus at most one page per standing fault per boot".**
+The tmpfs is cleared at reboot. If the state file was stale when that happened, each standing
+fault pages once more the first time the watchdog runs after the reboot, and then holds its
+window again. That is a stated deviation (below), not the documented rate exactly.
+
+### Decision — the failure stays out of every subject's fault vocabulary
+
+Trap 1 of the brief, and M1-343's lesson: `_throttle_key` hashes a subject's whole code set,
+so a `state_unwritable` code in, say, the resolutions vocabulary would re-key every standing
+condition and page each one again at deploy. The persistence failure has its own key
+(`persistence`), its own 24-hour window and its own push, and no subject's key changes whether
+or not the file is writable (`test_the_persistence_failure_joins_no_subjects_fault_vocabulary`).
+
+### Decision — the failure surfaces, walked one by one (trap 2)
+
+| Surface | What happens |
+| --- | --- |
+| `mkdir` of `~/.local/state` fails | `OSError` from `_write_atomic` → fallback |
+| `EACCES` (directory mode) | the temp file cannot be created → fallback; the old `STATE` is untouched |
+| `EROFS` (read-only home) | same as `EACCES` |
+| `ENOSPC` after the bytes were handed over | `fsync` raises → temp removed → fallback; the old `STATE` is byte-identical (tested) |
+| `os.replace` fails | temp removed → fallback |
+| fallback: no `XDG_RUNTIME_DIR`, relative, or equal to `STATE` | no fallback → the "windows cannot hold" line, no push |
+| fallback write fails too | same line, no push |
+| temp-file removal fails | ignored; the next run's temp name carries a fresh PID |
+
+### Decision — no push when both files fail
+
+With nothing durable left there is no window to stamp, so a persistence push there would itself
+repeat on every run, and so will the subjects' pages. That is honest but unbounded. The status
+line says exactly that ("throttle windows cannot hold, so standing faults page on every run"),
+so the journal explains the flood. It needs a broken user session to happen at all: the runtime
+directory is the user manager's own, and without a user manager the watchdog's timer is not
+running either.
+
+### Deviation
+
+- **The bound resets at reboot**: at most one extra page per standing fault per boot, above.
+- **A unit-file change** (`TimeoutStartSec=260`). Deploying it needs the unit copied and a
+  `daemon-reload`, not only the script copied. This is the RUNBOOK's existing "Installing or
+  changing it" block.
+- **Config, `AppConfig`, prompt**: none of the three. No `src/` change, no migration.
+
+### Rejected
+
+- **Report and do not bound**: rejected by the criterion itself.
+- **The atomic write alone**: worth doing, and done, but it bounds nothing. An unwritable
+  directory fails both the temp file and the target.
+- **One page, then silence until writable**: bounded and cheap. But it trades one muting for
+  another, because the subjects' own windows would still fail to hold, and they are the
+  alerts that matter.
+- **Raising, or exiting non-zero on the failure**: the watchdog has no `OnFailure`, so a crash
+  or a non-zero exit is quieter than a page, not louder.
+- **A fallback under `/tmp` or `$TMPDIR`**: world-shared, possibly the same filesystem as home,
+  and not guaranteed per-user. `$XDG_RUNTIME_DIR` is mode 0700 and per-user.
+- **Folding the report into the subjects' page bodies instead of a push**: it would need no
+  budget, but a healthy host with an unwritable file would then report nothing but a journal
+  line. The AFK operator is the audience.
+
+### Deferred (do not read the absence as an omission)
+
+- **M1-345** (diagnostic output non-fatal) touches the same file and runs after this merges. The
+  new `STATE:` prints are unguarded like every other print in `main`, and making all of them
+  non-fatal is exactly M1-345's criterion. It was deliberately not absorbed.
+
+### Standing risk — not verifiable offline
+
+- The live host's state file has never been unwritable, so the fallback has run only in tests.
+  The deploy check exercises it for real (a scratch copy with `STATE` pointed at a 0500
+  directory, see the deploy step) rather than trusting the tests alone.
+- `st_mtime_ns` ordering assumes the two filesystems' clocks agree. Both are local and stamped
+  by the same kernel. A backwards wall-clock step between two runs could make an older file win
+  once, which costs at most one early re-page. The failure cannot be silent.
+
+### Mutation pass — thirteen mutants, thirteen dead
+
+Committed first, `PYTHONDONTWRITEBYTECODE=1` and every `__pycache__` removed per mutant; the
+tests load the script by compiling it from source anyway.
+
+| Mutant | Killed by |
+| --- | --- |
+| A no fallback | the day-of-runs test |
+| B non-atomic write (`write_text` back) | `test_a_write_that_fails_part_way_leaves_the_old_stamps_whole` |
+| C persistence push unthrottled | the day-of-runs test |
+| D no status line | the day-of-runs test |
+| E no persistence push | the day-of-runs test |
+| F `_load_state` ignores the fallback | the day-of-runs test |
+| G newer-wins comparison inverted | `test_a_newer_fallback_wins_and_an_older_one_never_shadows_the_state_file` |
+| H fallback kept after recovery | `test_a_writable_state_file_again_retires_the_fallback` |
+| I the failure changes the exit code | `test_an_unwritable_state_file_is_never_the_reason_the_run_fails` |
+| J a push when both files fail | `test_with_no_fallback_either_the_line_says_the_windows_cannot_hold` |
+| K budget omits the new push | `test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_declares` |
+| L push body carries the state contents | `test_the_persistence_page_carries_the_path_and_never_the_files_contents` |
+| M the failure re-keys a subject's throttle | the day-of-runs test (first under `-x`) |
+
+The bound and the reporting were mutated separately (brief trap 5): C, D and E each kill on
+their own.
