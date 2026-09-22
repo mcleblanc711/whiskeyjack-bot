@@ -1,4 +1,4 @@
-"""Durable activation, operation journal, and prepaid round limits (LAUNCH).
+"""Durable activation, operation journal, and prepaid round limits (LAUNCH; M1-348).
 
 One ledger belongs to one bot account. Unknown charges retain their full reservation.
 Journal files intentionally survive SQLite restore; a mismatch blocks further writes
@@ -308,13 +308,41 @@ def require_activation(
     return data
 
 
+def _amounts(rows: list[dict[str, Any]], key: str) -> list[tuple[str, int]]:
+    """``(reservation_id, amount)`` pairs from journal rows, or a sanitized refusal.
+
+    The rows are read back out of the ledger and are untrusted: a malformed one used to
+    escape :func:`spending` as a raw ``KeyError``/``TypeError`` (M1-348 adds a reader, which
+    makes this new surface). Neither the amount nor the identifier is echoed.
+    """
+    pairs: list[tuple[str, int]] = []
+    for row in rows:
+        identifier = row.get("reservation_id") if type(row) is dict else None
+        amount = row.get(key) if type(row) is dict else None
+        if type(identifier) is not str or type(amount) is not int or amount < 0:
+            raise StorageFailure("cannot read tournament spending")
+        pairs.append((identifier, amount))
+    return pairs
+
+
 def spending(conn: sqlite3.Connection, scope: str) -> tuple[int, int]:
-    reserved = events(conn, "cost_reserved", scope)
-    settled = {
-        e["reservation_id"]: e["actual_microusd"] for e in events(conn, "cost_settled", scope)
-    }
+    """``(actual, held)`` micro-USD for one budget scope.
+
+    A ``cost_corrected`` event (M1-348) **replaces** the figure its reservation settled at;
+    it never adds to it. Applied as the larger of the two, so no append can lower actual
+    spend: a correction is only ever written over a settlement of 0, where the two readings
+    agree, and a second correction row for one reservation (the guard prevents it, a
+    restored ledger might not) cannot count twice. A correction with no matching settlement
+    is ignored -- its reservation is still held at the full estimate, which already
+    over-counts it.
+    """
+    reserved = _amounts(events(conn, "cost_reserved", scope), "estimate_microusd")
+    settled = dict(_amounts(events(conn, "cost_settled", scope), "actual_microusd"))
+    for identifier, amount in _amounts(events(conn, "cost_corrected", scope), "actual_microusd"):
+        if identifier in settled:
+            settled[identifier] = max(settled[identifier], amount)
     actual = sum(settled.values())
-    held = sum(e["estimate_microusd"] for e in reserved if e["reservation_id"] not in settled)
+    held = sum(amount for identifier, amount in reserved if identifier not in settled)
     return actual, held
 
 
@@ -333,6 +361,171 @@ def require_spending_clear(conn: sqlite3.Connection, scope: str) -> None:
         raise TournamentError(
             "restored spending outcome is unknown; spending hold blocks purchases"
         )
+
+
+# Where a settled model cost came from (M1-348). `openrouter` is `usage.cost`, what
+# OpenRouter bills; `upstream_byok` is `usage.cost_details.upstream_inference_cost`, what the
+# upstream provider bills a bring-your-own-key call. On a BYOK call `usage.cost` is 0: the
+# charge lands on the owner's own key, so reading it settled every GPT-6 Astra call as free.
+CostBasis = Literal["openrouter", "upstream_byok"]
+
+
+def _microusd(usd: float) -> int | None:
+    """Whole micro-USD, rounded up, or None if the figure cannot be represented."""
+    scaled = usd * 1_000_000
+    return math.ceil(scaled) if math.isfinite(scaled) else None
+
+
+def _valid_usd(value: object) -> float | None:
+    """A finite, non-negative USD figure that converts to micro-USD, or None.
+
+    Exact types: ``bool`` is an ``int`` subclass, so ``True`` would otherwise read as $1.
+    A huge JSON integer makes ``float()`` raise ``OverflowError``, and a huge finite float
+    overflows once scaled to micro-USD; both are unknown, not free.
+    """
+    if type(value) is int:
+        try:
+            usd = float(value)
+        except OverflowError:
+            return None
+    elif type(value) is float:
+        usd = value
+    else:
+        return None
+    if not math.isfinite(usd) or usd < 0 or _microusd(usd) is None:
+        return None
+    return usd
+
+
+def settled_cost(usage: object) -> tuple[float, CostBasis] | None:
+    """The cost a model call settles at, and its basis, from OpenRouter's ``usage``.
+
+    ``is_byok`` exactly ``True``: the upstream figure, never ``usage.cost`` (which is the 0
+    that made BYOK read as free). ``is_byok`` absent or exactly ``False``: ``usage.cost``.
+    Anything else -- ``is_byok`` of any other type, a missing or malformed figure -- is
+    None, and the caller leaves the reservation held at its full estimate, so an unknown
+    cost never reads as free. Total over arbitrary JSON: it never raises.
+    """
+    if type(usage) is not dict:
+        return None
+    byok = usage.get("is_byok", False)
+    if type(byok) is not bool:
+        return None
+    if byok:
+        details = usage.get("cost_details")
+        if type(details) is not dict:
+            return None
+        upstream = _valid_usd(details.get("upstream_inference_cost"))
+        return None if upstream is None else (upstream, "upstream_byok")
+    cost = _valid_usd(usage.get("cost"))
+    return None if cost is None else (cost, "openrouter")
+
+
+@dataclass(frozen=True)
+class CostCorrection:
+    """One reservation settled at 0 whose stored response carries its real upstream cost."""
+
+    scope: str
+    reservation_id: str
+    actual_microusd: int
+
+
+@dataclass(frozen=True)
+class CorrectionReport:
+    """What ``tournament correct-costs`` found, and (with ``--apply``) wrote."""
+
+    corrections: tuple[CostCorrection, ...]
+    already_corrected: int
+    refused: int
+    written: int
+
+    def as_dict(self, *, applied: bool) -> dict[str, Any]:
+        return {
+            "applied": applied,
+            "reservations": len(self.corrections),
+            "total_usd": sum(c.actual_microusd for c in self.corrections) / 1_000_000,
+            "already_corrected": self.already_corrected,
+            "refused_no_upstream_figure": self.refused,
+            "written": self.written,
+        }
+
+
+def _correction(conn: sqlite3.Connection, scope: str, identifier: str) -> CostCorrection | None:
+    """The correction for one reservation settled at 0, or None if it has no valid figure.
+
+    Reads only the stored ``model_response`` for the reservation -- no network call. Only
+    an ``upstream_byok`` figure corrects: a non-BYOK response settled at 0 was billed 0,
+    and a correction must be exactly what :func:`settled_cost` would settle today, which is
+    what makes it replay-stable. Exactly one response, or it is refused.
+    """
+    responses = events(conn, "model_response", identifier)
+    if len(responses) != 1 or type(responses[0]) is not dict:
+        return None
+    settled = settled_cost(responses[0].get("usage"))
+    if settled is None or settled[1] != "upstream_byok":
+        return None
+    amount = _microusd(settled[0])
+    if amount is None or amount == 0:
+        return None
+    return CostCorrection(scope, identifier, amount)
+
+
+def correct_costs(conn: sqlite3.Connection, *, apply: bool = False) -> CorrectionReport:
+    """Correct every reservation settled at 0 that has a valid upstream BYOK figure (M1-348).
+
+    Dry run unless ``apply``. Append-only: each correction is a ``cost_corrected`` event in
+    the settlement's own budget scope, which :func:`spending` applies over the settlement,
+    plus a ``cost_corrected_id`` guard scoped by reservation. The guard is checked again
+    inside the writing transaction, so a second run -- or two at once -- writes nothing
+    new. A reservation settled at 0 with no valid upstream figure is counted as refused and
+    never written: a correction only ever records a figure the provider reported.
+    """
+    try:
+        rows = [
+            (row[0], json.loads(row[1]))
+            for row in conn.execute(
+                "SELECT scope,data FROM tournament_events WHERE kind='cost_settled' ORDER BY seq"
+            )
+        ]
+    except (sqlite3.Error, ValueError):
+        raise StorageFailure("cannot read tournament journal") from None
+    corrections: list[CostCorrection] = []
+    seen: set[str] = set()
+    already = refused = 0
+    for scope, data in rows:
+        if type(scope) is not str:
+            raise StorageFailure("cannot read tournament spending")
+        ((identifier, amount),) = _amounts([data], "actual_microusd")
+        if amount != 0 or identifier in seen:
+            continue
+        seen.add(identifier)
+        if events(conn, "cost_corrected_id", identifier):
+            already += 1
+            continue
+        correction = _correction(conn, scope, identifier)
+        if correction is None:
+            refused += 1
+        else:
+            corrections.append(correction)
+    written = 0
+    if apply:
+        for correction in corrections:
+            with storage_transaction(conn):
+                if events(conn, "cost_corrected_id", correction.reservation_id):
+                    continue
+                append(
+                    conn,
+                    "cost_corrected",
+                    correction.scope,
+                    {
+                        "reservation_id": correction.reservation_id,
+                        "actual_microusd": correction.actual_microusd,
+                        "basis": "upstream_byok",
+                    },
+                )
+                append(conn, "cost_corrected_id", correction.reservation_id, {})
+                written += 1
+    return CorrectionReport(tuple(corrections), already, refused, written)
 
 
 @dataclass
@@ -411,8 +604,18 @@ class Budget:
         )
         return identifier
 
-    def settle(self, identifier: str, actual: float | None) -> None:
+    def settle(
+        self, identifier: str, actual: float | None, *, basis: CostBasis | None = None
+    ) -> None:
+        """Settle a reservation down to what was billed; an unknown cost leaves it held.
+
+        ``basis`` names where a model call's figure came from (M1-348); research providers
+        settle with ``None``, because neither OpenRouter vocabulary member describes them.
+        """
         if actual is None or not math.isfinite(actual) or actual < 0:
+            return
+        amount = _microusd(actual)
+        if amount is None:
             return
         with storage_transaction(self.conn):
             # Recovery may reach this after completion was committed but settlement
@@ -423,7 +626,7 @@ class Budget:
                 self.conn,
                 "cost_settled",
                 self.scope,
-                {"reservation_id": identifier, "actual_microusd": math.ceil(actual * 1_000_000)},
+                {"reservation_id": identifier, "actual_microusd": amount, "basis": basis},
             )
             append(self.conn, "cost_settled_id", identifier, {})
 
