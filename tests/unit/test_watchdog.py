@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -2238,3 +2239,137 @@ def test_a_state_file_stamped_in_the_future_outranks_every_fallback_until_overta
     assert _fresh_run(watchdog, monkeypatch, state) == 1
     assert fallback.exists()
     assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 3, "and then the window holds"
+
+
+# ── M1-345: diagnostic output is explicitly non-fatal ────────────────────────
+#
+# Two shapes, because they are two different branches and a test of one is no evidence about
+# the other: a write that raises (a pipe whose buffer is already full, a stream closed under
+# the process) and a write that SUCCEEDS into the buffer, leaving the failure for the
+# interpreter's own flush at shutdown. The second is the one M1-341 round 5 measured, and the
+# one that decides the exit code.
+
+
+class _RaisingStdout:
+    """A write-through stdout: every write raises, nothing is buffered."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.attempts = 0
+
+    def write(self, text: str) -> int:
+        self.attempts += 1
+        raise self.error
+
+    def flush(self) -> None:
+        raise self.error
+
+    def fileno(self) -> int:
+        return 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(32, "Broken pipe"), ValueError("I/O operation on closed file")],
+    ids=["OSError", "ValueError"],
+)
+def test_a_write_that_raises_stops_neither_the_checks_nor_the_pushes(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """Every subject still runs, every push is still delivered, and the exit code is the
+    one the faults imply."""
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    stdout = _RaisingStdout(error)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert watchdog.run() == 1
+
+    assert stdout.attempts > 0, "the run really did try to print"
+    assert len(watchdog.titled("WORKER DOWN")) == 1
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+    assert watchdog.fetched, "the rollover check ran too"
+    assert "resolutions" in watchdog.state(), "and the state file was still written"
+
+
+def test_a_healthy_run_with_a_raising_stdout_still_exits_zero_and_pings(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = _RaisingStdout(OSError(32, "Broken pipe"))
+    monkeypatch.setattr(sys, "stdout", stdout)
+    assert watchdog.run() == 0
+    assert watchdog.pings, "the dead-man ping is on the healthy path and must still happen"
+    assert watchdog.pushes == []
+
+
+def test_a_stdout_that_is_none_is_survivable(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Some launchers hand a process no standard output at all."""
+    monkeypatch.setattr(sys, "stdout", None)
+    assert watchdog.run() == 0
+
+
+def _run_with_closed_stdout(script: Path, ledger: Path, faulty: bool) -> int:
+    """Run the real script in a child process whose stdout is a pipe nobody reads.
+
+    The witness is outside the program: a closed pipe in a separate process, exactly what
+    `systemd` would leave behind, rather than an object this test wrote. The child patches
+    only the boundaries (systemd, the ledger, the network, the state file) and then runs the
+    real `main` and the real shutdown path.
+    """
+    runner = f"""
+import importlib.util, json, sys, os
+spec = importlib.util.spec_from_loader("wj", loader=None)
+module = importlib.util.module_from_spec(spec)
+exec(compile(open({str(script)!r}).read(), {str(script)!r}, "exec"), module.__dict__)
+module.STATE = __import__("pathlib").Path(os.environ["WJ_TEST_STATE"])
+module.LEDGER = __import__("pathlib").Path({str(ledger)!r})
+answers = json.loads(os.environ["WJ_TEST_UNITS"])
+module._systemctl = lambda *args, env=None: answers[json.dumps(list(args))]
+module._metaculus_get = lambda path, deadline: (
+    {{"id": {ACTIVE_PROJECT}}} if path.startswith("/projects/") else {{"results": []}}
+)
+module._push = lambda *a, **k: True
+module._now = lambda: __import__("datetime").datetime.fromisoformat(os.environ["WJ_TEST_NOW"])
+module._ping_deadman = lambda: None
+status = module.main()
+module._quiet_shutdown()
+sys.exit(status)
+"""
+    units = healthy_units()
+    if faulty:
+        units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    environment = dict(
+        os.environ,
+        WJ_TEST_UNITS=json.dumps({json.dumps(list(key)): value for key, value in units.items()}),
+        WJ_TEST_STATE=str(ledger.parent / "child-state.json"),
+        WJ_TEST_NOW=ANCHOR.isoformat(),
+        NTFY_TOPIC_URL="",
+    )
+    read, write = os.pipe()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - the child never returns
+        os.close(read)
+        os.dup2(write, 1)
+        os.close(write)
+        os.execve(sys.executable, [sys.executable, "-c", runner], environment)
+    os.close(write)
+    os.close(read)  # nobody will ever read it: the child's writes hit a closed pipe
+    _, status = os.waitpid(child, 0)
+    assert os.WIFEXITED(status), "the child must exit, never die on a signal"
+    return os.WEXITSTATUS(status)
+
+
+@pytest.mark.parametrize("faulty,expected", [(False, 0), (True, 1)], ids=["healthy", "faulty"])
+def test_a_closed_stdout_pipe_never_changes_the_exit_code(
+    watchdog: Harness, tmp_path: Path, faulty: bool, expected: int
+) -> None:
+    """The measured defect, and the reason guarding the prints is not enough.
+
+    Three short lines fit in stdout's buffer, so every `print` succeeds and the
+    `BrokenPipeError` surfaces during interpreter shutdown, after `main` has returned.
+    CPython reports **120** then, whatever `main` returned: a healthy run reads as a failure
+    and a real fault loses its own code. `_quiet_shutdown` is what makes this test pass.
+    """
+    assert _run_with_closed_stdout(SCRIPT, Path(watchdog.module.LEDGER), faulty) == expected

@@ -339,6 +339,58 @@ def _last_heartbeat() -> datetime | None:
     return _aware_stamp(row[0])
 
 
+def _say(line: str) -> None:
+    """Print one diagnostic line. Never raises -- M1-345.
+
+    Every status line in this program is a diagnostic: the journal is where an operator reads
+    what a run saw, and nothing downstream consumes it. A closed pipe or a full journal disk
+    must therefore not take down a check, and must not suppress a push -- this is the one unit
+    with no `OnFailure` pager, so a run that dies reports nothing at all.
+
+    `ValueError` as well as `OSError`: writing to a stream that has been closed raises
+    `ValueError: I/O operation on closed file`, not an `OSError`, and `sys.stdout` can be
+    `None` under a launcher that gave the process no standard output at all.
+    """
+    try:
+        print(line)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _quiet_shutdown() -> None:
+    """Flush what was buffered, and make the interpreter's own final flush harmless.
+
+    Measured, not assumed (M1-345): with stdout a closed pipe, three short lines fit in the
+    buffer, so every `print` SUCCEEDS and the `BrokenPipeError` arrives during interpreter
+    shutdown -- after `main` has returned. CPython then reports **exit code 120 whatever
+    `main` returned**, so a healthy run reads as a failure and a real fault loses its own
+    code. Guarding the prints alone cannot fix that; the buffer has to be dealt with.
+
+    So: flush here, where a failure can be caught, and if it fails point fd 1 at /dev/null and
+    flush again. The buffered bytes are then discarded to the null device, shutdown has
+    nothing left to write, and the exit status is the one the checks decided.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except (OSError, ValueError):
+            try:
+                descriptor = os.open(os.devnull, os.O_WRONLY)
+            except OSError:
+                continue
+            try:
+                os.dup2(descriptor, stream.fileno())
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
 def _load_state() -> dict:
     """The state file, or an empty state. Never anything a caller cannot use as a dict.
 
@@ -478,16 +530,16 @@ def _report_persistence(state: dict, landed: Path | None, primary_error: str | N
     """
     if primary_error is None:
         if state.pop("persistence", None) is not None:
-            print(f"STATE: {STATE} is writable again")
+            _say(f"STATE: {STATE} is writable again")
             _save_state(state)
         return
     if landed is None:
-        print(
+        _say(
             f"STATE: cannot write {STATE} ({primary_error}) or the runtime-directory fallback; "
             "throttle windows cannot hold, so standing faults page on every run"
         )
         return
-    print(f"STATE: cannot write {STATE} ({primary_error}); stamps kept in {landed} instead")
+    _say(f"STATE: cannot write {STATE} ({primary_error}); stamps kept in {landed} instead")
     stored = state.get("persistence")
     if not isinstance(stored, dict):
         stored = {}
@@ -774,7 +826,7 @@ def _check_resolutions(state: dict, observed_since: datetime) -> bool:
                 tags="white_check_mark",
             )
         state["resolutions"] = {}
-        print(f"OK: resolutions timer {timer_active}/{timer_enabled}")
+        _say(f"OK: resolutions timer {timer_active}/{timer_enabled}")
         return False
 
     key = _throttle_key(codes)
@@ -833,7 +885,7 @@ def _check_resolutions(state: dict, observed_since: datetime) -> bool:
             entry["last_alert"] = _now().isoformat()
 
     state["resolutions"] = entry
-    print("RESOLUTIONS STOPPED: " + ", ".join(codes))
+    _say("RESOLUTIONS STOPPED: " + ", ".join(codes))
     return True
 
 
@@ -898,7 +950,7 @@ def _check_tournament(state: dict) -> bool:
             if _push("whiskeyjack: WORKER DOWN", body, priority="urgent", tags="rotating_light"):
                 state["last_alert"] = _now().isoformat()
         state["alerting"] = True
-        print("DOWN: " + "; ".join(problems))
+        _say("DOWN: " + "; ".join(problems))
         return True
 
     if previously_bad and RECOVERY_NOTICE:
@@ -915,7 +967,7 @@ def _check_tournament(state: dict) -> bool:
     # withholding the ping for a stopped resolutions timer would raise a second, differently
     # worded alarm about the wrong thing.
     _ping_deadman()
-    print(f"OK: heartbeat {age_text}, timer {timer_active}/{timer_enabled}")
+    _say(f"OK: heartbeat {age_text}, timer {timer_active}/{timer_enabled}")
     return False
 
 
@@ -1154,7 +1206,7 @@ def _check_rollover(state: dict) -> bool:
             ):
                 entry["last_alert"] = _now().isoformat()
         state["rollover_check"] = entry
-        print("ROLLOVER CHECK FAILED: " + reason)
+        _say("ROLLOVER CHECK FAILED: " + reason)
         return True
 
     state["rollover_check"] = {}
@@ -1172,14 +1224,14 @@ def _check_rollover(state: dict) -> bool:
                 timeout=ROLLOVER_PUSH_TIMEOUT_SECONDS,
             )
         state["rollover"] = {}
-        print("OK: MiniBench is on the activation's project")
+        _say("OK: MiniBench is on the activation's project")
         return False
 
     if not _is_rollover(activation_project, slug_project, open_posts):
         # A mismatch with nothing open. Quiet, and the stored entry is LEFT as it is: an empty
         # batch is not evidence the activation was re-pointed, so it must not clear a standing
         # rollover (and so re-page it) when the next batch opens.
-        print("OK: MiniBench is on a new project with nothing open yet")
+        _say("OK: MiniBench is on a new project with nothing open yet")
         return False
 
     key = _rollover_key(activation_project, slug_project)
@@ -1209,7 +1261,7 @@ def _check_rollover(state: dict) -> bool:
         ):
             entry["last_alert"] = _now().isoformat()
     state["rollover"] = entry
-    print("ROLLOVER: MiniBench is on a project the activation does not cover")
+    _say("ROLLOVER: MiniBench is on a project the activation does not cover")
     return True
 
 
@@ -1238,4 +1290,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _status = main()
+    _quiet_shutdown()
+    sys.exit(_status)
