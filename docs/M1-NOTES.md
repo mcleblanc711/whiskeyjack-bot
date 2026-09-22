@@ -13848,8 +13848,10 @@ was loosened, globally or locally.
 - **The same money pump on the generation side, filed as M1-351.** A transient
   `generation_failed` (`internal_error`, `timeout`, …) inside a checkpoint window is
   re-invoked on every poll: the research is reused, but the model call (~$0.14 on Astra) is
-  bought again each time without counting as an attempt. The live 45754 history
-  (10 `internal_error` attempts against a cap of 3) is consistent with that. It is out of this
+  bought again each time without counting as an attempt. Measured on this branch with the
+  launch harness (a model that raises, six polls 5 minutes apart): **6 model calls, 1 counted
+  attempt, 1 research purchase**. The live 45754 history (10 `internal_error` attempts
+  against a cap of 3) is consistent with that. It is out of this
   item's criterion, which is about retrieval. `retry_wait` is keyed on the research outcome
   only, so extending it is a separate decision with its own test.
 - **An operator push for an evidence-poor post.** Not asked for. The marker, the comment and
@@ -13867,3 +13869,34 @@ was loosened, globally or locally.
   a `raw_response_path` (read 2026-09-22), so this holds today. A failed run written with
   retention disabled would stop the worker with `StorageFailure` rather than post, which is
   the safe direction.
+
+### Mutation pass — thirteen mutants, thirteen dead
+
+Run on the committed branch with `PYTHONDONTWRITEBYTECODE=1` and every `__pycache__`
+removed before each mutant (the stale-bytecode trap). Each mutant ran against
+`tests/unit/test_evidence_poor.py`, `tests/property/test_evidence_poor_properties.py` and
+`tests/unit/test_tournament.py`.
+
+| Mutant | Killed by |
+| --- | --- |
+| M1 classify by the LAST run again | failed primary + empty fallback, end to end |
+| M2 drop the marker | same |
+| M3 `stale_evidence` retries (dropped from the deterministic set) | `test_documents_that_are_all_unusable_still_block[future]` |
+| M4 no `retry_wait` gate | `test_one_retry_costs_at_most_one_more_asknews_reservation` |
+| M5 exhausted on every attempt (ignore `final_attempt`) | failed primary + empty fallback |
+| M6 no pre-approval marker check | `test_a_marker_for_other_content_is_refused_and_nothing_is_posted` |
+| M7 `quality_problem` not stood down | failed primary + empty fallback |
+| M8 sufficiency gate not stood down | `test_every_provider_finding_nothing_forecasts_evidence_poor_at_once[live-gate]` |
+| M9 never the final attempt | failed primary + empty fallback |
+| M10 no comment notice | same |
+| M11 hash mismatch ignored | `test_a_marker_for_other_content_is_refused_and_nothing_is_posted` |
+| M12 fallback never asked for | failed primary + empty fallback |
+| M13 `retry_wait` never written | the paid-call test |
+
+**M8 survived the first pass.** The launch harness inherits the committed default
+`fail_on_stale_research: false`, so a sufficiency gate that failed to stand down only
+logged. The live config sets it `true`. The `[live-gate]` variant sets it and re-runs
+`enable`, since a config change retires the activation there as it does live, and it kills M8.
+M13's first pattern did not match, because the formatter had wrapped the line. It was re-run,
+not counted as a kill.
+
