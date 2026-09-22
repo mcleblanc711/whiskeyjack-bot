@@ -14013,9 +14013,16 @@ running either.
 - The live host's state file has never been unwritable, so the fallback has run only in tests.
   The deploy check exercises it for real (a scratch copy with `STATE` pointed at a 0500
   directory, see the deploy step) rather than trusting the tests alone.
-- `st_mtime_ns` ordering assumes the two filesystems' clocks agree. Both are local and stamped
-  by the same kernel. A backwards wall-clock step between two runs could make an older file win
-  once, which costs at most one early re-page. The failure cannot be silent.
+- `st_mtime_ns` ordering assumes the two files' timestamps move forward together. Both are
+  local and stamped by the same kernel clock. **Corrected after review round 1:** this note first
+  said a backwards wall-clock step "costs at most one early re-page", which is wrong. If the
+  unwritable STATE carries an mtime ahead of the clock (the clock stepped back after STATE's last
+  successful write), `_load_state` keeps preferring STATE over every fallback written since. So
+  standing faults re-page at every run until the fallback's mtime overtakes STATE's: as long as
+  the step was. That is loud rather than silent, so the failure direction is still the safe
+  one. `test_a_state_file_stamped_in_the_future_outranks_every_fallback_until_overtaken` pins
+  the boundary. A monotonic generation counter inside the file was the alternative. It was not
+  taken, because it would move the file format for an event this host has not had.
 
 ### Mutation pass — thirteen mutants, thirteen dead
 

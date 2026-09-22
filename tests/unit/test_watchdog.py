@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2208,3 +2209,32 @@ def test_the_persistence_failure_joins_no_subjects_fault_vocabulary(
     fallback = Path(os.environ["XDG_RUNTIME_DIR"]) / "wj-watchdog.json"
     stored = json.loads(fallback.read_text(encoding="utf-8"))
     assert stored["resolutions"]["key"] == writable_key["key"]
+
+
+def test_a_state_file_stamped_in_the_future_outranks_every_fallback_until_overtaken(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_modes: None
+) -> None:
+    """The documented limit of newest-wins (M1-344 review round 1): after a backwards clock
+    step, an unwritable STATE whose mtime is still ahead wins over every fallback written since,
+    so a standing fault re-pages each run -- until a fallback write's mtime passes STATE's."""
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    state = directory / "wj-watchdog.json"
+    state.write_text("{}", encoding="utf-8")
+    ahead = time.time_ns() + 3600 * 10**9
+    os.utime(state, ns=(ahead, ahead))
+    directory.chmod(0o500)
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    for _ in range(3):
+        assert _fresh_run(watchdog, monkeypatch, state) == 1
+        watchdog.instant[0] += timedelta(minutes=5)
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 3, "the limit, pinned"
+
+    fallback = Path(os.environ["XDG_RUNTIME_DIR"]) / "wj-watchdog.json"
+    os.utime(state, ns=(1, 1))  # the fallback's writes have now overtaken it
+    assert _fresh_run(watchdog, monkeypatch, state) == 1
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert _fresh_run(watchdog, monkeypatch, state) == 1
+    assert fallback.exists()
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 3, "and then the window holds"
