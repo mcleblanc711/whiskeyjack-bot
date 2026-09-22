@@ -14047,3 +14047,85 @@ tests load the script by compiling it from source anyway.
 
 The bound and the reporting were mutated separately (brief trap 5): C, D and E each kill on
 their own.
+
+## M1-352 — Drop AskNews's historical "news knowledge" pass
+
+Owner decision 2026-09-22, taken while M1-344 was deploying: the AskNews plan was close to
+exhausted and the owner chose to cut the expensive half rather than top up. Backlog row filed
+by PR #118.
+
+### Delivered
+
+`research/asknews.py`'s `_STRATEGIES` is now `(_STRATEGY_CURRENT,)`. A retrieval issues one
+request per query instead of two, and the request it no longer makes is the expensive one: an
+estimated $0.125 against $0.025, about 83% of the AskNews credit cost.
+
+### The measurement, before the change
+
+From the live ledger on 2026-09-22 (`cost_reserved` rows with `provider='asknews'`, which is
+the billed-call counter; `research_runs` rows are wrong in both directions, M1-315/M1-326):
+
+| Day (UTC) | Billed AskNews calls | Distinct questions |
+| --- | --- | --- |
+| 2026-09-21 | 61 | 31 |
+| 2026-09-22 (to 17:00) | 22 | 11 |
+
+131 calls this month, 66 at $0.025 and 65 at $0.125. **Every question was retrieved exactly
+once**: no re-purchases, no retries, nothing like the M1-326 loop. The cause was question
+volume — MiniBench released 42 questions in the 29 hours after the 33125 re-point, against
+about 24 in all of Sept 7-20.
+
+### Decision — none of the three, so the activation stands
+
+The pass list was a code constant, never configuration, and `retired_bindings`
+(`tournament_state.py:255`) compares only account, destination, `config_sha256` and
+`prompt_sha256`. So this is worker code that deploys between polls with no `tournament enable`
+afterwards. (The first answer given to the owner said the opposite, and was corrected before
+anything was written.)
+
+### Decision — `_STRATEGY_HISTORICAL` stays defined
+
+It still names what a STORED run was configured with. `research_runs.provider_config` rows and
+the acceptance fixtures carry `"strategy": "news knowledge"`, and replay reads them. Deleting
+the constant would have made the code unable to describe its own history.
+
+### Deviation
+
+- **This buys fewer documents, and the notes say so rather than implying it is free.** The
+  2026-09-11 provider comparison measured the historical pass returning many URLs the current
+  pass never sees. Some questions will now retrieve less, fall through to the Exa fallback, and
+  — when that also finds nothing — become M1-349's evidence-poor forecast instead of a richer
+  packet. That path exists and was deployed hours earlier, which is what makes this safe to do
+  mid-tournament.
+- **The recorded-fixture count stays 2.** `test_replay_stored_packet` asserts its stored run
+  made two AskNews calls, because it really did. A recorded run is immutable, so that number
+  must not follow the adapter; the docstring now says which of the two kinds of claim it is.
+
+### Rejected
+
+- **A config flag for the pass list**: any new `AppConfig` field changes `config_sha256` and
+  retires the live activation. The owner asked for the cut, not for a switch.
+- **Halving `max_queries_per_question` instead**: that is a config byte, same problem, and it
+  would cut the cheap call as well as the expensive one.
+- **Keeping the historical pass and shortening `hours_back`**: the price is per call, not per
+  hour of coverage, so it would have saved nothing.
+
+### Deferred (do not read the absence as an omission)
+
+- Restoring the pass when the plan resets is an owner decision, not a scheduled change. The
+  constant and this section are what make it a one-line revert.
+
+### Standing risk — not verifiable offline
+
+- How much forecast quality this costs cannot be measured from the suite. The observable is
+  the live `evidence_gap` count and the share of questions that fall through to Exa; both are
+  in `tournament status`.
+
+### Mutation pass — four mutants, four dead
+
+| Mutant | Killed by |
+| --- | --- |
+| A the historical pass restored | `test_only_the_current_strategy_is_queried` |
+| B historical instead of current | same |
+| C `historical: True` sent anyway | same |
+| D the $0.125 estimate charged for the remaining call | `test_one_retrieval_bills_one_asknews_call_per_query` |

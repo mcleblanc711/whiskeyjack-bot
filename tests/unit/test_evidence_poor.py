@@ -323,3 +323,23 @@ def test_the_comment_refuses_a_marker_that_does_not_match(
     with pytest.raises(TournamentError) as raised:
         comment_text(conn, record_id)
     assert planted not in str(raised.value)
+
+
+# --- M1-352: what one retrieval is billed for -------------------------------------------
+
+
+def test_one_retrieval_bills_one_asknews_call_per_query(case: Any) -> None:
+    """The criterion, counted in the ledger rather than in the provider double.
+
+    `cost_reserved` rows are the billed-call counter (M1-315, M1-326): `research_runs` rows are
+    wrong in both directions. Before M1-352 this question reserved twice, 0.025 for
+    `latest news` and 0.125 for `news knowledge`; the second is the call that was dropped.
+    """
+    conn, _config, platform, news, _model = case
+    poll(case)
+    assert platform.posts == 1, "an ordinary, successful forecast"
+    reservations = [row for row in _rows(conn, "cost_reserved") if row["provider"] == "asknews"]
+    assert len(reservations) == news.calls == 1, "one query, one billed call"
+    assert [row["estimate_microusd"] for row in reservations] == [25_000], (
+        "the 125_000 historical estimate must appear nowhere"
+    )
