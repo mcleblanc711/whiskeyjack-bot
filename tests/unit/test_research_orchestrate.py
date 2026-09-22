@@ -39,6 +39,7 @@ from whiskeyjack_bot.metaculus.snapshots import load_snapshot
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion, CanonicalQuestion
 from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot.research.model import validate_run
+from whiskeyjack_bot.research import asknews
 from whiskeyjack_bot.research.orchestrate import (
     OrchestrationError,
     PaidRetrievalError,
@@ -542,24 +543,22 @@ def test_a_fallback_ledger_failure_still_reports_what_the_fallback_cost(
     assert caught.value.unpriced_calls == 1, "the unpriced primary is still one billed call"
 
 
-def test_one_query_is_two_billable_calls_and_the_outcome_says_so(
+def test_one_query_is_one_billable_call_per_strategy_and_the_outcome_says_so(
     config: AppConfig, ledger: Any
 ) -> None:
     """Round 3's blocking finding: a provider *run* is not a provider *call*.
 
-    ``retrieve_news`` issues one request per query per strategy, and there are two
-    strategies -- the "current" and "historical" passes whose overlap ``duplicates_collapsed``
-    exists to absorb. So the cheapest possible question is two billable calls, and the
-    accounting used to report one, because it counted entries in the recorded-run list.
-
-    The expected count is asserted against the provider double's own call log rather than a
-    literal, so the test tracks ``_STRATEGIES`` instead of restating it. A literal ``2`` here
-    would keep passing if a third strategy were added -- which is exactly the change that
-    would make the figure wrong again.
+    ``retrieve_news`` issues one request per query per strategy. There were two strategies --
+    the "current" and "historical" passes -- so the cheapest question was two billable calls,
+    and the accounting used to report one, because it counted entries in the recorded-run
+    list. **M1-352 dropped the historical pass**, so that floor is now one call; the defect
+    this test exists for is the same one, and the arithmetic is asserted rather than a
+    literal so it tracks ``_STRATEGIES`` either way.
     """
     sdk = _SDK()
     outcome = retrieve_for_question(ledger, config, question=question(), now=NOW, news_client=sdk)
-    assert len(sdk.news.calls) == 2, "one query, two strategies"
+    expected = len(derive_queries(question())) * len(asknews._STRATEGIES)
+    assert len(sdk.news.calls) == expected == 1, "one query, one strategy since M1-352"
     assert outcome.unpriced_calls == len(sdk.news.calls)
     assert outcome.cost_usd is None, "AskNews never reports a currency figure"
 
@@ -570,19 +569,18 @@ def test_a_group_sibling_costs_twice_that_and_the_outcome_says_so(
     """The same claim where the multiplier bites hardest, and the reason it is worth a
     second test rather than a parametrization.
 
-    ``derive_queries`` emits two queries for a group sibling -- the parent-qualified form and
-    the bare title -- because a sibling title like "Democratic" means nothing alone (M1-202).
-    Two queries at two strategies is four billable calls for one question, so the old
-    run-counting figure was low by a factor of four exactly where a group expansion makes the
-    batch most expensive. Anti-vacuity for the test above: if both reported the same number,
-    neither would be measuring the multiplier.
+    ``derive_queries`` emits a consolidated query for a group sibling -- the parent-qualified
+    form -- because a sibling title like "Democratic" means nothing alone (M1-202). The point
+    of the test is the MULTIPLIER: billable calls are queries times strategies, so a question
+    that derives more queries costs proportionally more, and the old run-counting figure was
+    low by exactly that factor. Asserted as the product, never as a literal.
     """
     sibling = question().model_copy(update={"group_parent_title": "Who wins the 2028 election?"})
     assert len(derive_queries(sibling)) == 1, "a sibling uses one consolidated query"
 
     sdk = _SDK()
     outcome = retrieve_for_question(ledger, config, question=sibling, now=NOW, news_client=sdk)
-    assert len(sdk.news.calls) == 2, "one query, two strategies"
+    assert len(sdk.news.calls) == len(derive_queries(sibling)) * len(asknews._STRATEGIES)
     assert outcome.unpriced_calls == len(sdk.news.calls)
 
 

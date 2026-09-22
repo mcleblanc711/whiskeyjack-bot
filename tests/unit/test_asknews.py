@@ -28,6 +28,7 @@ from asknews_sdk.dto.news import SearchResponse, SearchResponseDictItem
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.logging_setup import SecretRedactionFilter, configure_logging
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.research import asknews
 from whiskeyjack_bot.research.asknews import (
     AskNewsRetrievalError,
     build_asknews_client,
@@ -341,20 +342,28 @@ def test_raw_responses_are_returned_not_persisted(config: AppConfig, tmp_path: P
 # --- current + historical passes --------------------------------------------
 
 
-def test_both_current_and_historical_strategies_are_queried(config: AppConfig) -> None:
+def test_only_the_current_strategy_is_queried(config: AppConfig) -> None:
+    """M1-352: the historical pass is gone, and no path may reintroduce it.
+
+    It was `["latest news", "news knowledge"]` with `historical` False then True. The second
+    request was the expensive one (an estimated $0.125 against $0.025), and the owner dropped
+    it on 2026-09-22. Asserted as an exact list rather than as "no historical call", so adding
+    a third strategy is a failure here rather than a silent doubling of the bill.
+    """
     sdk = _FakeSDK([[_article()]])
     _retrieve(sdk, config)
-    strategies = [c["strategy"] for c in sdk.news.calls]
-    assert strategies == ["latest news", "news knowledge"]
-    assert [c["historical"] for c in sdk.news.calls] == [False, True]
+    assert [c["strategy"] for c in sdk.news.calls] == ["latest news"]
+    assert [c["historical"] for c in sdk.news.calls] == [False]
 
 
 def test_config_parameters_plumb_through(config: AppConfig) -> None:
     sdk = _FakeSDK([[_article()]])
     _retrieve(sdk, config, queries=["a", "b", "c", "d", "e", "f", "g", "h"])
 
-    # Queries capped, two strategy passes each.
-    assert len(sdk.news.calls) == config.retrieval.max_queries_per_question * 2
+    # Queries capped, one strategy pass each since M1-352 (two before it).
+    assert len(sdk.news.calls) == config.retrieval.max_queries_per_question * len(
+        asknews._STRATEGIES
+    )
     call = sdk.news.calls[0]
     assert call["n_articles"] == config.retrieval.max_documents_per_query
     assert call["hours_back"] == config.retrieval.freshness_days_default * 24
@@ -367,14 +376,18 @@ def test_config_parameters_plumb_through(config: AppConfig) -> None:
 def test_intra_run_duplicates_are_collapsed_without_marking_the_run_failed(
     config: AppConfig,
 ) -> None:
-    """The two passes overlap by design; UNIQUE(run, url, hash) would reject the pair.
+    """Two queries can return the same article; UNIQUE(run, url, hash) would reject the pair.
 
-    The overlap is the normal case, so the run must still look successful:
+    A collapsed duplicate is the normal case, so the run must still look successful:
     error_summary means "failed or returned nothing" per the schema, and a run
     that collapsed a duplicate did neither. (GPT review round 1, finding 3.)
+
+    **The source of the overlap changed with M1-352**: it was the current and historical
+    passes over ONE query, and those are now one pass, so the duplicate here comes from two
+    queries instead. The collapsing behaviour under test is the same one.
     """
     sdk = _FakeSDK([[_article()], [_article()]])
-    result = _retrieve(sdk, config)
+    result = _retrieve(sdk, config, queries=["a", "b"])
 
     assert len(result.documents) == 1
     assert result.duplicates_collapsed == 1

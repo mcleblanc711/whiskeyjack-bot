@@ -190,7 +190,8 @@ class _BilledCall:
 
     ``calls`` is the pass's **billable request count**, not 1. Round 3 found the accounting
     one layer up publishing a figure named ``unpriced_calls`` while counting provider *runs*:
-    a single AskNews pass issues ``len(queries) x len(_STRATEGIES)`` requests -- two per query,
+    a single AskNews pass issues ``len(queries) x len(_STRATEGIES)`` requests -- one per query
+    since M1-352, two per query before it,
     which is why :func:`derive_queries` treats query construction as the largest lever on what
     a run costs -- so a one-query question under-reported its unpriced calls by half, and a
     group sibling by three quarters. Both adapters now report the count; neither could be

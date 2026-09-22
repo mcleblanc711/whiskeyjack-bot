@@ -69,15 +69,24 @@ from whiskeyjack_bot.research.model import (
 from whiskeyjack_bot.research.preflight import require_run_metadata, string_list
 from whiskeyjack_bot.research.transport import apply_connection_retries
 
-# The two passes that together satisfy "current and historical news". AskNews
-# scopes each by strategy rather than by endpoint. Typed as the SDK's own
+# The passes AskNews scopes by strategy rather than by endpoint. Typed as the SDK's own
 # Literal so a rename in a future asknews release is a type error here, not a
-# silently rejected request.
+# silently rejected request. Only the current pass is issued; see `_STRATEGIES`.
 _Strategy = Literal["latest news", "news knowledge"]
 
 _STRATEGY_CURRENT: _Strategy = "latest news"
 _STRATEGY_HISTORICAL: _Strategy = "news knowledge"
-_STRATEGIES: tuple[_Strategy, ...] = (_STRATEGY_CURRENT, _STRATEGY_HISTORICAL)
+# M1-352, owner decision 2026-09-22: the historical pass is no longer issued. It was the
+# expensive half -- an estimated $0.125 against $0.025, about 83% of the AskNews credit cost --
+# and MiniBench's question rate after the 33125 re-point (42 questions in 29 hours, each
+# retrieved exactly once) was exhausting the plan. `_STRATEGY_HISTORICAL` stays defined: it
+# still names what a STORED run may have been configured with, and `replay` reads those rows.
+#
+# What this costs is stated rather than hidden: the historical pass returned URLs the current
+# pass never sees (measured 2026-09-11), so some questions now retrieve fewer documents, fall
+# through to the Exa fallback, and -- when that finds nothing either -- become M1-349's
+# evidence-poor forecast instead of a richer packet.
+_STRATEGIES: tuple[_Strategy, ...] = (_STRATEGY_CURRENT,)
 
 _HOURS_PER_DAY = 24
 
@@ -120,7 +129,8 @@ class AskNewsRetrieval:
     why it is reported rather than left to the caller: ``raw_responses`` holds
     only the requests that came back, so a caller reconstructing the count from
     it silently loses the failed one -- and this adapter issues
-    ``len(queries) x len(_STRATEGIES)`` requests, so a run is never one call.
+    ``len(queries) x len(_STRATEGIES)`` requests (one per query since M1-352 dropped the
+    historical pass, two before it), so the count is the adapter's to report.
     M1-315 round 3 found the paid-run accounting reporting provider *runs* where
     it published a count of *calls*; this is the field that makes the two agree.
     ``forecast/generate.py`` reports the same quantity as ``invocations``.
@@ -231,7 +241,10 @@ def retrieve_news(
     retrieval_run_id: str,
     now: datetime,
 ) -> AskNewsRetrieval:
-    """Retrieve current and historical news for ``queries`` as normalized documents.
+    """Retrieve current news for ``queries`` as normalized documents.
+
+    **Current only since M1-352.** The historical ("news knowledge") pass is no longer
+    issued; see ``_STRATEGIES``. Stored runs from before that change still record both.
 
     Refuses, before any network use and therefore before any billing, a caller mistake
     the run record would otherwise only catch after every call had already been paid
@@ -255,7 +268,7 @@ def retrieve_news(
     ``OverflowError`` with no recordable run (cross-model review round 1).
 
     **Never raises on provider failure.** A run makes up to
-    ``max_queries_per_question * 2`` billable calls; raising partway through would
+    ``max_queries_per_question * len(_STRATEGIES)`` billable calls; raising partway through would
     discard the record of every call already paid for, which is precisely the kind
     of shortcut that weakens the ledger. On failure this stops early, sets
     ``provider_failed``, records the failure in ``run.error_summary``, and returns

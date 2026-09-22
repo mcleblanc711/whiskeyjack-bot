@@ -229,7 +229,8 @@ def test_retrieval_cache_counts_only_new_requests(case: Any, provider: str) -> N
             first = retrieve("first", ["a"])
             cached = retrieve("cached", ["a"])
             mixed = retrieve("mixed", ["a", "b"])
-    assert first.calls_attempted == (1 if provider == "exa" else 2)
+    # One per query for both providers since M1-352; AskNews made two (both strategies) before.
+    assert first.calls_attempted == 1
     assert cached.calls_attempted == 0
     assert cached.run.cost_usd == 0
     assert mixed.calls_attempted == first.calls_attempted
@@ -237,7 +238,7 @@ def test_retrieval_cache_counts_only_new_requests(case: Any, provider: str) -> N
         assert mixed.run.cost_usd == 0.01
         assert len(calls) == 2
     else:
-        assert news.calls == 4
+        assert news.calls == 2, "the first query, then the new one in `mixed` (M1-352)"
 
 
 @pytest.mark.parametrize("provider", ["model", "retrieval"])

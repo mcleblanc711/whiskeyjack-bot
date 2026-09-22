@@ -18,7 +18,8 @@ pins a run's identity and provenance and deliberately leaves the completion colu
 writable). :func:`open_run` inserts identity and the start time *before* the billable
 calls; :func:`complete_run` fills in what the run learned. The reason is the one
 M1-302's first review round established at the adapter level and this closes one level
-up: a run makes up to ``max_queries_per_question * 2`` billable calls, the adapters no
+up: a run makes up to ``max_queries_per_question * len(asknews._STRATEGIES)`` billable
+calls (one per query since M1-352, two before it), the adapters no
 longer raise a mid-run failure away, and a single terminal insert would still lose the
 record of every paid call if the process died before it. Opening the row first means
 the spend stays attributable even when the process does not survive to describe it.

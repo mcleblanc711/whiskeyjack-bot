@@ -57,6 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
+| M1-352 | feat/m1-352-asknews-latest-only | whiskeyjack-m1-352 | no | none | 2026-09-22 |
 | M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 | M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |
@@ -81,8 +82,13 @@ near zero this time, with no other lane open when it started and one when it mer
 | M1-612 | feat/m1-612-show-record-history | whiskeyjack-m1-612 | no | none | 2026-09-16 |
 | M1-343 | feat/m1-343-watchdog-stale-timer | whiskeyjack-m1-343 | no | none | 2026-09-19 |
 | M1-346 | feat/m1-346-scoring-noleak-constant | whiskeyjack-m1-346 | no | none | 2026-09-20 |
-| M1-349 | feat/m1-349-evidence-poor-base-rate | whiskeyjack-m1-349 | no | none | 2026-09-22 |
-| M1-344 | feat/m1-344-watchdog-unwritable-state | whiskeyjack-m1-344 | no | none | 2026-09-22 |
+
+*(Swept the **M1-349** row (merged PR #116, round-1 approve 2026-09-22 — the evidence-poor
+base-rate forecast), which `finish-item.sh` left for this branch. Checked first: `origin` held
+`master` alone and `whiskeyjack-m1-349` is gone. **Also swept M1-344** (merged PR #117, round-1
+approve, deployed the same day), by the same check, because M1-345 — the branch that would
+otherwise own it — has not been opened and this table should not carry two landed claims.
+Earlier sweep note follows.)*
 
 *(Swept the **M1-347** row (merged PR #114, round 1 changes then round 2 approve, 2026-09-22 —
 the watchdog rollover detector), the one drop `finish-item.sh` asked for and NEXT.md assigns to
