@@ -515,3 +515,148 @@ def test_only_a_stored_stall_can_leave_a_recovery_unverified(
         assert unverified is False
     else:
         assert unverified == (last_trigger is None or ANCHOR - last_trigger >= WINDOW)
+
+
+# ── M1-347: the rollover check's parsers and its decision ─────────────────────
+#
+# Three parsers over untrusted shape -- two Metaculus answers and one ledger column -- and one
+# decision. The strategies name the VALID shapes as their own branches (a positive int id, a
+# `results` list of objects, an activation row that carries one), because arbitrary JSON almost
+# never produces them, and a parser property whose draws never reach the accept branch passes
+# against a parser that accepts nothing.
+
+JSON_LEAVES = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(),
+    st.floats(allow_nan=False),
+    st.text(max_size=20),
+)
+JSON_VALUES = st.recursive(
+    JSON_LEAVES,
+    lambda inner: st.one_of(
+        st.lists(inner, max_size=4), st.dictionaries(st.text(max_size=8), inner, max_size=4)
+    ),
+    max_leaves=12,
+)
+PROJECT_IDS = st.one_of(
+    st.integers(min_value=1, max_value=2**63),
+    st.integers(max_value=0),
+    st.booleans(),
+    st.integers(min_value=1).map(str),
+    st.integers(min_value=1).map(float),
+    st.none(),
+)
+PROJECT_ANSWERS = st.one_of(
+    st.fixed_dictionaries({"id": PROJECT_IDS}, optional={"slug": JSON_VALUES}),
+    JSON_VALUES,
+)
+POSTS = st.one_of(
+    st.fixed_dictionaries(
+        {},
+        optional={
+            "status": st.one_of(
+                st.sampled_from(["open", "closed", "resolved", "upcoming", "Open", "open "]),
+                JSON_LEAVES,
+            ),
+            "id": JSON_LEAVES,
+        },
+    ),
+    JSON_VALUES,
+)
+POSTS_ANSWERS = st.one_of(
+    st.fixed_dictionaries({"results": st.lists(POSTS, max_size=6)}, optional={"next": JSON_VALUES}),
+    st.fixed_dictionaries({"results": JSON_VALUES}),
+    JSON_VALUES,
+)
+
+
+@given(payload=PROJECT_ANSWERS)
+def test_the_project_parser_is_total_and_accepts_exactly_a_positive_int_id(
+    payload: object,
+) -> None:
+    got = watchdog._project_id(payload)
+    identifier = payload.get("id") if isinstance(payload, dict) else None
+    valid = type(identifier) is int and identifier > 0
+    assert got == (identifier if valid else None)
+    assert got is None or type(got) is int
+
+
+@given(payload=POSTS_ANSWERS)
+def test_the_open_post_count_is_total_and_counts_only_posts_that_say_open(
+    payload: object,
+) -> None:
+    got = watchdog._open_post_count(payload)
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or not all(isinstance(post, dict) for post in results):
+        assert got is None
+        return
+    assert got == len([post for post in results if post.get("status") == "open"])
+    assert 0 <= got <= len(results)
+
+
+@given(
+    raw=st.one_of(
+        PROJECT_IDS.map(lambda value: json.dumps({"project_id": value, "account_id": 1})),
+        JSON_VALUES.map(json.dumps),
+        st.text(max_size=40),
+        JSON_VALUES,
+        st.just("[" * 5000),
+    )
+)
+def test_the_activation_parser_is_total_and_never_reads_a_non_int_as_a_project(
+    raw: object,
+) -> None:
+    got = watchdog._activation_project_id(raw)
+    assert got is None or (type(got) is int and got > 0)
+    if got is not None:
+        assert isinstance(raw, str)
+        assert json.loads(raw)["project_id"] == got
+
+
+@given(
+    activation=st.integers(min_value=1, max_value=10**6),
+    slug=st.integers(min_value=1, max_value=10**6),
+    open_posts=st.one_of(st.none(), st.integers(min_value=0, max_value=100)),
+    same=st.booleans(),
+)
+def test_a_rollover_is_exactly_a_mismatch_with_something_open(
+    activation: int, slug: int, open_posts: int | None, same: bool
+) -> None:
+    """`same` lifts the match case off its ~1-in-a-million natural rate."""
+    slug = activation if same else slug
+    expected = activation != slug and open_posts is not None and open_posts >= 1
+    assert watchdog._is_rollover(activation, slug, open_posts) is expected
+
+
+@given(
+    a=st.tuples(st.integers(min_value=1), st.integers(min_value=1)),
+    b=st.tuples(st.integers(min_value=1), st.integers(min_value=1)),
+)
+def test_the_rollover_key_names_the_pair_and_only_the_pair(
+    a: tuple[int, int], b: tuple[int, int]
+) -> None:
+    assert (watchdog._rollover_key(*a) == watchdog._rollover_key(*b)) is (a == b)
+    assert watchdog._rollover_key(*a).startswith("rollover:")
+    assert watchdog._rollover_key(*a) != "rollover_check_failed"
+
+
+@given(
+    key=st.sampled_from(["rollover:33125->33130", "rollover_check_failed", "timer_inactive"]),
+    stored_key=st.one_of(
+        st.sampled_from(["rollover:33125->33130", "rollover_check_failed"]), JSON_LEAVES
+    ),
+    stamp=st.one_of(st.just(ANCHOR.isoformat()), JSON_LEAVES, st.just("2026-09-17T12:00:00")),
+    window_minutes=st.sampled_from([60, 360, 1440]),
+    elapsed=st.integers(min_value=0, max_value=200_000),
+)
+def test_the_shared_throttle_rule_is_total_and_silent_only_for_its_own_key_in_window(
+    key: str, stored_key: object, stamp: object, window_minutes: int, elapsed: int
+) -> None:
+    window = timedelta(minutes=window_minutes)
+    stored = {"key": stored_key, "last_alert": stamp}
+    due = watchdog._key_is_due(key, stored, ANCHOR + timedelta(seconds=elapsed), window)
+    if stored_key != key or stamp != ANCHOR.isoformat():
+        assert due is True
+    else:
+        assert due == (elapsed >= window.total_seconds())
