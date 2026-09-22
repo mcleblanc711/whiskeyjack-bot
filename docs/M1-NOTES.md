@@ -14181,9 +14181,12 @@ would skip the flush too — and every other cleanup with it, including anything
 ### Decision — the guard catches three types, not `Exception`
 
 `OSError` and `ValueError` are what a broken or closed stream raises; `AttributeError` covers
-a `None` stdout. A broader catch would swallow `KeyboardInterrupt` and `SystemExit` into a
-status line, which is how a guard stops being defence in depth and becomes a way to lose
-control of the process. A test asserts an interrupt still propagates.
+a `None` stdout. **Corrected after review round 1:** this first said `except Exception` would
+swallow `KeyboardInterrupt` and `SystemExit`, which is false — both inherit directly from
+`BaseException`, so `except Exception` already lets them through. The catch that would eat
+them is `except BaseException`, which is the mutant (E) the interrupt test kills. The narrow
+tuple is kept anyway, for the reason that survives the correction: a guard should name what it
+expects, so an error nobody predicted reaches the journal instead of a status line.
 
 ### Deviation
 

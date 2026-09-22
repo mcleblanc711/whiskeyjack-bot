@@ -2404,9 +2404,10 @@ def test_the_entry_point_flushes_before_it_exits() -> None:
 def test_a_diagnostic_guard_never_swallows_an_interrupt(watchdog: Harness) -> None:
     """`_say` catches what a broken stream raises, and nothing else.
 
-    A bare `except Exception` -- or worse, `BaseException` -- would make Ctrl-C and a
-    `SystemExit` raised inside `print` disappear into a status line, which is how a guard
-    stops being defence in depth and starts being a way to lose control of the process.
+    `except BaseException` would make Ctrl-C and a `SystemExit` raised inside `print`
+    disappear into a status line, which is how a guard stops being defence in depth and starts
+    being a way to lose control of the process. (`except Exception` would NOT: both inherit
+    from `BaseException` directly. Review round 1 corrected that claim in the notes.)
     """
 
     class _Interrupting:
