@@ -13751,7 +13751,10 @@ Owner decision 2026-09-22 (the Do-now blueprint's row 3a). Backlog row filed by 
   twice: before approval (so nothing is posted under a claim about other content) and in
   `comment_text`.
 - **The published comment** carries `EVIDENCE_POOR_NOTICE` above the rationale, and
-  `Sources:` reads `(none)` instead of an empty line.
+  `Sources:` reads `(none)` instead of an empty line. That `(none)` also applies to an *unmarked* record with no
+  sources. None exists today: with a document supplied, M1-501's attribution requires at
+  least one citation. Review round 1 noted that the request's "every record without the
+  marker is unchanged" was one clause too broad for this.
 - **None of the three.** No `config/*.yaml` byte, no `AppConfig` field, no prompt byte.
   Provider `retries` stay 0. No migration.
 
@@ -13854,6 +13857,10 @@ was loosened, globally or locally.
   against a cap of 3) is consistent with that. It is out of this
   item's criterion, which is about retrieval. `retry_wait` is keyed on the research outcome
   only, so extending it is a separate decision with its own test.
+  Review round 1 (APPROVE, non-blocking) added a second path to the same row, now in its
+  criterion: after an evidence-poor attempt whose *generation* fails transiently, the next
+  attempt re-buys the retrieval too, because `_research` reuses a checkpoint only when its
+  packet has documents.
 - **An operator push for an evidence-poor post.** Not asked for. The marker, the comment and
   `tournament status`'s `evidence_gaps` make it visible, and a new alert is new surface on
   the ntfy path.
