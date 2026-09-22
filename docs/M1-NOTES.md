@@ -14136,3 +14136,91 @@ from ``_STRATEGIES``, and they say that stored runs from before the change recor
 | B historical instead of current | same |
 | C `historical: True` sent anyway | same |
 | D the $0.125 estimate charged for the remaining call | `test_one_retrieval_bills_one_asknews_call_per_query` |
+
+## M1-345 — The watchdog's diagnostic output is explicitly non-fatal
+
+Raised as a non-blocking observation by M1-341's review round 5. Wave 21's queue behind
+M1-344, so it is written against the watchdog with three subjects and M1-344's `STATE:` lines.
+The wave-21 brief for it was never written; `~/wj-prompts/wave21/M1-345.md` was written from
+the backlog row before starting.
+
+### Delivered
+
+- `_say(line)` replaces all eleven `print` calls. It catches `OSError`, `ValueError` (writing
+  to a closed stream raises that, not an `OSError`) and `AttributeError` (`sys.stdout` can be
+  `None` under a launcher that gave the process no standard output).
+- `_quiet_shutdown()` runs between `main()` and `sys.exit` in the entry point: it flushes
+  where a failure can be caught, and if the flush fails it points that stream's descriptor at
+  `/dev/null` and flushes again.
+- Stricter reading of the criterion, which says "both subjects": there are three now, and the
+  persistence line is a fourth output site. All are covered.
+
+### The measurement that changed the design
+
+The criterion's "the exit code still reflects what it found" cannot be met by guarding the
+prints, and this was measured rather than reasoned about (`/dev/shm` probe, then the test):
+
+| stdout | what happens |
+| --- | --- |
+| closed pipe, a lot of output | the `print` itself raises: `_say` catches it |
+| **closed pipe, three short lines** | **every `print` SUCCEEDS** (they fit in the buffer), and `BrokenPipeError` arrives during interpreter shutdown, after `main` returned |
+
+In the second case CPython reports **exit code 120 whatever `main` returned**. Measured both
+ways: a `main` returning 0 exits 120, and one returning 1 also exits 120. So before this item
+a healthy watchdog run on a closed pipe read as a failure, and a real fault lost its own code.
+That is the case M1-341 round 5 found, and it is why `_quiet_shutdown` exists.
+
+### Decision — redirect to `/dev/null` rather than drop the buffer
+
+There is no supported way to discard a `TextIOWrapper`'s buffer. Pointing the file descriptor
+at the null device and flushing again empties it against a device that cannot fail, so the
+interpreter's own final flush has nothing left to write. The alternative, `os._exit(status)`,
+would skip the flush too — and every other cleanup with it, including anything a future
+`finally` block needs.
+
+### Decision — the guard catches three types, not `Exception`
+
+`OSError` and `ValueError` are what a broken or closed stream raises; `AttributeError` covers
+a `None` stdout. **Corrected after review round 1:** this first said `except Exception` would
+swallow `KeyboardInterrupt` and `SystemExit`, which is false — both inherit directly from
+`BaseException`, so `except Exception` already lets them through. The catch that would eat
+them is `except BaseException`, which is the mutant (E) the interrupt test kills. The narrow
+tuple is kept anyway, for the reason that survives the correction: a guard should name what it
+expects, so an error nobody predicted reaches the journal instead of a status line.
+
+### Deviation
+
+- None of the three (config, `AppConfig`, prompt). No `src/` change, no migration, no unit
+  file change: guarding a print costs no time, so `WORST_CASE_SECONDS` is untouched at 246.
+
+### Rejected
+
+- **Guarding only the prints**: measured insufficient, above.
+- **`signal.signal(SIGPIPE, SIG_DFL)`**: it makes the process die on a signal instead of
+  reporting a status at all, which is the opposite of the criterion.
+- **`contextlib.suppress` at the call sites**: eleven suppressions instead of one helper, and
+  the next `print` added would not be covered.
+- **Writing diagnostics to stderr when stdout fails**: a second channel that can fail the same
+  way, with no rule for what happens then. The journal captures both streams identically.
+
+### Deferred (do not read the absence as an omission)
+
+- Nothing new. M1-344's fallback and the three subjects' behaviour are untouched.
+
+### Standing risk — not verifiable offline
+
+- The out-of-process test uses a pipe nobody reads, which is what `systemd` leaves when a
+  journal consumer goes away. A journal disk full enough to fail a write is not reproduced;
+  it takes the same `OSError` path as the pipe.
+
+### Mutation pass — five mutants, five dead
+
+Two survived the first pass and each bought a test:
+
+| Mutant | Killed by |
+| --- | --- |
+| A the `print` unguarded | `test_a_write_that_raises...[OSError]` |
+| B only `OSError` caught | the same test's `[ValueError]` case |
+| C the entry point drops `_quiet_shutdown` | `test_the_entry_point_flushes_before_it_exits` **(added: the child process patches boundaries itself, so it could not reach the real entry point)** |
+| D the shutdown flush not redirected | `test_a_closed_stdout_pipe_never_changes_the_exit_code[healthy]` |
+| E `_say` catches `BaseException` | `test_a_diagnostic_guard_never_swallows_an_interrupt` **(added)** |
