@@ -339,9 +339,23 @@ version: 11
 | `score` | appends local score rows and `scored` events | no | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
+| `tournament correct-costs` | **read-only** | no | no |
+| `tournament correct-costs --apply` | appends `cost_corrected` events | no | no |
 
 `run` is the live paid path and `run-replay` is the free one. The money boundary is a
 **subcommand name**, not a flag, deliberately (M1-315).
+
+`tournament correct-costs` (M1-348) corrects what the budget guard **counts**, not what was
+billed. Before M1-348 every bring-your-own-key model call (GPT-6 Astra) settled at $0, because
+OpenRouter reports `usage.cost: 0` for BYOK and the real charge in
+`usage.cost_details.upstream_inference_cost`. The command reads each reservation settled at 0,
+finds its stored `model_response`, and appends one `cost_corrected` event at the upstream
+figure. It makes no network call and needs no activation. Run it without `--apply` first: the
+dry run opens the ledger read-only and prints `reservations` and `total_usd`. A second
+`--apply` writes nothing (`already_corrected` counts what an earlier run wrote).
+`refused_no_upstream_figure` counts reservations settled at 0 with no BYOK figure. On the live
+ledger these are the Exa searches, which really do settle at 0. `tournament status` then
+reports `actual_cost_usd` including the corrections.
 
 ---
 

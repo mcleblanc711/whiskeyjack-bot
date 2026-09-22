@@ -320,9 +320,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     tournament = subparsers.add_parser("tournament", help="activated tournament operation")
     commands = tournament.add_subparsers(dest="tournament_command", required=True)
-    for name in ("run-once", "enable", "disable", "status", "reconcile-restored"):
+    for name in ("run-once", "enable", "disable", "status", "reconcile-restored", "correct-costs"):
         command = commands.add_parser(name)
         command.add_argument("--config", type=Path, default=Path("config.yaml"))
+        if name == "correct-costs":
+            # M1-348: dry run by default, and a dry run opens the ledger read-only.
+            command.add_argument(
+                "--apply",
+                action="store_true",
+                help="append the corrections; without it, report them and write nothing",
+            )
         if name == "run-once":
             command.add_argument(
                 "--question-id",
@@ -1911,6 +1918,26 @@ def _run_show(args: argparse.Namespace) -> int:
         connection.close()
 
 
+def _correct_costs(path: Path, *, apply: bool) -> int:
+    """``tournament correct-costs`` (M1-348): no activation, no network, no config binding.
+
+    The dry run opens the ledger with ``connect_readonly`` -- it must be safe to run against
+    the live ledger while the worker polls -- and only ``--apply`` opens it for writing.
+    """
+    import json
+
+    from whiskeyjack_bot.ledger import connect_readonly, open_verified_ledger
+    from whiskeyjack_bot.tournament_state import correct_costs
+
+    connection = open_verified_ledger(path) if apply else connect_readonly(path)
+    try:
+        report = correct_costs(connection, apply=apply)
+    finally:
+        connection.close()
+    print(json.dumps(report.as_dict(applied=apply), indent=2))
+    return 0
+
+
 def _run_tournament(args: argparse.Namespace) -> int:
     import json
     from datetime import datetime
@@ -1927,6 +1954,8 @@ def _run_tournament(args: argparse.Namespace) -> int:
         configure_logging(config)
         if args.tournament_command == "enable":
             initialize_ledger(config.storage.sqlite_path)
+        if args.tournament_command == "correct-costs":
+            return _correct_costs(config.storage.sqlite_path, apply=args.apply)
         connection = open_verified_ledger(config.storage.sqlite_path)
         try:
             if args.tournament_command == "enable":

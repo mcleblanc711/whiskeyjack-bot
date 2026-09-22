@@ -13192,3 +13192,237 @@ combinations as `@example`s on the property would make the property self-suffici
 backstopped, which is a two-line change any later round can make — and making it now would
 invalidate an approval that names this commit, for a case that is already covered deterministically.
 Recorded here so the choice is visible rather than silent.
+
+## M1-348 — Settle BYOK model cost from the upstream figure, and correct the past spend
+
+Acceptance, in short: *when `usage.is_byok` is exactly `True` the settled cost is the finite,
+non-negative `usage.cost_details.upstream_inference_cost`, otherwise `usage.cost`. When neither
+is valid, nothing settles and the reservation stays held. The basis is recorded on
+`model_completed` and `cost_settled`. `tournament correct-costs` appends an idempotent
+`cost_corrected` event, and `spending()` applies it over the settlement.*
+
+### Delivered
+
+- `tournament_state.py`:
+  - `settled_cost(usage)` (`:400`) is the one settlement rule. It is total over arbitrary JSON.
+  - `CostBasis = Literal["openrouter", "upstream_byok"]`.
+  - `Budget.settle(..., basis=)` (`:607`) records the basis on `cost_settled`.
+  - `spending()` (`:328`) validates what it reads through `_amounts` (`:311`) and applies
+    corrections.
+  - `correct_costs()` (`:473`), with `_correction` (`:453`), is the writer.
+- `forecast/priced.py`: a fresh call settles through `settled_cost` and writes `cost_basis` on
+  `model_completed`. Cache replay re-derives the cost through `_replayed_cost` (`:109`).
+- `forecast/generate.py:311`: `last_cost or manager.current_usage` becomes an explicit `is None`
+  test.
+- `cli.py`: `tournament correct-costs [--apply]`. The dry run opens the ledger with
+  `connect_readonly`, and only `--apply` opens it for writing. Neither needs an activation or
+  the network.
+- `docs/RUNBOOK.md`: two rows in "Which commands cost money", plus a paragraph. Section P3 is
+  untouched, because M1-347 owns it.
+- Tests: `tests/unit/test_byok_cost.py` (52) and
+  `tests/property/test_cost_settlement_properties.py` (6).
+- Backlog: M1-348 is flipped to `Done`, and **M1-350** is filed (see Deferred).
+
+### The measurement, reconciled before any write
+
+The brief expected the dry run to report **43 reservations, about $6.03**. The dry run against
+the live ledger (read-only, 2026-09-22) reported **52 reservations, $7.390294**, and 29 refused.
+Two checks explain the gap and confirm the method:
+
+- **Grouped by the settlement's `created_at_utc`, the running total reaches 43 reservations
+  and exactly $6.030120 at 2026-09-22T01 UTC**, which is the evening of 2026-09-21 MDT. The
+  other 9 are Astra calls made since. The brief's number was a snapshot, and the method agrees
+  with it to the micro-dollar.
+- **The 29 refused are Exa settlements.** Exa settles at 0 and writes no `model_response`, and
+  every one of the 29 is an `exa` reservation.
+
+All 52 are in scope `305299:33125`, which is the live activation's scope. The per-call
+micro-USD rounds up, as `settle` does, so the total is $7.390294 against a raw upstream sum of
+$7.3902805. Before M1-348, `spending()` for that scope read actual $0.343 and held $5.925. The
+number the deploy step should see is whatever the dry run prints at that time, not 43.
+
+### Decision — `is_byok` must be absent or exactly a `bool`, or the cost is unknown
+
+The criterion says "exactly `True` → upstream, otherwise `usage.cost`". Read literally,
+`is_byok: 1`, `"true"` or `null` falls through to `usage.cost`, which is 0 on every BYOK call:
+a malformed flag would then read as free. The stricter reading is the one that honours "an
+unknown cost never reads as free". Only absent or exactly `False` selects `usage.cost`. Any
+other value is unknown, and the reservation stays held. An absent flag has to select
+`usage.cost`, because the Sol responses and every existing test body omit it.
+
+### Decision — a BYOK call with no valid upstream figure never falls back to `usage.cost`
+
+Falling back would reinstate the bug for exactly the malformed case. On a BYOK call,
+`usage.cost` is 0 by construction, so it is never evidence of the price. The fallback mutant
+(b) is killed by 11 tests.
+
+### Decision — gates by exact type, and "representable" is part of "valid"
+
+`_valid_usd` admits only `type(x) is int` or `type(x) is float`, because `True` is an `int`.
+Two further cases would otherwise escape raw on provider JSON. A JSON integer too large for a
+float makes `float()` raise `OverflowError`. A finite float such as `1e305` overflows to `inf`
+once scaled to micro-USD, and `math.ceil(inf)` raises. Both are unknown. `Budget.settle` keeps
+its early-return shape and adds the same representability check through `_microusd`.
+
+### Decision — the cache replay re-derives the cost from the stored response
+
+`priced.py`'s replay path used to re-settle from `model_completed.cost`. For every pre-M1-348
+Astra call that is the BYOK `0.0`, so an interrupted settlement would have replayed as free.
+The replay now reads the reservation's stored `model_response` and applies `settled_cost`,
+which is the rule a fresh call uses. If there is no stored response (a crash between the two
+appends), it trusts `model_completed` only when the record carries a `cost_basis`, which only a
+post-M1-348 writer records. A pre-M1-348 `0.0` with no basis is unknown, and its reservation
+stays held. In practice, the settlement guard `cost_settled_id` makes replay a no-op for every
+reservation already settled, including the 52 settled at 0. Those are what `correct-costs`
+exists for. Replay does not rewrite them.
+
+### Decision — a correction replaces the settlement, applied as the larger of the two
+
+`spending()` applies `settled[r] = max(settled[r], corrected)`. A correction is only ever
+written over a settlement of 0, and there replace and max agree. Taking the max makes two
+properties hold for anything a restored or odd ledger could contain:
+
+- a second correction row cannot count twice, which is what "replace, never add" requires;
+- no append can lower actual spend, which is the monotonicity criterion.
+
+A plain `settled[r] = corrected` could lower a settlement. That is mutant (l), killed by the
+monotonicity property and by a unit test. A correction with no matching settlement is ignored,
+because its reservation is still held at the full estimate, which already over-counts it.
+
+### Decision — every `cost_settled` row carries `basis`, `null` for research providers
+
+`research/durable.py` settles Exa and AskNews through the same `Budget.settle`. Neither
+OpenRouter vocabulary member describes them, and a third member would widen a vocabulary the
+criterion names. So `basis` is keyword-only with a `None` default, and the row always has the
+key, which is `null` for research. `model_completed` gains `cost_basis` the same way.
+
+### Decision — `spending()` now validates every row it reads, not only corrections
+
+Adding a reader makes the existing reads new surface (the M1-341 lesson). A malformed
+`cost_reserved`, `cost_settled` or `cost_corrected` row used to escape as a raw
+`KeyError`/`TypeError`. It is now `StorageFailure("cannot read tournament spending")` with no
+value echoed. **Checked against the live ledger before deploy:** `spending()` reads both live
+scopes without refusing. Otherwise this change would stop the worker on its first poll.
+
+### Decision — `correct-costs` scans every scope and writes into the settlement's own scope
+
+The correction belongs to the budget the settlement counted against. The command therefore
+reads `cost_settled` with its `scope` column across the whole ledger, rather than taking the
+latest activation's scope. On the live ledger every candidate is in `305299:33125`. A
+reservation is corrected only if:
+
+- it was settled at exactly 0;
+- it has exactly one stored `model_response`;
+- that response yields an `upstream_byok` figure above 0 micro-USD.
+
+The planning read and the write are separate. Each write re-checks the `cost_corrected_id`
+guard inside its own `BEGIN IMMEDIATE` transaction, so a second run landing between this run's
+plan and its write adds nothing. `test_the_write_rechecks_the_guard_inside_its_transaction`
+drives exactly that interleaving.
+
+### Decision — `generate.py:716` still counts only `usage > 0` as a measured cost
+
+The criterion changes `:311` so that a priced client's real `0.0` is not replaced by the
+package's counter. `:716`'s `usage > 0.0` is left alone: `MonetaryCostManager` coerces an
+untrackable cost to `0.0`, and M1-303 round 3 settled that 0 from that source is unknown.
+Astra's calls now settle above 0, so `cost_usd` is populated for them either way.
+
+### Deviation
+
+**None of the three activation-retiring changes.** This branch makes no byte change to
+`config/tournament.yaml`, adds no `AppConfig` field, and makes no byte change to the prompt
+file. The live activation `52fe4db2…` survives the deploy. No migration:
+`tournament_events.kind` is free text (`012_tournament_safety.sql`), and the two new kinds are
+`cost_corrected` and `cost_corrected_id`.
+
+The one deviation from the brief is the count above: 52 against 43, reconciled rather than
+assumed.
+
+### Rejected — a second `cost_settled` row, or rewriting the first
+
+Rewriting is impossible, because `tournament_events` has no-update and no-delete triggers,
+and it would break the ledger's append-only rule anyway. A second `cost_settled` would need
+the `cost_settled_id` guard bypassed. It would also make `spending()`'s last-wins dict
+semantics carry the correction implicitly, where a reader could not tell a correction from a
+settlement. A distinct kind with its own guard is auditable on its face.
+
+### Rejected — refetching the cost from OpenRouter's `/generation` endpoint
+
+The criterion says no network calls, and the stored `model_response.usage` already carries
+the figure the provider reported at the time. A refetch would add a network dependency and a
+second source that could disagree with the first.
+
+### Rejected — correcting a non-BYOK settlement at 0, or writing a correction of 0
+
+A non-BYOK response settled at 0 was billed 0. A correction of 0 changes nothing. Both are
+counted in `refused_no_upstream_figure` and never written, so every `cost_corrected` row is a
+real change and equals what `settled_cost` would settle today.
+
+### Rejected — a witness file per correction
+
+Settlements have no witness either. A restored ledger that loses corrections has lost only
+derived accounting, and re-running `correct-costs` rewrites them idempotently from the
+surviving `model_response` rows.
+
+### Deferred (do not read the absence as an omission)
+
+- **Whether OpenRouter adds a BYOK fee on top of the upstream figure** (owner question,
+  blueprint row 4). The settled figure is the upstream charge only. If a BYOK response ever
+  reports `usage.cost > 0`, this branch ignores it, which undercounts by that fee. The unit
+  case `byok-ignores-cost` pins the current reading, so answering the question is a one-line
+  change with a failing test to flip.
+- **M1-350 (filed)**: `httpx`'s `response.json()` accepts `NaN`/`Infinity`, and
+  `priced.py`'s `model_response` append runs `canonical()` (`allow_nan=False`) outside the
+  `try`. A non-finite number anywhere in `usage` therefore escapes `invoke` as a raw
+  `ValueError`. Reproduced on `origin/master`. It is pre-existing: this branch's
+  `settled_cost` already treats a non-finite figure as unknown, and the escape is in the
+  journal write this branch does not touch.
+- `research/durable.py:26` passes a stored `actual_cost` read back from the ledger straight
+  to `settle`. A non-numeric stored value would raise `TypeError` in `math.isfinite`. That is
+  pre-existing, not reached by this branch, and outside its criteria.
+- `tournament status` gains no new keys. `actual_cost_usd` and `remaining_budget_usd` include
+  corrections because they come from `spending()`. A separate "corrected" figure was not
+  asked for, and a new key is a contract change for anything parsing the JSON.
+
+### Standing risk — not verifiable offline
+
+- The upstream figure is OpenRouter's report of the upstream provider's charge. Nothing here
+  checks it against the OpenAI invoice.
+- The first live BYOK call after deploy is the only proof that the response shape still
+  matches the one copied into the tests. Deploy step 5 checks for it:
+  `cost_settled.actual_microusd > 0` with `basis: "upstream_byok"`.
+
+### Mutation pass — thirteen mutants, thirteen dead
+
+Each mutant was applied to the committed tree with `__pycache__` cleared, and run against both
+new files under the `ci` profile.
+
+| Mutant | Killed by |
+|---|---|
+| (a) ignore `is_byok` | 23 tests, incl. `test_the_settled_figure_follows_is_byok[byok]` |
+| (b) settle 0 when the upstream figure is missing | 11, incl. `test_an_unknown_cost_never_settles` |
+| (c1) drop the in-transaction guard re-check | `test_the_write_rechecks_the_guard_inside_its_transaction` |
+| (c2) drop the guard entirely | `test_correct_costs_is_a_dry_run_until_applied_then_idempotent`, the idempotence property |
+| (d) add the correction to the settlement | `test_a_correction_replaces_the_settlement_and_never_adds_to_it` |
+| (e) replay trusts the stored `model_completed.cost` | both replay tests |
+| (f) `generate.py` back to `or` | `test_a_reported_zero_is_not_replaced_by_the_package_counter[0.0-0.0]` |
+| (g) truthy `is_byok` | 6 `test_an_unknown_cost_never_settles` cases |
+| (h) `isinstance(value, int)` (admits `True`) | 2 unit cases + the exactness property |
+| (i) apply a correction with no settlement | `test_a_correction_with_no_settlement_is_ignored_…` |
+| (j) correct from a non-BYOK basis | the idempotence property |
+| (k) correct a nonzero settlement | the dry-run unit test + the idempotence property |
+| (l) plain replace (can lower a settlement) | the monotonicity property + the replace unit test |
+
+**The vacuity trap, three times, each measured and fixed before this was written:**
+
+1. The first `usage` strategy reached the valid-BYOK branch in **3 of 400** draws.
+2. Repeating a strategy inside `st.one_of` does not weight it. That version still gave only
+   17 of 400, and an explicit `st.integers(0, 3).flatmap(...)` pick raised it to 48.
+3. The first reservation strategy had anything to correct in **7 of 150** draws. It now has
+   43, with 40 of those mixing corrections and refusals.
+
+Both reach rates are asserted by tests (`test_the_strategy_reaches_every_branch` and
+`test_the_ledger_strategy_reaches_corrections_and_refusals_together`), so a later edit to the
+strategies cannot quietly undo them. Separately, mutant (l) **survived** the monotonicity
+property on its first strategy, because `st.floats()` settlements rarely landed on the
+corrections' scale. It dies now.
