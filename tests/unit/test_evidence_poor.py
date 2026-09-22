@@ -27,7 +27,7 @@ from whiskeyjack_bot.tournament import (
     MAX_TRANSIENT_ATTEMPTS,
     comment_text,
 )
-from whiskeyjack_bot.tournament_state import TournamentError, append, utcnow
+from whiskeyjack_bot.tournament_state import TournamentError, append, enable, utcnow
 from tests.unit.test_tournament import case, poll  # noqa: F401 - `case` is a fixture
 
 __all__ = ["case"]
@@ -204,10 +204,33 @@ def test_one_retry_costs_at_most_one_more_asknews_reservation(
 # --- the base-rate fallback --------------------------------------------------------------
 
 
+def _live_gate(case: Any) -> None:
+    """Switch the harness to the LIVE sufficiency setting, `fail_on_stale_research: true`.
+
+    The harness inherits the committed default (false, flag only), under which a missed
+    stand-down of the sufficiency gate merely logs -- the mutation pass found that mutant
+    surviving. Re-enabled afterwards because any config change retires the activation, which
+    is the operator's real sequence too.
+    """
+    conn, config, _platform, _news, _model = case
+    config.forecast.fail_on_stale_research = True
+    enable(
+        conn,
+        config,
+        account_id=42,
+        project_id=32977,
+        starts=utcnow() - timedelta(minutes=1),
+        ends=utcnow() + timedelta(days=1),
+    )
+
+
+@pytest.mark.parametrize("live_gate", [False, True], ids=["default-gate", "live-gate"])
 def test_every_provider_finding_nothing_forecasts_evidence_poor_at_once(
-    case: Any, monkeypatch: pytest.MonkeyPatch
+    case: Any, monkeypatch: pytest.MonkeyPatch, live_gate: bool
 ) -> None:
     conn, _config, platform, news, model = case
+    if live_gate:
+        _live_gate(case)
     _clock(case, monkeypatch)
     _nothing_found(news, monkeypatch)
     exa = _EmptyExa()
