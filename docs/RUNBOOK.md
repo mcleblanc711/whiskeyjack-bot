@@ -139,6 +139,9 @@ were written.
 | `Tournament refused: tournament activation is disabled` | [P1](#p1--the-cup-profile-is-dormant-its-refusals-are-correct) |
 | `activation retired: ... changed; re-run tournament enable` | [C5](#c5--activation-retired) |
 | Polls succeed, heartbeats are fresh, and every poll discovers 0 questions while MiniBench has open ones | [P3](#p3--minibench-rolled-over-to-a-new-project) |
+| ntfy push `whiskeyjack: MINIBENCH ROLLED OVER` | [P3](#p3--minibench-rolled-over-to-a-new-project) |
+| ntfy push `whiskeyjack: MiniBench rollover cleared` | [P3](#p3--minibench-rolled-over-to-a-new-project) — the activation covers the series again; nothing to do |
+| ntfy push `whiskeyjack: rollover check failed` | [P3](#when-the-rollover-check-itself-fails) — the detector is blind, the worker is not down |
 | `operation artifact missing; platform reconciliation required` | [P2](#p2--a-ledger-copied-without-its-artifact-root-will-refuse) |
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
@@ -251,9 +254,22 @@ subdirectory rather than sharing `data/` with MiniBench under a different filena
 
 ### P3 — MiniBench rolled over to a new project
 
-**What you see.** Nothing looks wrong. `tournament run-once` exits 0 every five minutes,
-heartbeats are fresh, the watchdog stays quiet, and every poll discovers 0 questions. On
-Metaculus, MiniBench questions are open and nobody is forecasting them.
+**What you see.** An ntfy push titled `whiskeyjack: MINIBENCH ROLLED OVER`, priority
+`urgent`, within one watchdog run (five minutes) of the first open question on the new project
+(M1-347). Nothing else looks wrong: `tournament run-once` exits 0 every five minutes, heartbeats
+are fresh, `WORKER DOWN` stays quiet, and every poll discovers 0 questions. On Metaculus,
+MiniBench questions are open and nobody is forecasting them. Before M1-347 that was *all* you
+saw, which is how the rollover of 2026-09-21 went unnoticed for about twelve hours.
+
+The watchdog asks Metaculus what the `minibench` slug resolves to
+(`/api/projects/tournaments/minibench/`, the slug the pinned SDK names as
+`CURRENT_MINIBENCH_ID`) and compares that project id with `project_id` on the newest
+`activation` event in the ledger. It pages only when they differ **and** the new project has at
+least one open question — a new series with nothing open yet has nothing to lose. The push
+carries no project id or count, so read both from the commands under **Confirm**. It re-pages
+hourly while the mismatch stands, and at once if the series moves again to a third project.
+When the activation covers the series again you get one `whiskeyjack: MiniBench rollover
+cleared` notice. The page changes nothing: re-pointing stays your action.
 
 **Why.** Metaculus runs MiniBench as a series of projects. On 2026-09-21 00:00 UTC it moved
 from project 33122 to project 33125. An activation binds to one concrete project, so the worker
@@ -262,7 +278,8 @@ a question that opens and closes while the worker is on the old project is lost,
 That day cost 13 questions over about 12 hours.
 
 **Confirm.** Open the MiniBench tournament page on Metaculus and read the project id of the
-open questions. Compare it with `project_id` in `tournament status`.
+open questions. Compare it with `project_id` in `tournament status`. The watchdog's journal
+names which state it saw (`journalctl --user -u whiskeyjack-watchdog.service -n 5 -o cat`).
 
 **Recovery.** Two steps, in this order:
 
@@ -277,13 +294,37 @@ open questions. Compare it with `project_id` in `tournament status`.
      --budget-usd 40
    ```
 
-   `--starts` must predate the questions that are already open, or they are skipped.
+   `--starts` is the activation window's lower bound, and nothing else. The worker checks it
+   against the current time on every poll (`require_activation`); it does **not** filter
+   questions by when they opened. A `--starts` in the future makes every poll refuse as
+   inactive until that moment, and any question that closes in the meantime is lost. So set it
+   to now or earlier — the series' own start is the natural choice.
 
 Spending is tracked per project, so the new activation starts with its full budget.
 
 **Never.** Do not run `tournament disable` to tidy up the old series. It disables the
 **latest** activation (`tournament_state.py`, `disable`), and once step 2 is done that is the
 new one. The old activation is already superseded and needs nothing.
+
+#### When the rollover check itself fails
+
+An ntfy push titled `whiskeyjack: rollover check failed`, priority `default`, naming one of:
+
+| line | what went wrong |
+|---|---|
+| the live activation's project could not be read from the ledger | no `activation` event, a ledger the watchdog cannot open read-only, or a `project_id` that is not a positive integer |
+| Metaculus did not answer with a usable MiniBench project | the GET failed (network, HTTP error, a redirect, which is refused so the token cannot follow it) or answered something without a positive integer `id` |
+| Metaculus did not answer with a usable list of MiniBench's open posts | the projects differ, and the open-posts GET failed or answered something that is not a list of posts |
+| the check did not finish within 15 s | the reads, together, outran their wall-clock bound |
+
+Those four lines are the whole vocabulary. **The worker is not down** — this page never says so,
+and `WORKER DOWN` has its own rule. What it means is that a rollover would go unreported until
+the check can run again: usually a Metaculus outage or a slow answer, and it clears by itself on
+the next good read, silently. It re-pages every six hours while it stands. A failed read never
+clears or re-sends a `MINIBENCH ROLLED OVER` that is already standing.
+
+If it does not clear: `METACULUS_TOKEN` must be in `.env` (the watchdog unit loads it; Metaculus
+refuses the API to unauthenticated callers), and the watchdog's journal shows which line it hit.
 
 ### The three submission flags
 
@@ -670,12 +711,18 @@ runs under the system interpreter rather than the venv, imports nothing from the
 the ledger read-only and touches no `AppConfig` field** — it cannot change `config_sha256` and
 so cannot retire a live activation ([C5](#c5--activation-retired)).
 
-It watches two subjects with **separate state, separate throttles and separate pushes**: the
-poll (`whiskeyjack: WORKER DOWN`, heartbeat staleness, 60-minute re-alert) and
-the resolutions schedule (W1 above, no heartbeat rule, 24-hour re-alert). Neither can mute the
-other, and "worker recovered" is never sent while the schedule is still stopped.
+It watches three subjects with **separate state, separate throttles and separate pushes**: the
+poll (`whiskeyjack: WORKER DOWN`, heartbeat staleness, 60-minute re-alert),
+the resolutions schedule (W1 above, no heartbeat rule, 24-hour re-alert) and the MiniBench
+series ([P3](#p3--minibench-rolled-over-to-a-new-project), hourly re-alert; its failed check
+re-alerts every six hours). None can mute another, and "worker recovered" is never sent while
+the schedule is still stopped.
 
-A run makes eleven `systemctl` queries at most and prints two `OK:` lines. The resolutions half
+The third is the only one that touches the network for its evidence: one read-only GET to
+Metaculus per run, and a second only when the projects differ, all under one 15-second
+wall-clock bound, authenticated with `METACULUS_TOKEN` from the unit's `.env`.
+
+A run makes eleven `systemctl` queries at most and prints three `OK:` lines. The resolutions half
 asks its two timestamp queries (`LastTriggerUSec`, `ActiveEnterTimestamp`) only while the timer
 is active and enabled, and asks them under `TZ=UTC LC_ALL=C`, because `systemctl show` renders
 timestamps in the client's local zone and `--timestamp=` does not change that.
@@ -698,7 +745,7 @@ journalctl --user -u whiskeyjack-watchdog.service -n 5 -o cat --no-pager
 systemctl --user enable --now whiskeyjack-watchdog.timer
 ```
 
-A healthy run prints two `OK:` lines, one per subject, and exits `0`. Any fault exits `1`; the
+A healthy run prints three `OK:` lines, one per subject, and exits `0`. Any fault exits `1`; the
 unit has no `OnFailure`, so that exit is visible in `systemctl --user status` and nowhere else.
 
 ### Where the lifecycle stops today

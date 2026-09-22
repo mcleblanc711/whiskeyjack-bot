@@ -696,6 +696,21 @@ def test_the_runbooks_w1_table_is_the_whole_vocabulary(watchdog: Harness) -> Non
     assert documented == set(watchdog.module.RESOLUTIONS_PROBLEMS.values())
 
 
+def test_the_runbooks_p3_check_failed_table_is_the_whole_vocabulary() -> None:
+    """The same partition claim as W1's, for `rollover check failed` (M1-347)."""
+    runbook = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    section = runbook.split("#### When the rollover check itself fails", 1)[1]
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break
+    cells = [row.split("|")[1].strip() for row in rows]
+    assert cells[:2] == ["line", "---"], cells[:2]
+    assert set(cells[2:]) == set(_load().ROLLOVER_CHECK_PROBLEMS.values())
+
+
 def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
     """The criterion's first silence, and it is guard A's -- not the arithmetic's.
 
@@ -1850,6 +1865,7 @@ def test_an_unusable_rollover_state_entry_still_pages(watchdog: Harness) -> None
 class _Body:
     payload: bytes
     status: int = 200
+    limits: list[int] = field(default_factory=list)
 
     def __enter__(self) -> _Body:
         return self
@@ -1858,6 +1874,7 @@ class _Body:
         return None
 
     def read(self, limit: int = -1) -> bytes:
+        self.limits.append(limit)
         return self.payload if limit < 0 else self.payload[:limit]
 
 
@@ -1870,8 +1887,9 @@ def _serve(module: ModuleType, monkeypatch: pytest.MonkeyPatch, body: bytes) -> 
             requests.append(("handlers", handlers))
 
         def open(self, request: Any, timeout: float | None = None) -> _Body:
-            requests.append((request, timeout))
-            return _Body(body)
+            response = _Body(body)
+            requests.append((request, timeout, response))
+            return response
 
     monkeypatch.setattr(module.urllib.request, "build_opener", _Opener)
     return requests
@@ -1905,7 +1923,7 @@ def test_the_get_sends_the_token_as_a_header_refuses_redirects_and_stays_in_budg
     assert module._metaculus_get("/projects/tournaments/minibench/", time.monotonic() + 15) == {
         "id": 33125
     }
-    (_, handlers), (request, timeout) = requests
+    (_, handlers), (request, timeout, response) = requests
     assert handlers == (module._NoRedirect,)
     assert module._NoRedirect().redirect_request() is None
     assert request.full_url == "https://www.metaculus.com/api/projects/tournaments/minibench/"
@@ -1914,6 +1932,8 @@ def test_the_get_sends_the_token_as_a_header_refuses_redirects_and_stays_in_budg
     # Measured: the default `Python-urllib/3.x` agent is answered 403 even with a valid token.
     assert request.get_header("User-agent") == module.ROLLOVER_USER_AGENT
     assert 0 < timeout <= module.ROLLOVER_FETCH_SECONDS
+    # The read is bounded, one byte past the limit so an oversize answer is detectable.
+    assert response.limits == [module.ROLLOVER_RESPONSE_LIMIT + 1]
 
     with pytest.raises(TimeoutError):
         module._metaculus_get("/projects/tournaments/minibench/", time.monotonic() - 1)
