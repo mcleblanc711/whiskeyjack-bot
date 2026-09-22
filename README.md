@@ -7,8 +7,9 @@ questions, including individual subquestions in groups.
 The implementation includes research, model generation, numeric conversion, approval,
 submission, refetch verification, and private reasoning comments. Autonomous operation
 requires an explicit, expiring activation for one bot account and one concrete project.
-**Production project 33122 is not activated by this release.** The
-[testing-area rehearsal](docs/LAUNCH-REHEARSAL.md) verified one forecast and private comment,
+Production MiniBench is project **33125** since 2026-09-21 (it was 33122 before that; see
+[the runbook's rollover section](docs/RUNBOOK.md#p3--minibench-rolled-over-to-a-new-project)).
+The [testing-area rehearsal](docs/LAUNCH-REHEARSAL.md) verified one forecast and private comment,
 then repeated without duplicates or additional spending.
 
 ## Install and verify
@@ -44,7 +45,7 @@ contains the deployment host's absolute paths; review those before installing el
 uv run whiskeyjack-bot tournament status --config config/tournament.yaml
 # Only after owner authorization, bind the reviewed profile to a validity window:
 uv run whiskeyjack-bot tournament enable --config config/tournament.yaml \
-  --project-id 33122 --starts '<UTC ISO timestamp>' --ends '<UTC ISO timestamp>' \
+  --project-id 33125 --starts '<UTC ISO timestamp>' --ends '<UTC ISO timestamp>' \
   --budget-usd 20
 uv run whiskeyjack-bot tournament run-once --config config/tournament.yaml
 uv run whiskeyjack-bot tournament disable --config config/tournament.yaml

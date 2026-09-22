@@ -1,7 +1,8 @@
 # Tournament operator runbook
 
 Production activation requires owner authorization for the reviewed account, project
-**33122**, validity window, and **US$20** ceiling. Committing configuration, installing a
+**33125** (MiniBench's series from 2026-09-21; 33122 before that, see `docs/RUNBOOK.md` P3),
+validity window, and budget ceiling (at most US$40). Committing configuration, installing a
 service, or passing tests does not activate the bot. Use testing project **32977** for
 rehearsals, with separate SQLite and artifact paths.
 

@@ -158,12 +158,13 @@ DOCUMENTED_COMMANDS: Final = frozenset(
         "score",
         "show",
         "submit",
+        "tournament",
         "unrecorded-posts",
         "verify-env",
         "verify-submission",
     }
 )
-DOCUMENTED_INVOCATION_COUNT: Final = 16
+DOCUMENTED_INVOCATION_COUNT: Final = 17
 
 
 def subparsers_of(parser: ArgumentParser) -> dict[str, ArgumentParser]:
@@ -192,7 +193,7 @@ def placeholder_for(action: Action) -> str:
     """
     if action.choices:
         return str(next(iter(action.choices)))
-    return "1" if action.type is int else "x"
+    return "1" if action.type in (int, float) else "x"
 
 
 def parseable_argv(argv: list[str]) -> list[str]:
