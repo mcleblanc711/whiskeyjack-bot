@@ -668,3 +668,61 @@ def test_the_shared_throttle_rule_is_total_and_silent_only_for_its_own_key_in_wi
         assert due is True
     else:
         assert due == (elapsed >= window.total_seconds())
+
+
+# ── M1-344: the state file round-trips whatever the filesystem does ──────────
+
+JSON_VALUES = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.text(max_size=20),
+    lambda children: (
+        st.lists(children, max_size=3) | st.dictionaries(st.text(max_size=8), children, max_size=3)
+    ),
+    max_leaves=10,
+)
+STATES = st.dictionaries(st.text(max_size=12), JSON_VALUES, max_size=5)
+
+
+def test_what_is_saved_is_what_the_next_run_loads_whichever_file_took_it() -> None:
+    """For any state and any of four filesystem conditions, `_save_state` never raises, and
+    `_load_state` in a FRESH module (a new run) returns exactly the saved dict whenever the
+    save said it landed. Reach is measured: all three save outcomes must occur."""
+    import os
+    import stat
+    import tempfile
+
+    reached: dict[str, int] = {"primary": 0, "fallback": 0, "nowhere": 0}
+
+    @given(state=STATES, primary_ok=st.booleans(), fallback_ok=st.booleans())
+    def check(state: dict, primary_ok: bool, fallback_ok: bool) -> None:
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as root:
+            base = Path(root)
+            home, run = base / "home", base / "run"
+            home.mkdir()
+            run.mkdir()
+            if not primary_ok:
+                home.chmod(stat.S_IRUSR | stat.S_IXUSR)
+            if not fallback_ok:
+                run.chmod(stat.S_IRUSR | stat.S_IXUSR)
+            previous = os.environ.get("XDG_RUNTIME_DIR")
+            os.environ["XDG_RUNTIME_DIR"] = str(run)
+            try:
+                writer, reader = _load(), _load()
+                writer.STATE = reader.STATE = home / "wj-watchdog.json"
+                landed, error = writer._save_state(state)
+                if landed is None:
+                    reached["nowhere"] += 1
+                    assert error is not None
+                    assert reader._load_state() == {}
+                else:
+                    reached["primary" if error is None else "fallback"] += 1
+                    assert reader._load_state() == json.loads(json.dumps(state))
+            finally:
+                if previous is None:
+                    os.environ.pop("XDG_RUNTIME_DIR", None)
+                else:
+                    os.environ["XDG_RUNTIME_DIR"] = previous
+                home.chmod(0o700)
+                run.chmod(0o700)
+
+    check()
+    assert all(count > 0 for count in reached.values()), reached

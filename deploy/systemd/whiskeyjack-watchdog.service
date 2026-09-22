@@ -16,6 +16,8 @@ ExecStart=/home/cleblanc/.local/bin/wj-watchdog
 # tournament half and before the resolutions page was ever attempted. 240 clears 190 and stays
 # under the 300s timer interval, so a hung run is always dead before the next one is due.
 # WORST_CASE_SECONDS in deploy/wj-watchdog is the arithmetic; a test compares the two.
-TimeoutStartSec=240
+# 260 since M1-344: its persistence push took the worst case from 238s to 246s. Still under
+# the 300s interval.
+TimeoutStartSec=260
 UMask=0077
 NoNewPrivileges=true
