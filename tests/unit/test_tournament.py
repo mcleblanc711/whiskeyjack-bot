@@ -210,10 +210,13 @@ def test_one_command_confirms_forecast_and_private_comment_and_repeat_is_idle(ca
     assert result["heartbeat"]["failures"] == 0
     repeated = poll(case)
     assert repeated["comment_completed"] == 1
-    assert (case[2].posts, case[2].comment_posts, case[3].calls, case[4].calls) == (1, 1, 2, 1)
+    # posts, comments, AskNews calls (one per retrieval since M1-352), model calls.
+    assert (case[2].posts, case[2].comment_posts, case[3].calls, case[4].calls) == (1, 1, 1, 1)
     approval = case[0].execute("SELECT actor FROM approval_events").fetchone()[0]
     assert approval.startswith("policy:launch-v1:")
-    assert result["reserved_cost_usd"] == 0.15  # AskNews charges are estimates, never free.
+    # AskNews charges are estimates, never free. 0.025 for the one `latest news` call since
+    # M1-352; it was 0.15 while the `news knowledge` pass (0.125) was also issued.
+    assert result["reserved_cost_usd"] == 0.025
 
 
 def test_empty_tournament_is_successful_idle_poll(case: Any) -> None:
@@ -250,7 +253,7 @@ def test_deterministic_refusal_is_recorded_and_never_re_purchased(
 
     assert poll(case)["heartbeat"]["failures"] == 1
     first = news.calls
-    assert first == 2, "one retrieval is two AskNews calls, never one"
+    assert first == 1, "one retrieval is one AskNews call since M1-352 dropped the historical pass"
 
     row = conn.execute("SELECT event_type, detail_code FROM pipeline_failure_events").fetchone()
     assert tuple(row) == ("research_failed", expected_code), (
@@ -273,14 +276,14 @@ def test_editing_the_question_re_qualifies_a_blocked_question(case: Any) -> None
     blocked = conn.execute(
         "SELECT COUNT(*) FROM tournament_events WHERE kind='question_blocked'"
     ).fetchone()[0]
-    assert blocked == 1 and news.calls == 2
+    assert blocked == 1 and news.calls == 1
 
     poll(case)
-    assert news.calls == 2, "unchanged question: still blocked"
+    assert news.calls == 1, "unchanged question: still blocked"
 
     news.raw["question"]["title"] += " (revised)"
     poll(case)
-    assert news.calls == 4, "an edited question must be retrieved again"
+    assert news.calls == 2, "an edited question must be retrieved again"
 
 
 def test_transient_exhaustion_records_the_blocked_question(
@@ -1051,7 +1054,7 @@ def test_a_named_resolution_source_no_longer_refuses_the_forecast(case: Any) -> 
 
     assert result["heartbeat"]["failures"] == 0, "a missing resolution source is not a failure"
     assert platform.posts == 1 and model.calls == 1, "the forecast must actually be made"
-    assert news.calls == 2, "one retrieval, two AskNews calls"
+    assert news.calls == 1, "one retrieval, one AskNews call since M1-352"
 
     rows = [
         (scope, json.loads(data))
@@ -1084,7 +1087,7 @@ def test_a_forecast_from_the_named_source_records_no_gap(case: Any) -> None:
     platform.raw["question"]["resolution_criteria"] = "Resolves per https://www.example.org/x ."
 
     assert poll(case)["heartbeat"]["failures"] == 0
-    assert platform.posts == 1 and news.calls == 2
+    assert platform.posts == 1 and news.calls == 1
     assert (
         conn.execute("SELECT COUNT(*) FROM tournament_events WHERE kind='evidence_gap'").fetchone()[
             0
@@ -1117,7 +1120,7 @@ def test_pre_activation_attempts_do_not_retire_a_question(case: Any) -> None:
 
     result = poll(case)
 
-    assert news.calls == 2, "legacy checkpoints must not read as exhausted attempts"
+    assert news.calls == 1, "legacy checkpoints must not read as exhausted attempts"
     assert platform.posts == 1 and result["heartbeat"]["failures"] == 0
     assert result["heartbeat"].get("exhausted", 0) == 0
 

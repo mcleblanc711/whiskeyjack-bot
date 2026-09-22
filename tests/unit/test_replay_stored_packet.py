@@ -347,15 +347,18 @@ def test_only_freshness_changes_between_the_two_instants(days: int) -> None:
 def test_the_stored_bodies_parse_to_the_packet_the_run_recorded() -> None:
     """The fixture is evidence, so what it parses to is asserted, not assumed.
 
-    One retrieval is two AskNews calls, never one -- two strategies per query -- and the run
-    this fixture came from stored one article under both of them. Carrying that duplicate is
-    deliberate: it is what keeps the ledger's ``UNIQUE (retrieval_run_id, canonical_url,
-    content_sha256)`` collapse in the replay instead of leaving it to the real run.
+    **This is a statement about the stored FIXTURE, not about today's adapter.** The run it
+    was captured from made two AskNews calls -- two strategies per query, as the adapter
+    issued them before M1-352 dropped the historical pass -- and stored one article under
+    both. Carrying that duplicate is deliberate: it is what keeps the ledger's
+    ``UNIQUE (retrieval_run_id, canonical_url, content_sha256)`` collapse in the replay
+    instead of leaving it to the real run. A recorded run is immutable, so this count must
+    NOT follow the adapter.
     """
     packet = stored_packet()
     articles = sum(len(body["as_dicts"]) for body in stored_bodies())
 
-    assert len(stored_bodies()) == 2, "one retrieval is two AskNews calls, never one"
+    assert len(stored_bodies()) == 2, "the recorded run made two calls, as the adapter did then"
     assert articles == _PROVENANCE["articles_kept"]
     assert len(packet.documents) < articles, "the run's dedup collapse must survive reduction"
     assert {d.retrieval_run_id for d in packet.documents} == {RETRIEVAL_RUN_ID}
@@ -485,13 +488,14 @@ def test_a_deterministic_verdict_over_real_evidence_is_never_re_purchased(replay
     """
     first = replay.poll()
     assert first["heartbeat"]["failures"] == 1
-    assert replay.news.calls == 2, "one retrieval is two AskNews calls, never one"
+    assert replay.news.calls == 1, "one retrieval is one AskNews call since M1-352"
     billed, refetched = replay.news.calls, replay.platform.refetches
 
-    # 0.025 for the `latest news` strategy plus 0.125 for `news knowledge`, in microdollars.
-    # Exact, not `> 0`: it pins that both strategies were bought and that the Exa fallback --
-    # which this question's named resolution authority does trigger -- billed nothing.
-    assert replay.reserved() == 150_000
+    # 0.025 for the `latest news` strategy, in microdollars. It was 150_000 until M1-352
+    # dropped the `news knowledge` pass (0.125). Exact, not `> 0`: it pins what was bought,
+    # and that the Exa fallback -- which this question's named resolution authority does
+    # trigger -- billed nothing.
+    assert replay.reserved() == 25_000
 
     # `stale_evidence`, not merely "some deterministic code": it pins the branch to the one
     # an aged-out packet takes, which an empty packet could not reach.
@@ -509,7 +513,7 @@ def test_a_deterministic_verdict_over_real_evidence_is_never_re_purchased(replay
     second = replay.poll()
 
     assert replay.news.calls == billed, "a deterministic verdict must never be re-purchased"
-    assert replay.reserved() == 150_000, "declining must reserve nothing"
+    assert replay.reserved() == 25_000, "declining must reserve nothing"
     assert replay.platform.refetches == refetched, "the skip precedes the Metaculus refetch"
     assert replay.model.calls == replay.platform.posts == 0
     assert second["heartbeat"]["blocked"] == 1
@@ -538,18 +542,19 @@ def test_without_the_gate_the_same_second_poll_buys_the_same_evidence_again(
     monkeypatch.setattr(whiskeyjack_tournament, "DETERMINISTIC_FAILURE_CODES", frozenset())
 
     replay.poll()
-    assert replay.news.calls == 2
-    assert replay.reserved() == 150_000
+    assert replay.news.calls == 1
+    assert replay.reserved() == 25_000
     assert replay.blocks() == [], "the verdict is no longer classified as deterministic"
 
     replay.advance(ADVANCE)
     again = replay.poll()
 
-    assert replay.news.calls == 4, (
+    assert replay.news.calls == 2, (
         "with nothing blocking it, the advance must reach the provider again -- otherwise "
-        "the zero in the replay test is a warm cache rather than the gate"
+        "the zero in the replay test is a warm cache rather than the gate; two retrievals, "
+        "one call each since M1-352"
     )
-    assert replay.reserved() == 300_000, "the second retrieval must really be re-billed"
+    assert replay.reserved() == 50_000, "the second retrieval must really be re-billed"
     assert again["heartbeat"]["failures"] == 1
     assert len(replay.failure_rows()) == 2, "the same verdict was re-derived at full price"
 
@@ -568,15 +573,15 @@ def test_a_second_poll_inside_the_window_proves_nothing_about_the_gate(
     monkeypatch.setattr(whiskeyjack_tournament, "DETERMINISTIC_FAILURE_CODES", frozenset())
 
     replay.poll()
-    assert replay.news.calls == 2
+    assert replay.news.calls == 1
 
     replay.advance(timedelta(minutes=10))
     replay.poll()
 
-    assert replay.news.calls == 2, (
+    assert replay.news.calls == 1, (
         "inside the window a second poll is free with or without the gate"
     )
-    assert replay.reserved() == 150_000
+    assert replay.reserved() == 25_000
 
 
 def test_an_edited_question_is_re_qualified_and_re_purchased(replay: Any) -> None:
@@ -591,7 +596,7 @@ def test_an_edited_question_is_re_qualified_and_re_purchased(replay: Any) -> Non
     """
     replay.poll()
     billed = replay.news.calls
-    assert billed == 2
+    assert billed == 1
     assert len(replay.blocks()) == 1
 
     replay.raw["question"]["title"] += " (revised)"

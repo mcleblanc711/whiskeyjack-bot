@@ -745,7 +745,7 @@ def test_unpriced_calls_are_counted_rather_than_added_as_zero(
     assert batch.unpriced_calls == len(sdk.news.calls) + 3, (
         "every billable retrieval request, plus one unpriced model call per question"
     )
-    assert len(sdk.news.calls) == 6, "three one-query questions at two strategies each"
+    assert len(sdk.news.calls) == 3, "three one-query questions, one strategy each (M1-352)"
     assert batch.stop_reason == "completed"
     assert batch.records_written == 3
 
