@@ -102,6 +102,46 @@ def _confirmed(conn: sqlite3.Connection, record_id: str) -> bool:
     return bool(events(conn, "forecast_confirmed", record_id))
 
 
+def _attempts(
+    conn: sqlite3.Connection, scope: str, fingerprint: str, activation: dict[str, Any]
+) -> int:
+    """Counted attempts at this question under this activation (M1-326/M1-327's counter)."""
+    return sum(
+        1
+        for event in events(conn, "question_started", scope)
+        if event.get("fingerprint") == fingerprint
+        and event.get("activation_id") == activation["activation_id"]
+    )
+
+
+def _awaiting_retry(
+    conn: sqlite3.Connection,
+    scope: str,
+    fingerprint: str,
+    activation: dict[str, Any],
+    now: datetime,
+) -> bool:
+    """Whether the current checkpoint window already ended in a provider failure (M1-349).
+
+    The window is the one the attempt path below pins ``now`` to: the latest
+    ``question_started`` for this fingerprint, if it is at most 1800 s old. Once it has
+    expired this is False, so the next poll appends a fresh ``question_started`` and the
+    retry is a counted attempt.
+    """
+    checkpoints = events(conn, "question_started", scope)
+    if not checkpoints or checkpoints[-1].get("fingerprint") != fingerprint:
+        return False
+    started = checkpoints[-1]["at"]
+    if (now - datetime.fromisoformat(started)).total_seconds() > 1800:
+        return False
+    return any(
+        event.get("started_at") == started
+        and event.get("fingerprint") == fingerprint
+        and event.get("activation_id") == activation["activation_id"]
+        for event in events(conn, "retry_wait", scope)
+    )
+
+
 def _notify_blocked(scope: str, *, reason: str, detail: str | None) -> None:
     """Report that a question will not be attempted again under this activation (M1-329).
 
@@ -281,16 +321,48 @@ def reconcile_forecast(
     return True
 
 
+EVIDENCE_POOR_NOTICE: Final = (
+    "Evidence: none retrieved. No research documents were retrieved for this question, so "
+    "this forecast rests on a base rate and the model's prior alone.\n\n"
+)
+
+
+def is_evidence_poor(conn: sqlite3.Connection, record: Any) -> bool:
+    """Whether ``record`` carries a valid M1-349 evidence-poor marker.
+
+    The marker is an ``evidence_gap`` row with code ``evidence_poor``, scoped to the record
+    and bound to its ``forecast_sha256``. A marker whose hash is not this record's is
+    refused rather than ignored: it describes some other content, and reading it as
+    absent would let the record be published as though it had evidence.
+    """
+    markers = [
+        event
+        for event in events(conn, "evidence_gap", record.record_id)
+        if event.get("code") == "evidence_poor"
+    ]
+    if not markers:
+        return False
+    digest = record_sha256(record)
+    if any(event.get("forecast_sha256") != digest for event in markers):
+        raise TournamentError("evidence-poor marker does not match the forecast hash")
+    return True
+
+
 def comment_text(conn: sqlite3.Connection, record_id: str) -> str:
     record = read_forecast_record(conn, record_id)
     forecast = record.forecast.model_dump(mode="json")
     # These are the public concise response fields requested by the forecaster schema.
     forecast.pop("as_of_utc", None)
+    # M1-349: said in the comment, above the rationale, because the rationale itself is
+    # model output inside `forecast_sha256` and replayed byte for byte (M1-406), so it
+    # cannot be rewritten after the fact. A record without the marker is unchanged.
+    notice = EVIDENCE_POOR_NOTICE if is_evidence_poor(conn, record) else ""
     return (
         f"Whiskeyjack forecast — subquestion {record.question_id}: {record.question.title}\n\n"
-        f"Concise forecast and rationale:\n{json.dumps(forecast, ensure_ascii=False, indent=2)}\n\n"
+        + notice
+        + f"Concise forecast and rationale:\n{json.dumps(forecast, ensure_ascii=False, indent=2)}\n\n"
         + "Sources:\n"
-        + "\n".join(s.canonical_url for s in record.sources)
+        + ("\n".join(s.canonical_url for s in record.sources) or "(none)")
         + f"\n\nModel: {record.model_settings.name}; prompt: {record.model_settings.prompt_version}"
         + f" ({record.model_settings.prompt_sha256})\n"
         + f"Record: [whiskeyjack:{record_id}]\nForecast SHA256: {record_sha256(record)}"
@@ -647,12 +719,7 @@ def run_once(
                 heartbeat["skipped"] += 1
                 heartbeat["blocked"] = heartbeat.get("blocked", 0) + 1
                 continue
-            attempts = sum(
-                1
-                for event in events(conn, "question_started", scope)
-                if event.get("fingerprint") == fingerprint
-                and event.get("activation_id") == activation["activation_id"]
-            )
+            attempts = _attempts(conn, scope, fingerprint, activation)
             if attempts >= MAX_TRANSIENT_ATTEMPTS:
                 # Round 1 finding B1: exhaustion skipped the question but recorded no
                 # `question_blocked` row, so the exhausted question was visible only as an
@@ -675,6 +742,13 @@ def run_once(
                 _notify_blocked(scope, reason="transient_attempts_exhausted", detail=None)
                 heartbeat["skipped"] += 1
                 heartbeat["exhausted"] = heartbeat.get("exhausted", 0) + 1
+                continue
+            if _awaiting_retry(conn, scope, fingerprint, activation, now):
+                # M1-349: this checkpoint window already bought research that a provider
+                # failed to deliver. Declined for free until the window expires, when the
+                # next poll starts a new, counted attempt (see `retry_wait` below).
+                heartbeat["skipped"] += 1
+                heartbeat["retry_wait"] = heartbeat.get("retry_wait", 0) + 1
                 continue
             existing = conn.execute(
                 "SELECT record_id FROM forecast_records WHERE question_id=? AND tournament_id=? "
@@ -744,6 +818,34 @@ def run_once(
                             forecaster=clients[0],
                             news_client=clients[1],
                             web_client=clients[2],
+                            # M1-349: an empty retrieval becomes an evidence-poor base-rate
+                            # forecast rather than a block -- at once when no provider
+                            # failed, and on the LAST transient attempt when one did.
+                            # Counted after the checkpoint above, so it includes this one.
+                            evidence_poor_fallback=True,
+                            final_attempt=_attempts(conn, scope, fingerprint, activation)
+                            >= MAX_TRANSIENT_ATTEMPTS,
+                        )
+                    if (
+                        outcome.status == "research_failed"
+                        and outcome.detail_code == "provider_error"
+                    ):
+                        # M1-349: pace the retry. Inside one checkpoint window `now` is
+                        # pinned and no `question_started` is appended, so without this
+                        # every 5-minute poll re-bought the research and none of them
+                        # counted as an attempt -- six purchases per counted attempt. The
+                        # gate above reads this row and declines the question until the
+                        # window expires, so each retry is one purchase and one attempt.
+                        append(
+                            conn,
+                            "retry_wait",
+                            scope,
+                            {
+                                "at": utcnow().isoformat(),
+                                "fingerprint": fingerprint,
+                                "activation_id": activation["activation_id"],
+                                "started_at": now.isoformat(),
+                            },
                         )
                     if (
                         outcome.status == "not_recorded"
@@ -792,6 +894,10 @@ def run_once(
                 )
                 if not replay_forecast(conn, replay_config, record_id=record_id).matches:
                     raise StorageFailure("saved forecast cannot be replayed")
+                # M1-349: read before approval, so a marker bound to other content stops the
+                # question before anything is posted, not after the forecast is up and only
+                # the comment is left to refuse. Its value is not needed here.
+                is_evidence_poor(conn, record)
                 if current_status(conn, record_id) == "validated":
                     approve(
                         conn,

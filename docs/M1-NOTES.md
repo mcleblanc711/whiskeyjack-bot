@@ -13716,3 +13716,194 @@ Both reach rates are asserted by tests (`test_the_strategy_reaches_every_branch`
 strategies cannot quietly undo them. Separately, mutant (l) **survived** the monotonicity
 property on its first strategy, because `st.floats()` settlements rarely landed on the
 corrections' scale. It dies now.
+
+## M1-349 — Retry a failed provider before blocking, then an evidence-poor base-rate forecast
+
+Owner decision 2026-09-22 (the Do-now blueprint's row 3a). Backlog row filed by PR #115.
+
+### Delivered
+
+- **The classification.** `_Research.provider_failed` now reads *any* run in the chain
+  (`pipeline_live.any_provider_failed`), not `RetrievalOutcome.provider_failed`, which asks
+  whether the *last* run failed. When AskNews failed and Exa then answered with nothing, the
+  last run had succeeded, so the empty result was recorded as `no_evidence`, a member of
+  `DETERMINISTIC_FAILURE_CODES`, and the first poll blocked the question for good over what
+  was an outage. It is now `provider_error`, which is transient and retried under the existing
+  `MAX_TRANSIENT_ATTEMPTS = 3`.
+- **Retry pacing** (`tournament._awaiting_retry`, new `retry_wait` event kind). See the
+  decision below: without it, a retry was not one purchase.
+- **The base-rate fallback** (`pipeline_live.evidence_poor_reason`, opt-in by
+  `_attempt_question(evidence_poor_fallback=True, final_attempt=...)`, and only the tournament
+  worker asks). A retrieval that found no document is forecast from an explicit empty packet
+  in two cases. `no_documents`: every provider answered and none found anything; this happens
+  at once. `provider_failed_exhausted`: a provider failed and this is the last transient
+  attempt. The packet is `load_packet` over the attempt's own runs, so the approval policy's
+  `require_research_artifacts` reproduces its hash from the `research_checkpoint` exactly as
+  it does for a packet with documents. Validation, replay, approval and posting are the
+  ordinary path. The only gates that stand down are the two that exist to say "this packet is
+  empty": `quality_problem`'s `no_evidence` and the sufficiency gate's `no_evidence`. Both
+  stand down only for an attempt already judged evidence-poor, and the sufficiency flag is
+  logged instead of failing.
+- **The marker.** An `evidence_gap` row with `code: "evidence_poor"`, `reason`,
+  `question_id`, `tournament_id` and `forecast_sha256`. It is written in the record's own
+  transaction and scope, beside M1-327's `named_source_absent`.
+  `tournament.is_evidence_poor` refuses a marker whose hash is not the record's, and it runs
+  twice: before approval (so nothing is posted under a claim about other content) and in
+  `comment_text`.
+- **The published comment** carries `EVIDENCE_POOR_NOTICE` above the rationale, and
+  `Sources:` reads `(none)` instead of an empty line. That `(none)` also applies to an *unmarked* record with no
+  sources. None exists today: with a document supplied, M1-501's attribution requires at
+  least one citation. Review round 1 noted that the request's "every record without the
+  marker is unchanged" was one clause too broad for this.
+- **None of the three.** No `config/*.yaml` byte, no `AppConfig` field, no prompt byte.
+  Provider `retries` stay 0. No migration.
+
+### Decision — reuse `provider_error`, not a new detail code
+
+`pipeline_failure_events.detail_code` is a closed `CHECK` vocabulary (`004`). A new code such
+as `provider_failed_empty` would mean rebuilding the table (M2-711's lesson), on a live ledger,
+mid-tournament. `provider_error` already means exactly "a provider failed, so this outcome says
+nothing about the question", which is why the packet-is-`None` branch already used it when the
+*last* provider failed. The fix is to make that branch's test true in the case it missed.
+
+### Decision — a retry is paced to the checkpoint window, so each retry is one purchase
+
+This was found by writing the paid-call test first, and it is the reason the retry is not a
+one-line change. Inside one 1800 s checkpoint window, `run_once` pins `now` to the window's
+`question_started` and appends no new one. So a transient research failure was re-bought on
+every 5-minute poll, and none of those purchases counted as an attempt: up to six AskNews
+retrievals per counted attempt, eighteen before the cap. The old exhaustion test never saw
+this because it advances the clock 31 minutes between polls.
+
+After a `research_failed/provider_error` outcome the worker now appends
+`retry_wait {fingerprint, activation_id, started_at}`. `_awaiting_retry` declines the question
+for free (`heartbeat.retry_wait`) while the same window is current. When the window expires,
+the next poll appends a fresh `question_started`, so the retry is a counted attempt that makes
+one purchase. `test_one_retry_costs_at_most_one_more_asknews_reservation` measures it:
+1 AskNews reservation after the first attempt, still 1 after five polls inside the window,
+exactly 2 after the retry. It counts `cost_reserved` rows and billed calls, never
+`research_runs`.
+
+### Decision — the last attempt forecasts; there is no fourth attempt
+
+"Retries exhausted" could be read as "after the third failure, attempt once more,
+evidence-poor". That attempt would buy research a fourth time only to throw it away. Instead,
+the third attempt itself becomes the evidence-poor forecast when its retrieval still comes
+back empty. `final_attempt` is `_attempts(...) >= MAX_TRANSIENT_ATTEMPTS`, counted after the
+checkpoint append, so it includes the current attempt. The attempt also has what an
+evidence-poor record needs: the run ids for the FK and for the reproducible packet hash.
+
+### Decision — evidence-poor means an EMPTY retrieval, never an unusable one
+
+The stricter reading of "every provider genuinely returned zero documents". A retrieval with
+documents that are all stale, future-dated or irrelevant is still `quality_problem`'s
+deterministic verdict and still blocks
+(`test_documents_that_are_all_unusable_still_block`). The evidence-poor state is decided before
+the quality gate, and only from `research.packet is None`, so a packet with documents cannot
+reach it.
+
+### Decision — the marker is the existing `evidence_gap` kind
+
+It fits: it is already scoped to the record, already carries `forecast_sha256`, and already
+means "this forecast was made without X". The existing 14 live rows all carry
+`code: "named_source_absent"` (read 2026-09-22). The kind's one other reader in the tree is
+`tournament status`, which counts distinct scopes whatever the code, so an evidence-poor
+record now also counts toward `evidence_gaps` there. That is a true statement about it.
+
+### Decision — no validator change
+
+M1-501's attribution rules already stand down three of their seven rules when the packet
+supplied no documents (`forecast/attribution.py`'s module docstring), and the rest still
+apply. So a reply that cites `src-001` from an empty packet is `schema_invalid`, which is
+deterministic and blocks (`test_a_schema_invalid_evidence_poor_reply_still_blocks`). Nothing
+was loosened, globally or locally.
+
+### Deviation
+
+- **None of the three**: no config, `AppConfig` or prompt byte. The activation
+  `52fe4db2…` is untouched by this merge.
+- **"The published comment and rationale must say that no evidence was retrieved"** is met
+  in the comment, above its "Concise forecast and rationale" section, and not by rewriting
+  `rationale_summary`. That field is model output inside `forecast_sha256`, and
+  `replay_forecast` re-derives it byte for byte from the stored reply before every post
+  (M1-406). Rewriting it would make every evidence-poor record fail its own replay. What the
+  model writes there is its own, and it is shown an empty `research_documents`.
+- **The classification change also reaches the paid `run` CLI.** A failed primary with an
+  empty fallback is now recorded as `research_failed/provider_error` there too, instead of
+  `no_evidence`. That is the true code for it, and nothing on that path blocks or retries on
+  either code. The fallback itself stays tournament-only.
+
+### Rejected
+
+- **A new `pipeline_failure_events` detail code**: a `CHECK` rebuild on a live ledger. See
+  above.
+- **Setting provider `retries` above 0**: this retires the activation. It was excluded by the
+  owner decision.
+- **Rewriting `rationale_summary`** to state the gap: breaks replay. See Deviation.
+- **A new event kind for the marker**: `evidence_gap` already has the shape. See above.
+- **An evidence-poor fallback for `stale_evidence` / unusable documents**: those are verdicts
+  about evidence that exists. See above.
+- **Pacing by a new constant, separate from the checkpoint window**: a second clock for the
+  same notion of "one attempt" would let the two disagree about what an attempt is.
+
+### Deferred (do not read the absence as an omission)
+
+- **The same money pump on the generation side, filed as M1-351.** A transient
+  `generation_failed` (`internal_error`, `timeout`, …) inside a checkpoint window is
+  re-invoked on every poll: the research is reused, but the model call (~$0.14 on Astra) is
+  bought again each time without counting as an attempt. Measured on this branch with the
+  launch harness (a model that raises, six polls 5 minutes apart): **6 model calls, 1 counted
+  attempt, 1 research purchase**. The live 45754 history (10 `internal_error` attempts
+  against a cap of 3) is consistent with that. It is out of this
+  item's criterion, which is about retrieval. `retry_wait` is keyed on the research outcome
+  only, so extending it is a separate decision with its own test.
+  Review round 1 (APPROVE, non-blocking) added a second path to the same row, now in its
+  criterion: after an evidence-poor attempt whose *generation* fails transiently, the next
+  attempt re-buys the retrieval too, because `_research` reuses a checkpoint only when its
+  packet has documents.
+- **An operator push for an evidence-poor post.** Not asked for. The marker, the comment and
+  `tournament status`'s `evidence_gaps` make it visible, and a new alert is new surface on
+  the ntfy path.
+
+### Standing risk — not verifiable offline
+
+- How the live model (GPT-6 Astra) answers an empty `research_documents` has not been
+  observed. If it cites ids anyway, the reply is `schema_invalid`: the question blocks exactly
+  as it did before this item. That is no worse, but it means the fallback may post nothing.
+  The first live evidence-poor attempt is the measurement.
+- `require_research_artifacts` needs a raw artifact for every run in the packet, failed runs
+  included. On the live ledger all 134 runs (including the 17 with an `error_summary`) carry
+  a `raw_response_path` (read 2026-09-22), so this holds today. A failed run written with
+  retention disabled would stop the worker with `StorageFailure` rather than post, which is
+  the safe direction.
+
+### Mutation pass — thirteen mutants, thirteen dead
+
+Run on the committed branch with `PYTHONDONTWRITEBYTECODE=1` and every `__pycache__`
+removed before each mutant (the stale-bytecode trap). Each mutant ran against
+`tests/unit/test_evidence_poor.py`, `tests/property/test_evidence_poor_properties.py` and
+`tests/unit/test_tournament.py`.
+
+| Mutant | Killed by |
+| --- | --- |
+| M1 classify by the LAST run again | failed primary + empty fallback, end to end |
+| M2 drop the marker | same |
+| M3 `stale_evidence` retries (dropped from the deterministic set) | `test_documents_that_are_all_unusable_still_block[future]` |
+| M4 no `retry_wait` gate | `test_one_retry_costs_at_most_one_more_asknews_reservation` |
+| M5 exhausted on every attempt (ignore `final_attempt`) | failed primary + empty fallback |
+| M6 no pre-approval marker check | `test_a_marker_for_other_content_is_refused_and_nothing_is_posted` |
+| M7 `quality_problem` not stood down | failed primary + empty fallback |
+| M8 sufficiency gate not stood down | `test_every_provider_finding_nothing_forecasts_evidence_poor_at_once[live-gate]` |
+| M9 never the final attempt | failed primary + empty fallback |
+| M10 no comment notice | same |
+| M11 hash mismatch ignored | `test_a_marker_for_other_content_is_refused_and_nothing_is_posted` |
+| M12 fallback never asked for | failed primary + empty fallback |
+| M13 `retry_wait` never written | the paid-call test |
+
+**M8 survived the first pass.** The launch harness inherits the committed default
+`fail_on_stale_research: false`, so a sufficiency gate that failed to stand down only
+logged. The live config sets it `true`. The `[live-gate]` variant sets it and re-runs
+`enable`, since a config change retires the activation there as it does live, and it kills M8.
+M13's first pattern did not match, because the formatter had wrapped the line. It was re-run,
+not counted as a kill.
+
