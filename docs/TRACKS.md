@@ -81,8 +81,14 @@ near zero this time, with no other lane open when it started and one when it mer
 | M1-612 | feat/m1-612-show-record-history | whiskeyjack-m1-612 | no | none | 2026-09-16 |
 | M1-343 | feat/m1-343-watchdog-stale-timer | whiskeyjack-m1-343 | no | none | 2026-09-19 |
 | M1-346 | feat/m1-346-scoring-noleak-constant | whiskeyjack-m1-346 | no | none | 2026-09-20 |
-| M1-347 | feat/m1-347-watchdog-rollover | whiskeyjack-m1-347 | no | none | 2026-09-22 |
 | M1-349 | feat/m1-349-evidence-poor-base-rate | whiskeyjack-m1-349 | no | none | 2026-09-22 |
+| M1-344 | feat/m1-344-watchdog-unwritable-state | whiskeyjack-m1-344 | no | none | 2026-09-22 |
+
+*(Swept the **M1-347** row (merged PR #114, round 1 changes then round 2 approve, 2026-09-22 —
+the watchdog rollover detector), the one drop `finish-item.sh` asked for and NEXT.md assigns to
+M1-344. Checked before making it: `origin` held `master` alone, `origin/master` carried the row, and
+`whiskeyjack-m1-347` is gone. **M1-349's row is left in place** — it is the next branch's one
+sweep (M1-345). Earlier sweep note follows.)*
 
 *(Swept the **M1-348** row (merged PR #113, round-1 approve, 2026-09-22 — BYOK cost settlement
 from the upstream figure), the one drop the M1-349 brief assigns to this branch. Checked before

@@ -47,6 +47,7 @@ never a "worker down" -- a Metaculus outage is not the worker's.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -62,6 +63,13 @@ from pathlib import Path
 ROOT = Path("/home/cleblanc/projects/whiskeyjack-bot")
 LEDGER = ROOT / "data/whiskeyjack_bot.sqlite3"
 STATE = Path.home() / ".local/state/wj-watchdog.json"
+# Where the stamps go when STATE cannot be written (M1-344): the user's runtime directory, a
+# tmpfs systemd creates for the user manager and that every user unit inherits. Read from the
+# environment at call time, not here, so the tests can point it at a temporary directory.
+FALLBACK_STATE_NAME = "wj-watchdog.json"
+# How often a standing persistence failure pages: once a day, the resolutions subject's
+# window, and for the same reason -- it is a condition that holds until a person acts.
+PERSISTENCE_REALERT_AFTER = timedelta(hours=24)
 
 UNIT = "whiskeyjack-tournament"
 STALE_AFTER = timedelta(minutes=20)  # 4 missed polls at a 5-minute cadence
@@ -104,6 +112,12 @@ DEADMAN_TIMEOUT_SECONDS = 10
 # so less than that would fail on an ordinary slow response) and 8s for one ntfy POST, 238s.
 ROLLOVER_FETCH_SECONDS = 15
 ROLLOVER_PUSH_TIMEOUT_SECONDS = 8
+# M1-344 adds one push, the persistence alert, sent only when the state file could not be
+# written. At 238s there was no room for it inside 240, so the unit's TimeoutStartSec moves to
+# 260: still under the 300s timer interval (a hung run is dead before the next is due), and the
+# test that reads the unit file checks both ends. Eight seconds, like the rollover push, rather
+# than PUSH_TIMEOUT_SECONDS: it is the last call of the run and the least urgent.
+PERSISTENCE_PUSH_TIMEOUT_SECONDS = 8
 WORST_CASE_SECONDS = (
     11 * SYSTEMCTL_TIMEOUT_SECONDS
     + LEDGER_TIMEOUT_SECONDS
@@ -111,6 +125,7 @@ WORST_CASE_SECONDS = (
     + DEADMAN_TIMEOUT_SECONDS
     + ROLLOVER_FETCH_SECONDS
     + ROLLOVER_PUSH_TIMEOUT_SECONDS
+    + PERSISTENCE_PUSH_TIMEOUT_SECONDS
 )
 
 RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
@@ -334,20 +349,168 @@ def _load_state() -> dict:
     Reproduced by execution at `3dda485`: `[]` in the file, a stopped resolutions timer, and
     the run died before it asked a single resolutions question. A hand-edited state file is an
     ordinary operator action, and the whole point of this file is to notice when things stop.
+
+    M1-344: two files, not one. When STATE could not be written, the stamps went to the
+    fallback in the runtime directory instead, so that file -- when it exists, is usable, and
+    is NEWER than STATE -- is the current state. Newer by modification time rather than by a
+    stamp inside it, because both files hold the same dict and a person may have edited either.
+    A tie goes to STATE.
     """
+    primary = _read_state(STATE)
+    fallback_path = _fallback_state_path()
+    fallback = _read_state(fallback_path) if fallback_path is not None else None
+    if fallback is None:
+        return primary if primary is not None else {}
+    if primary is None or _mtime_ns(fallback_path) > _mtime_ns(STATE):
+        return fallback
+    return primary
+
+
+def _read_state(path: Path) -> dict | None:
     try:
-        loaded = json.loads(STATE.read_text())
+        loaded = json.loads(path.read_text())
     except Exception:
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
-def _save_state(state: dict) -> None:
+def _mtime_ns(path: Path | None) -> int:
     try:
-        STATE.parent.mkdir(parents=True, exist_ok=True)
-        STATE.write_text(json.dumps(state))
+        return path.stat().st_mtime_ns if path is not None else -1
     except OSError:
-        pass
+        return -1
+
+
+def _fallback_state_path() -> Path | None:
+    """`$XDG_RUNTIME_DIR/wj-watchdog.json`, or None when there is no usable runtime directory.
+
+    An unset, relative or empty value is None rather than a guess: a relative path would land
+    in whatever the working directory is, which is the repo checkout.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if not runtime or not os.path.isabs(runtime):
+        return None
+    path = Path(runtime) / FALLBACK_STATE_NAME
+    return None if path == STATE else path
+
+
+def _errno_name(exc: OSError) -> str:
+    """`EACCES`, `EROFS`, `ENOSPC`... never the exception's text, which can quote a path twice
+    and is the platform's prose rather than this program's."""
+    return errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write `text` to `path` so that a failure leaves the old file whole (M1-344).
+
+    `write_text` truncates first and writes second, so a full disk mid-write left a
+    half-written file: invalid JSON, which `_load_state` reads as an EMPTY state -- every
+    throttle stamp lost at once, exactly the failure the fallback exists to prevent. Here the
+    bytes go to a sibling temporary file and `os.replace` swaps it in whole; any failure
+    removes the temporary file (best effort) and raises.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _save_state(state: dict) -> tuple[Path | None, str | None]:
+    """Persist `state`. Never raises. Returns (where it landed or None, STATE's errno name).
+
+    **Still never raises, and that stays deliberate.** The watchdog is the one unit with no
+    `OnFailure` pager, so a watchdog that dies because it could not write a stamp reports
+    nothing at all. What M1-344 changes is that the failure no longer costs the throttle: the
+    stamps go to the runtime-directory fallback, which `_load_state` reads back next run, and
+    `_report_persistence` says so. When STATE is writable again the fallback is removed, so a
+    stale copy can never shadow it (and if the removal fails, STATE is the newer file anyway).
+    """
+    text = json.dumps(state)
+    try:
+        _write_atomic(STATE, text)
+    except OSError as exc:
+        primary_error = _errno_name(exc)
+    else:
+        fallback_path = _fallback_state_path()
+        if fallback_path is not None:
+            try:
+                fallback_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return STATE, None
+    fallback_path = _fallback_state_path()
+    if fallback_path is None:
+        return None, primary_error
+    try:
+        _write_atomic(fallback_path, text)
+    except OSError:
+        return None, primary_error
+    return fallback_path, primary_error
+
+
+def _report_persistence(state: dict, landed: Path | None, primary_error: str | None) -> None:
+    """Make a state-file failure visible without making it the reason `main` exits non-zero.
+
+    Kept OUT of every subject's fault vocabulary on purpose (M1-343's lesson): `_throttle_key`
+    hashes a subject's whole code set, so adding "state unwritable" to one would re-key every
+    standing condition and page each of them once more. It has its own key, `persistence`, and
+    its own 24-hour window, stamped in the same state -- which is to say in the fallback, since
+    that is the only place a stamp can land while this is true.
+
+    Three cases:
+
+    - STATE written: nothing to say, beyond clearing a previous failure.
+    - STATE failed, fallback written: a status line every run, and one push a day. The
+      subjects' own windows hold, because their stamps are in the fallback.
+    - Both failed: a status line every run and NO push. Nothing durable is left to stamp a
+      window in, so a push here would repeat every run, and so will the subjects' pages -- which
+      this line exists to explain in the journal. There is no bound to be had without storage.
+    """
+    if primary_error is None:
+        if state.pop("persistence", None) is not None:
+            print(f"STATE: {STATE} is writable again")
+            _save_state(state)
+        return
+    if landed is None:
+        print(
+            f"STATE: cannot write {STATE} ({primary_error}) or the runtime-directory fallback; "
+            "throttle windows cannot hold, so standing faults page on every run"
+        )
+        return
+    print(f"STATE: cannot write {STATE} ({primary_error}); stamps kept in {landed} instead")
+    stored = state.get("persistence")
+    if not isinstance(stored, dict):
+        stored = {}
+    last_alert = _aware_stamp(stored.get("last_alert"))
+    now = _now()
+    if last_alert is not None and timedelta(0) <= now - last_alert < PERSISTENCE_REALERT_AFTER:
+        return
+    body = (
+        f"The watchdog cannot write its state file {STATE} ({primary_error}).\n\n"
+        f"Its throttle stamps are being kept in {landed}, which is cleared at reboot, so each "
+        "standing fault may page once more after a restart. Every check still runs.\n\n"
+        f"Check: ls -l {STATE}; df -h {STATE.parent}"
+    )
+    delivered = _push(
+        "whiskeyjack: watchdog state unwritable",
+        body,
+        priority="default",
+        tags="warning",
+        timeout=PERSISTENCE_PUSH_TIMEOUT_SECONDS,
+    )
+    if delivered:
+        state["persistence"] = {"last_alert": now.isoformat(), "error": primary_error}
+        _save_state(state)
 
 
 def _push(
@@ -1067,7 +1230,10 @@ def main() -> int:
     # Last, and with nothing downstream of it: the only subject that waits on the network, so
     # the other two have already paged by the time it could be slow.
     rollover_down = _check_rollover(state)
-    _save_state(state)
+    # M1-344: after the save, because only the save knows whether it failed. Reported, never
+    # returned: a state file that cannot be written is not one of the three subjects, and
+    # it must not be the reason this run exits non-zero.
+    _report_persistence(state, *_save_state(state))
     return 1 if tournament_down or resolutions_down or rollover_down else 0
 
 

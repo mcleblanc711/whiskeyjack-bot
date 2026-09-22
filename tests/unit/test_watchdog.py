@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -234,6 +235,10 @@ def watchdog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     harness = Harness(module=module, units=healthy_units(), pushes=[])
     harness.real_metaculus_get = module._metaculus_get
     monkeypatch.setattr(module, "STATE", tmp_path / "wj-watchdog.json")
+    # Hermetic (M1-344): the fallback lives in $XDG_RUNTIME_DIR, and the real one on this host
+    # may hold a live copy that `_load_state` would otherwise prefer.
+    (tmp_path / "run").mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     monkeypatch.setattr(module, "LEDGER", ledger)
     monkeypatch.setattr(module, "_systemctl", harness.systemctl)
     monkeypatch.setattr(module, "_metaculus_get", harness.metaculus)
@@ -328,6 +333,7 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
         + module.DEADMAN_TIMEOUT_SECONDS
         + module.ROLLOVER_FETCH_SECONDS
         + module.ROLLOVER_PUSH_TIMEOUT_SECONDS
+        + module.PERSISTENCE_PUSH_TIMEOUT_SECONDS
     )
 
 
@@ -386,6 +392,7 @@ def test_every_outward_call_passes_the_timeout_the_budget_counts(
         return _Response()
 
     monkeypatch.setattr(module, "STATE", tmp_path / "state.json")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setattr(module, "LEDGER", ledger)
     monkeypatch.setattr(module, "_now", lambda: ANCHOR)
     monkeypatch.setattr(module.subprocess, "run", fake_run)
@@ -1124,6 +1131,7 @@ def test_the_timestamp_queries_ask_in_utc_and_the_others_are_unchanged(
     ledger = tmp_path / "data" / "l.sqlite3"
     seeded_ledger(ledger, heartbeat_at=ANCHOR - timedelta(minutes=2))
     monkeypatch.setattr(module, "STATE", tmp_path / "state.json")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setattr(module, "LEDGER", ledger)
     monkeypatch.setattr(module, "_now", lambda: ANCHOR)
     monkeypatch.setattr(module.subprocess, "run", fake_run)
@@ -1494,6 +1502,7 @@ def test_the_watchdog_imports_nothing_from_the_package_it_watches() -> None:
     assert imported <= {
         "__future__",
         "datetime",
+        "errno",  # M1-344: names a state-file failure (EACCES, ENOSPC) without its prose
         "json",
         "os",
         "pathlib",
@@ -1985,3 +1994,247 @@ def test_no_payload_value_appears_in_any_push_or_on_stdout(
             assert leaked not in text, (leaked, text)
     if scenario == "rollover":
         assert " 7 " not in watchdog.titled(ROLLED)[0]["body"]
+
+
+# ── M1-344: an unwritable state file ─────────────────────────────────────────
+#
+# Every window above is keyed on a PERSISTED stamp, so a state file that cannot be written used
+# to cost the whole throttle: each run read an empty state, judged the standing condition unpaged
+# and pushed again -- 288 resolutions pages a day instead of 1, 288 worker pages instead of 24.
+# The day is driven with a FRESH module per run (the witness is outside the program: nothing may
+# carry over in memory between two runs of a oneshot unit), from the fixed ANCHOR (T-909), and the
+# four clocks are explicit: the run cadence (5 min), the worker window (60 min), the resolutions
+# window (24 h) and the persistence window (24 h).
+
+
+def _unwritable(directory: Path) -> Path:
+    """A state path whose directory refuses new files (EACCES): the temporary file for the
+    atomic write cannot be created, and neither can the target."""
+    directory.mkdir()
+    directory.chmod(0o500)
+    return directory / "wj-watchdog.json"
+
+
+def _fresh_run(watchdog: Harness, monkeypatch: pytest.MonkeyPatch, state: Path) -> int:
+    """One run of a freshly compiled module wired to the same fakes: a new process, in effect."""
+    module = _load()
+    for name, value in (
+        ("STATE", state),
+        ("LEDGER", watchdog.module.LEDGER),
+        ("_systemctl", watchdog.systemctl),
+        ("_metaculus_get", watchdog.metaculus),
+        ("_push", watchdog.push),
+        ("_ping_deadman", watchdog.ping),
+        ("_now", lambda: watchdog.instant[0]),
+    ):
+        monkeypatch.setattr(module, name, value)
+    return int(module.main())
+
+
+@pytest.fixture()
+def restore_modes(tmp_path: Path) -> Any:
+    yield
+    # pytest's own tmp_path cleanup cannot descend into a 0500 directory.
+    for path in tmp_path.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o700)
+
+
+def test_a_day_with_an_unwritable_state_file_pages_at_the_documented_rates(
+    watchdog: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    restore_modes: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The criterion: 288 runs, two standing faults, the state file unwritable throughout."""
+    state = _unwritable(tmp_path / "ro")
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    for _ in range(288):
+        assert _fresh_run(watchdog, monkeypatch, state) == 1
+        watchdog.instant[0] += timedelta(minutes=5)
+
+    assert not state.exists()
+    assert len(watchdog.titled("WORKER DOWN")) == 24, "one per 60 minutes, as documented"
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, "one per 24 hours"
+    reported = watchdog.titled("watchdog state unwritable")
+    assert len(reported) == 1, "the persistence failure pages once a day, not once a run"
+    assert str(state) in reported[0]["body"] and "EACCES" in reported[0]["body"]
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("STATE:")]
+    assert len(lines) == 288, "and it is on every run's status line"
+    assert all("EACCES" in line for line in lines)
+
+
+def test_an_unwritable_state_file_is_never_the_reason_the_run_fails(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_modes: None
+) -> None:
+    state = _unwritable(tmp_path / "ro")
+    for _ in range(3):
+        assert _fresh_run(watchdog, monkeypatch, state) == 0, "healthy subjects exit 0"
+        watchdog.instant[0] += timedelta(minutes=5)
+    assert len(watchdog.titled("watchdog state unwritable")) == 1
+    assert watchdog.titled("WORKER DOWN") == []
+
+
+def test_with_no_fallback_either_the_line_says_the_windows_cannot_hold(
+    watchdog: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    restore_modes: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Nothing durable is left, so no bound is claimed and no persistence page is sent (it
+    would repeat every run). The subjects page every run, and the line says why."""
+    state = _unwritable(tmp_path / "ro")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(_unwritable(tmp_path / "run-ro").parent))
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    for _ in range(3):
+        assert _fresh_run(watchdog, monkeypatch, state) == 1
+        watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.titled("watchdog state unwritable") == []
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 3
+    out = capsys.readouterr().out
+    assert out.count("throttle windows cannot hold") == 3
+
+
+def test_a_write_that_fails_part_way_leaves_the_old_stamps_whole(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ENOSPC after the bytes were handed over. `write_text` truncated first, so this used to
+    leave a half-written file that `_load_state` reads as EMPTY -- every stamp lost at once."""
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    assert watchdog.run() == 1
+    before = Path(watchdog.module.STATE).read_bytes()
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1
+
+    def full_disk(descriptor: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    real_fsync = watchdog.module.os.fsync
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+
+    def fsync(descriptor: int) -> None:
+        # Only the primary's write fails; the fallback (another filesystem) succeeds.
+        if not any(runtime in Path(p).parents for p in _open_paths(descriptor)):
+            full_disk(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(watchdog.module.os, "fsync", fsync)
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 1
+
+    assert Path(watchdog.module.STATE).read_bytes() == before, "the old file is untouched"
+    assert not list(Path(watchdog.module.STATE).parent.glob(".wj-watchdog.json.*.tmp"))
+    assert (runtime / "wj-watchdog.json").exists(), "the stamps went to the fallback"
+    reported = watchdog.titled("watchdog state unwritable")
+    assert len(reported) == 1 and "ENOSPC" in reported[0]["body"]
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 1, "the window still held"
+
+
+def _open_paths(descriptor: int) -> list[str]:
+    try:
+        return [os.readlink(f"/proc/self/fd/{descriptor}")]
+    except OSError:
+        return []
+
+
+def test_a_writable_state_file_again_retires_the_fallback(
+    watchdog: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory = tmp_path / "ro"
+    state = _unwritable(directory)
+    assert _fresh_run(watchdog, monkeypatch, state) == 0
+    fallback = Path(os.environ["XDG_RUNTIME_DIR"]) / "wj-watchdog.json"
+    assert fallback.exists()
+
+    directory.chmod(0o700)
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert _fresh_run(watchdog, monkeypatch, state) == 0
+    assert state.exists() and not fallback.exists()
+    assert "persistence" not in json.loads(state.read_text(encoding="utf-8"))
+    assert "is writable again" in capsys.readouterr().out
+
+
+def test_a_newer_fallback_wins_and_an_older_one_never_shadows_the_state_file(
+    watchdog: Harness,
+) -> None:
+    module = watchdog.module
+    fallback = Path(os.environ["XDG_RUNTIME_DIR"]) / "wj-watchdog.json"
+    Path(module.STATE).write_text(json.dumps({"from": "state"}), encoding="utf-8")
+    fallback.write_text(json.dumps({"from": "fallback"}), encoding="utf-8")
+    os.utime(Path(module.STATE), ns=(1_000_000_000, 1_000_000_000))
+    os.utime(fallback, ns=(2_000_000_000, 2_000_000_000))
+    assert module._load_state() == {"from": "fallback"}
+    os.utime(fallback, ns=(1_000_000_000, 1_000_000_000))
+    assert module._load_state() == {"from": "state"}, "a tie goes to the state file"
+    fallback.write_text("[]", encoding="utf-8")
+    os.utime(fallback, ns=(3_000_000_000, 3_000_000_000))
+    assert module._load_state() == {"from": "state"}, "an unusable fallback is no state at all"
+
+
+def test_the_persistence_page_carries_the_path_and_never_the_files_contents(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_modes: None
+) -> None:
+    """The path is operator configuration (the M1-401 carve-out); the contents are not."""
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    state = directory / "wj-watchdog.json"
+    state.write_text(json.dumps({"planted": "wj-planted-value-0001"}), encoding="utf-8")
+    directory.chmod(0o500)
+    state.chmod(0o400)
+    _fresh_run(watchdog, monkeypatch, state)
+    (page,) = watchdog.titled("watchdog state unwritable")
+    assert str(state) in page["body"]
+    assert all("wj-planted-value-0001" not in push["body"] for push in watchdog.pushes)
+    assert all("wj-planted-value-0001" not in push["title"] for push in watchdog.pushes)
+
+
+def test_the_persistence_failure_joins_no_subjects_fault_vocabulary(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_modes: None
+) -> None:
+    """M1-343's lesson: a code added to a subject's set re-keys its throttle and re-pages every
+    standing condition at deploy. The resolutions key must be the same whether or not the
+    state file is writable."""
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+    assert watchdog.run() == 1
+    writable_key = watchdog.state()["resolutions"]
+
+    state = _unwritable(tmp_path / "ro")
+    _fresh_run(watchdog, monkeypatch, state)
+    fallback = Path(os.environ["XDG_RUNTIME_DIR"]) / "wj-watchdog.json"
+    stored = json.loads(fallback.read_text(encoding="utf-8"))
+    assert stored["resolutions"]["key"] == writable_key["key"]
+
+
+def test_a_state_file_stamped_in_the_future_outranks_every_fallback_until_overtaken(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restore_modes: None
+) -> None:
+    """The documented limit of newest-wins (M1-344 review round 1): after a backwards clock
+    step, an unwritable STATE whose mtime is still ahead wins over every fallback written since,
+    so a standing fault re-pages each run -- until a fallback write's mtime passes STATE's."""
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    state = directory / "wj-watchdog.json"
+    state.write_text("{}", encoding="utf-8")
+    ahead = time.time_ns() + 3600 * 10**9
+    os.utime(state, ns=(ahead, ahead))
+    directory.chmod(0o500)
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    for _ in range(3):
+        assert _fresh_run(watchdog, monkeypatch, state) == 1
+        watchdog.instant[0] += timedelta(minutes=5)
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 3, "the limit, pinned"
+
+    fallback = Path(os.environ["XDG_RUNTIME_DIR"]) / "wj-watchdog.json"
+    os.utime(state, ns=(1, 1))  # the fallback's writes have now overtaken it
+    assert _fresh_run(watchdog, monkeypatch, state) == 1
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert _fresh_run(watchdog, monkeypatch, state) == 1
+    assert fallback.exists()
+    assert len(watchdog.titled("RESOLUTIONS SCHEDULE STOPPED")) == 3, "and then the window holds"
