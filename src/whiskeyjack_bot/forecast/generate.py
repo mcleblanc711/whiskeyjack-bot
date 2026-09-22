@@ -308,7 +308,9 @@ async def _invoke_once(client: Forecaster, messages: list[dict[str, str]]) -> tu
     """
     with MonetaryCostManager() as manager:
         text = await client.invoke(messages)
-        usage = getattr(client, "last_cost", None) or manager.current_usage
+        # `is None`, not `or` (M1-348): a priced client's real 0.0 must not be replaced.
+        reported = getattr(client, "last_cost", None)
+        usage = manager.current_usage if reported is None else reported
     return text, usage
 
 

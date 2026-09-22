@@ -1,5 +1,8 @@
 """Bounded, explicitly priced OpenRouter requests with auditable effective parameters (M1-408).
 
+M1-348 settles a bring-your-own-key call from its upstream figure; see
+:func:`whiskeyjack_bot.tournament_state.settled_cost`.
+
 Launch shipped this as a Sol-only client, with the model ID, the OpenRouter ``max_price`` and
 the budget reservation estimate each hard-coded from Sol's prices. M1-408 moves the tournament
 forecaster to GPT-6 Astra (5x Sol's prices), and the three numbers have to move together:
@@ -17,7 +20,6 @@ from __future__ import annotations
 
 import os
 import asyncio
-import math
 import json
 from dataclasses import dataclass
 from typing import Any, Final
@@ -28,7 +30,13 @@ from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError, append, canonical
 
 
-from whiskeyjack_bot.tournament_state import digest, events
+from whiskeyjack_bot.tournament_state import (
+    CostBasis,
+    StorageFailure,
+    digest,
+    events,
+    settled_cost,
+)
 from whiskeyjack_bot.redaction import redact_secrets
 
 # Output ceiling per call. `tournament.run_once` also requires model.max_output_tokens to
@@ -98,6 +106,33 @@ def reservation_estimate_usd(request: dict[str, Any], model: PricedModel) -> flo
     )
 
 
+def _replayed_cost(
+    conn: Any, reservation_id: str, completed: dict[str, Any]
+) -> tuple[float, CostBasis] | None:
+    """What a cached call settles at on replay (M1-348): re-derived, never trusted as stored.
+
+    The stored ``model_response`` for the reservation carries the provider's ``usage``, so
+    replay settles through the same rule a fresh call does. That matters for every GPT-6
+    Astra call made before M1-348: its ``model_completed.cost`` is the BYOK ``0.0``, and
+    re-settling that would make an interrupted settlement read as free. A completion with
+    no stored response (a crash between the two appends) is trusted only if it carries a
+    ``cost_basis``, which only a post-M1-348 writer records; a pre-M1-348 ``0.0`` with no
+    basis is unknown, and its reservation stays held.
+    """
+    responses = events(conn, "model_response", reservation_id)
+    if responses:
+        response = responses[-1]
+        return settled_cost(response.get("usage") if type(response) is dict else None)
+    basis, cost = completed.get("cost_basis"), completed.get("cost")
+    if basis == "upstream_byok":
+        found = settled_cost({"is_byok": True, "cost_details": {"upstream_inference_cost": cost}})
+    elif basis == "openrouter":
+        found = settled_cost({"is_byok": False, "cost": cost})
+    else:
+        found = None
+    return found
+
+
 class PricedClient:
     def __init__(self, config: AppConfig) -> None:
         priced = PRICED_MODELS.get(config.model.name)
@@ -116,9 +151,18 @@ class PricedClient:
         if budget:
             cached = events(budget.conn, "model_completed", cache_scope)
             if cached:
-                self.last_cost = cached[-1]["cost"]
-                started = events(budget.conn, "model_started", cache_scope)[-1]
-                budget.settle(started["reservation_id"], self.last_cost)
+                starts = events(budget.conn, "model_started", cache_scope)
+                started = starts[-1] if starts else None
+                reservation_id = started.get("reservation_id") if type(started) is dict else None
+                if type(reservation_id) is not str or type(cached[-1]) is not dict:
+                    raise StorageFailure("cannot read tournament journal")
+                replayed = _replayed_cost(budget.conn, reservation_id, cached[-1])
+                self.last_cost = None if replayed is None else replayed[0]
+                budget.settle(
+                    reservation_id,
+                    self.last_cost,
+                    basis=None if replayed is None else replayed[1],
+                )
                 return str(cached[-1]["content"])
             if events(budget.conn, "model_started", cache_scope):
                 raise TournamentError(
@@ -128,6 +172,7 @@ class PricedClient:
         if budget:
             append(budget.conn, "model_started", cache_scope, {"reservation_id": reservation})
         self.last_cost = None
+        basis: CostBasis | None = None
         try:
             async with asyncio.timeout(120), httpx.AsyncClient(timeout=120) as client:
                 response = await client.post(
@@ -143,9 +188,10 @@ class PricedClient:
             if not isinstance(text, str):
                 raise ValueError
             usage = data.get("usage", {})
-            cost = usage.get("cost")
-            if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
-                self.last_cost = float(cost)
+            # M1-348: a BYOK call reports `cost: 0` and bills upstream; see `settled_cost`.
+            settled = settled_cost(usage)
+            if settled is not None:
+                self.last_cost, basis = settled
         except Exception:
             raise TournamentError(
                 "priced model request failed or was unavailable at the authorized price"
@@ -156,7 +202,7 @@ class PricedClient:
                 budget.conn,
                 "model_completed",
                 cache_scope,
-                {"content": text, "cost": self.last_cost},
+                {"content": text, "cost": self.last_cost, "cost_basis": basis},
             )
             # Deliberately exclude reasoning/provider internals and all headers.
             append(
@@ -179,5 +225,5 @@ class PricedClient:
                     )
                 ),
             )
-            budget.settle(reservation, self.last_cost)
+            budget.settle(reservation, self.last_cost, basis=basis)
         return text
