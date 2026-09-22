@@ -4,7 +4,7 @@ metaculus:
   base_url: https://www.metaculus.com/api
   token_env: METACULUS_TOKEN
   tournament:
-    id: 33122
+    id: 33125
     use_sdk_current_id: false
   group_question_mode: unpack_subquestions
   request_timeout_seconds: 30

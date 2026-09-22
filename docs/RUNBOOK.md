@@ -138,6 +138,7 @@ were written.
 | `record_id does not name a stored forecast record` | [P0](#p0--two-profiles-one---config-and-the-error-that-looks-like-data-loss) — check `--config` first |
 | `Tournament refused: tournament activation is disabled` | [P1](#p1--the-cup-profile-is-dormant-its-refusals-are-correct) |
 | `activation retired: ... changed; re-run tournament enable` | [C5](#c5--activation-retired) |
+| Polls succeed, heartbeats are fresh, and every poll discovers 0 questions while MiniBench has open ones | [P3](#p3--minibench-rolled-over-to-a-new-project) |
 | `operation artifact missing; platform reconciliation required` | [P2](#p2--a-ledger-copied-without-its-artifact-root-will-refuse) |
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
@@ -183,7 +184,7 @@ wrong profile and the command reads a different database.
 | | MiniBench | Metaculus Cup Fall 2026 |
 |---|---|---|
 | config | `config/tournament.yaml` | `config/tournament-cup.yaml` |
-| project | 33122 | 33108 |
+| project | 33125 (was 33122 until 2026-09-21, see [P3](#p3--minibench-rolled-over-to-a-new-project)) | 33108 |
 | ledger | `data/whiskeyjack_bot.sqlite3` | `data/cup/ledger.sqlite3` |
 | artifacts | `data/artifacts/` | `data/cup/artifacts/` |
 | log | `data/logs/tournament.jsonl` | `data/logs/tournament-cup.jsonl` |
@@ -208,7 +209,7 @@ That message is telling the truth about the ledger it was pointed at. It is **no
 that the record was lost, that the ledger is corrupt, or that a migration dropped rows — and
 at 3am it reads like all three. Before you investigate anything else, check the `--config`
 you passed. The question id tells you which profile a record belongs to: Cup questions came
-from project 33108, MiniBench from 33122.
+from project 33108, MiniBench from 33122 (Sep 7-20) and 33125 (from Sep 21).
 
 Nothing in this situation needs recovery. Re-run the same command against the other profile.
 
@@ -247,6 +248,42 @@ Tournament refused: operation artifact missing; platform reconciliation required
 Found by execution while preparing P0 above — copying a ledger alone was enough to trigger
 it. This is the same guard that made both Cup profiles need their own `data/cup/`
 subdirectory rather than sharing `data/` with MiniBench under a different filename.
+
+### P3 — MiniBench rolled over to a new project
+
+**What you see.** Nothing looks wrong. `tournament run-once` exits 0 every five minutes,
+heartbeats are fresh, the watchdog stays quiet, and every poll discovers 0 questions. On
+Metaculus, MiniBench questions are open and nobody is forecasting them.
+
+**Why.** Metaculus runs MiniBench as a series of projects. On 2026-09-21 00:00 UTC it moved
+from project 33122 to project 33125. An activation binds to one concrete project, so the worker
+kept polling 33122, which had nothing open. Each MiniBench question is open for three hours, so
+a question that opens and closes while the worker is on the old project is lost, not delayed.
+That day cost 13 questions over about 12 hours.
+
+**Confirm.** Open the MiniBench tournament page on Metaculus and read the project id of the
+open questions. Compare it with `project_id` in `tournament status`.
+
+**Recovery.** Two steps, in this order:
+
+1. Set `metaculus.tournament.id` in `config/tournament.yaml` to the new project id. This retires
+   the current activation ([C5](#c5--activation-retired)) because both `destination` and
+   `configuration` moved, so the worker refuses from the next poll.
+2. Bind the new project, with the new series' window and the budget you intend:
+
+   ```bash
+   uv run whiskeyjack-bot tournament enable --config config/tournament.yaml \
+     --project-id '<new project id>' --starts '<UTC ISO timestamp>' --ends '<UTC ISO timestamp>' \
+     --budget-usd 40
+   ```
+
+   `--starts` must predate the questions that are already open, or they are skipped.
+
+Spending is tracked per project, so the new activation starts with its full budget.
+
+**Never.** Do not run `tournament disable` to tidy up the old series. It disables the
+**latest** activation (`tournament_state.py`, `disable`), and once step 2 is done that is the
+new one. The old activation is already superseded and needs nothing.
 
 ### The three submission flags
 
