@@ -82,7 +82,13 @@ near zero this time, with no other lane open when it started and one when it mer
 | M1-343 | feat/m1-343-watchdog-stale-timer | whiskeyjack-m1-343 | no | none | 2026-09-19 |
 | M1-346 | feat/m1-346-scoring-noleak-constant | whiskeyjack-m1-346 | no | none | 2026-09-20 |
 | M1-347 | feat/m1-347-watchdog-rollover | whiskeyjack-m1-347 | no | none | 2026-09-22 |
-| M1-348 | feat/m1-348-byok-cost-settlement | whiskeyjack-m1-348 | no | none | 2026-09-22 |
+| M1-349 | feat/m1-349-evidence-poor-base-rate | whiskeyjack-m1-349 | no | none | 2026-09-22 |
+
+*(Swept the **M1-348** row (merged PR #113, round-1 approve, 2026-09-22 — BYOK cost settlement
+from the upstream figure), the one drop the M1-349 brief assigns to this branch. Checked before
+making it: at the edit `origin` held `master` alone (the merged `docs/m1-349-backlog-row` was
+deleted first), `origin/master` carried the row, and `whiskeyjack-m1-348` is gone. **M1-347's row
+is left in place** — M1-344's lane owns that sweep. Earlier sweep note follows.)*
 
 *(Swept the **M1-330** row (merged PR #107, rounds 1 and 2 approve with zero blockers,
 2026-09-18 — the stored-packet replay path), which is the one drop the previous sweep note left
