@@ -136,6 +136,7 @@ class Model:
         self.raw = raw
         self.calls = 0
         self.wrong_time = False
+        self.requests: list[dict[str, Any]] = []
 
     async def invoke(self, prompt: Any, system_prompt: str | None = None) -> str:
         self.calls += 1
@@ -143,6 +144,14 @@ class Model:
         q = normalize_questions([DataOrganizer.get_question_from_post_json(self.raw)]).questions[0]
         reply = json.loads(reply_for(q))
         reply["as_of_utc"] = "2000-01-01T00:00:00Z" if self.wrong_time else request["as_of_utc"]
+        self.requests.append(request)
+        if not request["research_documents"]:
+            # What a well-behaved model does with an empty packet (M1-349): it cannot cite
+            # a document it was never shown, so every citation list is empty.
+            reply["base_rate"]["source_ids"] = []
+            for field in ("evidence_adjustments", "load_bearing_facts"):
+                for entry in reply.get(field) or []:
+                    entry["source_ids"] = []
         return json.dumps(reply)
 
 
@@ -302,6 +311,13 @@ def test_transient_exhaustion_records_the_blocked_question(
         raise RuntimeError("provider outage")
 
     monkeypatch.setattr(news, "search_news", outage)
+
+    # M1-349: the last transient attempt of a provider outage now forecasts evidence-poor
+    # instead of failing, so to reach exhaustion the model has to fail transiently too.
+    async def model_outage(prompt: Any, system_prompt: str | None = None) -> str:
+        raise RuntimeError("model outage")
+
+    monkeypatch.setattr(_model, "invoke", model_outage)
 
     for _ in range(MAX_TRANSIENT_ATTEMPTS):
         assert poll(case)["heartbeat"]["failures"] == 1

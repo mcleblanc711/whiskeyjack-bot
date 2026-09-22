@@ -57,6 +57,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -93,6 +94,7 @@ from whiskeyjack_bot.research.freshness import freshness_cutoff
 from whiskeyjack_bot.research.orchestrate import (
     OrchestrationError,
     PaidRetrievalError,
+    ProviderRun,
     retrieve_for_question,
 )
 from whiskeyjack_bot.research.packet import packet_sha256
@@ -120,6 +122,48 @@ StopReason = Literal["completed", "question_limit", "cost_limit"]
 QuestionStatus = Literal[
     "recorded", "research_failed", "generation_failed", "validation_failed", "not_recorded"
 ]
+
+# Why a forecast was made from an explicit empty packet (M1-349). ``no_documents``: every
+# provider answered and none found anything. ``provider_failed_exhausted``: a provider
+# failed, the retries ran out, and the fallback found nothing either. Recorded on the
+# `evidence_gap` row, whose code is ``evidence_poor`` in both cases.
+EvidencePoorReason = Literal["no_documents", "provider_failed_exhausted"]
+
+
+def any_provider_failed(runs: Sequence[ProviderRun]) -> bool:
+    """Whether ANY provider in the retrieval chain failed (M1-349).
+
+    Deliberately not :attr:`RetrievalOutcome.provider_failed`, which asks whether the LAST
+    run failed -- "did anything recover after it". For an empty result the question is
+    different: whether the emptiness is a fact about the question or about an outage, and
+    a failed primary makes it the latter no matter what the fallback then answered.
+    """
+    return any(run.provider_failed for run in runs)
+
+
+def evidence_poor_reason(
+    *, provider_failed: bool, evidence_poor_fallback: bool, final_attempt: bool
+) -> EvidencePoorReason | None:
+    """What a retrieval that found no document becomes (M1-349), or None to fail as before.
+
+    None leaves the old outcome in place: ``provider_error`` (transient, retried) when a
+    provider failed, ``no_evidence`` otherwise. The owner-decided table:
+
+    ============================  ===================  ==============================
+    provider failed               last attempt          outcome
+    ============================  ===================  ==============================
+    no                            either                ``no_documents``
+    yes                           no                    None (``provider_error``)
+    yes                           yes                   ``provider_failed_exhausted``
+    ============================  ===================  ==============================
+
+    and None throughout when the caller did not ask for the fallback.
+    """
+    if not evidence_poor_fallback:
+        return None
+    if not provider_failed:
+        return "no_documents"
+    return "provider_failed_exhausted" if final_attempt else None
 
 
 class LiveRunError(Exception):
@@ -437,7 +481,12 @@ def _research(
         packet=outcome.packet,
         retrieval_run_ids=outcome.retrieval_run_ids,
         reused=False,
-        provider_failed=outcome.provider_failed,
+        # ANY run, not `outcome.provider_failed` (the LAST run) -- M1-349. When AskNews
+        # failed and Exa then answered with nothing, the last run succeeded, so the old
+        # reading called the empty result `no_evidence`: a deterministic verdict that
+        # blocked the question for good over what was a provider outage. An empty answer
+        # from the fallback says nothing about what the failed primary would have found.
+        provider_failed=any_provider_failed(outcome.runs),
         cost_usd=outcome.cost_usd,
         unpriced_calls=outcome.unpriced_calls,
     )
@@ -491,8 +540,17 @@ def _attempt_question(
     news_client: Any | None,
     web_client: Any | None,
     forecaster: Any | None,
+    evidence_poor_fallback: bool = False,
+    final_attempt: bool = False,
 ) -> QuestionOutcome:
     """One question, end to end. **Never raises** -- every failure becomes this question's outcome.
+
+    ``evidence_poor_fallback`` and ``final_attempt`` are M1-349's, and only the tournament
+    worker passes them. With the first set, a retrieval that found no document is forecast
+    from an explicit empty packet -- a base-rate-only forecast, marked ``evidence_poor`` in
+    the ledger -- instead of failing, when either every provider answered with nothing or a
+    provider failed and ``final_attempt`` says no retry is left. Validation, the approval
+    policy and the submission path are the ordinary ones: nothing here is a bypass.
 
     That is the criterion's "a per-question failure ... does not abort the batch", and it is
     why the exception handling here is broad at the module boundaries rather than at the call
@@ -611,6 +669,57 @@ def _attempt_question(
             note=note,
         )
 
+    # M1-349: whether this attempt forecasts from an explicit EMPTY packet instead of failing.
+    # Opt-in (`tournament.py` is the only caller that asks), and only for the two cases the
+    # owner decided: every provider answered and none found anything, or a provider failed
+    # and this is the question's last transient attempt. Every other attempt keeps the
+    # old shapes: a provider failure is still `provider_error` (retried), and nothing here
+    # touches a packet that has documents.
+    evidence_poor: EvidencePoorReason | None = None
+    if research.packet is None and research.retrieval_run_ids:
+        evidence_poor = evidence_poor_reason(
+            provider_failed=research.provider_failed,
+            evidence_poor_fallback=evidence_poor_fallback,
+            final_attempt=final_attempt,
+        )
+    if evidence_poor is not None:
+        try:
+            # The same runs, read back through the same loader: an empty packet built from
+            # the runs this attempt recorded, so its hash is reproducible from the
+            # `research_checkpoint` `_research` just appended. That is what the approval
+            # policy's `require_research_artifacts` re-derives before it will post.
+            empty = load_packet(
+                conn, question_id=question_id, retrieval_run_ids=research.retrieval_run_ids
+            )
+        except StoreError as exc:
+            _LOGGER.error("could not read back the empty packet for question %d", question_id)
+            note = _record_pre_forecast(
+                conn,
+                attempt_id=attempt_id,
+                question_id=question_id,
+                tournament_id=tournament_id,
+                event_type="research_failed",
+                detail_code="internal_error",
+                retrieval_run_id=research.retrieval_run_ids[0],
+                occurred_at=now,
+            )
+            return QuestionOutcome(
+                question_id=question_id,
+                status="research_failed",
+                attempt_id=attempt_id,
+                retrieval_run_ids=research.retrieval_run_ids,
+                document_count=0,
+                research_reused=research.reused,
+                detail_code="internal_error",
+                problems=(str(exc),),
+                cost_usd=research.cost_usd,
+                unpriced_calls=research.unpriced_calls,
+                note=note,
+            )
+        if empty.documents:  # pragma: no cover - packet is None exactly when no document
+            raise LiveRunError("an evidence-poor packet must carry no documents")
+        research = replace(research, packet=empty)
+
     if research.packet is None:
         detail: PreForecastFailureCode = (
             "provider_error" if research.provider_failed else "no_evidence"
@@ -678,6 +787,12 @@ def _attempt_question(
             ),
         )
         assert research.packet is not None
+        if problem and evidence_poor is not None and problem.code == "no_evidence":
+            # M1-349: an empty packet is `no_evidence` by definition, and forecasting from
+            # one anyway is the whole point of evidence-poor mode -- so that one verdict,
+            # and only for an attempt already judged evidence-poor above, stands down.
+            # Any other code still refuses, and a packet with documents never gets here.
+            problem = None
         if problem:
             # Recorded, not raised past the recorder. Until M1-326 this was
             # `raise TournamentError(problem)`, which propagated straight past
@@ -852,7 +967,18 @@ def _attempt_question(
             research.packet, freshness_cutoff(now, config.retrieval.freshness_days_default)
         )
         gate_detail_code: PreForecastFailureCode | None = None
-        if verdict == "no_evidence" or verdict == "stale_evidence":
+        if verdict == "no_evidence" and evidence_poor is not None:
+            # M1-349: never silent. The empty packet is flagged here exactly as
+            # `flag_on_stale_research` would, and the `evidence_poor` evidence_gap row
+            # written below is the durable half of the flag. Only `no_evidence` and only
+            # for an evidence-poor attempt: a stale packet has documents, so it can
+            # never be one, and it still fails through the branch below.
+            _LOGGER.warning(
+                "question %d forecast from an empty packet (evidence-poor: %s)",
+                question_id,
+                evidence_poor,
+            )
+        elif verdict == "no_evidence" or verdict == "stale_evidence":
             if config.forecast.fail_on_stale_research:
                 gate_detail_code = verdict
             elif config.forecast.flag_on_stale_research:
@@ -927,6 +1053,26 @@ def _attempt_question(
                         "domains": list(absent_sources),
                     },
                 )
+            if evidence_poor is not None:
+                # M1-349: the evidence-poor marker, in the same transaction and on the same
+                # record scope as `named_source_absent` above and for the same reason -- a
+                # record committed without it would silently claim it had evidence. Bound
+                # to `forecast_sha256`: `tournament.comment_text` refuses to describe a
+                # record whose hash no longer matches the marker, so a content change
+                # invalidates it the way it invalidates an approval.
+                append(
+                    conn,
+                    "evidence_gap",
+                    record.record_id,
+                    {
+                        "at": now.isoformat(),
+                        "code": "evidence_poor",
+                        "reason": evidence_poor,
+                        "question_id": question_id,
+                        "tournament_id": tournament_id,
+                        "forecast_sha256": record_sha256(record),
+                    },
+                )
     except (ForecastRecordError, StoreError, LifecycleError) as exc:
         _LOGGER.error("could not record the forecast for question %d: %s", question_id, exc)
         return QuestionOutcome(
@@ -941,6 +1087,9 @@ def _attempt_question(
             note=str(exc),
         )
 
+    evidence_gaps: tuple[str, ...] = (("named_source_absent",) if absent_sources else ()) + (
+        ("evidence_poor",) if evidence_poor is not None else ()
+    )
     if gate_detail_code is not None:
         return QuestionOutcome(
             question_id=question_id,
@@ -958,7 +1107,7 @@ def _attempt_question(
             detail_code=gate_detail_code,
             cost_usd=cost,
             unpriced_calls=unpriced,
-            evidence_gaps=("named_source_absent",) if absent_sources else (),
+            evidence_gaps=evidence_gaps,
         )
 
     return QuestionOutcome(
@@ -976,7 +1125,7 @@ def _attempt_question(
         artifact_outcome=persisted.artifact_outcome,
         cost_usd=cost,
         unpriced_calls=unpriced,
-        evidence_gaps=("named_source_absent",) if absent_sources else (),
+        evidence_gaps=evidence_gaps,
     )
 
 
