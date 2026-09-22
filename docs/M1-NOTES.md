@@ -13454,3 +13454,31 @@ was identical and only the memory held differed. The fake response now records t
 was read with, and the header test asserts `LIMIT + 1`. The rerun kills `k`. Every "lives" in the
 props-alone column is a mutant in I/O or wiring that no pure function reaches. All six mutants
 in a pure function die under the properties alone, which is the reach check for the strategies.
+
+### Round 1 review (GPT) — CHANGES REQUESTED on `ba22a47`, one blocking finding, fixed
+
+**Finding: a malformed post status read as "nothing open", which is the quiet outcome.**
+`_open_post_count` checked that each post was an object and then counted `status == "open"`,
+so `{"status": null}`, `{"status": []}` and a post with no `status` all counted as zero open.
+On a mismatch that exits 0 with no page, and it cleared a standing `rollover_check` entry: a
+malformed Metaculus answer producing the false green the criterion forbids. **Reproduced by
+execution at `ba22a47`** before any fix (all three shapes → `0`).
+
+**My own test had enshrined it.** `test_closed_posts_in_the_answer_are_not_open_posts` listed
+`{}` among the quiet cases, and the property's oracle restated the permissive rule. So the parser
+and both of its witnesses agreed, and the mutation pass could not see it: no mutant *removed*
+a check that had never been written. That is the vacuity class again in its oracle form. A
+property whose expected value is computed by the same rule as the code under test proves
+consistency, not correctness.
+
+**Fix.** A post is counted only if it is an object whose `status` is exactly a `str`, and
+anything else makes the whole answer unusable (`None` → `posts_unreadable`). An unfamiliar
+string is still a status and still not open. Four failed-check rows were added to
+`test_a_malformed_posts_answer_is_a_failed_check` (`null`, `[]`, missing, and a bool beside a
+valid `closed`), and `{}` was removed from the quiet test. The property oracle now requires a
+string status. **Reverting the fix is killed by 4 unit tests, and by the properties alone.**
+
+**Reach, measured while fixing it.** With `status` optional in the post strategy, only 6.4% of
+2000 draws reached a counted list and 1.0% one with an open post. A dedicated well-formed branch
+and a required `status` bring that to 24.8% and 11.7%. Mutant `d` (`len(results)`) still dies
+under the properties alone.

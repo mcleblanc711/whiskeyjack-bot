@@ -551,20 +551,26 @@ PROJECT_ANSWERS = st.one_of(
     st.fixed_dictionaries({"id": PROJECT_IDS}, optional={"slug": JSON_VALUES}),
     JSON_VALUES,
 )
+STATUS_WORDS = st.sampled_from(["open", "closed", "resolved", "upcoming", "Open", "open "])
+# `status` is required in the first branch and drawn mostly from real vocabulary, so a list of
+# posts that ALL carry a string status -- the only shape that is counted -- is common rather than
+# the product of several independent coin flips. The malformed statuses (`None`, `[]`, a bool,
+# absent) come from the leaves and from the bare-JSON branch.
 POSTS = st.one_of(
     st.fixed_dictionaries(
-        {},
-        optional={
-            "status": st.one_of(
-                st.sampled_from(["open", "closed", "resolved", "upcoming", "Open", "open "]),
-                JSON_LEAVES,
-            ),
-            "id": JSON_LEAVES,
-        },
+        {"status": st.one_of(STATUS_WORDS, JSON_LEAVES)},
+        optional={"id": JSON_LEAVES},
     ),
+    st.fixed_dictionaries({}, optional={"id": JSON_LEAVES}),
     JSON_VALUES,
 )
 POSTS_ANSWERS = st.one_of(
+    # Well-formed answers as their own branch: without it ~6% of draws reach a counted list and
+    # ~1% one with an open post (measured over 2000 draws), so the counting assertion would rest
+    # on a handful of examples per run.
+    st.fixed_dictionaries(
+        {"results": st.lists(st.fixed_dictionaries({"status": STATUS_WORDS}), max_size=6)}
+    ),
     st.fixed_dictionaries({"results": st.lists(POSTS, max_size=6)}, optional={"next": JSON_VALUES}),
     st.fixed_dictionaries({"results": JSON_VALUES}),
     JSON_VALUES,
@@ -588,7 +594,9 @@ def test_the_open_post_count_is_total_and_counts_only_posts_that_say_open(
 ) -> None:
     got = watchdog._open_post_count(payload)
     results = payload.get("results") if isinstance(payload, dict) else None
-    if not isinstance(results, list) or not all(isinstance(post, dict) for post in results):
+    if not isinstance(results, list) or not all(
+        isinstance(post, dict) and type(post.get("status")) is str for post in results
+    ):
         assert got is None
         return
     assert got == len([post for post in results if post.get("status") == "open"])

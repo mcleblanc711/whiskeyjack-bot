@@ -788,12 +788,17 @@ def _open_post_count(payload: object) -> int | None:
     Counted from each post's OWN `status` rather than trusted to the `statuses=open` filter: if
     the filter were ever ignored, a page of closed posts would otherwise read as open ones and
     page about a series with nothing to forecast. A `results` that is not a list, or holds
-    anything but objects, is not an answer to the question asked.
+    anything but objects each carrying a string `status`, is not an answer to the question
+    asked -- and must not read as "nothing open", which is the quiet outcome (M1-347 review
+    round 1: `{"status": null}`, `[]` and a missing status all counted as zero and went green).
+    An unfamiliar string is still a status, and still not "open".
     """
     if not isinstance(payload, dict):
         return None
     results = payload.get("results")
-    if not isinstance(results, list) or not all(isinstance(post, dict) for post in results):
+    if not isinstance(results, list) or not all(
+        isinstance(post, dict) and type(post.get("status")) is str for post in results
+    ):
         return None
     return sum(1 for post in results if post.get("status") == "open")
 

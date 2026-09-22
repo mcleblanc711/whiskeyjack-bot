@@ -1581,7 +1581,7 @@ def test_a_mismatch_with_nothing_open_is_quiet(watchdog: Harness) -> None:
 def test_closed_posts_in_the_answer_are_not_open_posts(watchdog: Harness) -> None:
     """Counted by each post's own status, not by trusting the `statuses=open` filter."""
     watchdog.project[0] = {"id": NEXT_PROJECT}
-    watchdog.posts[0] = {"results": [{"status": "closed"}, {"status": "resolved"}, {}]}
+    watchdog.posts[0] = {"results": [{"status": "closed"}, {"status": "resolved"}]}
 
     assert watchdog.run() == 0
     assert watchdog.pushes == []
@@ -1651,10 +1651,24 @@ def test_a_malformed_project_answer_is_a_failed_check(watchdog: Harness, payload
 
 @pytest.mark.parametrize(
     "payload",
-    [None, [], {}, {"results": None}, {"results": "open"}, {"results": [1]}, {"results": [[]]}],
+    [
+        None,
+        [],
+        {},
+        {"results": None},
+        {"results": "open"},
+        {"results": [1]},
+        {"results": [[]]},
+        # Round-1 blocking finding: each of these counted as zero open and went green.
+        {"results": [{"status": None}]},
+        {"results": [{"status": []}]},
+        {"results": [{}]},
+        {"results": [{"status": "closed"}, {"status": True}]},
+    ],
     ids=repr,
 )
 def test_a_malformed_posts_answer_is_a_failed_check(watchdog: Harness, payload: object) -> None:
+    """Never quiet: "nothing open" is the green outcome, so an unreadable post cannot reach it."""
     watchdog.project[0] = {"id": NEXT_PROJECT}
     watchdog.posts[0] = payload
 
