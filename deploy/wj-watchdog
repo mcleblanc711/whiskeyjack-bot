@@ -34,6 +34,15 @@ The two subjects keep separate state, separate throttles and separate pushes. Fo
 second into the first would make either fault mute the other's page through one shared
 `last_alert`, and would send "worker recovered" while the other half was still stopped --
 the failure `docs/M4-NOTES.md` (M4-805) rejected once already, in the other direction.
+
+A third subject (M1-347): MiniBench rolling over to a Metaculus project the live activation
+does not cover. On 2026-09-21 00:00 UTC the series moved from project 33122 to 33125, and for
+about twelve hours the worker polled the old project, exited 0 with `discovered: 0` and kept its
+heartbeat fresh -- healthy by every signal above, and 13 questions lost. So this asks Metaculus
+what the `minibench` slug currently resolves to and compares it with the project the latest
+activation is bound to. It is the only subject that touches the network for its evidence, and a
+failed read is its own fault (`rollover_check_failed`) with its own throttle: never a green, and
+never a "worker down" -- a Metaculus outage is not the worker's.
 """
 
 from __future__ import annotations
@@ -43,6 +52,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -82,11 +93,24 @@ DEADMAN_TIMEOUT_SECONDS = 10
 # timestamp queries its stall rule needs, taking the declared worst case to 215s -- still inside
 # the 240s the unit already declares and under the timer's own 300s interval, so no unit file
 # changes there.
+#
+# M1-347 adds the rollover check: one WALL-CLOCK bound over all of its reads (the activation
+# row and at most two Metaculus GETs), plus one push. The bound is enforced by joining a worker
+# thread rather than by a socket timeout, because urllib's `timeout` is per blocking operation
+# -- DNS resolution is not covered at all, and a server dripping a byte per timeout never trips
+# it -- so a sum of socket timeouts would be arithmetic about a bound nothing enforces. The
+# push gets its own shorter timeout rather than PUSH_TIMEOUT_SECONDS because the unit's 240s
+# leaves 25s after M1-343's 215s: 15s of reads (one Metaculus answer took 10.2s on 2026-09-22,
+# so less than that would fail on an ordinary slow response) and 8s for one ntfy POST, 238s.
+ROLLOVER_FETCH_SECONDS = 15
+ROLLOVER_PUSH_TIMEOUT_SECONDS = 8
 WORST_CASE_SECONDS = (
     11 * SYSTEMCTL_TIMEOUT_SECONDS
     + LEDGER_TIMEOUT_SECONDS
     + 2 * PUSH_TIMEOUT_SECONDS
     + DEADMAN_TIMEOUT_SECONDS
+    + ROLLOVER_FETCH_SECONDS
+    + ROLLOVER_PUSH_TIMEOUT_SECONDS
 )
 
 RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
@@ -130,6 +154,46 @@ RESOLUTIONS_STALE_MARGIN = timedelta(hours=1)
 # break in the record, and a stall claimed across a break is really a claim about a host that
 # was off.
 WATCHDOG_GAP_TOLERANCE = timedelta(minutes=20)
+
+# The third subject (M1-347). `MINIBENCH_SLUG` is the pinned SDK's
+# `MetaculusClient.CURRENT_MINIBENCH_ID` (forecasting-tools 0.2.92, `metaculus_client.py:149`);
+# tests/unit/test_watchdog.py compares the two, so an SDK bump that renames the slug fails a
+# test rather than leaving this pointed at nothing. The SDK passes the slug straight to
+# `/posts/?tournaments=` and never resolves it, so the project endpoint below is this script's
+# own, confirmed by execution on 2026-09-22: `/projects/tournaments/minibench/` answered
+# `"id": 33125`, and `/posts/?tournaments=<id>&statuses=open` answered only open posts (the old
+# series, 33122, answered none). Both exact paths answer 200 without a redirect.
+METACULUS_API = "https://www.metaculus.com/api"
+MINIBENCH_SLUG = "minibench"
+# Only "is anything open" decides; the page size is a ceiling on what one answer carries, not a
+# count that has to be exact. The API's `next` is useless here: it is non-null even on an empty
+# page, because the endpoint does not count, so it is never read.
+ROLLOVER_OPEN_PAGE = 10
+# A MiniBench project answer is ~3 KB and a page of ten open posts ~75 KB. Anything past this
+# is not an answer to the question asked.
+ROLLOVER_RESPONSE_LIMIT = 1_000_000
+# Measured, not assumed: with urllib's default `Python-urllib/3.x` agent Metaculus answers 403
+# even to a valid token, so the agent is named explicitly.
+ROLLOVER_USER_AGENT = "whiskeyjack-watchdog"
+# A rollover is lost questions: each MiniBench question is open for three hours, so the
+# worker's own hourly re-alert is the right shape, and it is a separate constant rather than a
+# reuse of REALERT_AFTER because two clocks sharing one name become one clock by accident
+# (T-909).
+ROLLOVER_REALERT_AFTER = timedelta(hours=1)
+# A check that cannot run is a blind spot, not a loss: nothing is missed until a rollover
+# coincides with it. Six hours is two question windows -- long enough that a Metaculus outage
+# does not page all day, short enough that a detector that has gone blind is not blind for a
+# whole series unannounced.
+ROLLOVER_CHECK_REALERT_AFTER = timedelta(hours=6)
+# Closed vocabulary for WHY the check could not run. Named in the push, never keyed on: the
+# throttle key of a failed check is the one code, so a read that fails one way and then another
+# is one standing fault, not two.
+ROLLOVER_CHECK_PROBLEMS = {
+    "activation_unreadable": "the live activation's project could not be read from the ledger",
+    "project_unreadable": "Metaculus did not answer with a usable MiniBench project",
+    "posts_unreadable": "Metaculus did not answer with a usable list of MiniBench's open posts",
+    "timed_out": f"the check did not finish within {ROLLOVER_FETCH_SECONDS} s",
+}
 
 
 def _now() -> datetime:
@@ -286,8 +350,14 @@ def _save_state(state: dict) -> None:
         pass
 
 
-def _push(title: str, body: str, *, priority: str, tags: str) -> bool:
-    """Send one ntfy push. Never raises -- a dead channel must not kill the watchdog."""
+def _push(
+    title: str, body: str, *, priority: str, tags: str, timeout: int = PUSH_TIMEOUT_SECONDS
+) -> bool:
+    """Send one ntfy push. Never raises -- a dead channel must not kill the watchdog.
+
+    `timeout` defaults to what every caller before M1-347 passed; only the rollover check
+    passes its own, for the budget reason given at WORST_CASE_SECONDS.
+    """
     topic = os.environ.get("NTFY_TOPIC_URL", "").strip()
     if not topic:
         return False
@@ -298,7 +368,7 @@ def _push(title: str, body: str, *, priority: str, tags: str) -> bool:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=PUSH_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return 200 <= response.status < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
@@ -421,12 +491,22 @@ def _alert_is_due(codes: tuple[str, ...], stored: dict, now: datetime) -> bool:
     """
     if not codes:
         return False
-    if stored.get("key") != _throttle_key(codes):
+    return _key_is_due(_throttle_key(codes), stored, now, RESOLUTIONS_REALERT_AFTER)
+
+
+def _key_is_due(key: str, stored: dict, now: datetime, window: timedelta) -> bool:
+    """`_alert_is_due`'s rule for an arbitrary key and window (M1-347). Pure.
+
+    Split out rather than copied, so the rollover subject's two throttles and the resolutions
+    one are the same rule: a key that is not the stored one has never been paged, and a stamp
+    that cannot be read means no usable record of a page.
+    """
+    if stored.get("key") != key:
         return True
     last = _aware_stamp(stored.get("last_alert"))
     if last is None:
         return True
-    return (now - last) >= RESOLUTIONS_REALERT_AFTER
+    return (now - last) >= window
 
 
 def _throttle_key(codes: tuple[str, ...]) -> str:
@@ -676,12 +756,306 @@ def _check_tournament(state: dict) -> bool:
     return False
 
 
-def main() -> int:
-    """Both subjects, every run, whatever the other one says.
+def _positive_int(value: object) -> int | None:
+    """`value` when it is a positive int, else None. `bool` is refused: JSON `true` is not 1."""
+    return value if type(value) is int and value > 0 else None
 
-    Neither check may skip because the other failed: a broken poll and a stopped resolutions
-    timer are independent conditions with independent fixes, and the day the outage of
-    2026-09-09 repeats is exactly the day the other half must still be reported.
+
+def _activation_project_id(raw: object) -> int | None:
+    """The `project_id` of one stored `activation` event's `data` column, or None. Pure, total.
+
+    Read back out of the ledger, so untrusted (CLAUDE.md): not a string, not JSON, not an
+    object, no key, a string `"33125"`, `true` and a non-positive number are all "cannot say",
+    which the caller reports as a check that could not run -- never as a match.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return _positive_int(data.get("project_id")) if isinstance(data, dict) else None
+
+
+def _project_id(payload: object) -> int | None:
+    """The concrete project id in a Metaculus project answer, or None. Pure, total."""
+    return _positive_int(payload.get("id")) if isinstance(payload, dict) else None
+
+
+def _open_post_count(payload: object) -> int | None:
+    """How many posts in one `/posts/` answer say they are open, or None. Pure, total.
+
+    Counted from each post's OWN `status` rather than trusted to the `statuses=open` filter: if
+    the filter were ever ignored, a page of closed posts would otherwise read as open ones and
+    page about a series with nothing to forecast. A `results` that is not a list, or holds
+    anything but objects each carrying a string `status`, is not an answer to the question
+    asked -- and must not read as "nothing open", which is the quiet outcome (M1-347 review
+    round 1: `{"status": null}`, `[]` and a missing status all counted as zero and went green).
+    An unfamiliar string is still a status, and still not "open".
+    """
+    if not isinstance(payload, dict):
+        return None
+    results = payload.get("results")
+    if not isinstance(results, list) or not all(
+        isinstance(post, dict) and type(post.get("status")) is str for post in results
+    ):
+        return None
+    return sum(1 for post in results if post.get("status") == "open")
+
+
+def _rollover_key(activation_project: int, slug_project: int) -> str:
+    """The throttle key of a rollover: the code AND the project pair.
+
+    The pair is in the key so that a series that rolls over again while the first rollover is
+    still standing pages at once -- it is a different move, and an owner who re-pointed at the
+    first one needs to hear about the second.
+    """
+    return f"{_throttle_key(('rollover',))}:{activation_project}->{slug_project}"
+
+
+def _is_rollover(activation_project: int, slug_project: int, open_posts: int | None) -> bool:
+    """The criterion. Pure. A mismatch pages only while the slug's project has an open post.
+
+    A new series with nothing open yet has nothing to lose, and paging then would page at every
+    series boundary before the first batch -- when, if the owner re-points at once, `--starts`
+    is the only thing that matters (docs/RUNBOOK.md P3).
+    """
+    if activation_project == slug_project:
+        return False
+    return open_posts is not None and open_posts >= 1
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect, so the token cannot follow one.
+
+    urllib's redirect handler copies every header but the content ones onto the new request,
+    `Authorization` included, whatever host the `Location` names. Neither path this script asks
+    for redirects (measured on 2026-09-22; `/projects/tournaments/minibench` without its slash
+    does, with a 301), so refusing costs nothing and a redirect reads as a failed check.
+    """
+
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+def _metaculus_get(path: str, deadline: float) -> object:
+    """One read-only GET against the Metaculus API, parsed. Raises on anything but a JSON answer.
+
+    The token is sent as a header and never printed; an HTTPError's text is never rendered, by
+    the caller or here. `deadline` is `time.monotonic()` seconds; the socket timeout is what is
+    left of it, and the thread join in `_read_rollover` is what actually enforces it.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    headers = {"Accept": "application/json", "User-Agent": ROLLOVER_USER_AGENT}
+    token = os.environ.get("METACULUS_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Token {token}"
+    request = urllib.request.Request(f"{METACULUS_API}{path}", headers=headers, method="GET")
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(request, timeout=remaining) as response:
+        body = response.read(ROLLOVER_RESPONSE_LIMIT + 1)
+    if len(body) > ROLLOVER_RESPONSE_LIMIT:
+        raise ValueError
+    return json.loads(body)
+
+
+def _latest_activation_row(deadline: float) -> object:
+    """The `data` of the newest `activation` event, or None. Read-only; raises on I/O failure.
+
+    The same row `tournament_state.require_activation` reads (`kind='activation'`,
+    `scope='account'`, newest by `seq`), so "the project the worker polls" and "the project
+    this compares" are one fact.
+    """
+    timeout = max(0.0, min(float(LEDGER_TIMEOUT_SECONDS), deadline - time.monotonic()))
+    conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=timeout)
+    try:
+        row = conn.execute(
+            "select data from tournament_events "
+            "where kind='activation' and scope='account' order by seq desc limit 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def _rollover_observation(deadline: float) -> tuple[int, int, int | None] | str:
+    """`(activation project, slug project, open posts)`, or the code for why it cannot say.
+
+    Open posts are only asked for when the two projects differ, because only then do they
+    decide anything -- so the steady state is one GET per run, not two. Each stage catches
+    `Exception` broadly on purpose: this is the boundary where anything that goes wrong is,
+    by definition, a check that could not run, and nothing here may escape into `main`.
+    """
+    try:
+        activation = _activation_project_id(_latest_activation_row(deadline))
+    except Exception:
+        activation = None
+    if activation is None:
+        return "activation_unreadable"
+    try:
+        slug_project = _project_id(
+            _metaculus_get(f"/projects/tournaments/{MINIBENCH_SLUG}/", deadline)
+        )
+    except Exception:
+        slug_project = None
+    if slug_project is None:
+        return "project_unreadable"
+    if slug_project == activation:
+        return (activation, slug_project, None)
+    try:
+        open_posts = _open_post_count(
+            _metaculus_get(
+                f"/posts/?tournaments={slug_project}&statuses=open&limit={ROLLOVER_OPEN_PAGE}",
+                deadline,
+            )
+        )
+    except Exception:
+        open_posts = None
+    if open_posts is None:
+        return "posts_unreadable"
+    return (activation, slug_project, open_posts)
+
+
+def _read_rollover() -> tuple[int, int, int | None] | str:
+    """`_rollover_observation`, under a wall-clock bound of ROLLOVER_FETCH_SECONDS.
+
+    A daemon thread, joined with a timeout: the process exits a moment after `main` returns, so
+    a read abandoned here dies with it rather than outliving the run. The per-socket timeouts
+    inside are what keep the abandoned thread short; the join is what makes the bound true.
+    """
+    outcome: list[tuple[int, int, int | None] | str] = []
+    deadline = time.monotonic() + ROLLOVER_FETCH_SECONDS
+
+    def work() -> None:
+        try:
+            outcome.append(_rollover_observation(deadline))
+        except BaseException:
+            outcome.append("project_unreadable")
+
+    worker = threading.Thread(target=work, name="wj-rollover", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive() or not outcome:
+        return "timed_out"
+    return outcome[0]
+
+
+def _check_rollover(state: dict) -> bool:
+    """MiniBench's slug against the live activation (M1-347). True when paging or blind.
+
+    Two throttles, deliberately. `rollover` is keyed on the code and the project pair;
+    `rollover_check_failed` is keyed on its one code and lives in its own state entry. So a
+    failed read neither clears a standing rollover nor re-keys it: the M1-343 lesson is that a
+    code dropping out for a reason unrelated to the fault changes the key and re-pages, and a
+    Metaculus timeout says nothing about which project MiniBench is on. When the read succeeds
+    again, the rollover's own entry is exactly as the last good read left it.
+
+    Nothing here changes anything. Re-pointing the activation is an owner action
+    (docs/RUNBOOK.md P3), and the push says so.
+    """
+    now = _now()
+    stored = state.get("rollover")
+    if not isinstance(stored, dict):
+        stored = {}
+    stored_check = state.get("rollover_check")
+    if not isinstance(stored_check, dict):
+        stored_check = {}
+
+    observation = _read_rollover()
+    if isinstance(observation, str):
+        reason = observation if observation in ROLLOVER_CHECK_PROBLEMS else "project_unreadable"
+        key = _throttle_key(("rollover_check_failed",))
+        entry: dict = {"key": key}
+        previous = stored_check.get("last_alert")
+        if stored_check.get("key") == key and isinstance(previous, str):
+            entry["last_alert"] = previous
+        if _key_is_due(key, stored_check, now, ROLLOVER_CHECK_REALERT_AFTER):
+            body = (
+                "The MiniBench rollover check could not run, so a rollover to a new Metaculus "
+                "project would go unreported until it can.\n\n"
+                f"- {ROLLOVER_CHECK_PROBLEMS[reason]}"
+                "\n\nThis is not the worker: nothing here says the worker is down, and it pages "
+                "WORKER DOWN on its own. Usually a Metaculus outage or a slow answer; it clears "
+                "by itself on the next good read."
+                "\n\nCheck: journalctl --user -u whiskeyjack-watchdog.service -n 40"
+                "\n       whiskeyjack-bot tournament status --config config/tournament.yaml"
+            )
+            if _push(
+                "whiskeyjack: rollover check failed",
+                body,
+                priority="default",
+                tags="grey_question",
+                timeout=ROLLOVER_PUSH_TIMEOUT_SECONDS,
+            ):
+                entry["last_alert"] = _now().isoformat()
+        state["rollover_check"] = entry
+        print("ROLLOVER CHECK FAILED: " + reason)
+        return True
+
+    state["rollover_check"] = {}
+    activation_project, slug_project, open_posts = observation
+
+    if activation_project == slug_project:
+        # The only evidence that ends a rollover: the activation now covers the slug's project.
+        if stored.get("key") and RECOVERY_NOTICE:
+            _push(
+                "whiskeyjack: MiniBench rollover cleared",
+                "The live activation covers MiniBench's current project again. Questions that "
+                "opened and closed in between are not recoverable; nothing else is owed.",
+                priority="default",
+                tags="white_check_mark",
+                timeout=ROLLOVER_PUSH_TIMEOUT_SECONDS,
+            )
+        state["rollover"] = {}
+        print("OK: MiniBench is on the activation's project")
+        return False
+
+    if not _is_rollover(activation_project, slug_project, open_posts):
+        # A mismatch with nothing open. Quiet, and the stored entry is LEFT as it is: an empty
+        # batch is not evidence the activation was re-pointed, so it must not clear a standing
+        # rollover (and so re-page it) when the next batch opens.
+        print("OK: MiniBench is on a new project with nothing open yet")
+        return False
+
+    key = _rollover_key(activation_project, slug_project)
+    entry = {"key": key}
+    previous = stored.get("last_alert")
+    if stored.get("key") == key and isinstance(previous, str):
+        entry["last_alert"] = previous
+    if _key_is_due(key, stored, now, ROLLOVER_REALERT_AFTER):
+        # No value read out of Metaculus or the ledger is rendered here -- not the new project
+        # id, not the old one, not the count. The owner reads both from the two commands below.
+        body = (
+            "MiniBench has moved to a Metaculus project the live activation does not cover, "
+            "and that project has open questions. The worker is still polling the old project "
+            "and discovers 0 questions every poll, so it looks healthy -- but each MiniBench "
+            "question is open for three hours, and one that closes before the re-point is lost."
+            "\n\nNothing was changed. Re-pointing is an owner action: docs/RUNBOOK.md P3 "
+            "(set --starts to now or earlier)."
+            "\n\nCheck: whiskeyjack-bot tournament status --config config/tournament.yaml"
+            "\n       the project id of the open questions on Metaculus's MiniBench page"
+        )
+        if _push(
+            "whiskeyjack: MINIBENCH ROLLED OVER",
+            body,
+            priority="urgent",
+            tags="warning",
+            timeout=ROLLOVER_PUSH_TIMEOUT_SECONDS,
+        ):
+            entry["last_alert"] = _now().isoformat()
+    state["rollover"] = entry
+    print("ROLLOVER: MiniBench is on a project the activation does not cover")
+    return True
+
+
+def main() -> int:
+    """Every subject, every run, whatever the others say.
+
+    No check may skip because another failed: a broken poll, a stopped resolutions timer and a
+    MiniBench rollover are independent conditions with independent fixes, and the day the
+    outage of 2026-09-09 repeats is exactly the day the other halves must still be reported.
     """
     state = _load_state()
     # Before either check, and at the top level of the state file: the record of whether this
@@ -690,8 +1064,11 @@ def main() -> int:
     observed_since = _observe(state, _now())
     tournament_down = _check_tournament(state)
     resolutions_down = _check_resolutions(state, observed_since)
+    # Last, and with nothing downstream of it: the only subject that waits on the network, so
+    # the other two have already paged by the time it could be slow.
+    rollover_down = _check_rollover(state)
     _save_state(state)
-    return 1 if tournament_down or resolutions_down else 0
+    return 1 if tournament_down or resolutions_down or rollover_down else 0
 
 
 if __name__ == "__main__":

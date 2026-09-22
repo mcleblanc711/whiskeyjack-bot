@@ -120,6 +120,13 @@ class Harness:
     pings: list[datetime] = field(default_factory=list)
     instant: list[datetime] = field(default_factory=lambda: [ANCHOR])
     delivers: list[bool] = field(default_factory=lambda: [True])
+    # The Metaculus boundary (M1-347), faked at `_metaculus_get` and nowhere deeper, so the
+    # thread, the join, the parsers and the decision are all the real code. Each answer is a
+    # parsed payload, or an exception instance to raise in its place.
+    project: list[object] = field(default_factory=lambda: [{"id": ACTIVE_PROJECT}])
+    posts: list[object] = field(default_factory=lambda: [{"results": [{"status": "open"}]}])
+    fetched: list[str] = field(default_factory=list)
+    real_metaculus_get: Any = None
 
     def systemctl(self, *args: str, env: dict[str, str] | None = None) -> str:
         # `env` is recorded, not honoured: what it must CONTAIN is asserted against the real
@@ -146,9 +153,22 @@ class Harness:
     def ping(self) -> None:
         self.pings.append(self.instant[0])
 
-    def push(self, title: str, body: str, *, priority: str, tags: str) -> bool:
+    def push(
+        self, title: str, body: str, *, priority: str, tags: str, timeout: int | None = None
+    ) -> bool:
         self.pushes.append({"title": title, "body": body, "priority": priority, "tags": tags})
         return self.delivers[0]
+
+    def metaculus(self, path: str, deadline: float) -> object:
+        self.fetched.append(path)
+        answer = self.project[0] if path.startswith("/projects/") else self.posts[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def activate(self, project_id: object) -> None:
+        """Append one activation event, newest wins -- what `tournament enable` leaves."""
+        seed_activation(Path(self.module.LEDGER), project_id)
 
     def run(self) -> int:
         return int(self.module.main())
@@ -161,6 +181,26 @@ class Harness:
         loaded = json.loads(text)
         assert isinstance(loaded, dict)
         return loaded
+
+
+# The project the fixture's live activation is bound to, and what the fake Metaculus says the
+# `minibench` slug resolves to unless a test says otherwise. 33125 is the real current series.
+ACTIVE_PROJECT = 33125
+
+
+def seed_activation(path: Path, project_id: object) -> None:
+    """An `activation` event through the real journal writer, carrying only what is read.
+
+    `tournament_state.enable` would need a whole AppConfig to reach the same row; the watchdog
+    reads one key of it, and `append` is the writer every activation passes through.
+    """
+    connection = connect(path)
+    try:
+        tournament_state.append(
+            connection, "activation", "account", {"project_id": project_id, "account_id": 1}
+        )
+    finally:
+        connection.close()
 
 
 def seeded_ledger(path: Path, *, heartbeat_at: datetime | None) -> None:
@@ -189,11 +229,14 @@ def seeded_ledger(path: Path, *, heartbeat_at: datetime | None) -> None:
 def watchdog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     ledger = tmp_path / "data" / "whiskeyjack_bot.sqlite3"
     seeded_ledger(ledger, heartbeat_at=ANCHOR - timedelta(minutes=2))
+    seed_activation(ledger, ACTIVE_PROJECT)
     module = _load()
     harness = Harness(module=module, units=healthy_units(), pushes=[])
+    harness.real_metaculus_get = module._metaculus_get
     monkeypatch.setattr(module, "STATE", tmp_path / "wj-watchdog.json")
     monkeypatch.setattr(module, "LEDGER", ledger)
     monkeypatch.setattr(module, "_systemctl", harness.systemctl)
+    monkeypatch.setattr(module, "_metaculus_get", harness.metaculus)
     monkeypatch.setattr(module, "_push", harness.push)
     monkeypatch.setattr(module, "_ping_deadman", harness.ping)
     monkeypatch.setattr(module, "_now", lambda: harness.instant[0])
@@ -277,11 +320,14 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
     assert module.WORST_CASE_SECONDS < deadline, (module.WORST_CASE_SECONDS, deadline)
     assert deadline < interval, "a hung run must not still be alive when the next one starts"
     # And the arithmetic is over the numbers the code actually passes, not over a copy.
+    # M1-347 adds the rollover check's wall-clock read bound and its one push.
     assert module.WORST_CASE_SECONDS == (
         11 * module.SYSTEMCTL_TIMEOUT_SECONDS
         + module.LEDGER_TIMEOUT_SECONDS
         + 2 * module.PUSH_TIMEOUT_SECONDS
         + module.DEADMAN_TIMEOUT_SECONDS
+        + module.ROLLOVER_FETCH_SECONDS
+        + module.ROLLOVER_PUSH_TIMEOUT_SECONDS
     )
 
 
@@ -311,8 +357,11 @@ def test_every_outward_call_passes_the_timeout_the_budget_counts(
     seeded_ledger(ledger, heartbeat_at=ANCHOR - timedelta(hours=3))
     real_connect = sqlite3.connect
 
+    ledger_timeouts: list[float] = []
+    push_timeouts: dict[str, object] = {}
+
     def fake_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
-        seen["ledger"] = kwargs["timeout"]
+        ledger_timeouts.append(kwargs["timeout"])
         return real_connect(*args, **kwargs)
 
     class _Response:
@@ -328,8 +377,12 @@ def test_every_outward_call_passes_the_timeout_the_budget_counts(
             return None
 
     def fake_urlopen(target: Any, timeout: int | None = None) -> _Response:
-        # A push sends a Request; the dead-man ping sends a bare URL string.
-        seen["push" if hasattr(target, "get_method") else "ping"] = timeout
+        # A push sends a Request; the dead-man ping sends a bare URL string. Pushes are told
+        # apart by title, because the rollover check's push passes its own shorter timeout.
+        if hasattr(target, "get_method"):
+            push_timeouts[target.get_header("Title")] = timeout
+        else:
+            seen["ping"] = timeout
         return _Response()
 
     monkeypatch.setattr(module, "STATE", tmp_path / "state.json")
@@ -342,8 +395,16 @@ def test_every_outward_call_passes_the_timeout_the_budget_counts(
 
     assert module.main() == 1, "everything is inactive, so both subjects are down"
     assert seen["systemctl"] == module.SYSTEMCTL_TIMEOUT_SECONDS
-    assert seen["ledger"] == module.LEDGER_TIMEOUT_SECONDS
-    assert seen["push"] == module.PUSH_TIMEOUT_SECONDS
+    # The heartbeat read, then the rollover check's activation read -- which is also bounded by
+    # its thread join, so it may pass less than the ledger timeout and never more.
+    assert ledger_timeouts[0] == module.LEDGER_TIMEOUT_SECONDS
+    assert len(ledger_timeouts) == 2 and 0 < ledger_timeouts[1] <= module.LEDGER_TIMEOUT_SECONDS
+    # This ledger has no activation, so the rollover check could not run and says so.
+    assert push_timeouts == {
+        "whiskeyjack: WORKER DOWN": module.PUSH_TIMEOUT_SECONDS,
+        "whiskeyjack: RESOLUTIONS SCHEDULE STOPPED": module.PUSH_TIMEOUT_SECONDS,
+        "whiskeyjack: rollover check failed": module.ROLLOVER_PUSH_TIMEOUT_SECONDS,
+    }
 
     # The ping only fires on the healthy tournament path, so drive that separately.
     seen.clear()
@@ -633,6 +694,21 @@ def test_the_runbooks_w1_table_is_the_whole_vocabulary(watchdog: Harness) -> Non
     assert cells[:2] == ["line", "---"], cells[:2]  # the header and its separator
     documented = set(cells[2:])
     assert documented == set(watchdog.module.RESOLUTIONS_PROBLEMS.values())
+
+
+def test_the_runbooks_p3_check_failed_table_is_the_whole_vocabulary() -> None:
+    """The same partition claim as W1's, for `rollover check failed` (M1-347)."""
+    runbook = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    section = runbook.split("#### When the rollover check itself fails", 1)[1]
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break
+    cells = [row.split("|")[1].strip() for row in rows]
+    assert cells[:2] == ["line", "---"], cells[:2]
+    assert set(cells[2:]) == set(_load().ROLLOVER_CHECK_PROBLEMS.values())
 
 
 def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
@@ -1424,6 +1500,8 @@ def test_the_watchdog_imports_nothing_from_the_package_it_watches() -> None:
         "sqlite3",
         "subprocess",
         "sys",
+        "threading",
+        "time",
         "urllib",
     }, sorted(imported)
 
@@ -1443,3 +1521,467 @@ def test_no_push_carries_an_environment_value(
         for field_value in push.values():
             assert "wj-secret-topic-0001" not in field_value
             assert "wj-secret-ping-0001" not in field_value
+
+
+# ── M1-347: MiniBench rolling over to a project the activation does not cover ──
+#
+# 2026-09-21: Metaculus moved MiniBench from 33122 to 33125, the worker kept polling 33122 with
+# fresh heartbeats and `discovered: 0`, and 13 questions were lost before a person noticed.
+# The fixture's activation and the fake slug both say 33125, which is today's real state.
+
+NEXT_PROJECT = 33130
+ROLLED = "MINIBENCH ROLLED OVER"
+CHECK_FAILED = "rollover check failed"
+
+
+def test_the_slug_is_the_pinned_sdks_minibench_id() -> None:
+    """The witness outside the script: the SDK the worker polls through names the series.
+
+    If a pinned-SDK bump renamed `CURRENT_MINIBENCH_ID`, the worker and this check would ask
+    about two different things, and nothing else would say so.
+    """
+    from forecasting_tools.helpers.metaculus_client import MetaculusClient
+
+    assert _load().MINIBENCH_SLUG == MetaculusClient.CURRENT_MINIBENCH_ID
+
+
+def test_a_matching_project_is_quiet_and_asks_metaculus_one_question(watchdog: Harness) -> None:
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+    assert watchdog.fetched == ["/projects/tournaments/minibench/"]
+    assert watchdog.state()["rollover"] == {}
+    assert watchdog.state()["rollover_check"] == {}
+
+
+def test_a_mismatch_with_an_open_post_pages_once_within_one_run(watchdog: Harness) -> None:
+    """The criterion. Killed-mutant (a): a neutered comparison reads every run as a match."""
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+
+    assert watchdog.run() == 1
+    pages = watchdog.titled(ROLLED)
+    assert len(pages) == 1 and len(watchdog.pushes) == 1
+    assert pages[0]["priority"] == "urgent"
+    assert "docs/RUNBOOK.md P3" in pages[0]["body"]
+    # The open-post question is asked about the slug's project, never the activation's.
+    assert watchdog.fetched[1] == f"/posts/?tournaments={NEXT_PROJECT}&statuses=open&limit=10"
+    # And the worker's own page and throttle are untouched.
+    assert watchdog.titled("WORKER DOWN") == []
+    assert watchdog.state()["alerting"] is False
+
+
+def test_a_mismatch_with_nothing_open_is_quiet(watchdog: Harness) -> None:
+    """Killed-mutant (b): dropping the open-post condition pages at every series boundary."""
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    watchdog.posts[0] = {"results": []}
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+
+def test_closed_posts_in_the_answer_are_not_open_posts(watchdog: Harness) -> None:
+    """Counted by each post's own status, not by trusting the `statuses=open` filter."""
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    watchdog.posts[0] = {"results": [{"status": "closed"}, {"status": "resolved"}]}
+
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+
+def test_the_latest_activation_is_the_one_compared(watchdog: Harness) -> None:
+    """Newest by `seq`, the row `require_activation` reads -- in both directions."""
+    watchdog.activate(33122)
+    assert watchdog.run() == 1, "the newest activation is on the old series"
+    assert len(watchdog.titled(ROLLED)) == 1
+
+    watchdog.activate(ACTIVE_PROJECT)
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 0, "re-pointed: the newest activation covers the slug again"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("network is unreachable"),
+        TimeoutError(),
+        ValueError("Expecting value"),
+        RecursionError(),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        RuntimeError("anything else at all"),
+    ],
+    ids=["oserror", "timeout", "json", "recursion", "decode", "anything"],
+)
+def test_a_failed_read_is_its_own_fault_never_green_and_never_worker_down(
+    watchdog: Harness, failure: BaseException
+) -> None:
+    """Killed-mutant (c): swallowing the error as green exits 0 and pages nothing."""
+    watchdog.project[0] = failure
+
+    assert watchdog.run() == 1
+    assert [push["title"] for push in watchdog.pushes] == [f"whiskeyjack: {CHECK_FAILED}"]
+    assert watchdog.pushes[0]["priority"] == "default"
+    assert "Metaculus did not answer with a usable MiniBench project" in watchdog.pushes[0]["body"]
+    assert watchdog.state()["alerting"] is False, "a Metaculus outage is not the worker's"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        "33125",
+        {},
+        {"id": None},
+        {"id": "33125"},
+        {"id": True},
+        {"id": 0},
+        {"id": -33125},
+        {"id": 33125.0},
+        {"id": [33125]},
+    ],
+    ids=repr,
+)
+def test_a_malformed_project_answer_is_a_failed_check(watchdog: Harness, payload: object) -> None:
+    """Bool-as-int included: `True` is an int to `isinstance`, and it is not project 1."""
+    watchdog.project[0] = payload
+
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(CHECK_FAILED)) == 1
+    assert watchdog.titled(ROLLED) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {},
+        {"results": None},
+        {"results": "open"},
+        {"results": [1]},
+        {"results": [[]]},
+        # Round-1 blocking finding: each of these counted as zero open and went green.
+        {"results": [{"status": None}]},
+        {"results": [{"status": []}]},
+        {"results": [{}]},
+        {"results": [{"status": "closed"}, {"status": True}]},
+    ],
+    ids=repr,
+)
+def test_a_malformed_posts_answer_is_a_failed_check(watchdog: Harness, payload: object) -> None:
+    """Never quiet: "nothing open" is the green outcome, so an unreadable post cannot reach it."""
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    watchdog.posts[0] = payload
+
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(CHECK_FAILED)) == 1
+    assert "open posts" in watchdog.titled(CHECK_FAILED)[0]["body"]
+    assert watchdog.titled(ROLLED) == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        '{"project_id": "33125"}',
+        '{"project_id": true}',
+        '{"project_id": 0}',
+        '{"account_id": 1}',
+        "[33125]",
+        "33125",
+    ],
+)
+def test_an_activation_this_program_cannot_read_is_a_failed_check_not_a_match(
+    watchdog: Harness, data: str
+) -> None:
+    """Values read back out of the ledger are untrusted (CLAUDE.md). An INSERT, as `012` allows."""
+    connection = sqlite3.connect(Path(watchdog.module.LEDGER))
+    try:
+        connection.execute(
+            "INSERT INTO tournament_events(event_id, kind, scope, data, created_at_utc) "
+            "VALUES ('odd-activation', 'activation', 'account', ?, '2026-09-17T11:00:00+00:00')",
+            (data,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(CHECK_FAILED)) == 1
+    assert "could not be read from the ledger" in watchdog.titled(CHECK_FAILED)[0]["body"]
+    assert watchdog.fetched == [], "no Metaculus question is worth asking without the other half"
+
+
+def test_a_ledger_with_no_activation_is_a_failed_check(
+    tmp_path: Path, watchdog: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bare = tmp_path / "bare" / "ledger.sqlite3"
+    seeded_ledger(bare, heartbeat_at=ANCHOR - timedelta(minutes=2))
+    monkeypatch.setattr(watchdog.module, "LEDGER", bare)
+
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(CHECK_FAILED)) == 1
+
+
+def test_a_read_that_hangs_is_cut_off_at_the_declared_bound(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound is the thread join, not a socket timeout -- DNS has none at all.
+
+    Measured, not argued: a fetch that blocks far past the bound returns `timed_out` once the
+    bound has elapsed. Shrunk to a fraction of a second so the test costs that, not 15 s.
+    """
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def hang(path: str, deadline: float) -> object:
+        release.wait(30)
+        return {"id": ACTIVE_PROJECT}
+
+    monkeypatch.setattr(watchdog.module, "ROLLOVER_FETCH_SECONDS", 0.3)
+    monkeypatch.setattr(watchdog.module, "_metaculus_get", hang)
+    started = time.monotonic()
+    try:
+        assert watchdog.run() == 1
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert elapsed < 5, elapsed
+    assert "did not finish within" in watchdog.titled(CHECK_FAILED)[0]["body"]
+
+
+def test_a_standing_rollover_repeats_hourly_and_not_every_run(watchdog: Harness) -> None:
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    for _ in range(12):
+        assert watchdog.run() == 1
+        watchdog.instant[0] += timedelta(minutes=5)
+    assert len(watchdog.titled(ROLLED)) == 1, "an hour of runs, one page"
+
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(ROLLED)) == 2, "sixty minutes after the first page"
+
+
+def test_a_second_rollover_while_the_first_stands_pages_at_once(watchdog: Harness) -> None:
+    """The project pair is in the throttle key, so a new pair is new information."""
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    assert watchdog.run() == 1
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.project[0] = {"id": NEXT_PROJECT + 1}
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(ROLLED)) == 2
+
+
+def test_a_failed_read_neither_clears_nor_re_pages_a_standing_rollover(watchdog: Harness) -> None:
+    """The M1-343 lesson, applied: a code that drops out for an unrelated reason re-keys.
+
+    A Metaculus timeout says nothing about which project MiniBench is on. So the failed read
+    pages on its own throttle and leaves the rollover's entry exactly as it was, and when the
+    read works again the standing rollover is still inside its hour and stays quiet.
+    """
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    assert watchdog.run() == 1
+    rollover_entry = watchdog.state()["rollover"]
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.project[0] = TimeoutError()
+    assert watchdog.run() == 1
+    assert watchdog.state()["rollover"] == rollover_entry
+    assert len(watchdog.titled(CHECK_FAILED)) == 1
+
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(ROLLED)) == 1, "the same rollover, still inside its hour"
+    assert watchdog.state()["rollover_check"] == {}, "a good read clears the failed check"
+
+
+def test_an_empty_batch_does_not_clear_a_standing_rollover(watchdog: Harness) -> None:
+    """Nothing open is not evidence the activation was re-pointed."""
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    assert watchdog.run() == 1
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.posts[0] = {"results": []}
+    assert watchdog.run() == 0
+    watchdog.instant[0] += timedelta(minutes=5)
+    watchdog.posts[0] = {"results": [{"status": "open"}]}
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(ROLLED)) == 1
+    assert [push["title"] for push in watchdog.pushes if "cleared" in push["title"]] == []
+
+
+def test_a_failing_check_pages_on_its_own_six_hour_window(watchdog: Harness) -> None:
+    # Six hours outruns the fixture's heartbeat; a poll in progress holds it still, which is
+    # not a worker fault, so the worker half stays healthy and only this subject is exercised.
+    watchdog.units[("is-active", "whiskeyjack-tournament.service")] = "active"
+    watchdog.project[0] = OSError("down")
+    for _ in range(72):
+        assert watchdog.run() == 1
+        watchdog.instant[0] += timedelta(minutes=5)
+    assert len(watchdog.titled(CHECK_FAILED)) == 1, "six hours of runs, one page"
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(CHECK_FAILED)) == 2
+    assert watchdog.titled("WORKER DOWN") == []
+
+
+def test_re_pointing_the_activation_clears_the_rollover_and_says_so_once(
+    watchdog: Harness,
+) -> None:
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    assert watchdog.run() == 1
+    watchdog.activate(NEXT_PROJECT)
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 0
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 0
+    assert len([push for push in watchdog.pushes if "rollover cleared" in push["title"]]) == 1
+    assert watchdog.state()["rollover"] == {}
+
+
+def test_a_refused_rollover_push_is_retried_on_the_next_run(watchdog: Harness) -> None:
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    watchdog.delivers[0] = False
+    assert watchdog.run() == 1
+    watchdog.delivers[0] = True
+    watchdog.instant[0] += timedelta(minutes=5)
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(ROLLED)) == 2
+    assert "last_alert" in watchdog.state()["rollover"]
+
+
+def test_a_rollover_does_not_mute_or_alter_the_other_two_subjects(watchdog: Harness) -> None:
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    watchdog.units[("is-active", "whiskeyjack-resolutions.timer")] = "inactive"
+
+    assert watchdog.run() == 1
+    assert sorted(push["title"] for push in watchdog.pushes) == [
+        "whiskeyjack: MINIBENCH ROLLED OVER",
+        "whiskeyjack: RESOLUTIONS SCHEDULE STOPPED",
+        "whiskeyjack: WORKER DOWN",
+    ]
+
+
+def test_an_unusable_rollover_state_entry_still_pages(watchdog: Harness) -> None:
+    for entry in ([], "x", {"key": 3, "last_alert": [1]}, {"last_alert": "2026-09-17T11:00:00"}):
+        Path(watchdog.module.STATE).write_text(
+            json.dumps({"rollover": entry, "rollover_check": entry}), encoding="utf-8"
+        )
+        watchdog.pushes.clear()
+        watchdog.project[0] = {"id": NEXT_PROJECT}
+        assert watchdog.run() == 1, entry
+        assert len(watchdog.titled(ROLLED)) == 1, entry
+
+
+# ── the real HTTP half, against a fake opener ────────────────────────────────
+
+
+@dataclass
+class _Body:
+    payload: bytes
+    status: int = 200
+    limits: list[int] = field(default_factory=list)
+
+    def __enter__(self) -> _Body:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, limit: int = -1) -> bytes:
+        self.limits.append(limit)
+        return self.payload if limit < 0 else self.payload[:limit]
+
+
+def _serve(module: ModuleType, monkeypatch: pytest.MonkeyPatch, body: bytes) -> list[Any]:
+    """Replace `build_opener` so `_metaculus_get` runs for real against `body`."""
+    requests: list[Any] = []
+
+    class _Opener:
+        def __init__(self, *handlers: object) -> None:
+            requests.append(("handlers", handlers))
+
+        def open(self, request: Any, timeout: float | None = None) -> _Body:
+            response = _Body(body)
+            requests.append((request, timeout, response))
+            return response
+
+    monkeypatch.setattr(module.urllib.request, "build_opener", _Opener)
+    return requests
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"not json", b"\xff\xfe", b"[" * 200_000, b'{"id": 33125' + b" " * 1_000_000 + b"}", b""],
+    ids=["text", "undecodable", "deep", "oversize", "empty"],
+)
+def test_a_malformed_body_never_escapes_main(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    module = watchdog.module
+    monkeypatch.setattr(module, "_metaculus_get", watchdog.real_metaculus_get)
+    _serve(module, monkeypatch, body)
+
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(CHECK_FAILED)) == 1
+
+
+def test_the_get_sends_the_token_as_a_header_refuses_redirects_and_stays_in_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    module = _load()
+    requests = _serve(module, monkeypatch, b'{"id": 33125}')
+    monkeypatch.setenv("METACULUS_TOKEN", "wj-fake-token-0001")
+
+    assert module._metaculus_get("/projects/tournaments/minibench/", time.monotonic() + 15) == {
+        "id": 33125
+    }
+    (_, handlers), (request, timeout, response) = requests
+    assert handlers == (module._NoRedirect,)
+    assert module._NoRedirect().redirect_request() is None
+    assert request.full_url == "https://www.metaculus.com/api/projects/tournaments/minibench/"
+    assert request.get_method() == "GET"
+    assert request.get_header("Authorization") == "Token wj-fake-token-0001"
+    # Measured: the default `Python-urllib/3.x` agent is answered 403 even with a valid token.
+    assert request.get_header("User-agent") == module.ROLLOVER_USER_AGENT
+    assert 0 < timeout <= module.ROLLOVER_FETCH_SECONDS
+    # The read is bounded, one byte past the limit so an oversize answer is detectable.
+    assert response.limits == [module.ROLLOVER_RESPONSE_LIMIT + 1]
+
+    with pytest.raises(TimeoutError):
+        module._metaculus_get("/projects/tournaments/minibench/", time.monotonic() - 1)
+
+
+# ── no value read from Metaculus or the ledger reaches a push or stdout ────────
+
+
+CANARY_PROJECT = 987654321
+
+
+@pytest.mark.parametrize("scenario", ["rollover", "malformed", "raised"])
+def test_no_payload_value_appears_in_any_push_or_on_stdout(
+    watchdog: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    scenario: str,
+) -> None:
+    """Neither project id, the count, the token, nor any text Metaculus sent back."""
+    monkeypatch.setenv("METACULUS_TOKEN", "wj-secret-token-0001")
+    canary = "wj-canary-7f3a"
+    if scenario == "rollover":
+        watchdog.project[0] = {"id": CANARY_PROJECT, "name": canary, "slug": canary}
+        watchdog.posts[0] = {"results": [{"status": "open", "title": canary}] * 7}
+    elif scenario == "malformed":
+        watchdog.project[0] = {"id": canary, "detail": canary}
+    else:
+        watchdog.project[0] = RuntimeError(canary)
+
+    assert watchdog.run() == 1
+    assert watchdog.pushes
+    printed = capsys.readouterr().out
+    for text in [printed, *(value for push in watchdog.pushes for value in push.values())]:
+        for leaked in (canary, str(CANARY_PROJECT), str(ACTIVE_PROJECT), "wj-secret-token-0001"):
+            assert leaked not in text, (leaked, text)
+    if scenario == "rollover":
+        assert " 7 " not in watchdog.titled(ROLLED)[0]["body"]

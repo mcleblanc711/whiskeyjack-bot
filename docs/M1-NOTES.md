@@ -13193,6 +13193,296 @@ backstopped, which is a two-line change any later round can make — and making 
 invalidate an approval that names this commit, for a case that is already covered deterministically.
 Recorded here so the choice is visible rather than silent.
 
+## M1-347 — Page when MiniBench rolls over to a project the activation does not cover
+
+*Criterion (backlog row, abridged): the out-of-process watchdog resolves the `minibench` slug to
+its concrete project id and open-post count, compares it with the latest `activation` event's
+`project_id` (ledger read-only), and pages `rollover` when they differ and the slug's project
+has at least one open post. A failed or malformed read is `rollover_check_failed` with its own
+throttle, never a false green and never worker-down. The throttle key includes the fault set
+and the project pair. The added timeout is counted in `WORST_CASE_SECONDS`, under the unit's
+240 s. No Metaculus payload value appears in any alert text. The alert only pages. RUNBOOK P3
+describes `--starts` correctly and names the page.*
+
+On 2026-09-21 00:00 UTC Metaculus moved MiniBench from project 33122 to 33125. The worker kept
+polling 33122: every poll exited 0 with `discovered: 0`, heartbeats stayed fresh and the
+watchdog stayed quiet, which is exactly what "between batches" looks like. About twelve hours
+and 13 questions were lost before a person noticed, and a MiniBench question is open for three
+hours, so a missed one is lost rather than late. PR #111 re-pointed the activation by hand; this
+item makes the next rollover page within one watchdog run.
+
+### Delivered
+
+- `deploy/wj-watchdog` — a third subject, `_check_rollover`, run last in `main`, with its own
+  two state entries (`rollover`, `rollover_check`) and its own throttles. Pure helpers
+  `_positive_int`, `_activation_project_id`, `_project_id`, `_open_post_count`, `_rollover_key`,
+  `_is_rollover`; the I/O is `_latest_activation_row`, `_metaculus_get` and `_read_rollover`.
+  `_alert_is_due`'s rule is extracted into `_key_is_due(key, stored, now, window)`, which it now
+  calls with the resolutions window, so its behaviour is the same and its property tests pass
+  unchanged. `_push` gains a `timeout` keyword whose default is the old constant.
+  `WORST_CASE_SECONDS` 215 → 238.
+- `docs/RUNBOOK.md` — P3 now describes the page, the confirm step, the `--starts` correction, and
+  a "when the rollover check itself fails" subsection with its own four-line vocabulary table.
+  The symptom index gains three push rows, and § The watchdog itself now describes three subjects.
+- Tests: `tests/unit/test_watchdog.py` gains the rollover section (and the fixture now seeds a
+  real activation row and fakes Metaculus at `_metaculus_get`); six properties added to
+  `tests/property/test_watchdog_properties.py`.
+
+**No `src/` change, no `AppConfig` field, no `config/*.yaml` byte, no prompt byte, no unit-file
+change, no migration, no dependency.** The watchdog unit already loads `.env`, which holds
+`METACULUS_TOKEN`, so the token needed no new plumbing.
+
+### Decision — the endpoint, confirmed by execution before any code
+
+The pinned SDK never resolves the slug. `MetaculusClient.CURRENT_MINIBENCH_ID = "minibench"`
+(`metaculus_client.py:149`) is passed straight to `/posts/?tournaments=` as a filter value, so
+there was no SDK call to copy. What was measured on 2026-09-22:
+
+| request | answer |
+|---|---|
+| any `/api/…` unauthenticated | 403, "only available to authenticated users" |
+| `/api/projects/tournaments/minibench/` with a token, default urllib agent | **403** |
+| the same, `User-Agent: whiskeyjack-watchdog` | 200, `"id": 33125`, `"type": "question_series"`, `start_date 2026-09-21` |
+| `/api/posts/?tournaments=33125&statuses=open&limit=100` | 200, 1 result, its own `status` `open`, `default_project` 33125 |
+| `/api/posts/?tournaments=33122&statuses=open&limit=100` | 200, 0 results |
+| `/api/posts/?tournaments=33125&limit=100` (no status filter) | 52 results, `closed` and `open` |
+| page 2 of either open query (`offset=100`) | 0 results, `next` still non-null |
+| `/api/projects/tournaments/minibench` (no trailing slash) | **301** |
+
+Three things fell out of that table and are in the code: an explicit `User-Agent`, `next` never
+read (it is non-null even on an empty page, so it says nothing), and redirects refused.
+
+### Decision — the open-post count is counted from each post's own `status`
+
+The filter works (33122 answered none), but the check counts `status == "open"` over whatever
+came back rather than `len(results)`. If the `statuses` filter were ever ignored, a page of
+closed posts would otherwise page about a series with nothing to forecast. The count is capped at
+`ROLLOVER_OPEN_PAGE` (10); only "at least one" decides anything, so the cap costs nothing.
+
+### Decision — open posts are asked for only when the projects differ
+
+In the steady state (a match) the check makes **one** GET per run, not two. The second GET is
+only asked when its answer can change the outcome.
+
+### Decision — two throttles, and why a failed read must not touch the rollover's
+
+M1-343's lesson is that the fault-code set *is* the throttle key, so a code that drops out for a
+reason unrelated to the fault re-keys and re-pages. A Metaculus timeout says nothing about which
+project MiniBench is on. So:
+
+- `rollover` lives in `state["rollover"]`, keyed `rollover:<activation>-><slug>`, re-alerting
+  hourly (`ROLLOVER_REALERT_AFTER`).
+- `rollover_check_failed` lives in `state["rollover_check"]`, keyed on its one code, re-alerting
+  every six hours (`ROLLOVER_CHECK_REALERT_AFTER`).
+- A failed read writes **only** `rollover_check`. A standing rollover's entry stays exactly as
+  the last good read left it, so when the read comes back the rollover is still inside its hour
+  and stays quiet (`test_a_failed_read_neither_clears_nor_re_pages_a_standing_rollover`).
+- A good read clears `rollover_check` silently. A recovery notice for a blind spot that healed
+  would be noise.
+- The reason a check failed (`ROLLOVER_CHECK_PROBLEMS`) is **named in the push but not keyed
+  on**, so a read that fails one way and then another is one standing fault, not two pages.
+
+Only a *match* clears `rollover`. A mismatch with nothing open is quiet but **leaves the entry
+alone**: an empty batch is not evidence the activation was re-pointed, and clearing it would
+re-page the same rollover when the next batch opens (mutant `l` below).
+
+The project pair is in the rollover key, as the criterion requires, so a second move while the
+first is standing (33125 → 33130, then → 33131) pages at once.
+
+### Decision — hourly for a rollover, six-hourly for a blind check
+
+A rollover is lost questions at a rate of one per open window, the same class as the worker
+being down, so it takes the worker's hourly shape at `urgent` priority. It is a separate
+constant, not a reuse of `REALERT_AFTER`, because two clocks sharing one name become one clock
+by accident (T-909). A failed check is a blind spot, not a loss: nothing is missed unless a
+rollover happens at the same time. Six hours is two question windows, which is long enough
+that a Metaculus outage does not page all day at `default` priority. It is also short enough
+that a detector that has gone blind is not blind for a whole series without anyone hearing.
+
+### Decision — check every run; do not throttle the fetch itself
+
+The brief asked whether the fetch should run less often, say every 30 minutes via the state
+file. Rejected. The criterion is "page within one watchdog pass", a 30-minute fetch interval
+would spend up to a sixth of a three-hour question window before the first page, and the cost it
+saves is one ~3 KB authenticated GET every five minutes (288/day), a load the worker already
+generates many times over through the SDK. A fetch throttle would also be one more stamp in a
+person-editable state file, which is the surface M1-341 took five rounds to close.
+
+### Decision — one wall-clock bound, enforced by a thread join; the push gets 8 s
+
+urllib's `timeout` is per blocking socket operation. It does not cover DNS resolution at all,
+and a server dripping one byte per timeout never trips it (M1-329 found the same of httpx). So
+a sum of socket timeouts would be arithmetic about a bound nothing enforces. The activation read
+and both GETs run in one daemon thread joined with `ROLLOVER_FETCH_SECONDS` (15). The process
+exits a moment after `main` returns, so an abandoned read dies with it. The socket timeouts
+inside are set to what is left of the same deadline, which keeps an abandoned thread short.
+
+The budget was forced: M1-343 left the declared worst case at 215 s against the unit's 240 s,
+which leaves 25 s. The fetch cannot be much below 15 s, because one real answer took **10.2 s**
+on 2026-09-22 (three samples: 0.3–10.2 s for the project GET, 0.6–2.4 s for posts). The push
+therefore gets `ROLLOVER_PUSH_TIMEOUT_SECONDS = 8` instead of the shared 15, via a new `_push`
+keyword whose default keeps every existing caller's value. **238 s.**
+`test_every_outward_call_passes_the_timeout_the_budget_counts` now tells pushes apart by title
+and pins all three push timeouts.
+
+### Decision — refuse redirects
+
+urllib's `HTTPRedirectHandler.redirect_request` copies every non-content header onto the
+redirected request, `Authorization` included, to whatever host `Location` names. Neither path
+this script asks for redirects (measured, above), so `_NoRedirect` refuses every redirect and
+one reads as a failed check. It costs nothing today and keeps the token from following a
+misconfigured `Location` anywhere.
+
+### Decision — nothing read from outside reaches a push or stdout
+
+The criterion forbids Metaculus payload values in alert text. The stricter reading applied here
+also covers the **ledger's** project id (CLAUDE.md: values read back out of the ledger are
+untrusted, and error hygiene says messages never echo stored values), the open-post **count**
+(derived from the payload), and the journal lines `print` writes. So the page names neither
+project. Instead it points at the two places the owner reads both: `tournament status` and the
+Metaculus MiniBench page. `test_no_payload_value_appears_in_any_push_or_on_stdout` drives
+three scenarios with a canary string, a canary project id, the active project id and a token,
+and asserts none of them appears in any push field or on stdout.
+
+### Deviation — a ledger-side failure is also `rollover_check_failed`
+
+The criterion names a failed **Metaculus** read. A ledger with no activation, one the watchdog
+cannot open, or an activation whose `project_id` is not a positive `int` (a string `"33125"`,
+`true`, `0`) would otherwise have nowhere to go, and treating "cannot say" as a match is the
+false green the criterion forbids. So it gets the same fault, with its own line in the
+vocabulary. An unreadable ledger therefore pages twice, as `WORKER DOWN` (no heartbeat) and as a
+failed rollover check. Both are true, and the second is at `default` priority.
+
+### Deviation — the exit code is 1 for a failed check
+
+`main` exits 1 when any subject is down, and a failed rollover check counts. "Never escalated to
+worker-down" is about the **page**, and holds: the check writes nothing to the tournament's
+state, its title is its own, and the worker's `alerting` stays false
+(`test_a_failed_read_is_its_own_fault_never_green_and_never_worker_down`). The unit has no
+`OnFailure=`, so the exit code is visible only in `systemctl --user status`.
+
+### Rejected — the posts endpoint alone (`/posts/?tournaments=minibench&statuses=open`)
+
+One GET would do: the open posts carry `projects.default_project.id`, and when nothing is open
+the check is quiet anyway. Rejected because it infers the series' project from a post's
+*default* project, a field whose meaning for multi-project posts this item cannot verify,
+where the project endpoint answers the question directly. It would also make "the slug resolves
+to project X" unobservable whenever nothing is open.
+
+### Rejected — honouring `METACULUS_API_BASE_URL`
+
+The SDK reads it, so strictly the watchdog should ask wherever the worker asks. It is not set in
+`.env` (checked by key name only), and honouring it would put an environment value into the one
+URL this script sends a token to. Deferred rather than done.
+
+### Rejected — a grace count of consecutive failures before `rollover_check_failed` pages
+
+A single slow answer (10.2 s was observed) will occasionally fail the check, and a threshold of
+two or three consecutive failures would absorb that. Rejected under the stricter-reading rule:
+the criterion says a failed read *is* the fault. The six-hour throttle and `default` priority
+are what keep a flaky Metaculus from being loud. If the live failure rate proves noisy, a
+persistence threshold is the fix, and it would need an owner decision.
+
+### Deferred (do not read the absence as an omission)
+
+- **A disabled or out-of-window activation still gets compared.** The check reads the newest
+  `activation` row's `project_id` and nothing else, as the criterion states. If the owner
+  disables MiniBench and the series then moves, it pages. That is arguably right (the series
+  moved), but it is noise for a profile nobody runs. Not observed, not filed.
+- **The Cup profile is not watched.** It is dormant (2026-09-10), and `LEDGER` is MiniBench's.
+- **M1-344 and M1-345** still touch this file next, in that order.
+- **`--starts` is not checked by the watchdog.** A re-point with a future `--starts` refuses as
+  inactive until then, and the rollover page clears as soon as the activation row matches, even
+  though the worker is refusing. The refusal itself is the worker's to report.
+
+### Standing risk — not verifiable offline
+
+- **The endpoint shape was confirmed live on 2026-09-22** (table above) and cannot be verified
+  offline. Every test fakes Metaculus at `_metaculus_get` or at `build_opener`. If Metaculus
+  renames the path, changes the `id` field or stops honouring the `statuses` filter, the check
+  fails closed to `rollover_check_failed` (a missing path or field), or to fewer counted posts
+  (an ignored filter still yields `status`-counted posts). It never fails to a false green.
+  The exception: a filter change that returns *no* posts would read as "nothing open" and be
+  quiet.
+- **The 403-on-default-agent behaviour is Metaculus's (or its CDN's)** and may change in either
+  direction. The explicit agent is harmless if it does.
+- **Whether a push reaches a phone** is untestable here; `_push` is replaced in every test.
+- **The next real rollover is the only end-to-end test.** The deploy step drives a scratch copy
+  of the script against a fake mismatch to prove the page path, but the live slug moving is not
+  something this branch can cause.
+
+### Mutation pass — twenty-six mutants, twenty-six dead
+
+Run against committed `c1562a8`, one mutant at a time, each applied to `deploy/wj-watchdog` and
+restored from the committed text, `__pycache__` cleared between them. The tests compile the
+script from source anyway. Every mutant ran twice: under `tests/unit/test_watchdog.py`, and then
+under `tests/property/test_watchdog_properties.py` **alone**, so a property can't hide behind a
+unit test covering the same rule. The brief's three required mutants are `a1`, `b1` and `c1`.
+
+| # | mutant | unit | props alone | named witness |
+|---|---|---|---|---|
+| a1 | the match comparison in `_check_rollover` neutered to always-match | dead | lives | `test_a_mismatch_with_an_open_post_pages_once_within_one_run` |
+| a2 | `_is_rollover` never sees a mismatch | dead | dead | same; `test_a_rollover_is_exactly_a_mismatch_with_something_open` |
+| a3 | the observation reports a match without asking | dead | lives | same |
+| b1 | the open-post condition dropped | dead | dead | `test_a_mismatch_with_nothing_open_is_quiet` |
+| b2 | `>= 1` → `>= 0` | dead | dead | same |
+| c1 | a failed read exits green | dead | lives | `test_a_failed_read_is_its_own_fault_never_green_and_never_worker_down` |
+| c2 | a failed read returns before pushing | dead | lives | same |
+| c3 | a fetch error reads as the activation's own project | dead | lives | same |
+| d | `len(results)` instead of counting `status == "open"` | dead | dead | `test_closed_posts_in_the_answer_are_not_open_posts` |
+| e | `isinstance` instead of exact `int` (bool-as-int) | dead | dead | the `{"id": True}` row of `test_a_malformed_project_answer_...` |
+| f | the project pair dropped from the key | dead | dead | `test_a_second_rollover_while_the_first_stands_pages_at_once` |
+| g | a failed read clears the standing rollover | dead | lives | `test_a_failed_read_neither_clears_nor_re_pages_a_standing_rollover` |
+| h | the thread join unbounded | dead | lives | `test_a_read_that_hangs_is_cut_off_at_the_declared_bound` |
+| i | redirects followed | dead | lives | `test_the_get_sends_the_token_as_a_header_refuses_redirects_...` |
+| j | no `User-Agent` | dead | lives | same |
+| k | the body read unbounded | **lived**, then dead | lives | same, after the fix below |
+| l | an empty batch clears the standing rollover | dead | lives | `test_an_empty_batch_does_not_clear_a_standing_rollover` |
+| m | no recovery push | dead | lives | `test_re_pointing_the_activation_clears_the_rollover_and_says_so_once` |
+| n | failed-check window 6 h → 1 h | dead | lives | `test_a_failing_check_pages_on_its_own_six_hour_window` |
+| o | rollover window 1 h → 24 h | dead | lives | `test_a_standing_rollover_repeats_hourly_and_not_every_run` |
+| p | the oldest activation read instead of the newest | dead | lives | `test_the_latest_activation_is_the_one_compared` |
+| q | open posts asked about the activation's project | dead | lives | `test_a_mismatch_with_an_open_post_...` (the asked path) |
+| r | the page renders the slug's project id | dead | lives | `test_no_payload_value_appears_in_any_push_or_on_stdout` |
+| s | `main` never runs the check | dead | lives | every page test |
+| t | the exit code ignores the check | dead | lives | every page test |
+| u | the token not sent as `Authorization` | dead | lives | `test_the_get_sends_the_token_...` |
+
+**`k` survived the first pass, and it was nearly an equivalent mutant.** `response.read()`
+unbounded still hit the `len(body) > LIMIT` refusal on the oversize fixture, so the page outcome
+was identical and only the memory held differed. The fake response now records the limit it
+was read with, and the header test asserts `LIMIT + 1`. The rerun kills `k`. Every "lives" in the
+props-alone column is a mutant in I/O or wiring that no pure function reaches. All six mutants
+in a pure function die under the properties alone, which is the reach check for the strategies.
+
+### Round 1 review (GPT) — CHANGES REQUESTED on `ba22a47`, one blocking finding, fixed
+
+**Finding: a malformed post status read as "nothing open", which is the quiet outcome.**
+`_open_post_count` checked that each post was an object and then counted `status == "open"`,
+so `{"status": null}`, `{"status": []}` and a post with no `status` all counted as zero open.
+On a mismatch that exits 0 with no page, and it cleared a standing `rollover_check` entry: a
+malformed Metaculus answer producing the false green the criterion forbids. **Reproduced by
+execution at `ba22a47`** before any fix (all three shapes → `0`).
+
+**My own test had enshrined it.** `test_closed_posts_in_the_answer_are_not_open_posts` listed
+`{}` among the quiet cases, and the property's oracle restated the permissive rule. So the parser
+and both of its witnesses agreed, and the mutation pass could not see it: no mutant *removed*
+a check that had never been written. That is the vacuity class again in its oracle form. A
+property whose expected value is computed by the same rule as the code under test proves
+consistency, not correctness.
+
+**Fix.** A post is counted only if it is an object whose `status` is exactly a `str`, and
+anything else makes the whole answer unusable (`None` → `posts_unreadable`). An unfamiliar
+string is still a status and still not open. Four failed-check rows were added to
+`test_a_malformed_posts_answer_is_a_failed_check` (`null`, `[]`, missing, and a bool beside a
+valid `closed`), and `{}` was removed from the quiet test. The property oracle now requires a
+string status. **Reverting the fix is killed by 4 unit tests, and by the properties alone.**
+
+**Reach, measured while fixing it.** With `status` optional in the post strategy, only 6.4% of
+2000 draws reached a counted list and 1.0% one with an open post. A dedicated well-formed branch
+and a required `status` bring that to 24.8% and 11.7%. Mutant `d` (`len(results)`) still dies
+under the properties alone.
+
 ## M1-348 — Settle BYOK model cost from the upstream figure, and correct the past spend
 
 Acceptance, in short: *when `usage.is_byok` is exactly `True` the settled cost is the finite,
