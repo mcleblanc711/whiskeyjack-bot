@@ -13482,6 +13482,7 @@ string status. **Reverting the fix is killed by 4 unit tests, and by the propert
 2000 draws reached a counted list and 1.0% one with an open post. A dedicated well-formed branch
 and a required `status` bring that to 24.8% and 11.7%. Mutant `d` (`len(results)`) still dies
 under the properties alone.
+
 ## M1-348 — Settle BYOK model cost from the upstream figure, and correct the past spend
 
 Acceptance, in short: *when `usage.is_byok` is exactly `True` the settled cost is the finite,
