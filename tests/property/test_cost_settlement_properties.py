@@ -307,7 +307,13 @@ def test_a_correction_is_exact_replay_stable_and_idempotent(
 
 OPERATION = st.one_of(
     st.tuples(st.just("reserve"), st.just(0), st.none()),
-    st.tuples(st.just("settle"), st.integers(0, 5), st.one_of(st.none(), st.floats())),
+    # Mostly prices on the same scale as the raw corrections below: with only `st.floats()`
+    # here, a plain-replace `spending()` that lowers a settlement survived 150 draws.
+    st.tuples(
+        st.just("settle"),
+        st.integers(0, 5),
+        st.one_of(st.none(), st.just(0.0), st.floats(0, 10), st.floats()),
+    ),
     st.tuples(st.just("response"), st.integers(0, 5), USAGE.filter(_persistable)),
     st.tuples(st.just("correct"), st.just(0), st.none()),
     st.tuples(st.just("raw_correction"), st.integers(0, 5), st.integers(0, 10**7)),
