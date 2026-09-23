@@ -223,13 +223,70 @@ _POISON = st.sampled_from(
 )
 
 
+def _get(source: Any, path: tuple[Any, ...]) -> Any:
+    for key in path:
+        source = source[key]
+    return source
+
+
 def _set(target: Any, path: tuple[Any, ...], value: Any) -> None:
     for key in path[:-1]:
         target = target[key]
     target[path[-1]] = value
 
 
-def test_a_reply_value_never_reaches_the_problems_the_log_renders(tmp_path: Path) -> None:
+def _schema_admits_text(path: tuple[Any, ...]) -> bool:
+    """Whether a free-text sentinel at ``path`` still passes the schema.
+
+    Derived rather than listed: ids, timestamps and enums refuse free text, and the point of
+    the post-schema run is to reach the checks that run *after* the schema.
+    """
+    payload = copy.deepcopy(_REPLY)
+    _set(payload, path, f"The wire said {SENTINEL}.")
+    try:
+        validate_forecast_response(dict(payload, question_type=_QUESTION.qtype), _MODEL)
+    except ForecastSchemaError:
+        return False
+    return True
+
+
+_STRING_PATHS = [
+    path
+    for path in _REPLY_PATHS
+    if isinstance(_get(_REPLY, path), str) and _schema_admits_text(path)
+]
+
+
+def _check_reply(config: Any, payload: dict[str, Any], reached: Counter[str]) -> None:
+    forecast, problems = _parse(
+        json.dumps(payload),
+        _MODEL,
+        config.forecast,
+        question=_QUESTION,
+        source_ids=_SOURCES,
+    )
+    if forecast is not None:
+        reached["accepted"] += 1
+        event("accepted")
+        return
+    reached["refused"] += 1
+    stamped = dict(payload, question_type=_QUESTION.qtype)
+    try:
+        validate_forecast_response(stamped, _MODEL)
+        kind = "post-schema"
+    except ForecastSchemaError:
+        kind = "schema"
+    reached[kind] += 1
+    event(kind)
+    assert problems, "a refusal always carries at least one problem"
+    for problem in problems:
+        assert SENTINEL not in problem
+
+
+def test_a_reply_value_never_reaches_the_schema_problems_the_log_renders(
+    tmp_path: Path,
+) -> None:
+    """Any poison, anywhere: mostly refused by the schema, whose messages are the risk."""
     config = base_config.__wrapped__(tmp_path)
     reached: Counter[str] = Counter()
 
@@ -237,17 +294,10 @@ def test_a_reply_value_never_reaches_the_problems_the_log_renders(tmp_path: Path
         paths=st.lists(st.sampled_from(_REPLY_PATHS), min_size=1, max_size=3),
         poison=_POISON,
         extra_key=st.booleans(),
-        out_of_bounds=st.booleans(),
     )
     @settings(max_examples=300, deadline=None)
-    def check(
-        paths: list[tuple[Any, ...]], poison: Any, extra_key: bool, out_of_bounds: bool
-    ) -> None:
+    def check(paths: list[tuple[Any, ...]], poison: Any, extra_key: bool) -> None:
         payload = copy.deepcopy(_REPLY)
-        if out_of_bounds:
-            # Schema-valid and outside the configured probability bounds: the post-schema
-            # checks refuse it, with the poison (wherever it survived the schema) aboard.
-            payload["final_prediction"] = {"probability_yes": 0.9999}
         for path in paths:
             try:
                 _set(payload, path, copy.deepcopy(poison))
@@ -255,30 +305,33 @@ def test_a_reply_value_never_reaches_the_problems_the_log_renders(tmp_path: Path
                 continue  # an earlier poison already replaced this path's parent
         if extra_key:
             payload["unexpected"] = SENTINEL
-        forecast, problems = _parse(
-            json.dumps(payload),
-            _MODEL,
-            config.forecast,
-            question=_QUESTION,
-            source_ids=_SOURCES,
-        )
-        if forecast is not None:
-            reached["accepted"] += 1
-            event("accepted")
-            return
-        reached["refused"] += 1
-        stamped = dict(payload, question_type=_QUESTION.qtype)
-        try:
-            validate_forecast_response(stamped, _MODEL)
-            kind = "post-schema"
-        except ForecastSchemaError:
-            kind = "schema"
-        reached[kind] += 1
-        event(kind)
-        assert problems, "a refusal always carries at least one problem"
-        for problem in problems:
-            assert SENTINEL not in problem
+        _check_reply(config, payload, reached)
 
     check()
-    assert reached["refused"] >= 100, reached
-    assert reached["schema"] >= 20 and reached["post-schema"] >= 5, reached
+    assert reached["schema"] >= 150, reached
+
+
+def test_a_reply_value_never_reaches_the_post_schema_problems_the_log_renders(
+    tmp_path: Path,
+) -> None:
+    """A plain sentinel string in string fields, and a prediction outside the configured
+    bounds: schema-valid, so the post-schema checks are the ones that refuse it, with the
+    sentinel aboard. Split from the run above because there it was reached 8-20 times in
+    300 -- too thin a margin for a bar in a required gate."""
+    config = base_config.__wrapped__(tmp_path)
+    reached: Counter[str] = Counter()
+
+    @given(
+        paths=st.lists(st.sampled_from(_STRING_PATHS), min_size=1, max_size=3),
+        text=st.sampled_from([SENTINEL, f"The wire said {SENTINEL}.", f"{SENTINEL}\ud800"]),
+    )
+    @settings(max_examples=100, deadline=None)
+    def check(paths: list[tuple[Any, ...]], text: str) -> None:
+        payload = copy.deepcopy(_REPLY)
+        payload["final_prediction"] = {"probability_yes": 0.9999}
+        for path in paths:
+            _set(payload, path, text)
+        _check_reply(config, payload, reached)
+
+    check()
+    assert reached["post-schema"] >= 50, reached

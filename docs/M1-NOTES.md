@@ -14489,5 +14489,8 @@ the one reached. The two properties assert their own reach:
 - the non-finite body lands in `usage.cost`, deeper in `usage` and outside `usage`, one
   parametrized run of 40 examples apiece. A single run with `sampled_from` measured 85/9/26 of
   120 and failed its own reach bar in the gate, so reach is by construction now;
-- the reply sentinel reaches the schema half (≥ 20) and the post-schema half (≥ 5) of `_parse`,
-  in ≥ 100 refusals.
+- the reply sentinel reaches the schema half and the post-schema half of `_parse` in two runs.
+  A single mixed run reached the post-schema half only 5–20 times in 300, too thin a margin for
+  a required gate. The schema run now asserts ≥ 150 of 300 (measured 270–277). The post-schema
+  run plants free text only where the schema admits it, which is derived by trying each path,
+  with the prediction out of bounds, and asserts ≥ 50 of 100 (measured 100).
