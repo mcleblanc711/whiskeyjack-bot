@@ -50,6 +50,7 @@ def _rows() -> list[dict[str, str]]:
         {"ID": "M1-303", "Status": "Not Started"},
         {"ID": "M1-305", "Status": "Done"},
         {"ID": "M1-401", "Status": "In Review"},
+        {"ID": "M1-307", "Status": "Deferred"},
     ]
 
 
@@ -108,6 +109,10 @@ def test_skip_and_item_prefixes_are_disjoint() -> None:
         ("FEAT/M1-303-x", 1),
         ("feature/m1-303-x", 1),
         ("fix/m1-401-prompt", 1),
+        # Deferred is a valid status but not a shipped one: an item branch on a
+        # Deferred row fails like any other non-Done row.
+        ("feat/m1-307-x", 1),
+        ("FEAT/M1-307-x", 1),
         # Flipped to Done: the only passing item case.
         ("feat/m1-305-dedup", 0),
         ("FIX/M1-305-dedup", 0),
@@ -211,3 +216,46 @@ def test_lint_accepts_the_tracked_backlog() -> None:
     """The gate reads the same CSV the lint validates; a lint failure here means the
     tracked backlog drifted from the schema the gate assumes."""
     assert check_backlog._lint(check_backlog._read_rows()) == []
+
+
+def _full_row(status: str) -> dict[str, str]:
+    """One schema-complete row, so a lint result speaks only to its Status cell."""
+    return {
+        "ID": "M1-307",
+        "Epic": "Retrieval",
+        "Task": "Implement X retrieval adapter",
+        "Description": "A synthetic row.",
+        "Dependency": "None",
+        "Priority": "Medium",
+        "Suggested Owner": "Claude Code",
+        "Acceptance Criteria": "A synthetic criterion.",
+        "Estimated Complexity": "M",
+        "Status": status,
+        "Source or Decision Reference": "D40",
+        "__line__": "2",
+    }
+
+
+def test_lint_accepts_a_deferred_row() -> None:
+    """Deferred is part of the closed Status vocabulary (D40)."""
+    assert check_backlog._lint([_full_row("Deferred")]) == []
+
+
+def test_lint_still_rejects_an_unknown_status() -> None:
+    """The twin that keeps the accept case honest: the same row with a status outside
+    the vocabulary yields exactly one problem, and it is the Status cell."""
+    problems = check_backlog._lint([_full_row("Parked")])
+    assert len(problems) == 1
+    assert "Status 'Parked'" in problems[0]
+
+
+def test_gate_names_the_deferral(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Deferred row fails with its own message, not the "flip it to Done" advice that
+    would tell the author to overturn a phase decision by editing one cell."""
+    monkeypatch.setenv("BRANCH_NAME", "feat/m1-307-x")
+    monkeypatch.setenv("IS_DRAFT", "false")
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert check_backlog._gate(_rows()) == 1
+    assert "'Deferred'" in capsys.readouterr().out

@@ -215,7 +215,10 @@ paid-call controls, or the rule that malformed shapes arrive as the module's own
 ### Backlog status
 
 Vocabulary: `Not Started` → `In Review` (PR open) → `Done` (**at merge**, not when code lands).
-`Blocked` for owner-gated items.
+`Blocked` for owner-gated items. `Deferred` for items out of scope for the current phase, with a
+`D##` row in `decisions.csv` naming why and the revisit trigger (D40 is the first). It is not
+`Blocked`: a deferred item waits on a phase, not on the owner. Only `Done` passes
+`backlog-status`, so an item branch on a `Deferred` row fails: un-defer it by decision first.
 
 `docs/backlog/*.csv` are the **single source**. The `.xlsx` is a build output — untracked,
 gitignored, rebuilt on demand with `uv run python scripts/backlog_xlsx.py`. Never hand-edit it;
