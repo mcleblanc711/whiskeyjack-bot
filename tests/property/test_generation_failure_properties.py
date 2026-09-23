@@ -3,7 +3,7 @@
 M1-350: whatever JSON body OpenRouter returns, a non-finite literal anywhere in it reaches the
 caller as ``ModelOutcomeUnknown`` -- never a raw ``ValueError`` -- with a static message, the
 reservation held and no ``model_completed`` written. The strategy's reach is measured: it
-must land in ``usage.cost``, deeper in ``usage``, and outside ``usage``.
+is each of ``usage.cost``, deeper in ``usage``, and outside ``usage``, one run apiece.
 
 M1-324: whatever value a malformed reply carries, the problems ``_parse`` returns -- which are
 exactly what the no-forecast log line renders -- never contain it. Reach is measured too: the
@@ -25,6 +25,7 @@ from typing import Any
 from unittest import mock
 
 import httpx
+import pytest
 from hypothesis import event, given, settings, strategies as st
 
 from whiskeyjack_bot.config import validate_config_data
@@ -99,11 +100,13 @@ def _splice(tree: Any, path: list[str]) -> Any:
     return base
 
 
+_PLACEMENTS = ("usage.cost", "usage.nested", "outside")
+
+
 @st.composite
-def _bodies(draw: st.DrawFn) -> tuple[bytes, str]:
+def _bodies(draw: st.DrawFn, where: str) -> tuple[bytes, str]:
     usage = draw(st.dictionaries(st.text(max_size=5), _trees, max_size=3))
     extra = draw(_trees)
-    where = draw(st.sampled_from(["usage.cost", "usage.nested", "outside"]))
     body: dict[str, Any] = {
         "choices": [{"message": {"content": "ok"}}],
         "usage": usage,
@@ -121,7 +124,10 @@ def _bodies(draw: st.DrawFn) -> tuple[bytes, str]:
     return text.encode(), where
 
 
-def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path) -> None:
+@pytest.mark.parametrize("where", _PLACEMENTS)
+def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path, where: str) -> None:
+    """One run per placement: ``sampled_from`` inside one run skews toward its first member
+    (measured: 85/9/26 of 120), so reach is guaranteed by construction instead."""
     config = base_config.__wrapped__(tmp_path)
     data = config.model_dump(mode="json")
     data["model"].update(name="openrouter/openai/gpt-6-astra", temperature=None)
@@ -137,12 +143,13 @@ def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path) -> N
     original = httpx.AsyncClient
     reached: Counter[str] = Counter()
 
-    @given(drawn=_bodies())
-    @settings(max_examples=120, deadline=None)
+    @given(drawn=_bodies(where))
+    @settings(max_examples=40, deadline=None)
     def check(drawn: tuple[bytes, str]) -> None:
-        body, where = drawn
-        reached[where] += 1
-        event(where)
+        body, placed = drawn
+        assert placed == where
+        reached[placed] += 1
+        event(placed)
         current["body"] = body
         # A fresh prompt per example, so no example meets another's durable guard.
         prompt = [{"role": "user", "content": uuid.uuid4().hex}]
@@ -176,7 +183,7 @@ def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path) -> N
             check()
         finally:
             conn.close()
-    assert min(reached.values()) >= 10 and len(reached) == 3, reached
+    assert reached[where] >= 20, reached
 
 
 # --- M1-324: a value in a malformed reply never reaches the logged problems -------------

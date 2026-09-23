@@ -14486,7 +14486,8 @@ dies. Recorded because it is the "survivor from half a guard" shape the project 
 **The vacuity check.** Every in-window assertion in `test_generation_pacing.py` runs on a poll
 whose `heartbeat.retry_wait == 1` is asserted first, so the branch the assertion is about is
 the one reached. The two properties assert their own reach:
-- the non-finite body lands in `usage.cost`, deeper in `usage` and outside `usage`, at least 10
-  of 120 each;
+- the non-finite body lands in `usage.cost`, deeper in `usage` and outside `usage`, one
+  parametrized run of 40 examples apiece. A single run with `sampled_from` measured 85/9/26 of
+  120 and failed its own reach bar in the gate, so reach is by construction now;
 - the reply sentinel reaches the schema half (≥ 20) and the post-schema half (≥ 5) of `_parse`,
   in ≥ 100 refusals.
