@@ -32,6 +32,7 @@ from whiskeyjack_bot.tournament_state import CURRENT_BUDGET, TournamentError, ap
 
 from whiskeyjack_bot.tournament_state import (
     CostBasis,
+    ModelOutcomeUnknown,
     StorageFailure,
     digest,
     events,
@@ -133,6 +134,15 @@ def _replayed_cost(
     return found
 
 
+def _refuse_non_finite(literal: str) -> float:
+    """``json.loads``'s ``parse_constant`` hook: NaN, Infinity and -Infinity are refused.
+
+    Standard JSON has no such literals, so a body carrying one is malformed. The literal is
+    not echoed: the raise is translated to a static message by the caller's ``except``.
+    """
+    raise ValueError("non-finite number in response body")
+
+
 class PricedClient:
     def __init__(self, config: AppConfig) -> None:
         priced = PRICED_MODELS.get(config.model.name)
@@ -165,7 +175,7 @@ class PricedClient:
                 )
                 return str(cached[-1]["content"])
             if events(budget.conn, "model_started", cache_scope):
-                raise TournamentError(
+                raise ModelOutcomeUnknown(
                     "a prior model call has an unknown outcome; no repeat purchase"
                 )
         reservation = budget.reserve("openrouter", estimate, request) if budget else None
@@ -183,7 +193,12 @@ class PricedClient:
                     json=request,
                 )
                 response.raise_for_status()
-                data = response.json()
+                # Strict, not `response.json()` (M1-350): that accepts the NaN/Infinity
+                # literals, and the journal's `canonical()` refuses them -- so a non-finite
+                # number anywhere in the body escaped below as a raw ValueError, after
+                # `model_completed` was written and before settlement. Refused here, inside
+                # the `try`, it is an unknown outcome like any other failed request.
+                data = json.loads(response.content, parse_constant=_refuse_non_finite)
             text = data["choices"][0]["message"]["content"]
             if not isinstance(text, str):
                 raise ValueError
@@ -193,7 +208,7 @@ class PricedClient:
             if settled is not None:
                 self.last_cost, basis = settled
         except Exception:
-            raise TournamentError(
+            raise ModelOutcomeUnknown(
                 "priced model request failed or was unavailable at the authorized price"
             ) from None
         text = redact_secrets(text, self.config.secret_env_var_names())

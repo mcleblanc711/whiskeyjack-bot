@@ -40,6 +40,17 @@ class StorageFailure(TournamentError):
     """Stop the worker; continuing could lose evidence or spend."""
 
 
+class ModelOutcomeUnknown(TournamentError):
+    """A priced model call was started and never recorded a completion (M1-350/M1-351).
+
+    The journal holds a ``model_started`` with no ``model_completed``, the reservation stays
+    held because what was billed is unknown, and ``PricedClient`` refuses to buy the same
+    request again. A subclass rather than a message, so ``tournament.run_once`` can pace the
+    retry to the checkpoint window without parsing wording the error-hygiene rule may
+    legitimately change.
+    """
+
+
 # The activation bindings a retirement can name (M1-334). Names only: an operator told
 # *which* binding moved can act on it, and none of them is a value, a digest or config
 # content, so naming them is inside the project's no-value-echo rule.
