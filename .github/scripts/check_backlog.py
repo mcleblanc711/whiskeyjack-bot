@@ -12,7 +12,8 @@ truth for backlog state since the workbook stopped being tracked):
 ``gate``
     The check that exists because the Status flip to ``Done`` was forgotten at merge
     three times (M1-203, M1-401, M1-305). On an item branch the backlog row for
-    ``<item>`` must already read ``Done``. Draft pull requests and branches whose
+    ``<item>`` must already read ``Done`` -- the only passing status; ``Deferred`` fails
+    too, because deferring an item is not shipping it. Draft pull requests and branches whose
     prefix is on the infrastructure skip list are skipped; **every other branch name
     fails**, because the first version of this gate skipped anything its pattern did
     not recognize and a cross-model review found two live false-greens in it
@@ -51,8 +52,10 @@ EXPECTED_HEADER: Final = [
 ]
 
 # Workflow vocabulary (CLAUDE.md "Backlog status"): Not Started -> In Review (PR
-# open) -> Done (at merge). Blocked is for owner-gated items.
-VALID_STATUSES: Final = frozenset({"Not Started", "In Review", "Done", "Blocked"})
+# open) -> Done (at merge). Blocked is for owner-gated items. Deferred is out of scope
+# for the current phase, with a decision row naming why and when to revisit (D40) --
+# not Blocked, which waits on the owner rather than on a phase. Only Done passes the gate.
+VALID_STATUSES: Final = frozenset({"Not Started", "In Review", "Done", "Blocked", "Deferred"})
 VALID_PRIORITIES: Final = frozenset({"Critical", "High", "Medium", "Low"})
 VALID_COMPLEXITIES: Final = frozenset({"S", "M", "L"})
 VALID_OWNERS: Final = frozenset({"Claude Code", "Codex", "Chris", "Chris + Codex"})
@@ -262,6 +265,16 @@ def _gate(rows: list[dict[str, str]]) -> int:
         return 1
 
     status = row["Status"]
+    if status == "Deferred":
+        _annotate(
+            "error",
+            f"backlog-status: {item_id} is 'Deferred' in docs/backlog/backlog.csv, so this "
+            "phase decided not to ship it. Deferring an item is not shipping it: either "
+            "un-defer it with a decision row in docs/backlog/decisions.csv and flip it to "
+            "'Done' on this branch, or do not ship it.",
+        )
+        return 1
+
     if status != "Done":
         _annotate(
             "error",
