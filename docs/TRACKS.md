@@ -57,7 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| closeout-triage | chore/closeout-triage | whiskeyjack-closeout-triage | no | none | 2026-09-23 |
+| M1-351 | feat/m1-351-generation-failure-path | whiskeyjack-m1-351 | no | none | 2026-09-23 |
 | M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 | M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |
