@@ -258,4 +258,8 @@ def test_gate_names_the_deferral(
     monkeypatch.setenv("IS_DRAFT", "false")
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     assert check_backlog._gate(_rows()) == 1
-    assert "'Deferred'" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Deferring an item is not shipping it" in out
+    # The generic not-Done advice would also name the status, which is why this
+    # asserts on the deferral wording rather than on the word "Deferred".
+    assert "Flip it to 'Done' on this branch before merging" not in out
