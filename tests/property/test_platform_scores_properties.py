@@ -29,6 +29,7 @@ import json
 import math
 import sqlite3
 import struct
+import sys
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -228,7 +229,7 @@ SCORES = st.fixed_dictionaries({key: FINITE for key in SCORE_DATA_KEYS.values()}
 @given(scores=SCORES)
 @example(scores={key: -0.0 for key in SCORE_DATA_KEYS.values()})
 @example(scores={key: 5e-324 for key in SCORE_DATA_KEYS.values()})
-@example(scores={key: -1.7976931348623157e308 for key in SCORE_DATA_KEYS.values()})
+@example(scores={key: -sys.float_info.max for key in SCORE_DATA_KEYS.values()})
 def test_a_well_formed_payload_is_copied_bit_for_bit_and_replays(
     scores: dict[str, float],
 ) -> None:
