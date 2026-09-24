@@ -154,6 +154,7 @@ DOCUMENTED_COMMANDS: Final = frozenset(
         "reconcile-submission",
         "release-key",
         "replay",
+        "report",
         "run-replay",
         "score",
         "show",
@@ -164,7 +165,7 @@ DOCUMENTED_COMMANDS: Final = frozenset(
         "verify-submission",
     }
 )
-DOCUMENTED_INVOCATION_COUNT: Final = 17
+DOCUMENTED_INVOCATION_COUNT: Final = 18
 
 
 def subparsers_of(parser: ArgumentParser) -> dict[str, ArgumentParser]:

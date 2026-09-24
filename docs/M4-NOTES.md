@@ -1118,3 +1118,357 @@ command table still said `score` appends *local* score rows — is fixed after a
 with the same table's `ingest-resolutions` row (which can now push to ntfy) and this entry.
 Those three documentation lines are the only change after the approved commit.
 
+
+## M5-804 (+D-1002) — The attribution report dataset, and the schema it rests on
+
+Wave 23 close-out, PR-3. One branch (`feat/m5-804-attribution-report`), one review, one deploy
+(D39's bundling). **No migration, no `AppConfig` field, no prompt change** — none of the three
+things that retire the live activation. Read-only over the ledger; no worker path changes.
+
+- **M5-804 — Generate attribution report dataset.** Group outcomes by domain, type, model,
+  prompt and reasoning tags. Acceptance: *Export contains counts, calibration bins and score
+  summaries with small-sample warnings.* Owner decisions recorded as **D43**.
+- **D-1002 — Document schemas and exports.** Explain ledger lifecycle, immutable versions and
+  polygraph export contract. Acceptance: *Every table/field and export version has an auditable
+  definition.* Governing decisions D16, D25, D29.
+
+### Delivered
+
+- `src/whiskeyjack_bot/report.py` — the report. A pure layer (`calibration_bin`,
+  `summarize_values`, `classify`, `build_report`, `record_row`, `render_records`) over a ledger
+  layer (`read_facts`, `write_report`). Vocabularies `RecordState`, `Axis`, `EvidenceGapCode`,
+  `WarningCode`, `Exclusion`; constants `REPORT_SCHEMA_VERSION`, `TEST_TOURNAMENTS`,
+  `SMALL_SAMPLE_THRESHOLD`, `CALIBRATION_BIN_EDGES`.
+- `src/whiskeyjack_bot/cli.py` — `whiskeyjack-bot report --config PATH [--output DIR]`,
+  `_run_export`'s shape.
+- `docs/SCHEMA.md` — D-1002: every table and column with the migration that introduced it, each
+  table's mutability class, the version constants, the lifecycle transitions, resolution kinds,
+  score metrics, and the export and report contracts field by field.
+- Tests: `tests/unit/test_report.py` (hand-computed oracle over a real fixture ledger),
+  `tests/unit/test_cli_report.py`, `tests/unit/test_schema_doc.py` (the partitions),
+  `tests/property/test_report_properties.py`, and the fixture `tests/report_rows.py` (16 real
+  records through the production writers, reaching every state).
+- `docs/RUNBOOK.md` step 8 and a command-table row; `tests/unit/test_runbook.py`'s command set
+  gains `report`. `docs/backlog/decisions.csv` **D43**; M5-804 and D-1002 `Done`.
+
+### What was established by execution before designing
+
+Read-only against the live ledger on 2026-09-24 (queries by `mode=ro`, no writes):
+
+- 69 records: 65 in 33122/33125 (all 65 posted), 3 in `bot-testing-area`, 1 in `minibench`
+  (question 91001, validated and never posted; the 2026-09-03 rehearsal). Every record is
+  `forecast_version` 1. `forecast_records.status` is `draft` on all 69, as 003 intends.
+- **`question_domain` is NULL on all 69.** Nothing supplies it (`build_forecast_record_draft`'s
+  `question_domain` is caller-supplied and no caller passes one). Every record's
+  `record_json.question.source_categories` is populated: 12 Metaculus categories, one record in
+  two.
+- All 12 reasoning tags appear; `base_rate` and `status_quo` on every record.
+- 15 `evidence_gap` journal rows, all `named_source_absent`, all scoped to a record id and bound
+  to its `forecast_sha256`. No `evidence_poor` yet.
+- Model cost: 38 of the 45 Astra records have `cost_usd` NULL (BYOK before M1-348). Budget
+  reservations are scoped `account:tournament`, not per record, so journal cost cannot be
+  attributed to a forecast without new linkage — PR-4's territory.
+- **012's `submission_reserve_whole_question`** refuses a reservation for a question whose other
+  record already has an attempt or an outstanding reservation. Two *posted* versions of one
+  question therefore cannot arise through the submission path.
+
+### M5-804
+
+#### Decision — a separate derived artifact with its own version, and why
+
+The export is *what the ledger holds*: fifteen tables, raw, one reading imposed by nobody. The
+report is *what was derived from it*, and a derived artifact that shares a version number with
+a raw dump makes a change to either look like a change to both. So `report.py` is its own
+module with `REPORT_SCHEMA_VERSION = 1`, and it reuses the export's pieces rather than its
+contract: `ledger.connect_readonly` (whose docstring already named "the attribution report
+dataset" as its next caller), one deferred `BEGIN … ROLLBACK` snapshot, `export.canonical_json`
+(re-raised as `ReportError`), and `artifacts.write_new_file` (create-or-fail; manifest last).
+
+#### Decision — every fact through the verified readers, and why
+
+A value read back out of the ledger is untrusted, and a report is only an attribution claim
+while every number in it is what the evidence says. So nothing is read raw:
+`read_forecast_record` re-verifies `forecast_sha256` and the column projection;
+`latest_resolution` recomputes both digests and re-validates the snapshot;
+`read_local_scores` recomputes every local score and `read_platform_scores` re-reads every
+platform score out of its cited observation, exactly. A row that fails is a refusal
+(`ReportError`, the collaborator's own sanitized message, `show.py`'s pattern), never a skip.
+The only SQL in `report.py` lists the record ids. `tournament.py` is deliberately not imported
+(it reaches the paid and submission paths); the journal is read through
+`tournament_state.events`.
+
+#### Decision — one state per record, by precedence; every exclusion counted
+
+`RecordState` partitions every record: `not_posted` → `superseded` → by the latest
+observation (`awaiting_resolution`, `withheld`, `unresolved`, `annulled`, `ambiguous`,
+`resolved_unscored`, `scored`). "Latest" is `latest_resolution`'s, M4-801's rule, so post
+45561's record — lifecycle `resolved`, latest observation annulled — reads `annulled`, not
+`scored`. Records outside the included population are never dropped: every record is a line in
+`records.jsonl` with `included`, `exclusion` and `state`, and `report.json`'s `population`
+counts them. Every `states` object is zero-filled, so the key set is static.
+
+#### Decision — two domain axes: the stored tag, and the Metaculus category (owner)
+
+The AC groups by "domain". The ledger's only domain field is NULL everywhere, and M1-201
+settled that a Metaculus category is not a domain and that no mapping may be improvised. So
+`question_domain` is an axis exactly as stored (today one `null` group, which the report shows
+rather than hides), and `source_category` is a separate, overlapping axis keyed on the category
+**id** (M1-201: a slug can be renamed and is optional). The slugs seen for an id are carried as
+the group's `labels`, beside the key rather than in it, so a renamed slug cannot split a group.
+
+#### Decision — overlapping axes are flagged and never totalled
+
+A record carries several reasoning tags and may carry several categories and evidence-gap codes.
+On those three axes the groups overlap, so each axis block carries `overlapping: true`, a
+report-level warning says so, and **no field anywhere sums across an axis's groups** — not in
+`report.json`, not in the CLI's output. A record with no value on an overlapping axis sits in
+that axis's null group, so every included record appears on every axis.
+
+#### Decision — a score cell is one `(metric, implementation_version)`, and why
+
+Keying the cell on the metric makes it structurally impossible for a `local_*` and a
+`platform_*` number to share one, and for two implementation versions of one metric to be
+averaged together. Each cell carries its `provenance` (`local`/`platform`, from the metric
+vocabularies, never from the string prefix) and `comparison_baseline`. Only `scored` records
+contribute, and only their rows citing the latest observation; rows citing an older
+observation (a re-resolution, a retraction) are counted as `stale_score_rows` and summarized
+nowhere.
+
+Numerics, each a property: sums are `math.fsum` (correctly rounded, so order-independent);
+values are normalized with `v + 0.0` so `-0.0` reads as `0.0`, as SQLite REAL already stores it
+— without it `min` over `[0.0, -0.0]` depends on row order; the mean is clamped into `[min, max]`
+because `fsum` then a division can land one ulp outside (three 0.1s give
+0.10000000000000002); `sample_sd` uses `n - 1` and `d * d` rather than `d ** 2` (which raises
+`OverflowError`); and any statistic that is not finite refuses the report. The last is
+reachable: 017 admits any finite double, and two `sys.float_info.max` scores overflow a sum.
+
+#### Decision — calibration is binary, in fixed tenths, left-closed
+
+Ten bins over the literal doubles `0.0, 0.1, …, 1.0`, found by `bisect_right(edges, p) - 1`, the
+last bin closed at 1.0. A probability equal to an edge's double lies in the bin that edge opens:
+the literal `0.3` is the same double as the edge, so it lands in `[0.3, 0.4)`, and
+`nextafter(0.3, 0)` lands below. The population is binary records whose latest observation is
+`resolved` (states `scored` and `resolved_unscored`: calibration needs an outcome, not a score
+row). Multiple choice, numeric and discrete are declared out of scope in `parameters`.
+
+#### Decision — every cell below n = 30 is flagged (owner)
+
+One declared threshold, stated in `parameters.small_sample_threshold`: every score cell,
+calibration block and bin carries `n` and `small_sample`. It is a flag on a descriptive number,
+not a significance test. On the live corpus **every cell is flagged**; that is the report's
+main honest output, and the report-level `small_sample` warning counts the cells.
+
+#### Decision — the model-cost column only (owner)
+
+`forecast_records.cost_usd` per record; per group, `known`, `unknown` and the `fsum` of the
+known (`null`, not `0.0`, when none is known — a zero would read as "free"). The journal's
+actual-versus-held figures are per `account:tournament` scope and PR-4 is reworking the
+AskNews settlement they depend on.
+
+#### Decision — one scored subject per question
+
+Platform scores are per question for the account. Two posted versions of one question would
+each carry the same platform numbers, and summing both would count one number twice. So the
+latest posted version (highest `forecast_version`, then `record_id`, a UUIDv7) is the subject
+and an earlier posted one is `superseded`. **The subject is chosen within a population**
+(included or excluded): round 1 showed that choosing it across both let a test-tournament
+record of the same question supersede the included one and remove a verified outcome from
+every summary. The lifecycle writers admit the shape (the fixture builds it through them);
+012's reservation guard keeps two versions *in one tournament* out of the submission path, but
+nothing stops one question id appearing in a test tournament and a real one.
+
+#### Decision — evidence-gap markers are verified; an unknown code is refused
+
+`tournament.is_evidence_poor`'s rule, applied to both codes: a marker bound to another
+`forecast_sha256` describes other content and refuses the report rather than being read as
+present or absent. The code vocabulary is closed (`EvidenceGapCode`), so a new writer code
+fails loudly until it is described here and in `docs/SCHEMA.md`. Every malformed shape — not an
+object, an unhashable code, a nesting depth SQLite's `json_valid` accepts and Python's parser
+cannot (`RecursionError`, which `events()` does not catch) — arrives as `ReportError` without echoing the value.
+
+#### Deviation
+
+- **None of the three** (config bytes, `AppConfig`, prompt bytes). No migration.
+- `export.py`'s docstrings said "fourteen tables"; there are fifteen since 012. Docstring words
+  only, and the same two words in `tests/unit/test_export.py`.
+- `tests/unit/test_runbook.py`'s documented-command set and count gain `report` (the runbook now
+  shows it). A test-data change, not a rule change.
+- The stricter reading of "group by model": the key is provider **and** name.
+
+#### Rejected — extending `export` with a derived table, and why not
+
+A join or a summary baked into the export imposes one analytical reading a consumer cannot
+undo — M1-604's own reason for leaving the per-record join out — and would move
+`EXPORT_SCHEMA_VERSION` every time a report parameter changed.
+
+#### Rejected — cross-tabulations (model × type, and so on)
+
+Every cell of a cross-tab would be a handful of records. Single axes already flag everything.
+
+#### Rejected — calibration or a local score for multiple choice, numeric and discrete
+
+D30 forbids a local continuous replica; multiple-choice calibration needs a per-option
+reliability design the corpus (2 records) cannot exercise. Platform scores already compare every
+type.
+
+#### Rejected — Parquet output
+
+The report is a few hundred KB of nested JSON; the byte-stable JSONL/JSON pair is the replay
+form, and Parquet's bytes depend on the writer version (M1-604).
+
+#### Deferred (do not read the absence as an omission)
+
+- **Journal cost per record** (actual versus held) → PR-4 (M1-336), which makes the settlement
+  attributable.
+- **A time axis** (by week, by series phase) — not in the criterion; add when the corpus is large
+  enough for it to mean anything.
+- **A rendered view** — the owner follow-up is a refreshed Forecast Ledger artifact, offered
+  after deploy, not part of this PR.
+
+#### Standing risk — not verifiable offline
+
+- **Every live cell is small** (at most 19 platform scores per metric, 11 binary calibration
+  points). The report says so on every cell; nothing it prints is evidence of skill yet.
+- **`question_domain` is unpopulated**, so the domain axis is one `null` group until something
+  supplies it; D43's revisit trigger.
+- **`tournament_state.events` is a new caller's surface.** It catches `sqlite3.Error` and
+  `ValueError`; the report adds `RecursionError` at its own call. A journal row is written by
+  this program through `canonical`, so the refused shapes are hand-planted ones.
+
+### D-1002
+
+#### Decision — one document, tested as a set of partitions, and why
+
+`docs/SCHEMA.md` is one reference for the ledger and both derived artifacts. D-1001 spent three
+rounds on a table checked row by row; T-908 fixed it by asserting the table is a **total
+partition** of a universe built from the code. `tests/unit/test_schema_doc.py` does that for
+every table in the document: columns and declared types against `PRAGMA table_info` on a fresh
+ledger (170 columns, 15 tables); `_LEGAL_TRANSITIONS`; `RESOLUTION_KINDS` with
+`SCORABLE_KINDS`/`DEFINITIVE_KINDS`; the metric vocabularies with their versions, baselines and
+question types; every module-level `*_SCHEMA_VERSION` found by an AST scan of `src/` (13) with
+its value; and every field path of a generated export manifest (JSONL and Parquet) and of a
+generated report's three files. A `file.py:symbol` anchor must resolve against the file's AST.
+
+#### Decision — "since" is replayed, not transcribed
+
+The migration that introduced each column is established by applying the packaged migrations
+one at a time (`_load_migrations` narrowed to ≤ k, the upgrade tests' own pattern) and recording
+where each table and column first exists. A table rebuilt later still first exists at its
+creator, which is what "since" means here.
+
+#### Decision — mutability is classified from the triggers' SQL
+
+`append-only` (an unconditional BEFORE UPDATE and BEFORE DELETE), `annotatable` (unconditional
+DELETE block, only conditional UPDATE guards: `research_runs`, `research_documents`, per 003) or
+`unguarded` (`schema_migrations`). The test classifies each table from `sqlite_master` and
+compares; a table that fits none is its own answer and no document row can match it.
+
+#### Decision — map-valued keys are documented once
+
+The keys of a `states` object are the nine states and of `excluded` the exclusions; the field
+tables write them `<state>` and `<exclusion>`, the path collector maps them the same way, and the
+state vocabulary itself is pinned elsewhere (`parameters.states`, the unit tests).
+
+#### Deviation — the journal kinds are listed, not specified
+
+`tournament_events.data`'s shape is per kind and owned by each writer; the document lists the
+kinds for orientation and specifies only the one the report reads (`evidence_gap`). The column
+itself is fully defined.
+
+#### Rejected — generating the document from the schema
+
+A generated document can never be wrong and never says anything: the definitions are the part a
+reader needs, and a hand-written table plus a partition test turns a schema change into a
+decision — M1-604's argument for a hand-written `EXPORTED_TABLES`.
+
+#### Deferred (do not read the absence as an omission)
+
+- **Per-kind `tournament_events.data` shapes** — operational state read only by this program;
+  specify one when an external consumer needs it.
+- **Indexes and trigger bodies** — enforcement, cited by migration where a column's meaning
+  depends on it, not re-documented.
+
+#### Standing risk — not verifiable offline
+
+- **A definition can be wrong while its row exists.** The partitions prove every column, kind,
+  metric, transition, version and field has a row; the wording of each definition was checked
+  against the migrations by hand and is reviewable, not testable.
+
+### Property tests
+
+`tests/property/test_report_properties.py`, over hypothesis-built `RecordFacts` lists (0–12
+records; question ids that collide so `superseded` is reached; every type, status and kind;
+score values on one ±100 scale plus signed zeros, subnormals and `±float_info.max`). Asserted:
+`ReportError` is the only exception; every partition (states, single-valued axes, overlapping
+axes at `max(1, |values|)` groups per record, calibration bins); per-cell `n` equals the scored
+subjects' rows; at most one scored subject per question; shuffled facts give byte-identical
+output; the canonical form round-trips; the bin index is monotone with every edge opening its
+own bin; the small-sample flag flips exactly at 30; `sample_sd` divides by `n - 1`; 13 refused
+shapes never echo a planted value.
+
+**Reach is measured** (`test_the_strategy_reaches_every_branch`, 400 derandomized draws): each of
+the nine states ≥ 20, excluded and multi-valued rows ≥ 20, an edge probability in the
+calibration population ≥ 5. The first strategy starved `resolved_unscored` (12 of 400) and the
+refusal branch (0 of 400); statuses, kinds and tournaments are now weighted by repetition in
+`sampled_from` (which does weight, unlike `st.one_of` — M1-348), and overflow has its own
+property driving one cell with extremes.
+
+### Mutation testing
+
+Committed first (`b84c16b`); `__pycache__` cleared before every mutant; each file restored with
+`git checkout` and the tree checked clean at the end. Runner: `test_report.py`,
+`test_cli_report.py`, `test_schema_doc.py` and the property file, `-x`,
+`HYPOTHESIS_PROFILE=ci`, baseline green **by exit code**. The set enumerates the siblings of
+each entry point rather than of chosen values: every rule of `calibration_bin` and
+`summarize_values`, every branch of `_state` and `classify`, every axis and cell builder, every
+check in `_require_consistent`, every refusal in the marker reader, the snapshot, the write
+order, the CLI's refusal arm, and 19 document mutants (a column, transition, version, field or
+warning code dropped or added; a type, since, mutability, introduced, transition, version value,
+baseline, scorable flag or anchor changed).
+
+**68 mutants: 66 killed, 2 equivalent, 0 surviving** (the last two, `subject_across_populations` and
+`excluded_compared_to_included_subject`, were added with round 1's fix and are killed by it).
+
+| mutant | why it lived | disposition |
+| --- | --- | --- |
+| `superseded_before_not_posted` | the reorder I wrote kept the `in _POSTED` guard, so the two branches are disjoint and their order cannot matter | **equivalent**; replaced by `superseded_first_unguarded` (the real reorder), killed |
+| `binary_probability_unchecked` | `read_forecast_record` validates `ForecastRecord`, whose `_one_question` validator and discriminated union make a `binary` record carry a `BinaryForecastResponse`; the check cannot fire on anything the reader returns | **equivalent**; kept because it is what narrows the union for mypy, `lifecycle._prediction_inputs`' guard |
+
+Two mutants were first **skipped**, not survived: `ruff format` had reflowed their target text
+(`calibration_every_type`, `manifest_written_first`). Re-run against the formatted text: both
+killed. Every other mutant was killed on the first run.
+
+### Live-copy smoke
+
+`write_report` against a `sqlite3.backup` copy of the live ledger (2026-09-24, schema 17), 0.46 s:
+69 records, 4 excluded (`test_tournament`), 65 included — 19 `scored`, 1 `annulled` (post
+45561), 45 `awaiting_resolution`. `all` group: each `platform_*` cell n = 19, `local_*_binary`
+n = 11, binary calibration n = 11 across seven bins, model cost 27 known ($2.119) and 38
+unknown. Warnings: `small_sample` (276 cells), `overlapping_axes` (3), `unknown_model_cost`
+(38). A second run on the same copy was byte-identical in all three files (same `now`).
+Nothing was published.
+
+### Review
+
+**Round 1 — CHANGES REQUESTED on `bd55ab1`** (2026-09-24, local Codex against
+`GPT_REVIEW_REQUEST_M5-804_r1.md`, all four gates green in the request). One blocking finding,
+all twelve risk claims otherwise marked safe, no non-blocking observations.
+
+- **B1 — an excluded test record could supersede an included one.** `classify` chose one posted
+  subject per `question_id` *before* the test-tournament exclusion, so a `bot-testing-area`
+  record of the same question that sorted later made the included record `superseded` and
+  removed its verified outcome from every summary. **Reproduced by execution on `bd55ab1`**
+  (`rec-a` in 33125 read `superseded`, `rec-z` excluded read `scored`, the included population
+  reported zero scored records). **Fixed in `1fed9d6`:** subjects are keyed on
+  `(exclusion, question_id)`. `test_an_excluded_record_never_supersedes_an_included_one`
+  (production writers) and the reworked property both fail on `bd55ab1` and pass on the fix.
+  **Why the property missed it:** it asserted one subject per question across both
+  populations — which the bug satisfies. It is now per population, with an explicit check and a
+  reach floor (≥ 20 in 400 draws) for questions posted in both. Same family as the vacuous
+  property class: the assertion was about the wrong partition.
+
+**Round 2 — APPROVE on `3661084`** (2026-09-24, against `GPT_REVIEW_REQUEST_M5-804_r2.md`, which
+led with the `bd55ab1`→HEAD delta). B1 closed; no blocking findings; all thirteen risk claims
+marked safe. One non-blocking observation — `report.py`'s module docstring still said "one
+scored subject per question" — is fixed after approval ("within each population"). That
+docstring and this entry are the only change after the approved commit.

@@ -3,7 +3,7 @@
 The acceptance criterion is *"Exports round-trip record IDs/counts and never mutate
 SQLite"*, and both halves are stricter than they read:
 
-- **Round-trip** is set equality of primary identifiers, per table, for all fourteen --
+- **Round-trip** is set equality of primary identifiers, per table, for all fifteen --
   not a count, and not a one-sided subset. A one-sided check passes on an export that
   drops rows, which is the vacuity M1-501 lost a round to. It is also worth nothing on an
   empty table, so `test_the_seed_reaches_every_table` refuses to let that pass unnoticed.
@@ -289,7 +289,7 @@ def test_the_hand_written_spec_matches_the_schema_column_by_column(ledger_path: 
 def test_the_export_round_trips_every_identifier_in_every_table(
     ledger_path: Path, tmp_path: Path, export_format: str
 ) -> None:
-    """Set equality per table, both directions, for all fourteen.
+    """Set equality per table, both directions, for all fifteen.
 
     Equality rather than `<=` or `>=`: a subset check passes on an export that drops rows
     and a superset check passes on one that invents them, and the criterion means neither.
