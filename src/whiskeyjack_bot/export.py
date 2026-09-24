@@ -22,7 +22,7 @@ contract**, and three consequences follow that a dump would not have:
   type, a non-finite REAL, a BLOB, or text that is not valid UTF-8 is refused with an
   :class:`ExportError` rather than repaired into something that would no longer round-trip.
 
-**All fourteen tables are exported, and none is excluded.** ``schema_migrations`` is in
+**All fifteen tables are exported, and none is excluded.** ``schema_migrations`` is in
 deliberately: it is what lets a consumer tell which schema produced the files it is
 holding. The joined per-forecast view that ``lifecycle.py`` and ``forecast/record.py``
 anticipate "at read/export time" is **not** here: assembling one record with its history
@@ -116,7 +116,7 @@ class TableSpec:
 
     ``identifier`` is the single-column primary key, and it does double duty: it is the
     ``ORDER BY`` that makes the export byte-deterministic, and it is the key the acceptance
-    criterion's set-equality check compares. All fourteen tables have one, so no table
+    criterion's set-equality check compares. All fifteen tables have one, so no table
     needs a composite or a synthetic ordering.
     """
 

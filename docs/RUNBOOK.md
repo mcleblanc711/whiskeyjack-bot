@@ -379,6 +379,7 @@ version: 11
 | `verify-submission` | appends an event | **GET** | no |
 | `ingest-resolutions` | appends resolution rows and `resolved` events | **GET**; an ntfy push per `withheld` record (M4-807) | no |
 | `score` | appends local and platform score rows and `scored` events | no | no |
+| `report` | **read-only**; writes the report under `storage.export_root` | no | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 | `tournament correct-costs` | **read-only** | no | no |
@@ -594,6 +595,27 @@ records: 4  failed: 0
 - A `failed` line names a rule. The one you may meet in practice is a multiple-choice question
   that resolved to an option the forecast never priced (an option added after forecasting),
   which is refused rather than guessed. Exit `4` if any record failed.
+
+### 8. Derive the attribution report
+
+```bash
+uv run whiskeyjack-bot report --config config.yaml [--output DIR]
+```
+
+Writes the attribution report dataset (M5-804) to a new `report-<UTC>` directory under
+`storage.export_root`: `records.jsonl` (one row per forecast record and its state),
+`report.json` (counts, calibration bins and score summaries by tournament, question type,
+model, prompt, domain, Metaculus category, reasoning tag and evidence gap), then
+`manifest.json`. It opens the ledger read-only, makes no network call, and never overwrites an
+earlier report. The contract is `docs/SCHEMA.md`.
+
+- **Every cell carries its `n` and a `small_sample` flag** (below 30). On today's corpus every
+  cell is small; read the numbers as descriptive, not as evidence of skill.
+- **Never add up the groups of an overlapping axis** (`source_category`,
+  `reasoning_strategy_tag`, `evidence_gap`): a record sits in several of them.
+- `refused:` and exit `4` mean a stored row did not verify (a hash, a digest or a score that
+  no longer matches its evidence) or the output directory already holds a report. The message
+  names the rule, never the value.
 
 ### Scheduled ingestion and scoring
 
