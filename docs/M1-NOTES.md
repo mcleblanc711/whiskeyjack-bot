@@ -14828,3 +14828,442 @@ answering a strategy nobody had asked for, and the never-settling reservation ha
 The fake now picks the body by the requested `strategy`, in the stored run's pass order.
 `test_sdk_contract.py` gains the two `research/asknews.py` rows (`__module__`, `__name__`) for
 the classifier's name reads, guarded by the vocabulary-pin test, like `submission_live.py`'s.
+
+## M1-206 (+M1-409, M1-510, M1-512, M1-513, M1-316; decisions M1-508, M1-509, M1-511) — The validation sweep
+
+Wave 23 close-out, PR-5. The branch is named for the lead item under D39's bundling convention.
+The theme: the validators and the conversion that run on every generation say exactly what they
+enforce, and the three open "decide X" rows are decided (D45, D46, D47). **None of the three**:
+no `config/*.yaml` byte, no `AppConfig` field, no prompt byte (`prompts/forecaster.md` is read by
+tests and never edited). No migration, no dependency. **This PR edits `CLAUDE.md`** (D46's
+carve-out), stated here, in the PR body and in the review request.
+
+### Measured first: no new refusal would have refused a posted forecast
+
+The brief's constraint, checked read-only against the live ledger on 2026-09-24 before any code:
+
+- **69 forecast records, every one posted successfully** (`submission_attempts.success = 1`):
+  36 binary, 17 numeric, 13 discrete, 3 multiple choice.
+- **12 of the 30 bounded records carry a tied percentile value.** That is what decided M1-508:
+  refusing ties would have refused 12 real posts (D45).
+- **Multiple choice:** the 3 posted records carry 3, 3 and 4 options under (0.001, 0.999).
+  M1-512's preflight refuses nothing below 1000 options at those bounds, and M1-511 adds no cap.
+- **The prompt:** the shipped `prompts/forecaster.md` still parses to (0.001, 0.999) under M1-409's
+  sentence scan, from the same three declarations (pinned by test).
+- M1-513 changes no enforced value or message byte (`repr(0.001) == "0.001"`). M1-316 touches
+  only `replay`, which the worker never runs.
+
+**One claim in the brief did not reproduce.** Its appendix (written for wave 21) says "no
+discrete forecast has been accepted by Metaculus from this code" (M1-205's standing risk). By
+2026-09-24, **13 discrete forecasts had posted successfully** in 33122/33125. One of them,
+question 45960 (post 45775), is now a golden case, and its frozen array equals, value for value,
+the `continuous_cdf` in that post's live submission artifact (checked when the case was written).
+
+### M1-206 — Freeze the discrete CDF conversion against the pinned SDK
+
+#### Decision — three real shapes, and the stricter reading of the row
+
+The row says "17-point closed/open, 72-point open/open, non-integer grid". M1-205's notes are more
+specific, so the stricter reading covers the flag pairs the real questions actually have, plus
+the most common posted shape:
+
+| case | post | points | lower/upper | grid |
+| --- | --- | --- | --- | --- |
+| `discrete_17_closed_both` | 43321 | 17 | closed/closed | −0.5..15.5, half-integer |
+| `discrete_72_open_both` | 45517 | 72 | open/open | 0.095..0.805, step 0.01 |
+| `discrete_10_closed_lower_open_upper_posted` | 45775 (q 45960) | 10 | closed/open | 49.5..58.5 |
+
+The third is the flag pair 8 of the 13 posted discrete forecasts carry. Its nine values are the
+ones that live forecast declared, including a three-way tie at 50 and two values past the open
+bound, so the golden also freezes a real M1-508 rewrite. Open-lower/closed-upper is absent
+because no real discrete question in the tree has it
+(`test_the_discrete_cases_cover_the_bound_flags_real_questions_have`).
+
+#### Decision — the derivation is pinned through a real payload, not a declared `cdf_size`
+
+Trap 3: a case that only declared `cdf_size: 17` would freeze `get_cdf` and leave the SDK's
+`inbound_outcome_count + 1` free to become `+ 2`. So each discrete case names a stripped real
+payload (`tests/fixtures/api_posts/discrete_shapes/post_<id>.json`).
+`test_the_sdk_derives_each_discrete_cases_point_count_from_its_payload` drives it through
+`DataOrganizer.get_question_from_post_json` and `normalize_question`. It then requires
+hand-written literals (17, 72, 10), the payload's own `inbound_outcome_count + 1`, and the case's
+`question` block, field for field. Mutant `sdk-plus2` (the installed package edited, then
+restored) is killed there and nowhere else, which is the point.
+
+#### Decision — the three-sources test keeps `len(recorded) == 1`, over the numeric family only
+
+Trap 1. The cases carry a `family` tag and split into `NUMERIC_CASES`/`DISCRETE_CASES`. T-904's
+tie between `config.py`'s `Literal[201]`, `_SDK_DEFAULT_CDF_SIZE` and the emitted length iterates
+the numeric family with its assertion unchanged. Pooling the discrete lengths would have forced
+it to `>= 1`, and that would pass a numeric case drifting to 200 as long as another said 201. The
+discrete lengths get their own tie (to literals and to the derivation) instead. Two guards keep
+the split from going vacuous:
+- `test_every_case_belongs_to_exactly_one_family` requires both families to be non-empty and
+  every numeric case to declare 201;
+- the relabel mutant is killed.
+
+#### Decision — each discrete step is checked against its own cap
+
+Trap 2. The oracle `_rules` gives a numeric case the committed `max_adjacent_pmf` and a
+discrete case `min(1, 0.2 × 200 / inbound)`, written with the platform's literals.
+`test_our_scaled_discrete_cap_is_the_platforms` ties `cdf._cdf_rules` to it. Measured: the
+tallest discrete steps are 0.124, 0.031 and 0.174, against caps of 1.0, 0.563 and 1.0. All three
+would *also* pass the flat 0.2, so the flat check was not wrong for these three. It was simply
+not the rule; post 45559's 0.446 is where the two part.
+
+#### Decision — the ulp margin, re-measured, corrects T-904
+
+Trap 4. Measured by capturing the array handed to `np.round(…, 10)` and taking each value's
+distance to the nearest rounding boundary in ulps of `x × 1e10` (the value numpy rounds):
+
+| cases | worst margin |
+| --- | --- |
+| five plain linear numeric cases | 3.74e4 |
+| `log_scaled` | 1.40e3 |
+| `concentrated_saturating` | **905** |
+| discrete 17 / 72 / 10 | 2.62e5 / 3.69e3 / 5.83e4 |
+
+This method reproduces T-904's 3.74e4 and 1.40e3 exactly, and it gives 905 for the saturating
+case. So T-904's "every value ≥ 1.4e3 ulps", which the test docstring and the fixture `note` both
+carried, was wrong about one case. Both now say 905. The conclusion stands, because a few ulps of
+libm difference cannot move a rounded value at 905 ulps. But the number was a false claim read as
+evidence, and it is corrected in the same commit (trap 5).
+
+#### Deviation
+
+The fixture gained a `family` key on every case and a `source_payload` key on the discrete ones.
+`scripts/regenerate_cdf_golden.py`'s logic did not change: it already reads `cdf_size` from each
+case's `question` block. Only its docstring counts moved. The regenerated diff was read: **pure
+insertion**, with no numeric array value changed. `--check` is clean at HEAD.
+
+#### Rejected — deriving `cdf_size` inside the regeneration script
+
+A generator that derived the count from the payload would check the derivation against itself.
+The derivation is a test's job, against a literal.
+
+#### Deferred (do not read the absence as an omission)
+
+- The 72-point open/open shape (45517, a Cup-rehearsal question) has not been posted. The golden
+  proves what the pinned SDK emits for it, not that Metaculus accepts it.
+- `test_a_drifted_array_is_refused_for_exactly_one_reason` still drift-simulates on the numeric
+  `interior_closed_both` only. Its mutators index positions 100/101, and the four refusals it
+  exercises are family-blind in `_array_problems`.
+
+#### Standing risk — not verifiable offline
+
+What was stripped from the three payload fixtures, per the M1-330 trap:
+- `my_forecasts` became `{"history": null}`, the synthetic fixture's shape;
+- `description` and `fine_print` were replaced by a placeholder;
+- every key outside `discrete_post.json`'s key set was dropped (aggregations, comments, options
+  history, user permission and so on).
+
+`scaling`, the bounds and flags, `title`, `resolution_criteria` and the timestamps are verbatim. A
+future SDK that reads a dropped key during parse would fail these tests for the fixture's reason,
+not the package's. The failure is visible, but its message would point at the wrong thing.
+
+### M1-409 — A declaration wrapped across lines is seen
+
+#### Decision — scope the scan to a sentence, not a line and not a paragraph
+
+A sentence ends at any of:
+- `.`/`!`/`?` followed by whitespace or the end of the text;
+- a blank line (CRLF included);
+- a line that opens a Markdown list item or heading.
+
+A wrap never ends a sentence, so the scan cannot be blinded by one. `_DECLARED_RANGE_RE` already
+separates its tokens with `\s+`, so a range wrapped *inside* itself (`between 0.01` / newline /
+`and 0.99`) matches too. A paragraph scope is wrong for the row's own reason: the shipped bullets
+run together, and `test_a_neighbouring_bullets_range_is_not_read_as_a_probability_range` kills the
+paragraph mutant.
+
+#### Decision — the residual imprecision fails closed
+
+A sentence this scan over-joins (a line with no punctuation running into the next) can only add
+ranges to a probability sentence. Extra ranges can only produce a disagreement, which is a refusal
+at startup before any spend. `e.g.` splits a sentence. That is the one way a range and the word
+`probability` can be separated by something that is not a real break, and it is stated in the
+module comment. The block-boundary tests (list item, heading, blank line, CRLF blank line) make
+each alternative of the break regex killable on its own.
+
+#### Deviation
+
+The "no range" message says "sentence" where it said "line". No test pinned the old word.
+
+#### Rejected — keeping the line scan and joining continuation lines
+
+That reimplements Markdown paragraph flow and then still needs a sentence rule inside the
+paragraph.
+
+#### Deferred (do not read the absence as an omission)
+
+Nothing. The characterization test is **replaced**, as the AC requires, by
+`test_a_conflicting_declaration_is_refused_however_it_is_wrapped` and its agreeing twin.
+
+#### Standing risk — not verifiable offline
+
+None beyond the `e.g.` split above: the scan reads only the prompt file.
+
+**Oracle independence (the AC's second clause).** The unit oracles are the construction: a known
+sentence broken at every word boundary, with the verdict decided when the sentence was written. The
+property's oracle (`test_the_verdict_matches_a_hand_written_oracle_however_the_body_is_wrapped`)
+is a hand table of what each decimal spelling reads as, per slot (`1.` reads as `1` only in the
+high slot). It no longer imports `_DECLARED_RANGE_RE` or the old `_PROBABILITY_LINE_RE`. Reach
+over 400 draws: disagreement 10.6%, accepted from one declaration 9.3%, accepted from two or more
+2.9%, all wrapped. The line-scan mutant is killed by both the unit table and the property.
+
+### M1-510 — The composed strategy is registry-complete
+
+#### Decision — draw the type from `_TYPE_CHECKERS`, build it through a per-type table
+
+`composed_cases` draws from the non-`None` registry entries and dispatches through
+`_COMPOSED_BUILDERS`, with one builder each for binary, multiple choice, numeric **and discrete**.
+Discrete is registered to the same checker as numeric, but the pairing check in `output_problems`
+works per literal, so a shared checker is not a shared entry. The numeric and discrete arms draw
+from three declared value rows: one silent, one decreasing, one out of the closed bounds.
+
+#### Decision — anti-vacuity as a failure, by `find`
+
+`test_every_registered_type_reaches_both_verdicts` is parametrized over type × {biting, silent}.
+`hypothesis.find` must produce a composed case with that type-specific verdict, and it raises
+otherwise. `test_the_composed_strategy_covers_exactly_the_registered_types` names a registration
+that has no builder. Reach, tagged per type × verdict:
+
+| type | bites | silent |
+| --- | --- | --- |
+| binary | 4.7% | 42.3% |
+| multiple_choice | 14.0% | 0.9% |
+| numeric | 7.0% | 8.4% |
+| discrete | 6.5% | 9.3% |
+
+#### Deviation — none. Rejected — a hand-maintained type list (the pre-M1-510 shape, mutant killed).
+#### Deferred — nothing. Standing risk — none (test-only).
+
+### M1-512 — An option count the bounds cannot serve is refused before spending
+
+#### Decision — decided by the checker's own arithmetic, on one witness
+
+`multiple_choice.admits_a_distribution(n, config)` takes the uniform vector clamped into
+`[min, max]`:
+- if `1/n` is inside the bounds, the answer is yes;
+- otherwise all-min (or all-max) is the extreme every admissible vector is bounded by, and its
+  exact sum, rounded once, is what `math.fsum` over `n` copies returns.
+
+That makes the answer the checker's own `abs(total − 1) > 1e-6` comparison, with no tolerance
+arithmetic transcribed. `generate_forecast` calls it next to the other unsatisfiable-input
+preflights. The message names the configured bound (validated configuration, D46) and the count
+(an `int`).
+
+#### Deviation — both sides, where the AC names only `min_probability`
+
+A narrowed `max_probability` (0.4 with two options) is the same class, so the stricter reading
+refuses it too (`2 options under a 0.4 ceiling`).
+
+#### Rejected — `n > 1/min_probability`
+
+It ignores the sum tolerance and the ceiling, and it is a second statement of the rule that can
+drift from the checker's.
+
+#### Deferred (do not read the absence as an omission)
+
+The property draws edge counts up to 250. The committed default's edge is 1000, and building a
+thousand-option reply per draw costs minutes. The unit test drives the row's own 21-at-0.05
+example.
+
+#### Standing risk — none offline
+
+It is a pure function over validated config and a count.
+
+**Two defects the totality property found in the first version.** The first version summed `n`
+copies with `math.fsum(itertools.repeat(...))` and computed `1.0 / n`.
+- Its draws never reached the answering branch (100% refused), because three
+  independent draws rarely all came out valid.
+- Once a coherent-triple arm was added, `10**400` raised `OverflowError` from `1.0 / n`. The
+  materialised sum would not have returned either.
+
+Both moved to exact arithmetic. The `ignore-tolerance` mutant then **survived** the first
+strategy: a uniform draw never lands inside the 1e-6 band. An arm that places one side a fraction
+of the tolerance past `1/n` now kills it under both hypothesis profiles.
+
+### M1-513 — One probability envelope
+
+#### Decision — `submission_live` consumes `config.PROBABILITY_BOUND_FLOOR/CEILING`
+
+The module already imported `config`, and `config` pulls in no `forecasting_tools`. Every envelope
+diagnostic (binary, multiple choice, generate, submission) renders its endpoints with `!r` from
+the constants. The bytes are unchanged, so the existing exact-string pins hold.
+
+#### Decision — the enforcement is a syntax-tree walk, not a grep
+
+`tests/unit/test_probability_envelope.py` fails on any float constant equal to either endpoint.
+That includes `1e-3` and `999e-3`, which a grep misses. It also fails on any non-docstring string
+constant containing either spelling, f-string parts included, anywhere in `src/` except
+`config.py`'s two assignments. Comments and docstrings, which name the envelope in prose
+throughout the forecast package, are not executable and do not count. An anti-vacuity test
+plants each shape and requires the walker to report it.
+
+#### Deviation / Rejected / Deferred / Standing risk
+
+None: a constant moved and three strings became f-strings.
+
+### M1-316 — `run_replay` requires an exact `AppConfig`
+
+#### Decision — one exact-type check at the boundary, and the weaker guards removed
+
+`type(config) is not AppConfig` is the first statement, with the message "config must be an
+AppConfig", which is now exactly what it verifies. The `AttributeError` and value-type fallbacks in
+`_require_replay_enabled`/`_require_retained_output` became unreachable, so they read fields of
+the validated model directly. The AC's "either become that check or stop naming AppConfig": they
+stopped naming it by ceasing to check it. `AppConfig` moved out of `TYPE_CHECKING`, and there is
+no import cycle.
+
+#### Deviation / Rejected / Deferred / Standing risk
+
+`isinstance` was rejected for `submission_live`'s reason: a subclass could override what
+validation established. Otherwise none.
+
+The stand-in test is T-903's own `SimpleNamespace` with every switch on, and a tripwire
+connection that fails on any attribute access, proving the refusal comes before any I/O.
+
+### M1-508 — D45: ties are kept, and what the posted CDF was built from is recorded
+
+#### Decision — record, next to the posted array (owner chose the site, 2026-09-24)
+
+`submission_payload._built` runs the conversion **once** and returns the payload and its
+`NumericCdf`. `AuthorizedPayload.conversion` is `{"adjusted", "percentiles_used"}` for a bounded
+type and `None` otherwise.
+- It sits outside `canonical` and `sha256`, so an approval binds what it bound before.
+- `tournament.run_once` and `submit` pass it to `post_approved_forecast`, which checks it and
+  renders it through the payload renderer **before** the post.
+- It is written into the live artifact's `context` as `numeric_conversion`, beside
+  `request_payload.continuous_cdf`.
+
+`adjusted: false` is written too, so the key's absence means only "not derived here"
+(`--payload-file`).
+
+**Executed against the pinned SDK:** every member of a tie moves, each by a different amount.
+`10.0, 10.0` became `9.99999901, 9.99999905`, which is how the SDK makes the pair strictly
+increasing. The first draft of the test asserted only the second value moved, and it failed.
+
+#### Decision — M1-503's liveness guard is untouched
+
+`cdf._standardization_can_converge` and its tests (`test_the_guard_is_still_the_fast_path_and_the_bound_is_the_backstop`)
+are unchanged. A tie rewritten onto a bound is still refused as `_NOT_WELL_FORMED`, not hung.
+
+#### Deviation
+
+`post_approved_forecast` gains an optional keyword and `AuthorizedPayload` gains a defaulted
+field. Existing callers and fixtures are unaffected.
+
+#### Rejected
+
+These are recorded in D45:
+- refuse ties (would have refused 12 posts);
+- ask the prompt for strictly increasing values (retires the activation);
+- derivable-only (observable, not recorded);
+- a field on the forecast record (changes `record_json` and its hash).
+
+#### Deferred (do not read the absence as an omission)
+
+- `docs/SCHEMA.md` does not document the live-artifact envelope's `context`, before or after this
+  PR, and `test_schema_doc.py`'s partition does not cover artifacts.
+- Records posted before this PR have no `numeric_conversion`. For those, the derivation from the
+  stored record under the pinned SDK is what replay has.
+
+#### Standing risk — not verifiable offline
+
+The first live numeric or discrete post after deploy is the first artifact carrying the key. The
+post-deploy check reads it.
+
+### M1-509 — D46: validated configuration values join paths as a carve-out
+
+#### Decision — widen `CLAUDE.md`, with two limits
+
+CLAUDE.md's error-hygiene section gains a second carve-out: **validated** operator-supplied
+configuration values. The argument is M1-403's: the prompt prints a literal range, config may
+narrow it, and a repair turn that does not state the real bound cannot be satisfied.
+- A value that failed or bypassed validation stays withheld: the threat boundary already calls it
+  untrusted. This is why the envelope checks say "configured pair withheld".
+- A value that arrives through a question is provider content. `numeric.py` keeps withholding its
+  bounds, which the model is already sent.
+
+`binary.py`, `multiple_choice.py` and `numeric.py` all cite D46.
+`test_d46_a_validated_pair_is_rendered_and_an_unvalidated_one_is_withheld` pins both halves in
+each categorical module. Numeric's value-free rule stays pinned by
+`test_a_percentile_problem_never_varies_with_the_question_it_was_checked_against`.
+
+#### Deviation
+
+**This edits CLAUDE.md.** Stated in the PR and the review request.
+
+#### Rejected
+
+Withholding the configured pair: the repair turn becomes unactionable whenever config narrows the
+prompt's range.
+
+#### Deferred / Standing risk
+
+None.
+
+### M1-511 — D47: no option cap at generation
+
+#### Decision
+
+`_MAX_CATEGORIES = 64` is the verification snapshot's serialization budget, not a forecast rule,
+and generation does not mirror it. The comments in both modules cite D47, and
+`test_d47_a_sixty_five_option_forecast_is_accepted_here_and_refused_at_post` pins both halves in
+one place.
+
+#### Rejected
+
+Composing a cap of 64 into M1-512's preflight. That preflight is a fact about the validation rules.
+64 is a fact about one module's snapshot.
+
+#### Deviation / Deferred / Standing risk
+
+None.
+
+### Mutation pass — 33 mutants, 32 dead, one redundant survivor
+
+Committed before mutating, with `__pycache__` cleared before and after each mutant. Every baseline
+was confirmed by exit code.
+
+| item | mutant | killed by |
+| --- | --- | --- |
+| M1-206 | SDK `_get_cdf_size_from_json` +1 -> +2 (installed package, restored) | test_the_sdk_derives_each_discrete_cases_point_count_from_its_payload |
+| M1-206 | `_SDK_DEFAULT_CDF_SIZE = 200` | test_the_three_sources_of_the_point_count_agree |
+| M1-206 | discrete case relabelled numeric | test_the_three_sources_of_the_point_count_agree (+ family test) |
+| M1-206 | `_cdf_rules` scale 201/inbound instead of 200/inbound | test_our_scaled_discrete_cap_is_the_platforms |
+| M1-206 | drop `sdk_question.cdf_size ==` assertion | SURVIVED - redundant: normalized cdf_size equality carries it |
+| M1-409 | sentence split -> splitlines (the M1-407 scan) | unit wrap table; property oracle |
+| M1-409 | sentence split -> paragraph split | test_a_neighbouring_bullets_range_is_not_read_as_a_probability_range |
+| M1-409 | drop `.` from terminators | neighbouring-bullets test |
+| M1-409 | drop list-item break | block-boundary[list item] |
+| M1-409 | drop heading break | block-boundary[heading] |
+| M1-409 | drop blank-line break | block-boundary[blank line] |
+| M1-409 | blank line as `[ \t]*` (CRLF missed) | block-boundary[crlf blank line] |
+| M1-513 | re-add `_MIN_PROBABILITY = 0.001` in submission_live | test_no_module_in_src_declares_the_envelope_a_second_time |
+| M1-513 | binary envelope message back to a literal | same |
+| M1-513 | generate envelope message back to a literal | same |
+| M1-512 | generate preflight `if not admitted` -> `if False` | test_an_unsatisfiable_option_count_is_refused_before_any_billable_call |
+| M1-512 | ceiling side ignored (witness unclamped above) | property: checker on the bounding vectors |
+| M1-512 | past-2 branch returns True | property: checker on the bounding vectors |
+| M1-512 | tolerance ignored (`== 1.0`) | SURVIVED first strategy; killed after the tolerance-band arm was added |
+| M1-512 | sum by materialising n copies (the first design) | totality property (10**400 count) |
+| M1-511 | generation-time cap at 64 | test_d47_a_sixty_five_option_forecast_is_accepted_here_and_refused_at_post |
+| M1-316 | boundary type check removed | test_a_structurally_compatible_stand_in_is_refused_before_any_io |
+| M1-510 | numeric builder dropped | test_the_composed_strategy_covers_exactly_the_registered_types |
+| M1-510 | numeric arm never bites | test_every_registered_type_reaches_both_verdicts[numeric-biting] |
+| M1-510 | strategy draws a hand-written two-type list (the pre-M1-510 shape) | test_every_registered_type_reaches_both_verdicts[discrete-biting] |
+| M1-510 | a fourth type registered in src with no builder | test_the_composed_strategy_covers_exactly_the_registered_types |
+| M1-508 | tournament drops `conversion=` | test_the_poll_passes_the_derived_conversion_record_to_the_post |
+| M1-508 | CLI drops `conversion=` | test_a_derived_payload_carries_its_conversion_record_to_the_post |
+| M1-508 | context never gets `numeric_conversion` | test_the_live_artifact_records_the_percentiles_a_tied_cdf_was_built_from |
+| M1-508 | `adjusted` hard-coded False | test_a_tie_is_recorded_as_the_values_the_sdk_actually_used |
+| M1-508 | `percentiles_used` emptied | same |
+| M1-508 | binary record accepts a conversion | test_a_conversion_record_for_a_binary_forecast_is_refused_before_the_post |
+| M1-508 | no pre-post render (plain json.dumps) | test_an_unwritable_conversion_record_is_refused_before_the_post[nan] |
+
+The M1-206 survivor removes one of three equivalent statements of the same fact inside the
+derivation test. The normalized `cdf_size` and the payload's own count still carry it, so it is
+redundancy rather than a vacuous test. The M1-512 `ignore-tolerance` row is the strategy gap
+described above: it survived the first strategy and is killed at HEAD.
