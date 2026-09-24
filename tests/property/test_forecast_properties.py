@@ -14,6 +14,7 @@ the validators rather than about the first type check.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from fractions import Fraction
 import re
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ import time
 import yaml
 from pydantic import ValidationError
 from forecasting_tools import NumericDistribution, Percentile
-from hypothesis import assume, event, given
+from hypothesis import assume, event, find, given, settings
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT, research_documents, round_trip
 
@@ -92,6 +93,7 @@ from whiskeyjack_bot.forecast.validate import (
 from whiskeyjack_bot.submission_live import _require_cdf
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,
+    CanonicalDiscreteQuestion,
     CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestion,
@@ -2125,29 +2127,117 @@ def _as_multiple_choice(
 
 _ComposedCase = tuple[ForecastResponse, int, tuple[str, ...], ForecastConfig, CanonicalQuestion]
 
+# M1-510. Nine declared values per bounded reply, one per row: the first satisfies every
+# ``numeric_output_problems`` rule against the questions below (inside 0..100 closed,
+# non-decreasing), the second breaks the ordering rule and the third the closed bounds -- so
+# the numeric arm is silent on some draws and biting on others, which the row requires.
+_BOUNDED_VALUES: list[tuple[float, ...]] = [
+    (10.0, 12.0, 14.0, 18.0, 24.0, 31.0, 38.0, 42.0, 50.0),
+    (50.0, 42.0, 38.0, 31.0, 24.0, 18.0, 14.0, 12.0, 10.0),
+    (-5.0, 12.0, 14.0, 18.0, 24.0, 31.0, 38.0, 42.0, 150.0),
+]
+
+
+def _as_bounded(
+    response: BinaryForecastResponse, question_type: str, values: tuple[float, ...]
+) -> NumericForecastResponse:
+    """The same attribution case, retyped as a numeric or discrete reply (M1-510).
+
+    ``_as_multiple_choice``'s shape and reason: built from the binary draw so the
+    attribution layer is drawn identically for every type.
+    """
+    payload = response.model_dump(mode="json")
+    payload["question_type"] = question_type
+    payload["model_prior"] = None
+    payload["base_rate"] = {**payload["base_rate"], "prior_probability": None}
+    payload["final_prediction"] = {
+        "percentiles": [
+            {"percentile": level, "value": value}
+            for level, value in zip(DECLARED_PERCENTILE_LEVELS, values, strict=True)
+        ]
+    }
+    reloaded = validate_forecast_response(payload, NumericForecastResponse)
+    assert isinstance(reloaded, NumericForecastResponse)
+    return reloaded
+
+
+_Builder = Callable[
+    [st.DrawFn, BinaryForecastResponse, int], tuple[ForecastResponse, CanonicalQuestion]
+]
+
+
+def _compose_binary(
+    draw: st.DrawFn, response: BinaryForecastResponse, question_id: int
+) -> tuple[ForecastResponse, CanonicalQuestion]:
+    return response, _binary_question(question_id)
+
+
+def _compose_multiple_choice(
+    draw: st.DrawFn, response: BinaryForecastResponse, question_id: int
+) -> tuple[ForecastResponse, CanonicalQuestion]:
+    answers = draw(st.sampled_from(_MC_ANSWERS))
+    return _as_multiple_choice(response, answers), _mc_question_for(question_id, _MC_OPTIONS)
+
+
+def _compose_numeric(
+    draw: st.DrawFn, response: BinaryForecastResponse, question_id: int
+) -> tuple[ForecastResponse, CanonicalQuestion]:
+    values = draw(st.sampled_from(_BOUNDED_VALUES))
+    return _as_bounded(response, "numeric", values), _numeric_question(question_id=question_id)
+
+
+def _compose_discrete(
+    draw: st.DrawFn, response: BinaryForecastResponse, question_id: int
+) -> tuple[ForecastResponse, CanonicalQuestion]:
+    values = draw(st.sampled_from(_BOUNDED_VALUES))
+    question = CanonicalDiscreteQuestion(
+        question_id=question_id,
+        post_id=7,
+        title="How many things?",
+        lower_bound=-0.5,
+        upper_bound=100.5,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        cdf_size=102,
+    )
+    return _as_bounded(response, "discrete", values), question
+
+
+# One builder per *registered* response type, keyed on the same literal ``_TYPE_CHECKERS``
+# is. ``composed_cases`` draws its type from the registry, not from this table, so a type
+# registered without a builder here is a ``KeyError`` inside the strategy rather than a
+# type silently never drawn -- and
+# ``test_the_composed_strategy_covers_exactly_the_registered_types`` says so by name.
+_COMPOSED_BUILDERS: dict[str, _Builder] = {
+    "binary": _compose_binary,
+    "multiple_choice": _compose_multiple_choice,
+    "numeric": _compose_numeric,
+    "discrete": _compose_discrete,
+}
+_REGISTERED_TYPES = tuple(sorted(key for key, value in _TYPE_CHECKERS.items() if value is not None))
+
 
 @st.composite
 def composed_cases(draw: st.DrawFn) -> _ComposedCase:
     """An attribution case, the bounds the type-specific layer is checked against, and the
-    question's option list.
+    question the response is paired with.
 
     Both layers must be *reachable* from one strategy or the composition properties are
     vacuous -- the defect class this project has paid for more than any other. The bounds
-    are drawn wide and narrow so the type-specific layer is silent on some draws and biting
-    on others, and ``test_the_composition_is_reached_on_both_sides`` is the event-tagged
-    proof that both happen.
+    are drawn wide and narrow so the binary and multiple-choice layers are silent on some
+    draws and biting on others; the bounded arms bite or not through ``_BOUNDED_VALUES``.
 
-    **M1-404 widened this to draw two registered types.** Until that row the strategy drew
-    only ``BinaryForecastResponse``, so every composition property was a statement about
-    the one type whose entry was not ``None`` -- and the multiple-choice entry could have
-    been registered wrong without a single one of them failing. It said "both" until
-    M1-405 registered a third; ``numeric`` is **not** drawn here and ``M1-510`` is the row
-    that makes this strategy registry-complete.
-
-    **At the M1-404/M1-405 merge the fifth element became the paired question** rather than
-    a loose option list: the entry point reads the option list off the question, so a case
-    that carried both would carry one fact twice and could drift into a pairing the entry
-    point refuses for a reason unrelated to the property under test.
+    **Registry-complete since M1-510.** M1-404 widened this from binary alone to two types,
+    and it then said "both" while M1-405 registered a third: 300 draws gave 190
+    multiple-choice, 110 binary and 0 numeric, and M1-405's own round-3 request claimed the
+    opposite in writing. The type is now drawn from ``_TYPE_CHECKERS``' non-``None``
+    entries and dispatched through ``_COMPOSED_BUILDERS``, so a fourth registration either
+    has a builder or breaks this strategy -- and
+    ``test_every_registered_type_reaches_both_verdicts`` fails, by ``find``, if any
+    registered type is not drawn with both a biting and a silent type-specific verdict.
+    ``discrete`` is registered to the same checker as ``numeric`` and is drawn on its own:
+    the pairing check in ``output_problems`` is per literal, and a shared checker is not a
+    shared entry.
     """
     response, question_id, supplied = draw(attribution_cases())
     low, high = draw(
@@ -2167,16 +2257,9 @@ def composed_cases(draw: st.DrawFn) -> _ComposedCase:
         )
     )
     config = _forecast_config(low, high)
-    if draw(st.booleans()):
-        return response, question_id, supplied, config, _binary_question(question_id)
-    answers = draw(st.sampled_from(_MC_ANSWERS))
-    return (
-        _as_multiple_choice(response, answers),
-        question_id,
-        supplied,
-        config,
-        _mc_question_for(question_id, _MC_OPTIONS),
-    )
+    question_type = draw(st.sampled_from(_REGISTERED_TYPES))
+    typed, question = _COMPOSED_BUILDERS[question_type](draw, response, question_id)
+    return typed, question_id, supplied, config, question
 
 
 def _composed(case: _ComposedCase) -> list[str]:
@@ -2188,15 +2271,8 @@ def _type_specific_half(case: _ComposedCase) -> list[str]:
     """The type-specific layer alone, dispatched the way the entry point dispatches it.
 
     Written against ``_TYPE_CHECKERS`` rather than as an if/else, so *this helper* cannot
-    fall behind a new registration.
-
-    **The strategy that feeds it can, and currently does -- see M1-405 round 3.**
-    ``composed_cases()`` draws binary and multiple-choice only, so ``numeric`` is
-    registered and never reaches this helper through the composed entry point: 300 draws
-    gave 190 multiple-choice, 110 binary, 0 numeric. Registry-driven dispatch behind a
-    hand-written strategy is not registry-complete coverage, and reading this docstring
-    as though it were is the mistake M1-405's own round-3 request made in writing.
-    ``M1-510`` closes it; section 5b covers ``numeric_output_problems`` directly meanwhile.
+    fall behind a new registration -- and since M1-510 neither can the strategy that feeds
+    it (``composed_cases`` draws from the same registry).
     """
     response, _question_id, _supplied, config, question = case
     checker = _TYPE_CHECKERS[response.question_type]
@@ -2216,9 +2292,43 @@ def test_the_composition_is_reached_on_both_sides(
     response, question_id, supplied, _config, _question = case
     attribution_half = attribution_problems(response, question_id=question_id, source_ids=supplied)
     type_half = _type_specific_half(case)
-    event(f"response type: {response.question_type}")
     event(f"attribution bites: {bool(attribution_half)}")
-    event(f"type-specific bites: {bool(type_half)}")
+    # Per type (M1-510): "the numeric arm reaches both verdicts" is a claim about the
+    # pair, and two separate tags could each be populated by a different type.
+    event(f"{response.question_type}: type-specific bites: {bool(type_half)}")
+
+
+def test_the_composed_strategy_covers_exactly_the_registered_types() -> None:
+    """M1-510: one builder per non-``None`` registry entry, no more and no fewer.
+
+    A registration with no builder would make ``composed_cases`` raise, which is loud but
+    reads as a strategy bug; this names the actual defect. A builder with no registration
+    would be a type the strategy draws and the entry point refuses as unsupported.
+    """
+    assert set(_COMPOSED_BUILDERS) == set(_REGISTERED_TYPES)
+    assert set(_REGISTERED_TYPES) == {
+        key for key, value in _TYPE_CHECKERS.items() if value is not None
+    }
+
+
+@pytest.mark.parametrize("bites", [True, False], ids=["biting", "silent"])
+@pytest.mark.parametrize("question_type", _REGISTERED_TYPES)
+def test_every_registered_type_reaches_both_verdicts(question_type: str, bites: bool) -> None:
+    """The anti-vacuity assertion M1-510 asks for, as a failure rather than a statistic.
+
+    ``event`` tags above are read by a person; this is read by the gate. For every
+    registered type, ``find`` must produce a composed case of that type whose
+    type-specific half is non-empty (``biting``) and one where it is empty (``silent``).
+    ``find`` raises when no such example turns up, so a registered type the strategy never
+    draws -- or draws on only one side -- fails here by name.
+    """
+    find(
+        composed_cases(),
+        lambda case: (
+            case[0].question_type == question_type and bool(_type_specific_half(case)) is bites
+        ),
+        settings=settings(max_examples=2000, database=None, deadline=None),
+    )
 
 
 @given(composed_cases())
