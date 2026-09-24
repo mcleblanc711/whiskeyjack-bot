@@ -14375,10 +14375,36 @@ ledger is the product.
 - **Catching the `ValueError` at the journal write**: `model_completed` would already exist, and
   that is the defect.
 
+#### Round 1 — `1e999` is a finite-looking token that parses to infinity
+
+Review round 1 (on `2a59299`) found the one blocker, and it reproduced by execution:
+`json.loads('{"usage":{"cost":1e999}}', parse_constant=...)` returns `{'usage': {'cost': inf}}`.
+`parse_constant` sees only the three literals. A valid number token that overflows goes through
+`float()` and becomes infinity without calling it, so the original escape (a raw `ValueError`
+after `model_completed`) was still reachable.
+
+A `parse_float` hook (`_finite_float`) now refuses a non-finite result inside the same `try`.
+The unit test gained `overflow` and `nested-overflow` cases. The property runs once per
+placement × kind (the three literals, and `1e999`/`-1E400`/`2.5e+308`), so the overflow tokens
+get guaranteed reach.
+
+**The siblings, enumerated by execution against the fixed parse:**
+
+| Token or shape | Result |
+| --- | --- |
+| a 400-digit integer | parses; `settled_cost` → unknown, so the reservation is held; `canonical()` journals it |
+| a 5000-digit integer | `ValueError` from Python's int-digit limit, inside the `try` → `ModelOutcomeUnknown` |
+| `1e-999` | underflows to `0.0`, which is finite, and settles 0 |
+| `-0.0` | finite; `Budget.settle` treats it as 0 |
+| nesting depth 100 000 | `RecursionError`, inside the `try` → `ModelOutcomeUnknown` |
+
+Nothing that `json.loads` returns can now make `canonical()` refuse.
+
 #### Deferred
 
 - A body nested deeply enough to hit Python's recursion limit raises `RecursionError` inside the
-  same `try` and takes the same path. It was not separately tested.
+  same `try` and takes the same path. It was measured (the round-1 table above) but has no
+  standing test.
 
 ### M1-325 — Record the sanitized reason on `question_failure`
 
@@ -14476,6 +14502,10 @@ mutant ran against the four new test files, `test_byok_cost.py`, `test_evidence_
 | M16 `exc_info=True` on the caught-exception log | `test_a_refused_generation_…` (the sentinel is in the rendered traceback) |
 | M17 log `exc.__cause__` | same |
 | M18 log the raw reply instead of the problems | `test_a_malformed_reply_…` |
+| M19 (round 1) no `parse_float` hook | `test_a_non_finite_…[overflow]` |
+
+After the round-1 fix, M8 was re-run as "drop the `parse_constant` hook" and M10 as "move both
+hooks after `model_completed`". Both still die.
 
 **M10 survived its first form, for the wrong reason.** The first version added a check after
 `model_completed` but left the strict parse inside the `try` in place. That check still refused
