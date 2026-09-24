@@ -79,7 +79,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, cast, get_args
 
@@ -626,6 +626,10 @@ class StoredResolution:
     source_response_sha256: str
     observed_at_utc: str
     ingested_at_utc: str
+    # The stored post payload's canonical text, verified against ``source_response_sha256``
+    # with everything else here. Carried so a platform score is read from exactly the text
+    # that was hashed (M4-803); kept out of the repr because it is the whole payload.
+    source_response: str = field(repr=False)
 
     @property
     def kind(self) -> ResolutionKind:
@@ -2125,7 +2129,7 @@ def record_platform_scores(
             raise LifecycleError(
                 f"a score cannot be recorded for a record whose current status is {status}"
             )
-        source = _verified_source_response(conn, resolution)
+        source = _parsed_source_response(resolution)
         try:
             scores = extract_platform_scores(source, question_id)
         except PlatformScoreError as exc:
@@ -2228,7 +2232,7 @@ def read_platform_scores(
         )
         if resolution is None:
             raise LifecycleError("a stored score cites a resolution row this record does not have")
-        source = _verified_source_response(conn, resolution)
+        source = _parsed_source_response(resolution)
         try:
             value = recompute_platform(
                 stored.implementation_version, stored.metric, source, question_id
@@ -2250,30 +2254,16 @@ def _require_stored_question_id(conn: sqlite3.Connection, record_id: str) -> int
     return _stored_int(row[0], "question_id")
 
 
-def _verified_source_response(conn: sqlite3.Connection, resolution: StoredResolution) -> object:
-    """The stored post payload of a resolution row, parsed, and checked against its digest.
+def _parsed_source_response(resolution: StoredResolution) -> object:
+    """The stored post payload of a resolution row, parsed.
 
-    ``resolution`` has already been re-verified by :func:`_resolution_from_row`; this reads
-    the text again, in the same transaction, and requires the same digest, so what is parsed
-    is what was hashed. ``json.loads`` is not given a hook: a number too large for a double
-    parses to an infinity, which ``platform_scores`` refuses as non-finite.
+    ``resolution`` came from :func:`_resolution_from_row`, which verified this exact text
+    against ``source_response_sha256``, so what is parsed is what was hashed. ``json.loads``
+    is given no hook: a number too large for a double parses to an infinity, which
+    ``platform_scores`` refuses as non-finite.
     """
-    row = _fetch_one(
-        conn,
-        "SELECT source_response FROM resolution_events WHERE event_id = ?",
-        (resolution.event_id,),
-    )
-    if row is None:  # pragma: no cover - the row was read in this transaction
-        raise LifecycleError("a stored resolution row could not be read back")
-    text = _stored_text(row[0], "source_response")
     try:
-        matches = sha256_text(text) == resolution.source_response_sha256
-    except UnicodeEncodeError:
-        matches = False
-    if not matches:
-        raise LifecycleError("a stored resolution source response does not match its digest")
-    try:
-        return cast(object, json.loads(text))
+        return cast(object, json.loads(resolution.source_response))
     except (ValueError, RecursionError):
         raise LifecycleError(
             "a stored resolution source response is not JSON "
@@ -2986,6 +2976,7 @@ def _resolution_from_row(row: sqlite3.Row) -> StoredResolution:
         source_response_sha256=source_digest,
         observed_at_utc=_stored_text(row[6], "observed_at_utc"),
         ingested_at_utc=_stored_text(row[7], "ingested_at_utc"),
+        source_response=source,
     )
 
 
