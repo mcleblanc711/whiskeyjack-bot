@@ -39,12 +39,10 @@ import traceback
 from typing import Any
 
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import assume, event, given, settings, strategies as st
 from strategies import HOSTILE_TEXT
 
 from whiskeyjack_bot.prompt import (
-    _DECLARED_RANGE_RE,
-    _PROBABILITY_LINE_RE,
     DeclaredProbabilityBounds,
     PromptError,
     load_prompt,
@@ -80,7 +78,7 @@ _DECIMALS = st.sampled_from(
 )
 
 # Sentence frames the prompt body actually uses, plus ones it does not, so the generator
-# reaches both the matching and the non-matching branch of the line scan. The
+# reaches both the matching and the non-matching branch of the sentence scan. The
 # ``{low}``/``{high}`` slots are filled from _DECIMALS.
 _PROBABILITY_FRAMES = st.sampled_from(
     [
@@ -92,7 +90,7 @@ _PROBABILITY_FRAMES = st.sampled_from(
     ]
 )
 
-# Lines with no ``probabilit`` in them. The percentile one is the decoy the line scan
+# Lines with no ``probabilit`` in them. The percentile one is the decoy the scope
 # exists for: it carries a perfectly parseable range that is not a probability range.
 _NON_PROBABILITY_FRAMES = st.sampled_from(
     [
@@ -376,19 +374,141 @@ def test_an_accepted_range_can_always_bound_a_probability(text: str) -> None:
     assert 0.0 <= bounds.low < bounds.high <= 1.0
 
 
-@given(PROMPT_BODIES)
-def test_an_accepted_body_states_that_range_everywhere_it_states_one(body: str) -> None:
-    """The agreement rule, from the other side: if a body parses, then every range it
-    states on a probability line is the range returned. A parse that stopped at the first
-    match satisfies the no-raise properties above and fails this one."""
-    bounds = _parse(body)
-    if bounds is None:
-        return
-    found = [
-        (float(m.group(1)), float(m.group(2)))
-        for line in body.splitlines()
-        if _PROBABILITY_LINE_RE.search(line) is not None
-        for m in _DECLARED_RANGE_RE.finditer(line)
-    ]
-    assert found, "an accepted body must state the range at least once"
-    assert set(found) == {(bounds.low, bounds.high)}
+# --------------------------------------------------------------------------------------
+# M1-409: the verdict against an oracle that never reads the parser's regular expressions.
+# --------------------------------------------------------------------------------------
+
+# What each decimal spelling in ``_DECIMALS`` is read as, written out by hand, per slot.
+# This is the independent oracle the row asks for: M1-407's version of the property below
+# rebuilt its expectation from ``_DECLARED_RANGE_RE`` and ``_PROBABILITY_LINE_RE`` and so
+# agreed with the parser by construction -- it could not have seen the wrapping defect,
+# because it scanned lines exactly as the parser did. A spelling missing from a table is
+# one the parser must not read in that slot. The two tables differ in one entry: ``1.``
+# reads as ``1`` where a sentence may end on it (the high slot) and ends the sentence
+# before ``and`` where it cannot (the low slot).
+_OVERLONG_SMALL = "0." + "0" * 400 + "1"  # underflows to 0.0: not a raise
+_OVERLONG_LARGE = "9" * 400  # overflows to inf: not a raise
+_READ_AS_LOW: dict[str, float] = {
+    "0.001": 0.001,
+    "0.999": 0.999,
+    "0": 0.0,
+    "1": 1.0,
+    "0.5": 0.5,
+    "00.001": 0.001,
+    _OVERLONG_SMALL: 0.0,
+    _OVERLONG_LARGE: math.inf,
+}
+_READ_AS_HIGH: dict[str, float] = {**_READ_AS_LOW, "1.": 1.0}
+
+# Complete sentences, each ending in a terminator so the frames are separate sentences
+# whatever the wrapping does. The first three are the shipped prompt's own declarations.
+_KNOWN_PROBABILITY_FRAMES = (
+    "Use probability values between {low} and {high} for binary outcomes.",
+    "`probability_yes` must be between {low} and {high} inclusive.",
+    "Probabilities must be between {low} and {high} and sum to 1 within `1e-6`.",
+    "Probability: between {low} and {high}.",
+)
+_KNOWN_OTHER_FRAMES = (
+    "Percentile values must be between {low} and {high} and non-decreasing.",
+    "Values must be between {low} and {high}.",
+    "Return every supplied option exactly once.",
+)
+
+
+# ``_DECIMALS`` again, with the two shipped ends repeated so ``sampled_from`` draws them
+# often enough to reach agreement and disagreement between *usable* ranges; the near-miss
+# spellings stay in, so the not-read branch of each slot is still drawn.
+_KNOWN_DECIMALS = st.sampled_from(
+    ["0.001"] * 4
+    + ["0.999"] * 4
+    + ["0.5", "0", "1", "1.", "00.001", ".5", "-0.1", "1e-6", "０.００１"]
+    + [_OVERLONG_SMALL, _OVERLONG_LARGE]
+)
+
+
+def _opens_a_block(token: str) -> bool:
+    """Whether a line starting with ``token`` would open a Markdown list item or heading.
+
+    Hand-written from Markdown, for the wrap strategy below: an editor's wrap never puts a
+    list marker at the start of a continuation line, so a draw that would is not a wrap.
+    """
+    return token[:1] in {"-", "*", "+", "#"} or (token[:-1].isdigit() and token[-1:] in ".)")
+
+
+def _wrapped(draw: Any, sentence: str) -> str:
+    """``sentence`` with a drawn subset of its spaces replaced by a line break."""
+    words = sentence.split(" ")
+    out = [words[0]]
+    for word in words[1:]:
+        brk = draw(st.sampled_from([" ", " ", "\n", "\n    ", "\r\n"]))
+        out.append((" " if _opens_a_block(word) else brk) + word)
+    return "".join(out)
+
+
+@st.composite
+def _known_bodies(draw: Any) -> tuple[str, DeclaredProbabilityBounds | None, str]:
+    """A body, the verdict the oracle expects for it, and a reach tag.
+
+    Three modes, because two independent draws rarely coincide: every frame states one
+    shared pair (the accept branch, over several declarations), every frame but the last
+    does and the last states a different one (disagreement, with the odd one out wrapped as
+    often as any other), or each frame draws its own.
+    """
+    mode = draw(st.sampled_from(["shared", "one differs", "independent"]))
+    pair = (draw(_KNOWN_DECIMALS), draw(_KNOWN_DECIMALS))
+    odd = (draw(_KNOWN_DECIMALS), draw(_KNOWN_DECIMALS))
+    count = draw(st.integers(min_value=0, max_value=4))
+    sentences: list[str] = []
+    read: list[tuple[float, float]] = []
+    wraps = 0
+    for index in range(count):
+        about_probability = draw(st.integers(0, 3)) > 0
+        frames = _KNOWN_PROBABILITY_FRAMES if about_probability else _KNOWN_OTHER_FRAMES
+        if mode == "independent":
+            low, high = draw(_KNOWN_DECIMALS), draw(_KNOWN_DECIMALS)
+        elif mode == "one differs" and index == count - 1:
+            low, high = odd
+        else:
+            low, high = pair
+        sentence = draw(st.sampled_from(frames)).format(low=low, high=high)
+        wrapped = _wrapped(draw, sentence)
+        wraps += wrapped != sentence
+        sentences.append(wrapped)
+        if about_probability and low in _READ_AS_LOW and high in _READ_AS_HIGH:
+            read.append((_READ_AS_LOW[low], _READ_AS_HIGH[high]))
+    body = "\n".join(sentences)
+    # Unrelated text in its own paragraph, and never itself carrying a range: it is here
+    # to be ignored, and a hostile string that happened to state one is a different claim.
+    noise = draw(st.lists(HOSTILE_TEXT, max_size=2))
+    assume(all("between" not in line.lower() for line in noise))
+    body = "\n\n".join([body, *noise])
+
+    expected: DeclaredProbabilityBounds | None
+    if not read:
+        expected, tag = None, "no range"
+    elif any(other != read[0] for other in read[1:]):
+        expected, tag = None, "disagreement"
+    elif not 0.0 <= read[0][0] < read[0][1] <= 1.0:
+        expected, tag = None, "unusable range"
+    else:
+        expected = DeclaredProbabilityBounds(low=read[0][0], high=read[0][1])
+        tag = f"accepted from {min(len(read), 2)}{'+' if len(read) >= 2 else ''} declaration(s)"
+    return body, expected, f"{tag}; wrapped={wraps > 0}"
+
+
+@settings(max_examples=400)
+@given(_known_bodies())
+def test_the_verdict_matches_a_hand_written_oracle_however_the_body_is_wrapped(
+    case: tuple[str, DeclaredProbabilityBounds | None, str],
+) -> None:
+    """The M1-409 criterion as an iff, over bodies whose line breaks fall anywhere.
+
+    Accepted with exactly the stated pair when every probability declaration agrees on a
+    usable range; refused otherwise -- including when a disagreeing declaration is wrapped
+    so that its range and the word ``probability`` sit on different lines. Both directions,
+    because a one-sided property is vacuous on the side it never reaches (M1-501), and
+    ``event`` shows both are reached with and without wrapping.
+    """
+    body, expected, tag = case
+    event(tag)
+    assert _parse(body) == expected

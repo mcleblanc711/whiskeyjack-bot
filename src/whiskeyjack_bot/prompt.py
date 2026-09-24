@@ -98,11 +98,35 @@ _H1_VERSION_TOKEN_RE = re.compile(rf"\bv({_SEMVER})(?![\w.])", re.ASCII)
 # ``parse_declared_version``'s comment above describes: the body also carries a
 # ``1e-6`` sum tolerance and a percentile ladder of decimals.
 #
-# The scan is therefore *scoped by line to lines that are about probability*.
+# The scan is therefore *scoped to sentences that are about probability*.
 # That is what keeps "percentile values must be non-decreasing" and
 # "sum to 1 within ``1e-6``" out of the result, and it is a rule a custom prompt
 # can satisfy by writing the sentence any operator would write anyway.
-_PROBABILITY_LINE_RE = re.compile(r"probabilit", re.IGNORECASE)
+#
+# **A sentence, not a line (M1-409).** M1-407 scoped by line, and an ordinary editor's
+# wrap moved a declaration's range onto a line with no ``probabilit`` in it, where it was
+# skipped: ``must be`` / newline / ``between 0.01 and 0.99`` loaded with the *other* two
+# declarations' bounds while telling the model a different range. A wrap never ends a
+# sentence, so scoping by sentence makes the scan blind to line breaks by construction.
+# A paragraph was the other candidate and is wrong: the shipped prompt's bullet list runs
+# the probability bullet into the next one with no blank line between, so a paragraph
+# scope would pull a neighbouring bullet's range into the probability check.
+#
+# A sentence ends at ``.``/``!``/``?`` followed by whitespace or the end of the text
+# (never at a decimal point, which a digit follows), at a blank line, and where a line
+# opens a Markdown list item or heading. The residual imprecision is one-directional: a
+# sentence this over-joins -- an abbreviation like ``e.g.`` splits one, a line with no
+# terminal punctuation runs into the next -- can only make the scan see *more* ranges on
+# a probability sentence, and more ranges can only produce a disagreement, which is a
+# refusal at startup before anything is spent. It cannot make a stated range invisible
+# unless the range and the word ``probability`` are separated by a real sentence break.
+_PROBABILITY_WORD_RE = re.compile(r"probabilit", re.IGNORECASE)
+_SENTENCE_BREAK_RE = re.compile(
+    r"[.!?](?=\s|$)"  # a terminator; a decimal point is followed by a digit instead
+    r"|\n[^\S\n]*\n"  # a blank line (``[^\S\n]`` so a CRLF blank line counts too)
+    r"|\n(?=[^\S\n]*(?:[-*+]|\d+[.)]|#{1,6})[^\S\n])",  # a list item or heading opens
+    re.ASCII,
+)
 
 # A digit is required before the point: ``.5`` is not a spelling this accepts,
 # and the parser refuses rather than guessing at a prompt that uses one.
@@ -199,8 +223,9 @@ def parse_declared_version(text: str) -> str:
 def parse_declared_probability_bounds(text: str) -> DeclaredProbabilityBounds:
     """Return the probability range the prompt declares to the model (M1-407).
 
-    Every line that is about probability is scanned for ``between <low> and
-    <high>``; **every match found must agree**, and at least one is required.
+    Every sentence that is about probability is scanned for ``between <low> and
+    <high>``, wherever its line breaks fall (M1-409); **every match found must agree**, and
+    at least one is required.
 
     Both of those are the stricter reading, and both follow
     ``parse_declared_version``. A prompt whose three statements of the range
@@ -215,10 +240,13 @@ def parse_declared_probability_bounds(text: str) -> DeclaredProbabilityBounds:
     only file-derived values that reach one are parsed ``float``s.
     """
     found: list[tuple[float, float]] = []
-    for line in text.splitlines():
-        if _PROBABILITY_LINE_RE.search(line) is None:
+    for sentence in _SENTENCE_BREAK_RE.split(text):
+        if _PROBABILITY_WORD_RE.search(sentence) is None:
             continue
-        for match in _DECLARED_RANGE_RE.finditer(line):
+        # ``_DECLARED_RANGE_RE`` separates its tokens with ``\s+``, which spans a newline,
+        # so a range wrapped *inside* itself (``between 0.01`` / newline / ``and 0.99``)
+        # matches as well as one wrapped away from the word ``probability``.
+        for match in _DECLARED_RANGE_RE.finditer(sentence):
             # float() cannot raise on this pattern: it is digits with at most
             # one point. An overlong run becomes ``inf`` and fails the range
             # check below rather than escaping as an OverflowError.
@@ -226,7 +254,7 @@ def parse_declared_probability_bounds(text: str) -> DeclaredProbabilityBounds:
 
     if not found:
         raise PromptError(
-            "forecaster prompt declares no probability range: at least one line about "
+            "forecaster prompt declares no probability range: at least one sentence about "
             "probability must state it as 'between <low> and <high>', so a configured "
             "bound can be checked against the prompt rather than against a copy of its "
             "numbers (M1-407) (lines withheld: they can echo prompt contents)"
