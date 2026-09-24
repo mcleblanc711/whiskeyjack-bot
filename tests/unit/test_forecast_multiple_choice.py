@@ -728,3 +728,53 @@ def test_the_envelope_check_closes_the_gap_the_submission_path_would_have_found(
     )
     with pytest.raises(MultipleChoiceOutputError):
         _problems(forecast, config=_narrowed(0.0, 1.0))
+
+
+def test_d46_a_validated_pair_is_rendered_and_an_unvalidated_one_is_withheld() -> None:
+    """M1-509's decision, the multiple-choice half (D46; see the binary twin).
+
+    Rendered through a config that passed ``ForecastConfig``'s validators, withheld for one
+    that went around them. The two categorical checkers agree with each other on both
+    halves, which is what the row asked to stop being an accident.
+    """
+    validated = ForecastConfig.model_validate(
+        {
+            **_committed_forecast_config().model_dump(),
+            "min_probability": 0.2,
+            "max_probability": 0.8,
+        }
+    )
+    problems = _problems(_response(_answers((A, 0.9), (B, 0.1))), config=validated)
+    assert _bounds_problem(0.2, 0.8) in problems
+
+    with pytest.raises(MultipleChoiceOutputError) as caught:
+        _problems(_response(), config=_narrowed(0.0004, 0.9996))
+    (withheld,) = caught.value.problems
+    assert "0.0004" not in withheld and "0.9996" not in withheld
+    assert "configured pair withheld" in withheld
+
+
+def test_d47_a_sixty_five_option_forecast_is_accepted_here_and_refused_at_post() -> None:
+    """M1-511's decision, both halves in one test so the two modules cannot drift apart
+    silently: the generating side has no option-count cap, and the post side's
+    ``_MAX_CATEGORIES`` refuses the payload. If a later change caps generation, or lifts
+    the post-side budget, this fails and D47 has to be revisited on purpose.
+    """
+    from whiskeyjack_bot.submission_live import (
+        _MAX_CATEGORIES,
+        LiveSubmissionError,
+        plan_from_payload,
+    )
+
+    count = _MAX_CATEGORIES + 1
+    labels = [f"Option {index}" for index in range(count)]
+    share = 1 / count
+    reply = _response([{"option": label, "probability": share} for label in labels])
+    assert _problems(reply, options=labels) == []
+
+    payload = {
+        "question_type": "multiple_choice",
+        "probability_yes_per_category": dict.fromkeys(labels, share),
+    }
+    with pytest.raises(LiveSubmissionError, match=f"more than {_MAX_CATEGORIES} options"):
+        plan_from_payload(payload, expected_cdf_points=201)

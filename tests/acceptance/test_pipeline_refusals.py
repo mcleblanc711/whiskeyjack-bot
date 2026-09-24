@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -545,6 +546,44 @@ def test_a_config_that_is_not_an_app_config_is_refused(seed: Seed) -> None:
             )
     finally:
         conn.close()
+
+
+class _Tripwire:
+    """A stand-in connection that records any use, so "before any I/O" is observed."""
+
+    def __init__(self) -> None:
+        self.touched: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.touched.append(name)
+        raise AssertionError("run_replay touched the connection before refusing the config")
+
+
+def test_a_structurally_compatible_stand_in_is_refused_before_any_io() -> None:
+    """M1-316: the stand-in T-903's round-2 review built, and the claim it disproved.
+
+    Every attribute the old per-attribute guards read is present and a bool, and every
+    switch is on, so each of those guards passed it -- while each said "config must be an
+    AppConfig". The single exact-type check at the boundary refuses it, with a message that
+    states what it verifies, before the connection or the (non-existent) snapshot is read.
+    """
+    stand_in = SimpleNamespace(
+        retrieval=SimpleNamespace(replay_saved_research=True),
+        forecast=SimpleNamespace(replay_saved_model_output=True),
+        storage=SimpleNamespace(retain_raw_model_output=True),
+    )
+    conn = _Tripwire()
+    with pytest.raises(PipelineError) as caught:
+        run_replay(
+            conn,  # type: ignore[arg-type]
+            stand_in,  # type: ignore[arg-type]
+            question_id=QUESTION_ID,
+            attempt_id=SEED_ATTEMPT,
+            snapshot=Path("/nonexistent/m1-316/snapshot.json"),
+            now=datetime(2026, 8, 21, 15, 30, tzinfo=timezone.utc),
+        )
+    assert str(caught.value) == "config must be an AppConfig"
+    assert conn.touched == []
 
 
 def test_a_snapshot_that_is_not_a_path_is_refused(seed: Seed) -> None:

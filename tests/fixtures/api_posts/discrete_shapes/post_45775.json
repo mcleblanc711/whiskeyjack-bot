@@ -1,0 +1,60 @@
+{
+  "id": 45775,
+  "published_at": "2026-09-21T19:15:40Z",
+  "nr_forecasters": 158,
+  "forecasts_count": 161,
+  "projects": {
+    "tournament": [],
+    "default_project": {
+      "id": 33125,
+      "slug": "minibench",
+      "name": "MiniBench"
+    }
+  },
+  "question": {
+    "id": 45960,
+    "type": "discrete",
+    "title": "How many cumulative confirmed New World screwworm animal cases in the US will APHIS report as of October 1, 2026?",
+    "description": "[stripped for the M1-206 fixture: not read by the cdf_size derivation]",
+    "resolution_criteria": "This question resolves as the cumulative total number of confirmed New World screwworm (NWS) animal cases in the United States reported by USDA APHIS, taken from the figure in effect on October 1, 2026 (Eastern Time). This counts confirmed detections in individual animals (domestic, wildlife, or feral), cumulatively and regardless of active/inactive status, species, state, or county; wild-fly-trap detections and human cases are NOT counted. The count is published on the APHIS \"Confirmed Detections of New World Screwworm\" dashboard (https://www.aphis.usda.gov/animals/animal-health/livestock-and-poultry-disease/stop-screwworm/current-status/confirmed) and restated in plain text by trackers such as the genomicepi.com \"U.S. New World Screwworm case tracker\" (https://www.genomicepi.com/outbreaks/new-world-screwworm/) as \"Animal cases.\" For example, if the total confirmed US animal-case count is 53, this resolves as 53.",
+    "fine_print": "[stripped for the M1-206 fixture: not read by the cdf_size derivation]",
+    "status": "open",
+    "open_time": "2026-09-21T19:15:40Z",
+    "scheduled_close_time": "2026-09-21T22:15:40Z",
+    "scheduled_resolve_time": "2026-10-02T00:00:00Z",
+    "cp_reveal_time": "2026-09-21T22:15:40Z",
+    "actual_resolve_time": null,
+    "resolution": null,
+    "include_bots_in_aggregates": true,
+    "question_weight": 1,
+    "label": "",
+    "unit": "cases",
+    "open_upper_bound": true,
+    "open_lower_bound": false,
+    "scaling": {
+      "continuous_range": [
+        49.5,
+        50.5,
+        51.5,
+        52.5,
+        53.5,
+        54.5,
+        55.5,
+        56.5,
+        57.5,
+        58.5
+      ],
+      "inbound_outcome_count": 9,
+      "nominal_max": 58,
+      "nominal_min": 50,
+      "open_lower_bound": false,
+      "open_upper_bound": true,
+      "range_max": 58.5,
+      "range_min": 49.5,
+      "zero_point": null
+    },
+    "my_forecasts": {
+      "history": null
+    }
+  }
+}

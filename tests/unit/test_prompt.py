@@ -549,41 +549,146 @@ def test_the_bounds_paths_never_echo_prompt_contents(tmp_path: Path, body: str) 
     assert PLANTED not in rendered
 
 
-# --- The line-scoped scan's known blind spot (M1-407 round 1, filed as M1-409) ---
+# --- A declaration wrapped across lines is seen (M1-409) ---------------------------------
+#
+# M1-407's scan was scoped by line, and a declaration wrapped by an ordinary editor put its
+# range on a line with no ``probabilit`` in it, where it was skipped. M1-409 replaced the
+# characterization test that pinned that gap with the tests below.
+#
+# **Every oracle here is the construction, never the parser's own regular expressions.**
+# The texts are made by breaking one known sentence at known places; whether that sentence
+# agrees with the other two declarations is a fact about the sentence, decided when it was
+# written down, so the expectation cannot be wrong in the same way the parser is.
+
+# The three sentences ``prompts/forecaster.md`` states its range in, copied by hand. The
+# first test below proves each is present verbatim, so a prompt edit that moved one fails
+# loudly here rather than silently shrinking what these tests cover.
+_SHIPPED_DECLARATIONS = (
+    "Use probability values between 0.001 and 0.999 for binary outcomes.",
+    "`probability_yes` must be between 0.001 and 0.999 inclusive.",
+    "Probabilities must be between 0.001 and 0.999 and sum to 1 within `1e-6`.",
+)
+_SHIPPED = DeclaredProbabilityBounds(low=0.001, high=0.999)
 
 
-def test_a_conflicting_declaration_wrapped_across_lines_is_not_seen() -> None:
-    """**Characterization, not endorsement.** This pins a known gap so it cannot widen
-    silently and so nobody reads the standing-risk note as covering it.
+def _real() -> str:
+    return REAL_PROMPT.read_text(encoding="utf-8")
 
-    The scan is scoped to a line, so a declaration wrapped by an ordinary editor --
-    ``must be`` / newline / ``between 0.01 and 0.99`` -- puts the range on a line with no
-    ``probabilit`` in it. It is skipped, the two surviving declarations still agree, and
-    the prompt loads with bounds that are *not* what it tells the model for
-    ``probability_yes``. The same conflict on one line raises, which is the contrast that
-    makes this a wrapping bug rather than an agreement bug.
 
-    The oracle here is written by hand rather than reusing ``_DECLARED_RANGE_RE``: the
-    agreement property in ``tests/property/`` derives its expectation from the
-    implementation's own regexes and therefore cannot detect this class at all (round-1
-    review). M1-409 owns the fix.
+def _wrappings(sentence: str) -> list[str]:
+    """``sentence`` broken at each of its spaces in turn, plus the shapes an editor makes.
+
+    One break per variant, at every word boundary, as a plain newline; then an indented
+    continuation, a CRLF break and a break at every boundary at once. None of them starts a
+    continuation line with a list marker or a heading, because a wrap an editor makes does
+    not either -- and a line that did would be a new Markdown block, not a wrap.
     """
-    real = REAL_PROMPT.read_text(encoding="utf-8")
-    binary_line = "`probability_yes` must be between 0.001 and 0.999 inclusive."
-    assert binary_line in real
+    words = sentence.split(" ")
+    single = [" ".join(words[:cut]) + "\n" + " ".join(words[cut:]) for cut in range(1, len(words))]
+    return [
+        *single,
+        " ".join(words[:3]) + "\n    " + " ".join(words[3:]),
+        " ".join(words[:3]) + "\r\n" + " ".join(words[3:]),
+        "\n".join(words),
+    ]
 
-    wrapped = real.replace(
-        binary_line, "`probability_yes` must be\nbetween 0.01 and 0.99 inclusive."
-    )
-    # Hand-written oracle: the conflicting pair is present in the text, plainly.
-    assert "0.01 and 0.99" in wrapped
-    assert parse_declared_probability_bounds(wrapped) == DeclaredProbabilityBounds(
-        low=0.001, high=0.999
-    )
 
-    # The identical conflict, unwrapped, is refused -- so the gap is the newline.
-    unwrapped = real.replace(
-        binary_line, "`probability_yes` must be between 0.01 and 0.99 inclusive."
+def test_the_shipped_prompt_states_its_range_in_exactly_the_three_known_sentences() -> None:
+    """The fixture for everything below, checked against the real file (read-only).
+
+    Each of the three is shown to be *seen*, not merely present: disagreeing any one of
+    them alone makes the prompt refuse. A scan that silently lost one declaration would
+    still return the right bounds from the other two, which is exactly the M1-409 shape.
+    """
+    real = _real()
+    assert parse_declared_probability_bounds(real) == _SHIPPED
+    for sentence in _SHIPPED_DECLARATIONS:
+        assert real.count(sentence) == 1
+        conflicting = real.replace(sentence, sentence.replace("0.001 and 0.999", "0.01 and 0.99"))
+        with pytest.raises(PromptError, match="disagree"):
+            parse_declared_probability_bounds(conflicting)
+
+
+@pytest.mark.parametrize("sentence", _SHIPPED_DECLARATIONS)
+def test_a_conflicting_declaration_is_refused_however_it_is_wrapped(sentence: str) -> None:
+    """The row's acceptance criterion: disagreement is refused regardless of wrapping.
+
+    Every declaration in the shipped prompt, narrowed to ``0.01``-``0.99`` and then broken
+    at every word boundary -- including between ``between`` and its first number, between
+    the two numbers, and away from the word ``probability`` entirely, which is the break
+    M1-407's line scan could not see. The oracle is the sentence: it says ``0.01 and
+    0.99`` and the other two say ``0.001 and 0.999``, so every variant disagrees.
+    """
+    real = _real()
+    conflicting = sentence.replace("0.001 and 0.999", "0.01 and 0.99")
+    variants = _wrappings(conflicting)
+    assert len(variants) >= 8
+    for wrapped in variants:
+        with pytest.raises(PromptError, match="disagree"):
+            parse_declared_probability_bounds(real.replace(sentence, wrapped))
+
+
+@pytest.mark.parametrize("sentence", _SHIPPED_DECLARATIONS)
+def test_an_agreeing_declaration_still_loads_however_it_is_wrapped(sentence: str) -> None:
+    """The other half: the scan must not manufacture a disagreement out of a wrap.
+
+    A fix that refused every wrapped prompt would satisfy the test above and break an
+    operator who reflowed the file. Each unchanged declaration, wrapped every way, loads
+    with the shipped bounds.
+    """
+    real = _real()
+    for wrapped in _wrappings(sentence):
+        assert parse_declared_probability_bounds(real.replace(sentence, wrapped)) == _SHIPPED
+
+
+def test_a_neighbouring_bullets_range_is_not_read_as_a_probability_range() -> None:
+    """Why the scope is a sentence and not a paragraph (the row's own warning).
+
+    The shipped prompt's bullets run into each other with no blank line between, so a
+    paragraph scope would read the second bullet's range as a probability range and refuse
+    a prompt that is fine. A wrapped probability bullet directly above a bullet that states
+    some other range -- and the same pair as two sentences of one paragraph -- both load.
+    """
+    body = (
+        "# MiniBench forecaster prompt — v1.1.0\n\n"
+        "- Use probability values\n  between 0.001 and 0.999 for binary outcomes.\n"
+        "- Percentile values must lie between 5 and 10 for this example.\n\n"
+        "Probabilities must be between 0.001 and 0.999 inclusive. Values must be\n"
+        "between 5 and 10 for the percentile ladder.\n"
     )
-    with pytest.raises(PromptError):
-        parse_declared_probability_bounds(unwrapped)
+    assert parse_declared_probability_bounds(body) == _SHIPPED
+
+
+def test_a_sentence_break_does_separate_a_range_from_the_word_probability() -> None:
+    """The boundary of the rule, stated so it is a decision and not an accident.
+
+    A range in the *next sentence* after one that mentions probability is not a probability
+    declaration -- the scope has to end somewhere, and a terminator is where prose ends a
+    thought. A prompt whose only range is there declares none.
+    """
+    body = "State the probability. It must be between 0.01 and 0.99.\n"
+    with pytest.raises(PromptError, match="declares no probability range"):
+        parse_declared_probability_bounds(body)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        pytest.param("- Percentile values between 5 and 10\n", id="list item"),
+        pytest.param("## Percentile values between 5 and 10\n", id="heading"),
+        pytest.param("\nPercentile values between 5 and 10\n", id="blank line"),
+        pytest.param("\r\nPercentile values between 5 and 10\r\n", id="crlf blank line"),
+    ],
+)
+def test_a_block_boundary_ends_a_sentence_that_has_no_punctuation(boundary: str) -> None:
+    """Headings and bullets are often written without a full stop, so a terminator cannot
+    be the only thing that ends a sentence. Each body here has a probability line with no
+    punctuation directly above a new Markdown block that states some other range; if the
+    boundary were not a sentence break, the two would merge and the other range would be
+    read as a probability range. Each loads with the declared bounds.
+    """
+    body = (
+        "Probabilities must be between 0.001 and 0.999 inclusive.\n"
+        "- Probability guidance for binary questions\n" + boundary
+    )
+    assert parse_declared_probability_bounds(body) == _SHIPPED

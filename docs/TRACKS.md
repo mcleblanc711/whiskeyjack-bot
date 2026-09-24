@@ -57,7 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-336 | feat/m1-336-asknews-credit-settlement | whiskeyjack-m1-336 | no | none | 2026-09-24 |
+| M1-206 | feat/m1-206-validation-sweep | whiskeyjack-m1-206 | no | none | 2026-09-24 |
 | M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 | M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |

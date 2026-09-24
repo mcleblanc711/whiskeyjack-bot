@@ -74,9 +74,13 @@ part the model was missing.
 That matters beyond tidiness, because these strings do not stop at the repair turn. A
 response that fails twice puts them in ``ForecastGeneration.failure_problems``, which
 ``forecast/artifacts.py`` writes into the persisted raw-output envelope. Question fields
-come from Metaculus payloads, which CLAUDE.md classes as untrusted, and the carve-out that
-lets a *path* be rendered is about operator configuration, not about provider content. So a
-rendered bound is provider data entering the ledger's diagnostics.
+come from Metaculus payloads, which CLAUDE.md classes as untrusted, and the carve-outs that
+let a *path* or a *validated configuration value* be rendered (M1-401; D46, M1-509) are about
+operator configuration, not about provider content. So a rendered bound is provider data
+entering the ledger's diagnostics. This module and ``binary.py`` therefore differ **by
+D46's rule rather than by accident**: binary renders a number the operator configured and
+the model was never told; this module withholds numbers Metaculus supplied and the model was
+already sent.
 
 The nine declared levels **are** still named, and they are a different category: they are
 this project's own constant, transcribed from the hashed prompt, and naming them is what
@@ -210,9 +214,13 @@ def _ordering_problem(forecast: NumericForecastResponse) -> str | None:
     The pinned SDK agrees: ``NumericDistribution._check_percentiles_increasing`` raises only
     on ``value[i] > value[i + 1]``, whatever its message says. What it then does with a tie
     -- ``_check_and_update_repeating_values`` nudges each repeated value by 1e-6 -- sits
-    against this project's "nothing is clamped" rule and is filed as M1-508 against M1-503,
-    which owns the conversion where it happens. ``forecast/cdf.py`` is that conversion, and
-    it makes the difference readable on ``NumericCdf.percentiles_used``.
+    against this project's "nothing is clamped" rule. **D45 (M1-508) decided it: ties are
+    accepted and the difference is recorded.** Refusing them here would have refused 12 of
+    the first 30 bounded forecasts this project posted, every one a reply that followed the
+    prompt. ``forecast/cdf.py`` makes the difference readable on
+    ``NumericCdf.percentiles_used``, and ``submission_payload.conversion_record`` writes it
+    into the live submission artifact beside the posted CDF. A tie that would hang the
+    conversion is still refused, by ``cdf._standardization_can_converge``.
 
     **Corrected on the M1-503 branch:** this paragraph used to say the nudge happens "in
     place". It does not. The validator builds fresh ``Percentile`` objects into a fresh list

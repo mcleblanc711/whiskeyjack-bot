@@ -2145,3 +2145,68 @@ def test_the_stamped_tag_does_not_launder_a_reply_for_the_wrong_model(
     result = _generate(client, config, prompt, question=_question())
     assert result.forecast is None
     assert result.failure_code == "schema_invalid"
+
+
+# --- M1-512: an option count the configured bounds cannot serve is refused before spending ---
+
+
+def _bounded_forecast(config: AppConfig, minimum: float, maximum: float) -> AppConfig:
+    """``config`` with a narrowed probability pair, inside the spec envelope and inside the
+    prompt's declared range, so neither of those preflights is what refuses."""
+    return config.model_copy(
+        update={
+            "forecast": config.forecast.model_copy(
+                update={"min_probability": minimum, "max_probability": maximum}
+            )
+        }
+    )
+
+
+def _options(count: int) -> CanonicalMultipleChoiceQuestion:
+    return CanonicalMultipleChoiceQuestion(
+        question_id=42,
+        post_id=7,
+        title="Which X?",
+        options=[f"Option {index}" for index in range(count)],
+    )
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "count"),
+    [
+        pytest.param(0.05, 0.95, 21, id="21 options at a 0.05 floor (the row's example)"),
+        pytest.param(0.001, 0.4, 2, id="2 options under a 0.4 ceiling (the other side)"),
+    ],
+)
+def test_an_unsatisfiable_option_count_is_refused_before_any_billable_call(
+    config: AppConfig, prompt: LoadedPrompt, minimum: float, maximum: float, count: int
+) -> None:
+    """M1-512's criterion: refused before spending, naming the configured bound and the
+    count, and nothing the model wrote (there is nothing yet)."""
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(
+            client, _bounded_forecast(config, minimum, maximum), prompt, question=_options(count)
+        )
+    assert client.calls == []
+    message = str(caught.value)
+    assert f"{count} options" in message
+    assert repr(minimum) in message and repr(maximum) in message
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "count"),
+    [
+        pytest.param(0.05, 0.95, 20, id="20 options at a 0.05 floor: all at the floor sums to 1"),
+        pytest.param(0.001, 0.5, 2, id="2 options under a 0.5 ceiling: both at it sums to 1"),
+    ],
+)
+def test_a_satisfiable_option_count_at_the_edge_reaches_the_model(
+    config: AppConfig, prompt: LoadedPrompt, minimum: float, maximum: float, count: int
+) -> None:
+    """The other half, at exactly the edge: the preflight must not refuse a question some
+    reply can answer. Reaching the model is the observable -- the reply here is the
+    binary golden, so it fails the checker afterwards, and that is not what is asserted."""
+    client = _Model(good_reply())
+    _generate(client, _bounded_forecast(config, minimum, maximum), prompt, question=_options(count))
+    assert client.calls != []

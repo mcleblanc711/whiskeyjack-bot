@@ -93,6 +93,19 @@ is real but bounded — an operator who pastes a secret into a *path* has alread
 config file in plaintext. Do not redact paths in one module while the rest render them; a lone
 outlier is worse than either consistent policy.
 
+**Validated operator-supplied configuration values are the second carve-out** (D46, M1-509,
+2026-09-24), by the same reasoning. A configured bound is operator configuration, not content,
+and a diagnostic that withholds it can be unactionable: `prompts/forecaster.md` prints
+`0.001`–`0.999` to the model as a literal while `forecast.min_probability`/`max_probability` may
+narrow it, so a repair turn that does not state the real bound asks for something no model can
+aim at (M1-403). So `forecast/binary.py` and `forecast/multiple_choice.py` **render** the
+configured pair. Two limits keep this narrow. First, a config value that **failed validation**
+stays withheld: the threat boundary below classes it as untrusted, which is why the spec-envelope
+checks (reached only through `model_copy`, which skips the validators) say "configured pair
+withheld". Second, a value that arrives through a question or a provider is **not**
+configuration. `forecast/numeric.py` renders none of a question's bounds, because they are
+Metaculus payload content and the model is already sent them.
+
 ## Hard constraints
 
 - No reachable submission path until M2; `submission.enabled: false` and `dry_run: true` stay the

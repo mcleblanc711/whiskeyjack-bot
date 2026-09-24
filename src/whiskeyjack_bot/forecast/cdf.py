@@ -414,7 +414,7 @@ class NumericCdf:
     ``percentiles_used`` is what the SDK actually built from, as ``(level, value)`` pairs
     in the order it held them. It differs from the declared set when
     ``_check_and_update_repeating_values`` rewrites a repeated value -- see
-    :func:`_percentiles_used` and M1-508.
+    :func:`_percentiles_used`, and D45 (M1-508) for why that is recorded rather than refused.
     """
 
     values: tuple[float, ...]
@@ -865,11 +865,11 @@ def numeric_cdf_or_problems(
 
     adjusted = used != _declared(forecast)
     if adjusted:
-        # The count, never the values. M1-508 is the row that decides what a tie may cost;
-        # what this item owes it is that the divergence is observable rather than silent,
-        # and ``NumericCdf.percentiles_used`` is where a caller reads it. A log line naming
-        # the values would put model output into the operator's logs for a case that is not
-        # even an error.
+        # The count, never the values. D45 (M1-508) keeps ties and records the divergence:
+        # ``NumericCdf.percentiles_used`` is where a caller reads it, and
+        # ``submission_payload.conversion_record`` is how it reaches the live artifact
+        # beside the posted CDF. A log line naming the values would put model output into
+        # the operator's logs for a case that is not even an error.
         _LOGGER.info(
             "numeric CDF built from %d adjusted percentile value(s) (see M1-508)",
             sum(1 for before, after in zip(_declared(forecast), used) if before != after),

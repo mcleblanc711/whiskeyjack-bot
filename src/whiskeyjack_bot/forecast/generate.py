@@ -140,6 +140,10 @@ from whiskeyjack_bot.forecast.inputs import (
 # a client into the process. Only what this module actually uses is imported back --
 # `forecast.parse` is the real home and every other consumer names it directly, rather than
 # this module becoming a shim that quietly keeps the old coupling readable.
+from whiskeyjack_bot.forecast.multiple_choice import (
+    MultipleChoiceOutputError,
+    admits_a_distribution,
+)
 from whiskeyjack_bot.forecast.parse import (
     ForecastGeneration,
     ModelSettings,
@@ -159,6 +163,7 @@ from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.questions.model import (
     BoundedQuestion,
     CanonicalDiscreteQuestion,
+    CanonicalMultipleChoiceQuestion,
     CanonicalNumericQuestion,
     CanonicalQuestion,
     _CanonicalQuestionBase,
@@ -460,7 +465,8 @@ def generate_forecast(
         # that cannot happen. Refused here, before any billable call.
         raise ForecastGenerationError(
             "forecast.min_probability and forecast.max_probability are not within the "
-            "0.001 to 0.999 envelope the submission path requires"
+            f"{PROBABILITY_BOUND_FLOOR!r} to {PROBABILITY_BOUND_CEILING!r} envelope the "
+            "submission path requires"
         )
     prompt_bounds_problem = probability_bounds_violation(
         prompt.bounds,
@@ -488,6 +494,35 @@ def generate_forecast(
         # checked at load time is not provably the pair in this ``config``. Refused before
         # any billable call.
         raise ForecastGenerationError(prompt_bounds_problem)
+    if question.qtype == "multiple_choice" and isinstance(
+        question, CanonicalMultipleChoiceQuestion
+    ):
+        # M1-512, the same category as the preflights above: a pair of facts no reply can
+        # satisfy. Every option must be at least ``min_probability`` (and at most
+        # ``max_probability``) and the vector must sum to 1, which stops being possible
+        # past roughly ``1 / min_probability`` options -- 1000 at the committed default,
+        # 20 at 0.05. Left to the checker it would refuse every reply, and the question
+        # would cost the initial call and the repair to fail. The bound and the count are
+        # both named: the bound is validated operator configuration (D46) and the count is
+        # an ``int``, so neither can carry question or model content.
+        try:
+            admitted = admits_a_distribution(len(question.options), config.forecast)
+        except MultipleChoiceOutputError:
+            # Unreachable past the envelope check above, which refuses every config
+            # ``_require_config`` would; converted rather than trusted, so this function's
+            # contract -- every raise is a ForecastGenerationError, before any spend --
+            # does not rest on the ordering of two checks.
+            raise ForecastGenerationError(
+                "forecast.min_probability/forecast.max_probability cannot bound a "
+                "multiple-choice forecast (configured pair withheld)"
+            ) from None
+        if not admitted:
+            raise ForecastGenerationError(
+                f"the question's {len(question.options)} options cannot form a distribution "
+                f"with every probability between forecast.min_probability "
+                f"{config.forecast.min_probability!r} and forecast.max_probability "
+                f"{config.forecast.max_probability!r}; no reply could satisfy them"
+            )
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(

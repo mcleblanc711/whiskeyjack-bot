@@ -36,6 +36,16 @@ configuration and a repair turn that does not state the actual bound is one no m
 satisfy. The labels are the other case entirely: the model is *already holding the option
 list* -- ``forecast/inputs.py`` put it in the request under ``options``, which is where
 these labels came from -- so naming them back buys nothing and would echo model output.
+**No option-count cap, on purpose (D47, M1-511).** ``submission_live._MAX_CATEGORIES`` (64)
+refuses a larger payload at post time, and it is a serialization budget for that module's
+verification snapshot, not a forecast rule: capping here would refuse to forecast a question
+Metaculus accepted. The one count this module does refuse before spending is one no reply
+could satisfy (:func:`admits_a_distribution`, M1-512).
+
+The rendering of the configured pair is the carve-out CLAUDE.md names for *validated
+operator-supplied configuration values* (D46, M1-509), shared with ``forecast/binary.py``;
+the envelope refusal in ``_require_config`` withholds the pair because it fires only for a
+config that bypassed validation, which that decision leaves untrusted.
 Each rule contributes **at most one problem**, never one per offending label, because a
 per-label list would leak how many were wrong through a channel no leak test that reads
 only message text would see (M1-302's rule that a channel is a channel, and
@@ -64,6 +74,7 @@ hand-maintained mirror of its invariants -- see :func:`_require_question`.
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 
 from whiskeyjack_bot.config import (
     PROBABILITY_BOUND_CEILING,
@@ -155,7 +166,8 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
         raise MultipleChoiceOutputError(
             [
                 "forecast_config: min_probability and max_probability must lie within "
-                "0.001 and 0.999 inclusive (configured pair withheld)"
+                f"{PROBABILITY_BOUND_FLOOR!r} and {PROBABILITY_BOUND_CEILING!r} inclusive "
+                "(configured pair withheld)"
             ]
         )
     if not low < high:
@@ -253,6 +265,55 @@ def multiple_choice_output_problems(
             "(observed sum withheld)"
         )
     return problems
+
+
+def admits_a_distribution(option_count: int, forecast_config: ForecastConfig) -> bool:
+    """Whether *any* reply over ``option_count`` options can pass the bounds and sum rules.
+
+    M1-512. Every option must be at least ``min_probability`` and at most
+    ``max_probability``, and the vector must sum to 1 within ``_SUM_TOLERANCE``; those are
+    jointly satisfiable only while roughly ``n * min <= 1 <= n * max``. Past that, every
+    reply is refused, the repair turn asks for something no model can produce, and the
+    question costs two billed calls to fail -- the class ``_require_config`` refuses for an
+    inverted pair, one level up. ``forecast.generate`` asks this before spending anything.
+
+    **Decided by running this module's own rules on one witness, not by restating them.**
+    The witness is the uniform vector clamped into ``[min, max]``. When ``1/n`` is inside
+    the bounds it is a distribution, so the answer is yes (and the checker agrees on the
+    floats: ``n * fl(1/n)`` is within ``n * 2**-53`` of 1, and ``n <= 1/min <= 1000``). When ``1/n`` is below ``min``,
+    all-``min`` is the smallest vector the bounds rule admits and its exact sum is the
+    smallest any admitted vector can have (``math.fsum`` is correctly rounded, so it is
+    monotone in its inputs); if *it* sums too high, everything does. Above ``max``,
+    symmetrically. So the witness passing the same comparison the checker makes is exactly
+    the condition, including at the tolerance's edge, with no tolerance arithmetic
+    transcribed here to drift from the checker's.
+
+    The witness's sum is taken as the exact product ``n * witness`` rounded once, which is
+    what ``math.fsum`` over ``n`` copies returns (it is the correctly rounded exact sum) --
+    without iterating ``n`` times, so an unbounded count cannot hang this. A product past 2
+    is refused before the rounding, where a float could overflow.
+
+    Both sides, though M1-512's criterion names only ``min_probability``: a narrowed
+    ``max_probability`` (0.4 with two options) is the same class, and the stricter reading
+    refuses it too.
+
+    Raises :class:`MultipleChoiceOutputError` for a caller mistake -- a count that is not an
+    ``int`` of at least 2 (``CanonicalMultipleChoiceQuestion`` refuses fewer than two
+    options), or a config ``_require_config`` refuses.
+    """
+    if type(option_count) is not int or option_count < 2:
+        raise MultipleChoiceOutputError(["question: option count must be an int of at least 2"])
+    low, high = _require_config(forecast_config)
+    # Exact throughout: ``1.0 / option_count`` raises ``OverflowError`` for an int past
+    # the float range, and a count is a plain ``int`` with no upper bound here.
+    inverse = Fraction(1, option_count)
+    if Fraction(low) <= inverse <= Fraction(high):
+        return True
+    witness = low if inverse < Fraction(low) else high
+    exact = option_count * Fraction(witness)
+    if exact > 2:
+        return False
+    return not abs(float(exact) - 1.0) > _SUM_TOLERANCE
 
 
 def validate_multiple_choice_output(

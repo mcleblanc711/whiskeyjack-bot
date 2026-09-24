@@ -2283,3 +2283,39 @@ def test_the_unrecorded_alert_also_fires_on_the_spending_hold_exit(
     held = poll(case)
     assert held["spending_held"] and held["unrecorded_posts"] == 1
     assert len(pushes.matching("missing from the ledger")) == 1
+
+
+def test_the_poll_passes_the_derived_conversion_record_to_the_post(
+    case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1-508 (D45): the worker hands ``post_approved_forecast`` exactly the conversion
+    record the payload derivation produced, which is what lands beside the posted CDF.
+
+    The harness question is binary, which has no conversion, so the derivation's result is
+    replaced with a sentinel and the real post is called without it; only the wiring is
+    under test here. ``tests/unit/test_submission_live.py`` covers what is written.
+    """
+    import dataclasses
+
+    import whiskeyjack_bot.tournament as worker
+
+    sentinel = {"sentinel": "m1-508"}
+    real_derive = worker.authorized_payload
+    monkeypatch.setattr(
+        worker,
+        "authorized_payload",
+        lambda record, *, calibration: dataclasses.replace(
+            real_derive(record, calibration=calibration), conversion=sentinel
+        ),
+    )
+    seen: list[Any] = []
+    real_post = worker.post_approved_forecast
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("conversion", "argument not passed"))
+        return real_post(*args, **{**kwargs, "conversion": None})
+
+    monkeypatch.setattr(worker, "post_approved_forecast", spy)
+    result = poll(case)
+    assert result["forecast_confirmed"] == 1
+    assert seen == [sentinel]

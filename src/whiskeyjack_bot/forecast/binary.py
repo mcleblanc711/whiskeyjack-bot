@@ -40,6 +40,13 @@ turn that does not state the *actual* bound is one **no model can satisfy**, and
 error nobody can act on is its own failure mode. Nothing else in this module renders a
 value.
 
+**That category is now written down (D46, M1-509).** CLAUDE.md names *validated
+operator-supplied configuration values* as a carve-out alongside paths, citing this module
+and ``forecast/multiple_choice.py``. The same decision explains the one place here that
+withholds the pair: ``_require_config``'s envelope refusal fires only for a config that
+bypassed validation (``model_copy``), and a config value that failed validation is
+untrusted under CLAUDE.md's threat boundary, so it is not rendered.
+
 This module owns :class:`BinaryOutputError`, and it **subclasses**
 :class:`ForecastSchemaError`. The first cut raised the parent directly, reasoning that
 the condition -- *this model response is not acceptable* -- already belonged to that
@@ -146,7 +153,8 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
         raise BinaryOutputError(
             [
                 "forecast_config: min_probability and max_probability must lie within "
-                "0.001 and 0.999 inclusive (configured pair withheld)"
+                f"{PROBABILITY_BOUND_FLOOR!r} and {PROBABILITY_BOUND_CEILING!r} inclusive "
+                "(configured pair withheld)"
             ]
         )
     if not low < high:

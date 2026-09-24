@@ -113,7 +113,12 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast, get_args
 
 from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
-from whiskeyjack_bot.config import AppConfig, SupportedQuestionType
+from whiskeyjack_bot.config import (
+    PROBABILITY_BOUND_CEILING,
+    PROBABILITY_BOUND_FLOOR,
+    AppConfig,
+    SupportedQuestionType,
+)
 from whiskeyjack_bot.forecast.record import ForecastRecordError
 from whiskeyjack_bot.forecast.store import read_forecast_record
 from whiskeyjack_bot.lifecycle import (
@@ -160,10 +165,12 @@ _LIVE_ATTEMPT_PREFIX = LIVE_ATTEMPT_TAG
 # accept: after a post has happened, a value the ledger refuses is a live post with no row.
 
 # Metaculus's own bound on a binary forecast, enforced by the SDK's public method as a bare
-# `ValueError`. Restated here so the refusal happens *before* the post and arrives as this
-# module's error type rather than as an unhandled exception from inside the dependency.
-_MIN_PROBABILITY = 0.001
-_MAX_PROBABILITY = 0.999
+# `ValueError`, is checked here so the refusal happens *before* the post and arrives as this
+# module's error type rather than as an unhandled exception from inside the dependency. The
+# two ends are `config.PROBABILITY_BOUND_FLOOR`/`CEILING`, not a copy of them (M1-513): this
+# module declared its own `0.001`/`0.999` until then, so the forecast side and the post side
+# were two sources for one spec number and nothing failed if they drifted.
+# `tests/unit/test_probability_envelope.py` fails if a second declaration appears in `src/`.
 
 # How far two floats may differ and still count as the same forecast. Small enough that it
 # admits only representation noise, not a different forecast. Whether the platform
@@ -180,6 +187,16 @@ _CATEGORY_SUM_TOLERANCE = 1e-6
 # limit: it is what keeps the verification snapshot inside `MAX_BODY_LENGTH` without a second
 # serialization shape, and it refuses a caller mistake (a "distribution" over thousands of
 # categories) before the post. Metaculus multiple-choice questions carry a few dozen.
+#
+# **Deliberately not a generation rule (D47, M1-511).** `forecast/multiple_choice.py` has no
+# such cap, so a 65-option question is forecast, recorded and approved, and refused here.
+# That asymmetry is decided rather than accidental: this number is a serialization budget
+# this module chose, and a cap at generation would refuse to *forecast* a question Metaculus
+# accepted -- losing the attribution record for a budget that belongs to the post path.
+# What generation does refuse before spending is an option count no reply could satisfy at
+# all (M1-512, `multiple_choice.admits_a_distribution`), which is a fact about the rules
+# rather than about this module's snapshot. Pinned by
+# `tests/unit/test_forecast_multiple_choice.py::test_d47_...`.
 _MAX_CATEGORIES = 64
 
 # The longest option label this module will accept, in characters. Two things rest on it,
@@ -496,6 +513,36 @@ def plan_from_payload(payload: Mapping[str, object], *, expected_cdf_points: int
     )
 
 
+def _conversion_context_or_refuse(
+    conversion: object, question_type: str
+) -> dict[str, object] | None:
+    """The M1-508 conversion record as plain JSON data, or a refusal before the post.
+
+    Rendered here, once, through the payload renderer, so the value that reaches the
+    artifact is exactly JSON and cannot fail to render after the post -- where a failure
+    would cost the artifact (M1-312) and stop the worker. A record for a type with no
+    conversion is a caller mistake, not something to write down. No message names a value.
+    """
+    if conversion is None:
+        return None
+    if question_type not in ("numeric", "discrete"):
+        raise LiveSubmissionError(
+            "a conversion record was supplied for a forecast with no CDF conversion; "
+            "nothing was posted"
+        )
+    if not isinstance(conversion, Mapping):
+        raise LiveSubmissionError("the conversion record must be a mapping; nothing was posted")
+    try:
+        rendered = canonical_payload_json(conversion)
+    except GatewayError:
+        raise LiveSubmissionError(
+            "the conversion record is not JSON this module can write (detail withheld: "
+            "it can echo percentile values); nothing was posted"
+        ) from None
+    # ``canonical_payload_json`` accepts only a JSON object, so this is one.
+    return cast(dict[str, object], json.loads(rendered))
+
+
 def _canonical_or_refuse(payload: Mapping[str, object]) -> str:
     """``canonical_payload_json``, with its refusal converted to this module's type."""
     try:
@@ -591,11 +638,13 @@ def _require_probability(value: object, field: str) -> float:
         raise LiveSubmissionError(f"payload.{field} must be a number (offending value withheld)")
     if not math.isfinite(number):
         raise LiveSubmissionError(f"payload.{field} must be a finite number")
-    if not _MIN_PROBABILITY <= number <= _MAX_PROBABILITY:
-        # The bounds are this module's own literals and the platform's; naming them is what
-        # makes the refusal fixable, and neither is payload content.
+    if not PROBABILITY_BOUND_FLOOR <= number <= PROBABILITY_BOUND_CEILING:
+        # The bounds are the spec's and the platform's; naming them is what makes the
+        # refusal fixable, and neither is payload content. Rendered from the constants, so
+        # the message cannot state an envelope the check does not enforce (M1-513).
         raise LiveSubmissionError(
-            f"payload.{field} must be between {_MIN_PROBABILITY} and {_MAX_PROBABILITY}, "
+            f"payload.{field} must be between {PROBABILITY_BOUND_FLOOR!r} and "
+            f"{PROBABILITY_BOUND_CEILING!r}, "
             "which is what Metaculus accepts (offending value withheld)"
         )
     return number
@@ -1834,8 +1883,18 @@ def post_approved_forecast(
     occurred_at: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
+    conversion: Mapping[str, object] | None = None,
 ) -> LiveSubmissionRecord:
     """Post one approved forecast, verify it, and record it. **The only door to a live post.**
+
+    ``conversion`` is ``submission_payload.AuthorizedPayload.conversion`` -- for a numeric
+    or discrete payload, the percentile values the pinned SDK actually built the posted CDF
+    from (M1-508, D45). It is written into the live artifact's ``context`` as
+    ``numeric_conversion``, beside the posted array, and it is **not** part of what is
+    posted, digested or approved. It is plain data because this module must not import the
+    conversion (see the module docstring); it is checked, and rendered once, *before* the
+    post, so an unrenderable value is a refusal while nothing is spent rather than an
+    artifact failure after something was.
 
     Every gate is in front of the post and every one of them refuses without spending
     anything:
@@ -1935,6 +1994,8 @@ def post_approved_forecast(
             f"{record.question_type}; nothing was posted"
         )
 
+    conversion_context = _conversion_context_or_refuse(conversion, record.question_type)
+
     before_post = prepare_live_policy(conn, config, poster, record, payload, digest)
 
     gateway = MetaculusSubmissionGateway(
@@ -1994,6 +2055,9 @@ def post_approved_forecast(
             "tournament_id": record.tournament_id,
             "forecast_version": record.forecast_version,
             "post_id": record.post_id,
+            # M1-508/D45. Present only when the caller derived the payload here; its
+            # absence means "not recorded", never "not adjusted".
+            **({} if conversion_context is None else {"numeric_conversion": conversion_context}),
         },
     )
     receipt = replace(outcome.receipt, artifact_path=artifact_path)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -756,11 +756,16 @@ def _run_submit(args: argparse.Namespace) -> int:
         )
         print(f"status:    {summary.status}")
         print(f"hash:      {summary.forecast_sha256 or '(none stored)'}")
+        # M1-508/D45: what a numeric CDF was built from, recorded beside the post. Known
+        # only for a payload derived here; a supplied file carries none, and the artifact
+        # then has no record rather than a claim that nothing was adjusted.
+        conversion: Mapping[str, object] | None = None
         if supplied is None:
             derived = _derive_payload(connection, args.record_id, config)
             if derived is None:
                 return EXIT_REFUSED
             payload, digest, source = derived.payload, derived.sha256, "derived"
+            conversion = derived.conversion
         else:
             payload = supplied
             source = "from file"
@@ -793,6 +798,7 @@ def _run_submit(args: argparse.Namespace) -> int:
                 poster=poster,
                 config=config,
                 occurred_at=datetime.now(tz=timezone.utc),
+                conversion=conversion,
             )
         except LiveSubmissionError as exc:
             print(f"refused: {exc}")

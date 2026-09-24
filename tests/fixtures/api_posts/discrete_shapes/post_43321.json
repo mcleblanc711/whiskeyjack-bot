@@ -1,0 +1,67 @@
+{
+  "id": 43321,
+  "published_at": "2026-04-27T14:50:00Z",
+  "nr_forecasters": 103,
+  "forecasts_count": 251,
+  "projects": {
+    "tournament": [],
+    "default_project": {
+      "id": 32977,
+      "slug": "bot-testing-area",
+      "name": "Bot testing area"
+    }
+  },
+  "question": {
+    "id": 43322,
+    "type": "discrete",
+    "title": "How many of these 15 top US executive branch officials will be out before 2027?",
+    "description": "[stripped for the M1-206 fixture: not read by the cdf_size derivation]",
+    "resolution_criteria": "This question resolves as the number of the following 15 officials who leave their position, formally announce they will leave their position, or whose agency announces that they have left or will leave their position, before January 1, 2027:\r\n\r\n| Role                                                           | Incumbent             |\r\n| -------------------------------------------------------------- | --------------------- |\r\n| Secretary of State and National Security Advisor               | Marco Rubio           |\r\n| Secretary of the Treasury                                      | Scott Bessent         |\r\n| Secretary of Defense                                           | Pete Hegseth          |\r\n| Attorney General                                               | Pam Bondi             |\r\n| Secretary of Health & Human Services                           | Robert F. Kennedy Jr. |\r\n| Secretary of Commerce                                          | Howard Lutnick        |\r\n| Secretary of Homeland Security                                 | Kristi Noem           |\r\n| Director of National Intelligence                              | Tulsi Gabbard         |\r\n| Director of the Central Intelligence Agency                    | John Ratcliffe        |\r\n| OMB Director                                                   | Russell Vought        |\r\n| White House Chief of Staff                                     | Susie Wiles           |\r\n| DOJ (FBI) Director                                             | Kash Patel            |\r\n| Border Czar                                                    | Tom Homan             |\r\n| Senior Counselor for Trade/Manufacturing                       | Peter Navarro         |\r\n| Deputy Chief of Staff for Policy and Homeland Security Advisor | Stephen Miller        |",
+    "fine_print": "[stripped for the M1-206 fixture: not read by the cdf_size derivation]",
+    "status": "open",
+    "open_time": "2026-04-27T14:56:00Z",
+    "scheduled_close_time": "2027-01-01T00:00:00Z",
+    "scheduled_resolve_time": "2027-01-01T18:00:00Z",
+    "cp_reveal_time": "2026-04-27T14:56:00Z",
+    "actual_resolve_time": null,
+    "resolution": null,
+    "include_bots_in_aggregates": true,
+    "question_weight": 1,
+    "label": "",
+    "unit": "Officials",
+    "open_upper_bound": false,
+    "open_lower_bound": false,
+    "scaling": {
+      "continuous_range": [
+        -0.5,
+        0.5,
+        1.5,
+        2.5,
+        3.5,
+        4.5,
+        5.5,
+        6.5,
+        7.5,
+        8.5,
+        9.5,
+        10.5,
+        11.5,
+        12.5,
+        13.5,
+        14.5,
+        15.5
+      ],
+      "inbound_outcome_count": 16,
+      "nominal_max": 15,
+      "nominal_min": 0,
+      "open_lower_bound": false,
+      "open_upper_bound": false,
+      "range_max": 15.5,
+      "range_min": -0.5,
+      "zero_point": null
+    },
+    "my_forecasts": {
+      "history": null
+    }
+  }
+}

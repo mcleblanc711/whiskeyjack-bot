@@ -72,7 +72,7 @@ from dataclasses import dataclass
 from typing import Literal, Mapping
 
 from whiskeyjack_bot.config import NumericCalibrationConfig, SupportedQuestionType
-from whiskeyjack_bot.forecast.cdf import build_numeric_cdf, expected_cdf_points_for
+from whiskeyjack_bot.forecast.cdf import NumericCdf, build_numeric_cdf, expected_cdf_points_for
 from whiskeyjack_bot.forecast.record import ForecastRecord
 from whiskeyjack_bot.forecast.schema import (
     BinaryForecastResponse,
@@ -128,21 +128,34 @@ def build_submission_payload(
     conversion runs against the question the forecast was *made* against rather than
     against whatever a snapshot says today.
     """
+    payload, _ = _built(record, calibration)
+    return payload
+
+
+def _built(
+    record: ForecastRecord, calibration: NumericCalibrationConfig
+) -> tuple[dict[str, object], NumericCdf | None]:
+    """The payload, and the conversion it came from for a bounded type (M1-508).
+
+    One conversion serves both, so the record of what the SDK built the array from can
+    never describe a different run from the array itself.
+    """
     if type(calibration) is not NumericCalibrationConfig:
         raise PayloadBuildError("calibration must be a NumericCalibrationConfig")
     if type(record) is not ForecastRecord:
         raise PayloadBuildError("record must be a stored ForecastRecord")
     question_type = record.question_type
+    cdf: NumericCdf | None = None
     if question_type == "binary":
         payload = _binary_payload(record)
     elif question_type == "multiple_choice":
         payload = _multiple_choice_payload(record)
     elif question_type == "numeric":
-        payload = _bounded_payload(
+        payload, cdf = _bounded_payload(
             record, calibration, question_type="numeric", question_cls=CanonicalNumericQuestion
         )
     elif question_type == "discrete":
-        payload = _bounded_payload(
+        payload, cdf = _bounded_payload(
             record, calibration, question_type="discrete", question_cls=CanonicalDiscreteQuestion
         )
     else:  # pragma: no cover - `SupportedQuestionType` is closed and the record validates it
@@ -150,7 +163,29 @@ def build_submission_payload(
     _require_postable(
         payload, calibration, expected_cdf_points=_expected_points(record, calibration)
     )
-    return payload
+    return payload, cdf
+
+
+def conversion_record(cdf: NumericCdf) -> dict[str, object]:
+    """What the submitted CDF was built from, as plain JSON data (M1-508, D45).
+
+    ``forecasting-tools`` rewrites a repeated percentile value on construction -- by
+    ``1e-6`` inside the bounds, ``1e-10`` at or beyond one -- so the array a numeric or
+    discrete post carries can be built from values the model did not return and the record
+    does not store. D45 keeps ties (12 of the first 30 bounded forecasts posted had one;
+    refusing them would have refused those posts) and records the difference instead: this
+    is written into the live submission artifact beside the posted ``continuous_cdf``, so
+    the two are read together.
+
+    ``adjusted`` is written on every bounded post, ``false`` included, so its absence means
+    only that the payload was not derived here (``submit --payload-file``), never that
+    nothing was adjusted. The values are the SDK's own, unrounded; an artifact is a content
+    store and the declared values beside them are already in the ledger.
+    """
+    return {
+        "adjusted": cdf.adjusted,
+        "percentiles_used": [[level, value] for level, value in cdf.percentiles_used],
+    }
 
 
 @dataclass(frozen=True)
@@ -169,6 +204,11 @@ class AuthorizedPayload:
     payload: dict[str, object]
     canonical: str
     sha256: str
+    # M1-508/D45: for a bounded type, :func:`conversion_record` of the conversion that built
+    # ``payload``; ``None`` for binary and multiple choice. Deliberately **outside**
+    # ``canonical`` and ``sha256``: it describes how the posted bytes were made and is not
+    # part of them, so an approval binds exactly what it bound before this field existed.
+    conversion: Mapping[str, object] | None = None
 
 
 def authorized_payload(
@@ -180,12 +220,13 @@ def authorized_payload(
     and ``submit`` (which posts ``payload`` when no ``--payload-file`` is given), so the two
     commands cannot disagree about what a record authorizes.
     """
-    payload = build_submission_payload(record, calibration=calibration)
+    payload, cdf = _built(record, calibration)
     canonical = _render(payload)
     return AuthorizedPayload(
         payload=payload,
         canonical=canonical,
         sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        conversion=None if cdf is None else conversion_record(cdf),
     )
 
 
@@ -255,8 +296,8 @@ def _bounded_payload(
     *,
     question_type: Literal["numeric", "discrete"],
     question_cls: type[CanonicalNumericQuestion] | type[CanonicalDiscreteQuestion],
-) -> dict[str, object]:
-    """The CDF payload for either bounded type (M1-205).
+) -> tuple[dict[str, object], NumericCdf]:
+    """The CDF payload for either bounded type (M1-205), and the conversion behind it.
 
     One function rather than two: the two differ only in which canonical class the stored
     question must exactly be and which literal goes on the wire. The array itself is built
@@ -295,7 +336,7 @@ def _bounded_payload(
     return {
         "question_type": question_type,
         "continuous_cdf": list(cdf.values),
-    }
+    }, cdf
 
 
 # --- shared refusals and helpers ------------------------------------------------------
