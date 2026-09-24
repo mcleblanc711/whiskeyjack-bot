@@ -16,6 +16,12 @@ they stand and rewrites only what the SDK decides -- each case's ``cdf`` and
 ``point_count``, plus ``generated_with.version``. Adding a case is therefore a fixture edit
 followed by a run of this script, and the diff a run produces is exactly the drift.
 
+The script is family-blind by design (M1-206): a ``discrete`` case's length comes from the
+``cdf_size`` in its own hand-authored ``question`` block, exactly as a ``numeric`` case's
+does, so nothing here needed to learn the difference. What ties that ``cdf_size`` to the
+Metaculus payload it was read from is a test, not this script -- a generator that derived
+it would be checking the derivation against itself.
+
 ``tests/unit/test_forecast_cdf_golden.py`` deliberately does **not** import this module. It
 reads the JSON and calls the SDK itself, so the assertion is a live call against a frozen
 record rather than a generator checked against itself.
@@ -83,8 +89,9 @@ def _rebuilt(golden: dict[str, Any]) -> dict[str, Any]:
 def _wrapped(values: list[float], *, per_row: int, indent: int) -> str:
     """One frozen array as a JSON list, ``per_row`` values to a line.
 
-    ``json.dumps(..., indent=2)`` puts each of the 201 values on its own line, which makes
-    the seven cases an 1,815-line file (506 as written) -- and CLAUDE.md keeps review-request
+    ``json.dumps(..., indent=2)`` puts each value on its own line, which made T-904's seven
+    201-point cases an 1,815-line file (506 as written; the three discrete cases M1-206 added
+    carry 99 more values) -- and CLAUDE.md keeps review-request
     diffs embedded, so it would dominate every request this fixture appears in. Wrapping keeps
     the diff readable *and* keeps it pointing at a range of indices, which is the thing a
     drift diff is read for: a whole-array-on-one-line spelling would report "this case

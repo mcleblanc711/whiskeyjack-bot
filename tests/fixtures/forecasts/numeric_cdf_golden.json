@@ -1,5 +1,5 @@
 {
-  "note": "T-904. What forecasting-tools actually emits from NumericDistribution.get_cdf() for a set of edge-case inputs, frozen. Every other CDF assertion in this repository is written against our own config and our own guards, so a package upgrade that changed these numbers without changing their shape would pass all of them; this file is the only record that could notice. Compared with exact float equality and no tolerance: _standardize_cdf ends with np.round(cdf, 10), and every value below sits at least 1.4e3 ulps from a rounding boundary, so equality is a stable contract rather than a libm lottery. 'cdf' holds the cumulative heights (point.percentile), which is what the wire takes. The case inputs are hand-authored and each one is drawn from a value already in the tree; 'cdf', 'point_count' and generated_with.version are written by scripts/regenerate_cdf_golden.py and must never be hand-edited. Regenerate only for a deliberate pin move, and read the array diff before committing it.",
+  "note": "T-904. What forecasting-tools actually emits from NumericDistribution.get_cdf() for a set of edge-case inputs, frozen. Every other CDF assertion in this repository is written against our own config and our own guards, so a package upgrade that changed these numbers without changing their shape would pass all of them; this file is the only record that could notice. Compared with exact float equality and no tolerance: _standardize_cdf ends with np.round(cdf, 10), and every value below sits at least 905 ulps from a rounding boundary (measured in ulps of the value numpy rounds, x * 1e10), so equality is a stable contract rather than a libm lottery. 'cdf' holds the cumulative heights (point.percentile), which is what the wire takes. The case inputs are hand-authored and each one is drawn from a value already in the tree. Two families: 'numeric' (T-904, 201 points) and 'discrete' (M1-206, the question's own inbound_outcome_count + 1 points; each names the stripped Metaculus payload in tests/fixtures it was taken from, which the tests drive through the SDK's own parse); 'cdf', 'point_count' and generated_with.version are written by scripts/regenerate_cdf_golden.py and must never be hand-edited. Regenerate only for a deliberate pin move, and read the array diff before committing it.",
   "generated_with": {
     "package": "forecasting-tools",
     "version": "0.2.92"
@@ -8,6 +8,7 @@
     {
       "name": "interior_closed_both",
       "why": "The ordinary interior distribution: prompts/forecaster.md's own example on a closed 0-100 question. Both endpoints are pinned, so this is the case whose first and last values the bound rules are strictest about.",
+      "family": "numeric",
       "question": {
         "lower_bound": 0.0,
         "upper_bound": 100.0,
@@ -79,6 +80,7 @@
     {
       "name": "interior_open_lower",
       "why": "The same values with the lower bound open. The SDK must now leave mass below the bound, so cdf[0] is strictly positive rather than 0.0.",
+      "family": "numeric",
       "question": {
         "lower_bound": 0.0,
         "upper_bound": 100.0,
@@ -150,6 +152,7 @@
     {
       "name": "interior_open_upper",
       "why": "The same values with the upper bound open: mass above the bound, so cdf[-1] is strictly below 1.0.",
+      "family": "numeric",
       "question": {
         "lower_bound": 0.0,
         "upper_bound": 100.0,
@@ -221,6 +224,7 @@
     {
       "name": "interior_open_both",
       "why": "Both bounds open. The fourth corner of the flag matrix, and the one where _standardize_cdf's offset branch differs from all three others.",
+      "family": "numeric",
       "question": {
         "lower_bound": 0.0,
         "upper_bound": 100.0,
@@ -292,6 +296,7 @@
     {
       "name": "concentrated_saturating",
       "why": "Nine values inside a fifth of a unit on a 0-100 question, from tests/unit/test_forecast_cdf.py's saturation case. The SDK's standardization caps the inbound PMF at 0.2 * 0.95, so the array comes back at that cap. This is the frozen expression of why the committed max_adjacent_pmf: 0.2 is satisfiable at all.",
+      "family": "numeric",
       "question": {
         "lower_bound": 0.0,
         "upper_bound": 100.0,
@@ -363,6 +368,7 @@
     {
       "name": "tie_inside_bounds",
       "why": "A repeated value strictly inside the bounds. strict_validation rewrites it before any array exists, and the rewrite is visible here as a step roughly twice the untied case's -- the emitted array, not just percentiles_used.",
+      "family": "numeric",
       "question": {
         "lower_bound": 0.0,
         "upper_bound": 100.0,
@@ -434,6 +440,7 @@
     {
       "name": "log_scaled",
       "why": "A log-scaled question: zero_point below a 100-10000 range, values spanning three orders of magnitude. The only case whose path runs np.log, and the branch an upgrade is most likely to move -- forecasting-tools' own source carries two TODOs about handling log-scaled questions better.",
+      "family": "numeric",
       "question": {
         "lower_bound": 100.0,
         "upper_bound": 10000.0,
@@ -501,6 +508,123 @@
         0.9946421687, 0.9957137349, 0.9967853012, 0.9978568675, 0.9989284337,
         1.0
       ]
+    },
+    {
+      "name": "discrete_17_closed_both",
+      "why": "Metaculus post 43321: 16 outcomes on a -0.5..15.5 half-integer grid, so 17 points, both bounds closed, so both endpoints are pinned exactly (one of the 13 posted discrete forecasts, question 45944, had this flag pair on a 33-point grid). The coarsest real grid in the tree: the platform's scaled step cap is 0.2 * 200 / 16 = 2.5, clamped to 1.0, so a per-outcome step above the numeric 0.2 is legitimate here and the flat committed cap is not the rule.",
+      "family": "discrete",
+      "source_payload": "api_posts/discrete_shapes/post_43321.json",
+      "question": {
+        "lower_bound": -0.5,
+        "upper_bound": 15.5,
+        "open_lower_bound": false,
+        "open_upper_bound": false,
+        "zero_point": null,
+        "cdf_size": 17
+      },
+      "distribution": {
+        "standardize_cdf": true,
+        "strict_validation": true
+      },
+      "percentiles": [
+        {"percentile": 0.01, "value": 0.0},
+        {"percentile": 0.05, "value": 1.0},
+        {"percentile": 0.1, "value": 2.0},
+        {"percentile": 0.25, "value": 4.0},
+        {"percentile": 0.5, "value": 6.0},
+        {"percentile": 0.75, "value": 8.0},
+        {"percentile": 0.9, "value": 10.0},
+        {"percentile": 0.95, "value": 12.0},
+        {"percentile": 0.99, "value": 14.0}
+      ],
+      "cdf": [
+        0.0, 0.030325, 0.0755, 0.138, 0.212875,
+        0.3125, 0.436875, 0.56125, 0.685625, 0.78525,
+        0.860125, 0.91025, 0.935625, 0.958525, 0.97895,
+        0.992775, 1.0
+      ],
+      "point_count": 17
+    },
+    {
+      "name": "discrete_72_open_both",
+      "why": "Metaculus post 45517: 71 outcomes on a 0.095..0.805 grid of non-integer spacing 0.01, so 72 points, both bounds open. The finest real discrete grid in the tree; the SDK's scaled step cap is 0.2 * 200 / 71 (about 0.563).",
+      "family": "discrete",
+      "source_payload": "api_posts/discrete_shapes/post_45517.json",
+      "question": {
+        "lower_bound": 0.095,
+        "upper_bound": 0.805,
+        "open_lower_bound": true,
+        "open_upper_bound": true,
+        "zero_point": null,
+        "cdf_size": 72
+      },
+      "distribution": {
+        "standardize_cdf": true,
+        "strict_validation": true
+      },
+      "percentiles": [
+        {"percentile": 0.01, "value": 0.15},
+        {"percentile": 0.05, "value": 0.2},
+        {"percentile": 0.1, "value": 0.25},
+        {"percentile": 0.25, "value": 0.33},
+        {"percentile": 0.5, "value": 0.42},
+        {"percentile": 0.75, "value": 0.5},
+        {"percentile": 0.9, "value": 0.58},
+        {"percentile": 0.95, "value": 0.63},
+        {"percentile": 0.99, "value": 0.72}
+      ],
+      "cdf": [
+        0.00594, 0.0069790269, 0.0080180538, 0.0090570807, 0.0100961076,
+        0.0111351344, 0.0156770704, 0.0237219155, 0.0317667606, 0.0398116056,
+        0.0478564507, 0.0568892958, 0.0669101408, 0.0769309859, 0.086951831,
+        0.0969726761, 0.1113160211, 0.1299818662, 0.1486477113, 0.1673135563,
+        0.1859794014, 0.2046452465, 0.2233110915, 0.2419769366, 0.2651025039,
+        0.2926877934, 0.3202730829, 0.3478583725, 0.375443662, 0.4030289515,
+        0.430614241, 0.4581995305, 0.48578482, 0.5150853873, 0.5461012324,
+        0.5771170775, 0.6081329225, 0.6391487676, 0.6701646127, 0.7011804577,
+        0.7321963028, 0.7570371479, 0.775702993, 0.794368838, 0.8130346831,
+        0.8317005282, 0.8503663732, 0.8690322183, 0.8876980634, 0.9020414085,
+        0.9120622535, 0.9220830986, 0.9321039437, 0.9421247887, 0.9494011894,
+        0.9539331455, 0.9584651017, 0.9629970579, 0.9675290141, 0.9720609703,
+        0.9765929264, 0.9811248826, 0.9856568388, 0.9882838277, 0.9890058492,
+        0.9897278708, 0.9904498923, 0.9911719138, 0.9918939354, 0.9926159569,
+        0.9933379785, 0.99406
+      ],
+      "point_count": 72
+    },
+    {
+      "name": "discrete_10_closed_lower_open_upper_posted",
+      "why": "Metaculus post 45775 (question 45960, MiniBench 33125): 9 outcomes on 49.5..58.5, so 10 points, lower closed and upper open -- the shape of 8 of the 13 discrete forecasts this project has posted. The nine values are the ones that live forecast declared, including a three-way tie at 50 (the M1-508 rewrite) and two values past the open upper bound; the frozen array equalled the posted continuous_cdf when this case was written (docs/M1-NOTES.md, M1-206).",
+      "family": "discrete",
+      "source_payload": "api_posts/discrete_shapes/post_45775.json",
+      "question": {
+        "lower_bound": 49.5,
+        "upper_bound": 58.5,
+        "open_lower_bound": false,
+        "open_upper_bound": true,
+        "zero_point": null,
+        "cdf_size": 10
+      },
+      "distribution": {
+        "standardize_cdf": true,
+        "strict_validation": true
+      },
+      "percentiles": [
+        {"percentile": 0.01, "value": 50.0},
+        {"percentile": 0.05, "value": 50.0},
+        {"percentile": 0.1, "value": 50.0},
+        {"percentile": 0.25, "value": 51.0},
+        {"percentile": 0.5, "value": 53.0},
+        {"percentile": 0.75, "value": 55.0},
+        {"percentile": 0.9, "value": 58.0},
+        {"percentile": 0.95, "value": 61.0},
+        {"percentile": 0.99, "value": 68.0}
+      ],
+      "cdf": [
+        0.0, 0.1741861779, 0.3112847222, 0.4360208333, 0.5607569444,
+        0.6854930556, 0.7731416667, 0.8237027778, 0.8742638889, 0.9083416667
+      ],
+      "point_count": 10
     }
   ]
 }
