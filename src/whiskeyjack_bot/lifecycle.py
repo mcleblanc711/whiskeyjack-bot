@@ -41,10 +41,13 @@ The module deliberately does **not** ship:
 
 - ``approve`` / ``reject`` CLI commands -- M2-701 owns those, and adding them here would
   put a reachable approval path in the tree ahead of its item;
-- a platform score writer -- M4-803 owns that. The resolution writer landed with M4-801
+- a score computed for a numeric or discrete question -- D30 forbids a local replica of the
+  platform's continuous scores. The resolution writer landed with M4-801
   (:func:`record_resolution_observation`, whose rows ``014_resolution_ingestion.sql``
-  constrains) and the local Brier/log writer with M4-802 (:func:`record_local_scores`,
-  whose rows ``015_local_score_events.sql`` constrains);
+  constrains), the local Brier/log writer with M4-802 (:func:`record_local_scores`), and the
+  platform score writer with M4-803 (:func:`record_platform_scores`, which copies Metaculus's
+  own scores out of the stored observation); ``017_platform_score_events.sql`` constrains
+  both kinds of score row;
 - assembly of the handoff's full canonical record. Approval and submission history is
   joined at read/export time (M1-604, ``show``), never written back into ``record_json``
   -- writing it back would mean updating a stored forecast version, which is the thing
@@ -85,6 +88,17 @@ from whiskeyjack_bot.bounds import (
     MAX_BODY_LENGTH,
     MAX_IDENTIFIER_LENGTH,
     MAX_NOTE_LENGTH,
+)
+from whiskeyjack_bot.platform_scores import (
+    COMPARISON_BASELINES,
+    PLATFORM_METRICS,
+    ComparisonBaseline,
+    PlatformMetric,
+    PlatformScoreError,
+    extract_platform_scores,
+)
+from whiskeyjack_bot.platform_scores import (
+    recompute as recompute_platform,
 )
 from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.resolution import (
@@ -670,6 +684,36 @@ class ScoreWrite:
 
     outcome: ScoreWriteOutcome
     scores: tuple[StoredScore, ...]
+    event: LifecycleEvent | None
+    resolution: StoredResolution | None
+
+
+@dataclass(frozen=True)
+class StoredPlatformScore:
+    """One platform ``score_events`` row, read back (M4-803).
+
+    What :func:`read_platform_scores` returns has also been **re-read**: its value is exactly
+    what the cited observation's stored, digest-verified response holds under the path its
+    ``implementation_version`` names. ``comparison_baseline`` and the version together are
+    the score's source; ``resolution_event_id`` is the evidence.
+    """
+
+    event_id: int
+    forecast_record_id: str
+    resolution_event_id: int
+    metric: PlatformMetric
+    value: float
+    implementation_version: str
+    comparison_baseline: ComparisonBaseline
+    computed_at_utc: str
+
+
+@dataclass(frozen=True)
+class PlatformScoreWrite:
+    """The result of one :func:`record_platform_scores` call; :class:`ScoreWrite`'s shape."""
+
+    outcome: ScoreWriteOutcome
+    scores: tuple[StoredPlatformScore, ...]
     event: LifecycleEvent | None
     resolution: StoredResolution | None
 
@@ -1998,8 +2042,7 @@ def read_local_scores(conn: sqlite3.Connection, record_id: str) -> tuple[StoredS
     outcome. So each row's cited resolution is re-verified (both digests) and the value is
     recomputed by :func:`scoring.recompute` under the row's own ``implementation_version`` and
     compared **exactly**; a mismatch, an unregistered version or a row whose metric and
-    version disagree is refused. Rows whose metric is not a local metric (M4-803's) are not
-    this reader's.
+    version disagree is refused. Platform rows are :func:`read_platform_scores`'.
     """
     identifier = _require_identifier(record_id, "record_id")
     _require_stored_record(conn, identifier)
@@ -2037,6 +2080,205 @@ def read_local_scores(conn: sqlite3.Connection, record_id: str) -> tuple[StoredS
             raise LifecycleError("a stored score does not match its recomputation")
         verified.append(stored)
     return tuple(verified)
+
+
+def record_platform_scores(
+    conn: sqlite3.Connection, *, record_id: str, computed_at: datetime
+) -> PlatformScoreWrite:
+    """Copy Metaculus's scores for a record out of its latest observation, atomically (M4-803).
+
+    The record id is the only input. The scores are read from the latest resolution row's
+    stored ``source_response`` -- the payload the platform returned when it reported the
+    resolution, re-verified against its digest -- for the record's own question id, by
+    :func:`platform_scores.extract_platform_scores`. Nothing is fetched and nothing is
+    computed: a platform row is the platform's number and cites the evidence it was read
+    from, so it replays exactly (D30).
+
+    Every supported question type is recorded (owner decision 2026-09-23), and the outcomes
+    are :func:`record_local_scores`' own::
+
+        no resolution, or latest not `resolved`          not_scorable   nothing written
+        every current metric already recorded for it     unchanged      nothing written
+        otherwise                                        appended       the missing rows
+
+    A scorable observation that carries no readable scores is a :class:`LifecycleError`, not
+    ``not_scorable``: the resolution is definite, so a missing score is an attribution gap
+    and the run must say so.
+
+    A record still ``resolved`` takes the ``scored`` event, linking the first row written.
+    For binary and multiple choice the caller runs :func:`record_local_scores` first, so the
+    event keeps linking the local row it always has; for numeric and discrete -- which have
+    no local score -- this writer is what moves the record to ``scored``.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    computed = _require_utc(computed_at, "computed_at")
+
+    with transaction(conn):
+        question_id = _require_stored_question_id(conn, identifier)
+        resolution = latest_resolution(conn, identifier)
+        if resolution is None or not resolution.scorable:
+            return PlatformScoreWrite(
+                outcome="not_scorable", scores=(), event=None, resolution=resolution
+            )
+        status = current_status(conn, identifier)
+        if status not in _SCORABLE_STATUSES:
+            raise LifecycleError(
+                f"a score cannot be recorded for a record whose current status is {status}"
+            )
+        source = _verified_source_response(conn, resolution)
+        try:
+            scores = extract_platform_scores(source, question_id)
+        except PlatformScoreError as exc:
+            # platform_scores.py's messages name rules and its own key names only.
+            raise LifecycleError(f"the platform scores cannot be recorded: {exc}") from None
+        existing = {
+            (row[0], row[1])
+            for row in _fetch_all(
+                conn,
+                "SELECT metric, implementation_version FROM score_events "
+                "WHERE forecast_record_id = ? AND resolution_event_id = ?",
+                (identifier, resolution.event_id),
+            )
+        }
+        missing = [
+            score
+            for score in scores
+            if (score.metric, score.implementation_version) not in existing
+        ]
+        if not missing:
+            return PlatformScoreWrite(
+                outcome="unchanged", scores=(), event=None, resolution=resolution
+            )
+        if computed < resolution.observed_at_utc:
+            raise LifecycleError(
+                "computed_at is earlier than the observation the score is computed against"
+            )
+
+        event_ids = [
+            _insert(
+                conn,
+                "INSERT INTO score_events (forecast_record_id, metric, value, "
+                "implementation_version, comparison_baseline, computed_at_utc, "
+                "resolution_event_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    identifier,
+                    score.metric,
+                    score.value,
+                    score.implementation_version,
+                    score.comparison_baseline,
+                    computed,
+                    resolution.event_id,
+                ),
+            )
+            for score in missing
+        ]
+        event: LifecycleEvent | None = None
+        if status == "resolved":
+            event = _append_event(
+                conn,
+                record_id=identifier,
+                event_type="scored",
+                score_event_id=event_ids[0],
+                occurred_at_utc=computed,
+            )
+        stored = tuple(
+            _platform_score_from_row(row)
+            for row in _fetch_all(
+                conn,
+                f"SELECT {_SCORE_COLUMNS} FROM score_events WHERE event_id IN "
+                f"({', '.join('?' for _ in event_ids)}) ORDER BY event_id",
+                tuple(event_ids),
+            )
+        )
+        return PlatformScoreWrite(
+            outcome="appended", scores=stored, event=event, resolution=resolution
+        )
+
+
+def read_platform_scores(
+    conn: sqlite3.Connection, record_id: str
+) -> tuple[StoredPlatformScore, ...]:
+    """Every platform score row for a record, in append order, each re-read and checked.
+
+    :func:`read_local_scores`' rule for the platform's numbers: each row's cited resolution is
+    re-verified (both digests), its stored response is re-read under the row's own
+    ``implementation_version`` for the record's question, and the value is compared
+    **exactly**. A mismatch, an unregistered version, a row whose metric and version
+    disagree, or a comparison baseline that is not the metric's is refused.
+    """
+    identifier = _require_identifier(record_id, "record_id")
+    _require_stored_record(conn, identifier)
+    metrics = sorted(PLATFORM_METRICS)
+    rows = _fetch_all(
+        conn,
+        f"SELECT {_SCORE_COLUMNS} FROM score_events WHERE forecast_record_id = ? "
+        f"AND metric IN ({', '.join('?' for _ in metrics)}) ORDER BY event_id",
+        (identifier, *metrics),
+    )
+    if not rows:
+        return ()
+    question_id = _require_stored_question_id(conn, identifier)
+    verified: list[StoredPlatformScore] = []
+    for row in rows:
+        stored = _platform_score_from_row(row)
+        resolution = _read_resolution(
+            conn,
+            "event_id = ? AND forecast_record_id = ?",
+            (stored.resolution_event_id, identifier),
+        )
+        if resolution is None:
+            raise LifecycleError("a stored score cites a resolution row this record does not have")
+        source = _verified_source_response(conn, resolution)
+        try:
+            value = recompute_platform(
+                stored.implementation_version, stored.metric, source, question_id
+            )
+        except PlatformScoreError as exc:
+            raise LifecycleError(f"a stored platform score cannot be re-read: {exc}") from None
+        if value != stored.value:
+            raise LifecycleError("a stored platform score does not match its cited observation")
+        verified.append(stored)
+    return tuple(verified)
+
+
+def _require_stored_question_id(conn: sqlite3.Connection, record_id: str) -> int:
+    row = _fetch_one(
+        conn, "SELECT question_id FROM forecast_records WHERE record_id = ?", (record_id,)
+    )
+    if row is None:
+        raise LifecycleError("record_id does not name a stored forecast record")
+    return _stored_int(row[0], "question_id")
+
+
+def _verified_source_response(conn: sqlite3.Connection, resolution: StoredResolution) -> object:
+    """The stored post payload of a resolution row, parsed, and checked against its digest.
+
+    ``resolution`` has already been re-verified by :func:`_resolution_from_row`; this reads
+    the text again, in the same transaction, and requires the same digest, so what is parsed
+    is what was hashed. ``json.loads`` is not given a hook: a number too large for a double
+    parses to an infinity, which ``platform_scores`` refuses as non-finite.
+    """
+    row = _fetch_one(
+        conn,
+        "SELECT source_response FROM resolution_events WHERE event_id = ?",
+        (resolution.event_id,),
+    )
+    if row is None:  # pragma: no cover - the row was read in this transaction
+        raise LifecycleError("a stored resolution row could not be read back")
+    text = _stored_text(row[0], "source_response")
+    try:
+        matches = sha256_text(text) == resolution.source_response_sha256
+    except UnicodeEncodeError:
+        matches = False
+    if not matches:
+        raise LifecycleError("a stored resolution source response does not match its digest")
+    try:
+        return cast(object, json.loads(text))
+    except (ValueError, RecursionError):
+        raise LifecycleError(
+            "a stored resolution source response is not JSON "
+            "(detail withheld: it can echo stored values)"
+        ) from None
 
 
 def _prediction_inputs(
@@ -2077,7 +2319,8 @@ def _prediction_inputs(
         )
     if record.question_type in ("numeric", "discrete"):
         raise LifecycleError(
-            f"a {record.question_type} forecast has no local score (platform scores are M4-803's)"
+            f"a {record.question_type} forecast has no local score (its scores are the "
+            "platform's: record_platform_scores)"
         )
     raise LifecycleError("the stored forecast does not match its question type")
 
@@ -2670,6 +2913,28 @@ def _score_from_row(row: sqlite3.Row) -> StoredScore:
         metric=cast(LocalMetric, metric),
         value=value,
         implementation_version=_stored_text(row[5], "implementation_version"),
+        computed_at_utc=_stored_text(row[7], "computed_at_utc"),
+    )
+
+
+def _platform_score_from_row(row: sqlite3.Row) -> StoredPlatformScore:
+    """Gate one platform ``score_events`` row's shape. The value check is the reader's."""
+    metric = cast(PlatformMetric, _require_member(row[3], PLATFORM_METRICS, "metric"))
+    value = row[4]
+    if type(value) is not float:
+        raise LifecycleError(
+            "stored score value is not a real number (detail withheld: it can echo stored values)"
+        )
+    if row[6] != COMPARISON_BASELINES[metric]:
+        raise LifecycleError("a stored platform score does not carry its metric's baseline")
+    return StoredPlatformScore(
+        event_id=_stored_int(row[0], "event_id"),
+        forecast_record_id=_stored_text(row[1], "forecast_record_id"),
+        resolution_event_id=_stored_int(row[2], "resolution_event_id"),
+        metric=metric,
+        value=value,
+        implementation_version=_stored_text(row[5], "implementation_version"),
+        comparison_baseline=COMPARISON_BASELINES[metric],
         computed_at_utc=_stored_text(row[7], "computed_at_utc"),
     )
 

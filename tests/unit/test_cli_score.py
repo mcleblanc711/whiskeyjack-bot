@@ -28,7 +28,7 @@ from score_rows import (
 from whiskeyjack_bot.cli import EXIT_REFUSED, main
 from whiskeyjack_bot.env_verify import EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
-from whiskeyjack_bot.lifecycle import current_status, read_local_scores
+from whiskeyjack_bot.lifecycle import current_status, read_local_scores, read_platform_scores
 from whiskeyjack_bot.score_records import ScoreRecordsError, score_records
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -78,24 +78,43 @@ def test_every_record_with_a_resolution_gets_exactly_one_verdict(conn: Any) -> N
     _population(conn)
     clock = _clock()
     results = score_records(conn, clock=lambda: next(clock))
-    by_record = {r.record_id: (r.status, r.rows_appended, r.moved_to_scored) for r in results}
+    by_record = {
+        r.record_id: (
+            r.status,
+            r.platform_status,
+            r.rows_appended,
+            r.platform_rows_appended,
+            r.moved_to_scored,
+        )
+        for r in results
+    }
     assert by_record == {
-        "rec-yes": ("appended", 2, True),
-        "rec-mc": ("appended", 2, True),
-        "rec-annulled": ("not_scorable", 0, False),
-        "rec-num": ("out_of_scope", 0, False),
-        "rec-broken": ("failed", 0, False),
+        "rec-yes": ("appended", "appended", 2, 4, True),
+        "rec-mc": ("appended", "appended", 2, 4, True),
+        "rec-annulled": ("not_scorable", "not_scorable", 0, 0, False),
+        # M4-803: never scored locally (D30), and the platform writer is what moves it.
+        "rec-num": ("out_of_scope", "appended", 0, 4, True),
+        # The local writer cannot read the forecast back; the platform's scores need only the
+        # observation, so they are still recorded, and the platform row takes the event.
+        "rec-broken": ("failed", "appended", 0, 4, True),
     }
     broken = next(r for r in results if r.record_id == "rec-broken")
+    assert broken.failed
     assert broken.detail is not None and "cannot be read back" in broken.detail
     assert current_status(conn, "rec-yes") == "scored"
-    assert current_status(conn, "rec-num") == "resolved", "a numeric record is never scored here"
+    assert current_status(conn, "rec-num") == "scored"
     assert len(read_local_scores(conn, "rec-mc")) == 2
+    assert len(read_platform_scores(conn, "rec-num")) == 4
+    assert read_local_scores(conn, "rec-num") == ()
 
-    again = {r.record_id: r.status for r in score_records(conn, clock=lambda: next(clock))}
-    assert again["rec-yes"] == again["rec-mc"] == "unchanged"
-    assert again["rec-broken"] == "failed"
-    assert conn.execute("SELECT count(*) FROM score_events").fetchone()[0] == 4
+    again = {
+        r.record_id: (r.status, r.platform_status)
+        for r in score_records(conn, clock=lambda: next(clock))
+    }
+    assert again["rec-yes"] == again["rec-mc"] == ("unchanged", "unchanged")
+    assert again["rec-num"] == ("out_of_scope", "unchanged")
+    assert again["rec-broken"] == ("failed", "unchanged")
+    assert conn.execute("SELECT count(*) FROM score_events").fetchone()[0] == 4 + 4 * 4
 
 
 def test_one_named_record_is_scored_alone(conn: Any) -> None:
@@ -198,12 +217,21 @@ def test_the_command_scores_prints_and_is_idempotent(
 
     assert main(["score", "--config", str(config_file)]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "question 45747  record rec-yes  binary  appended  rows 2  -> scored" in out
-    assert "question 45748  record rec-no  binary  not_scorable  rows 0" in out
+    assert (
+        "question 45747  record rec-yes  binary  appended  rows 2  "
+        "platform appended  rows 4  -> scored"
+    ) in out
+    assert (
+        "question 45748  record rec-no  binary  not_scorable  rows 0  "
+        "platform not_scorable  rows 0"
+    ) in out
     assert "records: 2  failed: 0" in out
 
     assert main(["score", "--config", str(config_file)]) == EXIT_OK
-    assert "record rec-yes  binary  unchanged  rows 0" in capsys.readouterr().out
+    assert (
+        "record rec-yes  binary  unchanged  rows 0  platform unchanged  rows 0"
+        in capsys.readouterr().out
+    )
     assert offline == []
 
 
@@ -221,7 +249,10 @@ def test_the_command_exits_refused_when_any_record_failed(
         connection.close()
     assert main(["score", "--config", str(config_file)]) == EXIT_REFUSED
     out = capsys.readouterr().out
-    assert "record rec-broken  binary  failed: the forecast record cannot be read back" in out
+    assert (
+        "record rec-broken  binary  failed  rows 0  platform appended  rows 4  "
+        "failed: the forecast record cannot be read back"
+    ) in out
     assert "record rec-yes  binary  appended" in out, "the good record still landed"
     assert "records: 2  failed: 1" in out and offline == []
 

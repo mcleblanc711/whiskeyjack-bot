@@ -664,14 +664,14 @@ def _corrupt(
     it is reachable by an ordinary operator with a shell, so the export owes it an answer.
 
     Since 015, every shape planted here is also refused at INSERT by
-    `score_events_validate_local_score_on_insert` (a non-finite value, a metric outside the
-    vocabulary). The same shell that can REPLACE can drop that trigger, so this does, on the
+    `score_events_validate_on_insert` (017's rewrite of 015's trigger: a non-finite value, a
+    metric outside the vocabulary). The same shell that can REPLACE can drop that trigger, so this does, on the
     test's own ledger: what is under test is the export's answer to a stored value, which is
     the second line behind the schema and still owes one.
     """
     conn = sqlite3.connect(ledger_path)
     try:
-        conn.execute("DROP TRIGGER IF EXISTS score_events_validate_local_score_on_insert")
+        conn.execute("DROP TRIGGER IF EXISTS score_events_validate_on_insert")
         if recursive_triggers:
             conn.execute("PRAGMA recursive_triggers = ON")
         conn.execute(statement, parameters)

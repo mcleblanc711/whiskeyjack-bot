@@ -1,13 +1,19 @@
-"""Compute local Brier and log scores for resolved forecasts (M4-802).
+"""Record local and platform scores for resolved forecasts (M4-802, M4-803).
 
 ``whiskeyjack-bot score`` is this module's only caller. It reads and writes the ledger and
 nothing else: no network, no paid call, no submission path, and no import that reaches one.
 
 **Which records.** Every forecast record with at least one resolution observation, or the one
-record named. Binary and multiple-choice records are handed to
-:func:`lifecycle.record_local_scores`, which decides from the ledger whether the latest
-observation is scorable and what is already written. Numeric and discrete records are reported
-``out_of_scope`` and never scored locally: M4-803 ingests the platform's scores for them (D30).
+record named. Each gets two writers, in this order, each in its own transaction:
+
+- **Local** (M4-802). Binary and multiple-choice records are handed to
+  :func:`lifecycle.record_local_scores`, which decides from the ledger whether the latest
+  observation is scorable and what is already written. Numeric and discrete records are
+  reported ``out_of_scope`` and never scored locally (D30).
+- **Platform** (M4-803). Every record is handed to :func:`lifecycle.record_platform_scores`,
+  which copies Metaculus's own scores out of the stored observation. Local runs first so that,
+  for binary and multiple choice, the ``scored`` event keeps linking the local row it always
+  has; for numeric and discrete the platform writer is what moves the record to ``scored``.
 
 **Failures are per record.** A record the writer refuses is reported and skipped; the rest of
 the run proceeds. ``score`` exits non-zero if anything failed, so a scheduled run cannot fail
@@ -23,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Literal, get_args
 
 from whiskeyjack_bot.config import SupportedQuestionType
-from whiskeyjack_bot.lifecycle import LifecycleError, record_local_scores
+from whiskeyjack_bot.lifecycle import LifecycleError, record_local_scores, record_platform_scores
 
 ScoreStatus = Literal["appended", "unchanged", "not_scorable", "out_of_scope", "failed"]
 
@@ -42,17 +48,26 @@ class ScoreRecordsError(Exception):
 class ScoreResult:
     """What happened to one forecast record in one run.
 
-    ``detail`` is a message from this package's own sanitized error types, set only when
-    ``status`` is ``failed``; it names rules and fields, never a stored value.
+    ``status``/``rows_appended`` are the local writer's and ``platform_status``/
+    ``platform_rows_appended`` the platform writer's. ``detail`` is a message from this
+    package's own sanitized error types, set only when either status is ``failed`` (the local
+    one first); it names rules and fields, never a stored value. ``moved_to_scored`` is true
+    when either writer moved the record.
     """
 
     record_id: str
     question_id: int
     question_type: str
     status: ScoreStatus
+    platform_status: ScoreStatus
     rows_appended: int = 0
+    platform_rows_appended: int = 0
     moved_to_scored: bool = False
     detail: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed" or self.platform_status == "failed"
 
 
 def score_records(
@@ -67,37 +82,42 @@ def score_records(
     now = clock if clock is not None else _utcnow
     results: list[ScoreResult] = []
     for identifier, question_id, question_type in _candidate_records(conn, record_id):
-        if question_type not in _LOCALLY_SCORED_TYPES:
-            results.append(
-                ScoreResult(
-                    record_id=identifier,
-                    question_id=question_id,
-                    question_type=question_type,
-                    status="out_of_scope",
-                )
-            )
-            continue
+        details: list[str] = []
+        status: ScoreStatus = "out_of_scope"
+        rows = 0
+        moved = False
+        if question_type in _LOCALLY_SCORED_TYPES:
+            try:
+                write = record_local_scores(conn, record_id=identifier, computed_at=now())
+            except LifecycleError as exc:
+                status = "failed"
+                details.append(str(exc))
+            else:
+                status = write.outcome
+                rows = len(write.scores)
+                moved = write.event is not None
+        platform_status: ScoreStatus
+        platform_rows = 0
         try:
-            write = record_local_scores(conn, record_id=identifier, computed_at=now())
+            platform = record_platform_scores(conn, record_id=identifier, computed_at=now())
         except LifecycleError as exc:
-            results.append(
-                ScoreResult(
-                    record_id=identifier,
-                    question_id=question_id,
-                    question_type=question_type,
-                    status="failed",
-                    detail=str(exc),
-                )
-            )
-            continue
+            platform_status = "failed"
+            details.append(str(exc))
+        else:
+            platform_status = platform.outcome
+            platform_rows = len(platform.scores)
+            moved = moved or platform.event is not None
         results.append(
             ScoreResult(
                 record_id=identifier,
                 question_id=question_id,
                 question_type=question_type,
-                status=write.outcome,
-                rows_appended=len(write.scores),
-                moved_to_scored=write.event is not None,
+                status=status,
+                platform_status=platform_status,
+                rows_appended=rows,
+                platform_rows_appended=platform_rows,
+                moved_to_scored=moved,
+                detail="; ".join(details) if details else None,
             )
         )
     return tuple(results)

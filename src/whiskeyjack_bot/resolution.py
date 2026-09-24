@@ -183,7 +183,7 @@ def classify_resolution(
     if type(post_id) is not int:
         raise ResolutionError("post payload id must be an integer")
 
-    question = _select_question(post, question_id)
+    question = select_question(post, question_id)
     if question.get("type") != question_type:
         raise ResolutionError("payload question type does not match the forecast record")
 
@@ -237,7 +237,13 @@ def observation_from_snapshot(snapshot: object) -> ResolutionObservation:
         raise ResolutionError(_sanitized(exc)) from None
 
 
-def _select_question(post: dict[str, object], question_id: int) -> dict[str, object]:
+def select_question(post: dict[str, object], question_id: int) -> dict[str, object]:
+    """The question object for ``question_id`` in a post payload: top-level, or one group member.
+
+    Public because ``platform_scores`` reads the platform's scores out of the same stored
+    payload and must select the same question the classifier did (M4-803). Raises
+    :class:`ResolutionError` when the question is absent or listed twice.
+    """
     question = post.get("question")
     if (
         type(question) is dict

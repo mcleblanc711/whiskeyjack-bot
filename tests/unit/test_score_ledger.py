@@ -31,7 +31,9 @@ from whiskeyjack_bot.lifecycle import (
     latest_resolution,
     read_history,
     read_local_scores,
+    read_platform_scores,
     record_local_scores,
+    record_platform_scores,
 )
 
 # ln(x) from `echo "scale=25; l(x)" | bc -l`, as in test_scoring.py.
@@ -346,7 +348,7 @@ def test_the_reader_refuses_a_score_citing_another_records_resolution(
     other = seed_resolved(conn, "rec-other", question_id=QUESTION_ID + 5, post_id=POST_ID + 5)
     other_resolution = latest_resolution(conn, other)
     assert other_resolution is not None
-    conn.execute("DROP TRIGGER score_events_validate_local_score_on_insert")
+    conn.execute("DROP TRIGGER score_events_validate_on_insert")
     insert_score_row(
         conn,
         record,
@@ -359,15 +361,14 @@ def test_the_reader_refuses_a_score_citing_another_records_resolution(
 
 
 def test_the_reader_leaves_rows_of_other_metrics_alone(conn: sqlite3.Connection) -> None:
-    """M4-803's platform rows will share the table once it widens 015's vocabulary. Simulated
-    by dropping the trigger: such a row is not this reader's to recompute or refuse."""
+    """M4-803's platform rows share the table: they are not this reader's to recompute or
+    refuse, and this reader's rows are not the platform reader's."""
     record = _binary(conn)
     write = record_local_scores(conn, record_id=record, computed_at=SCORED_AT)
-    conn.execute("DROP TRIGGER score_events_validate_local_score_on_insert")
-    insert_score_row(
-        conn, record, metric="platform_peer", value=12.5, implementation_version="platform_peer/1"
-    )
+    platform = record_platform_scores(conn, record_id=record, computed_at=SCORED_AT)
+    assert platform.outcome == "appended" and len(platform.scores) == 4
     assert read_local_scores(conn, record) == write.scores
+    assert read_platform_scores(conn, record) == platform.scores
 
 
 # ── 015: what a score row may claim ──────────────────────────────────────────
@@ -432,17 +433,29 @@ def test_a_score_cannot_cite_a_superseded_observation(
 
 
 @pytest.mark.parametrize(
-    "metric", ["brier", "log", "metaculus_peer", "baseline", "LOCAL_BRIER_BINARY", ""]
+    "metric",
+    [
+        "brier",
+        "log",
+        "metaculus_peer",
+        "baseline",
+        "LOCAL_BRIER_BINARY",
+        "",
+        # M4-803: the prefix alone is not the vocabulary.
+        "platform_peer",
+        "PLATFORM_PEER_SCORE",
+        "platform_relative_legacy_score",
+    ],
 )
 def test_a_metric_outside_the_local_vocabulary_is_refused(
     conn: sqlite3.Connection, scorable: str, metric: str
 ) -> None:
-    with pytest.raises(sqlite3.IntegrityError, match="not a recognized local score metric"):
+    with pytest.raises(sqlite3.IntegrityError, match="not a recognized score metric"):
         insert_score_row(conn, scorable, metric=metric, implementation_version=f"{metric}/1")
 
 
 def test_a_blob_metric_is_refused(conn: sqlite3.Connection, scorable: str) -> None:
-    with pytest.raises(sqlite3.IntegrityError, match="not a recognized local score metric"):
+    with pytest.raises(sqlite3.IntegrityError, match="not a recognized score metric"):
         insert_score_row(conn, scorable, metric=b"local_brier_binary")
 
 
@@ -605,7 +618,7 @@ def test_a_ledger_at_014_with_resolutions_upgrades_to_015(
         record = seed_resolved_raw(connection, "rec-b", question_id=QUESTION_ID, post_id=POST_ID)
     finally:
         connection.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 16
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
     connection = connect(db)
     try:
         write = record_local_scores(connection, record_id=record, computed_at=SCORED_AT)
