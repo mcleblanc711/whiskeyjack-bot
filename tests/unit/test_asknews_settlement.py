@@ -219,6 +219,21 @@ def test_a_recovered_call_settles_once_from_the_stored_response(
     assert spending(conn, SCOPE) == (75_000, 0)
 
 
+@pytest.mark.parametrize("amount", [-1, True, 25_000.0, None, "25000"])
+def test_settle_microusd_refuses_anything_but_an_exact_non_negative_int(
+    case: Any, amount: Any
+) -> None:
+    """Its own guard, not only its callers': a refused figure leaves the reservation held."""
+    conn, config, *_ = case
+    budget = Budget(conn, config.storage.artifact_root, SCOPE, 10_000_000)
+    reservation = budget.reserve("asknews", 0.025, {})
+    budget.settle_microusd(reservation, amount, basis="asknews_credits")
+    assert events(conn, "cost_settled", SCOPE) == []
+    assert spending(conn, SCOPE) == (0, 25_000)
+    budget.settle_microusd(reservation, 0, basis="asknews_credits")
+    assert spending(conn, SCOPE) == (0, 0), "a real zero settles"
+
+
 # --- M1-337: the estimate is credits x rate ----------------------------------------------
 
 
