@@ -20,7 +20,13 @@ import pytest
 import requests
 import yaml
 
-from resolution_rows import FIXTURES, kind_payload, seed_record, seed_submitted
+from resolution_rows import (
+    FIXTURES,
+    kind_payload,
+    seed_record,
+    seed_submitted,
+    walk_to_submitted,
+)
 from whiskeyjack_bot.cli import EXIT_REFUSED, main
 from whiskeyjack_bot.env_verify import EXIT_ENV_MISSING, EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
@@ -630,3 +636,26 @@ def test_withheld_records_reads_the_condition_once_per_record(conn: Any) -> None
     assert withheld_records(conn, doubled) == (
         WithheldRecord(record_id="rec-g0", question_id=question_ids[0]),
     )
+
+
+def test_two_withheld_records_on_one_question_each_page(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, pager: Pager
+) -> None:
+    """The throttle is keyed on the record, not the question: two forecast versions posted on
+    the same question are two records the ledger cannot score, and each is reported."""
+    connection = _ledger(config_file)
+    try:
+        seed_submitted(connection, "rec-w1", question_id=45748, post_id=45557)
+        # The same question under another project id (`forecast_records` is unique per
+        # question, tournament and version), as across the 33122 -> 33125 rollover.
+        seed_record(connection, "rec-w2", question_id=45748, post_id=45557, tournament_id="33125")
+        walk_to_submitted(connection, "rec-w2")
+    finally:
+        connection.close()
+    posts = {45557: kind_payload("binary", "withheld", post_id=45557, question_id=45748)}
+    _install(monkeypatch, Wire(posts))
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert sorted(body.split("record=")[1].split()[0] for _, _, body in pager.pushes) == [
+        "rec-w1",
+        "rec-w2",
+    ]

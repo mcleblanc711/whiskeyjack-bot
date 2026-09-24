@@ -146,6 +146,17 @@ def test_an_observation_that_is_not_scorable_writes_nothing(
     assert (write.outcome, write.scores, write.event) == ("not_scorable", (), None)
 
 
+def test_a_record_that_never_moved_to_resolved_is_refused(conn: sqlite3.Connection) -> None:
+    """A scorable observation on a record still `submitted` (a raw row, no `resolved` event):
+    the writer refuses rather than scoring a record its lifecycle says is not resolved."""
+    seed_submitted(conn, "rec-s", question_id=QUESTION_ID, post_id=POST_ID, question_type="numeric")
+    insert_resolution_row(conn, "rec-s")
+    assert current_status(conn, "rec-s") == "submitted"
+    with pytest.raises(LifecycleError, match="whose current status is submitted"):
+        record_platform_scores(conn, record_id="rec-s", computed_at=SCORED_AT)
+    assert conn.execute("SELECT count(*) FROM score_events").fetchone()[0] == 0
+
+
 def test_a_record_with_no_observation_is_not_scorable(conn: sqlite3.Connection) -> None:
     seed_submitted(conn, "rec-0", question_id=QUESTION_ID, post_id=POST_ID)
     write = record_platform_scores(conn, record_id="rec-0", computed_at=SCORED_AT)
@@ -388,6 +399,35 @@ def test_a_group_row_must_hold_its_own_members_value(conn: sqlite3.Connection) -
     with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
         _platform_row(conn, "rec-g", value=SCORE_DATA["peer_score"] * 1.0)
     _platform_row(conn, "rec-g", value=SCORE_DATA["peer_score"] * 2.0)
+
+
+def test_a_group_members_integer_score_admits_no_platform_row(conn: sqlite3.Connection) -> None:
+    """The group branch's `json_type = 'real'`, as the top-level branch's is pinned above."""
+    member_scores = _scaled(1.0)
+    member_scores["peer_score"] = 3  # type: ignore[assignment]
+    post, question_ids = _group_payload([member_scores, _scaled(2.0), _scaled(3.0)])
+    seed_submitted(conn, "rec-gi", question_id=question_ids[0], post_id=post["id"])
+    _insert_resolution(conn, _payload_row(conn, "rec-gi", post))
+    with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
+        _platform_row(conn, "rec-gi", value=3.0)
+
+
+def test_a_stored_top_level_question_with_another_id_admits_no_platform_row(
+    conn: sqlite3.Connection,
+) -> None:
+    """The top-level branch matches the record's question id, as `select_question` does. The
+    classifier refuses such a payload at ingest, so the row is planted: the stored text is
+    swapped for one whose question is another, with a digest that matches it."""
+    seed_submitted(conn, "rec-o", question_id=QUESTION_ID, post_id=POST_ID, question_type="numeric")
+    columns = _payload_row(
+        conn, "rec-o", post_payload("numeric", post_id=POST_ID, question_id=QUESTION_ID)
+    )
+    other = post_payload("numeric", post_id=POST_ID, question_id=QUESTION_ID + 1)
+    columns["source_response"] = canonical_json(other)
+    columns["source_response_sha256"] = sha256_text(canonical_json(other))
+    _insert_resolution(conn, columns)
+    with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
+        _platform_row(conn, "rec-o")
 
 
 def test_a_group_listing_the_question_twice_admits_no_platform_row(

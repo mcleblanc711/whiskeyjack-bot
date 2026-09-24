@@ -17,7 +17,7 @@ import pytest
 import requests
 import yaml
 
-from resolution_rows import insert_resolution_row, seed_record, seed_submitted
+from resolution_rows import insert_resolution_row, post_payload, seed_record, seed_submitted
 from score_rows import (
     PAST_OBSERVATION,
     resolve,
@@ -28,7 +28,13 @@ from score_rows import (
 from whiskeyjack_bot.cli import EXIT_REFUSED, main
 from whiskeyjack_bot.env_verify import EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
-from whiskeyjack_bot.lifecycle import current_status, read_local_scores, read_platform_scores
+from whiskeyjack_bot.lifecycle import (
+    current_status,
+    read_local_scores,
+    read_platform_scores,
+    record_resolution_observation,
+)
+from whiskeyjack_bot.resolution import canonical_json, sha256_text
 from whiskeyjack_bot.score_records import ScoreRecordsError, score_records
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -277,3 +283,65 @@ def test_a_missing_ledger_is_refused_rather_than_created(
         yaml.safe_load(config_file.read_text(encoding="utf-8"))["storage"]["sqlite_path"]
     )
     assert not database.exists()
+
+
+def test_a_resolved_observation_without_platform_scores_fails_the_command(
+    config_file: Path, offline: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M4-803, owner decision: a definite resolution with no `score_data` is an attribution gap,
+    so it fails the record and the command (the schedule's OnFailure page) -- including for a
+    record whose local scores landed."""
+    connection = _ledger(config_file)
+    try:
+        seed_resolved(
+            connection, "rec-yes", question_id=45747, post_id=45556, observed_at=PAST_OBSERVATION
+        )
+        seed_submitted(
+            connection, "rec-bare", question_id=45750, post_id=45559, question_type="numeric"
+        )
+        record_resolution_observation(
+            connection,
+            record_id="rec-bare",
+            source_response=post_payload(
+                "numeric", post_id=45559, question_id=45750, score_data={}
+            ),
+            observed_at=PAST_OBSERVATION,
+        )
+        results = {r.record_id: r for r in score_records(connection)}
+    finally:
+        connection.close()
+    bare = results["rec-bare"]
+    assert (bare.status, bare.platform_status, bare.failed) == ("out_of_scope", "failed", True)
+    assert bare.detail == (
+        "the platform scores cannot be recorded: the observation carries no platform scores"
+    )
+    assert not results["rec-yes"].failed
+
+    connection = _ledger(config_file)
+    try:
+        seed_resolved(
+            connection, "rec-b2", question_id=45760, post_id=45570, observed_at=PAST_OBSERVATION
+        )
+        # A binary record whose local scores land but whose observation has no platform scores.
+        connection.execute("DROP TRIGGER resolution_events_block_update")
+        stripped = post_payload("binary", post_id=45570, question_id=45760, score_data={})
+        text = canonical_json(stripped)
+        connection.execute(
+            "UPDATE resolution_events SET source_response = ?, source_response_sha256 = ? "
+            "WHERE forecast_record_id = 'rec-b2'",
+            (text, sha256_text(text)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert main(["score", "--config", str(config_file)]) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert (
+        "record rec-bare  numeric  out_of_scope  rows 0  platform failed  rows 0  failed: the "
+        "platform scores cannot be recorded: the observation carries no platform scores"
+    ) in out
+    assert (
+        "record rec-b2  binary  appended  rows 2  platform failed  rows 0  failed: the "
+        "platform scores cannot be recorded: the observation carries no platform scores"
+    ) in out
+    assert "records: 3  failed: 2" in out and offline == []

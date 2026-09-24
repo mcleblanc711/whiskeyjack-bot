@@ -158,11 +158,20 @@ def test_a_corrupted_level_never_raises_outside_platform_score_error(
 
 
 @given(question_id=st.one_of(JSON_VALUES, st.integers()))
+# Equal to the question's id but not an int: `select_question` alone would select the question
+# (`45747 == 45747.0`, and `True == 1`), so only the exact-type gate refuses these.
+@example(question_id=float(QUESTION_ID))
+@example(question_id=True)
+@example(question_id=0)
 def test_a_malformed_question_id_is_refused_or_names_no_question(question_id: object) -> None:
     message = _refusal(_payload(), question_id)
     _record(message)
-    if question_id != QUESTION_ID or type(question_id) is not int:
+    if type(question_id) is not int or question_id < 1:
+        assert message == "question_id must be a positive integer"
+    elif question_id != QUESTION_ID:
         assert message is not None
+    else:
+        assert message is None
 
 
 @pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
