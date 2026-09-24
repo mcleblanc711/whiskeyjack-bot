@@ -6,6 +6,7 @@ from typing import Any
 
 from whiskeyjack_bot.tournament_state import (
     CURRENT_BUDGET,
+    CostBasis,
     TournamentError,
     append,
     digest,
@@ -33,8 +34,22 @@ def begin_call(
 
 
 def complete_call(
-    scope: str | None, response: dict[str, Any], actual_cost: float | None = None
+    scope: str | None,
+    response: dict[str, Any],
+    actual_cost: float | None = None,
+    *,
+    actual_microusd: int | None = None,
+    basis: CostBasis | None = None,
 ) -> None:
+    """Record a completed call once, then settle its reservation.
+
+    ``actual_cost`` is a dollar figure (Exa's ``costDollars.total``), stored on the
+    ``retrieval_completed`` row so recovery settles from it. ``actual_microusd`` is an exact
+    figure the caller derives from ``response`` itself (AskNews credits, M1-336): it is not
+    stored, because the stored response already carries it, and recovery reaches this
+    function again with the cached response and derives the same figure. Pass one or
+    neither; with both, the exact figure wins. Neither leaves the reservation held.
+    """
     budget = CURRENT_BUDGET.get()
     if budget is None or scope is None:
         return
@@ -51,4 +66,7 @@ def complete_call(
             {"response": response, "actual_cost": actual_cost},
         )
     started = events(budget.conn, "retrieval_started", scope)[-1]
-    budget.settle(started["reservation_id"], actual_cost)
+    if actual_microusd is not None:
+        budget.settle_microusd(started["reservation_id"], actual_microusd, basis=basis)
+    else:
+        budget.settle(started["reservation_id"], actual_cost, basis=basis)

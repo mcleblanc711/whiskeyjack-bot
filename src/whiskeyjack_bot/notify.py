@@ -141,7 +141,9 @@ assert all(seconds > 0 for seconds in _WINDOW_SECONDS.values())
 # **zero** settlements, so ``actual_cost_usd`` for the provider that exhausted the quota
 # is permanently $0.00 and a threshold on it can never fire. ``held`` is inflated by that
 # same non-settlement, and that is not a reason to discard it: inflated or not, it is the
-# number that stops the worker.
+# number that stops the worker. (Since M1-336 an AskNews call settles from its own
+# ``usage.credits``, so that measurement describes the ledger before it; the rule holds either
+# way, because a call whose cost is unknown is still held at its full estimate.)
 #
 # Read the levels honestly. On the same ledger the nine-hour incident reached only 31.7%
 # of the $10 ceiling, so neither level would have fired during it. This is a budget alarm,
@@ -641,8 +643,7 @@ def budget_level_crossed(used: int, ceiling: int) -> int | None:
     """The highest configured threshold ``used/ceiling`` has reached, or ``None``.
 
     Both arguments are micro-USD, the unit the ledger stores. ``used`` is
-    ``actual + held``: see :data:`BUDGET_THRESHOLD_PERCENTS` for why held spend counts
-    even though AskNews reservations never settle.
+    ``actual + held``: see :data:`BUDGET_THRESHOLD_PERCENTS` for why held spend counts.
     """
     if ceiling <= 0:
         return None

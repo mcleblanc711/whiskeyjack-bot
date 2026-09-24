@@ -52,12 +52,13 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Final, Literal, get_args
 
 from asknews_sdk import AskNewsSDK
 
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.research.asknews_cost import NEWS_CALL_ESTIMATE_USD, credits_microusd
 from whiskeyjack_bot.research.hashing import content_sha256
 from whiskeyjack_bot.research.model import (
     ResearchDocument,
@@ -89,6 +90,89 @@ _STRATEGY_HISTORICAL: _Strategy = "news knowledge"
 _STRATEGIES: tuple[_Strategy, ...] = (_STRATEGY_CURRENT,)
 
 _HOURS_PER_DAY = 24
+
+# What a failed AskNews call was, as far as the exception's CLASS can say (M1-332, D44).
+#
+# Honest names, not hopeful ones. The pinned SDK has no quota class: a spent quota arrives as
+# `ForbiddenError`, `RateLimitExceededError` or the base `APIError` (an HTTP status the SDK's
+# ErrorMap does not list, such as 402, maps to the base class), and only the numeric `code` --
+# which is copied out of the response body -- could tell them apart. M1-332 forbids reading
+# anything that could carry response content, and AskNews does not document which code means
+# quota, so every member that COULD be a quota says so in its name and none claims it for sure.
+AskNewsFailure = Literal[
+    "rate_or_quota_limited",
+    "forbidden_or_quota",
+    "auth_rejected",
+    "request_rejected",
+    "provider_unavailable",
+    "provider_error",
+    "transient",
+]
+
+# The module whose classes are matched, and the classes, by NAME. Restricted by module so a
+# same-named exception from anywhere else is never mistaken for the SDK's; nothing is
+# imported to classify, the way `submission_live.classify_error` matches `requests`.
+_SDK_ERRORS_MODULE: Final = "asknews_sdk.errors"
+_HTTPX_MODULE: Final = "httpx"
+_SDK_CLASSES: Final[dict[str, AskNewsFailure]] = {
+    "RateLimitExceededError": "rate_or_quota_limited",
+    "ConcurrencyLimitExceededError": "rate_or_quota_limited",
+    "ForbiddenError": "forbidden_or_quota",
+    "UnauthorizedError": "auth_rejected",
+    "BadRequestError": "request_rejected",
+    "ResourceNotFoundError": "request_rejected",
+    "MethodNotAllowed": "request_rejected",
+    "ValidationError": "request_rejected",
+    "RequestTimeoutError": "provider_unavailable",
+    "ServiceUnavailableError": "provider_unavailable",
+    # Last in any MRO it appears in: every SDK error subclasses it, so a class the pinned
+    # version does not have lands here rather than on the transient default.
+    "APIError": "provider_error",
+}
+_HTTPX_CLASSES: Final[dict[str, AskNewsFailure]] = {
+    "TimeoutException": "provider_unavailable",
+}
+assert set(_SDK_CLASSES.values()) | set(_HTTPX_CLASSES.values()) | {"transient"} == set(
+    get_args(AskNewsFailure)
+)
+
+# What each failure tells an operator, for the `provider_failed` alert (M1-332). Constants
+# only. "Quota" appears only where the class cannot rule it out, and never as a certainty.
+FAILURE_ADVICE: Final[dict[AskNewsFailure, str]] = {
+    "rate_or_quota_limited": (
+        "AskNews refused the call with a rate-limit response (HTTP 429). That is a "
+        "per-minute or concurrency limit, or a spent plan quota -- if the first call of "
+        "every question keeps failing this way, check the plan's remaining credits on the "
+        "AskNews dashboard."
+    ),
+    "forbidden_or_quota": (
+        "AskNews refused the call as forbidden (HTTP 403). That is either a key without "
+        "access to this endpoint or a spent plan quota -- check the plan's remaining "
+        "credits and the key's scopes on the AskNews dashboard."
+    ),
+    "auth_rejected": (
+        "AskNews rejected the API key (HTTP 401). Check the key the configured variable holds."
+    ),
+    "request_rejected": (
+        "AskNews rejected the request itself (HTTP 400/404/405/422): a problem with what "
+        "was asked, not with the account. Check data/logs/ for the retrieval run."
+    ),
+    "provider_unavailable": (
+        "AskNews timed out or reported itself unavailable. Usually transient; the next "
+        "poll retries."
+    ),
+    "provider_error": (
+        "AskNews returned an error the pinned SDK does not name (a 5xx, or an unlisted "
+        "status such as 402). It may be an outage or a billing refusal -- check the "
+        "AskNews dashboard if it repeats."
+    ),
+    "transient": (
+        "The call failed without a provider error response (a dropped connection or an "
+        "unrecognized error). The cause is not known beyond that; check data/logs/ if it "
+        "repeats."
+    ),
+}
+assert set(FAILURE_ADVICE) == set(get_args(AskNewsFailure))
 
 
 class AskNewsRetrievalError(Exception):
@@ -143,6 +227,35 @@ class AskNewsRetrieval:
     duplicates_collapsed: int
     provider_failed: bool
     calls_attempted: int
+    # What the failed call was (M1-332), or None when no call failed. Set exactly when
+    # `provider_failed` is: see `classify_failure`.
+    failure: AskNewsFailure | None
+
+
+def classify_failure(exc: BaseException) -> AskNewsFailure:
+    """Name a provider exception in this module's closed vocabulary, from its class alone.
+
+    **Reads nothing off the exception but its type** (M1-332). Not ``str(exc)``, not
+    ``args``, not the SDK's ``detail``, ``code`` or ``response``: an AskNews error may quote
+    the request, the response body or an auth header, and ``code`` is copied from the
+    response body. ``type(exc).__mro__`` is walked, most specific first, and each class is
+    matched on ``(__module__, __name__)`` -- so a subclass the pinned SDK does not have
+    resolves to its nearest listed ancestor, and a same-named class from another module
+    matches nothing.
+
+    Anything unrecognized is ``transient``, never a quota: a wrong "quota" label sends an
+    operator to a vendor dashboard for a dropped socket. Total: it never raises.
+    """
+    for klass in type(exc).__mro__:
+        module = getattr(klass, "__module__", None)
+        name = getattr(klass, "__name__", None)
+        if type(module) is not str or type(name) is not str:
+            continue
+        if module == _SDK_ERRORS_MODULE and name in _SDK_CLASSES:
+            return _SDK_CLASSES[name]
+        if module == _HTTPX_MODULE and name in _HTTPX_CLASSES:
+            return _HTTPX_CLASSES[name]
+    return "transient"
 
 
 def build_asknews_client(config: AppConfig) -> AskNewsSDK:
@@ -314,6 +427,7 @@ def retrieve_news(
     dropped = 0
     collapsed = 0
     provider_failed = False
+    failure: AskNewsFailure | None = None
     # Counted at the point of the request, so the one that raises is included: it
     # reached the provider and may well have been billed. Same rule as
     # `research/exa.py`'s `calls_attempted` and `forecast/generate.py`'s.
@@ -335,7 +449,9 @@ def retrieve_news(
             }
             call_scope, cached = begin_call(
                 "asknews",
-                0.125 if strategy == _STRATEGY_HISTORICAL else 0.025,
+                # M1-337: credits x rate, never a literal. Only the news pass is issued
+                # (M1-352), so there is one estimate.
+                NEWS_CALL_ESTIMATE_USD,
                 request,
                 question_id,
                 now_utc.isoformat(),
@@ -349,11 +465,14 @@ def retrieve_news(
                     calls_attempted += 1
                     response = client.news.search_news(**request)
 
-            except Exception:
+            except Exception as exc:
                 # Stop, but do not raise: calls already made were billed, and
                 # their responses are the only record of that spend. The SDK
-                # error is discarded entirely rather than inspected -- it may
-                # quote the request, the response body, or an auth header.
+                # error is discarded rather than inspected -- it may quote the
+                # request, the response body, or an auth header. Only its CLASS
+                # is read, to name it (M1-332); `del` so no later code can reach it.
+                failure = classify_failure(exc)
+                del exc
                 provider_failed = True
                 break
 
@@ -362,7 +481,16 @@ def retrieve_news(
             # *value* in their text, and this dict is built from untrusted
             # provider data. Do not remove. (GPT review round 1, finding 1.)
             raw = response.model_dump(mode="json", warnings=False)
-            complete_call(call_scope, raw)
+            # M1-336: settle from the response's own `usage.credits`. None (no usage
+            # block, a malformed count) leaves the reservation held at its estimate --
+            # unknown is never free. A recovered call reaches here with the cached
+            # response and settles from the same figure.
+            complete_call(
+                call_scope,
+                raw,
+                actual_microusd=credits_microusd(raw),
+                basis="asknews_credits",
+            )
             raw_responses.append(raw)
 
             for article in response.as_dicts or []:
@@ -401,13 +529,11 @@ def retrieve_news(
             "started_at_utc": now_utc,
             "completed_at_utc": now_utc,
             "freshness_cutoff_utc": freshness_cutoff_utc,
-            "error_summary": _error_summary(
-                provider_failed=provider_failed, retained=len(documents)
-            ),
-            # AskNews reports usage in credits, not currency, and no credit->USD
-            # rate is configured. Recording a converted number would put an
-            # unearned figure in the ledger; the credit count survives in
-            # raw_responses for M1-306, which owns cost capture.
+            "error_summary": _error_summary(failure=failure, retained=len(documents)),
+            # Still None when calls were made. Since M1-336 each call's reservation
+            # settles in the tournament journal from its own `usage.credits`; putting
+            # the sum on the run row as well is deferred (see the M1-336 notes), and
+            # the credit counts survive in raw_responses either way.
             "cost_usd": None if calls_attempted else 0.0,
         }
     )
@@ -420,10 +546,11 @@ def retrieve_news(
         duplicates_collapsed=collapsed,
         provider_failed=provider_failed,
         calls_attempted=calls_attempted,
+        failure=failure,
     )
 
 
-def _error_summary(*, provider_failed: bool, retained: int) -> str | None:
+def _error_summary(*, failure: AskNewsFailure | None, retained: int) -> str | None:
     """Describe an actual failure, or return None for a successful run.
 
     Scoped to the schema's own meaning for this field — "set when the run failed
@@ -434,11 +561,15 @@ def _error_summary(*, provider_failed: bool, retained: int) -> str | None:
     and validation (M1-504) logic that reads this field. (GPT review round 1,
     finding 3.)
 
+    ``failure`` (M1-332) is named in the text only once it is known to be one of this
+    module's own literals.
+
     Built from constants and integers only; no retrieved value reaches it.
     """
     parts: list[str] = []
-    if provider_failed:
-        parts.append("provider call failed; retrieval stopped early")
+    if failure is not None:
+        named = failure if failure in get_args(AskNewsFailure) else "transient"
+        parts.append(f"provider call failed ({named}); retrieval stopped early")
     if retained == 0:
         parts.append("no documents retained")
     return "; ".join(parts) if parts else None
