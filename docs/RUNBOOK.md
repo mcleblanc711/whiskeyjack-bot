@@ -521,7 +521,7 @@ poll that sees nothing new writes nothing. One line per record, then a count:
 ```
 question 45747  record 0192...  appended  kind resolved  scorable yes  -> resolved
 question 45748  record 0192...  unchanged  kind -  scorable -
-records: 2  failed: 0
+records: 2  failed: 0  withheld: 0
 ```
 
 `kind` is one of five, and only `resolved` can ever be scored — `score_events` refuses a row
@@ -553,24 +553,41 @@ safe at any time.
 uv run whiskeyjack-bot score --config config.yaml [--record-id ID]
 ```
 
-Computes **local** Brier and natural-log scores for every binary and multiple-choice record with
-a `resolved` latest observation, and appends them (M4-802, D36). No network call, no paid call.
-Run it after step 6; like step 6 it is safe to repeat — scoring an observation already scored
-writes nothing.
+Records two kinds of score for every record whose latest observation is `resolved`, and appends
+them. No network call, no paid call. Run it after step 6; like step 6 it is safe to repeat —
+scoring an observation already scored writes nothing.
+
+- **Local** (M4-802, D36): Brier and natural-log scores this program computes, for binary and
+  multiple choice only.
+- **Platform** (M4-803, D30): Metaculus's own scores for this account, for every question type,
+  copied out of the resolution observation step 6 stored. Nothing is fetched and nothing is
+  computed.
 
 ```
-question 45747  record 0192...  binary  appended  rows 2  -> scored
-question 45748  record 0192...  multiple_choice  unchanged  rows 0
-question 45749  record 0192...  numeric  out_of_scope  rows 0
-question 45750  record 0192...  binary  not_scorable  rows 0
+question 45747  record 0192...  binary  appended  rows 2  platform appended  rows 4  -> scored
+question 45748  record 0192...  multiple_choice  unchanged  rows 0  platform unchanged  rows 0
+question 45749  record 0192...  numeric  out_of_scope  rows 0  platform appended  rows 4  -> scored
+question 45750  record 0192...  binary  not_scorable  rows 0  platform not_scorable  rows 0
 records: 4  failed: 0
 ```
 
-- **These are not Metaculus scores.** The metrics are `local_brier_binary`, `local_log_binary`,
-  `local_brier_multiclass` and `local_log_multiclass`; none is a baseline or peer score, and none
-  should be quoted as one. Platform scores are M4-803.
+- **Local scores are not Metaculus scores.** Their metrics are `local_brier_binary`,
+  `local_log_binary`, `local_brier_multiclass` and `local_log_multiclass`; none is a baseline or
+  peer score, and none should be quoted as one.
+- **Platform scores are Metaculus's.** Their metrics are `platform_spot_peer_score` (MiniBench's
+  ranking score), `platform_spot_baseline_score`, `platform_peer_score` and
+  `platform_baseline_score`. Each row says what it is measured against (`comparison_baseline`:
+  `peer` or `baseline`) and where it was read (`implementation_version`
+  `<metric>/metaculus_score_data/1`), and cites the resolution row whose stored response holds
+  it. `show` prints both. There is deliberately no local numeric or discrete score.
 - `not_scorable`: no observation yet, or the latest is `annulled`/`ambiguous`/`withheld`/
-  `unresolved`. `out_of_scope`: numeric and discrete are never scored locally.
+  `unresolved`. `out_of_scope` (the local column only): numeric and discrete are never scored
+  locally.
+- **A resolved observation with no platform scores fails.** `failed: the platform scores cannot
+  be recorded: the observation carries no platform scores` means Metaculus reported the
+  resolution without this account's `score_data`. Every observation seen live has carried it, so
+  this means the platform's payload changed; nothing re-fetches an observation whose resolution
+  has not changed, so raise it rather than wait for it to clear.
 - **A re-resolution adds rows; nothing is overwritten.** Each score row names the resolution
   row it measured (`resolution_event_id`). A record's current score is the rows citing its
   latest resolution.
@@ -595,8 +612,12 @@ interpreter as the tournament poll.
   `result=exit-code exit=N`, and `N` is the exit code of whichever command failed (table
   [above](#exit-codes)). Because the pager throttles to one push per unit per 30 minutes, a
   failure that keeps happening pages once per run, four times a day.
-- **A `withheld` observation does not page.** It exits `0`, by design (step 6), so check the
-  `kind` column in the journal after questions resolve.
+- **A `withheld` observation sends its own alert** (M4-807), not the failure page: step 6 still
+  exits `0` for it, by design. The push reads `whiskeyjack: a posted forecast's resolution is
+  withheld`, names the record and question, and repeats once a day (UTC) for as long as the
+  record's latest observation is `withheld`. The last line of step 6 counts them
+  (`withheld: N`). One is a platform access fact about that question; every resolved record
+  reading `withheld` means the account cannot see its own resolutions (step 6).
 - **The Cup profile is not scheduled.** Its ledger is still at schema 13.
 
 When the push arrives:
