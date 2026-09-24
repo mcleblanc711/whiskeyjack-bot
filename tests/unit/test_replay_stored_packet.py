@@ -98,6 +98,11 @@ AGED_OUT = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 ADVANCE = timedelta(minutes=31)
 
 
+# The order the stored run issued its passes in: the adapter's `_STRATEGIES` before M1-352.
+# The bodies' own `usage.credits` (1, then 5) agree with it.
+_STORED_STRATEGY_ORDER = ("latest news", "news knowledge")
+
+
 def stored_bodies() -> list[dict[str, Any]]:
     """The provider response bodies, in the order AskNews returned them."""
     return [dict(body) for body in _RUN["raw_responses"]]
@@ -166,10 +171,13 @@ class StoredNews:
 
     def search_news(self, **kwargs: Any) -> SearchResponse:
         self.calls += 1
-        # Each strategy replays its own stored body. Indexing rather than cycling: if the
-        # adapter ever asks for more than the run recorded, that is a change in how many
-        # calls one retrieval costs, and it should surface here rather than be papered over.
-        index = (self.calls - 1) % len(self.bodies)
+        # Each strategy replays its own stored body, chosen by the strategy the adapter asked
+        # for. The run recorded the two passes in the adapter's pre-M1-352 order, `latest
+        # news` (1 credit) then `news knowledge` (5 credits). Cycling by call count served the
+        # historical body to the second `latest news` call, which was harmless while AskNews
+        # reservations never settled and is not since M1-336: that call then settled at the
+        # 5 credits a request nobody made would have cost.
+        index = _STORED_STRATEGY_ORDER.index(kwargs["strategy"])
         return SearchResponse.model_validate(self.bodies[index])
 
 

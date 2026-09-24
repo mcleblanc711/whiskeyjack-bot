@@ -14816,3 +14816,15 @@ these maps to *held*, never to a settlement, and each is a unit row:
 
 At the adapter level, a wire `true`, `"3"` or `1.0` is coerced by the SDK before the adapter
 sees it (see Deviation).
+
+**The gate found a test-harness defect that settlement exposed.**
+`tests/unit/test_replay_stored_packet.py`'s `StoredNews` picked the stored 2026-09-08 bodies by
+call count. So the *second* `latest news` call replayed the retired `news knowledge` body,
+which reports 5 credits, and with settlement live it settled at 125000 µUSD. It showed up as the
+positive control's `reserved() == 50_000` reading 150000.
+
+The adapter settled exactly what the response said, and that was correct. The fake was
+answering a strategy nobody had asked for, and the never-settling reservation had hidden it.
+The fake now picks the body by the requested `strategy`, in the stored run's pass order.
+`test_sdk_contract.py` gains the two `research/asknews.py` rows (`__module__`, `__name__`) for
+the classifier's name reads, guarded by the vocabulary-pin test, like `submission_live.py`'s.
