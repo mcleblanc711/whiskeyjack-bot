@@ -187,6 +187,16 @@ _CATEGORY_SUM_TOLERANCE = 1e-6
 # limit: it is what keeps the verification snapshot inside `MAX_BODY_LENGTH` without a second
 # serialization shape, and it refuses a caller mistake (a "distribution" over thousands of
 # categories) before the post. Metaculus multiple-choice questions carry a few dozen.
+#
+# **Deliberately not a generation rule (D47, M1-511).** `forecast/multiple_choice.py` has no
+# such cap, so a 65-option question is forecast, recorded and approved, and refused here.
+# That asymmetry is decided rather than accidental: this number is a serialization budget
+# this module chose, and a cap at generation would refuse to *forecast* a question Metaculus
+# accepted -- losing the attribution record for a budget that belongs to the post path.
+# What generation does refuse before spending is an option count no reply could satisfy at
+# all (M1-512, `multiple_choice.admits_a_distribution`), which is a fact about the rules
+# rather than about this module's snapshot. Pinned by
+# `tests/unit/test_forecast_multiple_choice.py::test_d47_...`.
 _MAX_CATEGORIES = 64
 
 # The longest option label this module will accept, in characters. Two things rest on it,
