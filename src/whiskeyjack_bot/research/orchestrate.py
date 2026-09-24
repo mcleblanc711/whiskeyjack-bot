@@ -60,6 +60,8 @@ from whiskeyjack_bot.metaculus.client import MissingCredentialError
 from whiskeyjack_bot.notify import emit
 from whiskeyjack_bot.questions.model import _CanonicalQuestionBase
 from whiskeyjack_bot.research.asknews import (
+    FAILURE_ADVICE,
+    AskNewsFailure,
     AskNewsRetrieval,
     AskNewsRetrievalError,
     build_asknews_client,
@@ -649,23 +651,24 @@ def retrieve_for_question(
                 # would train the operator to ignore this channel. Only the primary
                 # provider actually failing is an operational condition.
                 #
-                # Read what it can and cannot say. On 2026-09-08 this fired on 3 of the 17
-                # retrievals that exhausted the AskNews quota, the first 62 minutes in,
-                # because `asknews.py` discards the SDK exception rather than inspecting
-                # it: quota exhaustion is currently indistinguishable from a socket reset.
-                # Classifying it is filed separately; this alert says a provider failed and
-                # does not pretend to say why.
+                # Read what it can and cannot say (M1-332). The adapter names the failure
+                # from the exception's CLASS only, and the pinned SDK has no quota class:
+                # a spent quota arrives as a 403, a 429 or an unlisted status. So the body
+                # says "rate limit or quota" where the class cannot tell them apart, and
+                # never claims a quota for certain. On 2026-09-08 the quota ran out and
+                # this alert could only say "a provider failed".
+                failure: AskNewsFailure = (
+                    "transient" if primary.failure is None else primary.failure
+                )
                 emit(
                     "provider_failed",
                     subject=f"{config.retrieval.primary.provider}:{question_id}",
-                    title=f"whiskeyjack: {config.retrieval.primary.provider} failed",
+                    title=f"whiskeyjack: {config.retrieval.primary.provider} failed ({failure})",
                     body=(
                         f"The primary retrieval provider "
                         f"({config.retrieval.primary.provider}) failed on question "
                         f"{question_id}; the run fell back to "
-                        f"{config.retrieval.fallback.provider}. The cause is not recorded "
-                        f"-- a quota exhaustion and a dropped connection look the same "
-                        f"here. Check data/logs/ and the provider dashboard."
+                        f"{config.retrieval.fallback.provider}. {FAILURE_ADVICE[failure]}"
                     ),
                 )
             fallback = _fallback_pass(

@@ -336,6 +336,11 @@ def test_correct_costs_is_a_dry_run_until_applied_then_idempotent(case: Any) -> 
         "already_corrected": 0,
         "refused_no_upstream_figure": 3,
         "written": 0,
+        # M1-336's AskNews pass: no AskNews reservation in this journal.
+        "asknews_settlements": 0,
+        "asknews_total_usd": 0.0,
+        "asknews_refused_no_credits": 0,
+        "asknews_written": 0,
     }
     assert [c.reservation_id for c in dry.corrections] == [byok]
     assert _corrected(conn) == 0 and spending(conn, SCOPE) == before

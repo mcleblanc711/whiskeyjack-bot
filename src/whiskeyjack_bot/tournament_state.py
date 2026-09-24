@@ -374,11 +374,13 @@ def require_spending_clear(conn: sqlite3.Connection, scope: str) -> None:
         )
 
 
-# Where a settled model cost came from (M1-348). `openrouter` is `usage.cost`, what
-# OpenRouter bills; `upstream_byok` is `usage.cost_details.upstream_inference_cost`, what the
-# upstream provider bills a bring-your-own-key call. On a BYOK call `usage.cost` is 0: the
-# charge lands on the owner's own key, so reading it settled every GPT-6 Astra call as free.
-CostBasis = Literal["openrouter", "upstream_byok"]
+# Where a settled cost came from. `openrouter` is `usage.cost`, what OpenRouter bills;
+# `upstream_byok` is `usage.cost_details.upstream_inference_cost`, what the upstream provider
+# bills a bring-your-own-key call (M1-348). On a BYOK call `usage.cost` is 0: the charge lands
+# on the owner's own key, so reading it settled every GPT-6 Astra call as free.
+# `asknews_credits` is an AskNews response's `usage.credits` at the per-credit rate in
+# `research/asknews_cost.py` (M1-336): AskNews reports credits, never dollars.
+CostBasis = Literal["openrouter", "upstream_byok", "asknews_credits"]
 
 
 def _microusd(usd: float) -> int | None:
@@ -442,13 +444,30 @@ class CostCorrection:
 
 
 @dataclass(frozen=True)
+class AskNewsSettlement:
+    """One held AskNews reservation whose stored response carries its ``usage.credits``."""
+
+    scope: str
+    reservation_id: str
+    actual_microusd: int
+
+
+@dataclass(frozen=True)
 class CorrectionReport:
-    """What ``tournament correct-costs`` found, and (with ``--apply``) wrote."""
+    """What ``tournament correct-costs`` found, and (with ``--apply``) wrote.
+
+    Two passes. M1-348's corrects a model reservation settled at 0 whose response carries
+    an upstream BYOK figure (``cost_corrected``). M1-336's settles a *held* AskNews
+    reservation from its stored response's ``usage.credits`` (``cost_settled``).
+    """
 
     corrections: tuple[CostCorrection, ...]
     already_corrected: int
     refused: int
     written: int
+    asknews: tuple[AskNewsSettlement, ...] = ()
+    asknews_refused: int = 0
+    asknews_written: int = 0
 
     def as_dict(self, *, applied: bool) -> dict[str, Any]:
         return {
@@ -458,6 +477,10 @@ class CorrectionReport:
             "already_corrected": self.already_corrected,
             "refused_no_upstream_figure": self.refused,
             "written": self.written,
+            "asknews_settlements": len(self.asknews),
+            "asknews_total_usd": sum(a.actual_microusd for a in self.asknews) / 1_000_000,
+            "asknews_refused_no_credits": self.asknews_refused,
+            "asknews_written": self.asknews_written,
         }
 
 
@@ -491,15 +514,7 @@ def correct_costs(conn: sqlite3.Connection, *, apply: bool = False) -> Correctio
     new. A reservation settled at 0 with no valid upstream figure is counted as refused and
     never written: a correction only ever records a figure the provider reported.
     """
-    try:
-        rows = [
-            (row[0], json.loads(row[1]))
-            for row in conn.execute(
-                "SELECT scope,data FROM tournament_events WHERE kind='cost_settled' ORDER BY seq"
-            )
-        ]
-    except (sqlite3.Error, ValueError):
-        raise StorageFailure("cannot read tournament journal") from None
+    rows = _journal_rows(conn, "cost_settled")
     corrections: list[CostCorrection] = []
     seen: set[str] = set()
     already = refused = 0
@@ -536,7 +551,97 @@ def correct_costs(conn: sqlite3.Connection, *, apply: bool = False) -> Correctio
                 )
                 append(conn, "cost_corrected_id", correction.reservation_id, {})
                 written += 1
-    return CorrectionReport(tuple(corrections), already, refused, written)
+    settlements, asknews_refused = _asknews_settlements(conn)
+    asknews_written = 0
+    if apply:
+        for settlement in settlements:
+            with storage_transaction(conn):
+                if events(conn, "cost_settled_id", settlement.reservation_id):
+                    continue
+                append(
+                    conn,
+                    "cost_settled",
+                    settlement.scope,
+                    {
+                        "reservation_id": settlement.reservation_id,
+                        "actual_microusd": settlement.actual_microusd,
+                        "basis": "asknews_credits",
+                        "backfilled": True,
+                    },
+                )
+                append(conn, "cost_settled_id", settlement.reservation_id, {})
+                asknews_written += 1
+    return CorrectionReport(
+        tuple(corrections),
+        already,
+        refused,
+        written,
+        settlements,
+        asknews_refused,
+        asknews_written,
+    )
+
+
+def _journal_rows(conn: sqlite3.Connection, kind: str) -> list[tuple[Any, Any]]:
+    """Every ``(scope, data)`` of one kind, in journal order."""
+    try:
+        return [
+            (row[0], json.loads(row[1]))
+            for row in conn.execute(
+                "SELECT scope,data FROM tournament_events WHERE kind=? ORDER BY seq", (kind,)
+            )
+        ]
+    except (sqlite3.Error, ValueError):
+        raise StorageFailure("cannot read tournament journal") from None
+
+
+def _asknews_settlements(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[AskNewsSettlement, ...], int]:
+    """Every held AskNews reservation with a stored credit count, and how many had none (M1-336).
+
+    Before M1-336 no AskNews reservation settled, so each was held at its full estimate for
+    good. The response that billed it is already in the journal: ``retrieval_started`` names
+    the reservation and its call scope, and that scope's ``retrieval_completed`` holds the
+    response, ``usage.credits`` included. This reads only the journal -- no network call --
+    and converts with the same :func:`credits_microusd` the adapter settles with today, so a
+    back-filled settlement is exactly the one a live call would have written.
+
+    Refused, and left held: a reservation with no single ``retrieval_started`` naming it, a
+    call scope without exactly one ``retrieval_completed`` (the outcome is unknown), or a
+    response whose credit count is missing or malformed. Unknown is never free.
+    """
+    from whiskeyjack_bot.research.asknews_cost import credits_microusd
+
+    started: dict[str, list[str]] = {}
+    for scope, data in _journal_rows(conn, "retrieval_started"):
+        identifier = data.get("reservation_id") if type(data) is dict else None
+        if type(scope) is str and type(identifier) is str:
+            started.setdefault(identifier, []).append(scope)
+    found: list[AskNewsSettlement] = []
+    seen: set[str] = set()
+    refused = 0
+    for scope, data in _journal_rows(conn, "cost_reserved"):
+        identifier = data.get("reservation_id") if type(data) is dict else None
+        if type(scope) is not str or type(identifier) is not str:
+            raise StorageFailure("cannot read tournament spending")
+        if data.get("provider") != "asknews" or identifier in seen:
+            continue
+        seen.add(identifier)
+        if events(conn, "cost_settled_id", identifier):
+            continue
+        calls = started.get(identifier, [])
+        completed = events(conn, "retrieval_completed", calls[0]) if len(calls) == 1 else []
+        amount = (
+            credits_microusd(completed[0].get("response"))
+            if len(completed) == 1 and type(completed[0]) is dict
+            else None
+        )
+        if amount is None:
+            refused += 1
+            continue
+        found.append(AskNewsSettlement(scope, identifier, amount))
+    return tuple(found), refused
 
 
 @dataclass
@@ -589,9 +694,10 @@ class Budget:
                     title=f"whiskeyjack: budget at {crossed}%",
                     body=(
                         f"Spending for {self.scope} has reached {crossed}% of its "
-                        f"activation ceiling. Reserved spend counts toward this and "
-                        f"AskNews reservations never settle, so this tracks what will "
-                        f"stop the worker, not what has been billed. "
+                        f"activation ceiling. Reserved spend counts toward this -- a "
+                        f"call whose cost is not yet known is held at its full estimate "
+                        f"-- so this tracks what will stop the worker, not only what has "
+                        f"been billed. "
                         + (
                             "The ceiling is reached: paid calls are being refused."
                             if crossed == 100
@@ -627,6 +733,19 @@ class Budget:
             return
         amount = _microusd(actual)
         if amount is None:
+            return
+        self.settle_microusd(identifier, amount, basis=basis)
+
+    def settle_microusd(
+        self, identifier: str, amount: int, *, basis: CostBasis | None = None
+    ) -> None:
+        """Settle a reservation at an exact micro-USD figure (M1-336).
+
+        For a provider whose bill is an integer count at a fixed rate (AskNews credits), a
+        float dollar round trip is not exact: ``ceil(0.075 * 1e6)`` is 75001. Refuses (leaves
+        the reservation held) anything but an exact non-negative ``int``.
+        """
+        if type(amount) is not int or amount < 0:
             return
         with storage_transaction(self.conn):
             # Recovery may reach this after completion was committed but settlement

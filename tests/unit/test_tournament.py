@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -1416,8 +1417,10 @@ def test_a_reservation_that_crosses_a_budget_level_pushes_from_inside_the_poll(
         crossed = pushes.matching("budget at")
         assert len(crossed) == 1
         assert "50%" in crossed[0]["title"]
-        # Never settled and still counted: that is the whole point of the field choice.
-        assert "never settle" in crossed[0]["body"]
+        # Held and still counted: that is the whole point of the field choice. (It used to
+        # say AskNews never settles; since M1-336 it does, and a held estimate is the
+        # general case the body describes.)
+        assert "held at its full estimate" in crossed[0]["body"]
 
         # The refusal itself is the alert an operator most needs, and it is only
         # reachable on the raising path.
@@ -1535,10 +1538,48 @@ def test_a_primary_provider_failure_pushes_provider_failed(
     failures = loud.matching("failed")
     assert len(failures) == 1
     assert "asknews" in failures[0]["title"]
-    # It says a provider failed and does not pretend to know why: on 2026-09-08 this same
-    # code path saw a quota exhaustion and a dropped connection as the same event, because
-    # `asknews.py` discards the SDK exception rather than inspecting it.
-    assert "the cause is not recorded" in failures[0]["body"].lower()
+    # A class the adapter does not recognize is `transient`, and the body does not pretend
+    # to know more (M1-332): never a quota claim for what may be a dropped socket.
+    assert "(transient)" in failures[0]["title"]
+    assert "not known beyond that" in failures[0]["body"]
+    assert "quota" not in failures[0]["body"].lower()
+
+
+def test_a_rate_limit_response_is_named_in_the_provider_failed_push(
+    case: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M1-332: an SDK 429 names the rate-limit-or-quota class, and nothing of its text.
+
+    The real SDK class, raised the way ``raise_from_response`` raises it, with a sentinel
+    in every field an exception carries: the detail, the code the response supplied, and
+    the response object. None of them may reach the push.
+    """
+    from asknews_sdk.errors import RateLimitExceededError
+
+    caplog.set_level(logging.DEBUG)
+    conn, config, _platform, news, _model = case
+    sentinel = "SENTINEL-quota-body-0001"
+
+    def limited(**kwargs: Any) -> Any:
+        news.calls += 1
+        raise RateLimitExceededError(sentinel, sentinel, 429000)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(news, "search_news", limited)
+    loud = _recording(monkeypatch, config)
+    poll(case)
+
+    (failure,) = loud.matching("failed")
+    assert "(rate_or_quota_limited)" in failure["title"]
+    assert "quota" in failure["body"] and "HTTP 429" in failure["body"]
+    assert sentinel not in json.dumps(failure)
+    # It reaches the run row too, and nothing of the exception reaches any stored row.
+    summaries = [
+        row[0]
+        for row in conn.execute("SELECT error_summary FROM research_runs WHERE provider='asknews'")
+    ]
+    assert summaries and all("(rate_or_quota_limited)" in text for text in summaries)
+    assert sentinel not in "\n".join(conn.iterdump())
+    assert sentinel not in caplog.text
 
 
 def test_a_named_source_fallback_pushes_nothing(case: Any, monkeypatch: pytest.MonkeyPatch) -> None:

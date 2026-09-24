@@ -110,6 +110,11 @@ THIRD_PARTY_REACHES: dict[tuple[str, str], str] = {
         "tests/unit/test_metaculus_poster.py::test_the_error_vocabulary_is_pinned_to_the_"
         "real_classes"
     ),
+    ("research/asknews.py", "__module__"): (
+        "tests/unit/test_asknews_settlement.py::test_the_vocabulary_is_pinned_against_the_"
+        "real_sdk_classes (M1-332: classify_failure matches asknews_sdk.errors by name)"
+    ),
+    ("research/asknews.py", "__name__"): "same",
     ("submission_live.py", "__cause__"): (
         "tests/unit/test_metaculus_poster.py::test_the_http_status_is_recoverable_through_"
         "the_cause_chain"

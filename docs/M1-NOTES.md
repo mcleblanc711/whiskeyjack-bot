@@ -14524,3 +14524,307 @@ the one reached. The two properties assert their own reach:
   a required gate. The schema run now asserts ≥ 150 of 300 (measured 270–277). The post-schema
   run plants free text only where the schema admits it, which is derived by trying each path,
   with the prediction out of bounds, and asserts ≥ 50 of 100 (measured 100).
+
+## M1-336 (+M1-337, M1-332) — AskNews cost accounting truth
+
+Wave 23 close-out, PR-4. The branch is named for the lead item under D39's bundling
+convention. The theme: what AskNews costs is recorded as it was billed, and when an AskNews call
+fails, the alert says what the exception's class can tell. **None of the three**: no
+`config/*.yaml` byte, no `AppConfig` field, no prompt byte. The rate is a module constant (D41).
+No migration: `cost_settled` is an existing journal kind, and its `data` gains a `basis` member
+and, on a back-filled row, `backfilled: true`. `docs/SCHEMA.md` lists journal kinds, not their
+`data` shapes, so it does not change.
+
+### Measured first: settling does not raise "remaining"
+
+The brief expected that settling AskNews would free budget: "the guard's 'remaining' is
+understated by roughly [the held amount]". **That does not reproduce.** Read-only against the
+live ledger on 2026-09-24, before any code:
+
+- all 135 stored AskNews responses carry `usage.credits`: 70 read 1 and 65 read 5;
+- every count equals what was reserved for the call (1 credit for `latest news`, 5 for the
+  retired `news knowledge` pass): **0 mismatches**;
+- one AskNews reservation in 33125 has no `retrieval_completed`, so its outcome is unknown.
+
+At the owner-confirmed $0.025 per credit, the estimate *was* the bill. Settling moves $6.275
+from *held* to *actual* in the live 33125 scope and leaves *remaining* at $24.20. Before this
+PR the guard had the total right and the split wrong. Measured on a copy of the live ledger with
+this branch's `correct-costs --apply`: actual $9.302756 → $15.577756 and held $6.500000 →
+$0.225000 (the one unknown AskNews call plus four Exa holds). A second run writes 0.
+
+The measurement also corrects the reading in `docs/RETRIEVAL-PROVIDER-COMPARISON.md` (and the
+`asknews-never-settles` note) that AskNews's 74% share was "an accounting artifact". At the PAYG
+rate it was the real charge. What was an artifact is that the ledger could not *show* it as
+spent.
+
+### M1-336 — Settle AskNews spend from `usage.credits`
+
+#### Decision — integer micro-USD, never a float dollar
+
+`research/asknews_cost.py` holds `MICROUSD_PER_CREDIT = 25_000` and converts
+`credits * MICROUSD_PER_CREDIT` in integers. The obvious float spelling is wrong:
+`math.ceil(3 * 0.025 * 1_000_000)` is **75001**. Measured over counts 0..100000, 35,044 misround
+that way, always up by one micro-USD, and 1,591 still misround after an exact division back to
+dollars. The owner's table has a 3-credit endpoint (autofilter), so this is not hypothetical. A
+settlement must be exactly what the provider's figure implies. So `Budget.settle_microusd` takes
+an exact `int`, `Budget.settle` delegates to it after its own float conversion, and
+`complete_call` gains `actual_microusd=`.
+
+#### Decision — the settlement is derived from the stored response, not stored beside it
+
+AskNews passes `actual_microusd=credits_microusd(raw)` to `complete_call`, and the figure is not
+written onto `retrieval_completed`, whose `actual_cost` stays `None` for AskNews. The response
+row already carries `usage.credits`, and there are three readers:
+- the live call;
+- recovery, where the cached path re-enters `complete_call` with the stored response;
+- the back-fill.
+
+All three call the one function on the same stored bytes. A second stored figure would be a
+second source of truth (the M2-703 lesson). `begin_call`'s recovery branch still settles from
+`actual_cost` first, which is `None` for AskNews and so a no-op, then the adapter settles from
+the response.
+
+#### Decision — `credits_microusd` accepts only an exact int in `[0, 10**6]`
+
+`bool` is an `int` subclass, and `True` would read as one credit. Floats, strings, negatives, a
+missing key, a missing or non-object `usage`, and anything above `MAX_CREDITS` all return
+`None`, and the reservation stays held at its full estimate. Unknown is never free (the M1-348
+rule). The cap is far above any real call (the owner's most expensive endpoint is 15 credits)
+and keeps an absurd provider number out of the budget arithmetic. **Zero credits settles at
+zero**: it is a figure the provider reported, the same way M1-348 settles a real non-BYOK
+`cost: 0`.
+
+#### Decision — `CostBasis` gains `asknews_credits`
+
+It is recorded on every AskNews `cost_settled` row, live and back-filled, so a settlement says
+where its figure came from (the brief asked for "an AskNews basis"). `priced.py` compares only
+against `upstream_byok`/`openrouter` and is unaffected.
+
+#### Decision — `correct-costs` back-fills the held reservations (owner decision 2026-09-24)
+
+`tournament correct-costs` gains a second pass. For every `cost_reserved` row with
+`provider == "asknews"` and no `cost_settled_id`, it:
+1. finds the one `retrieval_started` that names the reservation, which gives the call scope;
+2. requires exactly one `retrieval_completed` in that scope;
+3. converts that response with `credits_microusd`.
+
+It appends `cost_settled` in the reservation's own budget scope, with
+`basis: asknews_credits` and `backfilled: true`, plus the `cost_settled_id` guard. The guard is
+re-checked inside the writing transaction, so a second run, or two at once, writes nothing.
+It is dry-run by default and makes no network call.
+
+It writes `cost_settled`, not `cost_corrected`, because there is no settlement to correct. The
+row is exactly what the live path would have written, plus the `backfilled` flag, so the record
+shows that it was written late. The report gains `asknews_settlements`, `asknews_total_usd`,
+`asknews_refused_no_credits` and `asknews_written`, and M1-348's keys are unchanged.
+
+#### Deviation
+
+- **What "remaining" does after the back-fill.** The brief expected it to rise; it doesn't (see
+  the measurement). The AC ("`spending()` reports actual rather than held") is met exactly.
+- The AC says the credit count is converted "to dollars". It is converted to micro-USD, which is
+  the ledger's own unit (`actual_microusd`); dollars appear only in `tournament status`.
+
+#### Rejected
+
+- **A float rate** (`0.025`): see the rounding decision.
+- **Storing the converted figure on `retrieval_completed`**: a second source of truth for a
+  number the stored response already determines.
+- **Settling a malformed count at the estimate**: that would be the same figure as the hold,
+  but it would write it down as *known*. The hold is the honest state for an unknown.
+- **Refusing a wire `true`, `"3"` or `1.0`**: the pinned SDK's `SearchResponse` validates the
+  body in lax mode and coerces all three to ints before the adapter sees them. Refusing them
+  would need the raw HTTP body, which the SDK does not expose. A negative or absurd count
+  survives the SDK and is refused here. `1.5` and NaN fail the SDK's own validation, so the call
+  raises (a `provider_failed`, counted as billed) and its reservation stays held.
+  `test_the_adapter_settles_what_the_sdk_parsed_not_the_wire` pins all of this.
+
+#### Deferred (do not read the absence as an omission)
+
+- **`research_runs.cost_usd` stays `None` when calls were made.** The AC is about the journal.
+  Summing settled credits onto the run row would make it a second record of the same spend,
+  and the run row predates the journal's recovery semantics.
+- **D43 still stands.** This PR does not make journal cost attributable per record:
+  reservations are scoped `account:tournament`, and a retrieval's reservation is not tied to a
+  `forecast_records` row. D43's revisit trigger is not met, and the report keeps reading
+  `forecast_records.cost_usd` only.
+- **Moving the rate to configuration** is M1-353 (Deferred until 33125 ends).
+- **`Budget.reserve` still takes a float dollar estimate.** For the one AskNews estimate
+  (1 credit), `ceil(0.025e6)` is exactly 25000, and a test pins it. A future multi-credit
+  estimate could round *up* by one micro-USD, which is the conservative direction for a
+  reservation.
+
+#### Standing risk — not verifiable offline
+
+- The first live settlement. Its expected shape is one `cost_settled` row per AskNews call,
+  with `basis: asknews_credits`, 25000 µUSD for a 1-credit news search, and held falling by the
+  same amount. This is checked after the deploy.
+- The rate itself. $0.025 is the owner-confirmed PAYG rate. If the account moves to a plan with
+  a different effective rate, the settlements are off by that ratio until M1-353.
+
+### M1-337 — The estimate is credits × rate
+
+#### Decision — one estimate, `NEWS_CALL_ESTIMATE_USD = CREDITS_PER_NEWS_CALL * MICROUSD_PER_CREDIT / 10**6`
+
+The dead `0.125 if historical else 0.025` branch is gone. M1-352 retired the historical pass, so
+the branch could only ever take its `0.025` arm. `_STRATEGY_HISTORICAL` stays defined, because
+stored runs name it and `replay` reads them.
+
+#### Deviation
+
+The original AC asked for a *configured* rate and a test that "the historical call reserves
+exactly five times the news call". D41 makes the rate a constant, and M1-352 removed the
+historical call, so that test would pin a call that is no longer made. The replacement, as the
+brief directs:
+- `estimate_microusd == CREDITS_PER_NEWS_CALL * MICROUSD_PER_CREDIT`, with the owner's figures
+  (25000, 1) written out in the test rather than read back from the module;
+- an AST check that `asknews.py` holds no float literal except the `0.0` of an uncalled run's
+  `cost_usd`.
+
+#### Rejected / Deferred
+
+- **Per-endpoint credit constants for endpoints we do not call** (archive 5, wiki 1,
+  autofilter 3, graph 15). Only the news search is issued. A constant for a call nobody makes is
+  the dead branch this item deletes.
+
+### M1-332 — Name an AskNews failure from its class
+
+#### Decision — an honest vocabulary, not a quota detector (D44, owner decision 2026-09-24)
+
+The pinned SDK (asknews 0.13.54) has **no quota class**. `raise_from_response` raises one of
+`ErrorMap`'s classes, keyed on a numeric `code` copied from the response body, or the base
+`APIError` for any status the map does not list (a 402 among them). So a spent quota arrives as
+`ForbiddenError`, `RateLimitExceededError` or `APIError`, and only `exc.code` could tell which.
+The AC forbids reading anything that could carry response content, and AskNews publishes no code
+table (its rate-limiting page lists none, checked 2026-09-24). The vocabulary therefore names what
+the class *can* establish:
+
+| Class (module `asknews_sdk.errors` unless noted) | `AskNewsFailure` |
+| --- | --- |
+| `RateLimitExceededError`, `ConcurrencyLimitExceededError` | `rate_or_quota_limited` |
+| `ForbiddenError` | `forbidden_or_quota` |
+| `UnauthorizedError` | `auth_rejected` |
+| `BadRequestError`, `ResourceNotFoundError`, `MethodNotAllowed`, `ValidationError` | `request_rejected` |
+| `RequestTimeoutError`, `ServiceUnavailableError`, `httpx.TimeoutException` | `provider_unavailable` |
+| `APIError` (the base: a 5xx or an unlisted status) | `provider_error` |
+| anything else (connection errors, a same-named class elsewhere, unknown classes) | `transient` |
+
+The table is a partition. `test_every_class_the_sdk_raises_from_a_response_is_named` checks it
+against `ErrorMap`, and a module-level assertion checks that every Literal member is reachable.
+
+#### Decision — how it matches
+
+`classify_failure` walks `type(exc).__mro__`, most specific first, and matches
+`(__module__, __name__)` pairs against the table. It imports nothing to classify, the way
+`submission_live.classify_error` matches `requests`. The MRO walk resolves an SDK subclass the
+pinned version does not have to its nearest named ancestor. The module check keeps a same-named
+exception from anywhere else unmatched. It reads nothing else off the exception: not `str()`,
+`args`, `detail`, `code` or `response`. `test_the_classifier_reads_nothing_off_the_exception_but_its_type`
+makes each of those raise if touched.
+
+#### Decision — where the name goes
+
+- `AskNewsRetrieval.failure` holds it. It is set exactly when `provider_failed` is.
+- `research_runs.error_summary` names it, built from constants:
+  `provider call failed (rate_or_quota_limited); retrieval stopped early`. Exa's identical
+  string is untouched.
+- The `provider_failed` push carries it. The title ends `(<failure>)`, and the body ends with a
+  constant `FAILURE_ADVICE` sentence. That sentence mentions a quota only for the three classes
+  that cannot rule one out, and always hedges: "if the first call of every question keeps
+  failing this way, check the plan's remaining credits".
+- The subject, and so the throttle key, is unchanged.
+
+#### Deviation
+
+The AC asks for the notify body to name "quota exhaustion as such". Under D44 it names "a
+rate-limit response … or a spent plan quota" instead. It never says a quota *is* spent, because
+the class cannot establish that.
+
+#### Rejected
+
+- **Reading `exc.code`** (403011/403012 as quota): it is copied from the response body, and the
+  mapping would be a guess.
+- **A `quota_exhausted` member reached by class name alone**: it would label every 403 and 429
+  a quota.
+- **Deferring M1-332**: the honest vocabulary is strictly more than today's single string, and
+  with M1-349 live a spent quota turns into evidence-poor forecasts, so seeing it matters now.
+
+#### Deferred / Standing risk — not verifiable offline
+
+- **Which class a real quota exhaustion raises.** The 2026-09-08 exhaustion was discarded
+  unread. The first live one names its class in `error_summary` and the push, which is D44's
+  revisit trigger.
+- **A connection error during exhaustion** reads `transient`. That is correct for what the
+  class says, but it will not hint at a quota.
+
+### Property reach and the mutation pass (M1-336/337/332)
+
+**Reach is measured, not assumed.** Each strategy asserts its own reach in a test:
+- `RESPONSE`: settles 144/400, nonzero 130, a `bool` count ≥ 5, out-of-range ints 33.
+- `EXCEPTIONS`: every Literal member ≥ 21/400, same-named lookalikes 137, own class overriding
+  its base 41.
+- The ledger strategy: a settlement in 118/150 draws, mixed settle/refuse 96, both scopes
+  settled at once 36.
+
+The first cut measured 76/400 settles and 3–11 two-scope draws. The two-scope count **moved
+between runs under `derandomize=True`**, because Hypothesis seeds part of its generation from
+constants in the loaded modules. So the live shape is weighted in by an explicit
+`st.integers(k).flatmap` pick (the M1-348 lesson: `one_of` does not weight by repetition).
+
+**Mutants.** Each was run after committing, with `__pycache__` cleared, against the new unit and
+property files plus the two `provider_failed` push tests and `test_byok_cost.py`. The baseline
+was confirmed by exit code.
+
+| Mutant | Result |
+| --- | --- |
+| float rate (`ceil(c*0.025*1e6)`) | killed |
+| `isinstance` admits `bool` | killed |
+| negatives admitted | killed |
+| upper bound dropped | killed |
+| falsy-`usage` check instead of `type is dict` | killed |
+| unknown settles 0 (`or 0`) | killed |
+| adapter never settles | killed |
+| `basis=None` | killed |
+| estimate literal `0.03` | killed |
+| `complete_call` ignores the exact figure | killed |
+| `settle_microusd` guard removed | **survived, then killed**: no caller could reach it; `test_settle_microusd_refuses_anything_but_an_exact_non_negative_int` added |
+| back-fill: no in-transaction guard re-check | killed |
+| back-fill: no plan-time guard | killed |
+| back-fill: any provider | killed |
+| back-fill: settles in the call scope | killed |
+| back-fill: ≥ 1 completion accepted | killed |
+| back-fill: `completed[-1]` for `[0]` | **equivalent**: the guard requires exactly one completion |
+| back-fill: `backfilled` flag dropped | killed |
+| back-fill: guard row not written | killed |
+| classifier ignores `__module__` | killed |
+| classifier default → `forbidden_or_quota` | killed |
+| classifier reads its own class only | killed |
+| classifier walks the MRO last-first | killed |
+| httpx timeout row dropped | killed |
+| classifier reads `str(exc)` | killed |
+| `error_summary` unnamed | killed |
+| failure not recorded | killed |
+| orchestrate always `transient` | killed |
+
+**The FAILED table**, meaning the malformed shapes a "quiet" branch must not swallow. Each of
+these maps to *held*, never to a settlement, and each is a unit row:
+- no `usage` block;
+- `usage: null`;
+- `usage` that is a list;
+- `credits` that is missing, `null`, a float, an integral float, NaN, a string, `true`, negative,
+  or above `10**6`.
+
+At the adapter level, a wire `true`, `"3"` or `1.0` is coerced by the SDK before the adapter
+sees it (see Deviation).
+
+**The gate found a test-harness defect that settlement exposed.**
+`tests/unit/test_replay_stored_packet.py`'s `StoredNews` picked the stored 2026-09-08 bodies by
+call count. So the *second* `latest news` call replayed the retired `news knowledge` body,
+which reports 5 credits, and with settlement live it settled at 125000 µUSD. It showed up as the
+positive control's `reserved() == 50_000` reading 150000.
+
+The adapter settled exactly what the response said, and that was correct. The fake was
+answering a strategy nobody had asked for, and the never-settling reservation had hidden it.
+The fake now picks the body by the requested `strategy`, in the stored run's pass order.
+`test_sdk_contract.py` gains the two `research/asknews.py` rows (`__module__`, `__name__`) for
+the classifier's name reads, guarded by the vocabulary-pin test, like `submission_live.py`'s.
