@@ -1026,6 +1026,8 @@ def run_once(
                     payload=authorized.payload,
                     poster=poster,
                     occurred_at=utcnow(),
+                    # M1-508/D45: the percentile values the posted CDF was built from.
+                    conversion=authorized.conversion,
                 )
                 if result.artifact_error:
                     raise StorageFailure("submission artifact failed; worker stopped")

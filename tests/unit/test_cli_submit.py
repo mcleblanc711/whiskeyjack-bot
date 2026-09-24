@@ -797,3 +797,65 @@ def isolate_activation_policy_for_gateway_tests(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
     )
+
+
+def _spy_on_the_conversion(monkeypatch: pytest.MonkeyPatch) -> tuple[list[Any], object]:
+    """M1-508: make the derived conversion record a sentinel and capture what the post gets.
+
+    The binary record here has no conversion of its own, and a record for a binary post is
+    refused, so the spy hands the real post ``None`` after capturing the argument. What is
+    asserted is only the wiring -- that the CLI passes what the derivation produced.
+    """
+    import dataclasses
+
+    import whiskeyjack_bot.submission_live as live
+    import whiskeyjack_bot.submission_payload as derivation
+
+    sentinel = {"sentinel": "m1-508"}
+    real_derive = derivation.authorized_payload
+    monkeypatch.setattr(
+        derivation,
+        "authorized_payload",
+        lambda record, *, calibration: dataclasses.replace(
+            real_derive(record, calibration=calibration), conversion=sentinel
+        ),
+    )
+    seen: list[Any] = []
+    real_post = live.post_approved_forecast
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("conversion", "argument not passed"))
+        return real_post(*args, **{**kwargs, "conversion": None})
+
+    monkeypatch.setattr(live, "post_approved_forecast", spy)
+    return seen, sentinel
+
+
+def test_a_derived_payload_carries_its_conversion_record_to_the_post(
+    config_file: Path, record_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen, sentinel = _spy_on_the_conversion(monkeypatch)
+    _install(monkeypatch, FakePoster())
+    assert main(["submit", "--config", str(config_file), "--record-id", record_id]) == EXIT_OK
+    assert seen == [sentinel]
+
+
+def test_a_supplied_payload_carries_no_conversion_record(
+    config_file: Path, record_id: str, payload_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file carries no record of how its CDF was built, so none is claimed."""
+    seen, _ = _spy_on_the_conversion(monkeypatch)
+    _install(monkeypatch, FakePoster())
+    exit_code = main(
+        [
+            "submit",
+            "--config",
+            str(config_file),
+            "--record-id",
+            record_id,
+            "--payload-file",
+            str(payload_file),
+        ]
+    )
+    assert exit_code == EXIT_OK
+    assert seen == [None]

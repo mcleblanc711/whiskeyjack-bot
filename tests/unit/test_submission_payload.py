@@ -658,3 +658,74 @@ def test_only_the_payload_the_record_derives_can_reach_a_submission_key(tmp_path
             )
     finally:
         connection.close()
+
+
+# --- M1-508 (D45): what the posted CDF was built from travels with the payload --------
+
+
+def _tied_numeric_record() -> ForecastRecord:
+    """The prompt's numeric example with its first two values tied, inside closed bounds --
+    a reply that followed the prompt ("non-decreasing") and that the pinned SDK rewrites."""
+    values = (10.0, 10.0, 14.0, 18.0, 24.0, 31.0, 38.0, 42.0, 50.0)
+    return _numeric_record(
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": value}
+                for level, value in zip(DECLARED_PERCENTILE_LEVELS, values, strict=True)
+            ]
+        }
+    )
+
+
+def test_a_tie_is_recorded_as_the_values_the_sdk_actually_used() -> None:
+    """D45's recording branch, by execution against the pinned SDK.
+
+    The conversion record differs from the declared percentiles exactly where the tie was
+    -- at *both* tied positions, each nudged down by a different amount, which is how the
+    SDK turns a repeat into a strictly increasing pair (executed on 0.2.92: ``10.0, 10.0``
+    became ``9.99999901, 9.99999905``) -- and nowhere else; the levels are unchanged.
+    Asserted against the declared values the record stores rather than the transcribed
+    nudge, so a pin move that changed the size of the rewrite fails only the golden that
+    freezes it.
+    """
+    record = _tied_numeric_record()
+    authorized = authorized_payload(record, calibration=CALIBRATION)
+    assert authorized.conversion is not None
+    assert authorized.conversion["adjusted"] is True
+    used = authorized.conversion["percentiles_used"]
+    declared = [
+        [point.percentile, point.value]
+        for point in record.forecast.final_prediction.percentiles  # type: ignore[union-attr]
+    ]
+    assert isinstance(used, list) and len(used) == len(declared)
+    moved = [index for index, (u, d) in enumerate(zip(used, declared, strict=True)) if u != d]
+    assert moved == [0, 1]
+    assert [point[0] for point in used] == [point[0] for point in declared]  # levels stay
+    assert used[0][1] < used[1][1] < declared[1][1]  # strictly increasing, nudged downward
+
+
+def test_an_untied_forecast_records_that_nothing_was_adjusted() -> None:
+    """``adjusted: false`` is written, not omitted, so absence can only mean "not derived"."""
+    record = _numeric_record()
+    authorized = authorized_payload(record, calibration=CALIBRATION)
+    assert authorized.conversion is not None
+    assert authorized.conversion["adjusted"] is False
+    assert authorized.conversion["percentiles_used"] == [
+        [point.percentile, point.value]
+        for point in record.forecast.final_prediction.percentiles  # type: ignore[union-attr]
+    ]
+
+
+def test_the_conversion_record_is_outside_what_an_approval_binds() -> None:
+    """The digest an approval stores is unchanged by the new field: it is taken over the
+    payload's canonical bytes, which the conversion record is not part of."""
+    record = _tied_numeric_record()
+    authorized = authorized_payload(record, calibration=CALIBRATION)
+    assert "percentiles_used" not in authorized.canonical
+    assert authorized.sha256 == payload_sha256(authorized.payload)
+    assert authorized.sha256 == payload_sha256_for_record(record, calibration=CALIBRATION)
+
+
+def test_only_a_bounded_type_carries_a_conversion_record() -> None:
+    assert authorized_payload(_binary_record(), calibration=CALIBRATION).conversion is None
+    assert authorized_payload(_multiple_choice_record(), calibration=CALIBRATION).conversion is None

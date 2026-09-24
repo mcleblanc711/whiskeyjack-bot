@@ -1966,3 +1966,151 @@ def isolate_activation_policy_for_gateway_tests(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         "whiskeyjack_bot.submission_live.prepare_live_policy", lambda *a, **kw: None
     )
+
+
+# ── M1-508 (D45): what a posted CDF was built from, written beside it ─────────
+
+
+def _approved_numeric(ledger: sqlite3.Connection, values: tuple[float, ...]) -> Any:
+    """A numeric record approved for posting, with the given nine declared values."""
+    from whiskeyjack_bot.forecast.numeric import DECLARED_PERCENTILE_LEVELS
+    from whiskeyjack_bot.questions.model import CanonicalNumericQuestion
+
+    shared = json.loads(_json_block("Shared fields"))
+    forecast = _response(
+        question_type="numeric",
+        model_prior=None,
+        base_rate={**shared["base_rate"], "prior_probability": None},
+        final_prediction={
+            "percentiles": [
+                {"percentile": level, "value": value}
+                for level, value in zip(DECLARED_PERCENTILE_LEVELS, values, strict=True)
+            ]
+        },
+    )
+    question = CanonicalNumericQuestion(
+        question_id=QUESTION_ID,
+        post_id=POST_ID,
+        title="How many things?",
+        lower_bound=0.0,
+        upper_bound=100.0,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        cdf_size=201,
+    )
+    draft = _draft(question=question, generation=_generation(forecast=forecast))
+    record = append_forecast_version(ledger, forecast_config=FORECAST_CONFIG, draft=draft)
+    record_validation(ledger, record_id=record.record_id, occurred_at=OCCURRED)
+    approve(
+        ledger,
+        record_id=record.record_id,
+        actor="chris",
+        occurred_at=OCCURRED,
+        calibration=CALIBRATION,
+    )
+    return record
+
+
+_TIED = (10.0, 10.0, 14.0, 18.0, 24.0, 31.0, 38.0, 42.0, 50.0)
+
+
+def _post_numeric(
+    ledger: sqlite3.Connection, config: AppConfig, *, with_conversion: bool
+) -> tuple[Any, Any]:
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    record = _approved_numeric(ledger, _TIED)
+    authorized = authorized_payload(record, calibration=CALIBRATION)
+    cdf = list(authorized.payload["continuous_cdf"])  # type: ignore[call-overload]
+    poster = FakePoster(after=FakeQuestion(history=[_entry(NEW_START, cdf)]))
+    recorded = post_approved_forecast(
+        ledger,
+        record_id=record.record_id,
+        payload=authorized.payload,
+        poster=poster,
+        config=config,
+        occurred_at=OCCURRED,
+        clock=lambda: OCCURRED,
+        sleep=lambda _seconds: None,
+        conversion=authorized.conversion if with_conversion else None,
+    )
+    return recorded, authorized
+
+
+def test_the_live_artifact_records_the_percentiles_a_tied_cdf_was_built_from(
+    ledger: sqlite3.Connection, live_config: AppConfig
+) -> None:
+    """D45's criterion at the place it is recorded: the artifact that holds the posted
+    ``continuous_cdf`` also holds the values the SDK built it from, and they differ from
+    the declared ones the ledger stores -- recorded, not silent."""
+    recorded, authorized = _post_numeric(ledger, live_config, with_conversion=True)
+    assert recorded.artifact_error is None and recorded.artifact_path is not None
+    envelope = read_live_artifact(live_config.storage.artifact_root, recorded.artifact_path)
+    written = envelope["context"]["numeric_conversion"]
+    assert written == json.loads(json.dumps(authorized.conversion))
+    assert written["adjusted"] is True
+    assert envelope["request_payload"] == authorized.payload
+
+
+def test_without_a_conversion_record_the_artifact_says_nothing_rather_than_false(
+    ledger: sqlite3.Connection, live_config: AppConfig
+) -> None:
+    """``submit --payload-file`` has no conversion to record; the key is absent, which a
+    reader must not take for ``adjusted: false``."""
+    recorded, _ = _post_numeric(ledger, live_config, with_conversion=False)
+    assert recorded.artifact_path is not None
+    envelope = read_live_artifact(live_config.storage.artifact_root, recorded.artifact_path)
+    assert "numeric_conversion" not in envelope["context"]
+
+
+def test_a_conversion_record_for_a_binary_forecast_is_refused_before_the_post(
+    approved: tuple[sqlite3.Connection, str], live_config: AppConfig
+) -> None:
+    ledger, record_id = approved
+    poster = FakePoster()
+    with pytest.raises(LiveSubmissionError, match="no CDF conversion"):
+        post_approved_forecast(
+            ledger,
+            record_id=record_id,
+            payload=dict(BINARY_PAYLOAD),
+            poster=poster,
+            config=live_config,
+            occurred_at=OCCURRED,
+            clock=lambda: OCCURRED,
+            sleep=lambda _seconds: None,
+            conversion={"adjusted": False, "percentiles_used": []},
+        )
+    assert poster.posts == 0
+
+
+@pytest.mark.parametrize(
+    "conversion",
+    [
+        pytest.param({"adjusted": True, "percentiles_used": [[0.01, float("nan")]]}, id="nan"),
+        pytest.param(["not", "a", "mapping"], id="not a mapping"),
+    ],
+)
+def test_an_unwritable_conversion_record_is_refused_before_the_post(
+    ledger: sqlite3.Connection, live_config: AppConfig, conversion: Any
+) -> None:
+    """Checked and rendered before the post: after it, an unrenderable value would cost the
+    artifact and stop the worker (M1-312), which is the wrong side of the spend to find out."""
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    record = _approved_numeric(ledger, _TIED)
+    authorized = authorized_payload(record, calibration=CALIBRATION)
+    poster = FakePoster()
+    with pytest.raises(LiveSubmissionError) as excinfo:
+        post_approved_forecast(
+            ledger,
+            record_id=record.record_id,
+            payload=authorized.payload,
+            poster=poster,
+            config=live_config,
+            occurred_at=OCCURRED,
+            clock=lambda: OCCURRED,
+            sleep=lambda _seconds: None,
+            conversion=conversion,
+        )
+    assert poster.posts == 0
+    assert "nan" not in str(excinfo.value).lower()

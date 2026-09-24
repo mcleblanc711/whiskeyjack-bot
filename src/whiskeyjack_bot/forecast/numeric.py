@@ -214,9 +214,13 @@ def _ordering_problem(forecast: NumericForecastResponse) -> str | None:
     The pinned SDK agrees: ``NumericDistribution._check_percentiles_increasing`` raises only
     on ``value[i] > value[i + 1]``, whatever its message says. What it then does with a tie
     -- ``_check_and_update_repeating_values`` nudges each repeated value by 1e-6 -- sits
-    against this project's "nothing is clamped" rule and is filed as M1-508 against M1-503,
-    which owns the conversion where it happens. ``forecast/cdf.py`` is that conversion, and
-    it makes the difference readable on ``NumericCdf.percentiles_used``.
+    against this project's "nothing is clamped" rule. **D45 (M1-508) decided it: ties are
+    accepted and the difference is recorded.** Refusing them here would have refused 12 of
+    the first 30 bounded forecasts this project posted, every one a reply that followed the
+    prompt. ``forecast/cdf.py`` makes the difference readable on
+    ``NumericCdf.percentiles_used``, and ``submission_payload.conversion_record`` writes it
+    into the live submission artifact beside the posted CDF. A tie that would hang the
+    conversion is still refused, by ``cdf._standardization_can_converge``.
 
     **Corrected on the M1-503 branch:** this paragraph used to say the nudge happens "in
     place". It does not. The validator builds fresh ``Percentile`` objects into a fresh list
