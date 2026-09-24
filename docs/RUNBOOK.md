@@ -383,7 +383,7 @@ version: 11
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 | `tournament correct-costs` | **read-only** | no | no |
-| `tournament correct-costs --apply` | appends `cost_corrected` events | no | no |
+| `tournament correct-costs --apply` | appends `cost_corrected` and back-filled AskNews `cost_settled` events | no | no |
 
 `run` is the live paid path and `run-replay` is the free one. The money boundary is a
 **subcommand name**, not a flag, deliberately (M1-315).
@@ -399,6 +399,19 @@ dry run opens the ledger read-only and prints `reservations` and `total_usd`. A 
 `refused_no_upstream_figure` counts reservations settled at 0 with no BYOK figure. On the live
 ledger these are the Exa searches, which really do settle at 0. `tournament status` then
 reports `actual_cost_usd` including the corrections.
+
+Since M1-336 the same command also **settles the AskNews reservations held before that change**.
+AskNews reports `usage.credits`, never dollars, so before M1-336 no AskNews reservation ever
+settled and each stayed held at its full estimate. The response that billed it is already in
+the journal (`retrieval_completed`), so the command converts its credit count at the rate in
+`research/asknews_cost.py` ($0.025 per credit, D41) and appends a `cost_settled` event with
+`basis: asknews_credits` and `backfilled: true`, in the reservation's own budget scope.
+`asknews_settlements` and `asknews_total_usd` say what it found; `asknews_written` what it
+wrote; `asknews_refused_no_credits` counts reservations it leaves held because the outcome is
+unknown (no single stored completion) or the count is missing or malformed. It moves spend from
+*held* to *actual*, and on the live ledger it leaves *remaining* unchanged: every stored
+response reports exactly the credits that were reserved. A second `--apply` writes nothing.
+New AskNews calls settle as they complete, so after one back-fill there is nothing left for it.
 
 ---
 
