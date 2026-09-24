@@ -14756,3 +14756,63 @@ the class cannot establish that.
   revisit trigger.
 - **A connection error during exhaustion** reads `transient`. That is correct for what the
   class says, but it will not hint at a quota.
+
+### Property reach and the mutation pass (M1-336/337/332)
+
+**Reach is measured, not assumed.** Each strategy asserts its own reach in a test:
+- `RESPONSE`: settles 144/400, nonzero 130, a `bool` count ≥ 5, out-of-range ints 33.
+- `EXCEPTIONS`: every Literal member ≥ 21/400, same-named lookalikes 137, own class overriding
+  its base 41.
+- The ledger strategy: a settlement in 118/150 draws, mixed settle/refuse 96, both scopes
+  settled at once 36.
+
+The first cut measured 76/400 settles and 3–11 two-scope draws. The two-scope count **moved
+between runs under `derandomize=True`**, because Hypothesis seeds part of its generation from
+constants in the loaded modules. So the live shape is weighted in by an explicit
+`st.integers(k).flatmap` pick (the M1-348 lesson: `one_of` does not weight by repetition).
+
+**Mutants.** Each was run after committing, with `__pycache__` cleared, against the new unit and
+property files plus the two `provider_failed` push tests and `test_byok_cost.py`. The baseline
+was confirmed by exit code.
+
+| Mutant | Result |
+| --- | --- |
+| float rate (`ceil(c*0.025*1e6)`) | killed |
+| `isinstance` admits `bool` | killed |
+| negatives admitted | killed |
+| upper bound dropped | killed |
+| falsy-`usage` check instead of `type is dict` | killed |
+| unknown settles 0 (`or 0`) | killed |
+| adapter never settles | killed |
+| `basis=None` | killed |
+| estimate literal `0.03` | killed |
+| `complete_call` ignores the exact figure | killed |
+| `settle_microusd` guard removed | **survived, then killed**: no caller could reach it; `test_settle_microusd_refuses_anything_but_an_exact_non_negative_int` added |
+| back-fill: no in-transaction guard re-check | killed |
+| back-fill: no plan-time guard | killed |
+| back-fill: any provider | killed |
+| back-fill: settles in the call scope | killed |
+| back-fill: ≥ 1 completion accepted | killed |
+| back-fill: `completed[-1]` for `[0]` | **equivalent**: the guard requires exactly one completion |
+| back-fill: `backfilled` flag dropped | killed |
+| back-fill: guard row not written | killed |
+| classifier ignores `__module__` | killed |
+| classifier default → `forbidden_or_quota` | killed |
+| classifier reads its own class only | killed |
+| classifier walks the MRO last-first | killed |
+| httpx timeout row dropped | killed |
+| classifier reads `str(exc)` | killed |
+| `error_summary` unnamed | killed |
+| failure not recorded | killed |
+| orchestrate always `transient` | killed |
+
+**The FAILED table**, meaning the malformed shapes a "quiet" branch must not swallow. Each of
+these maps to *held*, never to a settlement, and each is a unit row:
+- no `usage` block;
+- `usage: null`;
+- `usage` that is a list;
+- `credits` that is missing, `null`, a float, an integral float, NaN, a string, `true`, negative,
+  or above `10**6`.
+
+At the adapter level, a wire `true`, `"3"` or `1.0` is coerced by the SDK before the adapter
+sees it (see Deviation).
