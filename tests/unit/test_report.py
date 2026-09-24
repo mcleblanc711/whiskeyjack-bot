@@ -463,6 +463,52 @@ def test_reporting_never_changes_the_ledger(ledger: Path, tmp_path: Path) -> Non
     assert row["evidence_gaps"] == ["evidence_poor"]
 
 
+def test_the_report_reads_one_snapshot_even_while_a_writer_commits(
+    ledger: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker committed after the first record is read is invisible to every later read.
+
+    Without the one deferred transaction each read would take its own snapshot, and a run
+    committing mid-report could give one record facts from after the others'. The writer
+    commits into rec-16 -- read last -- right after rec-01 is read; deleting the report's
+    ``BEGIN`` must turn this red.
+    """
+    from whiskeyjack_bot import report as report_module
+
+    writer = connect(ledger)
+    (digest,) = writer.execute(
+        "SELECT forecast_sha256 FROM forecast_records WHERE record_id = 'rec-16'"
+    ).fetchone()
+    original = report_module.read_facts
+    calls: list[str] = []
+
+    def read_then_commit(connection: sqlite3.Connection, record_id: str) -> Any:
+        facts = original(connection, record_id)
+        calls.append(record_id)
+        if record_id == "rec-01":
+            append(
+                writer,
+                "evidence_gap",
+                "rec-16",
+                {"code": "evidence_poor", "forecast_sha256": digest},
+            )
+        return facts
+
+    monkeypatch.setattr(report_module, "read_facts", read_then_commit)
+    try:
+        write_report(ledger, tmp_path / "out", now=NOW)
+    finally:
+        writer.close()
+        monkeypatch.undo()
+    assert calls[0] == "rec-01" and calls[-1] == "rec-16"
+    (row,) = [row for row in _records(tmp_path / "out") if row["record_id"] == "rec-16"]
+    assert row["evidence_gaps"] == []
+    # The commit really happened: a second report sees it.
+    write_report(ledger, tmp_path / "again", now=NOW)
+    (row,) = [row for row in _records(tmp_path / "again") if row["record_id"] == "rec-16"]
+    assert row["evidence_gaps"] == ["evidence_poor"]
+
+
 def test_an_empty_ledger_reports_zero_everywhere(tmp_path: Path) -> None:
     path = tmp_path / "empty.sqlite3"
     initialize_ledger(path)

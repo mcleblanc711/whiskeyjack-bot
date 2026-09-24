@@ -369,6 +369,17 @@ def test_extreme_scores_in_one_cell_arrive_as_report_error(values: list[float]) 
         assert all(math.isfinite(cell[key]) for key in ("sum", "mean", "min", "max"))
 
 
+@pytest.mark.parametrize(("n", "small"), [(1, True), (29, True), (30, False), (31, False)])
+def test_the_small_sample_flag_turns_off_exactly_at_the_threshold(n: int, small: bool) -> None:
+    """No draw above reaches 30 values in one cell, so the boundary is pinned here."""
+    assert summarize_values([0.5] * n)["small_sample"] is small
+
+
+def test_the_sample_deviation_divides_by_n_minus_one() -> None:
+    """Values 1 and 3: mean 2, squared deviations 1 + 1, over n - 1 = 1."""
+    assert summarize_values([1.0, 3.0])["sample_sd"] == math.sqrt(2.0)
+
+
 def test_the_mean_of_equal_values_is_that_value() -> None:
     """Three 0.1s: fsum then divide rounds one ulp past 0.1; the clamp puts it back."""
     assert summarize_values([0.1, 0.1, 0.1])["mean"] == 0.1
@@ -485,6 +496,13 @@ _RESOLVED = ResolutionFact(1, "resolved", "yes", "a" * 64, "b" * 64, "2026-09-17
         _base(model_cost_usd=math.inf),
         _base(stale_score_rows=-5150),
         _base(resolution=None, scores=(ScoreFact(1, 1, "platform_peer_score", "v", "peer", 1.0),)),
+        _base(
+            resolution=_RESOLVED,
+            scores=(
+                ScoreFact(1, 1, "platform_peer_score", "v", "peer", 5150.0),
+                ScoreFact(2, 1, "platform_peer_score", "v", "peer", 5150.0),
+            ),
+        ),
     ],
 )
 def test_a_refused_fact_never_reaches_the_message(facts: RecordFacts) -> None:
