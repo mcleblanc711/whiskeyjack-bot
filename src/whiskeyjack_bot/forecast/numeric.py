@@ -74,9 +74,13 @@ part the model was missing.
 That matters beyond tidiness, because these strings do not stop at the repair turn. A
 response that fails twice puts them in ``ForecastGeneration.failure_problems``, which
 ``forecast/artifacts.py`` writes into the persisted raw-output envelope. Question fields
-come from Metaculus payloads, which CLAUDE.md classes as untrusted, and the carve-out that
-lets a *path* be rendered is about operator configuration, not about provider content. So a
-rendered bound is provider data entering the ledger's diagnostics.
+come from Metaculus payloads, which CLAUDE.md classes as untrusted, and the carve-outs that
+let a *path* or a *validated configuration value* be rendered (M1-401; D46, M1-509) are about
+operator configuration, not about provider content. So a rendered bound is provider data
+entering the ledger's diagnostics. This module and ``binary.py`` therefore differ **by
+D46's rule rather than by accident**: binary renders a number the operator configured and
+the model was never told; this module withholds numbers Metaculus supplied and the model was
+already sent.
 
 The nine declared levels **are** still named, and they are a different category: they are
 this project's own constant, transcribed from the hashed prompt, and naming them is what

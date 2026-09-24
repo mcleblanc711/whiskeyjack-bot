@@ -36,6 +36,10 @@ configuration and a repair turn that does not state the actual bound is one no m
 satisfy. The labels are the other case entirely: the model is *already holding the option
 list* -- ``forecast/inputs.py`` put it in the request under ``options``, which is where
 these labels came from -- so naming them back buys nothing and would echo model output.
+The rendering of the configured pair is the carve-out CLAUDE.md names for *validated
+operator-supplied configuration values* (D46, M1-509), shared with ``forecast/binary.py``;
+the envelope refusal in ``_require_config`` withholds the pair because it fires only for a
+config that bypassed validation, which that decision leaves untrusted.
 Each rule contributes **at most one problem**, never one per offending label, because a
 per-label list would leak how many were wrong through a channel no leak test that reads
 only message text would see (M1-302's rule that a channel is a channel, and

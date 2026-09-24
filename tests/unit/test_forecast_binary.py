@@ -522,3 +522,31 @@ def test_the_envelope_ends_themselves_are_accepted(golden: dict[str, Any]) -> No
         binary_output_problems(_with_probability(golden, 0.5), _bounds(0.001, 0.999), _question())
         == []
     )
+
+
+def test_d46_a_validated_pair_is_rendered_and_an_unvalidated_one_is_withheld(
+    golden: dict[str, Any],
+) -> None:
+    """M1-509's decision, both halves in one place (CLAUDE.md's second carve-out, D46).
+
+    A pair that went through ``ForecastConfig``'s validators is operator configuration and
+    is named, because the prompt tells the model 0.001-0.999 and only the message can say
+    the bound is narrower. A pair that reached this module *around* the validators
+    (``model_copy``) is a config value that failed -- or never faced -- validation, which
+    CLAUDE.md's threat boundary leaves untrusted, and it is withheld.
+    """
+    validated = ForecastConfig.model_validate(
+        {
+            **_committed_forecast_config().model_dump(),
+            "min_probability": 0.05,
+            "max_probability": 0.95,
+        }
+    )
+    (problem,) = binary_output_problems(_with_probability(golden, 0.02), validated, _question())
+    assert "0.05" in problem and "0.95" in problem
+
+    with pytest.raises(BinaryOutputError) as caught:
+        binary_output_problems(_with_probability(golden, 0.5), _bounds(0.0004, 0.9996), _question())
+    (withheld,) = caught.value.problems
+    assert "0.0004" not in withheld and "0.9996" not in withheld
+    assert "configured pair withheld" in withheld
