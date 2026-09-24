@@ -943,7 +943,7 @@ def test_a_v15_ledger_upgrades_and_its_events_carry_no_reconciliation(
         walk_to_submitted_raw(conn, "rec-old")
     finally:
         conn.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 16
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
     conn = connect(db)
     try:
         history = read_history(conn, "rec-old")

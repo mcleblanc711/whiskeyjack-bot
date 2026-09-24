@@ -4228,7 +4228,9 @@ def test_rows_written_before_migration_004_keep_a_null_attempt_id(tmp_path: Path
     # 016 (M2-713) creates one table, adds a NULLable link column to `lifecycle_events` and
     # rewrites its insert trigger with clauses that read only that new column. Nothing a v2
     # ledger holds can carry a link that did not exist, so reaching 16 is the same statement.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 16
+    # 017 (M4-803) only rewrites a `score_events` insert trigger, and a v2 ledger has no score
+    # rows for it to read: reaching 17 is the same statement again.
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
 
     conn = connect(db)
     try:
@@ -4826,7 +4828,7 @@ def test_an_attempt_written_before_009_still_partitions_by_the_old_rule(
     """
     db = tmp_path / "ledger.sqlite3"
     attempt_id = _seed_v8_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 16
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
 
     conn = connect(db)
     try:
@@ -4923,7 +4925,7 @@ def test_a_clean_v5_ledger_upgrades_to_006(tmp_path: Path) -> None:
     # COALESCE, and 010 only creates tables, so neither probes the rows a v5 ledger holds.
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 16
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
 
 
 @pytest.mark.parametrize(
@@ -5028,7 +5030,7 @@ def test_rows_written_before_006_survive_it_when_their_identifiers_are_well_form
     """
     db = tmp_path / "ledger.sqlite3"
     _seed_v5_ledger(db)
-    assert initialize_ledger(db) == 16
+    assert initialize_ledger(db) == 17
     conn = connect(db)
     try:
         assert current_status(conn, "rec-legacy") == "draft"
