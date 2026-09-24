@@ -73,7 +73,13 @@ reply_for: Any = _helpers.reply_for
 
 SCOPE = "42:32977"
 _MARKER = "__non_finite_literal__"
-_LITERALS = ("NaN", "Infinity", "-Infinity")
+# Two kinds, one run each: the literals `parse_constant` sees, and valid number tokens that
+# overflow to infinity and never reach it (review round 1).
+_KINDS = {
+    "constant": ("NaN", "Infinity", "-Infinity"),
+    "overflow": ("1e999", "-1E400", "2.5e+308"),
+}
+_LITERALS = (*_KINDS["constant"], *_KINDS["overflow"])
 
 _leaves = st.one_of(
     st.none(),
@@ -104,7 +110,7 @@ _PLACEMENTS = ("usage.cost", "usage.nested", "outside")
 
 
 @st.composite
-def _bodies(draw: st.DrawFn, where: str) -> tuple[bytes, str]:
+def _bodies(draw: st.DrawFn, where: str, kind: str) -> tuple[bytes, str]:
     usage = draw(st.dictionaries(st.text(max_size=5), _trees, max_size=3))
     extra = draw(_trees)
     body: dict[str, Any] = {
@@ -119,13 +125,16 @@ def _bodies(draw: st.DrawFn, where: str) -> tuple[bytes, str]:
         body["usage"] = _splice(usage, ["cost_details", *depth])
     else:
         body["extra"] = _splice(extra, [draw(st.text(min_size=1, max_size=4))])
-    literal = draw(st.sampled_from(_LITERALS))
+    literal = draw(st.sampled_from(_KINDS[kind]))
     text = json.dumps(body).replace(json.dumps(_MARKER), literal, 1)
     return text.encode(), where
 
 
+@pytest.mark.parametrize("kind", sorted(_KINDS))
 @pytest.mark.parametrize("where", _PLACEMENTS)
-def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path, where: str) -> None:
+def test_a_non_finite_number_anywhere_is_an_unknown_outcome(
+    tmp_path: Path, where: str, kind: str
+) -> None:
     """One run per placement: ``sampled_from`` inside one run skews toward its first member
     (measured: 85/9/26 of 120), so reach is guaranteed by construction instead."""
     config = base_config.__wrapped__(tmp_path)
@@ -143,7 +152,7 @@ def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path, wher
     original = httpx.AsyncClient
     reached: Counter[str] = Counter()
 
-    @given(drawn=_bodies(where))
+    @given(drawn=_bodies(where, kind))
     @settings(max_examples=40, deadline=None)
     def check(drawn: tuple[bytes, str]) -> None:
         body, placed = drawn
@@ -163,7 +172,7 @@ def test_a_non_finite_number_anywhere_is_an_unknown_outcome(tmp_path: Path, wher
             else:
                 raise AssertionError("a non-finite body was accepted")
         assert message == "priced model request failed or was unavailable at the authorized price"
-        for literal in (*_LITERALS, "nan", "inf"):
+        for literal in (*_LITERALS, "nan", "inf", "1e999", "1E400"):
             assert literal not in message
         assert spending(conn, SCOPE)[1] > before, "the reservation stays held"
         completed = conn.execute(

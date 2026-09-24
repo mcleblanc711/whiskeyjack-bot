@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -143,6 +144,18 @@ def _refuse_non_finite(literal: str) -> float:
     raise ValueError("non-finite number in response body")
 
 
+def _finite_float(token: str) -> float:
+    """``json.loads``'s ``parse_float`` hook: a number token that overflows is refused.
+
+    ``1e999`` is valid JSON and ``float`` turns it into infinity without ever calling
+    ``parse_constant`` -- the review-round-1 finding. Same refusal, same static translation.
+    """
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("non-finite number in response body")
+    return value
+
+
 class PricedClient:
     def __init__(self, config: AppConfig) -> None:
         priced = PRICED_MODELS.get(config.model.name)
@@ -194,11 +207,16 @@ class PricedClient:
                 )
                 response.raise_for_status()
                 # Strict, not `response.json()` (M1-350): that accepts the NaN/Infinity
-                # literals, and the journal's `canonical()` refuses them -- so a non-finite
-                # number anywhere in the body escaped below as a raw ValueError, after
-                # `model_completed` was written and before settlement. Refused here, inside
-                # the `try`, it is an unknown outcome like any other failed request.
-                data = json.loads(response.content, parse_constant=_refuse_non_finite)
+                # literals and overflowing numbers such as `1e999`, and the journal's
+                # `canonical()` refuses the non-finite floats they become -- so one anywhere
+                # in the body escaped below as a raw ValueError, after `model_completed` was
+                # written and before settlement. Refused here, inside the `try`, it is an
+                # unknown outcome like any other failed request.
+                data = json.loads(
+                    response.content,
+                    parse_constant=_refuse_non_finite,
+                    parse_float=_finite_float,
+                )
             text = data["choices"][0]["message"]["content"]
             if not isinstance(text, str):
                 raise ValueError

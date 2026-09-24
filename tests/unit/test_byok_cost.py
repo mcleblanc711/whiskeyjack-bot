@@ -502,8 +502,12 @@ _CONTENT = b'"choices": [{"message": {"content": "ok"}}]'
         b"{" + _CONTENT + b', "usage": {"is_byok": true, "cost": 0, '
         b'"cost_details": {"upstream_inference_cost": Infinity}}}',
         b"{" + _CONTENT + b', "usage": {"cost": 0.01}, "provider_meta": [1, -Infinity]}',
+        # Round 1: valid JSON number tokens that overflow to infinity, which never reach
+        # `parse_constant`.
+        b"{" + _CONTENT + b', "usage": {"cost": 1e999}}',
+        b"{" + _CONTENT + b', "usage": {"cost": 0, "cost_details": {"x": -1E400}}}',
     ],
-    ids=["usage.cost", "nested-usage-key", "outside-usage"],
+    ids=["usage.cost", "nested-usage-key", "outside-usage", "overflow", "nested-overflow"],
 )
 def test_a_non_finite_number_in_the_body_is_an_unknown_outcome(
     case: Any, monkeypatch: Any, body: bytes
@@ -528,7 +532,7 @@ def test_a_non_finite_number_in_the_body_is_an_unknown_outcome(
         "priced model request failed or was unavailable at the authorized price"
     )
     assert raised.value.__cause__ is None and raised.value.__suppress_context__
-    for literal in ("NaN", "Infinity", "nan", "inf"):
+    for literal in ("NaN", "Infinity", "nan", "inf", "1e999", "1E400"):
         assert literal not in str(raised.value)
     scope = f"{SCOPE}:{digest(build_request(PROMPT, PRICED_MODELS[ASTRA]))}"
     assert len(events(conn, "model_started", scope)) == 1
