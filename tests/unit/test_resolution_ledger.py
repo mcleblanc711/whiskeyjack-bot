@@ -235,12 +235,13 @@ def test_an_explicit_event_id_cannot_make_a_row_older_than_its_predecessors(
 
 
 def test_a_score_needs_a_resolution(conn: sqlite3.Connection, submitted: str) -> None:
-    # With no resolution row there is nothing for a score to cite, so 015 refuses it first
-    # (SQLite fires the newer trigger first). 014's own clause is asserted with 015's trigger
-    # dropped on this test's ledger, so each layer is shown to refuse on its own.
+    # With no resolution row there is nothing for a score to cite, so 015's clause (017's
+    # trigger since M4-803) refuses it first (SQLite fires the newer trigger first). 014's own
+    # clause is asserted with that trigger dropped on this test's ledger, so each layer is
+    # shown to refuse on its own.
     with pytest.raises(sqlite3.IntegrityError, match="must name a resolution row"):
         _score(conn)
-    conn.execute("DROP TRIGGER score_events_validate_local_score_on_insert")
+    conn.execute("DROP TRIGGER score_events_validate_on_insert")
     with pytest.raises(sqlite3.IntegrityError, match="not scorable"):
         _score(conn)
 

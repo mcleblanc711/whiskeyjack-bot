@@ -811,3 +811,310 @@ assertion that failed, so no kill is a collection error or an unrelated failure.
 `GPT_REVIEW_REQUEST_M4-805_r1.md`, all four gates green in the request). No blocking findings
 and no backlog candidates beyond the recorded M4-806, M4-807 and M1-341; each of the eight
 falsifiable risk claims was marked safe. This entry is the only change after the approved commit.
+
+## M4-803 (+M4-807) — Platform scores, and the withheld alert
+
+Wave 23 close-out, PR-2. One branch (`feat/m4-803-platform-scores`), one review, one deploy (D39's
+bundling). Migration **`017`**.
+
+- **M4-803 — Ingest numeric platform scores.** Acceptance: *Numeric record identifies score source
+  and does not label a proxy as Metaculus score.* Governing decision **D30**; owner decisions
+  recorded as **D42**.
+- **M4-807 — Alert when a posted record's resolution comes back withheld.** Acceptance: *A
+  withheld observation of a record this account posted reaches the operator through the existing
+  ntfy channel at most once per record per throttle window; ingest-resolutions' exit-code
+  contract is unchanged; the alert carries no payload value.*
+
+### Delivered
+
+- `src/whiskeyjack_bot/platform_scores.py` — pure: `PlatformMetric`, `PLATFORM_METRIC_ORDER`,
+  `SCORE_DATA_KEYS`, `COMPARISON_BASELINES`, `IMPLEMENTATION_VERSIONS`, `PlatformScore`,
+  `PlatformScoreError`, `extract_platform_scores`, `recompute`.
+- `src/whiskeyjack_bot/migrations/017_platform_score_events.sql` — DROP 015's
+  `score_events_validate_local_score_on_insert`; CREATE `score_events_validate_on_insert` (015's
+  clauses, plus the platform branch). `LEDGER_SCHEMA_VERSION` → 17.
+- `src/whiskeyjack_bot/lifecycle.py` — `record_platform_scores`, `read_platform_scores`,
+  `StoredPlatformScore`, `PlatformScoreWrite`; `StoredResolution.source_response` (the verified
+  text, `repr=False`).
+- `src/whiskeyjack_bot/resolution.py` — `select_question` public.
+- `src/whiskeyjack_bot/score_records.py`, `cli.py` (`score`) — both writers per record, the
+  platform column, `ScoreResult.failed`.
+- `src/whiskeyjack_bot/show.py`, `cli.py` (`show`) — platform scores in the record's history, with
+  their baseline and source.
+- `src/whiskeyjack_bot/notify.py` — `resolution_withheld` (86400 s, `default`).
+- `src/whiskeyjack_bot/resolution_ingest.py`, `cli.py` (`ingest-resolutions`) — `WithheldRecord`,
+  `withheld_records`, `notify_withheld`; `withheld: N` on the last line.
+- Tests: `tests/unit/test_platform_score_ledger.py`, `tests/property/test_platform_scores_properties.py`,
+  M4-807's block in `tests/unit/test_cli_ingest_resolutions.py`; `tests/resolution_rows.py`'s
+  `post_payload` now carries a live-shaped `score_data` (`SCORE_DATA` when resolved to a value,
+  `{}` otherwise).
+- `docs/RUNBOOK.md` steps 6–7 and the schedule's withheld bullet; `docs/backlog/decisions.csv`
+  **D42**; M4-803 and M4-807 `Done`.
+
+### What was established by execution before designing
+
+The brief made the design conditional on a read-only probe (CLAUDE.md: spec versus observed).
+It was run 2026-09-23 against post 45556 (CME live cattle, numeric, resolved), with the
+watchdog's request shape: an explicit User-Agent, the trailing slash, no redirect followed with
+the token. Field names only:
+
+- `question.my_forecasts` holds `history`, `latest` and **`score_data`**, whose keys are
+  `baseline_score`, `peer_score`, `spot_baseline_score`, `spot_peer_score`,
+  `relative_legacy_score`, `coverage` and `weighted_coverage`. The question also carries
+  `default_score_type` (`spot_peer` on every MiniBench question). `aggregations.*.score_data` is
+  `null`: the community's scores are not returned, and none are wanted (the community prediction
+  is never an input; nothing here reads it).
+- **Every one of the 20 scorable live `resolution_events` rows already stores `score_data`** in
+  its `source_response`: 11 binary, 3 discrete, 6 numeric. All seven values are JSON floats on
+  every row, 140 of 140. The one annulled row carries `{}`, and so does the committed real
+  withheld payload (`withheld_minibench_45321.json`).
+- Post 45556's stored `score_data`, observed 2026-09-19 12:23 UTC, is **bit-identical** to the
+  live refetch on 2026-09-23.
+- SQLite's JSON number parse against Python's (the question 017's value clause depends on): on
+  the SQLite the deployed venv ships (**3.53.1**), exact for 699,996 doubles (random bit
+  patterns, the realistic score range, and wide magnitudes) plus all 140 live values. On the
+  system SQLite (**3.45.1**) it is **not** exact: 66 of 599,849 random-bit doubles, and 8 of
+  500,000 in the realistic range [-1000, 200].
+- Scored against a backup copy of the live ledger at 017: 19 records gain 4 rows each (76 rows);
+  every row is admitted by 017's exact-value clause and re-read exactly; the 8 numeric/discrete
+  records move to `scored`; the annulled record stays `not_scorable`; a second run is all
+  `unchanged`. **19 and 8, not the brief's 20 and 9:** post 45561's record resolved and was then
+  annulled, so its latest observation is not scorable.
+
+### M4-803
+
+#### Decision — copy the platform's scores out of the observation already stored, and why
+
+D30 says ingest the platform's numbers before any local replica; the probe shows they are
+already in the ledger. `platform_scores.extract_platform_scores` reads them from the latest
+scorable resolution row's `source_response` — re-verified against `source_response_sha256` in
+the same transaction — for the record's own question, selected by `resolution.select_question`
+(made public for this, so the classifier and the extractor cannot pick different questions). No
+fetch, no computation, no change to `ingest-resolutions`. Each row cites the resolution row it
+was read from, so it replays from the ledger alone.
+
+#### Decision — the four score types, all question types (owner), and why
+
+`platform_spot_peer_score`, `platform_spot_baseline_score`, `platform_peer_score`,
+`platform_baseline_score`: the platform's four score types for a forecaster. Written in that
+order, so when the platform writer moves a record it links `spot_peer`, the tournament's own
+`default_score_type`. **All four question types** (owner decision 2026-09-23): the acceptance
+criterion names numeric, but M5-804 groups by type and metric, and only the platform's score is
+comparable across types. Binary and multiple choice keep their `local_*` rows alongside.
+
+#### Decision — the source is three columns, and `comparison_baseline` gets its 001 meaning back
+
+"Identifies score source": the `platform_` prefix, `comparison_baseline` (`peer` or `baseline`,
+fixed per metric — the column 001 created for exactly this label, and which D36 forbids on a
+local score), and `implementation_version` `<metric>/metaculus_score_data/1`, which names the
+*extraction path*, since there is no formula to version. Plus `resolution_event_id`, the
+evidence.
+
+#### Decision — 017 checks the value itself, where 015 declined to
+
+015 would not recompute a local score in SQL: `ln` depends on build flags, and a second
+implementation of a formula is a second source of truth. A platform score has no formula; the
+check is a lookup of the stored text (top-level question, or the one group member with the
+record's question id — `select_question`'s rule, including refusing a doubled member), so it is
+the same source read twice. It makes "a `platform_*` row is the platform's number" a property of
+the schema, not of the writer: nothing can write a proxy under a `platform_` name. A JSON
+integer is refused too (SQLite's `=` would admit 3 against 3.0, and the Python reader refuses
+it; the schema must not be laxer than the reader).
+
+#### Decision — a resolved observation without readable scores fails (owner), and why
+
+Missing, `null` or `{}` `score_data`, a missing key, a non-float or a non-finite score: a
+`LifecycleError`, so the record reports `failed` and `score` exits non-zero (the unit's
+OnFailure page). Nothing re-fetches an observation whose resolution has not changed, so a quiet
+status would be a permanent, silent attribution gap — the "malformed maps to quiet" shape. 0 of
+20 live observations would trip it.
+
+#### Decision — `score` runs both writers, local first
+
+Each in its own transaction. Local first, so binary and multiple choice keep the `scored` event
+on the local row they always had; for numeric and discrete the platform writer takes it. When the
+local writer **fails** for a binary record (an unreadable stored forecast), the platform writer
+still records the platform's scores — they need only the observation — and takes the event;
+`test_every_record_with_a_resolution_gets_exactly_one_verdict` pins that. `ScoreResult` gains
+`platform_status`/`platform_rows_appended` and a `failed` property over both.
+
+#### Deviation
+
+- **None of the three live-run hazards:** no byte change to `config/tournament.yaml`, no new
+  `AppConfig` field, no change to `prompts/forecaster*.md`. The live activation is untouched.
+- **A migration, 017** — so the deploy takes the worker down until `init-ledger` runs (CONTEXT
+  § 3.3), which the brief anticipated.
+- **`resolution._select_question` became public** (`select_question`), with no behaviour change.
+- **`score`'s output line gained a platform column**, and a `failed` line now prints both
+  statuses before the detail. The exit rule is unchanged: non-zero when any record failed.
+- **The brief's expected counts were 20 and 9; the measured ones are 19 and 8** (see above).
+- **"Bit for bit" through the ledger is IEEE equality, not bit identity, for one value:**
+  SQLite's REAL storage turns `-0.0` into `0.0`. The property pass found it. Every comparison in
+  the program — the trigger's `=`, the reader's `!=` — treats the two as equal, and the JSON
+  round trip in `source_response` does preserve the sign. Pinned as an explicit `@example`.
+
+#### Rejected — a local numeric or discrete score, and why not
+
+D30. Nothing in this branch computes a continuous score; 017 still refuses every `local_*`
+metric on a numeric or discrete record.
+
+#### Rejected — `relative_legacy_score`, `coverage`, `weighted_coverage`
+
+`relative_legacy_score` is the platform's pre-2023 score. `coverage` and `weighted_coverage`
+qualify the time-weighted scores rather than being scores, and a score row with a coverage value
+in it would be a category error. All three stay in the stored `source_response`, replayable.
+
+#### Rejected — re-fetching scores during ingestion
+
+It would be a second network read per post for numbers the first read already stored, and a
+second observation of the same resolution the ledger has no row for.
+
+#### Rejected — a quiet `no_platform_scores` status
+
+Owner decision; see above.
+
+#### Deferred (do not read the absence as an omission)
+
+- **A re-fetch path for an observation whose scores arrive late or change.** `ingest-resolutions`
+  appends a row only when the *observation* (kind, outcome) changes, and `observation_sha256`
+  does not cover `score_data` — deliberately: widening the snapshot would change every existing
+  row's digest. M4-804 (deferred by D40) is the re-resolution path and the place for it.
+- **The Cup profile.** Its ledger is still at schema 13 and it is not scheduled.
+
+#### Standing risk — not verifiable offline
+
+- **The platform recomputes scores after the observation.** Measured stable over four days on one
+  post; nothing re-reads an unchanged observation, so a later platform correction would not reach
+  the ledger.
+- **SQLite's JSON number parse.** 017's value clause is exact on the deployed SQLite (3.53.1) and
+  on CI's (uv's Python, the same build); on an older SQLite (3.45.1) about 1 value in 60,000 in the
+  realistic range parses a ulp off, and the clause then **refuses** a genuine score — a loud
+  `failed`, never a wrong value admitted. The ledger property
+  (`test_the_ledger_stores_and_rereads_every_finite_double_exactly`) carries two doubles 3.45.1
+  misparses as `@example`s, so running the suite on such a build says so.
+
+### M4-807
+
+#### Decision — a condition read after the run, not the transition, and why
+
+`IngestResult` carries no kind for an `unchanged` observation, so an alert keyed to the append
+would be sent once, ever, and lost if that one push failed. `withheld_records` reads, after the
+run, which of the run's records **currently** stand on a `withheld` latest observation — through
+`latest_resolution`, which re-verifies both digests — and `notify_withheld` sends one
+`resolution_withheld` per record. The event's window is a day (the `unrecorded_post` rationale: a
+condition, reminded daily, never 4-a-day); priority `default` (an attribution gap nobody here can
+close, not an incident).
+
+#### Decision — the exit code cannot move
+
+`emit` absorbs every failure, and returns `disabled` with no notifier; the notifier is built only
+when there is something to send, after the ledger work, and its exit is decided by the results
+alone. A digest mismatch while reading the condition is `ResolutionIngestError` — the command's
+existing refusal (`EXIT_REFUSED`) — so an unreadable row never reads as "nothing withheld".
+`test_the_alert_never_changes_the_exit_code` runs a rejected push, a transport error, a handler
+that raises, and no notifier, each with and without a failed record.
+
+#### Decision — what the alert carries
+
+Title a literal; body the record id and question id, both from `forecast_records` (the ledger's
+identifiers, as `unrecorded_post` carries them), and nothing from the platform's payload — no
+value, no title, no status text. The test plants sentinels in the payload's title, question
+title and description.
+
+#### Deviation
+
+None beyond the bundle's. The last line of `ingest-resolutions` gains `withheld: N`.
+
+#### Rejected — an out-of-process check (the watchdog)
+
+The watchdog has no ledger reader for resolutions and a worst-case budget of 238 of 240 s (M1-347);
+the condition is known in-process at the only moment it can change.
+
+#### Deferred
+
+None.
+
+#### Standing risk — not verifiable offline
+
+The ntfy push itself (the channel is exercised live by the tournament worker's alerts; this
+event has never fired, since 0 live rows are `withheld`).
+
+### Quiet-branch table (M4-807)
+
+Every malformed shape that could otherwise read as "no alert", and where it goes instead:
+
+| shape | outcome |
+| --- | --- |
+| no `resolution` key | record `failed`, exit 4 (OnFailure), no row |
+| `resolution` a number | record `failed`, exit 4, no row |
+| an unknown status | record `failed`, exit 4, no row |
+| the post names another question | record `failed`, exit 4, no row |
+| the question's type disagrees with the record | record `failed`, exit 4, no row |
+| an empty post | record `failed`, exit 4, no row |
+| a stored withheld row whose content no longer matches its digest | `refused:`, exit 4 |
+
+### Property tests
+
+`tests/property/test_platform_scores_properties.py`, at the `ci` profile (200 examples):
+
+- `extract_platform_scores` never raises outside `PlatformScoreError`, with the payload
+  corrupted at one level per test — post, question, `my_forecasts`, `score_data`, one score —
+  chosen by `parametrize`, not `sampled_from`, so each level is reached by construction.
+  `event()` reach: every refusal message and the accept branch appear; the rarely drawn ones
+  (a non-finite score, reached ~1% by the scalar strategy; `recompute`'s accept branch, 0.5%)
+  have deterministic tests beside them.
+- A malformed `question_id` is refused by the exact-type gate, including `45747.0` and `True`,
+  which `select_question` alone would accept (the mutation pass found this; see M-P01).
+- A well-formed payload is copied bit for bit and replays through
+  `canonical_json` → `json.loads`; `recompute` agrees on the replayed form.
+- Through a real file-backed ledger: arbitrary finite doubles are admitted by 017's exact-value
+  clause and re-read equal — bit-identical except `-0.0`, which SQLite's REAL storage stores as
+  `0.0` (found by this property; pinned as an `@example`). Two doubles SQLite 3.45.1 misparses
+  are `@example`s.
+- No refusal reprints a value: a sentinel in every string and a float canary in every payload.
+
+### Mutation testing
+
+Committed first (`0b777d1`); `__pycache__` cleared before every mutant; the original bytes
+restored after each and the tree checked clean at the end. Runner: the eight affected test
+modules, `-x`, `HYPOTHESIS_PROFILE=fast`, baseline green **by exit code**. SQL clauses are
+neutered as `WHERE 0 AND (<pred>)`. The set enumerates the siblings of each entry point: every
+refusal of `extract_platform_scores`, every arm of the writer and reader, the `score` wiring,
+the withheld read and emission, and every clause of 017 plus the parts of its value clause.
+
+**First run: 49 of 58 killed.** The nine survivors, and what each one was:
+
+| mutant | why it lived | disposition |
+| --- | --- | --- |
+| P01 `question_id` gate removed | `select_question` refuses almost every bad id anyway; only an id *equal* to the real one but not an int (`45747.0`, `True`) needs the gate, and nothing drew one | `@example`s + exact message assertion — killed |
+| L02 writer status gate removed | no test put a scorable observation on a record still `submitted` | `test_a_record_that_never_moved_to_resolved_is_refused` — killed |
+| L07 second source-digest check removed | **equivalent**: `latest_resolution` had already verified the same text, in the same transaction, on an append-only row | the second read is gone; `StoredResolution` carries the verified text (`2f690d9`) |
+| S02 `failed` ignores the platform status | the planned command-level test for absent scores was never written | `test_a_resolved_observation_without_platform_scores_fails_the_command` — killed |
+| S04 platform error detail dropped | same | same — killed |
+| C01 `score` exit ignores the platform status | same | same — killed |
+| R05 throttle subject is the question | no test had two withheld records on one question | `test_two_withheld_records_on_one_question_each_page` — killed |
+| Q16 group branch's `json_type = 'real'` dropped | the integer-score test used a top-level question only | `test_a_group_members_integer_score_admits_no_platform_row` — killed |
+| Q19 top-level question id unchecked | the classifier refuses such a payload at ingest, so no test planted one | `test_a_stored_top_level_question_with_another_id_admits_no_platform_row` — killed |
+
+**Second run, the survivors against `924ffcd`: 8 of 8 killed** (L07's code no longer exists).
+Final: 57 killed, 1 removed as equivalent, 0 surviving.
+
+Killed on the first run (49): P02–P14 (the extractor's other gates, the key and baseline tables,
+the version string, `recompute`'s metric check); L01, L03–L06, L08–L11 (scorable gate,
+idempotency, the `scored` event and its link, the written baseline, the reader's value, baseline
+and recompute checks, a swallowed extractor error); S01, S03 (platform skipped for local types,
+`moved` ignoring the platform); C02, C03 (withheld never notified, a withheld read failure made
+quiet); R01–R04, R06 (wrong kind, no dedup, an unreadable row read as not withheld, failed
+results skipped, the body without the record); N01, N02 (window, priority); Q01–Q15, Q17, Q18,
+Q20 (every 017 clause neutered, platform types narrowed, the version tail, the top-level `real`
+check, the group branch disabled, group uniqueness, the metric-to-key map crossed).
+
+### Review
+
+**Round 1 — APPROVE on `0f9fbd3`** (2026-09-23, local Codex against
+`GPT_REVIEW_REQUEST_M4-803_r1.md`, all four gates green in the request). No blocking findings;
+all ten falsifiable risk claims marked safe. One non-blocking observation — the runbook's
+command table still said `score` appends *local* score rows — is fixed after approval, together
+with the same table's `ingest-resolutions` row (which can now push to ntfy) and this entry.
+Those three documentation lines are the only change after the approved commit.
+

@@ -14,6 +14,11 @@ snapshot, the indexed columns and both digests agree the way the writer makes th
 The post payloads are the committed ``tests/fixtures/api_posts`` files with the question's
 status and resolution replaced. Values follow the shapes Metaculus documents in
 ``docs/openapi.yml`` (``resolution: "no"``, ``resolution: "77289125.94957079"``).
+
+``my_forecasts.score_data`` follows what the live API returned on 2026-09-23 (M4-803): the
+account's seven scores for a question it predicted that resolved to a value, and ``{}`` for
+everything else -- the live annulled observation and the committed real withheld payload
+(``withheld_minibench_45321.json``) both carry ``{}``. The values are synthetic.
 """
 
 from __future__ import annotations
@@ -47,6 +52,18 @@ _TYPE_FIXTURES = {
     "multiple_choice": "multiple_choice_post.json",
 }
 
+# `question.my_forecasts.score_data` for a question the account predicted on that resolved to a
+# value. The keys are the live ones; the numbers are made up.
+SCORE_DATA: dict[str, float] = {
+    "baseline_score": 12.653108159476442,
+    "peer_score": 2.4154150938466965,
+    "coverage": 0.3078232610225677,
+    "relative_legacy_score": 0.03767701797265986,
+    "weighted_coverage": 0.3078232610225677,
+    "spot_peer_score": 7.812678563619664,
+    "spot_baseline_score": -41.105107253570395,
+}
+
 # One scorable value per supported type.
 RESOLVED_VALUE = {
     "binary": "yes",
@@ -65,11 +82,14 @@ def post_payload(
     resolution: str | None = "__scorable__",
     actual_resolve_time: str | None = "2026-09-17T12:00:00Z",
     resolution_set_time: str | None = "2026-09-17T16:30:00.123456Z",
+    score_data: object = "__auto__",
 ) -> dict[str, Any]:
     """A committed post fixture re-identified and re-resolved.
 
     ``resolution="__scorable__"`` stands for "the type's own scorable value", so callers
-    that only need *a* resolved post do not repeat the table above.
+    that only need *a* resolved post do not repeat the table above. ``score_data="__auto__"``
+    is :data:`SCORE_DATA` when the question resolved to a value and ``{}`` otherwise; pass
+    anything else to plant that exact value.
     """
     with (FIXTURES / _TYPE_FIXTURES[question_type]).open(encoding="utf-8") as handle:
         post: dict[str, Any] = json.load(handle)
@@ -84,6 +104,14 @@ def post_payload(
     )
     question["actual_resolve_time"] = actual_resolve_time
     question["resolution_set_time"] = resolution_set_time
+    if score_data == "__auto__":
+        scored = status == "resolved" and question["resolution"] not in (
+            None,
+            "annulled",
+            "ambiguous",
+        )
+        score_data = dict(SCORE_DATA) if scored else {}
+    question["my_forecasts"]["score_data"] = score_data
     return post
 
 

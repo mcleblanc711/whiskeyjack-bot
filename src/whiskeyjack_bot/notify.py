@@ -79,6 +79,7 @@ NotifyEvent = Literal[
     "poll_summary",
     "activation_retired",
     "unrecorded_post",
+    "resolution_withheld",
 ]
 
 # What happened to one push. Closed for the same reason the outcome vocabularies in
@@ -114,6 +115,10 @@ NotifyOutcome = Literal["sent", "throttled", "disabled", "failed"]
 #   platform and the lifecycle ledger does not record it, and that stays true until an operator
 #   runs ``reconcile-submission``. Keyed on the record, so a second record in the same state
 #   also pages, and a day-long window makes each one page once a day rather than 288 times.
+# - ``resolution_withheld`` (M4-807) is a condition too: Metaculus reported a question this
+#   account posted on as resolved but masked its value, so the record cannot be scored, and
+#   that stays true until the platform unmasks it. Emitted by ``ingest-resolutions`` (every
+#   six hours) and keyed on the record, so each such record reminds once a day.
 _WINDOW_SECONDS: Final[dict[str, int]] = {
     "question_blocked": 1800,
     "provider_failed": 1800,
@@ -122,6 +127,7 @@ _WINDOW_SECONDS: Final[dict[str, int]] = {
     "poll_summary": 86400,
     "activation_retired": 86400,
     "unrecorded_post": 86400,
+    "resolution_withheld": 86400,
 }
 assert set(_WINDOW_SECONDS) == set(get_args(NotifyEvent))
 assert all(seconds > 0 for seconds in _WINDOW_SECONDS.values())
@@ -165,6 +171,9 @@ _PRIORITY: Final[dict[str, str]] = {
     # A live forecast the attribution ledger does not hold: runbook L4, and the ledger is the
     # product. It pages like an incident until someone reconciles it.
     "unrecorded_post": "high",
+    # An attribution gap nobody here can close -- access is the platform's -- so it is worth
+    # knowing, not worth waking anyone for.
+    "resolution_withheld": "default",
 }
 assert set(_PRIORITY) == set(get_args(NotifyEvent))
 

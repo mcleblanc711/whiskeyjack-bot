@@ -15,7 +15,8 @@ to those tables:
   find the attempt id if you lost it").
 - :func:`lifecycle.record_attempt_id`, :func:`lifecycle.read_submission_attempts`,
   :func:`lifecycle.read_submission_verifications`, :func:`lifecycle.read_resolution_history`,
-  :func:`lifecycle.read_local_scores`, :func:`lifecycle.read_pipeline_failure_events` --
+  :func:`lifecycle.read_local_scores`, :func:`lifecycle.read_platform_scores` (M4-803),
+  :func:`lifecycle.read_pipeline_failure_events` --
   M1-612's join: every linked approval, submission, verification, lifecycle, pre-forecast
   failure, resolution and score event, merged below into one chronological order.
 - :func:`submission.live_reservations_for_record` -- standing key reservations, otherwise
@@ -47,6 +48,7 @@ from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     LifecycleEvent,
     PreForecastFailure,
+    StoredPlatformScore,
     StoredResolution,
     StoredScore,
     StoredSubmissionAttempt,
@@ -54,6 +56,7 @@ from whiskeyjack_bot.lifecycle import (
     read_history,
     read_local_scores,
     read_pipeline_failure_events,
+    read_platform_scores,
     read_resolution_history,
     read_submission_attempts,
     read_submission_verifications,
@@ -61,6 +64,11 @@ from whiskeyjack_bot.lifecycle import (
     unresolved_uncertainties,
 )
 from whiskeyjack_bot.submission import KeyReservation, SubmissionError, live_reservations_for_record
+
+
+# A score row of either provenance: local arithmetic (M4-802) or the platform's own number
+# (M4-803). Both readers verify what they return; the metric's prefix says which it is.
+AnyStoredScore = StoredScore | StoredPlatformScore
 
 
 class ShowError(Exception):
@@ -103,7 +111,7 @@ class HistoryEntry:
     lifecycle_event: LifecycleEvent | None = None
     pre_forecast_failure: PreForecastFailure | None = None
     resolution: StoredResolution | None = None
-    score: StoredScore | None = None
+    score: AnyStoredScore | None = None
 
 
 def merge_canonical_history(
@@ -114,7 +122,7 @@ def merge_canonical_history(
     lifecycle_events: tuple[LifecycleEvent, ...],
     pre_forecast_failures: tuple[PreForecastFailure, ...],
     resolutions: tuple[StoredResolution, ...],
-    scores: tuple[StoredScore, ...],
+    scores: tuple[AnyStoredScore, ...],
 ) -> tuple[HistoryEntry, ...]:
     """Merge seven independently-ordered event streams into one chronological order.
 
@@ -194,7 +202,7 @@ class RecordShow:
     submission_attempts: tuple[StoredSubmissionAttempt, ...]
     submission_verifications: tuple[StoredSubmissionVerification, ...]
     resolution_history: tuple[StoredResolution, ...]
-    score_history: tuple[StoredScore, ...]
+    score_history: tuple[AnyStoredScore, ...]
     pre_forecast_failures: tuple[PreForecastFailure, ...]
     canonical_history: tuple[HistoryEntry, ...]
 
@@ -217,7 +225,14 @@ def assemble_show(conn: sqlite3.Connection, record_id: str) -> RecordShow:
         attempts = read_submission_attempts(conn, record_id)
         verifications = read_submission_verifications(conn, record_id)
         resolutions = read_resolution_history(conn, record_id)
-        scores = read_local_scores(conn, record_id)
+        # One stream in append order: a record can hold both kinds (binary and multiple
+        # choice), and `event_id` is the order they were written in.
+        scores: tuple[AnyStoredScore, ...] = tuple(
+            sorted(
+                (*read_local_scores(conn, record_id), *read_platform_scores(conn, record_id)),
+                key=lambda score: score.event_id,
+            )
+        )
         attempt_id = record_attempt_id(conn, record_id)
         pre_forecast_failures = (
             () if attempt_id is None else read_pipeline_failure_events(conn, attempt_id)

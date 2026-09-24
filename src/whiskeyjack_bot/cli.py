@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from whiskeyjack_bot.config import AppConfig
     from whiskeyjack_bot.lifecycle import ApprovalDecision
-    from whiskeyjack_bot.show import HistoryEntry, RecordShow
+    from whiskeyjack_bot.show import AnyStoredScore, HistoryEntry, RecordShow
     from whiskeyjack_bot.submission_payload import AuthorizedPayload
 
 # A command that refused to act: an unusable ledger, an unknown record, an illegal
@@ -877,11 +877,14 @@ def _run_ingest_resolutions(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
     from whiskeyjack_bot.logging_setup import configure_logging
     from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_client
+    from whiskeyjack_bot.notify import build_notifier, notifier_context
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.resolution_ingest import (
         ResolutionIngestError,
         ingest_resolutions,
+        notify_withheld,
         sdk_post_fetcher,
+        withheld_records,
     )
 
     try:
@@ -907,9 +910,16 @@ def _run_ingest_resolutions(args: argparse.Namespace) -> int:
             results = ingest_resolutions(
                 connection, sdk_post_fetcher(client), question_id=args.question_id
             )
+            withheld = withheld_records(connection, results)
         except ResolutionIngestError as exc:
             print(f"refused: {exc}")
             return EXIT_REFUSED
+        # M4-807. `emit` absorbs every failure, so the exit code below is decided by the
+        # results alone. The notifier is built only when there is something to send, after
+        # the ledger work is done.
+        if withheld:
+            with notifier_context(build_notifier(config)):
+                notify_withheld(withheld)
         failed = 0
         for result in results:
             if result.status == "failed":
@@ -926,14 +936,14 @@ def _run_ingest_resolutions(args: argparse.Namespace) -> int:
                 f"question {result.question_id}  record {result.record_id}  "
                 f"{result.status}  kind {kind}  scorable {scorable}{moved}"
             )
-        print(f"records: {len(results)}  failed: {failed}")
+        print(f"records: {len(results)}  failed: {failed}  withheld: {len(withheld)}")
         return EXIT_REFUSED if failed else EXIT_OK
     finally:
         connection.close()
 
 
 def _run_score(args: argparse.Namespace) -> int:
-    """Compute local Brier and log scores for resolved forecasts (M4-802).
+    """Record local (M4-802) and platform (M4-803) scores for resolved forecasts.
 
     Reads and writes the ledger only. It builds no client and imports nothing that reaches
     the network, so there is no post method and no paid call anywhere on this path. Exits
@@ -970,12 +980,14 @@ def _run_score(args: argparse.Namespace) -> int:
                 f"question {result.question_id}  record {result.record_id}  "
                 f"{result.question_type}  "
             )
-            if result.status == "failed":
-                failed += 1
-                print(f"{prefix}failed: {result.detail}")
-                continue
+            local = f"{result.status}  rows {result.rows_appended}"
+            platform = f"platform {result.platform_status}  rows {result.platform_rows_appended}"
             moved = "  -> scored" if result.moved_to_scored else ""
-            print(f"{prefix}{result.status}  rows {result.rows_appended}{moved}")
+            if result.failed:
+                failed += 1
+                print(f"{prefix}{local}  {platform}  failed: {result.detail}")
+                continue
+            print(f"{prefix}{local}  {platform}{moved}")
         print(f"records: {len(results)}  failed: {failed}")
         return EXIT_REFUSED if failed else EXIT_OK
     finally:
@@ -1753,7 +1765,16 @@ def _history_entry_detail(entry: HistoryEntry) -> str:
         case "score":
             score = entry.score
             assert score is not None
-            return f"{score.metric} = {score.value}"
+            return f"{score.metric} = {score.value}{_score_source(score)}"
+
+
+def _score_source(score: AnyStoredScore) -> str:
+    """A platform score names what it is measured against and where it was read (M4-803)."""
+    from whiskeyjack_bot.lifecycle import StoredPlatformScore
+
+    if isinstance(score, StoredPlatformScore):
+        return f"  vs {score.comparison_baseline}  source: {score.implementation_version}"
+    return ""
 
 
 def _print_show(view: RecordShow) -> None:
@@ -1852,8 +1873,8 @@ def _print_show(view: RecordShow) -> None:
         print(f"score history ({len(view.score_history)}):")
         for score in view.score_history:
             print(
-                f"  - seq {score.event_id}: {score.metric} = {score.value}  "
-                f"computed: {score.computed_at_utc}"
+                f"  - seq {score.event_id}: {score.metric} = {score.value}"
+                f"{_score_source(score)}  computed: {score.computed_at_utc}"
             )
     else:
         print("score history: none")

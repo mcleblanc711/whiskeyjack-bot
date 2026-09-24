@@ -17,6 +17,13 @@ whose read retry is kept as shipped -- a GET is idempotent.
 **Failures are per question.** A post that cannot be fetched or classified, and a record the
 ledger refuses, are reported and skipped; the rest of the run proceeds. ``ingest-resolutions``
 exits non-zero if anything was skipped, so a scheduled run cannot fail quietly.
+
+**A withheld resolution is reported, not failed (M4-807).** ``withheld`` -- resolved, value
+masked -- is an access fact and exits 0 (M4-801), so the schedule's pager never sees it. After
+a run, :func:`withheld_records` reads which of the run's records currently stand on a
+``withheld`` observation, and :func:`notify_withheld` sends one ``resolution_withheld`` push per
+record through ``notify.emit``, whose per-record daily throttle bounds the repeats and which
+absorbs every failure: the alert can never change an exit code.
 """
 
 from __future__ import annotations
@@ -32,8 +39,10 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 from whiskeyjack_bot.lifecycle import (
     LifecycleError,
     ResolutionWriteOutcome,
+    latest_resolution,
     record_resolution_observation,
 )
+from whiskeyjack_bot.notify import emit
 from whiskeyjack_bot.resolution import ResolutionKind
 
 # post_id -> the raw post payload, exactly as the API returned it.
@@ -122,6 +131,69 @@ def ingest_resolutions(
                 _record_one(conn, record_id, record_question_id, post_id, payload, observed_at)
             )
     return tuple(results)
+
+
+@dataclass(frozen=True)
+class WithheldRecord:
+    """A record whose latest resolution observation is ``withheld``. Ledger identifiers only."""
+
+    record_id: str
+    question_id: int
+
+
+def withheld_records(
+    conn: sqlite3.Connection, results: tuple[IngestResult, ...]
+) -> tuple[WithheldRecord, ...]:
+    """The run's records that currently stand on a ``withheld`` observation, in result order.
+
+    A **condition**, read from the ledger after the run, not the run's transitions: a record
+    that went withheld on an earlier run reads ``unchanged`` with no kind on this one, and an
+    alert keyed to the append alone would be sent once and lost if that one push failed.
+    Every record in ``results`` is read, including one that failed this run -- its failure
+    already exits non-zero, but what the ledger holds for it is still true.
+
+    The read is :func:`lifecycle.latest_resolution`, which re-verifies both digests, so a row
+    whose content no longer matches what was hashed is a :class:`ResolutionIngestError` --
+    ``ingest-resolutions``' existing refusal -- and never reads as "nothing withheld".
+    """
+    found: list[WithheldRecord] = []
+    seen: set[str] = set()
+    for result in results:
+        if result.record_id in seen:
+            continue
+        seen.add(result.record_id)
+        try:
+            latest = latest_resolution(conn, result.record_id)
+        except LifecycleError as exc:
+            raise ResolutionIngestError(
+                f"a record's latest resolution could not be read: {exc}"
+            ) from None
+        if latest is not None and latest.kind == "withheld":
+            found.append(WithheldRecord(record_id=result.record_id, question_id=result.question_id))
+    return tuple(found)
+
+
+def notify_withheld(found: tuple[WithheldRecord, ...]) -> None:
+    """Send one ``resolution_withheld`` alert per record (M4-807).
+
+    Keyed on the record, so each one is throttled on its own. The message carries the
+    record's ledger identifiers and nothing read from the platform's payload -- no value, no
+    title, no status text. ``emit`` absorbs every failure and is a no-op with no notifier
+    installed, so this can never change what the command exits with.
+    """
+    for entry in found:
+        emit(
+            "resolution_withheld",
+            subject=entry.record_id,
+            title="whiskeyjack: a posted forecast's resolution is withheld",
+            body=(
+                f"Metaculus reports the question resolved but returns no value for it, so the "
+                f"record cannot be scored. record={entry.record_id} "
+                f"question={entry.question_id}. The platform unmasks a resolution for a "
+                f"question the account predicted on; if every resolved record reads withheld, "
+                f"the account cannot see its own resolutions (runbook step 6)."
+            ),
+        )
 
 
 def sdk_post_fetcher(client: MetaculusClient) -> FetchPost:

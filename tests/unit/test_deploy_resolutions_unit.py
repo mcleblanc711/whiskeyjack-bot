@@ -339,7 +339,7 @@ def test_the_unit_ingests_then_scores_and_reaches_nothing_paid_or_posting(
     assert run_unit(config_file) == [("ingest-resolutions", EXIT_OK), ("score", EXIT_OK)]
     out = capsys.readouterr().out
     assert "record rec-a  appended  kind resolved  scorable yes  -> resolved" in out
-    assert "record rec-a  binary  appended  rows 2  -> scored" in out
+    assert "record rec-a  binary  appended  rows 2  platform appended  rows 4  -> scored" in out
     assert len(wire.gets) == 2
     assert wire.reached == []
 

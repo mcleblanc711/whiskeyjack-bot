@@ -17,7 +17,7 @@ import pytest
 import requests
 import yaml
 
-from resolution_rows import insert_resolution_row, seed_record, seed_submitted
+from resolution_rows import insert_resolution_row, post_payload, seed_record, seed_submitted
 from score_rows import (
     PAST_OBSERVATION,
     resolve,
@@ -28,7 +28,13 @@ from score_rows import (
 from whiskeyjack_bot.cli import EXIT_REFUSED, main
 from whiskeyjack_bot.env_verify import EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
-from whiskeyjack_bot.lifecycle import current_status, read_local_scores
+from whiskeyjack_bot.lifecycle import (
+    current_status,
+    read_local_scores,
+    read_platform_scores,
+    record_resolution_observation,
+)
+from whiskeyjack_bot.resolution import canonical_json, sha256_text
 from whiskeyjack_bot.score_records import ScoreRecordsError, score_records
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -78,24 +84,43 @@ def test_every_record_with_a_resolution_gets_exactly_one_verdict(conn: Any) -> N
     _population(conn)
     clock = _clock()
     results = score_records(conn, clock=lambda: next(clock))
-    by_record = {r.record_id: (r.status, r.rows_appended, r.moved_to_scored) for r in results}
+    by_record = {
+        r.record_id: (
+            r.status,
+            r.platform_status,
+            r.rows_appended,
+            r.platform_rows_appended,
+            r.moved_to_scored,
+        )
+        for r in results
+    }
     assert by_record == {
-        "rec-yes": ("appended", 2, True),
-        "rec-mc": ("appended", 2, True),
-        "rec-annulled": ("not_scorable", 0, False),
-        "rec-num": ("out_of_scope", 0, False),
-        "rec-broken": ("failed", 0, False),
+        "rec-yes": ("appended", "appended", 2, 4, True),
+        "rec-mc": ("appended", "appended", 2, 4, True),
+        "rec-annulled": ("not_scorable", "not_scorable", 0, 0, False),
+        # M4-803: never scored locally (D30), and the platform writer is what moves it.
+        "rec-num": ("out_of_scope", "appended", 0, 4, True),
+        # The local writer cannot read the forecast back; the platform's scores need only the
+        # observation, so they are still recorded, and the platform row takes the event.
+        "rec-broken": ("failed", "appended", 0, 4, True),
     }
     broken = next(r for r in results if r.record_id == "rec-broken")
+    assert broken.failed
     assert broken.detail is not None and "cannot be read back" in broken.detail
     assert current_status(conn, "rec-yes") == "scored"
-    assert current_status(conn, "rec-num") == "resolved", "a numeric record is never scored here"
+    assert current_status(conn, "rec-num") == "scored"
     assert len(read_local_scores(conn, "rec-mc")) == 2
+    assert len(read_platform_scores(conn, "rec-num")) == 4
+    assert read_local_scores(conn, "rec-num") == ()
 
-    again = {r.record_id: r.status for r in score_records(conn, clock=lambda: next(clock))}
-    assert again["rec-yes"] == again["rec-mc"] == "unchanged"
-    assert again["rec-broken"] == "failed"
-    assert conn.execute("SELECT count(*) FROM score_events").fetchone()[0] == 4
+    again = {
+        r.record_id: (r.status, r.platform_status)
+        for r in score_records(conn, clock=lambda: next(clock))
+    }
+    assert again["rec-yes"] == again["rec-mc"] == ("unchanged", "unchanged")
+    assert again["rec-num"] == ("out_of_scope", "unchanged")
+    assert again["rec-broken"] == ("failed", "unchanged")
+    assert conn.execute("SELECT count(*) FROM score_events").fetchone()[0] == 4 + 4 * 4
 
 
 def test_one_named_record_is_scored_alone(conn: Any) -> None:
@@ -198,12 +223,20 @@ def test_the_command_scores_prints_and_is_idempotent(
 
     assert main(["score", "--config", str(config_file)]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "question 45747  record rec-yes  binary  appended  rows 2  -> scored" in out
-    assert "question 45748  record rec-no  binary  not_scorable  rows 0" in out
+    assert (
+        "question 45747  record rec-yes  binary  appended  rows 2  "
+        "platform appended  rows 4  -> scored"
+    ) in out
+    assert (
+        "question 45748  record rec-no  binary  not_scorable  rows 0  platform not_scorable  rows 0"
+    ) in out
     assert "records: 2  failed: 0" in out
 
     assert main(["score", "--config", str(config_file)]) == EXIT_OK
-    assert "record rec-yes  binary  unchanged  rows 0" in capsys.readouterr().out
+    assert (
+        "record rec-yes  binary  unchanged  rows 0  platform unchanged  rows 0"
+        in capsys.readouterr().out
+    )
     assert offline == []
 
 
@@ -221,7 +254,10 @@ def test_the_command_exits_refused_when_any_record_failed(
         connection.close()
     assert main(["score", "--config", str(config_file)]) == EXIT_REFUSED
     out = capsys.readouterr().out
-    assert "record rec-broken  binary  failed: the forecast record cannot be read back" in out
+    assert (
+        "record rec-broken  binary  failed  rows 0  platform appended  rows 4  "
+        "failed: the forecast record cannot be read back"
+    ) in out
     assert "record rec-yes  binary  appended" in out, "the good record still landed"
     assert "records: 2  failed: 1" in out and offline == []
 
@@ -247,3 +283,65 @@ def test_a_missing_ledger_is_refused_rather_than_created(
         yaml.safe_load(config_file.read_text(encoding="utf-8"))["storage"]["sqlite_path"]
     )
     assert not database.exists()
+
+
+def test_a_resolved_observation_without_platform_scores_fails_the_command(
+    config_file: Path, offline: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M4-803, owner decision: a definite resolution with no `score_data` is an attribution gap,
+    so it fails the record and the command (the schedule's OnFailure page) -- including for a
+    record whose local scores landed."""
+    connection = _ledger(config_file)
+    try:
+        seed_resolved(
+            connection, "rec-yes", question_id=45747, post_id=45556, observed_at=PAST_OBSERVATION
+        )
+        seed_submitted(
+            connection, "rec-bare", question_id=45750, post_id=45559, question_type="numeric"
+        )
+        record_resolution_observation(
+            connection,
+            record_id="rec-bare",
+            source_response=post_payload(
+                "numeric", post_id=45559, question_id=45750, score_data={}
+            ),
+            observed_at=PAST_OBSERVATION,
+        )
+        results = {r.record_id: r for r in score_records(connection)}
+    finally:
+        connection.close()
+    bare = results["rec-bare"]
+    assert (bare.status, bare.platform_status, bare.failed) == ("out_of_scope", "failed", True)
+    assert bare.detail == (
+        "the platform scores cannot be recorded: the observation carries no platform scores"
+    )
+    assert not results["rec-yes"].failed
+
+    connection = _ledger(config_file)
+    try:
+        seed_resolved(
+            connection, "rec-b2", question_id=45760, post_id=45570, observed_at=PAST_OBSERVATION
+        )
+        # A binary record whose local scores land but whose observation has no platform scores.
+        connection.execute("DROP TRIGGER resolution_events_block_update")
+        stripped = post_payload("binary", post_id=45570, question_id=45760, score_data={})
+        text = canonical_json(stripped)
+        connection.execute(
+            "UPDATE resolution_events SET source_response = ?, source_response_sha256 = ? "
+            "WHERE forecast_record_id = 'rec-b2'",
+            (text, sha256_text(text)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert main(["score", "--config", str(config_file)]) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert (
+        "record rec-bare  numeric  out_of_scope  rows 0  platform failed  rows 0  failed: the "
+        "platform scores cannot be recorded: the observation carries no platform scores"
+    ) in out
+    assert (
+        "record rec-b2  binary  appended  rows 2  platform failed  rows 0  failed: the "
+        "platform scores cannot be recorded: the observation carries no platform scores"
+    ) in out
+    assert "records: 3  failed: 2" in out and offline == []
