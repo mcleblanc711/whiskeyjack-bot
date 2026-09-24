@@ -449,30 +449,39 @@ def _state(facts: RecordFacts, subject: tuple[int, str] | None) -> RecordState:
     return "ambiguous"
 
 
+def _exclusion(facts: RecordFacts) -> Exclusion | None:
+    return "test_tournament" if facts.tournament_id in TEST_TOURNAMENTS else None
+
+
 def classify(facts: Sequence[RecordFacts]) -> tuple[AttributionRow, ...]:
     """Give every record its exclusion and its state, in ``record_id`` order.
 
     The scored subject of a question is its latest posted version -- highest
     ``forecast_version``, then ``record_id`` (a UUIDv7, so time order) -- and any other posted
-    version of the same question is ``superseded``.
+    version of the same question is ``superseded``. The subject is chosen **within a
+    population**: an excluded record is never the reason an included one is superseded, or a
+    test-tournament forecast of a question would silently remove the included record's
+    outcome from every summary (review round 1). Excluded records get their own subject, so
+    their state in ``records.jsonl`` still means the same thing.
     """
     identifiers = [item.record_id for item in facts]
     if len(set(identifiers)) != len(identifiers):
         raise ReportError("two records share one record_id")
     for item in facts:
         _require_consistent(item)
-    subjects: dict[int, tuple[int, str]] = {}
+    subjects: dict[tuple[Exclusion | None, int], tuple[int, str]] = {}
     for item in facts:
         if item.lifecycle_status in _POSTED:
+            population = (_exclusion(item), item.question_id)
             candidate = (item.forecast_version, item.record_id)
-            current = subjects.get(item.question_id)
+            current = subjects.get(population)
             if current is None or candidate > current:
-                subjects[item.question_id] = candidate
+                subjects[population] = candidate
     return tuple(
         AttributionRow(
             facts=item,
-            exclusion="test_tournament" if item.tournament_id in TEST_TOURNAMENTS else None,
-            state=_state(item, subjects.get(item.question_id)),
+            exclusion=_exclusion(item),
+            state=_state(item, subjects.get((_exclusion(item), item.question_id))),
         )
         for item in sorted(facts, key=lambda each: each.record_id)
     )

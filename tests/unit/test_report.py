@@ -663,6 +663,39 @@ def test_a_ledger_behind_this_build_is_refused_and_not_migrated(
         conn.close()
 
 
+def test_an_excluded_record_never_supersedes_an_included_one(tmp_path: Path) -> None:
+    """Round 1's finding, reproduced through the production writers.
+
+    Both records forecast question 2001 and both were posted and scored; `rec-z` is in a test
+    tournament and sorts after `rec-a`. Choosing the subject across both populations made
+    `rec-z` the subject and `rec-a` `superseded`, so the included population reported no
+    scored record, no score cell and no calibration point for a verified outcome.
+    """
+    path = build_ledger(
+        tmp_path / "ledger.sqlite3",
+        (
+            Spec("rec-a", 2001, probability_yes=0.6, observations=(("yes", 3.0, True),)),
+            Spec(
+                "rec-z",
+                2001,
+                probability_yes=0.6,
+                tournament_id="bot-testing-area",
+                observations=(("yes", 9.0, True),),
+            ),
+        ),
+    )
+    write_report(path, tmp_path / "out", now=NOW)
+    rows = {row["record_id"]: row for row in _records(tmp_path / "out")}
+    assert (rows["rec-a"]["included"], rows["rec-a"]["state"]) == (True, "scored")
+    assert (rows["rec-z"]["included"], rows["rec-z"]["state"]) == (False, "scored")
+    report = _report(tmp_path / "out")
+    assert report["population"]["states"]["scored"] == 1
+    everything = _group(report, "all", {})
+    cell = _cell(everything, "platform_spot_peer_score")
+    assert (cell["n"], cell["sum"]) == (1, 3.0)
+    assert everything["calibration"]["n"] == 1
+
+
 def test_every_spec_record_is_in_the_fixture() -> None:
     """The fixture table and the expected partition name the same records."""
     assert {spec.record_id for spec in SPECS} == set(EXPECTED_STATES)

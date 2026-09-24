@@ -279,13 +279,22 @@ def test_the_all_group_counts_each_scored_subjects_scores_once(facts: list[Recor
 
 
 @given(facts=fact_lists())
-def test_each_question_has_at_most_one_scored_subject(facts: list[RecordFacts]) -> None:
+def test_each_question_has_one_subject_per_population(facts: list[RecordFacts]) -> None:
+    """One subject per (population, question), and only a later posted version of the same
+    question **in the same population** supersedes.
+
+    Round 1's finding: the first version asserted one subject per question across both
+    populations, which an excluded record winning the selection satisfies -- so it passed
+    while a test-tournament record silently removed an included outcome from every summary.
+    """
     built = _attempt(facts)
     if built is None:
         return
     rows, _ = built
     posted = [row for row in rows if row.state != "not_posted"]
-    subjects = Counter(row.facts.question_id for row in posted if row.state != "superseded")
+    subjects = Counter(
+        (row.included, row.facts.question_id) for row in posted if row.state != "superseded"
+    )
     assert all(count == 1 for count in subjects.values())
     for row in posted:
         if row.state == "superseded":
@@ -293,11 +302,22 @@ def test_each_question_has_at_most_one_scored_subject(facts: list[RecordFacts]) 
             later = [
                 other
                 for other in posted
-                if other.facts.question_id == row.facts.question_id
+                if other.included == row.included
+                and other.facts.question_id == row.facts.question_id
                 and (other.facts.forecast_version, other.facts.record_id)
                 > (row.facts.forecast_version, row.facts.record_id)
             ]
             assert later
+    for included in (row for row in posted if row.included):
+        rivals = [
+            other
+            for other in posted
+            if not other.included and other.facts.question_id == included.facts.question_id
+        ]
+        if rivals:
+            event("a question posted in both populations")
+            # The included population keeps a subject of its own for this question.
+            assert subjects[(True, included.facts.question_id)] == 1
 
 
 # ── 3-4. order-independence and replay ───────────────────────────────────────
@@ -549,6 +569,12 @@ def test_the_strategy_reaches_every_branch() -> None:
                 hits["calibrated_on_edge"] += 1
             if row.state == "scored" and row.included and len(facts_.scores) > 1:
                 hits["scored_with_cells"] += 1
+        posted = {
+            (row.included, row.facts.question_id) for row in rows if row.state != "not_posted"
+        }
+        hits["question_in_both_populations"] += sum(
+            1 for included, question in posted if included and (False, question) in posted
+        )
 
     draw()
     for state in STATES:
@@ -560,3 +586,4 @@ def test_the_strategy_reaches_every_branch() -> None:
     assert hits["refused"] >= 1, hits
     assert hits["calibrated_on_edge"] >= 5, hits
     assert hits["scored_with_cells"] >= 20, hits
+    assert hits["question_in_both_populations"] >= 20, hits

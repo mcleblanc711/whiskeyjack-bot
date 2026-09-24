@@ -1270,9 +1270,12 @@ AskNews settlement they depend on.
 Platform scores are per question for the account. Two posted versions of one question would
 each carry the same platform numbers, and summing both would count one number twice. So the
 latest posted version (highest `forecast_version`, then `record_id`, a UUIDv7) is the subject
-and an earlier posted one is `superseded`. The lifecycle writers admit the shape (the fixture
-builds it through them); 012's reservation guard keeps it out of the submission path. Cheap to
-state, and it keeps the state set a partition rather than a guess.
+and an earlier posted one is `superseded`. **The subject is chosen within a population**
+(included or excluded): round 1 showed that choosing it across both let a test-tournament
+record of the same question supersede the included one and remove a verified outcome from
+every summary. The lifecycle writers admit the shape (the fixture builds it through them);
+012's reservation guard keeps two versions *in one tournament* out of the submission path, but
+nothing stops one question id appearing in a test tournament and a real one.
 
 #### Decision — evidence-gap markers are verified; an unknown code is refused
 

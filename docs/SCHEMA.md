@@ -516,9 +516,11 @@ calibration bins and score summaries, every cell carrying its `n` and a small-sa
   summary (D43).
 - **One state per record** (`report.py:RecordState`), by precedence:
   1. `not_posted`: the record never reached `submitted`.
-  2. `superseded`: a later posted version of the same question exists. Platform scores are
-     per question, so only the latest posted version is scored; unreachable through the
-     submission path today (012's whole-question reservation guard).
+  2. `superseded`: a later posted version of the same question exists **in the same
+     population** (included or excluded). Platform scores are per question, so only the latest
+     posted version is scored; an excluded record never supersedes an included one. Unreachable
+     within one tournament through the submission path today (012's whole-question
+     reservation guard).
   3. By the latest observation: `awaiting_resolution` (none), `withheld`, `unresolved`,
      `annulled`, `ambiguous`, `resolved_unscored` (resolved, no score row cites it), or
      `scored` (resolved, and at least one score row cites it).
