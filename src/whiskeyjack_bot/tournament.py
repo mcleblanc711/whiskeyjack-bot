@@ -9,7 +9,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, get_args
 from uuid import uuid4
 
 from whiskeyjack_bot.approval import approve
@@ -18,11 +18,16 @@ from whiskeyjack_bot.forecast.priced import PRICED_MODELS
 from whiskeyjack_bot.forecast.record import record_sha256
 from whiskeyjack_bot.forecast.replay import replay_forecast
 from whiskeyjack_bot.forecast.store import read_forecast_record
-from whiskeyjack_bot.lifecycle import current_status
+from whiskeyjack_bot.lifecycle import PreForecastFailureCode, current_status
 from whiskeyjack_bot.metaculus.client import SingleAttemptPoster, build_client
 from whiskeyjack_bot.metaculus.snapshots import save_snapshot
 from whiskeyjack_bot.notify import build_notifier, describe, emit, notifier_context
-from whiskeyjack_bot.pipeline_live import _attempt_question, _build_clients
+from whiskeyjack_bot.pipeline_live import (
+    QuestionOutcome,
+    QuestionStatus,
+    _attempt_question,
+    _build_clients,
+)
 from whiskeyjack_bot.prompt import PromptError, load_prompt
 from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot.submission_live import (
@@ -46,6 +51,7 @@ from whiskeyjack_bot.tournament_state import (
     ActivationInactive,
     ActivationRetired,
     Budget,
+    ModelOutcomeUnknown,
     StorageFailure,
     TournamentError,
     append,
@@ -140,6 +146,83 @@ def _awaiting_retry(
         and event.get("activation_id") == activation["activation_id"]
         for event in events(conn, "retry_wait", scope)
     )
+
+
+def _paces_retry(status: str, detail_code: str | None) -> bool:
+    """Whether a failed attempt waits out its checkpoint window before a counted retry.
+
+    Research (M1-349, unchanged): only ``research_failed/provider_error``.
+
+    Generation (M1-351): every ``generation_failed`` code that is not a deterministic
+    verdict -- ``internal_error``, ``timeout``, ``provider_error``, ``malformed_response``,
+    ``http_error``, ``provider_unavailable``. The deterministic ones (``schema_invalid``,
+    ``calibration_invalid``) block instead, below. A code outside the vocabulary paces too:
+    waiting is the cheap direction, and blocking is the path that needs a proof.
+
+    **This does not change what a retry costs**, and that was measured before it was
+    written. With the production ``PricedClient`` an in-window re-attempt was already free:
+    a failed call leaves ``model_started`` with no completion and the same request is refused,
+    and a completed call is replayed from the journal. Live question 45754's ten
+    ``internal_error`` rows are two billed calls, one per window. What the re-attempt did cost
+    was a failure row, a failed poll (exit 1, ``OnFailure``) and a duplicate
+    ``generation_failed`` row every five minutes -- the row inflation that made two attempts
+    look like ten.
+    """
+    if status == "research_failed":
+        return detail_code == "provider_error"
+    if status == "generation_failed":
+        return detail_code not in DETERMINISTIC_FAILURE_CODES
+    return False
+
+
+def _append_retry_wait(
+    conn: sqlite3.Connection,
+    scope: str,
+    fingerprint: str,
+    activation: dict[str, Any],
+    window_start: datetime,
+) -> None:
+    """The row ``_awaiting_retry`` reads (M1-349), written from one place for both callers."""
+    append(
+        conn,
+        "retry_wait",
+        scope,
+        {
+            "at": utcnow().isoformat(),
+            "fingerprint": fingerprint,
+            "activation_id": activation["activation_id"],
+            "started_at": window_start.isoformat(),
+        },
+    )
+
+
+_QUESTION_STATUSES: Final = frozenset(get_args(QuestionStatus))
+_PRE_FORECAST_CODES: Final = frozenset(get_args(PreForecastFailureCode))
+
+
+def _failed_outcome_reason(outcome: QuestionOutcome) -> str:
+    """The recorded reason for an attempt that produced no usable record (M1-325).
+
+    Built from two closed vocabularies and nothing else, so it is value-free by construction;
+    anything outside them renders as ``unclassified`` rather than being echoed. Before this
+    every such failure -- a quality-gate refusal, a sufficiency-gate refusal, a failed
+    generation -- recorded the same sentence, and the ledger could not say which.
+    """
+    status = outcome.status if outcome.status in _QUESTION_STATUSES else "unclassified"
+    code = outcome.detail_code
+    detail = code if code in _PRE_FORECAST_CODES else ("none" if code is None else "unclassified")
+    return f"question {status} ({detail})"
+
+
+def _question_failure_reason(exc: Exception) -> str | None:
+    """What a ``question_failure`` row may say about ``exc`` beyond its type (M1-325).
+
+    A ``TournamentError`` message is module-owned: every raise site passes a literal or a
+    translation of an already-sanitized error, which ``test_question_failure_reason``'s
+    source scan holds every raise site to. Any other type is withheld -- a third-party
+    message can quote a request, a response body or a header.
+    """
+    return str(exc) if isinstance(exc, TournamentError) else None
 
 
 def _notify_blocked(scope: str, *, reason: str, detail: str | None) -> None:
@@ -533,7 +616,43 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
     # for this is `_notify_unrecorded_posts`, throttled; this field is the standing count.
     data["unrecorded_posts"] = len(_unrecorded(conn))
     data["unresolved"] += data["restored_question_holds"]
+    data["recent_question_failures"] = _recent_question_failures(conn)
     return data
+
+
+RECENT_QUESTION_FAILURES: Final = 5
+
+
+def _recent_question_failures(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """The newest ``question_failure`` rows, newest first, as ``status`` reports them (M1-325).
+
+    The read path the criterion asks for: why a question failed, without a sqlite query.
+    Rows written before M1-325 carry no ``reason`` and report ``None``, which is what they
+    recorded. Only the named fields are read back, and a row that is not an object is
+    reported as a storage failure rather than guessed at -- the journal is the ledger's.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT scope, data FROM tournament_events WHERE kind='question_failure' "
+            "ORDER BY seq DESC LIMIT ?",
+            (RECENT_QUESTION_FAILURES,),
+        ).fetchall()
+        found: list[dict[str, Any]] = []
+        for scope, raw in rows:
+            data = json.loads(raw)
+            if type(data) is not dict:
+                raise ValueError
+            found.append(
+                {
+                    "scope": scope,
+                    "error_type": data.get("error_type"),
+                    "reason": data.get("reason"),
+                    "at": data.get("at"),
+                }
+            )
+    except (sqlite3.Error, ValueError):
+        raise StorageFailure("cannot read tournament journal") from None
+    return found
 
 
 def run_once(
@@ -770,6 +889,9 @@ def run_once(
             if heartbeat["processed"] >= config.run_limits.max_questions:
                 break
             heartbeat["processed"] += 1
+            # The checkpoint window this attempt runs in, once one is established below;
+            # None on the recovery path, which buys nothing and so is never paced.
+            window_start: datetime | None = None
             try:
                 require_activation(conn, config, account_id=account, project_id=project)
                 if existing:
@@ -799,6 +921,7 @@ def run_once(
                                 "activation_id": activation["activation_id"],
                             },
                         )
+                    window_start = now
                     if clients is None:
                         clients = _build_clients(
                             config,
@@ -826,27 +949,14 @@ def run_once(
                             final_attempt=_attempts(conn, scope, fingerprint, activation)
                             >= MAX_TRANSIENT_ATTEMPTS,
                         )
-                    if (
-                        outcome.status == "research_failed"
-                        and outcome.detail_code == "provider_error"
-                    ):
-                        # M1-349: pace the retry. Inside one checkpoint window `now` is
-                        # pinned and no `question_started` is appended, so without this
-                        # every 5-minute poll re-bought the research and none of them
-                        # counted as an attempt -- six purchases per counted attempt. The
-                        # gate above reads this row and declines the question until the
-                        # window expires, so each retry is one purchase and one attempt.
-                        append(
-                            conn,
-                            "retry_wait",
-                            scope,
-                            {
-                                "at": utcnow().isoformat(),
-                                "fingerprint": fingerprint,
-                                "activation_id": activation["activation_id"],
-                                "started_at": now.isoformat(),
-                            },
-                        )
+                    if _paces_retry(outcome.status, outcome.detail_code):
+                        # M1-349 (research) and M1-351 (generation): pace the retry. Inside
+                        # one checkpoint window `now` is pinned and no `question_started`
+                        # is appended, so without this every 5-minute poll re-ran the
+                        # attempt and none of them counted as one. The gate above reads
+                        # this row and declines the question until the window expires, so
+                        # each retry is one counted attempt.
+                        _append_retry_wait(conn, scope, fingerprint, activation, now)
                     if (
                         outcome.status == "not_recorded"
                         or outcome.note
@@ -880,7 +990,7 @@ def run_once(
                             detail=outcome.detail_code,
                         )
                     if outcome.status != "recorded" or outcome.record_id is None:
-                        raise TournamentError("question research or generation failed")
+                        raise TournamentError(_failed_outcome_reason(outcome))
                     record_id = outcome.record_id
                 record = read_forecast_record(conn, record_id)
                 if record.question != question:
@@ -933,8 +1043,19 @@ def run_once(
                     conn,
                     "question_failure",
                     f"{project}:{question.question_id}",
-                    {"error_type": type(exc).__name__, "at": utcnow().isoformat()},
+                    {
+                        "error_type": type(exc).__name__,
+                        "reason": _question_failure_reason(exc),
+                        "at": utcnow().isoformat(),
+                    },
                 )
+                if isinstance(exc, ModelOutcomeUnknown) and window_start is not None:
+                    # M1-351: a priced model call that failed, or whose outcome is unknown,
+                    # escapes `_attempt_question` as this error rather than as an outcome.
+                    # The same request is already refused for free for the rest of the
+                    # window (`PricedClient`'s repeat guard), so pacing it spends nothing
+                    # differently; what it stops is a failed poll every five minutes.
+                    _append_retry_wait(conn, scope, fingerprint, activation, window_start)
             heartbeat["at"] = utcnow().isoformat()
             append(conn, "heartbeat", "worker", heartbeat)
         heartbeat["complete"] = True

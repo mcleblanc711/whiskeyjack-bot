@@ -468,3 +468,81 @@ def test_the_command_never_creates_a_missing_ledger(case: Any, tmp_path: Any, ap
     args = ["tournament", "correct-costs", "--config", config_file(config, tmp_path)]
     assert main([*args, "--apply"] if apply else args) != 0
     assert not config.storage.sqlite_path.exists()
+
+
+# --- M1-350: a non-finite number in the response body -----------------------------------
+
+
+def _answer_with_body(monkeypatch: Any, config: Any, body: bytes) -> list[int]:
+    """Answer every OpenRouter call with these exact bytes; return a one-element counter.
+
+    Bytes rather than ``json=``: the case is a body a strict encoder would never produce.
+    """
+    calls = [0]
+
+    def respond(request: Any) -> httpx.Response:
+        calls[0] += 1
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setenv(config.model.api_key_env, "test-secret")
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(respond), **kw)
+    )
+    return calls
+
+
+_CONTENT = b'"choices": [{"message": {"content": "ok"}}]'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{" + _CONTENT + b', "usage": {"cost": NaN}}',
+        b"{" + _CONTENT + b', "usage": {"is_byok": true, "cost": 0, '
+        b'"cost_details": {"upstream_inference_cost": Infinity}}}',
+        b"{" + _CONTENT + b', "usage": {"cost": 0.01}, "provider_meta": [1, -Infinity]}',
+        # Round 1: valid JSON number tokens that overflow to infinity, which never reach
+        # `parse_constant`.
+        b"{" + _CONTENT + b', "usage": {"cost": 1e999}}',
+        b"{" + _CONTENT + b', "usage": {"cost": 0, "cost_details": {"x": -1E400}}}',
+    ],
+    ids=["usage.cost", "nested-usage-key", "outside-usage", "overflow", "nested-overflow"],
+)
+def test_a_non_finite_number_in_the_body_is_an_unknown_outcome(
+    case: Any, monkeypatch: Any, body: bytes
+) -> None:
+    """M1-350: never a raw ValueError; the reservation stays held; nothing is echoed.
+
+    Before the fix the first two escaped ``invoke`` as ``ValueError`` from the journal's
+    ``canonical()``, after ``model_completed`` had been written -- so the next poll replayed
+    the content for free, with no ``model_response`` behind it. The third was accepted.
+    """
+    from whiskeyjack_bot.tournament_state import ModelOutcomeUnknown, TournamentError
+
+    conn, config, *_ = case
+    config = _astra(config)
+    calls = _answer_with_body(monkeypatch, config, body)
+    budget = Budget(conn, config.storage.artifact_root, SCOPE, 10_000_000)
+    with budget_context(budget):
+        with pytest.raises(ModelOutcomeUnknown) as raised:
+            asyncio.run(PricedClient(config).invoke(PROMPT))
+    assert isinstance(raised.value, TournamentError)
+    assert str(raised.value) == (
+        "priced model request failed or was unavailable at the authorized price"
+    )
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+    for literal in ("NaN", "Infinity", "nan", "inf", "1e999", "1E400"):
+        assert literal not in str(raised.value)
+    scope = f"{SCOPE}:{digest(build_request(PROMPT, PRICED_MODELS[ASTRA]))}"
+    assert len(events(conn, "model_started", scope)) == 1
+    assert events(conn, "model_completed", scope) == [], "the call did not complete"
+    assert events(conn, "cost_settled", SCOPE) == []
+    actual, held = spending(conn, SCOPE)
+    assert actual == 0 and held > 0, "the cost is unknown, so the reservation stays held"
+
+    # The same request is never bought again: refused for free, as the same type.
+    with budget_context(budget):
+        with pytest.raises(ModelOutcomeUnknown, match="unknown outcome"):
+            asyncio.run(PricedClient(config).invoke(PROMPT))
+    assert calls[0] == 1

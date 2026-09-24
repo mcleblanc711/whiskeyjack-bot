@@ -14224,3 +14224,303 @@ Two survived the first pass and each bought a test:
 | C the entry point drops `_quiet_shutdown` | `test_the_entry_point_flushes_before_it_exits` **(added: the child process patches boundaries itself, so it could not reach the real entry point)** |
 | D the shutdown flush not redirected | `test_a_closed_stdout_pipe_never_changes_the_exit_code[healthy]` |
 | E `_say` catches `BaseException` | `test_a_diagnostic_guard_never_swallows_an_interrupt` **(added)** |
+
+## M1-351 (+M1-350, M1-325, M1-324) — The generation failure path
+
+Wave 23 close-out, PR-1. The branch is named for the lead item under D39's bundling
+convention. The theme: a failed model purchase is paid for once, typed, recorded and tested.
+**None of the three**: no `config/*.yaml` byte, no `AppConfig` field, no prompt byte. No
+migration either: `tournament_events.kind` and its `data` are free text.
+
+### M1-351 — Pace a transient generation retry
+
+#### Measured first: the money pump does not reproduce with the production client
+
+The row claimed that "the model call is bought again on every poll inside a checkpoint window".
+M1-349 measured it as 6 model calls per counted attempt. **That measurement was taken on the
+test harness's fake `Model`, which bypasses the durable guard in `PricedClient`.** Every live
+model call goes through `PricedClient`. There, a call that fails leaves a `model_started` with
+no `model_completed`, and the same request digest is then refused for free ("a prior model
+call has an unknown outcome; no repeat purchase"). A call that completes is replayed from the
+journal for free. Inside one window `now` is pinned and the research is reused, so the request
+is byte-identical.
+
+Measured on `0cda561` by driving `run_once` through 6 polls 5 minutes apart and then one poll
+at +31 minutes, with the real `PricedClient` behind an httpx MockTransport:
+
+| Scenario | POSTs billed | Counted attempts | What the in-window polls did |
+| --- | --- | --- | --- |
+| A: OpenRouter returns 5xx | 2 | 2 | refused free by the repeat guard |
+| B: the reply is not JSON | 4 (call + repair, ×2) | 2 | replayed the cached reply free |
+| C: evidence-poor + 5xx | 2; AskNews reservations 2 | 2 | retrieval hit the durable cache free |
+| D: the fake `Model` raises (M1-349's harness) | 7 fake invocations | 2 | re-invoked every poll |
+
+The live ledger agrees (read-only, 2026-09-23):
+- 91 `model_started` rows under 91 distinct digests;
+- 0 without a completion;
+- question 45754's ten `generation_failed/internal_error` rows fall in **two** checkpoint windows
+  (`occurred_at_utc` 03:55 and 04:30 on 2026-09-08), with one `model_started` in the poll of
+  each. The other eight rows are free in-window replays of a cached reply.
+
+**What was real is the rest of the re-attempt.** Every poll inside the window re-ran the
+question, which cost:
+- a `question_failure` row;
+- on the reply path, a duplicate `generation_failed` row and a duplicate raw artifact;
+- `heartbeat.failures = 1`. The CLI turns that into exit 1, and the unit's
+  `OnFailure=whiskeyjack-notify@` fired every five minutes.
+
+That row inflation is what made 45754 read as ten attempts. The owner decided (2026-09-23) to
+record this rebuttal and still pace at the gate. The spend is unchanged, while the rows, the exit
+code and the pages are fixed.
+
+#### Decision — one rule, `_paces_retry(status, detail_code)`, replacing M1-349's inline condition
+
+- Research keeps M1-349's condition exactly: only `research_failed/provider_error`.
+- Generation paces every `generation_failed` code that is not in
+  `DETERMINISTIC_FAILURE_CODES`: `internal_error`, `timeout`, `provider_error`,
+  `malformed_response`, `http_error` and `provider_unavailable`.
+- `schema_invalid` and `calibration_invalid` still block through the untouched
+  deterministic branch.
+- A code outside the vocabulary paces, because waiting is the cheap direction and blocking is
+  the path that needs a proof.
+
+One function rather than a parallel condition, so the two cases cannot drift in how they write
+the row. The row itself is `_append_retry_wait`, shared by both call sites.
+
+#### Decision — a priced call that fails is paced too, through a typed error
+
+In the tournament a failed model call never becomes a `generation_failed` outcome.
+`PricedClient` raises, and `generate._attempt_loop` re-raises `TournamentError` by design,
+because a budget refusal must stop the question. So the commonest live shape (scenario A)
+escaped `_attempt_question` into the outer handler and would not have been paced by
+`_paces_retry` at all.
+
+`PricedClient` now raises `ModelOutcomeUnknown(TournamentError)` from both of its
+unknown-outcome sites: the translated request failure and the repeat guard. Their messages are
+unchanged. The outer handler appends the same `retry_wait` for it, keyed to the window this
+attempt ran in (`window_start`, which is set only once a checkpoint is established, so the
+recovery path is never paced). Budget refusals stay plain `TournamentError` and are not paced.
+A subclass rather than a message match: the error-hygiene rule may legitimately reword a
+message.
+
+#### Decision — "at most one model call" is one generation
+
+A counted attempt costs one generation: the call, plus at most M1-402's one bounded repair.
+Scenario B makes that 2 POSTs per attempt, and the test says so rather than asserting 1.
+Suppressing the repair on a retry would change what gets forecast, and M1-402 settled that one
+repair is part of one purchase.
+
+#### Deviation
+
+- **The money half of the criterion was already met**, and this item cannot be what met it. See
+  the measurement above. The test counts billed POSTs through the real client, so it pins the
+  existing guarantee and the new pacing together.
+- An in-window poll after a wall-clock CDF `timeout` used to get a free second try at the
+  conversion. It now waits out the window. Accepted: the retry after it is one counted attempt,
+  as for every other transient code.
+
+#### Rejected
+
+- **Pacing every `question_failure`**: a post-forecast failure (an unresolved comment, a lost
+  response) must be retried on the very next poll by the recovery path.
+- **Suppressing the repair turn on a retry**: see above.
+- **A second clock for generation pacing**: M1-349 already rejected a second notion of "one
+  attempt", for the same reason.
+
+#### Deferred (do not read the absence as an omission)
+
+- **The research-side `TournamentError("retrieval outcome is unknown; no repeat purchase")`
+  escape** from `research/durable.begin_call` is not paced. The criterion keeps research
+  pacing unchanged, and that path is free for the same reason scenario A was. It still
+  records one `question_failure` per in-window poll, now with its reason (M1-325).
+- **An evidence-poor retry re-buys retrieval across windows.** So does every retry, because a
+  checkpoint is reused only within 1800 s. Inside the window nothing is re-bought (scenario C,
+  pinned by `test_an_evidence_poor_generation_failure_buys_no_retrieval_inside_the_window`).
+
+#### Standing risk — not verifiable offline
+
+- That OpenRouter's live failure modes all surface through `PricedClient`'s one `except`, and
+  therefore as `ModelOutcomeUnknown`, is true of the code. The next live transient failure is
+  the measurement: one `model_started` per `question_started`, `retry_wait` rows between them.
+
+### M1-350 — A non-finite number in the OpenRouter body
+
+#### Decision — parse strictly, inside the `try`, and read it as an unknown outcome
+
+`response.json()` accepted `NaN`/`Infinity`/`-Infinity`, and the journal's `canonical()`
+refuses them. So a non-finite number in `usage` escaped `invoke` as a raw `ValueError` after
+`model_completed` was written and before settlement. The body is now parsed with
+`json.loads(..., parse_constant=_refuse_non_finite)` inside the existing `try`.
+
+A non-finite literal **anywhere** in the body (the stricter reading of "anywhere") is therefore a
+failed request:
+- `ModelOutcomeUnknown` with the existing static message;
+- no `model_completed`;
+- the reservation held, because the cost is unknown;
+- the same digest refused on repeat.
+
+That is the priced client's existing unknown-outcome shape: a started call with no
+completion. It is the model-call analogue of M2-711's unknown submission outcome, so no new
+shape was invented.
+
+**Why not "usable".** Before the fix `model_completed` was written, so the *next* poll replayed
+the content from the journal and posted it, with no `model_response` behind it and a cost
+nobody could settle. A reply whose body cannot be journaled is not attributable, and the
+ledger is the product.
+
+#### Rejected
+
+- **Journaling `usage` with the non-finite value replaced by null**: the ledger would store a
+  body the provider did not send.
+- **Catching the `ValueError` at the journal write**: `model_completed` would already exist, and
+  that is the defect.
+
+#### Round 1 — `1e999` is a finite-looking token that parses to infinity
+
+Review round 1 (on `2a59299`) found the one blocker, and it reproduced by execution:
+`json.loads('{"usage":{"cost":1e999}}', parse_constant=...)` returns `{'usage': {'cost': inf}}`.
+`parse_constant` sees only the three literals. A valid number token that overflows goes through
+`float()` and becomes infinity without calling it, so the original escape (a raw `ValueError`
+after `model_completed`) was still reachable.
+
+A `parse_float` hook (`_finite_float`) now refuses a non-finite result inside the same `try`.
+The unit test gained `overflow` and `nested-overflow` cases. The property runs once per
+placement × kind (the three literals, and `1e999`/`-1E400`/`2.5e+308`), so the overflow tokens
+get guaranteed reach.
+
+**The siblings, enumerated by execution against the fixed parse:**
+
+| Token or shape | Result |
+| --- | --- |
+| a 400-digit integer | parses; `settled_cost` → unknown, so the reservation is held; `canonical()` journals it |
+| a 5000-digit integer | `ValueError` from Python's int-digit limit, inside the `try` → `ModelOutcomeUnknown` |
+| `1e-999` | underflows to `0.0`, which is finite, and settles 0 |
+| `-0.0` | finite; `Budget.settle` treats it as 0 |
+| nesting depth 100 000 | `RecursionError`, inside the `try` → `ModelOutcomeUnknown` |
+
+Nothing that `json.loads` returns can now make `canonical()` refuse.
+
+#### Deferred
+
+- A body nested deeply enough to hit Python's recursion limit raises `RecursionError` inside the
+  same `try` and takes the same path. It was measured (the round-1 table above) but has no
+  standing test.
+
+### M1-325 — Record the sanitized reason on `question_failure`
+
+#### Decision — the message for a `TournamentError`, the type alone for anything else
+
+The row is now `{"error_type", "reason", "at"}`:
+- `reason` is `str(exc)` when the exception is a `TournamentError`, whose messages are
+  module-owned;
+- `reason` is `None` for any other type, because a third-party message can quote a request, a
+  body or a header;
+- the journal's `journal_form` redaction applies on top.
+
+"Module-owned and value-free" is a test, not a comment.
+`test_every_tournament_error_message_is_value_free_by_construction` scans every constructor
+call of every `TournamentError` subclass in `src/`. It admits only three kinds of argument:
+- a string literal;
+- an f-string over module constants;
+- the two `str(exc)` translations of already-sanitized errors (`PromptError`,
+  `ReconciliationError`).
+
+It also admits `_failed_outcome_reason`, whose output is property-tested.
+
+#### Decision — the generic refusal names what refused
+
+Since M1-326, the quality gate records its code and returns, and the question then fails through
+`tournament.py`'s generic `"question research or generation failed"`. That was one sentence for
+a quality-gate refusal, a sufficiency-gate refusal and a failed generation alike: the
+2026-09-22 10:21 row. It is now `"question <status> (<code>)"`, for example
+`question research_failed (stale_evidence)`. Both parts come from closed `Literal`
+vocabularies, and anything outside them renders as `unclassified`.
+
+#### Decision — `tournament status` reports `recent_question_failures`
+
+This is the criterion's read path. It lists the newest five rows, newest first, as
+`{scope, error_type, reason, at}`. It is additive, so it also appears in every poll's JSON
+summary. A row written before this change reports `reason: null`, which is what it recorded.
+A row that is not an object is a `StorageFailure`.
+
+#### Deferred
+
+- **A per-question failure history command.** Five rows answer "why did the last poll fail";
+  a history is what `sqlite3` or M1-604's export is for.
+
+### M1-324 — Tests for the generation-refusal logging
+
+Both of M1-323's sites are covered:
+- the caught-exception handler (`generation refused for question …`);
+- the no-forecast branch (`generation produced no forecast …`).
+
+The no-forecast branch is driven by a malformed reply whose field **values** carry a sentinel,
+and by a provider exception whose **text** carries one. The handler is driven by a module-owned
+refusal chained from a sentinel-bearing cause, simulated at the `generate_forecast` seam. Every
+record the run emitted is searched for the sentinel, through a real formatter with any
+traceback rendered. A property in `tests/property/test_generation_failure_properties.py` plants
+the sentinel across every field of a reply and checks the problems `_parse` returns, which are
+exactly what the log line renders. Its reach is measured into both the schema and the
+post-schema halves.
+
+#### Deferred
+
+- `pipeline_live.py`'s other two `%s`-with-`exc` log lines (`could not file the failed reply`
+  and `could not record the forecast`) interpolate only module-owned errors, whose messages may
+  carry a path under the settled carve-out. They are outside the criterion's two sites.
+- A pydantic `msg` that echoes input (`union_tag_invalid`, and others) is M0-008, in PR-7. The
+  property found no leak through the forecast schema.
+
+### Mutation pass — twenty-two mutants, twenty-two dead
+
+Run on the committed branch (`d487340`) with `PYTHONDONTWRITEBYTECODE=1`, every
+`__pycache__` removed before each mutant, and the baseline confirmed green by exit code. Each
+mutant ran against the four new test files, `test_byok_cost.py`, `test_evidence_poor.py` and
+`test_tournament.py`.
+
+| Mutant | Killed by |
+| --- | --- |
+| M1 no `retry_wait` on the outcome path | `test_an_unusable_reply_is_one_generation_per_counted_attempt` |
+| M2 no `retry_wait` for `ModelOutcomeUnknown` | `test_a_failed_model_call_is_paid_once_per_counted_attempt` |
+| M3 a deterministic code paces | `test_a_deterministic_generation_verdict_still_blocks_and_never_waits` |
+| M4 research also paces on `internal_error` | `test_which_outcomes_pace[internal_error-research_failed]` |
+| M5 a wait appends `question_started` (counts twice) | `test_a_failed_model_call_is_paid_once_per_counted_attempt` |
+| M6 `_awaiting_retry` ignores the window | same |
+| M7 a wait counts as a failure | same |
+| M8 lenient `response.json()` | `test_a_non_finite_number_in_the_body_is_an_unknown_outcome[usage.cost]` |
+| M9 plain `TournamentError` on a failed request | `test_a_failed_model_call_is_paid_once_per_counted_attempt` |
+| M9b plain `TournamentError` on the repeat guard | `test_a_non_finite_…[usage.cost]` (second invoke) |
+| M10 the strict check moved after `model_completed` | `test_a_non_finite_…[usage.cost]` (`model_completed == []`) |
+| M11 `reason` always `None` | `test_a_failed_model_call_is_paid_once_per_counted_attempt` |
+| M12 `str(exc)` recorded for every type | `test_any_other_exception_keeps_its_type_only` |
+| M13 the generic refusal loses its code | `test_an_unusable_reply_is_one_generation_per_counted_attempt` |
+| M14 `status` omits the failures | `test_the_three_reasons_are_distinguishable` |
+| M14b the outcome reason echoes a foreign status | `test_the_outcome_reason_is_drawn_from_closed_vocabularies` |
+| M14c `status` reads oldest first | `test_the_three_reasons_are_distinguishable` |
+| M15 the caught-exception log call deleted | `test_a_refused_generation_logs_its_type_and_message_and_never_its_cause` |
+| M15b the no-forecast log call deleted | `test_a_malformed_reply_logs_its_sanitized_problems_and_never_the_value` |
+| M16 `exc_info=True` on the caught-exception log | `test_a_refused_generation_…` (the sentinel is in the rendered traceback) |
+| M17 log `exc.__cause__` | same |
+| M18 log the raw reply instead of the problems | `test_a_malformed_reply_…` |
+| M19 (round 1) no `parse_float` hook | `test_a_non_finite_…[overflow]` |
+
+After the round-1 fix, M8 was re-run as "drop the `parse_constant` hook" and M10 as "move both
+hooks after `model_completed`". Both still die.
+
+**M10 survived its first form, for the wrong reason.** The first version added a check after
+`model_completed` but left the strict parse inside the `try` in place. That check still refused
+first, so the added code was unreachable and the mutant was equivalent. Re-run as a real *move*
+(the strict parse replaced by the lenient one, with the check re-added after the write), it
+dies. Recorded because it is the "survivor from half a guard" shape the project has hit before.
+
+**The vacuity check.** Every in-window assertion in `test_generation_pacing.py` runs on a poll
+whose `heartbeat.retry_wait == 1` is asserted first, so the branch the assertion is about is
+the one reached. The two properties assert their own reach:
+- the non-finite body lands in `usage.cost`, deeper in `usage` and outside `usage`, one
+  parametrized run of 40 examples apiece. A single run with `sampled_from` measured 85/9/26 of
+  120 and failed its own reach bar in the gate, so reach is by construction now;
+- the reply sentinel reaches the schema half and the post-schema half of `_parse` in two runs.
+  A single mixed run reached the post-schema half only 5–20 times in 300, too thin a margin for
+  a required gate. The schema run now asserts ≥ 150 of 300 (measured 270–277). The post-schema
+  run plants free text only where the schema admits it, which is derived by trying each path,
+  with the prediction out of bounds, and asserts ≥ 50 of 100 (measured 100).
