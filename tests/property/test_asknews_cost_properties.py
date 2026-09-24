@@ -68,8 +68,9 @@ ANY_JSON = st.recursive(
     max_leaves=8,
 )
 # A count: mostly in range, often at an edge, sometimes any hostile leaf.
-COUNT = st.integers(0, 3).flatmap(
+COUNT = st.integers(0, 4).flatmap(
     lambda pick: (
+        st.booleans(),
         st.integers(0, 20),
         # Hypothesis shrinks toward small ints, so the range edges are drawn on purpose.
         st.integers(-3, -1) | st.integers(10**6 - 2, 10**6 + 2),
@@ -322,7 +323,13 @@ def _ledger(template: Path, workdir: Path) -> Iterator[tuple[sqlite3.Connection,
 
 
 SCOPES = ("42:33122", "42:33125")
-STORED = RESPONSE.filter(_persistable)
+# Mostly the live shape: a settlement needs AskNews, one completion AND a valid count, and
+# the two-scope case needs two of those at once. Measured before this weighting: 7-11 draws
+# of 150 settled in both scopes, and the count moved between runs, because Hypothesis seeds
+# part of its generation from the constants of whatever modules are loaded.
+STORED = (
+    st.integers(0, 3).flatmap(lambda pick: (LIVE, LIVE, LIVE, RESPONSE)[pick]).filter(_persistable)
+)
 CALL = st.tuples(
     st.sampled_from(["asknews", "asknews", "asknews", "exa"]),
     st.integers(0, 5).map(lambda n: (0, 1, 1, 1, 1, 2)[n]),
