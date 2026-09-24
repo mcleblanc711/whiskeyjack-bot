@@ -113,7 +113,12 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast, get_args
 
 from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
-from whiskeyjack_bot.config import AppConfig, SupportedQuestionType
+from whiskeyjack_bot.config import (
+    PROBABILITY_BOUND_CEILING,
+    PROBABILITY_BOUND_FLOOR,
+    AppConfig,
+    SupportedQuestionType,
+)
 from whiskeyjack_bot.forecast.record import ForecastRecordError
 from whiskeyjack_bot.forecast.store import read_forecast_record
 from whiskeyjack_bot.lifecycle import (
@@ -160,10 +165,12 @@ _LIVE_ATTEMPT_PREFIX = LIVE_ATTEMPT_TAG
 # accept: after a post has happened, a value the ledger refuses is a live post with no row.
 
 # Metaculus's own bound on a binary forecast, enforced by the SDK's public method as a bare
-# `ValueError`. Restated here so the refusal happens *before* the post and arrives as this
-# module's error type rather than as an unhandled exception from inside the dependency.
-_MIN_PROBABILITY = 0.001
-_MAX_PROBABILITY = 0.999
+# `ValueError`, is checked here so the refusal happens *before* the post and arrives as this
+# module's error type rather than as an unhandled exception from inside the dependency. The
+# two ends are `config.PROBABILITY_BOUND_FLOOR`/`CEILING`, not a copy of them (M1-513): this
+# module declared its own `0.001`/`0.999` until then, so the forecast side and the post side
+# were two sources for one spec number and nothing failed if they drifted.
+# `tests/unit/test_probability_envelope.py` fails if a second declaration appears in `src/`.
 
 # How far two floats may differ and still count as the same forecast. Small enough that it
 # admits only representation noise, not a different forecast. Whether the platform
@@ -591,11 +598,13 @@ def _require_probability(value: object, field: str) -> float:
         raise LiveSubmissionError(f"payload.{field} must be a number (offending value withheld)")
     if not math.isfinite(number):
         raise LiveSubmissionError(f"payload.{field} must be a finite number")
-    if not _MIN_PROBABILITY <= number <= _MAX_PROBABILITY:
-        # The bounds are this module's own literals and the platform's; naming them is what
-        # makes the refusal fixable, and neither is payload content.
+    if not PROBABILITY_BOUND_FLOOR <= number <= PROBABILITY_BOUND_CEILING:
+        # The bounds are the spec's and the platform's; naming them is what makes the
+        # refusal fixable, and neither is payload content. Rendered from the constants, so
+        # the message cannot state an envelope the check does not enforce (M1-513).
         raise LiveSubmissionError(
-            f"payload.{field} must be between {_MIN_PROBABILITY} and {_MAX_PROBABILITY}, "
+            f"payload.{field} must be between {PROBABILITY_BOUND_FLOOR!r} and "
+            f"{PROBABILITY_BOUND_CEILING!r}, "
             "which is what Metaculus accepts (offending value withheld)"
         )
     return number

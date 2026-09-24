@@ -155,7 +155,8 @@ def _require_config(forecast_config: ForecastConfig) -> tuple[float, float]:
         raise MultipleChoiceOutputError(
             [
                 "forecast_config: min_probability and max_probability must lie within "
-                "0.001 and 0.999 inclusive (configured pair withheld)"
+                f"{PROBABILITY_BOUND_FLOOR!r} and {PROBABILITY_BOUND_CEILING!r} inclusive "
+                "(configured pair withheld)"
             ]
         )
     if not low < high:

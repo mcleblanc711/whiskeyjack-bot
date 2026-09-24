@@ -460,7 +460,8 @@ def generate_forecast(
         # that cannot happen. Refused here, before any billable call.
         raise ForecastGenerationError(
             "forecast.min_probability and forecast.max_probability are not within the "
-            "0.001 to 0.999 envelope the submission path requires"
+            f"{PROBABILITY_BOUND_FLOOR!r} to {PROBABILITY_BOUND_CEILING!r} envelope the "
+            "submission path requires"
         )
     prompt_bounds_problem = probability_bounds_violation(
         prompt.bounds,

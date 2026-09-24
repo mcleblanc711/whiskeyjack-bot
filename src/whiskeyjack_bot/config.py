@@ -249,9 +249,10 @@ class RetrievalConfig(_StrictModel):
 
 
 # Spec (CODEX_HANDOFF.md § Configuration schema): 0.001 <= min < max <= 0.999. Named
-# here because this is the single source -- ``forecast.binary``, ``forecast.multiple_choice``
-# and ``forecast.generate`` all re-check the envelope against these, and a fourth copy of
-# the literals is exactly the drift M1-502 was reviewed for.
+# here because this is the single source -- ``forecast.binary``, ``forecast.multiple_choice``,
+# ``forecast.generate`` and ``submission_live`` all check the envelope against these and
+# render their diagnostics from them, and a second copy of the literals is exactly the drift
+# M1-502 was reviewed for (M1-513; ``tests/unit/test_probability_envelope.py`` enforces it).
 PROBABILITY_BOUND_FLOOR = 0.001
 PROBABILITY_BOUND_CEILING = 0.999
 
