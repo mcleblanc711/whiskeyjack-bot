@@ -98,6 +98,7 @@ from whiskeyjack_bot.forecast.record import (
 from whiskeyjack_bot.forecast.replay import replay_generation
 from whiskeyjack_bot.forecast.schema import ForecastSchemaError, response_model_for
 from whiskeyjack_bot.forecast.store import mint_record_id
+from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.lifecycle import (
     FailureCode,
     LifecycleError,
@@ -115,7 +116,6 @@ from whiskeyjack_bot.research.store import StoreError, list_retrieval_run_ids, r
 from whiskeyjack_bot.research.sufficiency import assess_sufficiency
 
 if TYPE_CHECKING:
-    from whiskeyjack_bot.config import AppConfig
     from whiskeyjack_bot.forecast.artifacts import StoredModelOutput
     from whiskeyjack_bot.forecast.inputs import ModelInput
     from whiskeyjack_bot.questions.model import CanonicalQuestion
@@ -205,13 +205,12 @@ def _require_replay_enabled(config: AppConfig) -> None:
     committed default for both is ``false`` -- the pair is the operator's statement that
     this is a replay, and reading it once, up front, is what makes the refusal legible.
     """
-    try:
-        research = config.retrieval.replay_saved_research
-        model_output = config.forecast.replay_saved_model_output
-    except AttributeError:
-        raise PipelineError("config must be an AppConfig") from None
-    if type(research) is not bool or type(model_output) is not bool:
-        raise PipelineError("config must be an AppConfig")
+    # ``run_replay`` has already refused anything but an exact ``AppConfig`` (M1-316), so both
+    # reads are fields of a validated model. The ``AttributeError`` and value-type fallbacks
+    # that used to stand here said "config must be an AppConfig" while checking only that
+    # two attributes existed and were bools, which a ``SimpleNamespace`` satisfies.
+    research = config.retrieval.replay_saved_research
+    model_output = config.forecast.replay_saved_model_output
     if not research:
         raise PipelineError(
             "retrieval.replay_saved_research is disabled; refusing to replay saved research"
@@ -243,12 +242,8 @@ def _require_retained_output(config: AppConfig) -> None:
     reason: a refusal an operator can act on is one that arrives before the work, not one
     that arrives after a row was nearly appended.
     """
-    try:
-        retain = config.storage.retain_raw_model_output
-    except AttributeError:
-        raise PipelineError("config must be an AppConfig") from None
-    if type(retain) is not bool:
-        raise PipelineError("config must be an AppConfig")
+    # A field of the exact ``AppConfig`` ``run_replay`` has already required (M1-316).
+    retain = config.storage.retain_raw_model_output
     if not retain:
         raise PipelineError(
             "storage.retain_raw_model_output is disabled; this command would append a "
@@ -494,7 +489,16 @@ def run_replay(
     ledger that never happened.
 
     Raises :class:`PipelineError`, or :class:`ForecastRejected` for that one recorded case.
+
+    **The config is checked once, by exact type, before anything else runs (M1-316).** The
+    per-attribute guards this replaced each said "config must be an AppConfig" while
+    verifying only the attributes they read, so a structurally compatible stand-in passed
+    them all. ``type(...) is``, not ``isinstance``, for ``submission_live``'s reason: the
+    claim is about the validated model, and a subclass could override what validation
+    established. The message now states exactly what the check verifies.
     """
+    if type(config) is not AppConfig:
+        raise PipelineError("config must be an AppConfig")
     _require_replay_enabled(config)
     _require_retained_output(config)
     if type(attempt_id) is not str:
