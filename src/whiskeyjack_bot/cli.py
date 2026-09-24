@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from whiskeyjack_bot.config import AppConfig
     from whiskeyjack_bot.lifecycle import ApprovalDecision
-    from whiskeyjack_bot.show import HistoryEntry, RecordShow
+    from whiskeyjack_bot.show import AnyStoredScore, HistoryEntry, RecordShow
     from whiskeyjack_bot.submission_payload import AuthorizedPayload
 
 # A command that refused to act: an unusable ledger, an unknown record, an illegal
@@ -1765,7 +1765,16 @@ def _history_entry_detail(entry: HistoryEntry) -> str:
         case "score":
             score = entry.score
             assert score is not None
-            return f"{score.metric} = {score.value}"
+            return f"{score.metric} = {score.value}{_score_source(score)}"
+
+
+def _score_source(score: AnyStoredScore) -> str:
+    """A platform score names what it is measured against and where it was read (M4-803)."""
+    from whiskeyjack_bot.lifecycle import StoredPlatformScore
+
+    if isinstance(score, StoredPlatformScore):
+        return f"  vs {score.comparison_baseline}  source: {score.implementation_version}"
+    return ""
 
 
 def _print_show(view: RecordShow) -> None:
@@ -1864,8 +1873,8 @@ def _print_show(view: RecordShow) -> None:
         print(f"score history ({len(view.score_history)}):")
         for score in view.score_history:
             print(
-                f"  - seq {score.event_id}: {score.metric} = {score.value}  "
-                f"computed: {score.computed_at_utc}"
+                f"  - seq {score.event_id}: {score.metric} = {score.value}"
+                f"{_score_source(score)}  computed: {score.computed_at_utc}"
             )
     else:
         print("score history: none")

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import requests
 import yaml
@@ -24,10 +25,13 @@ from whiskeyjack_bot.cli import EXIT_REFUSED, main
 from whiskeyjack_bot.env_verify import EXIT_ENV_MISSING, EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import current_status, latest_resolution
+from whiskeyjack_bot import notify
 from whiskeyjack_bot.resolution_ingest import (
     ResolutionFetchError,
     ResolutionIngestError,
+    WithheldRecord,
     ingest_resolutions,
+    withheld_records,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -365,3 +369,264 @@ def test_the_ingest_module_imports_nothing_that_can_post() -> None:
             imported.update(alias.name for alias in node.names)
     assert imported, "vacuity guard: the module does import things"
     assert not {name for name in imported if "submission" in name or "poster" in name.lower()}
+
+
+# ── M4-807: a withheld resolution reaches the operator ───────────────────────
+
+
+class Pager:
+    """The ntfy side of a real :class:`notify.Notifier`, over ``httpx.MockTransport``.
+
+    The notifier is the production one -- its throttle stamps, redaction and deadline all
+    run -- and only the transport is fake. ``mode`` makes the push fail in each way the
+    channel can: a rejection, a transport error, or a handler bug.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.pushes: list[tuple[str, str, str]] = []  # (title, priority, body)
+        self.built = 0
+        self.mode = "ok"
+        self.now = T0
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if self.mode == "raise":
+            raise RuntimeError("the push blew up")
+        if self.mode == "transport":
+            raise httpx.ConnectError("unreachable", request=request)
+        self.pushes.append(
+            (request.headers["Title"], request.headers["Priority"], request.content.decode())
+        )
+        return httpx.Response(500 if self.mode == "rejected" else 200)
+
+    def build(self, config: Any) -> notify.Notifier:
+        self.built += 1
+        return notify.Notifier(
+            client=httpx.Client(transport=httpx.MockTransport(self._handle)),
+            topic_url="https://ntfy.invalid/topic-not-a-secret",
+            state_root=config.storage.artifact_root,
+            clock=lambda: self.now,
+        )
+
+
+@pytest.fixture()
+def pager(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pager:
+    installed = Pager(tmp_path)
+    # The command imports `build_notifier` from the module at call time.
+    monkeypatch.setattr(notify, "build_notifier", installed.build)
+    return installed
+
+
+def _withheld_population(config_file: Path) -> dict[int, dict[str, Any]]:
+    connection = _ledger(config_file)
+    try:
+        seed_submitted(connection, "rec-w", question_id=45748, post_id=45557)
+        seed_submitted(connection, "rec-a", question_id=45747, post_id=45556)
+    finally:
+        connection.close()
+    withheld = kind_payload("binary", "withheld", post_id=45557, question_id=45748)
+    # Payload text the alert must never carry.
+    withheld["title"] = "SENTINEL-post-title"
+    withheld["question"]["title"] = "SENTINEL-question-title"
+    withheld["question"]["description"] = "SENTINEL-description"
+    return {
+        45556: kind_payload("binary", "resolved", post_id=45556, question_id=45747),
+        45557: withheld,
+    }
+
+
+def test_a_withheld_record_pages_once_per_window_while_it_stays_withheld(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pager: Pager,
+) -> None:
+    _install(monkeypatch, Wire(_withheld_population(config_file)))
+
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "record rec-w  appended  kind withheld  scorable no" in out
+    assert "records: 2  failed: 0  withheld: 1" in out
+    assert len(pager.pushes) == 1
+    title, priority, body = pager.pushes[0]
+    assert title == "whiskeyjack: a posted forecast's resolution is withheld"
+    assert priority == "default"
+    assert "record=rec-w" in body and "question=45748" in body
+    assert "rec-a" not in body and "45747" not in body, "only the withheld record pages"
+    assert "SENTINEL" not in title + body, "the alert carries no payload value"
+
+    # The next scheduled run, same day: the record reads `unchanged` (no kind), but it is
+    # still withheld -- the throttle, not the transition, is what keeps it quiet.
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "record rec-w  unchanged" in out and "withheld: 1" in out
+    assert len(pager.pushes) == 1
+
+    # Later the same UTC day -- the window is a tumbling one, floor(epoch / 86400), and T0 is
+    # 18:00 -- the day-long window still holds it.
+    pager.now = T0 + timedelta(hours=5, minutes=59)
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert len(pager.pushes) == 1
+
+    # A day later it is still true, so it reminds again.
+    pager.now = T0 + timedelta(days=1)
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert len(pager.pushes) == 2 and "record=rec-w" in pager.pushes[1][2]
+
+
+def test_a_record_the_platform_unmasks_stops_paging(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pager: Pager,
+) -> None:
+    posts = _withheld_population(config_file)
+    _install(monkeypatch, Wire(posts))
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert len(pager.pushes) == 1
+    posts[45557] = kind_payload("binary", "resolved", post_id=45557, question_id=45748)
+    pager.now = T0 + timedelta(days=1)
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert "withheld: 0" in capsys.readouterr().out
+    assert len(pager.pushes) == 1
+
+
+@pytest.mark.parametrize("kind", ["resolved", "annulled", "ambiguous", "unresolved"])
+def test_no_other_kind_pages_or_builds_a_notifier(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, pager: Pager, kind: str
+) -> None:
+    connection = _ledger(config_file)
+    try:
+        seed_submitted(connection, "rec-a", question_id=45747, post_id=45556)
+    finally:
+        connection.close()
+    posts = {45556: kind_payload("binary", "resolved", post_id=45556, question_id=45747)}
+    _install(monkeypatch, Wire(posts))
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    # Then the observation `kind` is recorded on top (`unresolved` is a retraction).
+    posts[45556] = kind_payload("binary", kind, post_id=45556, question_id=45747)
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert pager.pushes == [] and pager.built == 0
+
+
+@pytest.mark.parametrize("mode", ["rejected", "transport", "raise", "no_notifier"])
+@pytest.mark.parametrize("also_failed", [False, True])
+def test_the_alert_never_changes_the_exit_code(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pager: Pager,
+    mode: str,
+    also_failed: bool,
+) -> None:
+    posts = _withheld_population(config_file)
+    if also_failed:
+        del posts[45556]  # a 404: rec-a fails, which is what decides the exit code
+    if mode == "no_notifier":
+        monkeypatch.setattr(notify, "build_notifier", lambda config: None)
+    else:
+        pager.mode = mode
+    _install(monkeypatch, Wire(posts))
+    expected = EXIT_REFUSED if also_failed else EXIT_OK
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == expected
+    assert f"failed: {1 if also_failed else 0}  withheld: 1" in capsys.readouterr().out
+
+
+# The quiet-branch table. A payload the classifier cannot read must never be stored as
+# `withheld` -- which would page daily and look like routine access -- nor pass silently as
+# no alert: each is a `failed` record, a non-zero exit, and the schedule's OnFailure page.
+def _no_resolution_key(post: dict[str, Any]) -> None:
+    del post["question"]["resolution"]
+
+
+def _numeric_resolution(post: dict[str, Any]) -> None:
+    post["question"]["resolution"] = 5
+
+
+def _unknown_status(post: dict[str, Any]) -> None:
+    post["question"]["status"] = "resolvedish"
+
+
+def _other_question(post: dict[str, Any]) -> None:
+    post["question"]["id"] = 99999
+
+
+def _other_type(post: dict[str, Any]) -> None:
+    post["question"]["type"] = "numeric"
+
+
+def _not_a_post(post: dict[str, Any]) -> None:
+    post.clear()
+
+
+@pytest.mark.parametrize(
+    "malform",
+    [
+        _no_resolution_key,
+        _numeric_resolution,
+        _unknown_status,
+        _other_question,
+        _other_type,
+        _not_a_post,
+    ],
+)
+def test_a_malformed_withheld_shape_fails_loudly_and_never_reads_as_withheld(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pager: Pager,
+    malform: Any,
+) -> None:
+    posts = _withheld_population(config_file)
+    malform(posts[45557])
+    _install(monkeypatch, Wire(posts))
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert "record rec-w  failed" in out and "withheld: 0" in out
+    assert pager.pushes == []
+    connection = _ledger(config_file)
+    try:
+        assert latest_resolution(connection, "rec-w") is None
+    finally:
+        connection.close()
+
+
+def test_a_withheld_row_that_no_longer_matches_its_digest_is_refused_not_quiet(
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pager: Pager,
+) -> None:
+    """The condition is read through the verifying reader, so a stored row whose content was
+    changed after hashing refuses the run rather than dropping out of the withheld set."""
+    posts = _withheld_population(config_file)
+    _install(monkeypatch, Wire(posts))
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_OK
+    assert len(pager.pushes) == 1
+    connection = _ledger(config_file)
+    try:
+        connection.execute("DROP TRIGGER resolution_events_block_update")
+        connection.execute(
+            "UPDATE resolution_events SET source_response = '{}' WHERE forecast_record_id = 'rec-w'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    pager.now = T0 + timedelta(days=1)
+    assert main(["ingest-resolutions", "--config", str(config_file)]) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert "refused: a record's latest resolution could not be read" in out
+    assert "SENTINEL" not in out
+    assert len(pager.pushes) == 1
+
+
+def test_withheld_records_reads_the_condition_once_per_record(conn: Any) -> None:
+    post, question_ids = _group_post((None, "yes", "annulled"))
+    post_id = post["id"]
+    for index, question_id in enumerate(question_ids):
+        seed_submitted(conn, f"rec-g{index}", question_id=question_id, post_id=post_id)
+    results = ingest_resolutions(conn, FakePlatform({post_id: post}), clock=_clock().__next__)
+    doubled = results + results
+    assert withheld_records(conn, doubled) == (
+        WithheldRecord(record_id="rec-g0", question_id=question_ids[0]),
+    )

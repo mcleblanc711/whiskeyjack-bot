@@ -222,8 +222,7 @@ def test_the_command_scores_prints_and_is_idempotent(
         "platform appended  rows 4  -> scored"
     ) in out
     assert (
-        "question 45748  record rec-no  binary  not_scorable  rows 0  "
-        "platform not_scorable  rows 0"
+        "question 45748  record rec-no  binary  not_scorable  rows 0  platform not_scorable  rows 0"
     ) in out
     assert "records: 2  failed: 0" in out
 
