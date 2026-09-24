@@ -377,8 +377,8 @@ version: 11
 | `unrecorded-posts` | **read-only** | no | no |
 | `reconcile-submission` | appends a reconciliation and an event | **GET** (no post) | no |
 | `verify-submission` | appends an event | **GET** | no |
-| `ingest-resolutions` | appends resolution rows and `resolved` events | **GET** | no |
-| `score` | appends local score rows and `scored` events | no | no |
+| `ingest-resolutions` | appends resolution rows and `resolved` events | **GET**; an ntfy push per `withheld` record (M4-807) | no |
+| `score` | appends local and platform score rows and `scored` events | no | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 | `tournament correct-costs` | **read-only** | no | no |

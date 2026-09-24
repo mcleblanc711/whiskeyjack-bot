@@ -1109,3 +1109,12 @@ results skipped, the body without the record); N01, N02 (window, priority); Q01�
 Q20 (every 017 clause neutered, platform types narrowed, the version tail, the top-level `real`
 check, the group branch disabled, group uniqueness, the metric-to-key map crossed).
 
+### Review
+
+**Round 1 — APPROVE on `0f9fbd3`** (2026-09-23, local Codex against
+`GPT_REVIEW_REQUEST_M4-803_r1.md`, all four gates green in the request). No blocking findings;
+all ten falsifiable risk claims marked safe. One non-blocking observation — the runbook's
+command table still said `score` appends *local* score rows — is fixed after approval, together
+with the same table's `ingest-resolutions` row (which can now push to ntfy) and this entry.
+Those three documentation lines are the only change after the approved commit.
+
