@@ -109,6 +109,18 @@ _HIGHS: Final = [0.999, 0.9, 0.6, 0.5, 0.4, 0.34, 1 / 3, 0.3, 0.26]
 
 @st.composite
 def _cases(draw: Any) -> tuple[int, float, float]:
+    if draw(st.integers(0, 3)) == 0:
+        # Inside the sum tolerance's own band: one side of the pair placed a fraction of
+        # ``_SUM_TOLERANCE`` past (or short of) exactly ``1 / count``. Where a reply that
+        # misses 1 by less than the tolerance is still accepted, so an answer that ignored
+        # the tolerance -- "the witness sums to exactly 1" -- is wrong only here, and a
+        # uniform draw essentially never lands here (the ``ignore-tolerance`` mutant
+        # survived the first version of this strategy).
+        count = draw(st.integers(3, 200))
+        offset = draw(st.sampled_from([0.4, 0.9, 1.1, 3.0])) * _SUM_TOLERANCE
+        if draw(st.booleans()):
+            return count, (1 + offset) / count, 0.999
+        return count, 0.001, (1 - offset) / count
     low = draw(st.one_of(st.sampled_from(_LOWS), st.floats(0.001, 0.5)))
     high = draw(st.one_of(st.sampled_from(_HIGHS), st.floats(0.001, 0.999)))
     assume(low < high)
