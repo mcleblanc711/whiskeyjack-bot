@@ -1426,7 +1426,8 @@ order, the CLI's refusal arm, and 19 document mutants (a column, transition, ver
 warning code dropped or added; a type, since, mutability, introduced, transition, version value,
 baseline, scorable flag or anchor changed).
 
-**66 mutants: 64 killed, 2 equivalent, 0 surviving.**
+**68 mutants: 66 killed, 2 equivalent, 0 surviving** (the last two, `subject_across_populations` and
+`excluded_compared_to_included_subject`, were added with round 1's fix and are killed by it).
 
 | mutant | why it lived | disposition |
 | --- | --- | --- |
@@ -1446,3 +1447,22 @@ n = 11, binary calibration n = 11 across seven bins, model cost 27 known ($2.119
 unknown. Warnings: `small_sample` (276 cells), `overlapping_axes` (3), `unknown_model_cost`
 (38). A second run on the same copy was byte-identical in all three files (same `now`).
 Nothing was published.
+
+### Review
+
+**Round 1 — CHANGES REQUESTED on `bd55ab1`** (2026-09-24, local Codex against
+`GPT_REVIEW_REQUEST_M5-804_r1.md`, all four gates green in the request). One blocking finding,
+all twelve risk claims otherwise marked safe, no non-blocking observations.
+
+- **B1 — an excluded test record could supersede an included one.** `classify` chose one posted
+  subject per `question_id` *before* the test-tournament exclusion, so a `bot-testing-area`
+  record of the same question that sorted later made the included record `superseded` and
+  removed its verified outcome from every summary. **Reproduced by execution on `bd55ab1`**
+  (`rec-a` in 33125 read `superseded`, `rec-z` excluded read `scored`, the included population
+  reported zero scored records). **Fixed in `1fed9d6`:** subjects are keyed on
+  `(exclusion, question_id)`. `test_an_excluded_record_never_supersedes_an_included_one`
+  (production writers) and the reworked property both fail on `bd55ab1` and pass on the fix.
+  **Why the property missed it:** it asserted one subject per question across both
+  populations — which the bug satisfies. It is now per population, with an explicit check and a
+  reach floor (≥ 20 in 400 draws) for questions posted in both. Same family as the vacuous
+  property class: the assertion was about the wrong partition.
