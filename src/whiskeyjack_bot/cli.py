@@ -362,6 +362,23 @@ def build_parser() -> argparse.ArgumentParser:
             "directory under storage.export_root. An existing export is never overwritten"
         ),
     )
+
+    report = subparsers.add_parser(
+        "report",
+        help=(
+            "derive the attribution report dataset (counts, calibration bins, score "
+            "summaries) from the ledger; never writes to it"
+        ),
+    )
+    report.add_argument("--config", default="config.yaml", type=Path)
+    report.add_argument(
+        "--output",
+        type=Path,
+        help=(
+            "directory to create the report in; defaults to a new UTC-timestamped "
+            "directory under storage.export_root. An existing report is never overwritten"
+        ),
+    )
     return parser
 
 
@@ -1663,6 +1680,59 @@ def _run_export(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_report(args: argparse.Namespace) -> int:
+    """Derive the attribution report dataset from the ledger (M5-804).
+
+    ``_run_export``'s shape, for ``_run_export``'s reasons: no ledger connection of its own
+    (:func:`report.write_report` takes the path and opens it read-only), ``--output``
+    defaulting to a new UTC-timestamped directory under ``storage.export_root``, and a
+    refusal rather than an overwrite if that directory already holds a report.
+
+    What it prints is counts only. Nothing is summed across the groups of an axis -- on the
+    overlapping axes that total would count records twice -- and the per-group numbers are
+    in ``report.json``, where every cell carries its own ``n`` and small-sample flag.
+    """
+    from datetime import datetime, timezone
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.ledger import LedgerError
+    from whiskeyjack_bot.logging_setup import configure_logging
+    from whiskeyjack_bot.report import ReportError, write_report
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    configure_logging(config)
+
+    stamped = datetime.now(timezone.utc)
+    destination = args.output
+    if destination is None:
+        destination = config.storage.export_root / f"report-{stamped.strftime('%Y%m%dT%H%M%SZ')}"
+
+    try:
+        result = write_report(config.storage.sqlite_path, destination, now=stamped)
+    except (ReportError, LedgerError) as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
+
+    print(f"ledger:    {config.storage.sqlite_path}")
+    print(f"schema:    version {result.ledger_schema_version}")
+    print(f"output:    {result.destination}")
+    print(f"records:   {result.records} ({result.excluded} excluded, {result.included} included)")
+    for state, count in result.states:
+        print(f"  {count:>7} {state}")
+    for code, count in result.warnings:
+        print(f"warning:   {code} ({count})")
+    return EXIT_OK
+
+
 def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
     """Open an existing ledger, or print why not and return ``None`` (M2-701).
 
@@ -2086,6 +2156,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_show(args)
     if args.command == "export":
         return _run_export(args)
+    if args.command == "report":
+        return _run_report(args)
     raise AssertionError(f"unhandled command: {args.command}")
 
 
