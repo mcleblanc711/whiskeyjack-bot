@@ -31,10 +31,12 @@ itself is never read, shown or derived.
 categories and several evidence-gap codes, so on those axes a record sits in several groups at
 once. Their group counts do not sum to the population, and nothing in the report sums them.
 
-**One scored subject per question.** Platform scores are per question, so if two posted
-versions of one question existed, counting both would count one platform number twice. The
-latest posted version is the subject; an earlier posted one is ``superseded``. No live question
-has a second version today.
+**One scored subject per question within each population.** Platform scores are per
+question, so if two posted versions of one question existed, counting both would count one
+platform number twice. The latest posted version is the subject; an earlier posted one is
+``superseded``. The subject is chosen separately for included and excluded records, so a
+test-tournament record never supersedes an included one (review round 1). No live question has
+a second version today.
 
 Error hygiene follows ``ExportError``: a :class:`ReportError` never echoes a stored value.
 Collaborators' errors are re-raised with their own already-sanitized messages (``show.py``'s

@@ -1466,3 +1466,9 @@ all twelve risk claims otherwise marked safe, no non-blocking observations.
   populations — which the bug satisfies. It is now per population, with an explicit check and a
   reach floor (≥ 20 in 400 draws) for questions posted in both. Same family as the vacuous
   property class: the assertion was about the wrong partition.
+
+**Round 2 — APPROVE on `3661084`** (2026-09-24, against `GPT_REVIEW_REQUEST_M5-804_r2.md`, which
+led with the `bd55ab1`→HEAD delta). B1 closed; no blocking findings; all thirteen risk claims
+marked safe. One non-blocking observation — `report.py`'s module docstring still said "one
+scored subject per question" — is fixed after approval ("within each population"). That
+docstring and this entry are the only change after the approved commit.
