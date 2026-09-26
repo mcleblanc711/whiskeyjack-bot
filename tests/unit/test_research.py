@@ -243,7 +243,7 @@ def test_validation_error_never_echoes_an_input_controlled_field_name() -> None:
     assert secret not in rendered
     assert excinfo.value.__cause__ is None
     # Still diagnostic: the caller learns an unexpected key was rejected.
-    assert "Extra inputs are not permitted" in str(excinfo.value)
+    assert "<withheld>: extra_forbidden" in str(excinfo.value)
 
 
 def test_validation_error_never_echoes_a_provider_config_key() -> None:

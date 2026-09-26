@@ -35,6 +35,7 @@ from pydantic import (
 # prompt.py imports only stdlib, so this stays acyclic. The semver rule lives
 # there because M1-401 owns it; duplicating it here is what let the two drift.
 from whiskeyjack_bot.prompt import BARE_VERSION_RE
+from whiskeyjack_bot.validation_errors import authored_error, sanitized_problems
 
 PLACEHOLDER_PREFIX = "REPLACE_WITH"
 
@@ -99,7 +100,7 @@ def _require_non_blank(value: str) -> str:
     """
     if not value.strip():
         # No value in the message: the caller's input may be untrusted.
-        raise ValueError("must not be blank")
+        raise authored_error("blank_text", "must not be blank")
     return value
 
 
@@ -110,13 +111,15 @@ def _require_non_blank(value: str) -> str:
 NonBlankStr = Annotated[str, AfterValidator(_require_non_blank)]
 
 
-def _require_env_var_name(value: str, field_name: str) -> str:
+def _require_env_var_name(value: str) -> str:
     if not _ENV_VAR_NAME_RE.fullmatch(value):
         # Deliberately do not include the offending value: if a credential was
-        # pasted here by mistake, the diagnostic must not repeat it.
-        raise ValueError(
-            f"{field_name} must be an UPPER_SNAKE_CASE environment variable "
-            "name, not a value (offending input withheld from this message)"
+        # pasted here by mistake, the diagnostic must not repeat it. The field is named
+        # by the error's location, which the sanitizer renders (M0-008).
+        raise authored_error(
+            "env_var_name_expected",
+            "must be an UPPER_SNAKE_CASE environment variable name, not a value "
+            "(offending input withheld from this message)",
         )
     return value
 
@@ -129,7 +132,9 @@ class TournamentConfig(_StrictModel):
     @classmethod
     def _non_empty_id(cls, v: int | str) -> int | str:
         if isinstance(v, str) and not v.strip():
-            raise ValueError("tournament id must be a non-empty slug or integer id")
+            raise authored_error(
+                "tournament_id_blank", "tournament id must be a non-empty slug or integer id"
+            )
         return v
 
 
@@ -145,7 +150,7 @@ class MetaculusConfig(_StrictModel):
     @field_validator("token_env")
     @classmethod
     def _token_env_is_name(cls, v: str) -> str:
-        return _require_env_var_name(v, "metaculus.token_env")
+        return _require_env_var_name(v)
 
 
 class ModelConfig(_StrictModel):
@@ -172,18 +177,21 @@ class ModelConfig(_StrictModel):
     @classmethod
     def _no_placeholder_model(cls, v: str) -> str:
         if v.startswith(PLACEHOLDER_PREFIX):
-            raise ValueError(
+            raise authored_error(
+                "model_name_placeholder",
                 "model.name is still the placeholder; set a verified "
-                "LiteLLM-compatible model name (D27: no silent default)"
+                "LiteLLM-compatible model name (D27: no silent default)",
             )
         if not v.strip():
-            raise ValueError("model.name must be non-empty (D27: no silent default)")
+            raise authored_error(
+                "model_name_blank", "model.name must be non-empty (D27: no silent default)"
+            )
         return v
 
     @field_validator("api_key_env")
     @classmethod
     def _key_env_is_name(cls, v: str) -> str:
-        return _require_env_var_name(v, "model.api_key_env")
+        return _require_env_var_name(v)
 
 
 class RetrievalProviderConfig(_StrictModel):
@@ -198,7 +206,7 @@ class RetrievalProviderConfig(_StrictModel):
     @field_validator("api_key_env")
     @classmethod
     def _key_env_is_name(cls, v: str) -> str:
-        return _require_env_var_name(v, "retrieval provider api_key_env")
+        return _require_env_var_name(v)
 
 
 class SocialRetrievalConfig(_StrictModel):
@@ -219,7 +227,7 @@ class SocialRetrievalConfig(_StrictModel):
     @field_validator("api_key_env")
     @classmethod
     def _key_env_is_name(cls, v: str) -> str:
-        return _require_env_var_name(v, "retrieval.social.api_key_env")
+        return _require_env_var_name(v)
 
     @model_validator(mode="after")
     def _no_placeholder_when_enabled(self) -> SocialRetrievalConfig:
@@ -227,10 +235,11 @@ class SocialRetrievalConfig(_StrictModel):
         # committed example must load, but enabling social retrieval without a
         # verified Grok model name is a D27 violation.
         if self.enabled and self.agent_model.startswith(PLACEHOLDER_PREFIX):
-            raise ValueError(
+            raise authored_error(
+                "social_agent_model_placeholder",
                 "retrieval.social.enabled is true but agent_model is still the "
                 "placeholder; verify the current Grok model name at docs.x.ai "
-                "(D27: no silent default)"
+                "(D27: no silent default)",
             )
         return self
 
@@ -289,17 +298,19 @@ class ForecastConfig(_StrictModel):
         # Shared with prompt.py: ASCII-only digits and no leading zeroes, so a
         # config value and a prompt H1 can never be accepted by different rules.
         if not BARE_VERSION_RE.fullmatch(v):
-            raise ValueError(
+            raise authored_error(
+                "prompt_version_not_bare",
                 "forecast.prompt_version must be a bare MAJOR.MINOR.PATCH version "
-                "with no 'v' prefix"
+                "with no 'v' prefix",
             )
         return v
 
     @model_validator(mode="after")
     def _probability_bounds_ordered(self) -> ForecastConfig:
         if self.min_probability >= self.max_probability:
-            raise ValueError(
-                "forecast.min_probability must be strictly below forecast.max_probability"
+            raise authored_error(
+                "probability_bounds_unordered",
+                "forecast.min_probability must be strictly below forecast.max_probability",
             )
         return self
 
@@ -312,9 +323,10 @@ class ForecastConfig(_StrictModel):
         # combination is rejected here rather than given a silent-by-default behavior
         # the gate's own call sites would otherwise have to invent.
         if not self.fail_on_stale_research and not self.flag_on_stale_research:
-            raise ValueError(
+            raise authored_error(
+                "research_gate_silent",
                 "forecast.fail_on_stale_research and forecast.flag_on_stale_research must "
-                "not both be false: a stale or missing research gate is never silent"
+                "not both be false: a stale or missing research gate is never silent",
             )
         return self
 
@@ -388,31 +400,33 @@ class SubmissionConfig(_StrictModel):
         is refused at load instead. This is the *stricter reading* of an ambiguous
         combination, per CLAUDE.md.
         """
-        problems: list[str] = []
+        # Each rule is one authored sentence naming every flag it covers (M0-008, D50): the
+        # sanitizer renders an authored sentence and nothing a caller wrote, so the list of
+        # *which* flags are wrong is replaced by the full rule, which names all of them.
+        # With both rules broken the first is reported, and the second follows at the next
+        # load.
         # Invariants that hold in every milestone (hard constraints).
-        if self.enabled and not self.require_human_approval:
-            problems.append("submission.enabled requires require_human_approval: true")
-        if self.enabled and not self.approval_must_match_forecast_hash:
-            problems.append("submission.enabled requires approval_must_match_forecast_hash: true")
-        if self.enabled and not self.verify_by_refetch:
-            problems.append("submission.enabled requires verify_by_refetch: true")
-        if self.enabled and not self.block_retry_on_uncertain_result:
-            problems.append("submission.enabled requires block_retry_on_uncertain_result: true")
+        if self.enabled and not (
+            self.require_human_approval
+            and self.approval_must_match_forecast_hash
+            and self.verify_by_refetch
+            and self.block_retry_on_uncertain_result
+        ):
+            raise authored_error(
+                "submission_safety_invariant",
+                "submission.enabled requires require_human_approval: true, "
+                "approval_must_match_forecast_hash: true, verify_by_refetch: true and "
+                "block_retry_on_uncertain_result: true",
+            )
         # The combination that has no coherent meaning. `dry_run` and `no_submit` are two
         # independent brakes on one path and either one alone stops it; `enabled: true`
         # with a brake still on is a configuration whose author expected a post.
-        if self.enabled and self.dry_run:
-            problems.append(
-                "submission.enabled: true requires dry_run: false; a run cannot both "
-                "submit and rehearse"
+        if self.enabled and (self.dry_run or self.no_submit):
+            raise authored_error(
+                "submission_brake_still_on",
+                "submission.enabled: true requires dry_run: false and no_submit: false; a "
+                "run cannot both submit and rehearse, and no_submit is the kill switch",
             )
-        if self.enabled and self.no_submit:
-            problems.append(
-                "submission.enabled: true requires no_submit: false; no_submit is the "
-                "kill switch and it is still on"
-            )
-        if problems:
-            raise ValueError("; ".join(problems))
         return self
 
 
@@ -458,7 +472,7 @@ class NotifyConfig(_StrictModel):
     @field_validator("topic_url_env")
     @classmethod
     def _topic_url_env_is_name(cls, v: str) -> str:
-        return _require_env_var_name(v, "notify.topic_url_env")
+        return _require_env_var_name(v)
 
 
 class RunLimitsConfig(_StrictModel):
@@ -573,12 +587,10 @@ class ConfigError(Exception):
 
 
 def _sanitize_validation_error(exc: ValidationError) -> ConfigError:
-    problems = []
-    for err in exc.errors(include_input=False, include_url=False):
-        location = ".".join(str(part) for part in err["loc"]) or "<root>"
-        message = err["msg"]
-        problems.append(f"{location}: {message}")
-    return ConfigError(problems)
+    # The shared rendering (M0-008): locations the schema authored, pydantic's type slug,
+    # and the sentence only of an authored error. An unknown key under extra="forbid"
+    # is withheld like any other input -- it may be a pasted credential.
+    return ConfigError(sanitized_problems(exc, AppConfig))
 
 
 def validate_config_data(data: Any) -> AppConfig:

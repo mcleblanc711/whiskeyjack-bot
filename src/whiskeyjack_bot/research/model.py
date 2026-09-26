@@ -66,6 +66,7 @@ from pydantic import (
 )
 
 from whiskeyjack_bot.config import _StrictModel
+from whiskeyjack_bot.validation_errors import authored_error, sanitized_problems
 
 # Where a document came from. ``structured`` is the M1-304 router's official
 # dataset path (FRED and friends); ``official`` is a primary-source web document
@@ -151,7 +152,7 @@ def _require_http_url(value: str) -> str:
     # the string it parsed is no longer the string we would store. Covers the
     # leading/trailing case too -- " https://x/y " is not the URL we were given.
     if any(_is_forbidden_in_url(char) for char in value):
-        raise ValueError(_BAD_URL)
+        raise authored_error("url_not_http", _BAD_URL)
     try:
         parts = urlsplit(value)
         # .port parses lazily and raises for an out-of-range or non-numeric port;
@@ -164,13 +165,13 @@ def _require_http_url(value: str) -> str:
         # in some of its own ValueErrors (the NFKC-normalization check does), so
         # letting either the message or the __cause__ through re-leaks the input
         # that this validator exists to withhold.
-        raise ValueError(_BAD_URL) from None
+        raise authored_error("url_not_http", _BAD_URL) from None
     if parts.scheme not in ("http", "https"):
-        raise ValueError(_BAD_URL)
+        raise authored_error("url_not_http", _BAD_URL)
     if not hostname:
-        raise ValueError(_BAD_URL)
+        raise authored_error("url_not_http", _BAD_URL)
     if port is not None and not 1 <= port <= 65535:
-        raise ValueError(_BAD_URL)
+        raise authored_error("url_not_http", _BAD_URL)
     _require_resolvable_hostname(hostname)
     return value
 
@@ -212,7 +213,7 @@ def _require_resolvable_hostname(hostname: str) -> None:
     except idna.IDNAError:
         # Constant message and from None, as everywhere in this validator: the
         # idna exceptions embed the offending label.
-        raise ValueError(_BAD_URL) from None
+        raise authored_error("url_not_http", _BAD_URL) from None
 
 
 # An absolute http(s) URL, preserved exactly. See _require_http_url.
@@ -243,7 +244,9 @@ def _require_finite(value: float) -> float:
     convention into a validation failure.
     """
     if not isfinite(value):
-        raise ValueError("must be a finite number: NaN and Infinity cannot be persisted")
+        raise authored_error(
+            "number_not_finite", "must be a finite number: NaN and Infinity cannot be persisted"
+        )
     return value + 0.0
 
 
@@ -277,7 +280,7 @@ def _require_identifier_text(value: str) -> str:
     disagree about the same string.
     """
     if not value.strip() or "\x00" in value:
-        raise ValueError(_BAD_IDENTIFIER)
+        raise authored_error("identifier_invalid", _BAD_IDENTIFIER)
     return value
 
 
@@ -301,7 +304,10 @@ def _reject_non_finite(value: JsonValue) -> JsonValue:
     """
     if isinstance(value, float) and not isfinite(value):
         # No value in the message: config may hold provider-supplied material.
-        raise ValueError("must not contain NaN or Infinity: they cannot round-trip through JSON")
+        raise authored_error(
+            "config_not_finite",
+            "must not contain NaN or Infinity: they cannot round-trip through JSON",
+        )
     if isinstance(value, dict):
         for nested in value.values():
             _reject_non_finite(nested)
@@ -384,14 +390,16 @@ class ResearchDocument(_StrictModel):
         """
         if self.source_type == "social":
             if self.provenance != "llm_reported":
-                raise ValueError(
+                raise authored_error(
+                    "social_provenance_mismatch",
                     "source_type 'social' requires provenance 'llm_reported': "
-                    "social evidence is reported by the research agent, not retrieved"
+                    "social evidence is reported by the research agent, not retrieved",
                 )
             if self.reliability_tag is None:
-                raise ValueError(
+                raise authored_error(
+                    "social_reliability_tag_missing",
                     "source_type 'social' requires a reliability_tag "
-                    "(use 'unverified_social' when the handle is not on the allowlist)"
+                    "(use 'unverified_social' when the handle is not on the allowlist)",
                 )
         return self
 
@@ -447,7 +455,9 @@ class ResearchRun(_StrictModel):
         if self.completed_at_utc is not None and self.completed_at_utc < self.started_at_utc:
             # No values in the message: a run's timestamps are row content and
             # this class contracts not to echo it.
-            raise ValueError("completed_at_utc must not precede started_at_utc")
+            raise authored_error(
+                "run_completed_before_start", "completed_at_utc must not precede started_at_utc"
+            )
         return self
 
     @model_validator(mode="after")
@@ -466,57 +476,37 @@ class ResearchRun(_StrictModel):
         """
         if self.provider == "xai_x_search":
             if self.agent_model is None or not self.agent_model.strip():
-                raise ValueError(
+                raise authored_error(
+                    "agent_model_missing",
                     "provider 'xai_x_search' requires a non-blank agent_model: "
-                    "an agent's output is attributed to the model that produced it (D27)"
+                    "an agent's output is attributed to the model that produced it (D27)",
                 )
             if self.posts_dropped_no_url is None:
-                raise ValueError(
+                raise authored_error(
+                    "posts_dropped_no_url_missing",
                     "provider 'xai_x_search' requires posts_dropped_no_url "
-                    "(use 0 for a run that dropped no citations; None means unmeasured)"
+                    "(use 0 for a run that dropped no citations; None means unmeasured)",
                 )
         return self
-
-
-# Substituted for any error-location part that did not come from the schema. See
-# _sanitize: matches the "offending input withheld" wording config.py uses.
-_WITHHELD = "<withheld>"
 
 
 def _sanitize(exc: ValidationError, model: type[BaseModel]) -> ResearchSchemaError:
     """Render a ValidationError with every input-controlled fragment removed.
 
-    ``include_input=False`` withholds the offending *value*, but an error's
-    ``loc`` can itself be input: under ``extra="forbid"`` the location of an
-    unexpected key **is** that key, and inside ``provider_config`` it is a
-    caller-supplied dict key. A payload assembled from provider text (or from a
-    misplaced credential) would otherwise print verbatim.
+    The shared rendering (M0-008): see :mod:`whiskeyjack_bot.validation_errors`. Under
+    ``extra="forbid"`` the location of an unexpected key **is** that key, and inside
+    ``provider_config`` it is a caller-supplied dict key, so only schema-authored
+    location parts survive. Pydantic's own ``msg`` is dropped. A validator here says
+    what is wrong through :func:`authored_error`, whose sentence is a literal.
 
-    So a location part survives only if the schema authored it: an ``int`` list
-    index, or a field name declared on ``model``. Everything else is withheld.
-    That is stricter than needed for today's two flat models and stays correct
-    if a later error type puts something new in ``loc``.
-
-    **The message itself cannot be filtered here**, because a ``ValueError`` from
-    any validator becomes ``err["msg"]`` verbatim. So the companion invariant is
-    on the validators: *every* raise in this module uses a constant, value-free
-    message. That is easy to satisfy by hand and easy to breach by accident --
-    ``_require_http_url`` originally let ``urlsplit``'s own ValueError propagate,
-    and that exception embeds the offending netloc, which leaked a URL through a
-    sanitizer that was otherwise airtight (review round 2, finding 1). Any raise
-    added here must either use a literal string or be caught and replaced with
-    one. ``test_no_field_leaks_a_planted_secret_through_any_message`` is the net.
+    The history is why that matters: ``_require_http_url`` once let ``urlsplit``'s own
+    ValueError propagate, and that exception embeds the offending netloc (review round
+    2, finding 1). Under the shared rule such an escape now renders as ``value_error``,
+    not as its text. Every raise here still uses a constant message, or is caught and
+    replaced with one, and ``test_no_field_leaks_a_planted_secret_through_any_message``
+    is still the net.
     """
-    known = set(model.model_fields)
-    problems = []
-    for err in exc.errors(include_input=False, include_url=False):
-        parts = [
-            str(part) if isinstance(part, int) or part in known else _WITHHELD
-            for part in err["loc"]
-        ]
-        location = ".".join(parts) or "<root>"
-        problems.append(f"{location}: {err['msg']}")
-    return ResearchSchemaError(problems)
+    return ResearchSchemaError(sanitized_problems(exc, model))
 
 
 def validate_document(data: Any) -> ResearchDocument:

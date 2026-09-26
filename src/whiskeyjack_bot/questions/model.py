@@ -32,6 +32,7 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, Field, TypeAdapter, model_validator
 
 from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel, _require_non_blank
+from whiskeyjack_bot.validation_errors import authored_error
 
 # Pydantic accepts NaN and +/-infinity for a bare ``float``, but ``model_dump_json``
 # serializes them as JSON ``null`` -- which then fails to validate back, breaking the
@@ -138,9 +139,9 @@ class CanonicalMultipleChoiceQuestion(_CanonicalQuestionBase):
         # Do not echo the labels: mirror the project-wide rule that a validation
         # message never reprints record content.
         if any(not option.strip() for option in self.options):
-            raise ValueError("multiple-choice options must not be blank")
+            raise authored_error("options_blank", "multiple-choice options must not be blank")
         if len(set(self.options)) != len(self.options):
-            raise ValueError("multiple-choice options must be distinct")
+            raise authored_error("options_not_distinct", "multiple-choice options must be distinct")
         return self
 
 
@@ -188,7 +189,9 @@ class _CanonicalBoundedQuestion(_CanonicalQuestionBase):
         if self.lower_bound >= self.upper_bound:
             # Do not echo the bound values: mirror the project-wide rule that a
             # validation message never reprints record content.
-            raise ValueError("lower_bound must be strictly less than upper_bound")
+            raise authored_error(
+                "bounds_unordered", "lower_bound must be strictly less than upper_bound"
+            )
         return self
 
 

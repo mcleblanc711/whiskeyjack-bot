@@ -529,8 +529,8 @@ def test_a_response_of_another_question_type_is_a_caller_mistake() -> None:
     [
         ([], "too_short"),
         (["A"], "too_short"),
-        (["A", "A"], "value_error"),
-        (["A", "  "], "value_error"),
+        (["A", "A"], "options_not_distinct"),
+        (["A", "  "], "options_blank"),
         (["A", 2], "string_type"),
     ],
     ids=["empty", "singleton", "repeated", "blank", "non-str-member"],

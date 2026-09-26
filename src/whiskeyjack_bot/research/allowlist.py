@@ -56,13 +56,14 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, get_origin
+from typing import Any
 
 import yaml
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator
 
 from whiskeyjack_bot.config import _StrictModel
 from whiskeyjack_bot.research.model import ReliabilityTag
+from whiskeyjack_bot.validation_errors import authored_error, sanitized_problems
 
 # The X handle rule. Matched with re.fullmatch, never a ``$`` anchor: ``$`` also matches
 # just before a trailing newline, so "BLS_gov\n" would pass a "$"-anchored pattern and
@@ -87,7 +88,9 @@ class AllowlistEntry(_StrictModel):
         # counted as its own entry by the uniqueness check, and then never returned by
         # lookup_by_username(). The handle rule rejects all of them at load time.
         if _HANDLE.fullmatch(v) is None:
-            raise ValueError("username must be 1-15 characters of A-Z, a-z, 0-9 or _")
+            raise authored_error(
+                "username_not_a_handle", "username must be 1-15 characters of A-Z, a-z, 0-9 or _"
+            )
         return v
 
     @field_validator("domains")
@@ -97,8 +100,9 @@ class AllowlistEntry(_StrictModel):
         # match_domain() compares exactly, so a blank or padded element silently never
         # matches any question domain -- a dead tag, worth rejecting at load time.
         if any(not domain.strip() or domain != domain.strip() for domain in v):
-            raise ValueError(
-                "domains entries must be non-blank and free of leading/trailing whitespace"
+            raise authored_error(
+                "domain_blank_or_padded",
+                "domains entries must be non-blank and free of leading/trailing whitespace",
             )
         return v
 
@@ -107,26 +111,6 @@ class _AllowlistFile(_StrictModel):
     """The top-level shape of ``config/x_accounts.yaml``: ``{accounts: [...]}``."""
 
     accounts: list[AllowlistEntry] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _usernames_are_unique_case_insensitively(self) -> _AllowlistFile:
-        seen: dict[str, int] = {}
-        problems: list[str] = []
-        for index, entry in enumerate(self.accounts):
-            key = entry.username.casefold()
-            first = seen.get(key)
-            if first is None:
-                seen[key] = index
-            else:
-                # Indices only -- never the username itself. A collision is a config
-                # problem, and this module's error messages never echo entry content.
-                problems.append(
-                    f"accounts[{index}] duplicates the username already used by "
-                    f"accounts[{first}] (case-insensitive)"
-                )
-        if problems:
-            raise ValueError("; ".join(problems))
-        return self
 
 
 class AllowlistError(Exception):
@@ -151,54 +135,57 @@ class AllowlistError(Exception):
         super().__init__("invalid account allowlist:\n" + "\n".join(f"  - {p}" for p in problems))
 
 
-# Substituted for any error-location part that did not come from the schema. Same
-# convention as research.model._sanitize / config._sanitize_validation_error.
-_WITHHELD = "<withheld>"
-
-# loc parts may name a field on either model: _AllowlistFile ("accounts") or the nested
-# AllowlistEntry ("username", "reliability_tag", ...). Both are schema-authored, so both
-# are allowed through; nothing else is.
-_KNOWN_FIELDS = set(_AllowlistFile.model_fields) | set(AllowlistEntry.model_fields)
-
-# The list-valued fields, derived rather than restated: a hardcoded {"accounts", "domains"}
-# drifts the moment a field is added, and this set decides what gets *rendered*. Derived by
-# annotation, so a later ``list[str] | None`` field (origin UnionType, not list) drops out
-# and its indices are withheld -- over-redacting, which is the fail-safe direction.
-_SEQUENCE_FIELDS = {
-    name
-    for model in (_AllowlistFile, AllowlistEntry)
-    for name, info in model.model_fields.items()
-    if get_origin(info.annotation) is list
-}
-
-
 def _sanitize(exc: ValidationError) -> AllowlistError:
     """Render a ValidationError with every file-controlled fragment removed.
 
-    An ``int`` in ``loc`` is a list index only when the part before it names a list-valued
-    field. Anywhere else it is a *mapping key lifted from the file*: pydantic's
+    The shared rendering (M0-008), which generalizes this module's own round-5 rule: an
+    ``int`` in ``loc`` is a list index only when the part before it names a list-valued
+    field. Anywhere else it is a *mapping key lifted from the file*. Pydantic's
     ``invalid_key`` error sets ``loc`` to the key itself, and an unquoted numeric YAML key
-    parses as an int, so ``987654321: x`` used to be echoed verbatim by a sanitizer that
-    trusted every int as an index (round-5 review finding 1). Withholding all ints would
-    close it too, but ``accounts.<withheld>.username`` cannot be acted on against a
-    46-entry file, and the index is schema-authored, not content.
-
-    String parts need no such positional test: a key that is not a declared field name is
-    withheld outright, which already covers ``extra="forbid"`` reporting an unknown key.
+    parses as an int, so ``987654321: x`` was once echoed verbatim by a sanitizer that
+    trusted every int as an index. A string part that is not a declared field name is
+    withheld outright, which covers ``extra="forbid"`` reporting an unknown key.
     """
-    problems = []
-    for err in exc.errors(include_input=False, include_url=False):
-        parts: list[str] = []
-        previous: str | int = ""
-        for part in err["loc"]:
-            if isinstance(part, int):
-                parts.append(str(part) if previous in _SEQUENCE_FIELDS else _WITHHELD)
-            else:
-                parts.append(part if part in _KNOWN_FIELDS else _WITHHELD)
-            previous = part
-        location = ".".join(parts) or "<root>"
-        problems.append(f"{location}: {err['msg']}")
-    return AllowlistError(problems)
+    return AllowlistError(sanitized_problems(exc, _AllowlistFile))
+
+
+def _validate_payload(data: object) -> AccountAllowlist:
+    """Validate an already-parsed payload: the schema, then username uniqueness.
+
+    Separate from :func:`load_allowlist` so the property suite runs exactly this step
+    without the file I/O around it, rather than a copy of it that could drift.
+    """
+    try:
+        parsed = _AllowlistFile.model_validate(data)
+    except ValidationError as exc:
+        raise _sanitize(exc) from None
+    duplicates = _duplicate_username_problems(parsed.accounts)
+    if duplicates:
+        raise AllowlistError(duplicates)
+    return AccountAllowlist(entries=tuple(parsed.accounts))
+
+
+def _duplicate_username_problems(accounts: list[AllowlistEntry]) -> list[str]:
+    """Case-insensitive username collisions, named by index and never by username.
+
+    Checked after validation rather than inside it (M0-008). A model validator can
+    report only one authored sentence with no location of its own, and "some username
+    repeats" in a 46-entry file cannot be acted on. The indices are this function's own
+    counters, not file content, so they are safe to render.
+    """
+    seen: dict[str, int] = {}
+    problems: list[str] = []
+    for index, entry in enumerate(accounts):
+        key = entry.username.casefold()
+        first = seen.get(key)
+        if first is None:
+            seen[key] = index
+        else:
+            problems.append(
+                f"accounts[{index}] duplicates the username already used by "
+                f"accounts[{first}] (case-insensitive)"
+            )
+    return problems
 
 
 @dataclass(frozen=True)
@@ -345,8 +332,4 @@ def load_allowlist(path: Path | str) -> AccountAllowlist:
         raise AllowlistError(
             [f"account allowlist {path} must contain a YAML mapping at the top level"]
         )
-    try:
-        parsed = _AllowlistFile.model_validate(data)
-    except ValidationError as exc:
-        raise _sanitize(exc) from None
-    return AccountAllowlist(entries=tuple(parsed.accounts))
+    return _validate_payload(data)

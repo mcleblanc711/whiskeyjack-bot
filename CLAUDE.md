@@ -78,8 +78,13 @@ locked sync fails. A second required job, `backlog-status`, gates the Done-flip 
 Every module owns a sanitized exception (`ConfigError`, `SnapshotError`, `LedgerError`,
 `NormalizationError`). The rule: **an error message never echoes stored/file/field values**, and
 sanitizing raises use `from None` so an underlying exception cannot reprint a value through its
-text or a rendered traceback. Pydantic's own `ValidationError` interpolates the offending input —
-always rebuild it with `errors(include_input=False, include_url=False)`.
+text or a rendered traceback. Pydantic's own `ValidationError` interpolates the offending input, and
+`errors(include_input=False)` is **not** enough: `msg` quotes a union tag, and under
+`extra="forbid"` an unknown key *is* its `loc`. Always rebuild it with
+`validation_errors.sanitized_problems` (M0-008, D50), which renders schema-authored locations
+and pydantic's type slug only. A validator says what is wrong by raising
+`authored_error(slug, sentence)` with literal arguments (an AST test enforces it); a plain
+`ValueError`'s text is dropped.
 
 Callers only handle the module's own error type, so **every malformed shape must arrive as one** —
 a raw `AttributeError`/`KeyError`/`ValueError` escaping is a review finding (it has been, twice).
@@ -303,7 +308,3 @@ implementation-matching.
   stale landed claim.
 - **M1-401 is more than its one-line title** — it also applies the forecaster-prompt v1.1.0 patch
   from `CLAUDE_CODE_PROMPT.md` § B and re-hashes.
-- **`content_sha256` raises on a lone surrogate** (`hashing.py`, found by `tests/property/`).
-  Lone surrogates reach the schema from provider JSON, so an adapter hashing provider text can
-  crash with an unsanitized `UnicodeEncodeError` that quotes the offending character. Open —
-  awaiting an owner decision; see the xfail in `tests/property/test_canonical_properties.py`.
