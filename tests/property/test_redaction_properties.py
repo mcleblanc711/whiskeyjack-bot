@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT
 
@@ -103,9 +103,9 @@ def _shape(value: object) -> object:
 
     Keys are erased because redacting them is the point, so their text is expected to
     change. Insertion order carries the correspondence instead, which the walk preserves.
-    (Two keys that redact to the same marker would collapse into one, and that is the
-    reviewer's non-blocking collision observation; these strategies cannot produce it, since
-    generated keys are at most 8 characters and the planted secret is far longer.)
+    (These strategies cannot make two keys redact to the same text, since generated keys
+    are at most 8 characters and the planted secret is far longer. M1-339's collision
+    properties at the end of this file draw keys that do.)
     """
     if isinstance(value, dict):
         return {"?": [_shape(v) for v in value.values()]}
@@ -164,3 +164,63 @@ def test_the_walk_survives_nesting_deeper_than_the_recursion_limit(value: object
         assert isinstance(redacted, dict)
         redacted = redacted["nested"]
     assert FAKE_SECRET not in json.dumps(redacted, default=repr)
+
+
+# --------------------------------------------------------------------------------------
+# M1-339: two distinct keys that redact to the same text. The documented representation is
+# that both entries survive, the later one under "<key><collision:N>".
+# --------------------------------------------------------------------------------------
+
+_MARKER = f"<redacted:{SECRET_ENV_VAR}>"
+
+# Keys assembled from fragments that include the secret *and its marker*, so a key holding
+# the secret and a key already spelling the marker are both drawable: those are the pairs
+# that collide. Short plain fragments keep ordinary keys distinct most of the time.
+_COLLIDING_KEYS = st.lists(
+    st.sampled_from(["a", "b", FAKE_SECRET, _MARKER, "<collision:2>"]), min_size=1, max_size=3
+).map("".join)
+
+_COLLIDING_VALUES = st.recursive(
+    JSON_LEAVES,
+    lambda children: st.one_of(
+        st.lists(children, max_size=3),
+        st.dictionaries(_COLLIDING_KEYS, children, max_size=5),
+    ),
+    max_leaves=10,
+)
+
+
+def _entry_counts(value: object) -> object:
+    """Every mapping's entry count, in walk order: the thing a collision used to shrink."""
+    if isinstance(value, dict):
+        return [len(value), [_entry_counts(v) for v in value.values()]]
+    if isinstance(value, (list, tuple)):
+        return [_entry_counts(v) for v in value]
+    return None
+
+
+def _collides(value: object) -> bool:
+    if isinstance(value, dict):
+        redacted = [redact_secrets(k, [SECRET_ENV_VAR]) for k in value]
+        return len(set(redacted)) < len(redacted) or any(_collides(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_collides(v) for v in value)
+    return False
+
+
+@given(value=st.dictionaries(_COLLIDING_KEYS, _COLLIDING_VALUES, min_size=1, max_size=5))
+@_STATIC_ENV_SETTINGS
+def test_colliding_keys_keep_every_entry_and_leak_nothing(value: dict[str, object]) -> None:
+    collides = _collides(value)
+    event(f"collision: {collides}")
+    redacted = redact_leaves(value, [SECRET_ENV_VAR])
+    # Every entry survives: no mapping lost a key to a collision.
+    assert _entry_counts(redacted) == _entry_counts(value)
+    rendered = json.dumps(redacted, ensure_ascii=True, sort_keys=True)
+    assert FAKE_SECRET not in rendered
+    # Deterministic, which check_storage relies on (the witness file and the row are two
+    # separate calls), and replay-stable through the persisted form. Compared as bytes: a
+    # surrogate *pair* drawn as two code points loads back as one, so the objects may differ
+    # while the persisted form, which is what replay reads, cannot (M1-306).
+    assert redact_leaves(value, [SECRET_ENV_VAR]) == redacted
+    assert json.dumps(json.loads(rendered), ensure_ascii=True, sort_keys=True) == rendered

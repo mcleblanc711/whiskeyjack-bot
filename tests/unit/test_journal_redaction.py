@@ -206,3 +206,122 @@ def test_a_true_cycle_fails_exactly_as_json_dumps_already_did() -> None:
         redaction.redact_leaves(cyclic, [VARIABLE])
     with pytest.raises(ValueError, match="Circular reference detected"):
         json.dumps(cyclic)
+
+
+# --- M1-338: a payload that cannot be journaled arrives as StorageFailure ------------------
+
+_PLANT = "WJLEAKMARKER338"
+
+
+class _Opaque:
+    def __repr__(self) -> str:
+        return _PLANT
+
+
+def _cyclic() -> dict[str, object]:
+    payload: dict[str, object] = {"note": _PLANT}
+    payload["self"] = payload
+    return payload
+
+
+def _deep() -> dict[str, object]:
+    payload: dict[str, object] = {"note": _PLANT}
+    for _ in range(5000):
+        payload = {"nested": payload}
+    return payload
+
+
+# Every way `canonical(journal_form(data))` can refuse a payload -- the siblings of the entry
+# point, not only the cycle M1-338 names.
+_UNJOURNALABLE = {
+    "cycle": _cyclic,
+    "nan": lambda: {"note": _PLANT, "value": float("nan")},
+    "infinity": lambda: {"note": _PLANT, "value": float("inf")},
+    "no_json_form": lambda: {"note": _Opaque()},
+    "mixed_key_types": lambda: {_PLANT: 1, 2: 3},
+    "too_deep": _deep,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNJOURNALABLE))
+def test_an_unjournalable_payload_raises_storage_failure_and_persists_nothing(
+    shape: str, ledger: tuple[sqlite3.Connection, Path]
+) -> None:
+    conn, _ = ledger
+    before = conn.execute("SELECT COUNT(*) FROM tournament_events").fetchone()[0]
+    with pytest.raises(StorageFailure) as excinfo:
+        append(conn, "comment_intent", "rec-1", _UNJOURNALABLE[shape]())
+    assert type(excinfo.value) is StorageFailure
+    assert excinfo.value.__cause__ is None
+    assert _PLANT not in str(excinfo.value)
+    assert "payload withheld" in str(excinfo.value)
+    after = conn.execute("SELECT COUNT(*) FROM tournament_events").fetchone()[0]
+    assert after == before
+    assert not conn.in_transaction
+
+
+def test_witness_refuses_an_unjournalable_payload_before_writing_a_file(
+    ledger: tuple[sqlite3.Connection, Path], tmp_path: Path
+) -> None:
+    conn, _ = ledger
+    root = tmp_path / "artifacts"
+    with pytest.raises(StorageFailure):
+        witness(conn, root, "42:33122", _cyclic())
+    assert not (root / "operations").exists()
+    assert conn.execute("SELECT COUNT(*) FROM tournament_events").fetchone()[0] == 0
+
+
+# --- M1-339: two keys that redact to the same text keep both entries -----------------------
+
+
+def test_colliding_redacted_keys_keep_both_entries_under_the_documented_representation(
+    ledger: tuple[sqlite3.Connection, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Constructed directly: the key holding the secret redacts to exactly the text of the
+    key that already spells the marker. Before M1-339 the second assignment overwrote the
+    first and the journal row silently lost an entry."""
+    conn, _ = ledger
+    monkeypatch.setenv(VARIABLE, FAKE_SECRET)
+    redaction.register_secret_env_var_names([VARIABLE])
+    marker = f"<redacted:{VARIABLE}>"
+    data: dict[str, object] = {FAKE_SECRET: "first", marker: "second", "other": "third"}
+
+    identifier = append(conn, "comment_intent", "rec-1", data)
+
+    stored = _stored(conn, identifier)
+    assert FAKE_SECRET not in stored
+    assert json.loads(stored) == {
+        marker: "first",
+        f"{marker}<collision:2>": "second",
+        "other": "third",
+    }
+
+
+def test_a_collision_with_an_existing_suffix_takes_the_next_free_number() -> None:
+    marker = f"<redacted:{VARIABLE}>"
+    data = {
+        f"{marker}<collision:2>": "taken",
+        marker: "first",
+        FAKE_SECRET: "second",
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(VARIABLE, FAKE_SECRET)
+        redacted = redaction.redact_leaves(data, [VARIABLE])
+    assert redacted == {
+        f"{marker}<collision:2>": "taken",
+        marker: "first",
+        f"{marker}<collision:3>": "second",
+    }
+
+
+def test_a_colliding_witness_still_matches_its_row(
+    ledger: tuple[sqlite3.Connection, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file and the row are two calls to `journal_form`, and `check_storage` compares
+    them for equality, so the representation must be deterministic."""
+    conn, _ = ledger
+    monkeypatch.setenv(VARIABLE, FAKE_SECRET)
+    redaction.register_secret_env_var_names([VARIABLE])
+    root = tmp_path / "artifacts"
+    witness(conn, root, "42:33122", {FAKE_SECRET: 1, f"<redacted:{VARIABLE}>": 2})
+    check_storage(conn, root)
