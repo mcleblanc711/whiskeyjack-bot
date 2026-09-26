@@ -38,6 +38,7 @@ from typing import Final, Literal, get_args
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
+from whiskeyjack_bot.validation_errors import sanitized_problems
 
 OBSERVATION_SCHEMA_VERSION: Final = "1.0.0"
 
@@ -354,12 +355,10 @@ def _require_encodable(text: str, field: str) -> None:
 
 
 def _sanitized(exc: ValidationError) -> str:
-    """Field locations and rule names only; pydantic's own text interpolates the input."""
-    parts: list[str] = []
-    for error in exc.errors(include_input=False, include_url=False, include_context=False):
-        location = ".".join(str(part) for part in error["loc"] if part in _FIELD_NAMES)
-        parts.append(f"{location or 'observation'}: {error['type']}")
+    """Field locations and rule names only; pydantic's own text interpolates the input.
+
+    The shared rendering (M0-008). A location part the schema did not author is now
+    replaced by ``<withheld>`` rather than dropped, so a path keeps its shape.
+    """
+    parts = sanitized_problems(exc, ResolutionObservation)
     return "resolution observation is invalid (" + "; ".join(parts) + ")"
-
-
-_FIELD_NAMES: Final[frozenset[str]] = frozenset(ResolutionObservation.model_fields)

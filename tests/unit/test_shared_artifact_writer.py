@@ -34,6 +34,7 @@ writer it exists for.
 
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -47,6 +48,10 @@ import pytest
 from whiskeyjack_bot import artifacts as shared
 from whiskeyjack_bot import submission_gateway
 from whiskeyjack_bot.artifacts import ArtifactError, write_new_file
+from whiskeyjack_bot.export import ExportError
+from whiskeyjack_bot.notify import NotifyError
+from whiskeyjack_bot.report import ReportError
+from whiskeyjack_bot.tournament_state import StorageFailure
 from whiskeyjack_bot.forecast import artifacts as forecast_artifacts
 from whiskeyjack_bot.forecast.parse import ForecastGeneration, ModelSettings
 from whiskeyjack_bot.research import artifacts as research_artifacts
@@ -408,29 +413,88 @@ def test_every_failure_arm_raises_the_error_the_caller_supplied(tmp_path: Path) 
     assert not issubclass(ArtifactError, GatewayError)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN DEFECT, filed as M1-322 and pre-existing on master in all three writers: a "
-        "lone surrogate in artifact_root makes Path.mkdir raise a raw UnicodeEncodeError "
-        "-- a ValueError, not an OSError -- so it escapes `except OSError` and reaches the "
-        "caller as something other than the module's own error type, which is a review "
-        "finding in this project. It is the writer-side twin of the reader-side defect "
-        "M1-314 closed, and the fix is M1-314's: `except ValueError` raising the caller's "
-        "error with the path withheld, since interpolating it is itself the failing "
-        "operation. Not fixed here -- changing what a merged, reviewed writer does with a "
-        "path is the behaviour-change-to-merged-code this project files a row for, the "
-        "same convention M2-709 itself was filed under. Strict, so the day M1-322 lands "
-        "this test turns red and gets deleted rather than quietly passing."
-    ),
-)
-def test_a_lone_surrogate_in_the_artifact_root_arrives_as_this_modules_error(
-    tmp_path: Path,
+# --- M1-322: an unencodable root, through every writer -----------------------------
+
+# `\udcc3` would round-trip -- it is a surrogateescape for a real byte -- so the case is
+# `\ud800`, which has no byte behind it and cannot be encoded for the syscall at all. An
+# embedded NUL encodes, but no path syscall takes it: the same raw ValueError, the sibling.
+_UNENCODABLE = "ro\ud800ot"
+_UNUSABLE_ROOTS = [_UNENCODABLE, "ro\x00ot"]
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_ROOTS, ids=["surrogate", "nul"])
+@pytest.mark.parametrize("writer", WRITERS, ids=_IDS)
+def test_a_lone_surrogate_in_the_artifact_root_arrives_as_each_writers_own_error(
+    writer: Writer, bad: str, tmp_path: Path
 ) -> None:
-    """Not a hostile operator: `artifact_root` is operator configuration, and this is the
-    ordinary local-I/O failure class the threat boundary keeps in scope. `\\udcc3` would
-    round-trip -- it is a surrogateescape for a real byte -- so the case is `\\ud800`,
-    which has no byte behind it and cannot be encoded for the syscall at all."""
-    root = tmp_path / "ro\ud800ot"
-    with pytest.raises(ArtifactError):
-        write_new_file(root / "a.json", b"body", what="retrieval artifact")
+    """M1-322. Not a hostile operator: `artifact_root` is operator configuration, and
+    this is the ordinary local-I/O failure class the threat boundary keeps in scope.
+    Before the fix, `Path.mkdir` raised a raw `UnicodeEncodeError` (a ValueError, not an
+    OSError) that escaped every writer's `except OSError`. The path is withheld, because
+    interpolating it is itself the operation that fails."""
+    root = tmp_path / bad
+    with pytest.raises(writer.error) as excinfo:
+        writer.write(root, 0)
+    assert type(excinfo.value) is writer.error
+    assert excinfo.value.__cause__ is None
+    assert "ro" + bad[2] not in str(excinfo.value)
+    assert "path withheld" in str(excinfo.value)
+    assert not any(tmp_path.iterdir()), "nothing may be created for an unencodable root"
+
+
+def test_a_surrogateescape_root_still_writes(tmp_path: Path) -> None:
+    """The companion: `\udcc3` names a real byte (0xC3), so it encodes and the write
+    succeeds. The fix refuses what the filesystem cannot represent, not every surrogate."""
+    root = tmp_path / "ro\udcc3ot"
+    write_new_file(root / "a.json", b"body", what="artifact")
+    assert (root / "a.json").read_bytes() == b"body"
+
+
+# Every error type a caller passes to write_new_file. Pinned against a scan of src/, so a
+# new caller with a new error type has to be added here, and the direct call below then
+# proves the encode refusal arrives as it.
+_CALLER_ERRORS = {
+    "ArtifactError": ArtifactError,
+    "GatewayError": GatewayError,
+    "ExportError": ExportError,
+    "NotifyError": NotifyError,
+    "ReportError": ReportError,
+    "StorageFailure": StorageFailure,
+}
+
+
+def test_the_caller_error_table_matches_every_call_site() -> None:
+    src = Path(shared.__file__).parent
+    passed: set[str] = set()
+    calls = 0
+    for path in src.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name != "write_new_file":
+                continue
+            calls += 1
+            errors = [kw.value for kw in node.keywords if kw.arg == "error"]
+            if not errors:
+                passed.add("ArtifactError")  # the helper's default
+                continue
+            assert isinstance(errors[0], ast.Name), f"{path}: error= must name a class"
+            passed.add(errors[0].id)
+    assert calls >= 10, "the scan found too few call sites to be looking in the right place"
+    assert passed == set(_CALLER_ERRORS)
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_ROOTS, ids=["surrogate", "nul"])
+@pytest.mark.parametrize("name", sorted(_CALLER_ERRORS))
+def test_the_encode_refusal_arrives_as_every_callers_error(
+    name: str, bad: str, tmp_path: Path
+) -> None:
+    error = _CALLER_ERRORS[name]
+    with pytest.raises(error) as excinfo:
+        write_new_file(tmp_path / bad / "a.json", b"body", what="artifact", error=error)
+    assert type(excinfo.value) is error
+    assert excinfo.value.__cause__ is None
+    assert str(tmp_path) not in str(excinfo.value)
+    assert "path withheld" in str(excinfo.value)

@@ -43,6 +43,32 @@ def normalize_content(text: str) -> str:
     return _WHITESPACE_RUN_RE.sub(" ", unicodedata.normalize("NFC", text)).strip()
 
 
+class ContentHashError(ValueError):
+    """``text`` has no UTF-8 form, so it has no content identity (D49).
+
+    The only such text is one carrying a lone surrogate (``\\ud800`` with no pair),
+    which ``json.loads`` returns for provider JSON and ``ResearchDocument`` accepts. The
+    pinned rule's step 4 cannot encode it. Before D49 the raw ``UnicodeEncodeError``
+    escaped, and its message quotes the offending character. The owner chose to
+    **reject** the document rather than hash it with ``surrogatepass``: nothing else in
+    the pipeline has to carry surrogate-bearing provider text afterwards, and no existing
+    digest changes, because such input never had one.
+
+    A ``ValueError`` subclass on purpose. Both adapters already catch ``ValueError`` when
+    they build a document and drop it, counted, so the live behaviour is unchanged and
+    only the error's hygiene is new. The message is a constant, raised ``from None``.
+    """
+
+
 def content_sha256(text: str) -> str:
-    """Return the lowercase hex SHA-256 of ``text`` under the pinned rule."""
-    return hashlib.sha256(normalize_content(text).encode("utf-8")).hexdigest()
+    """Return the lowercase hex SHA-256 of ``text`` under the pinned rule.
+
+    Raises :class:`ContentHashError` (D49) for text with no UTF-8 form.
+    """
+    try:
+        encoded = normalize_content(text).encode("utf-8")
+    except UnicodeEncodeError:
+        raise ContentHashError(
+            "document text is not valid Unicode (a lone surrogate); content withheld"
+        ) from None
+    return hashlib.sha256(encoded).hexdigest()

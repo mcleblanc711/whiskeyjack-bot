@@ -23,7 +23,7 @@ from strategies import (
 )
 
 from whiskeyjack_bot.research.canonical import _BAD_URL, CanonicalizationError, canonicalize_url
-from whiskeyjack_bot.research.hashing import content_sha256, normalize_content
+from whiskeyjack_bot.research.hashing import ContentHashError, content_sha256, normalize_content
 from whiskeyjack_bot.research.model import _require_http_url, validate_document
 
 HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -198,18 +198,27 @@ def test_hash_collapses_unicode_spelling_and_whitespace_runs(text: str) -> None:
     assert content_sha256(text) == content_sha256(text.replace(" ", "  \t "))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN DEFECT, found by this suite: content_sha256 raises a raw "
-        "UnicodeEncodeError on a lone surrogate, and that exception's message quotes "
-        "the offending character. Lone surrogates are reachable -- json.loads('\"\\\\ud800\"') "
-        "returns one and ResearchDocument accepts it in title/snippet/summary -- so an "
-        "adapter hashing provider text can crash with an unsanitized error. Needs an "
-        "owner decision (reject the document via ResearchError, or encode with "
-        "surrogatepass); not fixed on the workflow-hardening branch that found it."
-    ),
-)
-@given(SURROGATE_TEXT)
-def test_content_hash_handles_every_string_the_schema_accepts(text: str) -> None:
+@given(ENCODABLE_TEXT, SURROGATE_TEXT, ENCODABLE_TEXT)
+def test_a_lone_surrogate_is_refused_as_this_modules_error(
+    before: str, surrogates: str, after: str
+) -> None:
+    """D49 (owner decision, 2026-09-25): reject, sanitized. This was a strict xfail. Lone
+    surrogates are reachable, because ``json.loads('"\\ud800"')`` returns one and
+    ``ResearchDocument`` accepts it in title, snippet and summary. The raw
+    ``UnicodeEncodeError`` quoted the offending character. The adapters catch ValueError
+    and drop the document, so ContentHashError being one keeps that path unchanged."""
+    text = before + surrogates + after
+    with pytest.raises(ContentHashError) as excinfo:
+        content_sha256(text)
+    assert isinstance(excinfo.value, ValueError)
+    assert excinfo.value.__cause__ is None
+    message = str(excinfo.value)
+    assert not any(unicodedata.category(char) == "Cs" for char in message)
+    assert surrogates not in message
+
+
+@given(ENCODABLE_TEXT)
+def test_content_hash_handles_every_encodable_string(text: str) -> None:
+    """The companion: the refusal is exactly the unencodable case, so every other string
+    still hashes, and to the same digest the pinned rule always gave it."""
     assert HEX64.match(content_sha256(text))

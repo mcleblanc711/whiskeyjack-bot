@@ -122,7 +122,7 @@ from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.research.canonical import CanonicalizationError, canonicalize_url
 from whiskeyjack_bot.research.dedup import deduplicate
-from whiskeyjack_bot.research.hashing import content_sha256
+from whiskeyjack_bot.research.hashing import ContentHashError, content_sha256
 from whiskeyjack_bot.research.model import (
     ResearchDocument,
     ResearchRun,
@@ -733,6 +733,7 @@ def retrieve_web(
                 document = validate_document(payload_document)
             except (
                 ResearchSchemaError,
+                ContentHashError,
                 CanonicalizationError,
                 AttributeError,
                 TypeError,
@@ -740,10 +741,10 @@ def retrieve_web(
                 KeyError,
             ):
                 # One unusable result must not fail a run that otherwise
-                # retrieved good evidence. Counted, never echoed. ValueError
-                # also covers the known `content_sha256` lone-surrogate raise
-                # (UnicodeEncodeError is a ValueError) -- see the CLAUDE.md
-                # gotcha; here it degrades to a drop rather than a crash.
+                # retrieved good evidence. Counted, never echoed.
+                # ContentHashError (D49) is `content_sha256` refusing text with a
+                # lone surrogate: the document is dropped, which is the owner's
+                # chosen policy, not a degraded crash.
                 dropped += 1
                 continue
 

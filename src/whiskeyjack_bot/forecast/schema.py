@@ -61,6 +61,7 @@ from pydantic import (
 # ``NonBlankStr`` lives in config.py because questions/model.py needs the same
 # predicate and forecast/* imports questions/* rather than the reverse (T-901).
 from whiskeyjack_bot.config import NonBlankStr, SupportedQuestionType, _StrictModel
+from whiskeyjack_bot.validation_errors import authored_error, sanitized_problems
 
 # The version of the *output record* contract, which is not the prompt's version.
 # ``prompts/forecaster.md`` carries both: its H1 reads v1.1.0 (the prompt, M1-401)
@@ -234,9 +235,10 @@ class _ForecastResponseBase(_StrictModel):
     def _schema_version_matches(self) -> _ForecastResponseBase:
         if self.schema_version != RESPONSE_SCHEMA_VERSION:
             # The value is withheld: it is model output like any other field.
-            raise ValueError(
+            raise authored_error(
+                "schema_version_mismatch",
                 f"schema_version must be {RESPONSE_SCHEMA_VERSION} "
-                "(offending input withheld from this message)"
+                "(offending input withheld from this message)",
             )
         return self
 
@@ -246,13 +248,18 @@ class _ForecastResponseBase(_StrictModel):
         if len(set(tags)) != len(tags):
             # Constant message: the vocabulary is ours, but which tag repeated is
             # still a fact about the model's output and buys nothing here.
-            raise ValueError("reasoning_strategy_tags must not repeat a tag")
+            raise authored_error(
+                "strategy_tags_repeat", "reasoning_strategy_tags must not repeat a tag"
+            )
         return self
 
     @model_validator(mode="after")
     def _rationale_within_word_cap(self) -> _ForecastResponseBase:
         if len(self.rationale_summary.split()) > MAX_RATIONALE_WORDS:
-            raise ValueError(f"rationale_summary must be at most {MAX_RATIONALE_WORDS} words")
+            raise authored_error(
+                "rationale_too_long",
+                f"rationale_summary must be at most {MAX_RATIONALE_WORDS} words",
+            )
         return self
 
 
@@ -283,7 +290,10 @@ def _reject_priors(response: _ForecastResponseBase) -> None:
     side.
     """
     if response.base_rate.prior_probability is not None or response.model_prior is not None:
-        raise ValueError("prior_probability and model_prior must be null for this question type")
+        raise authored_error(
+            "prior_not_null",
+            "prior_probability and model_prior must be null for this question type",
+        )
 
 
 class BinaryForecastResponse(_ForecastResponseBase):
@@ -390,72 +400,16 @@ def response_model_for(question_type: str) -> type[ForecastResponse]:
     return model
 
 
-# Substituted for any error-location part the schema did not author. Matches the
-# wording config.py and research/model.py use.
-_WITHHELD = "<withheld>"
-
-
-def _nested_models(annotation: Any) -> list[type[BaseModel]]:
-    """Every pydantic model reachable from one field annotation."""
-    found: list[type[BaseModel]] = []
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        found.append(annotation)
-    for arg in get_args(annotation):
-        found.extend(_nested_models(arg))
-    return found
-
-
-def _schema_field_names(model: type[BaseModel]) -> frozenset[str]:
-    """Field names declared anywhere in ``model`` or a model nested inside it.
-
-    ``research/model.py::_sanitize`` collects only the top-level field names, which is
-    right for its two flat models. This response is four levels deep, so the same rule
-    applied naively would withhold ``base_rate.prior_probability`` -- a name this
-    schema authored -- and turn every nested diagnostic into ``<withheld>.<withheld>``.
-    An error nobody can act on is its own failure mode (the M1-401 path carve-out made
-    the same argument).
-
-    Widening it stays safe because the set is still *schema-authored only*: an
-    unexpected key under ``extra="forbid"`` has that key as its own ``loc``, and a key
-    the model invented is in no ``model_fields`` anywhere, so it is still withheld.
-    """
-    names: set[str] = set()
-    seen: set[type[BaseModel]] = set()
-    stack: list[type[BaseModel]] = [model]
-    while stack:
-        current = stack.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        names.update(current.model_fields)
-        for field in current.model_fields.values():
-            stack.extend(_nested_models(field.annotation))
-    return frozenset(names)
-
-
 def _sanitize(exc: ValidationError, model: type[BaseModel]) -> ForecastSchemaError:
     """Render a ValidationError with every model-controlled fragment removed.
 
-    ``include_input=False`` withholds the offending value, but ``loc`` can itself be
-    model output: under ``extra="forbid"`` the location of an unexpected key *is* that
-    key. So a location part survives only if this schema authored it -- an int list
-    index, or a field name declared somewhere in the model tree.
-
-    As in ``research/model.py``, the message text cannot be filtered here: a
-    ``ValueError`` raised by any validator becomes ``err["msg"]`` verbatim. The
-    companion invariant is on the validators above -- every raise in this module uses
-    a constant, value-free message -- and the property suite is the net.
+    The shared rendering (M0-008): see :mod:`whiskeyjack_bot.validation_errors`. A
+    location part survives only if this schema authored it, since under
+    ``extra="forbid"`` the location of an unexpected key *is* that key. Pydantic's own
+    ``msg`` is dropped. The validators above say what is wrong through
+    :func:`authored_error`, and that sentence is what the repair turn shows the model.
     """
-    known = _schema_field_names(model)
-    problems = []
-    for err in exc.errors(include_input=False, include_url=False):
-        parts = [
-            str(part) if isinstance(part, int) or part in known else _WITHHELD
-            for part in err["loc"]
-        ]
-        location = ".".join(parts) or "<root>"
-        problems.append(f"{location}: {err['msg']}")
-    return ForecastSchemaError(problems)
+    return ForecastSchemaError(sanitized_problems(exc, model))
 
 
 def validate_forecast_response(data: Any, model: type[ForecastResponseT]) -> ForecastResponseT:

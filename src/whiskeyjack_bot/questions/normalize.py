@@ -48,6 +48,7 @@ from whiskeyjack_bot.questions.model import (
     CanonicalNumericQuestion,
     CanonicalQuestion,
 )
+from whiskeyjack_bot.validation_errors import sanitized_problems
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +82,13 @@ class UnsupportedQuestionTypeError(NormalizationError):
 
 
 def _sanitize(exc: ValidationError) -> NormalizationError:
-    """Rebuild a ValidationError as a NormalizationError with inputs stripped."""
-    problems = [
-        f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
-        for err in exc.errors(include_input=False, include_url=False)
-    ]
+    """Rebuild a ValidationError as a NormalizationError with inputs stripped.
+
+    The shared rendering (M0-008): schema-authored locations, pydantic's type slug, and
+    the sentence of an authored error only. ``msg`` is never rendered, since pydantic
+    interpolates question text into several of its messages.
+    """
+    problems = sanitized_problems(exc, CanonicalQuestion)
     return NormalizationError(
         "cannot normalize question:\n" + "\n".join(f"  - {p}" for p in problems)
     )

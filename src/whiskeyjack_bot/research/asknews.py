@@ -59,7 +59,7 @@ from asknews_sdk import AskNewsSDK
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.research.asknews_cost import NEWS_CALL_ESTIMATE_USD, credits_microusd
-from whiskeyjack_bot.research.hashing import content_sha256
+from whiskeyjack_bot.research.hashing import ContentHashError, content_sha256
 from whiskeyjack_bot.research.model import (
     ResearchDocument,
     ResearchRun,
@@ -501,9 +501,17 @@ def retrieve_news(
                         retrieved_at=now_utc,
                     )
                     document = validate_document(payload)
-                except (ResearchSchemaError, AttributeError, TypeError, ValueError):
+                except (
+                    ResearchSchemaError,
+                    ContentHashError,
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                ):
                     # One unusable article must not fail a run that otherwise
-                    # retrieved good evidence. Counted, never echoed.
+                    # retrieved good evidence. Counted, never echoed. ContentHashError
+                    # (D49) is a ValueError and is named here for the reader: an
+                    # article whose text carries a lone surrogate is dropped.
                     dropped += 1
                     continue
 

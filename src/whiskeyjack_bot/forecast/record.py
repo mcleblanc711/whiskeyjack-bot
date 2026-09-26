@@ -58,10 +58,9 @@ from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
 from whiskeyjack_bot.forecast.schema import (
     ForecastResponse,
     UtcDatetime,
-    _schema_field_names,
-    _WITHHELD,
 )
 from whiskeyjack_bot.questions.model import CanonicalQuestion
+from whiskeyjack_bot.validation_errors import sanitized_problems
 
 if TYPE_CHECKING:
     # `forecast.parse`, not `forecast.generate`: M1-406 moved the value object to the
@@ -598,14 +597,12 @@ def _sanitized(exc: ValidationError) -> ForecastRecordError:
     extra_forbidden)``. So a location part survives only if this schema authored it -- an
     integer list index, or a field name declared somewhere in the model tree.
 
-    ``_schema_field_names`` and ``_WITHHELD`` are imported from
-    :mod:`whiskeyjack_bot.forecast.schema` rather than reimplemented. It is a private name
-    from a sibling in the same subpackage, which is deliberate: this is one rule, the
+    That rule is now :mod:`whiskeyjack_bot.validation_errors` (M0-008), the one sanitizer
+    every module uses, rather than helpers imported from a sibling. It is one rule, the
     traversal is non-trivial (the model tree is five levels deep here), and M1-607's note
-    about a rule written twice is what round 1's finding B4 turned out to be.
-
-    Integer ``loc`` entries are list indices and render as ``[i]`` rather than being
-    dropped, so the path stays readable.
+    about a rule written twice is what round 1's finding B4 turned out to be. An integer
+    ``loc`` entry renders as ``.i`` only directly after a sequence field, where it is a list
+    index. An authored validator error renders its literal sentence.
     """
     joined = _sanitized_locations(exc)
     return ForecastRecordError(f"stored record_json does not match the record schema ({joined})")
@@ -614,25 +611,14 @@ def _sanitized(exc: ValidationError) -> ForecastRecordError:
 def _sanitized_locations(exc: ValidationError) -> str:
     """The ``loc: type`` rendering shared by :func:`_sanitized` and the builder's own catch.
 
-    Pulled out rather than duplicated: it is the leak-safety rule itself (see
+    Pulled out rather than duplicated. It is the leak-safety rule itself (see
     :func:`_sanitized`), and M1-610's round-1 finding was a second call site that skipped
-    it -- a generic message with no field name at all, which under-shares rather than
-    over-shares but still fails the acceptance criterion that the field be named.
+    it: a generic message with no field name at all, which under-shares rather than
+    over-shares but still fails the acceptance criterion that the field be named. The
+    per-error rendering is now the project's one sanitizer (M0-008). This function only
+    deduplicates and orders the lines.
     """
-    known = _schema_field_names(ForecastRecord)
-    paths = []
-    for error in exc.errors(include_input=False, include_url=False):
-        parts = []
-        for part in error["loc"]:
-            if isinstance(part, int):
-                parts.append(f"[{part}]")
-            elif part in known:
-                parts.append(str(part))
-            else:
-                parts.append(_WITHHELD)
-        location = ".".join(parts)
-        paths.append(f"{location or '<record>'}: {error['type']}")
-    return "; ".join(sorted(set(paths)))
+    return "; ".join(sorted(set(sanitized_problems(exc, ForecastRecord))))
 
 
 def build_forecast_record_draft(

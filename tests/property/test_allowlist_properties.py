@@ -31,14 +31,12 @@ from pathlib import Path
 import pytest
 from hypothesis import given, strategies as st
 from strategies import HOSTILE_TEXT, RELIABILITY_TAGS
-from pydantic import ValidationError
 
 from whiskeyjack_bot.research.allowlist import (
     AccountAllowlist,
     AllowlistEntry,
     AllowlistError,
-    _AllowlistFile,
-    _sanitize,
+    _validate_payload,
     load_allowlist,
 )
 
@@ -151,12 +149,8 @@ def _plausible_payload(draw: st.DrawFn) -> dict[str, object]:
 
 
 def _validate(data: object) -> AccountAllowlist:
-    """Mirrors load_allowlist's validation step, without the file I/O around it."""
-    try:
-        parsed = _AllowlistFile.model_validate(data)
-    except ValidationError as exc:
-        raise _sanitize(exc) from None
-    return AccountAllowlist(entries=tuple(parsed.accounts))
+    """load_allowlist's validation step itself, without the file I/O around it."""
+    return _validate_payload(data)
 
 
 @given(_allowlist_payload())

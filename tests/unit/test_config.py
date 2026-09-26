@@ -141,13 +141,23 @@ def test_a_topic_url_pasted_where_the_variable_name_goes_is_refused(valid_data: 
 
 
 def test_unknown_top_level_key_rejected(valid_data: dict) -> None:
+    """The unknown key is not named (M0-008). Under extra="forbid" its location *is* the
+    key, the schema did not author it, and a key is where a pasted credential would sit."""
     valid_data["surprise"] = 1
-    expect_rejection(valid_data, "surprise")
+    expect_rejection(valid_data, "<withheld>: extra_forbidden")
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config_data(valid_data)
+    assert "surprise" not in str(excinfo.value)
 
 
 def test_unknown_nested_key_rejected(valid_data: dict) -> None:
+    """The section survives, because the schema authored it, so the operator still knows
+    where to look. The key itself does not."""
     valid_data["submission"]["auto_submit"] = True
-    expect_rejection(valid_data, "auto_submit")
+    expect_rejection(valid_data, "submission.<withheld>: extra_forbidden")
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config_data(valid_data)
+    assert "auto_submit" not in str(excinfo.value)
 
 
 # ── live-submit combinations (M2-704: the path exists; the invariants remain) ─

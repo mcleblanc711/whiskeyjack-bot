@@ -15545,3 +15545,261 @@ with `-x`. Exit 1 counts as killed; a collection error would have exited 2.
 
 The group-id recount case first reached only 0.78% of the property's draws. It is now its own
 constructed property, so every example reaches it, and mutant `d` is killed there.
+
+## M0-008 (+M1-322, M1-338, M1-339, D49) — The error-hygiene sweep
+
+Wave 23 close-out, PR-7, the last of the eight. The branch is named for the lead item under D39.
+**None of the three**: no `config/*.yaml` byte, no `AppConfig` field (validator *raises* changed,
+not fields, so `model_dump` and `config_sha256` are unchanged), no prompt byte. No migration, no
+dependency. Also on this branch: the TRACKS sweep of the merged M1-340 row, decisions **D49**
+(the surrogate) and **D50** (the message policy), both owner decisions taken in plan mode on
+2026-09-25, and the CLAUDE.md error-hygiene paragraph corrected: it still stated the false rule
+this item exists to retire.
+
+**The one live-visible change is repair-turn wording.** `forecast/schema.py`'s problems are
+what the repair turn shows the model. A pydantic built-in problem used to read
+`probability_yes: Input should be less than or equal to 1` and now reads
+`probability_yes: less_than_equal`. The project's own rules read as before, now with their slug:
+`<root>: rationale_summary must be at most 120 words [rationale_too_long]`.
+
+### M0-008 — One shared sanitizer, and every module on it
+
+#### Decision — authored slugs, not strict loc + type (D50, owner)
+
+The AC says "renders a ValidationError from loc and type only". Read literally, that also drops
+this project's own validator text, and that text is the whole diagnosis in two places:
+
+- **Config.** `submission.enabled requires require_human_approval: true` would render as
+  `submission: value_error`.
+- **The repair turn.** A `model_validator` reports at `<root>`, so
+  `rationale_summary must be at most 120 words` would render as `<root>: value_error`.
+
+The owner chose the design that keeps both. Validators raise `authored_error(slug, sentence)`,
+which is a `PydanticCustomError` with no context. The *type* is then authored, and the sanitizer
+renders `<location>: <sentence> [<slug>]` for a type outside pydantic's catalogue and
+`<location>: <type>` for anything inside it. That the sentence is determined by the type is a
+mechanical claim, not a convention. `tests/unit/test_validation_errors.py` scans `src/` with
+`ast` and fails:
+
+- any `authored_error` whose slug is not a literal, or is one of pydantic's own types;
+- any sentence that is not a string constant, an f-string over UPPER_CASE names only, or an
+  UPPER_CASE module constant bound to one of those;
+- any brace in constant text, because pydantic formats `{name}` in a custom template;
+- any slug with two sentences;
+- any `PydanticCustomError` referenced outside `validation_errors.py`.
+
+The scan's refusals are themselves tested against seven hand-written bad calls.
+
+A validator that raises a plain `ValueError` still works, and it is safe: its text is dropped.
+**Withholding is the default and opting in shows up in the diff**, which is the answer to M1-602's
+objection to a type-keyed allowlist. That objection was that such an allowlist makes every future
+validator's wording part of the leak surface *silently*.
+
+#### Decision — promote, don't rewrite
+
+`forecast/schema.py`'s `_nested_models`/`_schema_field_names` moved into
+`whiskeyjack_bot/validation_errors.py` and were widened to take an annotation as well as a model,
+so the union adapters work: `ForecastRecord` via `_RecordAdapter`, and `CanonicalQuestion`.
+allowlist's round-5 int rule is now everyone's: an int in `loc` renders only directly after a
+sequence-valued field, and anywhere else it is a mapping key taken from the input.
+`schema_sequence_field_names` derives the sequence fields by annotation, unwrapping `Optional`,
+`Union` and `Annotated`.
+
+#### Decision — "every module uses it" is tested as a partition
+
+Two `src/` scans back it (the T-908 lesson; neither lists the seven call sites as the check):
+
+- no `.errors(` call outside the shared module;
+- every module with an `except` naming `ValidationError` imports `sanitized_problems`.
+
+The anti-vacuity half asserts that the scan finds the seven known catchers.
+
+#### Decision — the real entry points are tested with a live leak channel
+
+`test_a_planted_marker_never_reaches_a_modules_error` drives all eight entry points: config (four
+payloads), research document, research run (`provider_config` keys), forecast response, stored
+record (the discriminated union), allowlist (an int key), canonical question (`union_tag_invalid`)
+and resolution. **Each case first asserts that pydantic's raw rendering carries the marker**, so
+the absence it then asserts cannot be `None == None`.
+
+#### Deviation
+
+- **Multi-problem validators state their whole rule.** `SubmissionConfig`'s six checks became
+  two authored sentences: the four safety flags in one, the two brakes in the other. Each names
+  every flag it covers, so `test_enabled_without_human_approval_names_every_violation` and
+  `test_enabled_with_a_brake_still_on_names_both_flags` still pass unedited. With both rules
+  broken, the second is reported at the next load.
+- **The allowlist's duplicate-username check moved out of the model** into
+  `_validate_payload`, run after the schema. A model validator can report only one authored
+  sentence at `<root>`, and "some username repeats" cannot be acted on in a 46-entry file. The
+  indices are the function's own counters and are rendered as before. The property suite now
+  calls `_validate_payload` itself instead of a hand copy of the loader's step, which would have
+  lost the check silently.
+- **An unknown config key is no longer named.** `submission.auto_submit` renders as
+  `submission.<withheld>: extra_forbidden`. The AC withholds any `loc` part the schema did not
+  author, and a key is where a pasted credential would sit. The section still names where to
+  look. Two tests changed their needle: they now assert the withheld form *and* the key's absence.
+- **Formats unified.** `forecast/record.py` used `[i]` for an index and now uses `.i`.
+  `resolution.py` used to drop an unauthored part and now substitutes `<withheld>`. Both are
+  type-only renderings, as before.
+- **Test edits**, each legitimate: two multiple-choice cases expect `options_not_distinct` and
+  `options_blank` instead of `value_error`, and `test_research.py` expects `extra_forbidden`
+  instead of pydantic's `Extra inputs are not permitted`. No authored field name was lost
+  anywhere. The companion tests pin `forecast.min_probability`, `accounts.0.username` and
+  `base_rate.prior_probability`.
+
+#### Rejected — rendering built-in `ctx` for constraint types, and `msg` for `value_error`
+
+`le`/`ge`/`literal_error` context is schema-authored, and a repair turn would benefit from seeing
+the bound. But choosing which built-in types are safe to render *is* the type-keyed allowlist,
+and the prompt already states every bound. Rendering `msg` for `value_error` is the same rule
+with a wider hole: `urlsplit`'s own ValueError embedding a netloc (research/model round 2) is
+precisely a `value_error`.
+
+#### Deferred (do not read the absence as an omission)
+
+- `forecast/record.py` and `resolution.py` validators still raise plain `ValueError`. Both
+  rendered type-only before this item, so they lose nothing; converting them would only *add*
+  text. They are safe by the default.
+- A third-party annotated type that raises a non-catalogue `PydanticCustomError` *with context*
+  would be rendered. No schema in `src/` uses one, and adding one is D50's revisit trigger.
+
+#### Standing risk — not verifiable offline
+
+Whether live repair turns succeed as often with slug-only built-ins as they did with pydantic's
+sentences. Every authored rule still reads as a sentence, and a built-in failure is a type or
+range error that the prompt already states the rule for. The first repair turn after deploy is
+the observation.
+
+### M1-322 — Refuse an unusable artifact path on the write side
+
+#### Decision — one `os.fsencode` check before any I/O, and its NUL sibling
+
+It sits in `write_new_file` after the policy check, so `mkdir`, `mkstemp`, `link` and the cleanup
+are covered at once, and the refusal is raised as the caller's own `error=` with the path
+withheld. `\udcc3` (surrogateescape for the real byte 0xC3) still encodes, and a test proves it
+still writes. **An embedded NUL is the sibling, found while writing the risk claims.** It
+encodes, but every path syscall refuses it with the same raw `ValueError` ("embedded null
+byte"), which was reproduced before the fix. The same check refuses it, and every writer test is
+parametrized over both shapes.
+
+#### Deviation
+
+None from the AC. The stricter reading of "all three writers" also covers every other caller:
+a test pins the set of `error=` types passed across `src/` by an `ast` scan of every
+`write_new_file(` call. The set is `ArtifactError`, `GatewayError`, `ExportError`,
+`NotifyError`, `ReportError` and `StorageFailure`, and the test drives the refusal through each
+one. The strict xfail is deleted. The replacement is parametrized over the four writer entry
+points: research, forecast, dry-run and live.
+
+#### Rejected — `except (OSError, ValueError)` around each I/O arm
+
+That would be four catch sites instead of one check, and a `ValueError` caught around `mkdir`
+reads as "any value problem", not "unencodable path".
+
+#### Deferred / Standing risk
+
+None.
+
+### M1-338 — Sanitize what escapes `tournament_state.append`
+
+#### Decision — serialize before the transaction, and cover the entry point's siblings
+
+`canonical(journal_form(data))` now runs before `transaction(conn)` opens, so a refused payload
+persists nothing. A cycle has siblings at the same entry point, which were enumerated rather
+than just the one the row names:
+
+- NaN and Infinity (`allow_nan=False`);
+- an object with no JSON form (`TypeError`, whose text names the type);
+- int and str keys in one mapping (`sort_keys` raises `TypeError`);
+- nesting past `json.dumps`' recursion (`RecursionError`).
+
+All six arrive as `StorageFailure("cannot serialize tournament journal payload (payload
+withheld)")`, with an unchanged row count, no open transaction and no `__cause__`. `witness`
+calls `append` first, so it refuses before writing a file, and that is tested too.
+
+#### Deviation
+
+None. `redact_leaves` still raises `ValueError` on a cycle: `redaction.py` imports nothing from
+the package and owns no error type, and `append` is where it becomes the module's error.
+
+#### Rejected / Deferred / Standing risk
+
+None. A cycle is unreachable from provider JSON. This is hygiene.
+
+### M1-339 — Two dict keys that redact to the same text
+
+#### Decision — keep both entries; the later one becomes `<key><collision:N>`
+
+The AC allows either keeping both entries or refusing. A refusal would surface through `append`
+as `StorageFailure`, which **stops the worker**, and would lose the whole journal row to save one
+key. So:
+
+- the later entry in source iteration order gets the smallest free `N >= 2`;
+- the candidate is redacted again, so no secret can form across the join;
+- the result is deterministic, which `check_storage` needs: the witness file and the row are
+  two separate `journal_form` calls compared for equality.
+
+A test constructs the collision directly (`FOO=…`, keys `"<secret>"` and `"<redacted:FOO>"`), and
+another takes the next free number past an existing `<collision:2>`.
+
+#### Deviation
+
+A non-redacted key can carry the suffix too, when a redacted key came first in iteration order.
+That is the "later entry" rule applied uniformly, and it is documented.
+
+#### Rejected — refusal
+
+See above.
+
+#### Deferred (do not read the absence as an omission)
+
+An int key `1` and a str key `"1"` in one mapping are distinct Python keys but not distinct JSON
+keys. That is not a redaction collision, and M1-338 now refuses the mixed-type mapping outright.
+
+#### Standing risk
+
+None. The property draws keys from fragments including the secret and its marker, reaching a
+collision in about 9% of draws. It asserts that every mapping keeps its entry count, that no
+secret appears, and that the output is deterministic and byte-stable through the persisted form.
+
+### D49 — `content_sha256` and a lone surrogate: reject, sanitized (owner)
+
+`ContentHashError(ValueError)` has a constant message and is raised `from None`. Both adapters
+already caught `ValueError` while building a document and dropped it, counted. So **live
+behaviour is unchanged**, and `ContentHashError` is now named in both `except` tuples for the
+reader. No digest changes, because such text never had one. The strict xfail became a passing
+property: surrogates embedded in encodable text raise `ContentHashError`, and the message
+contains no `Cs` character. Its companion asserts that every encodable string still hashes. The
+CLAUDE.md gotcha and the open-decision memory are deleted. The rejected alternative,
+`surrogatepass`, is recorded with its revisit trigger in D49.
+
+### Mutation pass — sixteen mutants, sixteen dead
+
+The mutants were edits to this worktree's `src/` and `tests/` only (never `site-packages`; see
+PR-6). Each was committed first, `__pycache__` was cleared before each one, the baseline was
+confirmed by exit code, and each file was restored from `HEAD` afterwards. The tree was clean at
+the end. The first run is the lesson: the last five mutants were all "killed" by the *same*
+unrelated test, the sanitizer marker property. That was a strategy bug, where a `value` mutation
+could replace `items` with a string and a later draw then indexed into it, so those kills were
+not attributable. The strategy was fixed, the property run ten times green, and the pass re-run.
+Every killer below is the test aimed at that mutant.
+
+| Mutant | Killed by |
+| --- | --- |
+| built-in `msg` rendered | real-entry sweep `[forecast-record]` (union tag). The marker property also kills it alone |
+| every str `loc` part rendered | real-entry sweep `[config-0]`. The marker property also kills it alone |
+| every int `loc` part rendered | real-entry sweep `[config-2]` (int key). The marker property also kills it alone |
+| no sequence fields | `test_a_list_index_after_a_sequence_field_survives` |
+| top-level field names only | `test_a_nested_authored_field_name_survives_with_the_builtin_type` |
+| `config.py` raises `from exc` | real-entry sweep (`__cause__ is None`) |
+| `normalize.py` renders `.errors()` itself | `test_no_module_renders_a_validation_error_itself` |
+| an authored sentence interpolates `{value!r}` | `test_every_authored_error_is_a_literal_slug_and_a_literal_sentence` |
+| the scan accepts any f-string | `test_the_scan_refuses_a_sentence_that_could_carry_a_value[f"bad {value}"]` |
+| allowlist duplicate check removed | `test_duplicate_username_case_insensitive_rejected` |
+| M1-322 `fsencode` check removed | `test_a_lone_surrogate_in_the_artifact_root_arrives_as_each_writers_own_error[research]` |
+| M1-322 NUL half removed (after the fix, re-run against the committed code) | `…_arrives_as_each_writers_own_error[research-nul]` |
+| M1-338 catches `ValueError` only | `test_an_unjournalable_payload_…[mixed_key_types]` |
+| M1-338 catches nothing | `test_an_unjournalable_payload_…[cycle]` |
+| M1-339 no disambiguation | `test_colliding_redacted_keys_keep_both_entries_under_the_documented_representation` |
+| D49 wrap removed | `test_a_lone_surrogate_is_refused_as_this_modules_error` |

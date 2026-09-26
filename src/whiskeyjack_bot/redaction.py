@@ -58,6 +58,18 @@ def registered_secret_env_var_names() -> tuple[str, ...]:
     return tuple(sorted(_REGISTERED))
 
 
+def _disambiguated(key: str, taken: dict[Any, Any], names: Sequence[str]) -> str:
+    """``key``, or its first free ``<collision:N>`` spelling in ``taken`` (M1-339)."""
+    if key not in taken:
+        return key
+    suffix = 2
+    while True:
+        candidate = redact_secrets(f"{key}<collision:{suffix}>", names)
+        if candidate not in taken:
+            return candidate
+        suffix += 1
+
+
 def redact_leaves(value: object, env_var_names: Sequence[str]) -> object:
     """Redact every string inside a JSON-shaped value, keys included, and nothing else.
 
@@ -72,6 +84,18 @@ def redact_leaves(value: object, env_var_names: Sequence[str]) -> object:
     `canonical(journal_form(data))`, that *lowered* the depth the journal would take. Payloads
     the base persisted began raising a raw `RecursionError` instead. Iterating costs one list
     entry per level and nothing else.
+
+    **Key collisions keep both entries (M1-339).** Redacting keys can make two distinct
+    keys equal. With ``FOO=abcd1234``, the keys ``"abcd1234"`` and ``"<redacted:FOO>"``
+    both become ``"<redacted:FOO>"``, and the second assignment used to overwrite the
+    first, silently dropping an entry from a journal row. The documented representation:
+    the **later** entry in the source mapping's iteration order is stored under
+    ``"<key><collision:N>"``, with the smallest ``N >= 2`` not already taken in that output
+    mapping. The candidate is redacted again, so no secret can form across the join.
+    Insertion order is deterministic, so the same input always produces the same output,
+    which ``check_storage`` relies on when it compares a witness file with its row. A
+    refusal was the alternative. It was rejected because ``append`` turns any failure here
+    into ``StorageFailure``, which stops the worker over a journal detail.
     """
     names = tuple(env_var_names)
 
@@ -109,7 +133,8 @@ def redact_leaves(value: object, env_var_names: Sequence[str]) -> object:
 
         if is_map:
             key, item = entry
-            key = redact_secrets(key, names) if isinstance(key, str) else key
+            if isinstance(key, str):
+                key = _disambiguated(redact_secrets(key, names), out, names)
         else:
             key, item = None, entry
 
