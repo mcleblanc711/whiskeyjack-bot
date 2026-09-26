@@ -43,24 +43,10 @@ from typing import TYPE_CHECKING, Any
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from whiskeyjack_bot.config import AppConfig
+from whiskeyjack_bot.credentials import MissingCredentialError
 
 if TYPE_CHECKING:  # pragma: no cover - import-time typing only, never at runtime
     from whiskeyjack_bot.submission_live import MetaculusPoster
-
-
-class MissingCredentialError(Exception):
-    """A required credential environment variable is unset.
-
-    Raised before any network attempt; the message names the variable and
-    never contains a value.
-    """
-
-    def __init__(self, env_var_name: str):
-        self.env_var_name = env_var_name
-        super().__init__(
-            f"environment variable {env_var_name} is not set; "
-            "set it in the environment (never in config or code)"
-        )
 
 
 def build_client(config: AppConfig) -> MetaculusClient:

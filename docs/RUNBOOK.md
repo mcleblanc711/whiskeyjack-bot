@@ -146,7 +146,7 @@ were written.
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
 | `missing env var: ...` / `environment NOT ready` | [C4](#c4--environment-not-ready) |
-| `missing env var: EXA_API_KEY` and nothing else is wrong | [C4](#c4--environment-not-ready) — known false red |
+| `optional env var not set: ...` (verdict still `environment OK`) | [C4](#c4--environment-not-ready) — informational |
 | `run` printed `status: research_failed` | [R1](#r1--research_failed) |
 | `run` printed `status: generation_failed` | [R2](#r2--generation_failed) |
 | `run` printed `status: validation_failed` | [R3](#r3--validation_failed) |
@@ -1030,12 +1030,18 @@ environment NOT ready
 **Confirm.** `verify-env` reports **names only** and never reads a value. Set the variable
 in your environment — never in a config file, never in code.
 
-**The known false red.** `verify-env` treats `retrieval.fallback.api_key_env`
-(`EXA_API_KEY` in the example config) as **required**, while `run` treats the same key as
-**optional** — its absence just marks the fallback retrieval provider unavailable and the
-run proceeds. So an install with no Exa account reports `environment NOT ready` and exits
-`3` while being perfectly runnable. If `EXA_API_KEY` is the only line in the report, you
-are not blocked. Filed as **M0-010**; when it ships, this paragraph goes away.
+**An optional key is reported, not required** (M0-010). The fallback retrieval key,
+`retrieval.fallback.api_key_env` (`EXA_API_KEY` in the example config), is optional: `run`
+without it marks the fallback provider unavailable and proceeds. So its absence prints
+
+```
+optional env var not set: EXA_API_KEY (fallback retrieval is unavailable; runs proceed without it)
+environment OK
+```
+
+and exits `0`. A question whose primary provider fails is then recorded as a research
+failure instead of falling back. Set the key if you want the fallback. If the fallback shares
+its variable with a required key, the variable is required and reported as `missing env var`.
 
 **Never.** Do not put a credential in `config.yaml` to satisfy this check. The config
 carries the *name* of the variable, never its value.
@@ -1271,11 +1277,14 @@ and, from `reject`:
 refused: a rejected event is not a legal transition for a record whose current status is approved
 ```
 
-**Why this bites.** `submit` refuses a payload the approval did not authorize with a
-message that ends *"either submit the payload this record derives or approve the record
-again"* — but **approving again is not possible**. `approved` is reachable only from
-`validated` and nothing returns a record to `validated`, so both `approve` and `reject` are
-closed for that record. The refusal points at an action the state machine forbids.
+**Why.** `approved` is reachable only from `validated` and nothing returns a record to
+`validated`, so both `approve` and `reject` are closed for that record. This is deliberate:
+an approval is a decision about content, and the ledger never rewrites one. `submit`'s
+refusal for a payload the approval did not authorize says so (M2-715):
+
+```
+refused: this submission payload is not the one the approval in force authorized, so no submission key may be derived for it; an approved record cannot be approved again, so either submit the payload this record derives under the configuration it was approved with, or make a new forecast version for this question (run it again) and approve that
+```
 
 You reach this state when the payload derivation changes between approve and submit — a
 `numeric_calibration` config edit is enough to do it.
@@ -1285,30 +1294,37 @@ record, its derived status, its hash and the derived payload digest, then refuse
 configuration gate having written nothing. Compare that digest with the one `approve`
 printed.
 
-**Recovery today.** Make a **new forecast version** (a fresh `run` for that question) and
-approve that. On the live paid path that costs money.
+**Recovery.** Either of the two the message names:
+
+1. **Restore the derivation.** Revert the configuration change (for example the
+   `numeric_calibration` edit) so the record derives the payload that was approved, then
+   `submit` again. Free, and correct if the change was not meant for this record.
+2. **Make a new forecast version** (a fresh `run` for that question), then validate and
+   approve it. On the live paid path that costs money.
 
 **Never.** Do not edit the approval row to match the new payload. An approval is a claim
 about what a person reviewed; rewriting it makes the ledger lie about a human decision.
 
-**Filed as M2-715.** The message and the state machine disagree, and one of them has to
-move.
+**Shipped as M2-715**, message-only. Making re-approval legal would be a schema change
+(`009`'s transition table), and it was rejected for the close-out: see `docs/M1-NOTES.md`.
 
 ### A3 — An approval older than migration 011
 
 **What you see** (exit `4`):
 
 ```
-refused: the approval in force for this forecast record predates the payload binding (migration 011) and so authorizes no particular payload; approve the record again to bind the decision to the payload it authorizes
+refused: the approval in force for this forecast record predates the payload binding (migration 011) and so authorizes no particular payload; an approved record cannot be approved again, so make a new forecast version for this question (run it again) and approve that
 ```
 
 **Confirm.** The approval was written before migration `011` added the payload binding, so
 it carries no `payload_sha256`. Such an approval is **refused rather than exempted** — it
 authorizes the forecast but no particular payload.
 
-**Recovery.** As the message says, approve the record again — **if** the record is still
-`validated`. If it is already `approved`, you are in [A2](#a2--an-approved-record-cannot-be-re-approved-or-rejected)
-and the recovery there applies.
+**Recovery.** As the message says: make a new forecast version and approve that. The
+record holding the old approval is `approved`, so it cannot be approved again
+([A2](#a2--an-approved-record-cannot-be-re-approved-or-rejected)), and restoring a
+configuration does not help here — an approval with no payload digest authorizes no payload
+under any configuration.
 
 **Never.** Do not treat the absence of a payload digest as "no restriction". It means the
 opposite.
@@ -1800,7 +1816,7 @@ not evidence of what was sent.
 
 ## When the only recovery would be a database edit
 
-Three states in this document have no complete recovery through a documented command. They
+Two states in this document have no complete recovery through a documented command. They
 are listed here rather than papered over with a SQL snippet, because a runbook that teaches
 you to edit the ledger has destroyed the thing it documents. (**M1-611**'s `show --record-id`
 closed a fourth: finding a record's state, or a lost attempt id, from the ledger alone — see
@@ -1812,11 +1828,7 @@ the full `submission_attempts` row behind a lifecycle event — [L1](#l1--submis
 | State | Section | Row | What is missing |
 |---|---|---|---|
 | A `mismatched` refetch | [L3](#l3--a-mismatched-refetch) | **M2-714** | A way to record a human's judgement closing it |
-| An approved record needing re-approval | [A2](#a2--an-approved-record-cannot-be-re-approved-or-rejected) | **M2-715** | Either a legal path back, or a refusal that stops suggesting one |
 | A `not_recorded` forecast | [R4](#r4--not_recorded-the-forecast-the-ledger-never-saw) | **M1-317** | A ledger identity for a post-generation persistence failure |
-
-One further filed item is a nuisance rather than a stuck state: **M0-010**, `verify-env`
-requiring the optional fallback retrieval key ([C4](#c4--environment-not-ready)).
 
 If you hit a state that is not in this document and whose only exit appears to be a
 database edit, that is a sixth gap and it is worth a backlog row. File it rather than

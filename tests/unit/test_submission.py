@@ -1024,8 +1024,12 @@ def test_an_approval_written_before_the_binding_existed_is_refused(
     ledger.execute("DROP TRIGGER approval_events_block_update")
     ledger.execute("UPDATE approval_events SET payload_sha256 = NULL")
     assert current_status(ledger, record_id) == "approved"
-    with pytest.raises(SubmissionError, match="predates the payload binding"):
+    with pytest.raises(SubmissionError, match="predates the payload binding") as refused:
         submission_key_for_approved_record(ledger, record_id, request_payload_sha256=PAYLOAD_SHA)
+    # M2-715: the record is `approved`, which `approve` cannot leave, so the refusal must name
+    # a new forecast version rather than a re-approval.
+    assert "approve the record again" not in str(refused.value)
+    assert "new forecast version for this question" in str(refused.value)
 
 
 # --- the gate is about the status now, not only the history --------------------------

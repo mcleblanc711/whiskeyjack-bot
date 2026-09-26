@@ -1013,6 +1013,50 @@ def test_submission_policy_revalidates_numeric_bounds_and_mc_options(
     assert platform.posts == 0
 
 
+@pytest.mark.parametrize(
+    "options,refused",
+    [
+        (["Other", "Option Beta", "Option Alpha"], False),  # reversed: the same members
+        (["Option Beta", "Option Alpha", "Other"], False),
+        (["Option Alpha", "Option Beta", "Other", "Option Gamma"], True),  # one added
+        (["Option Alpha", "Other"], True),  # one dropped
+        (["Other", "Option Beta", "Option Alpha "], True),  # reordered AND one relabelled
+    ],
+)
+def test_the_live_option_check_reads_membership_not_order(
+    case: Any, options: list[str], refused: bool
+) -> None:
+    """M1-340, through the real ``before_post``. Options are matched by label everywhere else
+    (M1-331), so a refetch returning the same labels in another order is the same question and
+    must reach the intent write; a changed membership must still refuse, which is what a fix
+    that merely *ignored* ``options`` would fail."""
+    from whiskeyjack_bot.submission_policy import prepare_live_policy
+    from whiskeyjack_bot.submission_live import LiveSubmissionError, ForecastHistory
+    from whiskeyjack_bot.forecast.store import read_forecast_record
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    conn, config, platform, news, model = case
+    raw = json.loads((ROOT / "tests/fixtures/api_posts/multiple_choice_post.json").read_text())
+    raw["projects"]["default_project"]["id"] = 32977
+    raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(hours=2)).isoformat()
+    platform.raw = news.raw = model.raw = raw
+    rid = _prepare_version(case)
+    record = read_forecast_record(conn, rid)
+    payload = authorized_payload(record, calibration=config.numeric_calibration)
+    callback = prepare_live_policy(conn, config, platform, record, payload.payload, payload.sha256)
+    raw = copy.deepcopy(raw)
+    raw["question"]["options"] = options
+    refetched = DataOrganizer.get_question_from_post_json(raw)
+    if refused:
+        with pytest.raises(LiveSubmissionError, match="resolution inputs changed"):
+            callback(refetched, ForecastHistory(()))
+        assert not tournament_state.events(conn, "forecast_intent", rid)
+    else:
+        callback(refetched, ForecastHistory(()))
+        assert len(tournament_state.events(conn, "forecast_intent", rid)) == 1
+    assert platform.posts == 0
+
+
 def test_archived_resolution_url_names_the_original_publisher(case: Any) -> None:
     from whiskeyjack_bot.research.quality import source_domains
 
@@ -1917,6 +1961,107 @@ def test_every_binding_the_activation_stores_is_compared_by_name(case: Any) -> N
     _conn, config, *_ = case
     assert set(bindings(config)) == {"config_sha256", "prompt_sha256"}
     assert get_args(RetiredBinding) == ("account", "destination", "configuration", "prompt")
+
+
+# --- M1-335: every combination of moved bindings, not one at a time -------------------------
+
+# Each stored key is independently unchanged, changed, or absent (a journal row read back from
+# the ledger is untrusted, so "absent" is a real shape). The changed values are chosen so a
+# leak would be findable in the result's repr.
+_STORED = {
+    "account_id": 424242,
+    "project_id": 90909,
+    "config_sha256": "c" * 64,
+    "prompt_sha256": "d" * 64,
+}
+_STATES = ("unchanged", "changed", "absent")
+# The config side of "destination": the configured project may move away from the activated
+# one, or hand its choice to the SDK. Either also changes config_sha256, which is the pair
+# config_sha256 forces and why "configuration" is expected alongside it.
+_CONFIG_SIDE = ("unchanged", "other_project", "sdk_current_id")
+_ORDER = ("account", "destination", "configuration", "prompt")
+_KEY_BINDING = {
+    "account_id": "account",
+    "project_id": "destination",
+    "config_sha256": "configuration",
+    "prompt_sha256": "prompt",
+}
+
+
+@pytest.fixture(scope="module")
+def binding_configs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    config = base_config.__wrapped__(tmp_path_factory.mktemp("bindings"))
+    data = config.model_dump(mode="json")
+    data["metaculus"]["tournament"].update(id=32977, use_sdk_current_id=False)
+    variants: dict[str, Any] = {"unchanged": validate_config_data(data)}
+    other = copy.deepcopy(data)
+    other["metaculus"]["tournament"]["id"] = 32978
+    variants["other_project"] = validate_config_data(other)
+    sdk = copy.deepcopy(data)
+    sdk["metaculus"]["tournament"]["use_sdk_current_id"] = True
+    variants["sdk_current_id"] = validate_config_data(sdk)
+    return variants
+
+
+def _combinations() -> list[Any]:
+    import itertools
+
+    return [
+        pytest.param(dict(zip(_STORED, states)), side, id="-".join((*states, side)))
+        for states in itertools.product(_STATES, repeat=len(_STORED))
+        for side in _CONFIG_SIDE
+    ]
+
+
+@pytest.mark.parametrize("states,config_side", _combinations())
+def test_retired_bindings_over_every_combination_of_moved_keys(
+    binding_configs: dict[str, Any], states: dict[str, str], config_side: str
+) -> None:
+    from typing import get_args
+
+    from whiskeyjack_bot.tournament_state import RetiredBinding, bindings, retired_bindings
+
+    base = binding_configs["unchanged"]
+    config = binding_configs[config_side]
+    activation: dict[str, Any] = {
+        "activation_id": "a" * 32,
+        "account_id": 42,
+        "project_id": 32977,
+        **bindings(base),
+    }
+    for key, state in states.items():
+        if state == "changed":
+            activation[key] = _STORED[key]
+        elif state == "absent":
+            del activation[key]
+
+    moved = {_KEY_BINDING[key] for key, state in states.items() if state != "unchanged"}
+    if config_side != "unchanged":
+        moved |= {"destination", "configuration"}
+    expected = tuple(name for name in _ORDER if name in moved)
+
+    result = retired_bindings(activation, config, account_id=42, project_id="32977")
+    assert result == expected
+    # Deterministic: again, and across the round-trip a stored activation actually takes.
+    assert retired_bindings(activation, config, account_id=42, project_id="32977") == result
+    replayed = json.loads(json.dumps(activation, ensure_ascii=True, sort_keys=True))
+    assert retired_bindings(replayed, config, account_id=42, project_id="32977") == result
+    # Key-only: binding names, never a stored or computed value.
+    assert set(result) <= set(get_args(RetiredBinding))
+    rendered = repr(result)
+    for value in (*_STORED.values(), *bindings(base).values(), *bindings(config).values()):
+        assert str(value) not in rendered
+
+
+def test_the_combination_table_reaches_every_multi_key_shape() -> None:
+    """Anti-vacuity for the table above: it must hold every subset of the four bindings as an
+    expected result, including all two- and three-key moves the one-at-a-time tests missed."""
+    import itertools
+
+    reached = set()
+    for states in itertools.product(_STATES, repeat=len(_STORED)):
+        reached.add(frozenset(_KEY_BINDING[k] for k, s in zip(_STORED, states) if s != "unchanged"))
+    assert len(reached) == 2 ** len(_ORDER)
 
 
 def test_an_activation_retired_refusal_needs_a_known_binding() -> None:

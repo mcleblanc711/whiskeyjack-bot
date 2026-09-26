@@ -14,7 +14,7 @@ from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from whiskeyjack_bot.cli import main
 from whiskeyjack_bot.config import AppConfig, validate_config_data
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.metaculus.fetch import (
     fetch_open_questions_fixture,
     fetch_open_questions_live,

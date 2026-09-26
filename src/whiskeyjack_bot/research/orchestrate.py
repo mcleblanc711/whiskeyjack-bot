@@ -56,7 +56,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from whiskeyjack_bot.config import AppConfig
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.notify import emit
 from whiskeyjack_bot.questions.model import _CanonicalQuestionBase
 from whiskeyjack_bot.research.asknews import (

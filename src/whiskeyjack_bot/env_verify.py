@@ -33,6 +33,8 @@ class VerificationReport:
     config_problems: list[str] = field(default_factory=list)
     filesystem_problems: list[str] = field(default_factory=list)
     missing_env_vars: list[str] = field(default_factory=list)
+    # M0-010. Reported, never counted against readiness: a run proceeds without these.
+    optional_env_vars_missing: list[str] = field(default_factory=list)
     checks_passed: list[str] = field(default_factory=list)
 
     @property
@@ -53,6 +55,11 @@ class VerificationReport:
             lines.append(f"filesystem error: {problem}")
         for name in self.missing_env_vars:
             lines.append(f"missing env var: {name} (set it in the environment; never in config)")
+        for name in self.optional_env_vars_missing:
+            lines.append(
+                f"optional env var not set: {name} (fallback retrieval is unavailable; "
+                "runs proceed without it)"
+            )
         verdict = "environment OK" if self.exit_code == EXIT_OK else "environment NOT ready"
         lines.append(verdict)
         return "\n".join(lines)
@@ -235,6 +242,17 @@ def _verify_env_vars(config: AppConfig, report: VerificationReport) -> None:
             report.checks_passed.append(f"env var {name} is set")
         else:
             report.missing_env_vars.append(name)
+    # M0-010. The fallback retrieval key is optional -- ``pipeline_live`` runs without it and
+    # marks the fallback unavailable -- so its absence is said, distinguishably, and does not
+    # make the environment "NOT ready". Only the fallback: an optional ntfy topic URL with
+    # ``notify`` off stays unreported, as M1-329 settled. A fallback key that shares its
+    # variable with a required role is not in the optional set and was checked above.
+    fallback = config.retrieval.fallback.api_key_env
+    if fallback in config.optional_env_var_names():
+        if os.environ.get(fallback):
+            report.checks_passed.append(f"env var {fallback} is set (optional: fallback retrieval)")
+        else:
+            report.optional_env_vars_missing.append(fallback)
 
 
 def verify_environment(config_path: Path | str) -> VerificationReport:

@@ -25,7 +25,7 @@ from whiskeyjack_bot.cli import EXIT_REFUSED, main
 from whiskeyjack_bot.env_verify import EXIT_ENV_MISSING, EXIT_OK
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.lifecycle import current_status, record_validation
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 
 from tests.unit.records import CALIBRATION, FORECAST_CONFIG
 from tests.unit.test_submission_live import (  # noqa: F401 - fixtures reused deliberately

@@ -57,7 +57,7 @@ from typing import Any, Final, Literal, get_args
 from asknews_sdk import AskNewsSDK
 
 from whiskeyjack_bot.config import AppConfig
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.research.asknews_cost import NEWS_CALL_ESTIMATE_USD, credits_microusd
 from whiskeyjack_bot.research.hashing import content_sha256
 from whiskeyjack_bot.research.model import (

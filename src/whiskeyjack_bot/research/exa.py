@@ -119,7 +119,7 @@ import httpx
 from publicsuffixlist import PublicSuffixList
 
 from whiskeyjack_bot.config import AppConfig
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.research.canonical import CanonicalizationError, canonicalize_url
 from whiskeyjack_bot.research.dedup import deduplicate
 from whiskeyjack_bot.research.hashing import content_sha256

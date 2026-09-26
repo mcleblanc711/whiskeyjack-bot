@@ -13,12 +13,12 @@ What is claimed for *this* module is narrower and is asserted the same way. It r
 ``research.asknews``, ``research.exa`` and ``forecast.generate`` -- it must, it spends money
 through all three -- and it reaches **no submission module and no approval module**, so
 ``CODEX_HANDOFF.md`` § "Required CLI entry points"'s rule that ``run`` never submits
-implicitly holds here for the same structural reason it holds there. One honest caveat,
-stated rather than papered over: ``whiskeyjack_bot.metaculus.client`` *is* on this graph,
-because ``research/exa.py`` takes ``MissingCredentialError`` from it and that module also
-holds ``build_poster``. That coupling predates this branch and is filed as its own row; what
-makes "cannot post" true here is the absence of ``submission*`` and ``approval``, plus the
-fact that a post requires an approved record and a separate command (D23).
+implicitly holds here for the same structural reason it holds there. Nor does it reach
+``whiskeyjack_bot.metaculus.client``, which holds ``build_poster``: until M1-320 it did,
+because every paid adapter took ``MissingCredentialError`` from that module, and the guard had
+to name the coupling as an exception to itself. The error now lives in
+``whiskeyjack_bot.credentials``, which imports nothing. Beyond the import graph, a post still
+requires an approved record and a separate command (D23).
 
 **The order of every decision below is "refuse before the money, report after it."** That is
 M1-303 round 4's rule and M1-312's inversion of it, and the boundary between them is the
@@ -84,7 +84,7 @@ from whiskeyjack_bot.lifecycle import (
     record_validation,
     transaction,
 )
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.metaculus.snapshots import SnapshotError, load_snapshot
 from whiskeyjack_bot.prompt import PromptError, load_prompt
 from whiskeyjack_bot.questions.normalize import NormalizationError, normalize_questions

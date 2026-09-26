@@ -14,12 +14,10 @@ the tests below add the corresponding claim for the new module -- which is delib
 *different* claim, because a module that spends money cannot assert the same zero.
 
 What ``pipeline_live`` may reach: the paid adapters, necessarily. What it may not: any
-submission or approval module. One honest caveat is asserted rather than hidden --
-``metaculus.client`` **is** on the graph, because ``research/exa.py`` imports
-``MissingCredentialError`` from the module that also holds ``build_poster``. That coupling
-predates this branch and is filed as its own row; the guard names it instead of pretending it
-is not there, because a guard that quietly excludes what it cannot prove is the vacuity this
-project keeps paying for.
+submission or approval module, and not ``metaculus.client``, which holds ``build_poster``.
+That last clause used to be an asserted caveat instead -- the adapters took
+``MissingCredentialError`` from ``metaculus.client`` -- until M1-320 moved the error into
+``whiskeyjack_bot.credentials`` and the guard could forbid the module outright.
 
 Both provider clients are recording doubles installed at ``pipeline_live``'s own construction
 seam, and the suite runs under three network guards -- so a double that failed to install
@@ -63,6 +61,8 @@ POSTING = (
     "whiskeyjack_bot.submission_gateway",
     "whiskeyjack_bot.submission_live",
     "whiskeyjack_bot.approval",
+    # Holds ``build_poster`` and ``SingleAttemptPoster``. Forbidden outright since M1-320.
+    "whiskeyjack_bot.metaculus.client",
 )
 # What it must reach, so the guard above cannot pass by measuring nothing.
 PAID = (
@@ -452,18 +452,44 @@ def test_the_live_guard_is_not_vacuous() -> None:
     assert set(PAID) <= added, sorted(set(PAID) - added)
 
 
-def test_the_poster_coupling_is_named_rather_than_hidden() -> None:
-    """``metaculus.client`` is on the paid graph, and this records exactly why.
+@pytest.mark.parametrize(
+    "module",
+    [
+        "whiskeyjack_bot.pipeline_live",
+        "whiskeyjack_bot.research.exa",
+        "whiskeyjack_bot.research.asknews",
+        "whiskeyjack_bot.research.orchestrate",
+        "whiskeyjack_bot.forecast.generate",
+    ],
+)
+def test_no_paid_module_loads_the_metaculus_poster(module: str) -> None:
+    """M1-320. Every module that raises ``MissingCredentialError`` once put ``metaculus.client``
+    -- ``build_poster``, ``SingleAttemptPoster`` -- on its graph for an exception class. Each is
+    measured on its own, in a clean interpreter, so a single adapter reverting its import
+    fails here even while ``pipeline_live`` is also checked above."""
+    assert "whiskeyjack_bot.metaculus.client" not in imported_by(f"import {module};")
 
-    ``research/exa.py`` takes ``MissingCredentialError`` from the module that also holds
-    ``build_poster``. That predates this branch, it is filed as its own row, and the honest
-    thing is a test that fails when the reason changes -- rather than a forbidden-set that
-    quietly omits a module it cannot exclude.
-    """
-    assert "whiskeyjack_bot.metaculus.client" in imported_by("import whiskeyjack_bot.research.exa;")
-    assert "whiskeyjack_bot.metaculus.client" in imported_by(
-        "import whiskeyjack_bot.pipeline_live;"
-    )
+
+def test_the_credential_error_module_imports_nothing() -> None:
+    """``credentials`` is only useful to the guard above if it stays a leaf: it must add no
+    whiskeyjack module but itself, and no third-party client."""
+    added = imported_by("import whiskeyjack_bot.credentials;")
+    assert {name for name in added if name.startswith("whiskeyjack_bot")} == {
+        "whiskeyjack_bot",
+        "whiskeyjack_bot.credentials",
+    }
+    assert not {
+        name for name in added if name.split(".")[0] in {"httpx", "requests", "forecasting_tools"}
+    }
+
+
+def test_the_poster_module_raises_the_class_callers_catch() -> None:
+    """The move must not fork the class: ``build_client`` raising a second
+    ``MissingCredentialError`` would slip past every ``except`` written against the new one."""
+    from whiskeyjack_bot import credentials
+    from whiskeyjack_bot.metaculus import client
+
+    assert client.MissingCredentialError is credentials.MissingCredentialError
 
 
 def test_the_replay_command_handler_names_no_paid_module() -> None:
