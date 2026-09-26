@@ -416,25 +416,28 @@ def test_every_failure_arm_raises_the_error_the_caller_supplied(tmp_path: Path) 
 # --- M1-322: an unencodable root, through every writer -----------------------------
 
 # `\udcc3` would round-trip -- it is a surrogateescape for a real byte -- so the case is
-# `\ud800`, which has no byte behind it and cannot be encoded for the syscall at all.
+# `\ud800`, which has no byte behind it and cannot be encoded for the syscall at all. An
+# embedded NUL encodes, but no path syscall takes it: the same raw ValueError, the sibling.
 _UNENCODABLE = "ro\ud800ot"
+_UNUSABLE_ROOTS = [_UNENCODABLE, "ro\x00ot"]
 
 
+@pytest.mark.parametrize("bad", _UNUSABLE_ROOTS, ids=["surrogate", "nul"])
 @pytest.mark.parametrize("writer", WRITERS, ids=_IDS)
 def test_a_lone_surrogate_in_the_artifact_root_arrives_as_each_writers_own_error(
-    writer: Writer, tmp_path: Path
+    writer: Writer, bad: str, tmp_path: Path
 ) -> None:
     """M1-322. Not a hostile operator: `artifact_root` is operator configuration, and
     this is the ordinary local-I/O failure class the threat boundary keeps in scope.
     Before the fix, `Path.mkdir` raised a raw `UnicodeEncodeError` (a ValueError, not an
     OSError) that escaped every writer's `except OSError`. The path is withheld, because
     interpolating it is itself the operation that fails."""
-    root = tmp_path / _UNENCODABLE
+    root = tmp_path / bad
     with pytest.raises(writer.error) as excinfo:
         writer.write(root, 0)
     assert type(excinfo.value) is writer.error
     assert excinfo.value.__cause__ is None
-    assert "\ud800" not in str(excinfo.value)
+    assert "ro" + bad[2] not in str(excinfo.value)
     assert "path withheld" in str(excinfo.value)
     assert not any(tmp_path.iterdir()), "nothing may be created for an unencodable root"
 
@@ -483,11 +486,15 @@ def test_the_caller_error_table_matches_every_call_site() -> None:
     assert passed == set(_CALLER_ERRORS)
 
 
+@pytest.mark.parametrize("bad", _UNUSABLE_ROOTS, ids=["surrogate", "nul"])
 @pytest.mark.parametrize("name", sorted(_CALLER_ERRORS))
-def test_the_encode_refusal_arrives_as_every_callers_error(name: str, tmp_path: Path) -> None:
+def test_the_encode_refusal_arrives_as_every_callers_error(
+    name: str, bad: str, tmp_path: Path
+) -> None:
     error = _CALLER_ERRORS[name]
     with pytest.raises(error) as excinfo:
-        write_new_file(tmp_path / _UNENCODABLE / "a.json", b"body", what="artifact", error=error)
+        write_new_file(tmp_path / bad / "a.json", b"body", what="artifact", error=error)
     assert type(excinfo.value) is error
     assert excinfo.value.__cause__ is None
-    assert "\ud800" not in str(excinfo.value)
+    assert str(tmp_path) not in str(excinfo.value)
+    assert "path withheld" in str(excinfo.value)

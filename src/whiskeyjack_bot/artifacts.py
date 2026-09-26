@@ -151,20 +151,22 @@ def write_new_file(
         raise error(
             f"on_existing must be one of {get_args(ExistingFilePolicy)} (offending input withheld)"
         )
+    # M1-322, the writer-side twin of M1-314. A path the syscalls cannot take makes every one
+    # of them below raise a ValueError, not an OSError, so it escaped each `except OSError`
+    # as a raw error. Two shapes do this:
+    # - a lone surrogate such as \ud800 in ``artifact_root``, which has no byte behind it
+    #   (UnicodeEncodeError);
+    # - an embedded NUL, which encodes but which no path syscall accepts.
+    # Checked once here, before any I/O, which covers mkdir, mkstemp, link and the cleanup
+    # together. A surrogateescape character (\udcc3) does encode, so a real undecodable byte
+    # in a path still works. The path is withheld: interpolating it is the operation that
+    # fails.
     try:
-        # M1-322, the writer-side twin of M1-314. A path the filesystem encoding cannot
-        # represent (a lone surrogate such as \ud800 in ``artifact_root``, with no byte
-        # behind it) makes every syscall below raise UnicodeEncodeError, which is a
-        # ValueError, not an OSError, so it escaped each `except OSError` as a raw error.
-        # Checked once here, before any I/O, which covers mkdir, mkstemp, link and the
-        # cleanup together. A surrogateescape character (\udcc3) does encode, so a real
-        # undecodable byte in a path still works. The path is withheld: interpolating it
-        # is the operation that fails.
-        os.fsencode(destination)
+        unusable = b"\x00" in os.fsencode(destination)
     except UnicodeEncodeError:
-        raise error(
-            f"cannot encode the path for {what} for the filesystem (path withheld)"
-        ) from None
+        unusable = True
+    if unusable:
+        raise error(f"cannot represent the path for {what} for the filesystem (path withheld)")
     new_directories = [p for p in destination.parents if not p.exists()]
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
