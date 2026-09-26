@@ -522,10 +522,40 @@ class AppConfig(_StrictModel):
         Collapsing them again in either direction gets one of the two wrong: verify-env
         would report a machine with no notifications configured as not ready, or the
         redaction filter would stop scrubbing a live bearer token the moment someone set
-        ``notify.enabled: false`` without clearing the variable.
+        ``notify.enabled: false`` without clearing the variable. M0-010 made the fallback
+        retrieval key the second such name; :meth:`optional_env_var_names` says why.
         """
-        optional = set() if self.notify.enabled else {self.notify.topic_url_env}
+        optional = set(self.optional_env_var_names())
         return [name for name in self.secret_env_var_names() if name not in optional]
+
+    def optional_env_var_names(self) -> list[str]:
+        """Credential names whose absence does not block a run: the complement (M0-010).
+
+        ``secret_env_var_names`` minus :meth:`required_env_var_names`, computed here so the two
+        cannot disagree. Two roles are optional. The ntfy topic URL while ``notify`` is off
+        (M1-329). And the fallback retrieval key, always: ``pipeline_live`` treats a missing Exa
+        key as "fallback unavailable for this run" and proceeds, so verify-env requiring it
+        reported a runnable install as not ready (D-1001 runbook C4's false red).
+
+        A name is optional only if **no required role also uses it**. An operator who points
+        the fallback at the same variable as a required key has made that variable required;
+        subtracting it by role would drop a credential the run cannot start without from the
+        readiness check. Redaction is unaffected either way: it reads ``secret_env_var_names``,
+        which still names every one of these.
+        """
+        required_roles = [
+            self.metaculus.token_env,
+            self.model.api_key_env,
+            self.retrieval.primary.api_key_env,
+        ]
+        if self.notify.enabled:
+            required_roles.append(self.notify.topic_url_env)
+        if self.retrieval.social.enabled:
+            required_roles.append(self.retrieval.social.api_key_env)
+        optional_roles = [self.retrieval.fallback.api_key_env]
+        if not self.notify.enabled:
+            optional_roles.append(self.notify.topic_url_env)
+        return [name for name in dict.fromkeys(optional_roles) if name not in set(required_roles)]
 
 
 class ConfigError(Exception):

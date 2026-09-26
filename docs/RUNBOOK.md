@@ -146,7 +146,7 @@ were written.
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
 | `missing env var: ...` / `environment NOT ready` | [C4](#c4--environment-not-ready) |
-| `missing env var: EXA_API_KEY` and nothing else is wrong | [C4](#c4--environment-not-ready) — known false red |
+| `optional env var not set: ...` (verdict still `environment OK`) | [C4](#c4--environment-not-ready) — informational |
 | `run` printed `status: research_failed` | [R1](#r1--research_failed) |
 | `run` printed `status: generation_failed` | [R2](#r2--generation_failed) |
 | `run` printed `status: validation_failed` | [R3](#r3--validation_failed) |
@@ -1030,12 +1030,18 @@ environment NOT ready
 **Confirm.** `verify-env` reports **names only** and never reads a value. Set the variable
 in your environment — never in a config file, never in code.
 
-**The known false red.** `verify-env` treats `retrieval.fallback.api_key_env`
-(`EXA_API_KEY` in the example config) as **required**, while `run` treats the same key as
-**optional** — its absence just marks the fallback retrieval provider unavailable and the
-run proceeds. So an install with no Exa account reports `environment NOT ready` and exits
-`3` while being perfectly runnable. If `EXA_API_KEY` is the only line in the report, you
-are not blocked. Filed as **M0-010**; when it ships, this paragraph goes away.
+**An optional key is reported, not required** (M0-010). The fallback retrieval key,
+`retrieval.fallback.api_key_env` (`EXA_API_KEY` in the example config), is optional: `run`
+without it marks the fallback provider unavailable and proceeds. So its absence prints
+
+```
+optional env var not set: EXA_API_KEY (fallback retrieval is unavailable; runs proceed without it)
+environment OK
+```
+
+and exits `0`. A question whose primary provider fails is then recorded as a research
+failure instead of falling back. Set the key if you want the fallback. If the fallback shares
+its variable with a required key, the variable is required and reported as `missing env var`.
 
 **Never.** Do not put a credential in `config.yaml` to satisfy this check. The config
 carries the *name* of the variable, never its value.
@@ -1814,9 +1820,6 @@ the full `submission_attempts` row behind a lifecycle event — [L1](#l1--submis
 | A `mismatched` refetch | [L3](#l3--a-mismatched-refetch) | **M2-714** | A way to record a human's judgement closing it |
 | An approved record needing re-approval | [A2](#a2--an-approved-record-cannot-be-re-approved-or-rejected) | **M2-715** | Either a legal path back, or a refusal that stops suggesting one |
 | A `not_recorded` forecast | [R4](#r4--not_recorded-the-forecast-the-ledger-never-saw) | **M1-317** | A ledger identity for a post-generation persistence failure |
-
-One further filed item is a nuisance rather than a stuck state: **M0-010**, `verify-env`
-requiring the optional fallback retrieval key ([C4](#c4--environment-not-ready)).
 
 If you hit a state that is not in this document and whose only exit appears to be a
 database edit, that is a sixth gap and it is worth a backlog row. File it rather than

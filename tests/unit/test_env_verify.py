@@ -94,6 +94,79 @@ def test_empty_string_counts_as_missing(config_file: Path, monkeypatch: pytest.M
     assert report.missing_env_vars == ["METACULUS_TOKEN"]
 
 
+def test_a_missing_fallback_key_alone_leaves_the_environment_ready(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M0-010's acceptance test: every required key set, no fallback key. ``pipeline_live``
+    runs such an install (the fallback is marked unavailable), so verify-env must exit 0 and
+    say "environment OK" -- and still name the absent key, on a line an operator cannot
+    mistake for the blocking kind."""
+    set_all_env(monkeypatch)
+    monkeypatch.delenv("EXA_API_KEY")
+    exit_code = main(["verify-env", "--config", str(config_file)])
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_OK
+    assert out.splitlines()[-1] == "environment OK"
+    assert (
+        "optional env var not set: EXA_API_KEY (fallback retrieval is unavailable; "
+        "runs proceed without it)"
+    ) in out.splitlines()
+    assert "missing env var" not in out
+
+
+def test_a_missing_fallback_key_does_not_mask_a_missing_required_one(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    set_all_env(monkeypatch)
+    monkeypatch.delenv("EXA_API_KEY")
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+    exit_code = main(["verify-env", "--config", str(config_file)])
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_ENV_MISSING
+    assert out.splitlines()[-1] == "environment NOT ready"
+    assert "missing env var: OPENROUTER_API_KEY" in out
+    assert "missing env var: EXA_API_KEY" not in out
+    assert "optional env var not set: EXA_API_KEY" in out
+
+
+def test_a_set_fallback_key_is_reported_as_set_and_optional(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_all_env(monkeypatch)
+    report = verify_environment(config_file)
+    assert report.optional_env_vars_missing == []
+    assert "env var EXA_API_KEY is set (optional: fallback retrieval)" in report.checks_passed
+
+
+def test_the_fallback_key_is_still_redacted(config_file: Path) -> None:
+    """The M0-010 trap: ``secret_env_var_names`` serves the redaction filter too. Readiness
+    may stop requiring the fallback key; the filter must never stop scrubbing it."""
+    from whiskeyjack_bot.config import load_config
+
+    config = load_config(config_file)
+    assert "EXA_API_KEY" in config.secret_env_var_names()
+    assert "EXA_API_KEY" not in config.required_env_var_names()
+    assert "EXA_API_KEY" in config.optional_env_var_names()
+
+
+def test_a_fallback_sharing_a_required_variable_stays_required(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional is decided per *variable*, not per role: pointing the fallback at the primary
+    provider's variable makes that variable required, and the fallback role must not subtract
+    it from the readiness check."""
+    set_all_env(monkeypatch)
+    monkeypatch.delenv("ASKNEWS_API_KEY")
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    data["retrieval"]["fallback"]["api_key_env"] = "ASKNEWS_API_KEY"
+    shared = tmp_path / "shared.yaml"
+    shared.write_text(yaml.safe_dump(data), encoding="utf-8")
+    report = verify_environment(shared)
+    assert report.exit_code == EXIT_ENV_MISSING
+    assert report.missing_env_vars == ["ASKNEWS_API_KEY"]
+    assert report.optional_env_vars_missing == []
+
+
 def test_invalid_live_submit_config_exits_config_invalid(
     tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -656,7 +729,16 @@ def test_startup_module_does_not_import_provider_sdks(module: str) -> None:
     assert _providers_loaded_by(module) == []
 
 
-def test_the_provider_probe_would_notice_a_regression() -> None:
+@pytest.mark.parametrize(
+    "module,expected",
+    [
+        ("whiskeyjack_bot.research.asknews", ["asknews_sdk"]),
+        ("whiskeyjack_bot.metaculus.client", ["forecasting_tools"]),
+    ],
+)
+def test_the_provider_probe_would_notice_a_regression(module: str, expected: list[str]) -> None:
     """The test above passes trivially if the probe is wrong -- misspelled SDK names, a
-    marker that never prints. Importing the AskNews adapter must make it report both."""
-    assert _providers_loaded_by("whiskeyjack_bot.research.asknews") == sorted(_PROVIDER_MODULES)
+    marker that never prints. One witness per SDK name. The AskNews adapter used to witness
+    both, but ``forecasting_tools`` only reached it through ``metaculus.client`` for
+    ``MissingCredentialError``; M1-320 cut that, so the Metaculus client witnesses it now."""
+    assert set(expected) <= set(_providers_loaded_by(module))
