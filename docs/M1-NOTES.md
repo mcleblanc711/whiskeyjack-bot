@@ -15267,3 +15267,281 @@ The M1-206 survivor removes one of three equivalent statements of the same fact 
 derivation test. The normalized `cdf_size` and the payload's own count still carry it, so it is
 redundancy rather than a vacuous test. The M1-512 `ignore-tolerance` row is the strategy gap
 described above: it survived the first strategy and is killed at HEAD.
+
+## M1-340 (+M1-320, M0-010, M1-335, M2-715) — The ops and imports sweep
+
+Wave 23 close-out, PR-6. The branch is named for the lead item under D39's bundling convention.
+Five small items, of which only M1-340 touches the live submission path. **None of the three**:
+no `config/*.yaml` byte, no `AppConfig` field (M0-010 adds a *method*,
+`optional_env_var_names`, which `model_dump` and so `config_sha256` never see), no prompt byte.
+No migration, no dependency. Also on this branch: the TRACKS sweep of the merged M1-206 row, and
+**M2-717 filed `Deferred` under D48**. That row is PR-5's round-1 non-blocking candidate ("Bind
+conversion metadata to its CDF"). It is a defence with no reachable defect, because both callers
+pass `AuthorizedPayload.conversion` from the same derivation as the CDF.
+
+### Found first: the pinned SDK had been edited on disk, and the live worker was running it
+
+Before any code, `test_submission_policy_revalidates_numeric_bounds_and_mc_options[numeric]`
+was red on an untouched `f8827dd`: generation refused the fixture with "cdf_size does not match
+numeric_calibration.expected_cdf_points".
+
+- **The cause.** `forecasting_tools/data_models/questions.py` in the installed 0.2.92 read
+  `cdf_size = outcome_count + 2`, where the PyPI wheel reads `+ 1`. The file's sha256 did not
+  match the wheel's `RECORD`. It was the only mismatch among 20,630 installed files. Its mtime was
+  2026-09-24 07:55 MDT, which fits the PR-5 mutant `sdk-plus2` ("the installed package edited, then
+  restored", § M1-206 above). The restore evidently did not take.
+- **Why it reached the live worker.** uv installs by hardlink from its cache. That one inode
+  (link count 3) was the uv cache entry, the live `whiskeyjack-bot/.venv` and this worktree's
+  `.venv`, so the edit reached all three.
+- **Live impact: none.** The live ledger holds no forecast record and no pipeline failure after
+  2026-09-23 23:51 UTC; every poll since has been between batches. The next numeric question
+  would have been refused at generation, and the next discrete question converted on a 202-point
+  grid.
+- **Restored, with owner approval**, at 20:25:22 MDT on 2026-09-25, after that poll finished:
+  1. the wheel's bytes written through the shared inode;
+  2. the module's `.pyc` deleted in both venvs;
+  3. `RECORD` re-verified in both venvs, with 0 mismatches.
+
+  The next poll succeeded. No repo byte was involved.
+- **Lesson.** Never mutation-test by editing `site-packages`. Here it is a hardlink into the
+  cache, which means an edit to every venv at once, including the one the worker runs. Monkeypatch
+  instead.
+
+### M1-340 — Exclude group/option membership order from the live-question equality check
+
+#### Decision — sort, don't ignore: the AC's first option fails its own second half
+
+The AC offers "join the ignored set (or an equivalent order-insensitive comparison)". Ignoring
+`options`/`question_ids_of_group` would let a *changed* option list or sibling set post, and the
+AC's test clause requires "an actual membership change still does [refuse]". So the fix is the
+second option. `submission_policy.resolution_inputs(question)` is the old
+`model_dump(exclude=ignored)`, with each of the two lists replaced by `sorted(...)`. That is a
+multiset comparison:
+- a relabelled option still differs;
+- so does an added or dropped option;
+- so does a replaced sibling;
+- so does a sibling whose *count* changed (`question_ids_of_group` is not unique by schema).
+
+`before_post` compares `resolution_inputs(current) != resolution_inputs(record.question)`. The
+refusal text is unchanged.
+
+#### Decision — python-mode dump, not `canonicalize_for_fingerprint`
+
+`questions/canonical.py` already sorts exactly these lists (M1-331), and its classification is
+the evidence cited here. It was not reused, for two reasons:
+- It dumps in `mode="json"`, which would change how every *other* field compares. For example, two
+  aware datetimes for the same instant in different zones are equal in python mode and unequal as
+  strings, so reusing it would add a new false refusal.
+- Refactoring it to share code would touch the live fingerprint behind M1-326's gate.
+
+The two-line sort is local to the comparison.
+
+#### Decision — "can labels change while membership stays the same?"
+
+No, not in any sense that matters here. An option *is* its label everywhere downstream: the
+response and the payload both match by label. So a relabel is a membership change, and it refuses
+(`test_the_live_option_check_reads_membership_not_order[...relabelled]`, and the property's
+`options relabelled` event).
+
+#### Deviation
+
+None.
+
+#### Rejected — adding the two fields to `ignored`
+
+That would fail the AC's second half. See above. Mutant `a` (`data.pop(name)`) is this change,
+and it is killed.
+
+#### Deferred (do not read the absence as an omission)
+
+`tournament_slugs`/`source_categories` stay *ignored*, not sorted, as before. The AC asks for no
+change to them, and a membership change to either is still classed as platform metadata.
+
+#### Standing risk — not verifiable offline
+
+Whether Metaculus ever actually reorders either list between two fetches has not been observed.
+The fix is defensive and costs nothing when the order is stable.
+
+### M1-320 — Move `MissingCredentialError` out of the module that holds the poster
+
+#### Decision — a leaf module, `whiskeyjack_bot.credentials`
+
+It holds the class alone, with the message unchanged and no imports. `metaculus/client.py`
+imports it from there in order to raise it. Every importer was repointed: 6 source modules, 5 CLI
+handlers and 6 test modules. The M1-315 acceptance file now:
+- puts `whiskeyjack_bot.metaculus.client` in its forbidden `POSTING` set;
+- replaces `test_the_poster_coupling_is_named_rather_than_hidden` with a per-module guard for
+  every raiser (`pipeline_live`, `research.{exa,asknews,orchestrate}`, `forecast.generate`), each
+  in a fresh interpreter;
+- adds a leaf check on `credentials`;
+- adds an identity check that `metaculus.client.MissingCredentialError is
+  credentials.MissingCredentialError`, because a forked class would slip past every `except`.
+
+#### Deviation — one existing anti-vacuity witness had to move
+
+`test_env_verify.py::test_the_provider_probe_would_notice_a_regression` used the AskNews adapter
+to witness **both** provider SDKs. But `forecasting_tools` only reached that adapter *through*
+`metaculus.client`, and this item cut that path. The probe now has one witness per SDK: `research.asknews` for
+`asknews_sdk`, and `metaculus.client` for `forecasting_tools`. It is a side benefit: importing
+the AskNews adapter no longer loads the Metaculus SDK at all.
+
+#### Rejected — a compatibility re-export from `metaculus.client`
+
+The name still resolves there, because `client.py` imports it. Nothing in `src` or `tests` uses
+that spelling any more, and the AC says every importer is updated.
+
+#### Deferred (do not read the absence as an omission)
+
+`tournament.py` and `metaculus/fetch.py` still import `metaculus.client` for `build_client`
+and `SingleAttemptPoster`. They are the modules that are supposed to reach Metaculus.
+
+#### Standing risk — not verifiable offline
+
+None. The claim is structural and measured in fresh subprocesses.
+
+### M0-010 — Stop verify-env requiring the optional fallback retrieval key
+
+#### Decision — the split already existed; extend it, not the redaction set
+
+M1-329 had already separated `required_env_var_names()` (readiness) from
+`secret_env_var_names()` (redaction). This item adds `optional_env_var_names()`, the complement,
+and derives the required set from it:
+- the fallback key is always optional;
+- the ntfy URL is optional while `notify` is off.
+
+**`secret_env_var_names()` is not touched**, so the redaction filter still scrubs the Exa key
+(`test_the_fallback_key_is_still_redacted`, mutant `h`).
+
+#### Decision — optional is decided per *variable*, not per role
+
+If the fallback points at the same variable as a required role (for example `ASKNEWS_API_KEY`),
+that variable stays required. A blind subtraction by role would drop a credential that blocks a
+run from the readiness check (`test_a_fallback_sharing_a_required_variable_stays_required`,
+mutant `j`). The same rule now also covers the ntfy URL.
+
+#### Decision — reported distinguishably, and only the fallback
+
+A new `VerificationReport.optional_env_vars_missing` renders as `optional env var not set: NAME
+(fallback retrieval is unavailable; runs proceed without it)`. It does not affect `exit_code` or
+the verdict (mutant `k`). The ntfy URL with `notify` off stays unreported, as M1-329 settled, so
+that report shape does not change.
+
+#### Deviation
+
+None. The runbook C4 "known false red" paragraph and its symptom-table row are replaced by a
+description of the new line, as the AC requires. The "one further filed item" sentence under
+"When the only recovery would be a database edit" is removed.
+
+#### Rejected — removing the fallback key from `secret_env_var_names`
+
+That was the brief's trap. A secret the filter stops scrubbing is far worse than a red readiness
+line.
+
+#### Deferred (do not read the absence as an omission)
+
+An operator-visible `run` warning when the fallback is absent is out of scope. `pipeline_live`
+already logs "the fallback provider is unavailable for this run".
+
+#### Standing risk — not verifiable offline
+
+None.
+
+### M1-335 — Cover `retired_bindings` over combinations of moved binding keys
+
+#### Decision — exhaustive, not sampled
+
+There are 3⁴ = 81 stored-key states: each of `account_id`/`project_id`/`config_sha256`/
+`prompt_sha256` is unchanged, changed or **absent**. Each runs against three config-side
+destination states (unchanged, another configured project, `use_sdk_current_id`), for 243
+parametrized cases, 6 s in total. There is no ledger: the activation is built as `enable` writes
+it. Each case asserts:
+- the expected tuple, in `_ORDER`;
+- determinism, both on a second call and after a JSON round-trip of the activation;
+- membership in `get_args(RetiredBinding)`;
+- no stored or computed value in the result's repr.
+
+A separate test proves that the table reaches all 16 subsets of the four bindings. The mutants
+it kills are an `elif` chain (`l`), swapped append order (`m`) and raw `activation["account_id"]`
+access, which raises on the absent case (`n`).
+
+#### Deviation / Rejected / Deferred
+
+None. Tests only, with no source change.
+
+#### Standing risk — not verifiable offline
+
+None.
+
+### M2-715 — Make the approve-again refusal reachable, or stop telling operators to do it
+
+#### Decision — the message-only reading
+
+Both refusals fire only for a record whose status is `approved`, because `status != "approved"`
+refuses first. 009's and 016's transition tables admit `approved` only from `validated`, so
+"approve the record again" was unreachable in **both**, not only the unauthorized-payload one.
+The new text names what that state allows:
+- **Unauthorized payload:** "an approved record cannot be approved again, so either submit the
+  payload this record derives under the configuration it was approved with, or make a new
+  forecast version for this question (run it again) and approve that".
+- **Pre-011 approval:** the second clause only. An approval with no digest authorizes no payload
+  under any configuration.
+
+`test_the_unauthorized_payload_refusal_names_a_path_the_record_can_take` drives D33's real case,
+a `numeric_calibration` change between `approve` and `submit`, through the real writers. It
+asserts:
+- the exact refusal;
+- that `approve` on the record now refuses with "not a legal transition";
+- that the payload derived under the approving calibration still reaches a key;
+- that a new version of the same question (`forecast_version + 1`) validates, approves and keys
+  under the new calibration.
+
+Runbook A2/A3 now quote the new messages and list both recoveries, and the "database edit" gaps
+table drops the M2-715 row (three states become two).
+
+#### Rejected — making re-approval legal
+
+Re-approval would need a new `approved → validated` (or `approved → approved`) transition,
+which means a DROP/CREATE of `lifecycle_events_validate_on_insert` and so a migration. That is
+out of close-out scope, and it would also have to answer what re-approving does to a standing
+key reservation. The brief directs the message-only reading.
+
+#### Deviation
+
+The unit file `deploy/systemd/whiskeyjack-resolutions.service` `Description=` now says "local and
+platform scoring" (a CONTEXT § 2 cosmetic). This is repo only: the installed unit changes at
+the owner's next reinstall, and nothing is restarted by this PR.
+
+#### Deferred (do not read the absence as an omission)
+
+The tournament worker's own path is unchanged. The policy approves inline, and a mismatch there
+raises `LiveSubmissionError` before any of this.
+
+#### Standing risk — not verifiable offline
+
+None.
+
+### Mutation pass — fifteen mutants, fifteen dead
+
+Committed first. `__pycache__` was cleared before each mutant, and each ran only its named tests
+with `-x`. Exit 1 counts as killed; a collection error would have exited 2.
+
+| # | item | mutant | killed by |
+| --- | --- | --- | --- |
+| a | M1-340 | ignore both fields (`data.pop`) | properties (unequal halves) + wiring `refused` cases |
+| b | M1-340 | options not sorted | `test_reordered_options_compare_equal` |
+| c | M1-340 | group ids not sorted | `test_reordered_group_ids_compare_equal` |
+| d | M1-340 | `sorted(set(...))` | `test_a_recounted_group_compares_unequal` |
+| e | M1-340 | `before_post` back to the raw dump | wiring reorder cases |
+| f | M1-320 | `exa.py` imports from `metaculus.client` again | `test_no_paid_module_loads_the_metaculus_poster[research.exa]` |
+| g | M1-320 | `client.py` defines its own class | `test_the_poster_module_raises_the_class_callers_catch` |
+| h | M0-010 | fallback dropped from `secret_env_var_names` | `test_the_fallback_key_is_still_redacted` |
+| i | M0-010 | fallback still required | `test_a_missing_fallback_key_alone_leaves_the_environment_ready` |
+| j | M0-010 | blind per-role subtraction | `test_a_fallback_sharing_a_required_variable_stays_required` |
+| k | M0-010 | optional missing counts against readiness | `test_a_missing_fallback_key_alone_leaves_the_environment_ready` |
+| l | M1-335 | `elif` between destination and configuration | combination table |
+| m | M1-335 | configuration/prompt append order swapped | combination table |
+| n | M1-335 | `activation["account_id"]` | combination table (absent case) |
+| o | M2-715 | the old "approve the record again" text | `test_the_unauthorized_payload_refusal_names_a_path_the_record_can_take` |
+
+The group-id recount case first reached only 0.78% of the property's draws. It is now its own
+constructed property, so every example reaches it, and mutant `d` is killed there.
