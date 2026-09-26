@@ -144,12 +144,27 @@ def journal_form(data: dict[str, Any]) -> Any:
 
 def append(conn: sqlite3.Connection, kind: str, scope: str, data: dict[str, Any]) -> str:
     identifier = uuid4().hex
+    # Serialized before the transaction opens (M1-338), so a payload that cannot be
+    # journaled never reaches the INSERT and persists nothing. Every shape that fails here
+    # arrives as StorageFailure with the payload withheld. Before M1-338 a cycle escaped as
+    # a raw ValueError('Circular reference detected'), and it has siblings:
+    # - NaN or Infinity, which ``allow_nan=False`` refuses (ValueError);
+    # - an object with no JSON form (TypeError);
+    # - int and str keys in one mapping, which ``sort_keys`` cannot order (TypeError);
+    # - nesting deeper than ``json.dumps`` recurses (RecursionError).
+    # Their texts can name a value (a key, a type or an object repr), so none is rendered.
+    try:
+        row = canonical(journal_form(data))
+    except (ValueError, TypeError, RecursionError):
+        raise StorageFailure(
+            "cannot serialize tournament journal payload (payload withheld)"
+        ) from None
     try:
         with transaction(conn):
             conn.execute(
                 "INSERT INTO tournament_events(event_id,kind,scope,data,created_at_utc) "
                 "VALUES(?,?,?,?,?)",
-                (identifier, kind, scope, canonical(journal_form(data)), utcnow().isoformat()),
+                (identifier, kind, scope, row, utcnow().isoformat()),
             )
     except (sqlite3.Error, LifecycleError):
         raise StorageFailure("cannot commit tournament journal") from None
