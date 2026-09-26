@@ -151,6 +151,20 @@ def write_new_file(
         raise error(
             f"on_existing must be one of {get_args(ExistingFilePolicy)} (offending input withheld)"
         )
+    try:
+        # M1-322, the writer-side twin of M1-314. A path the filesystem encoding cannot
+        # represent (a lone surrogate such as \ud800 in ``artifact_root``, with no byte
+        # behind it) makes every syscall below raise UnicodeEncodeError, which is a
+        # ValueError, not an OSError, so it escaped each `except OSError` as a raw error.
+        # Checked once here, before any I/O, which covers mkdir, mkstemp, link and the
+        # cleanup together. A surrogateescape character (\udcc3) does encode, so a real
+        # undecodable byte in a path still works. The path is withheld: interpolating it
+        # is the operation that fails.
+        os.fsencode(destination)
+    except UnicodeEncodeError:
+        raise error(
+            f"cannot encode the path for {what} for the filesystem (path withheld)"
+        ) from None
     new_directories = [p for p in destination.parents if not p.exists()]
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
