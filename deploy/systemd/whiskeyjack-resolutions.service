@@ -1,5 +1,5 @@
 [Unit]
-Description=Whiskeyjack resolution ingestion, then local scoring (MiniBench profile)
+Description=Whiskeyjack resolution ingestion, then local and platform scoring (MiniBench profile)
 # M4-805. Runs the two operator commands of runbook steps 6 and 7 on a schedule, so the
 # attribution record follows the platform's resolutions without anyone typing them.
 #

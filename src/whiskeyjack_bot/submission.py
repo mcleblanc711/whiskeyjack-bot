@@ -429,15 +429,25 @@ def submission_key_for_record(
 # M2-707. Module constants for the same reason `_SPENT_KEY_REFUSAL` is one: a refusal an
 # operator will act on is asserted by tests and rendered by the CLI, and two spellings of
 # one bound is the defect M1-608 and M2-710 were both filed for.
+#
+# M2-715. Both refusals are raised only for a record whose status is `approved` (checked just
+# above them), and 009's transition table admits `approved` only from `validated`; nothing
+# returns a record to `validated`. So both used to end "approve the record again", which the
+# schema forbids -- `approve` and `reject` each refuse the record. They now name what the
+# state the record is really in allows: a new forecast version, which starts at `draft` and
+# can be validated and approved; and, for a payload that merely differs from what the
+# approval bound, the payload the record derives under the configuration it was approved with.
+_NEW_VERSION = "make a new forecast version for this question (run it again) and approve that"
 _UNBOUND_APPROVAL_REFUSAL = (
     "the approval in force for this forecast record predates the payload binding "
-    "(migration 011) and so authorizes no particular payload; approve the record again to "
-    "bind the decision to the payload it authorizes"
+    "(migration 011) and so authorizes no particular payload; an approved record cannot be "
+    f"approved again, so {_NEW_VERSION}"
 )
 _UNAUTHORIZED_PAYLOAD_REFUSAL = (
     "this submission payload is not the one the approval in force authorized, so no "
-    "submission key may be derived for it; either submit the payload this record derives "
-    "or approve the record again"
+    "submission key may be derived for it; an approved record cannot be approved again, so "
+    "either submit the payload this record derives under the configuration it was approved "
+    f"with, or {_NEW_VERSION}"
 )
 
 

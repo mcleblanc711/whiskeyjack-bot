@@ -660,6 +660,95 @@ def test_only_the_payload_the_record_derives_can_reach_a_submission_key(tmp_path
         connection.close()
 
 
+def test_the_unauthorized_payload_refusal_names_a_path_the_record_can_take(tmp_path: Path) -> None:
+    """M2-715. An approved record whose derived payload no longer matches its approval -- a
+    ``numeric_calibration`` change between ``approve`` and ``submit``, D33's case -- is refused,
+    and the refusal used to say "approve the record again", which 009's transition table
+    forbids. Every clause of the new refusal is driven here from the state the record is
+    really in: re-approval refuses (so the message must not offer it), the payload derived
+    under the approving configuration still reaches a key, and a new forecast version for the
+    same question can be validated, approved and keyed under the new configuration."""
+    from whiskeyjack_bot.approval import ApprovalError
+    from whiskeyjack_bot.lifecycle import LifecycleError, current_status
+    from whiskeyjack_bot.submission import _UNAUTHORIZED_PAYLOAD_REFUSAL
+
+    changed = _calibration(use_forecasting_tools_standardization=False)
+    database = tmp_path / "ledger.sqlite3"
+    initialize_ledger(database)
+    connection = connect(database)
+    try:
+        connection.execute(
+            "INSERT INTO research_runs (retrieval_run_id, provider, question_id, "
+            "started_at_utc, created_at_utc) VALUES (?, 'exa', ?, ?, ?)",
+            (RUN_ID, QUESTION_ID, TS, TS),
+        )
+        first = append_forecast_version(
+            connection,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(_numeric_question(), _response("Numeric schema"), "attempt-1"),
+        )
+        record_validation(connection, record_id=first.record_id, occurred_at=OCCURRED)
+        approve(
+            connection,
+            record_id=first.record_id,
+            actor="chris",
+            occurred_at=OCCURRED,
+            calibration=CALIBRATION,
+        )
+        rederived = authorized_payload(first, calibration=changed)
+        with pytest.raises(SubmissionError) as refused:
+            submission_key_for_approved_record(
+                connection, first.record_id, request_payload_sha256=rederived.sha256
+            )
+        message = str(refused.value)
+        assert message == _UNAUTHORIZED_PAYLOAD_REFUSAL
+        assert "approve the record again" not in message
+        assert "cannot be approved again" in message
+        assert "new forecast version" in message
+
+        # The action the old message named is not reachable from `approved`.
+        assert current_status(connection, first.record_id) == "approved"
+        with pytest.raises((ApprovalError, LifecycleError), match="not a legal transition"):
+            approve(
+                connection,
+                record_id=first.record_id,
+                actor="chris",
+                occurred_at=OCCURRED,
+                calibration=changed,
+            )
+
+        # Path one: the payload this record derives under the configuration it was approved with.
+        original = authorized_payload(first, calibration=CALIBRATION)
+        assert submission_key_for_approved_record(
+            connection, first.record_id, request_payload_sha256=original.sha256
+        )
+
+        # Path two: a new forecast version for the same question, approved under the new one.
+        second = append_forecast_version(
+            connection,
+            forecast_config=FORECAST_CONFIG,
+            draft=_draft(_numeric_question(), _response("Numeric schema"), "attempt-2"),
+        )
+        assert second.question_id == first.question_id
+        assert second.forecast_version == first.forecast_version + 1
+        record_validation(connection, record_id=second.record_id, occurred_at=OCCURRED)
+        approve(
+            connection,
+            record_id=second.record_id,
+            actor="chris",
+            occurred_at=OCCURRED,
+            calibration=changed,
+        )
+        assert current_status(connection, second.record_id) == "approved"
+        assert submission_key_for_approved_record(
+            connection,
+            second.record_id,
+            request_payload_sha256=authorized_payload(second, calibration=changed).sha256,
+        )
+    finally:
+        connection.close()
+
+
 # --- M1-508 (D45): what the posted CDF was built from travels with the payload --------
 
 
