@@ -15673,12 +15673,15 @@ the observation.
 
 ### M1-322 — Refuse an unusable artifact path on the write side
 
-#### Decision — one `os.fsencode` check before any I/O
+#### Decision — one `os.fsencode` check before any I/O, and its NUL sibling
 
 It sits in `write_new_file` after the policy check, so `mkdir`, `mkstemp`, `link` and the cleanup
 are covered at once, and the refusal is raised as the caller's own `error=` with the path
 withheld. `\udcc3` (surrogateescape for the real byte 0xC3) still encodes, and a test proves it
-still writes.
+still writes. **An embedded NUL is the sibling, found while writing the risk claims.** It
+encodes, but every path syscall refuses it with the same raw `ValueError` ("embedded null
+byte"), which was reproduced before the fix. The same check refuses it, and every writer test is
+parametrized over both shapes.
 
 #### Deviation
 
@@ -15771,7 +15774,7 @@ contains no `Cs` character. Its companion asserts that every encodable string st
 CLAUDE.md gotcha and the open-decision memory are deleted. The rejected alternative,
 `surrogatepass`, is recorded with its revisit trigger in D49.
 
-### Mutation pass — fifteen mutants, fifteen dead
+### Mutation pass — sixteen mutants, sixteen dead
 
 The mutants were edits to this worktree's `src/` and `tests/` only (never `site-packages`; see
 PR-6). Each was committed first, `__pycache__` was cleared before each one, the baseline was
@@ -15795,6 +15798,7 @@ Every killer below is the test aimed at that mutant.
 | the scan accepts any f-string | `test_the_scan_refuses_a_sentence_that_could_carry_a_value[f"bad {value}"]` |
 | allowlist duplicate check removed | `test_duplicate_username_case_insensitive_rejected` |
 | M1-322 `fsencode` check removed | `test_a_lone_surrogate_in_the_artifact_root_arrives_as_each_writers_own_error[research]` |
+| M1-322 NUL half removed (after the fix, re-run against the committed code) | `…_arrives_as_each_writers_own_error[research-nul]` |
 | M1-338 catches `ValueError` only | `test_an_unjournalable_payload_…[mixed_key_types]` |
 | M1-338 catches nothing | `test_an_unjournalable_payload_…[cycle]` |
 | M1-339 no disambiguation | `test_colliding_redacted_keys_keep_both_entries_under_the_documented_representation` |
