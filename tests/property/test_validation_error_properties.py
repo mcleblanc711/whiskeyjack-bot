@@ -127,18 +127,25 @@ def _planted(draw: st.DrawFn) -> tuple[dict[str, Any], list[str]]:
             target[field] = value
             markers.append(value)
         elif kind == "tag_value":
-            leaf = payload["items"][0]
-            leaf["tag"] = draw(_STR_MARKERS)
-            markers.append(leaf["tag"])
+            # An earlier "value" mutation may have replaced the container with a string.
+            items = payload.get("items")
+            if not (isinstance(items, list) and items and isinstance(items[0], dict)):
+                continue
+            items[0]["tag"] = draw(_STR_MARKERS)
+            markers.append(items[0]["tag"])
         elif kind == "union_tag":
             tag = draw(_STR_MARKERS)
             payload["child"] = {"kind": tag, "leaf": _leaf()}
             markers.append(tag)
         elif kind == "table_key":
+            if not isinstance(payload.get("table"), dict):
+                continue
             key = draw(_STR_MARKERS)
             payload["table"][key] = {"n": draw(_STR_MARKERS), "tag": "ok"}
             markers.append(key)
         else:
+            if not isinstance(payload.get("numbered"), dict):
+                continue
             number = draw(_INT_MARKERS)
             payload["numbered"][number] = {"n": "x", "tag": "ok"}
             markers.append(str(number))
