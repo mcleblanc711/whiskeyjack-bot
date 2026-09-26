@@ -1013,6 +1013,50 @@ def test_submission_policy_revalidates_numeric_bounds_and_mc_options(
     assert platform.posts == 0
 
 
+@pytest.mark.parametrize(
+    "options,refused",
+    [
+        (["Other", "Option Beta", "Option Alpha"], False),  # reversed: the same members
+        (["Option Beta", "Option Alpha", "Other"], False),
+        (["Option Alpha", "Option Beta", "Other", "Option Gamma"], True),  # one added
+        (["Option Alpha", "Other"], True),  # one dropped
+        (["Other", "Option Beta", "Option Alpha "], True),  # reordered AND one relabelled
+    ],
+)
+def test_the_live_option_check_reads_membership_not_order(
+    case: Any, options: list[str], refused: bool
+) -> None:
+    """M1-340, through the real ``before_post``. Options are matched by label everywhere else
+    (M1-331), so a refetch returning the same labels in another order is the same question and
+    must reach the intent write; a changed membership must still refuse, which is what a fix
+    that merely *ignored* ``options`` would fail."""
+    from whiskeyjack_bot.submission_policy import prepare_live_policy
+    from whiskeyjack_bot.submission_live import LiveSubmissionError, ForecastHistory
+    from whiskeyjack_bot.forecast.store import read_forecast_record
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    conn, config, platform, news, model = case
+    raw = json.loads((ROOT / "tests/fixtures/api_posts/multiple_choice_post.json").read_text())
+    raw["projects"]["default_project"]["id"] = 32977
+    raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(hours=2)).isoformat()
+    platform.raw = news.raw = model.raw = raw
+    rid = _prepare_version(case)
+    record = read_forecast_record(conn, rid)
+    payload = authorized_payload(record, calibration=config.numeric_calibration)
+    callback = prepare_live_policy(conn, config, platform, record, payload.payload, payload.sha256)
+    raw = copy.deepcopy(raw)
+    raw["question"]["options"] = options
+    refetched = DataOrganizer.get_question_from_post_json(raw)
+    if refused:
+        with pytest.raises(LiveSubmissionError, match="resolution inputs changed"):
+            callback(refetched, ForecastHistory(()))
+        assert not tournament_state.events(conn, "forecast_intent", rid)
+    else:
+        callback(refetched, ForecastHistory(()))
+        assert len(tournament_state.events(conn, "forecast_intent", rid)) == 1
+    assert platform.posts == 0
+
+
 def test_archived_resolution_url_names_the_original_publisher(case: Any) -> None:
     from whiskeyjack_bot.research.quality import source_domains
 

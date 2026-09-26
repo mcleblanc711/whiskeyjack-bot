@@ -3,14 +3,43 @@
 from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Mapping
+from typing import Any
+
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.forecast.record import ForecastRecord, ForecastRecordError
+from whiskeyjack_bot.questions.model import CanonicalQuestion
 from whiskeyjack_bot.submission_live import (
     ForecastHistory,
     LiveSubmissionError,
     MetaculusPoster,
     _utcnow,
 )
+
+
+# Platform metadata unrelated to the resolution contract: never compared at all.
+_IGNORED_METADATA = frozenset({"question_weight", "source_categories", "tournament_slugs"})
+# Membership sets compared as multisets (M1-340). Each is classified unordered on the evidence
+# questions/canonical.py records (M1-331): group-sibling ids are never indexed against anything,
+# and options are matched by label, never position, in forecast/multiple_choice.py and
+# submission_payload.py. Sorted rather than ignored, so a changed membership still differs --
+# a label renamed, an option added or dropped, a sibling replaced or its count changed.
+_UNORDERED_MEMBERSHIP = ("question_ids_of_group", "options")
+
+
+def resolution_inputs(question: CanonicalQuestion) -> dict[str, Any]:
+    """The parts of ``question`` a pre-post refetch must reproduce exactly (M1-340).
+
+    ``model_dump`` in python mode, as the comparison always was, with the ignored metadata
+    excluded and each unordered membership list sorted, so the API returning the same
+    members in a different order between the record's fetch and the refetch is not read as
+    "question resolution inputs changed". Every other field compares exactly as before.
+    """
+    data = question.model_dump(exclude=set(_IGNORED_METADATA))
+    for name in _UNORDERED_MEMBERSHIP:
+        members = data.get(name)
+        if members is not None:
+            data[name] = sorted(members)
+    return data
 
 
 def require_research_artifacts(
@@ -145,9 +174,7 @@ def prepare_live_policy(
             if len(normalized) != 1:
                 raise LiveSubmissionError("live question cannot be normalized")
             current = normalized[0]
-            # Ignore only platform metadata unrelated to the resolution contract.
-            ignored = {"question_weight", "source_categories", "tournament_slugs"}
-            if current.model_dump(exclude=ignored) != record.question.model_dump(exclude=ignored):
+            if resolution_inputs(current) != resolution_inputs(record.question):
                 raise LiveSubmissionError("question resolution inputs changed; nothing was posted")
             closing = current.close_time
             if closing is None or closing <= _utcnow():
