@@ -15770,3 +15770,32 @@ property: surrogates embedded in encodable text raise `ContentHashError`, and th
 contains no `Cs` character. Its companion asserts that every encodable string still hashes. The
 CLAUDE.md gotcha and the open-decision memory are deleted. The rejected alternative,
 `surrogatepass`, is recorded with its revisit trigger in D49.
+
+### Mutation pass — fifteen mutants, fifteen dead
+
+The mutants were edits to this worktree's `src/` and `tests/` only (never `site-packages`; see
+PR-6). Each was committed first, `__pycache__` was cleared before each one, the baseline was
+confirmed by exit code, and each file was restored from `HEAD` afterwards. The tree was clean at
+the end. The first run is the lesson: the last five mutants were all "killed" by the *same*
+unrelated test, the sanitizer marker property. That was a strategy bug, where a `value` mutation
+could replace `items` with a string and a later draw then indexed into it, so those kills were
+not attributable. The strategy was fixed, the property run ten times green, and the pass re-run.
+Every killer below is the test aimed at that mutant.
+
+| Mutant | Killed by |
+| --- | --- |
+| built-in `msg` rendered | real-entry sweep `[forecast-record]` (union tag). The marker property also kills it alone |
+| every str `loc` part rendered | real-entry sweep `[config-0]`. The marker property also kills it alone |
+| every int `loc` part rendered | real-entry sweep `[config-2]` (int key). The marker property also kills it alone |
+| no sequence fields | `test_a_list_index_after_a_sequence_field_survives` |
+| top-level field names only | `test_a_nested_authored_field_name_survives_with_the_builtin_type` |
+| `config.py` raises `from exc` | real-entry sweep (`__cause__ is None`) |
+| `normalize.py` renders `.errors()` itself | `test_no_module_renders_a_validation_error_itself` |
+| an authored sentence interpolates `{value!r}` | `test_every_authored_error_is_a_literal_slug_and_a_literal_sentence` |
+| the scan accepts any f-string | `test_the_scan_refuses_a_sentence_that_could_carry_a_value[f"bad {value}"]` |
+| allowlist duplicate check removed | `test_duplicate_username_case_insensitive_rejected` |
+| M1-322 `fsencode` check removed | `test_a_lone_surrogate_in_the_artifact_root_arrives_as_each_writers_own_error[research]` |
+| M1-338 catches `ValueError` only | `test_an_unjournalable_payload_…[mixed_key_types]` |
+| M1-338 catches nothing | `test_an_unjournalable_payload_…[cycle]` |
+| M1-339 no disambiguation | `test_colliding_redacted_keys_keep_both_entries_under_the_documented_representation` |
+| D49 wrap removed | `test_a_lone_surrogate_is_refused_as_this_modules_error` |
