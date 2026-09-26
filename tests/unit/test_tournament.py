@@ -1963,6 +1963,107 @@ def test_every_binding_the_activation_stores_is_compared_by_name(case: Any) -> N
     assert get_args(RetiredBinding) == ("account", "destination", "configuration", "prompt")
 
 
+# --- M1-335: every combination of moved bindings, not one at a time -------------------------
+
+# Each stored key is independently unchanged, changed, or absent (a journal row read back from
+# the ledger is untrusted, so "absent" is a real shape). The changed values are chosen so a
+# leak would be findable in the result's repr.
+_STORED = {
+    "account_id": 424242,
+    "project_id": 90909,
+    "config_sha256": "c" * 64,
+    "prompt_sha256": "d" * 64,
+}
+_STATES = ("unchanged", "changed", "absent")
+# The config side of "destination": the configured project may move away from the activated
+# one, or hand its choice to the SDK. Either also changes config_sha256, which is the pair
+# config_sha256 forces and why "configuration" is expected alongside it.
+_CONFIG_SIDE = ("unchanged", "other_project", "sdk_current_id")
+_ORDER = ("account", "destination", "configuration", "prompt")
+_KEY_BINDING = {
+    "account_id": "account",
+    "project_id": "destination",
+    "config_sha256": "configuration",
+    "prompt_sha256": "prompt",
+}
+
+
+@pytest.fixture(scope="module")
+def binding_configs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    config = base_config.__wrapped__(tmp_path_factory.mktemp("bindings"))
+    data = config.model_dump(mode="json")
+    data["metaculus"]["tournament"].update(id=32977, use_sdk_current_id=False)
+    variants: dict[str, Any] = {"unchanged": validate_config_data(data)}
+    other = copy.deepcopy(data)
+    other["metaculus"]["tournament"]["id"] = 32978
+    variants["other_project"] = validate_config_data(other)
+    sdk = copy.deepcopy(data)
+    sdk["metaculus"]["tournament"]["use_sdk_current_id"] = True
+    variants["sdk_current_id"] = validate_config_data(sdk)
+    return variants
+
+
+def _combinations() -> list[Any]:
+    import itertools
+
+    return [
+        pytest.param(dict(zip(_STORED, states)), side, id="-".join((*states, side)))
+        for states in itertools.product(_STATES, repeat=len(_STORED))
+        for side in _CONFIG_SIDE
+    ]
+
+
+@pytest.mark.parametrize("states,config_side", _combinations())
+def test_retired_bindings_over_every_combination_of_moved_keys(
+    binding_configs: dict[str, Any], states: dict[str, str], config_side: str
+) -> None:
+    from typing import get_args
+
+    from whiskeyjack_bot.tournament_state import RetiredBinding, bindings, retired_bindings
+
+    base = binding_configs["unchanged"]
+    config = binding_configs[config_side]
+    activation: dict[str, Any] = {
+        "activation_id": "a" * 32,
+        "account_id": 42,
+        "project_id": 32977,
+        **bindings(base),
+    }
+    for key, state in states.items():
+        if state == "changed":
+            activation[key] = _STORED[key]
+        elif state == "absent":
+            del activation[key]
+
+    moved = {_KEY_BINDING[key] for key, state in states.items() if state != "unchanged"}
+    if config_side != "unchanged":
+        moved |= {"destination", "configuration"}
+    expected = tuple(name for name in _ORDER if name in moved)
+
+    result = retired_bindings(activation, config, account_id=42, project_id="32977")
+    assert result == expected
+    # Deterministic: again, and across the round-trip a stored activation actually takes.
+    assert retired_bindings(activation, config, account_id=42, project_id="32977") == result
+    replayed = json.loads(json.dumps(activation, ensure_ascii=True, sort_keys=True))
+    assert retired_bindings(replayed, config, account_id=42, project_id="32977") == result
+    # Key-only: binding names, never a stored or computed value.
+    assert set(result) <= set(get_args(RetiredBinding))
+    rendered = repr(result)
+    for value in (*_STORED.values(), *bindings(base).values(), *bindings(config).values()):
+        assert str(value) not in rendered
+
+
+def test_the_combination_table_reaches_every_multi_key_shape() -> None:
+    """Anti-vacuity for the table above: it must hold every subset of the four bindings as an
+    expected result, including all two- and three-key moves the one-at-a-time tests missed."""
+    import itertools
+
+    reached = set()
+    for states in itertools.product(_STATES, repeat=len(_STORED)):
+        reached.add(frozenset(_KEY_BINDING[k] for k, s in zip(_STORED, states) if s != "unchanged"))
+    assert len(reached) == 2 ** len(_ORDER)
+
+
 def test_an_activation_retired_refusal_needs_a_known_binding() -> None:
     from whiskeyjack_bot.tournament_state import ActivationRetired
 
