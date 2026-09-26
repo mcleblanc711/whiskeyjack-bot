@@ -478,7 +478,7 @@ def _run_questions_fetch(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING
     from whiskeyjack_bot.logging_setup import configure_logging
-    from whiskeyjack_bot.metaculus.client import MissingCredentialError
+    from whiskeyjack_bot.credentials import MissingCredentialError
     from whiskeyjack_bot.metaculus.fetch import (
         fetch_open_questions_fixture,
         fetch_open_questions_live,
@@ -711,7 +711,8 @@ def _run_submit(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
     from whiskeyjack_bot.logging_setup import configure_logging
-    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_poster
+    from whiskeyjack_bot.credentials import MissingCredentialError
+    from whiskeyjack_bot.metaculus.client import build_poster
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.submission import SubmissionError
     from whiskeyjack_bot.submission_gateway import payload_sha256
@@ -846,7 +847,8 @@ def _run_verify_submission(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
     from whiskeyjack_bot.logging_setup import configure_logging
-    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_poster
+    from whiskeyjack_bot.credentials import MissingCredentialError
+    from whiskeyjack_bot.metaculus.client import build_poster
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.submission_live import LiveSubmissionError, verify_uncertain_attempt
 
@@ -899,7 +901,8 @@ def _run_ingest_resolutions(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
     from whiskeyjack_bot.logging_setup import configure_logging
-    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_client
+    from whiskeyjack_bot.credentials import MissingCredentialError
+    from whiskeyjack_bot.metaculus.client import build_client
     from whiskeyjack_bot.notify import build_notifier, notifier_context
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.resolution_ingest import (
@@ -1153,7 +1156,8 @@ def _run_reconcile_submission(args: argparse.Namespace) -> int:
     from whiskeyjack_bot.config import ConfigError
     from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
     from whiskeyjack_bot.logging_setup import configure_logging
-    from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_poster
+    from whiskeyjack_bot.credentials import MissingCredentialError
+    from whiskeyjack_bot.metaculus.client import build_poster
     from whiskeyjack_bot.research.allowlist import AllowlistError
     from whiskeyjack_bot.submission_reconcile import (
         ReconciliationError,

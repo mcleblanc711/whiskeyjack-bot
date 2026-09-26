@@ -11,7 +11,8 @@ import yaml
 
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.logging_setup import SecretRedactionFilter, configure_logging
-from whiskeyjack_bot.metaculus.client import MissingCredentialError, build_client
+from whiskeyjack_bot.credentials import MissingCredentialError
+from whiskeyjack_bot.metaculus.client import build_client
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FAKE_TOKEN = "fake-metaculus-token-abcdef123456"

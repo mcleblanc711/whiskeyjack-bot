@@ -27,7 +27,7 @@ import yaml
 
 from whiskeyjack_bot.config import AppConfig, validate_config_data
 from whiskeyjack_bot.logging_setup import SecretRedactionFilter, configure_logging
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.research import exa
 from whiskeyjack_bot.research.canonical import canonicalize_url
 from whiskeyjack_bot.research.exa import (

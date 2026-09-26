@@ -53,7 +53,7 @@ from whiskeyjack_bot.logging_setup import (
     SecretRedactionFilter,
     configure_logging,
 )
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.prompt import DeclaredProbabilityBounds, LoadedPrompt, load_prompt
 from whiskeyjack_bot.questions.model import (
     CanonicalBinaryQuestion,

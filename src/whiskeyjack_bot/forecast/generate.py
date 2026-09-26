@@ -157,7 +157,7 @@ from whiskeyjack_bot.forecast.schema import (
     response_model_for,
 )
 from whiskeyjack_bot.lifecycle import PreForecastFailureCode
-from whiskeyjack_bot.metaculus.client import MissingCredentialError
+from whiskeyjack_bot.credentials import MissingCredentialError
 from whiskeyjack_bot.prompt import LoadedPrompt, probability_bounds_violation
 from whiskeyjack_bot.redaction import redact_secrets
 from whiskeyjack_bot.questions.model import (
