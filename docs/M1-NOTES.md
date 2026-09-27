@@ -15999,3 +15999,9 @@ transaction; that is now pinned by
 `test_an_enable_that_fails_partway_commits_neither_the_series_nor_the_activation`. Both tests
 were mutation-checked against a non-atomic version, and both fail on it. `_rebind` and
 `Budget.reserve` each make a single journal write.
+
+### Round 2 — APPROVE on `aaa96c5`, no findings
+
+The partial-disable blocker is closed, and the reviewer confirmed the `enable` sibling is
+transactional and tested. The only change after the approved commit is this note and the
+backlog row flipped to `Done`.
