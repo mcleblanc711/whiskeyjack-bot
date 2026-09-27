@@ -15983,3 +15983,19 @@ Each test was rewritten so that only the guard it names can refuse, and all five
 - `test_a_series_ceiling_reached_mid_poll_refuses_the_purchase` first passed on the
   *per-project* refusal, because the seeded spend sat on the polled project. It now seeds the
   other project and asserts the recorded reason.
+
+### Round 1 — CHANGES REQUESTED on `8b31def`, one blocker
+
+**The blocker was a partial `disable`.** The activation's `disabled` event committed before
+the series', so an ordinary I/O failure on the second write left the activation disabled and
+the series still able to rebind. The next poll would then bind a fresh, enabled activation
+after the owner's disable had failed partway. The reviewer reproduced it, and it was
+reproduced here before the fix (`test_a_disable_that_fails_partway_commits_neither_event`
+failed with `[{}] == []`).
+
+**Fix:** both events commit in one `storage_transaction`. Siblings of the entry point were
+checked, not only this one. `enable`'s series and first activation were already one
+transaction; that is now pinned by
+`test_an_enable_that_fails_partway_commits_neither_the_series_nor_the_activation`. Both tests
+were mutation-checked against a non-atomic version, and both fail on it. `_rebind` and
+`Budget.reserve` each make a single journal write.
