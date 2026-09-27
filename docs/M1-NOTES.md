@@ -15919,3 +15919,67 @@ of the same limit.
 - Deploying this changes `AppConfig`, so the live activation retires at the first poll after
   the merge. The re-enable is `tournament enable … --series-budget-usd 80 --series-ends …`, and
   it must happen in the same sitting.
+
+### Mutation pass — thirty-five mutants, thirty dead, then five more
+
+Each mutant was a one-line edit to `src/` in this worktree, after the work was committed. The
+`__pycache__` directories were cleared before each run, the edit was reverted from `HEAD`
+after it, and the tree was clean at the end. Each ran against `test_follow.py`, the follow
+properties and `test_tournament.py`, with `-x`. The killer is the first failure.
+
+**Five survived the first pass, and all five were the recurring defect: a test that refused
+for a different reason than the one it was about.**
+- The oversize body was bare spaces, which also fails to parse.
+- The replay tamper changed the project id, which the id check catches before the hash.
+- The path probe named a file that did not exist.
+- The test-profile case was refused as "testing profiles may activate only 32977" first.
+- No test sat exactly on the series end.
+
+Each test was rewritten so that only the guard it names can refuse, and all five then died.
+
+| Mutant | Killed by |
+| --- | --- |
+| account check | `test_another_account_is_refused` |
+| disabled check | `test_a_disabled_series_binds_nothing` |
+| expiry >= to > | **survived the first pass**; now `test_the_series_end_and_the_close_date_are_exclusive_at_the_instant` |
+| bindings check | `test_a_changed_prompt_is_outside_the_owner_authorization` |
+| slug check | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[other-series]` |
+| not_newer check | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[older-project]` |
+| ongoing flag ignored | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[not-ongoing]` |
+| close date ignored | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[closed]` |
+| exhausted check | `test_an_exhausted_series_binds_nothing` |
+| exhausted >= to > | `test_an_exhausted_series_binds_nothing` |
+| parse: bool ongoing | `test_the_answer_parser_is_total_and_exact` |
+| parse: tz check | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[naive-close]` |
+| parse: id > 0 | `test_the_answer_parser_is_total_and_exact` |
+| read failure escapes | `test_a_failed_read_never_stops_the_poll[network]` |
+| no size check | **survived the first pass**; now `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[oversize]` |
+| no superseded re-check | `test_an_owner_enable_during_the_read_supersedes_the_rebind` |
+| ends ignores series end | `test_the_window_ends_at_the_series_end_when_the_project_outlives_it` |
+| no notice | `test_a_rollover_is_followed_and_the_same_poll_forecasts_on_the_new_project` |
+| replay: no sha check | **survived the first pass**; now `test_replay_refuses_an_altered_or_missing_answer` |
+| replay: no path check | **survived the first pass**; now `test_replay_refuses_an_altered_or_missing_answer` |
+| read: follows redirects | `test_the_read_refuses_anything_but_a_200_and_never_follows_a_redirect[301]` |
+| read: no user agent | `test_the_read_asks_for_the_slug_with_a_token_and_an_explicit_agent` |
+| budget: no series check | `test_the_series_ceiling_spans_projects_and_ignores_spend_before_the_series` |
+| budget: no series stamp | `test_the_series_ceiling_spans_projects_and_ignores_spend_before_the_series` |
+| series_spending counts all | `test_the_series_ceiling_spans_projects_and_ignores_spend_before_the_series` |
+| follow dest: project ignored | `test_a_policy_bound_project_is_the_destination_of_a_following_config` |
+| follow dest: series ignored | `test_an_activation_without_a_series_is_no_destination_for_a_following_config` |
+| disable leaves series | `test_a_disabled_series_binds_nothing` |
+| enable: series max | `test_a_follow_enable_outside_its_limits_appends_nothing[ceiling-over-80]` |
+| enable: project over series | `test_a_follow_enable_outside_its_limits_appends_nothing[project-over-series]` |
+| enable: window past series | `test_a_follow_enable_outside_its_limits_appends_nothing[window-past-series]` |
+| enable: follow on test profile | **survived the first pass**; now `test_a_testing_profile_cannot_follow` |
+| bound_project ignores activation | `test_a_rollover_is_followed_and_the_same_poll_forecasts_on_the_new_project` |
+| run_once never follows | `test_a_rollover_is_followed_and_the_same_poll_forecasts_on_the_new_project` |
+| run_once budget without series | `test_a_poll_stamps_every_reservation_with_its_series` |
+
+**Three more were found before the pass, by the reachability checks.**
+- Two property strategies never reached their accept branch. Both the answer parser's and the
+  series row's drew every field from one mixed strategy; `find` proved no valid whole was ever
+  assembled. Both now draw a valid value per key most of the time, and
+  `test_…_reaches_its_accept_branch` keeps it that way.
+- `test_a_series_ceiling_reached_mid_poll_refuses_the_purchase` first passed on the
+  *per-project* refusal, because the seeded spend sat on the polled project. It now seeds the
+  other project and asserts the recorded reason.
