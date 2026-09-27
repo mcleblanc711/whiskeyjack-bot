@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -62,6 +62,10 @@ from whiskeyjack_bot.tournament_state import (
     require_spending_clear,
     spending,
     utcnow,
+    bound_project,
+    series_disabled,
+    series_of,
+    series_spending,
     witness,
 )
 
@@ -568,13 +572,29 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
             reserved_cost_usd=held / 1_000_000,
             remaining_budget_usd=max(0, active["budget_microusd"] - actual - held) / 1_000_000,
         )
+        series = series_of(conn, active)
+        if series is not None:
+            # M1-354: the followed series' own ceiling, across every project it has bound.
+            series_actual, series_held = series_spending(conn, series.series_id)
+            data["series"] = {
+                "series_id": series.series_id,
+                "follow": series.follow,
+                "ends": series.ends.isoformat(),
+                "disabled": series_disabled(conn, series),
+                "bound_by": active.get("bound_by"),
+                "ceiling_usd": series.budget_microusd / 1_000_000,
+                "actual_cost_usd": series_actual / 1_000_000,
+                "reserved_cost_usd": series_held / 1_000_000,
+                "remaining_budget_usd": max(0, series.budget_microusd - series_actual - series_held)
+                / 1_000_000,
+            }
     # This is a local configuration/storage check, not live credential verification.
     try:
         require_activation(
             conn,
             config,
             account_id=activations[-1]["account_id"] if activations else 0,
-            project_id=str(config.metaculus.tournament.id),
+            project_id=bound_project(conn, config),
         )
         data["enabled"] = True
     except ActivationInactive:
@@ -665,6 +685,7 @@ def run_once(
     web_client: Any | None = None,
     forecaster: Any | None = None,
     question_id: int | None = None,
+    series_reader: Callable[[], bytes] | None = None,
 ) -> dict[str, Any]:
     require_live_submission_enabled(config)
     if not config.submission.post_private_reasoning_comment:
@@ -689,7 +710,20 @@ def run_once(
         client = build_client(config) if client is None else client
         poster = SingleAttemptPoster(client) if poster is None else poster
         account = poster.get_current_user_id()
-        project = str(config.metaculus.tournament.id)
+        follow_slug = config.metaculus.tournament.follow
+        if follow_slug is not None:
+            # M1-354: before the activation is required, so a rollover can be followed even
+            # when the old project's window has closed. Never raises for a read problem;
+            # the project below is whatever the newest activation binds afterwards.
+            from whiskeyjack_bot.follow import follow, read_series_project
+
+            follow(
+                conn,
+                config,
+                account_id=account,
+                read=series_reader or (lambda: read_series_project(config, follow_slug)),
+            )
+        project = bound_project(conn, config)
         try:
             activation = require_activation(conn, config, account_id=account, project_id=project)
         except ActivationRetired as retired:
@@ -769,12 +803,15 @@ def run_once(
         normalized = normalize_questions(questions)
         heartbeat["discovered"] = len(questions)
         ordered = sorted(normalized.questions, key=lambda q: q.close_time or utcnow())
+        series = series_of(conn, activation)
         budget = Budget(
             conn,
             config.storage.artifact_root,
             f"{account}:{project}",
             activation["budget_microusd"],
             tuple(config.secret_env_var_names()),
+            series_id=None if series is None else series.series_id,
+            series_ceiling=0 if series is None else series.budget_microusd,
         )
         try:
             prompt = load_prompt(

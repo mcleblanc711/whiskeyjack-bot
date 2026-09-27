@@ -1168,7 +1168,9 @@ def _check_rollover(state: dict) -> bool:
     again, the rollover's own entry is exactly as the last good read left it.
 
     Nothing here changes anything. Re-pointing the activation is an owner action
-    (docs/RUNBOOK.md P3), and the push says so.
+    (docs/RUNBOOK.md P3), and the push says so. On a profile that follows MiniBench (M1-354)
+    the worker binds the new project itself; this page then means it declined to, and the
+    newest activation is what makes that visible here.
     """
     now = _now()
     stored = state.get("rollover")
@@ -1247,8 +1249,10 @@ def _check_rollover(state: dict) -> bool:
             "and that project has open questions. The worker is still polling the old project "
             "and discovers 0 questions every poll, so it looks healthy -- but each MiniBench "
             "question is open for three hours, and one that closes before the re-point is lost."
-            "\n\nNothing was changed. Re-pointing is an owner action: docs/RUNBOOK.md P3 "
-            "(set --starts to now or earlier)."
+            "\n\nNothing was changed. A profile that follows MiniBench (M1-354) binds the "
+            "new project itself, so on one this means the worker declined to: its log says "
+            "why, as a `series follow:` line. Re-pointing is then an owner action: "
+            "docs/RUNBOOK.md P3 (set --starts to now or earlier)."
             "\n\nCheck: whiskeyjack-bot tournament status --config config/tournament.yaml"
             "\n       the project id of the open questions on Metaculus's MiniBench page"
         )

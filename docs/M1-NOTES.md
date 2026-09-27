@@ -15803,3 +15803,205 @@ Every killer below is the test aimed at that mutant.
 | M1-338 catches nothing | `test_an_unjournalable_payload_…[cycle]` |
 | M1-339 no disambiguation | `test_colliding_redacted_keys_keep_both_entries_under_the_documented_representation` |
 | D49 wrap removed | `test_a_lone_surrogate_is_refused_as_this_modules_error` |
+
+## M1-354 (D51) — Follow MiniBench across a rollover
+
+### What shipped
+
+A production profile with `metaculus.tournament.follow: minibench` no longer waits on the owner
+at a rollover. `tournament enable` on it records a **series**:
+- the account and the followed slug;
+- a ceiling across every project the series binds (at most `MAX_SERIES_BUDGET_USD` = 80);
+- each project's own ceiling;
+- an end date.
+
+The owner's project is the first activation (`bound_by: owner`). At the start of each poll,
+`follow.follow` asks Metaculus what the slug resolves to. When the project moved and every guard
+in `follow.verdict` holds, it stores the answer as an artifact, then appends an activation
+attributed to `policy:follow-v1:<series id>`, with the answer's sha256. The same poll then
+forecasts on the new project.
+
+`Budget.reserve` stamps every reservation with its series and refuses past the series ceiling,
+in the same `BEGIN IMMEDIATE` as the project check. `MAX_ACTIVATION_BUDGET_USD` rises from 40 to
+80. `tournament disable` stops the series. `tournament status` reports it under `series`. The
+watchdog's `MINIBENCH ROLLED OVER` text now says what the page means on a following profile.
+Nothing else about the watchdog changed.
+
+### Decision — the worker re-points, never the watchdog
+
+The watchdog already knows about a rollover within five minutes, so it was the tempting place.
+It is a read-only monitor with its own budget (`WORST_CASE_SECONDS` 238 of 240). An actuator
+there would be a second writer of activation state outside `worker_lock`, racing the poll it
+re-points. The worker already holds the lock, has the account from the token, and has the
+config it would bind. The watchdog's comparison (slug against the newest activation) is exactly
+what a guard refusal leaves unequal, so the page remains the fallback unchanged. That is tested
+against the follow ledger itself (`test_the_watchdog_pages_on_a_refused_follow_…`).
+
+### Decision — a reservation carries its series; the series is not a range of `seq`
+
+D51 counts spend "from enablement", and the first project already had $15.58 on it. Two
+readings were possible:
+- every reservation in a series project scope after the series event's `seq`;
+- every reservation stamped with the series id.
+
+The stamp is a fact of the row, so a replay needs no ordering argument. It also cannot
+mis-attribute a reservation made on the same project by a pinned activation later. Settlements
+and corrections carry no series and are matched by reservation id, exactly as `spending` does.
+
+### Decision — `id` stays required, and means "where the series started"
+
+A following config could have dropped `id`. It is kept, because the owner's `enable` still binds
+one concrete project they named, and `enable` still requires `--project-id` to equal it. The
+cost is one runbook sentence: to re-enable after a rollover, set `id` to the current project.
+`retired_bindings` has a follow branch, so a policy-bound project different from `id` is not a
+moved destination. The pinned branch is byte-for-byte what it was, which is what keeps M1-335's
+243-case table meaningful.
+
+### Decision — the authorization is scoped to one configuration and one prompt
+
+The series stores `config_sha256`/`prompt_sha256`. A worker whose bindings differ refuses to
+extend it (`bindings_moved`). Without this, a config change would retire the current activation,
+but the next rollover would append a *fresh* activation under the new config, which the owner
+never enabled. That turns a retirement into a silent re-authorization.
+
+### Decision — bind as soon as the slug moves; do not wait for an open question
+
+The watchdog pages only when the new project has an open post, because a page with nothing to
+lose is noise. A rebind with nothing open yet is free and loses nothing: the next batch is
+forecast from its first poll. Waiting would reintroduce the five-minute gap for nothing.
+
+### Decision — a failed read never stops the poll; a malformed ledger row does
+
+A Metaculus outage must not stop forecasting on the bound project, so every read failure is
+`project_unreadable`. That covers exceptions, a timeout, a non-200, a redirect, non-bytes, an
+oversize answer and junk JSON. A series row that cannot be read is different: the authorization
+cannot be shown, so it is `StorageFailure`, the same as a malformed spending row.
+
+### Decision — follow runs before `require_activation`
+
+Otherwise a rollover that happens after the old project's window closed could never be
+followed: the poll would refuse as inactive first.
+
+### Rejected — the SDK client for the read
+
+`MetaculusClient` has no project-by-slug method. Its GETs retry through the SDK's decorator,
+which would defeat the 20 s wall-clock bound. The read is one `httpx` GET: explicit
+User-Agent (M1-347 measured the 403), redirects refused (the token is a header), and the body
+bounded while streaming. The `transport` parameter is the test seam.
+
+### Rejected — reusing `use_sdk_current_id`
+
+It already means "adopt the SDK alias", and `enable`/`retired_bindings` treat it as a moved
+destination on purpose. Reusing it would make one flag mean two things in two eras of the
+ledger. `follow` is new and closed (`Literal["minibench"]`), and the validator forbids combining
+the two.
+
+### Rejected — a rebind budget of "whatever the series has left"
+
+Each policy activation gets the owner's per-project figure. The series ceiling is enforced at
+every reservation anyway, so shrinking the per-project ceiling would add a second, weaker copy
+of the same limit.
+
+### Deferred (do not read the absence as an omission)
+
+- **M1-355**, the AskNews sub-cap inside a series, is its own item, filed with this one.
+- **A forecast still unconfirmed on the old project when the worker re-points is not
+  recovered.** The recovery loop skips intents from another project, and `complete_comment`
+  would refuse the destination. This is exactly what a manual re-point does today; the runbook
+  says so.
+- **A `replay-follow` CLI.** `follow.replay_rebind` exists and is tested. The acceptance
+  criterion asks that the rebind be replayable, not for a command.
+
+### Standing risk — not verifiable offline
+
+- The project answer's shape (`id`, `slug`, `close_date`, `is_ongoing`) was measured once, on
+  2026-09-27, against 33125. The first real rollover is the first live test of the rebind.
+- Deploying this changes `AppConfig`, so the live activation retires at the first poll after
+  the merge. The re-enable is `tournament enable … --series-budget-usd 80 --series-ends …`, and
+  it must happen in the same sitting.
+
+### Mutation pass — thirty-five mutants, thirty dead, then five more
+
+Each mutant was a one-line edit to `src/` in this worktree, after the work was committed. The
+`__pycache__` directories were cleared before each run, the edit was reverted from `HEAD`
+after it, and the tree was clean at the end. Each ran against `test_follow.py`, the follow
+properties and `test_tournament.py`, with `-x`. The killer is the first failure.
+
+**Five survived the first pass, and all five were the recurring defect: a test that refused
+for a different reason than the one it was about.**
+- The oversize body was bare spaces, which also fails to parse.
+- The replay tamper changed the project id, which the id check catches before the hash.
+- The path probe named a file that did not exist.
+- The test-profile case was refused as "testing profiles may activate only 32977" first.
+- No test sat exactly on the series end.
+
+Each test was rewritten so that only the guard it names can refuse, and all five then died.
+
+| Mutant | Killed by |
+| --- | --- |
+| account check | `test_another_account_is_refused` |
+| disabled check | `test_a_disabled_series_binds_nothing` |
+| expiry >= to > | **survived the first pass**; now `test_the_series_end_and_the_close_date_are_exclusive_at_the_instant` |
+| bindings check | `test_a_changed_prompt_is_outside_the_owner_authorization` |
+| slug check | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[other-series]` |
+| not_newer check | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[older-project]` |
+| ongoing flag ignored | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[not-ongoing]` |
+| close date ignored | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[closed]` |
+| exhausted check | `test_an_exhausted_series_binds_nothing` |
+| exhausted >= to > | `test_an_exhausted_series_binds_nothing` |
+| parse: bool ongoing | `test_the_answer_parser_is_total_and_exact` |
+| parse: tz check | `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[naive-close]` |
+| parse: id > 0 | `test_the_answer_parser_is_total_and_exact` |
+| read failure escapes | `test_a_failed_read_never_stops_the_poll[network]` |
+| no size check | **survived the first pass**; now `test_a_refused_answer_binds_nothing_and_the_poll_carries_on[oversize]` |
+| no superseded re-check | `test_an_owner_enable_during_the_read_supersedes_the_rebind` |
+| ends ignores series end | `test_the_window_ends_at_the_series_end_when_the_project_outlives_it` |
+| no notice | `test_a_rollover_is_followed_and_the_same_poll_forecasts_on_the_new_project` |
+| replay: no sha check | **survived the first pass**; now `test_replay_refuses_an_altered_or_missing_answer` |
+| replay: no path check | **survived the first pass**; now `test_replay_refuses_an_altered_or_missing_answer` |
+| read: follows redirects | `test_the_read_refuses_anything_but_a_200_and_never_follows_a_redirect[301]` |
+| read: no user agent | `test_the_read_asks_for_the_slug_with_a_token_and_an_explicit_agent` |
+| budget: no series check | `test_the_series_ceiling_spans_projects_and_ignores_spend_before_the_series` |
+| budget: no series stamp | `test_the_series_ceiling_spans_projects_and_ignores_spend_before_the_series` |
+| series_spending counts all | `test_the_series_ceiling_spans_projects_and_ignores_spend_before_the_series` |
+| follow dest: project ignored | `test_a_policy_bound_project_is_the_destination_of_a_following_config` |
+| follow dest: series ignored | `test_an_activation_without_a_series_is_no_destination_for_a_following_config` |
+| disable leaves series | `test_a_disabled_series_binds_nothing` |
+| enable: series max | `test_a_follow_enable_outside_its_limits_appends_nothing[ceiling-over-80]` |
+| enable: project over series | `test_a_follow_enable_outside_its_limits_appends_nothing[project-over-series]` |
+| enable: window past series | `test_a_follow_enable_outside_its_limits_appends_nothing[window-past-series]` |
+| enable: follow on test profile | **survived the first pass**; now `test_a_testing_profile_cannot_follow` |
+| bound_project ignores activation | `test_a_rollover_is_followed_and_the_same_poll_forecasts_on_the_new_project` |
+| run_once never follows | `test_a_rollover_is_followed_and_the_same_poll_forecasts_on_the_new_project` |
+| run_once budget without series | `test_a_poll_stamps_every_reservation_with_its_series` |
+
+**Three more were found before the pass, by the reachability checks.**
+- Two property strategies never reached their accept branch. Both the answer parser's and the
+  series row's drew every field from one mixed strategy; `find` proved no valid whole was ever
+  assembled. Both now draw a valid value per key most of the time, and
+  `test_…_reaches_its_accept_branch` keeps it that way.
+- `test_a_series_ceiling_reached_mid_poll_refuses_the_purchase` first passed on the
+  *per-project* refusal, because the seeded spend sat on the polled project. It now seeds the
+  other project and asserts the recorded reason.
+
+### Round 1 — CHANGES REQUESTED on `8b31def`, one blocker
+
+**The blocker was a partial `disable`.** The activation's `disabled` event committed before
+the series', so an ordinary I/O failure on the second write left the activation disabled and
+the series still able to rebind. The next poll would then bind a fresh, enabled activation
+after the owner's disable had failed partway. The reviewer reproduced it, and it was
+reproduced here before the fix (`test_a_disable_that_fails_partway_commits_neither_event`
+failed with `[{}] == []`).
+
+**Fix:** both events commit in one `storage_transaction`. Siblings of the entry point were
+checked, not only this one. `enable`'s series and first activation were already one
+transaction; that is now pinned by
+`test_an_enable_that_fails_partway_commits_neither_the_series_nor_the_activation`. Both tests
+were mutation-checked against a non-atomic version, and both fail on it. `_rebind` and
+`Budget.reserve` each make a single journal write.
+
+### Round 2 — APPROVE on `aaa96c5`, no findings
+
+The partial-disable blocker is closed, and the reviewer confirmed the `enable` sibling is
+transactional and tested. The only change after the approved commit is this note and the
+backlog row flipped to `Done`.

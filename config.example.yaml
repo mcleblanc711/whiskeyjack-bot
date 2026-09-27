@@ -10,6 +10,10 @@ metaculus:
     # Current verified MiniBench SDK alias as checked 2026-07-09.
     id: "minibench"
     use_sdk_current_id: false
+    # M1-354: `follow: minibench` makes a production profile bind each new MiniBench project
+    # itself, under a series enabled with `tournament enable --series-budget-usd ...`. It needs
+    # a positive integer `id` (the series' first project) and use_sdk_current_id false.
+    # Omitted here: the example is a pinned development profile.
   group_question_mode: "unpack_subquestions"
   request_timeout_seconds: 30
   request_spacing_seconds: 3.5

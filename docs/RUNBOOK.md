@@ -142,6 +142,9 @@ were written.
 | ntfy push `whiskeyjack: MINIBENCH ROLLED OVER` | [P3](#p3--minibench-rolled-over-to-a-new-project) |
 | ntfy push `whiskeyjack: MiniBench rollover cleared` | [P3](#p3--minibench-rolled-over-to-a-new-project) — the activation covers the series again; nothing to do |
 | ntfy push `whiskeyjack: rollover check failed` | [P3](#when-the-rollover-check-itself-fails) — the detector is blind, the worker is not down |
+| ntfy push `whiskeyjack: MiniBench followed to a new project` | [P3](#follow-mode--the-worker-re-points-itself-m1-354) — the worker bound the new project; nothing to do |
+| ntfy push `whiskeyjack: series budget at N%` | [P3](#follow-mode--the-worker-re-points-itself-m1-354) — the followed series' own ceiling |
+| `series follow: <code>` in the tournament log | [P3](#follow-mode--the-worker-re-points-itself-m1-354) — the code table |
 | `operation artifact missing; platform reconciliation required` | [P2](#p2--a-ledger-copied-without-its-artifact-root-will-refuse) |
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
 | `invalid configuration:` / exit `2` | [C3](#c3--configuration-refused) |
@@ -306,6 +309,65 @@ Spending is tracked per project, so the new activation starts with its full budg
 **Never.** Do not run `tournament disable` to tidy up the old series. It disables the
 **latest** activation (`tournament_state.py`, `disable`), and once step 2 is done that is the
 new one. The old activation is already superseded and needs nothing.
+
+#### Follow mode — the worker re-points itself (M1-354)
+
+A profile with `metaculus.tournament.follow: minibench` does the recovery above by itself, inside
+limits you set once (D51). You enable a **series**, not a project:
+
+```bash
+uv run whiskeyjack-bot tournament enable --config config/tournament.yaml \
+  --project-id '<current project id>' --starts '<UTC ISO timestamp>' --ends '<UTC ISO timestamp>' \
+  --budget-usd 40 --series-budget-usd 80 --series-ends '<UTC ISO timestamp>'
+```
+
+`--project-id` must equal `metaculus.tournament.id`; that is the series' first project, bound as
+yours (`bound_by: owner`). `--series-budget-usd` is the ceiling across **every** project the
+series binds, at most USD 80, counted only from this command — spend already on the ledger does
+not count. `--budget-usd` is each project's own ceiling and may not exceed the series'. The
+activation window must end by `--series-ends`.
+
+At the start of each poll the worker asks Metaculus what `minibench` resolves to. When it has
+moved, the worker appends a new activation for the new project — `bound_by:
+policy:follow-v1:<series id>`, `starts` now, `ends` at the earlier of the project's close and the
+series end, its budget your `--budget-usd` — and forecasts on it in the same poll. The answer it
+acted on is stored under `data/artifacts/follow/` and bound into the activation by its sha256
+(`follow.replay_rebind` re-derives the rebind from it). You get one `whiskeyjack: MiniBench
+followed to a new project` push. The configuration does not change, so nothing retires, and the
+watchdog, which compares the slug with the newest activation, goes quiet by itself.
+
+It binds only when every guard holds. When one refuses, nothing is appended, the worker keeps
+polling the project it had, and `MINIBENCH ROLLED OVER` pages as before — do the manual recovery
+above. The tournament log (`data/logs/tournament.jsonl`) carries one `series follow: <code>` line
+per poll that did anything but find the slug where it was:
+
+| code | what it means | what to do |
+|---|---|---|
+| `rebound` | the new project was bound | nothing |
+| `no_series` | no series on this ledger, or the newest activation was not bound under one | enable a series |
+| `account_mismatch` | the token's account is not the series' account | check `METACULUS_TOKEN` |
+| `series_disabled` | `tournament disable` stopped the series | enable a new series |
+| `series_expired` | past `--series-ends` | enable a new series |
+| `bindings_moved` | the configuration or prompt changed since the series was enabled; the activation is retired too ([C5](#c5--activation-retired)) | re-enable |
+| `project_unreadable` | the Metaculus read failed, timed out (20 s) or answered something that is not a project | usually clears next poll; the watchdog's `rollover check failed` is the same blind spot |
+| `not_the_series` | the slug answered a project whose own slug is not `minibench` | manual recovery; look before you trust it |
+| `not_newer` | the answered project id is lower than the bound one | manual recovery; look before you trust it |
+| `not_ongoing` | the new project is not running, or its close date has passed | usually wait for Metaculus |
+| `series_exhausted` | the series ceiling is spent | enable a new series if you mean to spend more |
+| `superseded` | you ran `enable` or `disable` while the poll was reading; it appended nothing | nothing |
+
+**Spending.** Every paid call is checked against the project's ceiling and the series ceiling,
+in one transaction; either refuses the call. `tournament status` reports the series under
+`series` (ceiling, actual, reserved, remaining). The series pages its own `series budget at N%`
+alongside the project's.
+
+**Stopping it.** `tournament disable` disables the newest activation **and** its series, so no
+later rollover is bound. To change the configuration, set `metaculus.tournament.id` to the
+project the series is on now (`tournament status` shows it) and enable a new series.
+
+**Standing limit.** A forecast whose post or private comment was still unconfirmed on the old
+project when the worker re-pointed is not recovered by later polls (`unresolved` stays above 0),
+exactly as after a manual re-point. It needs `reconcile-restored` or a look by hand.
 
 #### When the rollover check itself fails
 

@@ -839,12 +839,12 @@ def test_astra_reserves_at_least_five_times_what_sol_does_for_the_same_prompt(
     assert astra >= 5 * sol - 5
 
 
-def test_the_activation_ceiling_is_forty_dollars_exactly(case: Any) -> None:
-    """M1-408, round 1: the owner authorized a $40 cap for the Astra switch, and the Launch
-    hard maximum of $20 refused it (reproduced by the reviewer and again before this fix).
+def test_the_activation_ceiling_is_eighty_dollars_exactly(case: Any) -> None:
+    """M1-408 raised the Launch maximum to $40 for the Astra switch; M1-354 raises it to $80
+    under D51, the owner's approval with the funding grant (2026-09-27).
 
     Both sides of the boundary, because a ceiling tested only from below is not a ceiling:
-    $40 activates, and a cent over is refused without appending an activation.
+    $80 activates, and a cent over is refused without appending an activation.
     """
     conn, config, *_ = case
     window = {
@@ -853,14 +853,14 @@ def test_the_activation_ceiling_is_forty_dollars_exactly(case: Any) -> None:
         "starts": utcnow() - timedelta(minutes=1),
         "ends": utcnow() + timedelta(days=1),
     }
-    assert tournament_state.MAX_ACTIVATION_BUDGET_USD == 40
+    assert tournament_state.MAX_ACTIVATION_BUDGET_USD == 80
     before = len(tournament_state.events(conn, "activation", "account"))
-    with pytest.raises(TournamentError, match=r"maximum USD 40\b"):
-        enable(conn, config, budget_usd=40.01, **window)
+    with pytest.raises(TournamentError, match=r"maximum USD 80\b"):
+        enable(conn, config, budget_usd=80.01, **window)
     assert len(tournament_state.events(conn, "activation", "account")) == before
-    enable(conn, config, budget_usd=40, **window)
+    enable(conn, config, budget_usd=80, **window)
     latest = tournament_state.events(conn, "activation", "account")[-1]
-    assert latest["budget_microusd"] == 40_000_000
+    assert latest["budget_microusd"] == 80_000_000
 
 
 def test_a_poll_on_astra_confirms_a_forecast(case: Any) -> None:

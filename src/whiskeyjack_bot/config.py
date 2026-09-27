@@ -124,9 +124,19 @@ def _require_env_var_name(value: str) -> str:
     return value
 
 
+# The Metaculus project series a production profile may follow across rollovers (M1-354,
+# D51). Closed on purpose: following hands the choice of project to a Metaculus answer, and
+# the owner authorized that for MiniBench only.
+FollowSlug = Literal["minibench"]
+
+
 class TournamentConfig(_StrictModel):
     id: int | str
     use_sdk_current_id: bool = False
+    # M1-354: when set, `id` is the series' first project and the worker binds later ones
+    # itself, under the series authorization `tournament enable` records. None is the
+    # pinned profile, unchanged.
+    follow: FollowSlug | None = None
 
     @field_validator("id")
     @classmethod
@@ -136,6 +146,19 @@ class TournamentConfig(_StrictModel):
                 "tournament_id_blank", "tournament id must be a non-empty slug or integer id"
             )
         return v
+
+    @model_validator(mode="after")
+    def _follow_starts_from_a_concrete_project(self) -> TournamentConfig:
+        # A followed series still starts from one concrete project the owner named, and the
+        # SDK alias would be a second, unrecorded way of choosing it.
+        if self.follow is not None and (
+            self.use_sdk_current_id or type(self.id) is not int or self.id <= 0
+        ):
+            raise authored_error(
+                "tournament_follow_needs_project",
+                "tournament.follow requires a positive integer id and use_sdk_current_id false",
+            )
+        return self
 
 
 class MetaculusConfig(_StrictModel):

@@ -4,8 +4,12 @@ metaculus:
   base_url: https://www.metaculus.com/api
   token_env: METACULUS_TOKEN
   tournament:
+    # M1-354 (D51): the series' FIRST project. With `follow` set the worker binds each later
+    # MiniBench project itself, under the series `tournament enable --series-budget-usd ...`
+    # records; this id changes only when the owner enables a new series.
     id: 33125
     use_sdk_current_id: false
+    follow: minibench
   group_question_mode: unpack_subquestions
   request_timeout_seconds: 30
   request_spacing_seconds: 3.5

@@ -341,6 +341,17 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--starts", required=True, help="UTC ISO timestamp")
             command.add_argument("--ends", required=True, help="UTC ISO timestamp")
             command.add_argument("--budget-usd", type=float, default=20.0)
+            # M1-354 (D51): required together, and only, on a profile with
+            # metaculus.tournament.follow set.
+            command.add_argument(
+                "--series-budget-usd",
+                type=float,
+                help="ceiling across every project a followed series binds (follow mode)",
+            )
+            command.add_argument(
+                "--series-ends",
+                help="UTC ISO timestamp after which the series binds nothing (follow mode)",
+            )
 
     export = subparsers.add_parser(
         "export",
@@ -2069,10 +2080,18 @@ def _run_tournament(args: argparse.Namespace) -> int:
                     starts=datetime.fromisoformat(args.starts.replace("Z", "+00:00")),
                     ends=datetime.fromisoformat(args.ends.replace("Z", "+00:00")),
                     budget_usd=args.budget_usd,
+                    series_budget_usd=args.series_budget_usd,
+                    series_ends=(
+                        None
+                        if args.series_ends is None
+                        else datetime.fromisoformat(args.series_ends.replace("Z", "+00:00"))
+                    ),
                 )
                 print(
                     f"Activated policy {identifier} for account {account}, project {args.project_id}"
                 )
+                if config.metaculus.tournament.follow is not None:
+                    print("Following the series: later projects are bound by the worker")
             elif args.tournament_command == "disable":
                 disable(connection)
                 print("Tournament activation disabled")
