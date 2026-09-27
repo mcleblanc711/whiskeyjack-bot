@@ -437,6 +437,53 @@ def test_a_disabled_series_binds_nothing(series: Any) -> None:
     assert len(activations(conn)) == 1
 
 
+def test_a_disable_that_fails_partway_commits_neither_event(
+    series: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 (M1-354): the activation's `disabled` committed before the series', so an
+    ordinary I/O failure on the second write left the series able to rebind. Both events now
+    commit together or not at all."""
+    conn, config, *_ = series
+    (series_id,) = [row["series_id"] for row in events(conn, "series", "account")]
+    real = tournament_state.append
+
+    def failing(conn: Any, kind: str, scope: str, data: dict[str, Any]) -> str:
+        if kind == "disabled" and scope == series_id:
+            raise tournament_state.StorageFailure("cannot commit tournament journal")
+        return real(conn, kind, scope, data)
+
+    monkeypatch.setattr(tournament_state, "append", failing)
+    with pytest.raises(tournament_state.StorageFailure):
+        disable(conn)
+    monkeypatch.setattr(tournament_state, "append", real)
+    (owner,) = activations(conn)
+    assert events(conn, "disabled", owner["activation_id"]) == []
+    assert events(conn, "disabled", series_id) == []
+    disable(conn)
+    assert follow(conn, config, account_id=ACCOUNT, read=lambda: answer()) == "series_disabled"
+
+
+def test_an_enable_that_fails_partway_commits_neither_the_series_nor_the_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sibling of the partial disable: `enable` writes the series and its first
+    activation, and a series with no activation (or the reverse) must never be left."""
+    config = _config(tmp_path)
+    initialize_ledger(config.storage.sqlite_path)
+    conn = connect(config.storage.sqlite_path)
+    real = tournament_state.append
+
+    def failing(conn: Any, kind: str, scope: str, data: dict[str, Any]) -> str:
+        if kind == "activation":
+            raise tournament_state.StorageFailure("cannot commit tournament journal")
+        return real(conn, kind, scope, data)
+
+    monkeypatch.setattr(tournament_state, "append", failing)
+    with pytest.raises(tournament_state.StorageFailure):
+        _enable_series(conn, config)
+    assert events(conn, "series", "account") == [] and activations(conn) == []
+
+
 def test_an_expired_series_binds_nothing(series: Any) -> None:
     conn, config, *_ = series
     later = utcnow() + timedelta(days=31)

@@ -416,12 +416,15 @@ def enable(
 def disable(conn: sqlite3.Connection) -> None:
     active = events(conn, "activation", "account")
     if active:
-        append(conn, "disabled", active[-1]["activation_id"], {})
         # M1-354: disabling a followed project also stops its series, or the next rollover
-        # would bind a fresh, enabled activation behind the owner's back.
+        # would bind a fresh, enabled activation behind the owner's back. One transaction
+        # (round 1): committed one at a time, a failure on the second write left the
+        # activation disabled and the series still able to rebind.
         series = active[-1].get("series_id") if type(active[-1]) is dict else None
-        if type(series) is str:
-            append(conn, "disabled", series, {})
+        with storage_transaction(conn):
+            append(conn, "disabled", active[-1]["activation_id"], {})
+            if type(series) is str:
+                append(conn, "disabled", series, {})
 
 
 def retired_bindings(
