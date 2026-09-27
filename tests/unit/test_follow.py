@@ -91,7 +91,11 @@ def answer(
 
 
 def _config(
-    tmp_path: Path, *, environment: str = "production", follow: object = "minibench"
+    tmp_path: Path,
+    *,
+    environment: str = "production",
+    follow: object = "minibench",
+    project: int = FIRST,
 ) -> Any:
     tmp_path.mkdir(parents=True, exist_ok=True)
     config = base_config.__wrapped__(tmp_path)
@@ -100,7 +104,7 @@ def _config(
     prompt.write_bytes(config.forecast.prompt_path.read_bytes())
     data["forecast"]["prompt_path"] = str(prompt)
     data["environment"] = environment
-    data["metaculus"]["tournament"].update(id=FIRST, use_sdk_current_id=False, follow=follow)
+    data["metaculus"]["tournament"].update(id=project, use_sdk_current_id=False, follow=follow)
     data["model"].update(
         name=Model.model, max_output_tokens=6000, timeout_seconds=120, temperature=None
     )
@@ -219,10 +223,13 @@ def test_a_pinned_profile_refuses_series_options(tmp_path: Path) -> None:
 
 
 def test_a_testing_profile_cannot_follow(tmp_path: Path) -> None:
-    config = _config(tmp_path, environment="test")
+    """On the testing project, so the only refusal left is the production one. (The first
+    draft kept id 33125, was refused as a testing profile off 32977, and the mutation pass
+    showed the follow-mode refusal itself was never reached.)"""
+    config = _config(tmp_path, environment="test", project=32977)
     initialize_ledger(config.storage.sqlite_path)
     conn = connect(config.storage.sqlite_path)
-    with pytest.raises(TournamentError):
+    with pytest.raises(TournamentError, match="production profile"):
         _enable_series(conn, config, project_id=32977)
     assert activations(conn) == []
 
@@ -349,7 +356,10 @@ def test_the_next_poll_after_a_rebind_is_the_steady_state(series: Any) -> None:
         (answer(True), "project_unreadable"),
         (answer(NEXT, close="2026-10-09T00:00:00"), "project_unreadable"),
         (b"{" * 100_000, "project_unreadable"),
-        (b" " * (follow_module.FOLLOW_RESPONSE_LIMIT + 1), "project_unreadable"),
+        # Valid JSON padded past the limit: refused for its size, not its content. (The
+        # first draft padded with bare spaces, which fails to parse anyway, and the mutation
+        # pass showed removing the size check survived it.)
+        (answer(NEXT) + b" " * follow_module.FOLLOW_RESPONSE_LIMIT, "project_unreadable"),
     ],
     ids=[
         "other-series",
@@ -433,6 +443,23 @@ def test_an_expired_series_binds_nothing(series: Any) -> None:
     assert (
         follow(conn, config, account_id=ACCOUNT, read=lambda: answer(), now=later)
         == "series_expired"
+    )
+    assert len(activations(conn)) == 1
+
+
+def test_the_series_end_and_the_close_date_are_exclusive_at_the_instant(series: Any) -> None:
+    """Both boundaries, exactly: at the series end nothing binds, and a project that closes
+    at this instant is not ongoing. A strict comparison survived the first mutation pass."""
+    conn, config, *_ = series
+    (recorded,) = events(conn, "series", "account")
+    end = datetime.fromisoformat(recorded["ends"])
+    assert follow(conn, config, account_id=ACCOUNT, read=lambda: answer(), now=end) == (
+        "series_expired"
+    )
+    now = utcnow()
+    closing = answer(NEXT, close=now.isoformat())
+    assert follow(conn, config, account_id=ACCOUNT, read=lambda: closing, now=now) == (
+        "not_ongoing"
     )
     assert len(activations(conn)) == 1
 
@@ -628,6 +655,19 @@ def test_replay_refuses_an_altered_or_missing_answer(series: Any) -> None:
     assert not replay_rebind(
         conn, config, dict(bound, evidence=dict(bound["evidence"], path="../../etc/passwd"))
     )
+    # The same project, re-serialized: every re-derived fact still holds, so only the hash
+    # can refuse it. (Changing the project id instead let a removed hash check survive.)
+    original = evidence.read_bytes()
+    evidence.write_bytes(json.dumps(json.loads(original), indent=2).encode())
+    assert not replay_rebind(conn, config, bound)
+    evidence.write_bytes(original)
+    # A readable file with the right hash outside `follow/`: only the path shape refuses it.
+    outside = config.storage.artifact_root / "outside.json"
+    outside.write_bytes(original)
+    assert not replay_rebind(
+        conn, config, dict(bound, evidence=dict(bound["evidence"], path="outside.json"))
+    )
+    assert replay_rebind(conn, config, bound)
     evidence.write_bytes(answer(NEXT + 1))
     assert not replay_rebind(conn, config, bound)
     evidence.unlink()
