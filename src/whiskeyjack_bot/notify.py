@@ -80,6 +80,7 @@ NotifyEvent = Literal[
     "activation_retired",
     "unrecorded_post",
     "resolution_withheld",
+    "series_followed",
 ]
 
 # What happened to one push. Closed for the same reason the outcome vocabularies in
@@ -119,6 +120,9 @@ NotifyOutcome = Literal["sent", "throttled", "disabled", "failed"]
 #   account posted on as resolved but masked its value, so the record cannot be scored, and
 #   that stays true until the platform unmasks it. Emitted by ``ingest-resolutions`` (every
 #   six hours) and keyed on the record, so each such record reminds once a day.
+# - ``series_followed`` (M1-354) is an event, not a condition: the worker bound a new
+#   project of a followed series. Keyed on the new activation, so each rebind pages exactly
+#   once; the window is a backstop.
 _WINDOW_SECONDS: Final[dict[str, int]] = {
     "question_blocked": 1800,
     "provider_failed": 1800,
@@ -128,6 +132,7 @@ _WINDOW_SECONDS: Final[dict[str, int]] = {
     "activation_retired": 86400,
     "unrecorded_post": 86400,
     "resolution_withheld": 86400,
+    "series_followed": 86400,
 }
 assert set(_WINDOW_SECONDS) == set(get_args(NotifyEvent))
 assert all(seconds > 0 for seconds in _WINDOW_SECONDS.values())
@@ -176,6 +181,10 @@ _PRIORITY: Final[dict[str, str]] = {
     # An attribution gap nobody here can close -- access is the platform's -- so it is worth
     # knowing, not worth waking anyone for.
     "resolution_withheld": "default",
+    # M1-354: the worker changed which project it forecasts on the owner's behalf. Worth
+    # seeing promptly, not an incident -- the incident is a rollover it did NOT follow, and
+    # the watchdog pages that one urgently.
+    "series_followed": "default",
 }
 assert set(_PRIORITY) == set(get_args(NotifyEvent))
 

@@ -1,4 +1,4 @@
-"""Durable activation, operation journal, and prepaid round limits (LAUNCH; M1-348).
+"""Durable activation, operation journal, and prepaid round limits (LAUNCH; M1-348; M1-354).
 
 One ledger belongs to one bot account. Unknown charges retain their full reservation.
 Journal files intentionally survive SQLite restore; a mismatch blocks further writes
@@ -217,10 +217,110 @@ def witness(conn: sqlite3.Connection, root: Path, scope: str, data: dict[str, An
 
 # The hard maximum for one activation's spending ceiling, in USD. Launch shipped 20; M1-408
 # raised it to 40 on the owner's explicit authorization (2026-09-11), when the forecaster moved
-# to GPT-6 Astra at 5x Sol's prices. It is a code constant rather than configuration on
-# purpose: an activation binds to config_sha256, and a paid-call limit living in the same file
-# it authorizes would let one edit both raise the limit and re-authorize under it.
-MAX_ACTIVATION_BUDGET_USD: Final = 40
+# to GPT-6 Astra at 5x Sol's prices; M1-354 raised it to 80 under D51 (2026-09-27), with the
+# funding grant. It is a code constant rather than configuration on purpose: an activation
+# binds to config_sha256, and a paid-call limit living in the same file it authorizes would
+# let one edit both raise the limit and re-authorize under it.
+MAX_ACTIVATION_BUDGET_USD: Final = 80
+# The hard maximum for a followed series' ceiling (M1-354, D51): the owner's approval covers
+# USD 80 across every project one series binds, counted from the moment it is enabled. A
+# code constant for the same reason as the one above.
+MAX_SERIES_BUDGET_USD: Final = 80
+
+
+@dataclass(frozen=True)
+class Series:
+    """One owner-enabled series authorization, as the journal stores it (M1-354).
+
+    Read back out of the ledger, so every field is checked on the way in: a malformed row is
+    a :class:`StorageFailure`, never a guess about what the owner authorized.
+    """
+
+    series_id: str
+    account_id: int
+    follow: str
+    budget_microusd: int
+    project_budget_microusd: int
+    ends: datetime
+    config_sha256: str
+    prompt_sha256: str
+
+
+def _series_from(data: object) -> Series:
+    fields = data if type(data) is dict else {}
+    ends: datetime | None = None
+    raw_ends = fields.get("ends")
+    if type(raw_ends) is str:
+        try:
+            ends = datetime.fromisoformat(raw_ends)
+        except ValueError:
+            ends = None
+    if (
+        type(fields.get("series_id")) is not str
+        or type(fields.get("account_id")) is not int
+        or type(fields.get("follow")) is not str
+        or type(fields.get("budget_microusd")) is not int
+        or fields["budget_microusd"] <= 0
+        or type(fields.get("project_budget_microusd")) is not int
+        or fields["project_budget_microusd"] <= 0
+        or ends is None
+        or ends.tzinfo is None
+        or type(fields.get("config_sha256")) is not str
+        or type(fields.get("prompt_sha256")) is not str
+    ):
+        raise StorageFailure("cannot read series authorization")
+    return Series(
+        series_id=fields["series_id"],
+        account_id=fields["account_id"],
+        follow=fields["follow"],
+        budget_microusd=fields["budget_microusd"],
+        project_budget_microusd=fields["project_budget_microusd"],
+        ends=ends,
+        config_sha256=fields["config_sha256"],
+        prompt_sha256=fields["prompt_sha256"],
+    )
+
+
+def series_of(conn: sqlite3.Connection, activation: dict[str, Any]) -> Series | None:
+    """The series an activation was bound under, or None for a pinned activation.
+
+    An activation that names a series the journal does not hold is a storage failure: the
+    authorization it claims cannot be shown.
+    """
+    identifier = activation.get("series_id")
+    if identifier is None:
+        return None
+    if type(identifier) is not str:
+        raise StorageFailure("cannot read series authorization")
+    matches = [row for row in events(conn, "series", "account") if type(row) is dict]
+    found = [row for row in matches if row.get("series_id") == identifier]
+    if len(found) != 1:
+        raise StorageFailure("cannot read series authorization")
+    return _series_from(found[0])
+
+
+def series_disabled(conn: sqlite3.Connection, series: Series) -> bool:
+    return bool(events(conn, "disabled", series.series_id))
+
+
+def bound_project(conn: sqlite3.Connection, config: AppConfig) -> str:
+    """The project this profile polls: the configured one, or a followed series' latest.
+
+    A pinned profile polls exactly `metaculus.tournament.id`, as before M1-354. A following
+    profile polls whatever project its newest activation binds -- the owner's first, or one
+    the series policy bound since -- so a rollover changes no configuration and retires
+    nothing. With no activation yet it is the configured id, which `require_activation`
+    then refuses as inactive.
+    """
+    if config.metaculus.tournament.follow is None:
+        return str(config.metaculus.tournament.id)
+    active = events(conn, "activation", "account")
+    if not active:
+        return str(config.metaculus.tournament.id)
+    project = active[-1].get("project_id") if type(active[-1]) is dict else None
+    if type(project) is not int:
+        raise StorageFailure("cannot read tournament activation")
+    return str(project)
 
 
 def enable(
@@ -232,6 +332,8 @@ def enable(
     starts: datetime,
     ends: datetime,
     budget_usd: float = 20.0,
+    series_budget_usd: float | None = None,
+    series_ends: datetime | None = None,
 ) -> str:
     now = utcnow()
     if (
@@ -255,20 +357,59 @@ def enable(
         raise TournamentError("activation requires the concrete configured project ID")
     if config.environment != "production" and project_id != 32977:
         raise TournamentError("testing profiles may activate only project 32977")
+    follow = config.metaculus.tournament.follow
+    if follow is None and (series_budget_usd is not None or series_ends is not None):
+        raise TournamentError("series options require a profile with tournament.follow set")
+    if follow is not None:
+        # M1-354 (D51). All or nothing: a following profile without a series would bind
+        # nothing past its first project, and silently.
+        if config.environment != "production":
+            raise TournamentError("following a series requires the production profile")
+        if (
+            series_budget_usd is None
+            or series_ends is None
+            or series_ends.tzinfo is None
+            or not 0 < series_budget_usd <= MAX_SERIES_BUDGET_USD
+            or budget_usd > series_budget_usd
+            or series_ends <= now
+            or ends > series_ends
+        ):
+            raise TournamentError(
+                "invalid series ceiling or end "
+                f"(maximum USD {MAX_SERIES_BUDGET_USD}; the project budget and window must "
+                "fit inside the series)"
+            )
     prior = events(conn, "activation", "account")
     if any(a["account_id"] != account_id for a in prior):
         raise TournamentError("this ledger is already bound to another bot account")
     check_storage(conn, config.storage.artifact_root)
-    data = {
+    bound = bindings(config)
+    data: dict[str, Any] = {
         "activation_id": uuid4().hex,
         "account_id": account_id,
         "project_id": project_id,
         "starts": starts.isoformat(),
         "ends": ends.isoformat(),
         "budget_microusd": math.floor(budget_usd * 1_000_000),
-        **bindings(config),
+        **bound,
     }
-    append(conn, "activation", "account", data)
+    if follow is not None:
+        assert series_budget_usd is not None and series_ends is not None
+        series = {
+            "series_id": uuid4().hex,
+            "account_id": account_id,
+            "follow": follow,
+            "budget_microusd": math.floor(series_budget_usd * 1_000_000),
+            "project_budget_microusd": data["budget_microusd"],
+            "ends": series_ends.isoformat(),
+            **bound,
+        }
+        data.update(series_id=series["series_id"], follow=follow, bound_by="owner")
+        with storage_transaction(conn):
+            append(conn, "series", "account", series)
+            append(conn, "activation", "account", data)
+    else:
+        append(conn, "activation", "account", data)
     return str(data["activation_id"])
 
 
@@ -276,6 +417,11 @@ def disable(conn: sqlite3.Connection) -> None:
     active = events(conn, "activation", "account")
     if active:
         append(conn, "disabled", active[-1]["activation_id"], {})
+        # M1-354: disabling a followed project also stops its series, or the next rollover
+        # would bind a fresh, enabled activation behind the owner's back.
+        series = active[-1].get("series_id") if type(active[-1]) is dict else None
+        if type(series) is str:
+            append(conn, "disabled", series, {})
 
 
 def retired_bindings(
@@ -289,15 +435,30 @@ def retired_bindings(
     ledger and are untrusted.
     """
     computed = bindings(config)
+    tournament = config.metaculus.tournament
     moved: list[RetiredBinding] = []
     if activation.get("account_id") != account_id:
         moved.append("account")
-    if (
-        str(activation.get("project_id")) != project_id
-        or str(config.metaculus.tournament.id) != project_id
-        or config.metaculus.tournament.use_sdk_current_id
-        or (config.environment != "production" and project_id != "32977")
-    ):
+    if tournament.follow is None:
+        destination_moved = (
+            str(activation.get("project_id")) != project_id
+            or str(tournament.id) != project_id
+            or tournament.use_sdk_current_id
+            or (config.environment != "production" and project_id != "32977")
+        )
+    else:
+        # M1-354: a following profile's configured id is only where the series started.
+        # The destination holds when the activation was bound under a series that follows
+        # what this config follows -- by the owner or by the series policy -- and it is the
+        # project being polled.
+        destination_moved = (
+            str(activation.get("project_id")) != project_id
+            or activation.get("follow") != tournament.follow
+            or type(activation.get("series_id")) is not str
+            or tournament.use_sdk_current_id
+            or config.environment != "production"
+        )
+    if destination_moved:
         moved.append("destination")
     if activation.get("config_sha256") != computed["config_sha256"]:
         moved.append("configuration")
@@ -365,6 +526,35 @@ def spending(conn: sqlite3.Connection, scope: str) -> tuple[int, int]:
     reserved = _amounts(events(conn, "cost_reserved", scope), "estimate_microusd")
     settled = dict(_amounts(events(conn, "cost_settled", scope), "actual_microusd"))
     for identifier, amount in _amounts(events(conn, "cost_corrected", scope), "actual_microusd"):
+        if identifier in settled:
+            settled[identifier] = max(settled[identifier], amount)
+    actual = sum(settled.values())
+    held = sum(amount for identifier, amount in reserved if identifier not in settled)
+    return actual, held
+
+
+def series_spending(conn: sqlite3.Connection, series_id: str) -> tuple[int, int]:
+    """``(actual, held)`` micro-USD for every reservation made under one series (M1-354).
+
+    A reservation belongs to a series when :meth:`Budget.reserve` stamped its id on it, so
+    spend made before the series was enabled -- on the same project -- is not counted, which
+    is D51's "counted from enablement". Settlements and corrections apply exactly as
+    :func:`spending` applies them; they carry no series, and are matched by reservation.
+    """
+    rows = [data for _, data in _journal_rows(conn, "cost_reserved")]
+    mine = [row for row in rows if type(row) is dict and row.get("series_id") == series_id]
+    reserved = _amounts(mine, "estimate_microusd")
+    ids = {identifier for identifier, _ in reserved}
+    settled = {
+        identifier: amount
+        for identifier, amount in _amounts(
+            [data for _, data in _journal_rows(conn, "cost_settled")], "actual_microusd"
+        )
+        if identifier in ids
+    }
+    for identifier, amount in _amounts(
+        [data for _, data in _journal_rows(conn, "cost_corrected")], "actual_microusd"
+    ):
         if identifier in settled:
             settled[identifier] = max(settled[identifier], amount)
     actual = sum(settled.values())
@@ -666,6 +856,11 @@ class Budget:
     scope: str
     ceiling: int
     secret_names: tuple[str, ...] = ()
+    # M1-354: the series this budget's activation was bound under, and its ceiling. Every
+    # reservation is stamped with the id and refused past the ceiling, in the same
+    # transaction as the per-project check.
+    series_id: str | None = None
+    series_ceiling: int = 0
 
     def reserve(self, provider: str, estimate: float, request: Any) -> str:
         if not math.isfinite(estimate) or estimate <= 0:
@@ -677,6 +872,7 @@ class Budget:
         # outside it: this block holds BEGIN IMMEDIATE, and an HTTP POST inside it would
         # serialize every other process's budget check behind a third party's latency.
         crossed: int | None = None
+        series_crossed: int | None = None
         try:
             # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
             with storage_transaction(self.conn):
@@ -688,18 +884,40 @@ class Budget:
                     # condition that has already stopped a paid call from happening.
                     crossed = 100
                     raise TournamentError("round budget exhausted; no provider call made")
+                reservation: dict[str, Any] = {
+                    "reservation_id": identifier,
+                    "provider": provider,
+                    "estimate_microusd": amount,
+                }
+                if self.series_id is not None:
+                    series_actual, series_held = series_spending(self.conn, self.series_id)
+                    series_used = series_actual + series_held + amount
+                    if series_used > self.series_ceiling:
+                        series_crossed = 100
+                        raise TournamentError("series budget exhausted; no provider call made")
+                    series_crossed = budget_level_crossed(series_used, self.series_ceiling)
+                    reservation["series_id"] = self.series_id
                 crossed = budget_level_crossed(actual + held + amount, self.ceiling)
-                append(
-                    self.conn,
-                    "cost_reserved",
-                    self.scope,
-                    {
-                        "reservation_id": identifier,
-                        "provider": provider,
-                        "estimate_microusd": amount,
-                    },
-                )
+                append(self.conn, "cost_reserved", self.scope, reservation)
         finally:
+            if series_crossed is not None and self.series_id is not None:
+                # The series' own threshold, beside the project's. The subject carries the
+                # series id so each series pages on its own levels; the id is never sent.
+                emit(
+                    "budget_threshold",
+                    subject=f"series-{self.series_id}-{series_crossed}",
+                    title=f"whiskeyjack: series budget at {series_crossed}%",
+                    body=(
+                        f"Spending across the followed MiniBench series has reached "
+                        f"{series_crossed}% of its ceiling. Reserved spend counts toward "
+                        f"this. "
+                        + (
+                            "The ceiling is reached: paid calls are being refused."
+                            if series_crossed == 100
+                            else "Check `tournament status` for the split."
+                        )
+                    ),
+                )
             # `finally` so the exhaustion refusal above is reported too -- that is the
             # alert an operator most needs, and it is only reachable on the raising path.
             if crossed is not None:
