@@ -16005,3 +16005,98 @@ were mutation-checked against a non-atomic version, and both fail on it. `_rebin
 The partial-disable blocker is closed, and the reviewer confirmed the `enable` sibling is
 transactional and tested. The only change after the approved commit is this note and the
 backlog row flipped to `Done`.
+
+## M1-355 (D51) — An AskNews sub-cap inside the series
+
+### What shipped
+
+`tournament enable` on a following profile takes a required `--asknews-budget-usd`: above zero,
+at most `--series-budget-usd`, floored to whole micro-USD and stored on the series event as
+`asknews_budget_microusd`. A pinned profile that passes it is refused, like the other series
+options.
+
+`Budget.reserve` for provider `asknews` sums AskNews spend under the series
+(`series_spending(conn, series_id, "asknews")`: the same stamped `cost_reserved` rows, matched on
+the `provider` they already carry, settlements and corrections applied by reservation id) in the
+same `BEGIN IMMEDIATE` as the project and series checks. A reservation that would take it past
+the sub-cap raises `AskNewsSubcapReached`, a `TournamentError` subclass of its own, and writes
+nothing.
+
+`retrieve_news` catches exactly that subtype around `begin_call`, stops the pass, and returns
+what it has. It sets **no** failure flag (see the first decision). The orchestrator is unchanged:
+with nothing retained the Exa fallback already runs. `tournament status` reports
+`series.asknews` (`sub_cap_usd`, `actual_cost_usd`, `reserved_cost_usd`, `remaining_budget_usd`).
+Two pages, `AskNews sub-cap at 80%` and `at 100%`, each keyed on the series and the level. The
+runbook documents both and the degrade.
+
+### Decision — a sub-cap refusal is a skip, not a provider failure
+
+My first version set `provider_failed` and a new `subcap_reached` failure literal so the existing
+fallback would run. The mutation pass showed the flag was inert (Exa ran without it), and reading
+`pipeline_live` showed it was also wrong in two ways. `decide_fallback`'s own docstring forbids
+persisting `primary_provider_failed` when the primary did not fail, and `any_provider_failed`
+turns an empty result into a transient `provider_error` that retries until the last attempt, with
+Exa bought again each time. The sub-cap is the owner's limit working. So the primary run's
+`error_summary` says `stopped by the series AskNews sub-cap`, `provider_failed` stays False,
+and an empty Exa answer is `no_documents`: recorded evidence-poor at once, never retried. A test
+pins the recorded reasons and the `evidence_poor` marker.
+
+### Decision — only 80 and 100, not the shared levels
+
+`notify.BUDGET_THRESHOLD_PERCENTS` is `(80, 50)` and `budget_level_crossed` would have paged the
+sub-cap at 50%. D51 and the criterion say 80% and 100%, so the sub-cap has its own
+`ASKNEWS_PAGE_PERCENT = 80`; 100 is the refusal itself, as for the other ceilings. The throttle is
+the existing per-subject window (a day), keyed `series-<id>-asknews-<level>`. "Once" therefore
+means once per day while the condition holds, the same reading M1-354 gave the series page.
+
+### Decision — a series row with no sub-cap key reads back as "no sub-cap"
+
+The live series (`46a47ab5…`, enabled 2026-09-27) predates this item and has no such key.
+Refusing it would stop the worker at the next poll after deploy; inventing a value would invent an
+owner authorization. So an absent key is `None`, a present one must be an exact `int` in
+`1..budget`, and `tournament status` prints `series.asknews: null`. **Giving the live series a
+sub-cap means a new `enable`, which starts a new series, and its $80 counts from that moment.**
+That is an owner decision; see the standing risk.
+
+### Rejected — an `AppConfig` field for the sub-cap
+
+D41 and `docs/LESSONS.md`: any new field changes `config_sha256` and retires the live activation.
+The owner passes it at enable, as D51 says.
+
+### Rejected — an event that amends a series' sub-cap
+
+It would let the live series gain a cap without a new series. It is also a second writer of
+authorization state, with its own replay and approval story, for a one-off migration. Deferred
+below rather than built.
+
+### Deferred (do not read the absence as an omission)
+
+- **Amending the sub-cap on a live series.** See above; a backlog candidate if the owner does
+  not want the series' $80 to restart.
+- **Exa is not capped separately.** Only the series and project ceilings bound it.
+- **A sub-cap that is hit mid-question** keeps the AskNews documents from the calls already
+  made, and Exa runs only if those are empty or a named source is required. The live path has one
+  query and one strategy, so this is reachable only by calling `retrieve_news` directly.
+
+### Standing risk — not verifiable offline
+
+- **The live series has no sub-cap until the owner re-enables.** Deploying changes no `AppConfig`
+  field, so nothing retires, and nothing is bounded either.
+- The 80% page fires on a *reservation*, which is held at the 25000-micro-USD estimate until it
+  settles, so it can arrive a few calls before settled spend reaches 80%.
+
+### Mutation pass — thirty-eight mutants
+
+One-line edits to `src/`, run after the work was committed, against `test_asknews_subcap.py` and
+`test_follow.py`.
+- **Pass 1, 29 mutants: 27 dead, 2 survivors.** `math.isfinite` in `enable` was dead code (`nan` and
+  `inf` already fail `0 < x <= ceiling`), so I removed it. "No fallback flag" survived because Exa
+  runs on no documents anyway, which led to the first decision.
+- **Pass 2, nine mutants after the redesign: six dead, three survivors.** One was a dead result
+  field nothing read, now removed. One was `0 <` in the sub-cap check, an equivalent mutant: the
+  floor-to-zero guard refuses zero and negatives. One, the outer-loop `subcap_reached` check, was
+  unreachable through `run_once` because production derives one query; a test now drives
+  `retrieve_news` with three and counts reservation attempts, and it kills.
+- Properties in `tests/property/test_series_subcap_properties.py`: the stored value is read back
+  iff an exact `int` in `1..budget`, only `StorageFailure` escapes, no value is echoed, and a
+  reachability `find` for each of accept, refuse, bool and float.
