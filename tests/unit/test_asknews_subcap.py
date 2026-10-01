@@ -518,6 +518,26 @@ def test_the_100_percent_page_fires_once_at_the_refusal_and_not_again_while_it_h
     assert len(pushes.matching("AskNews sub-cap at 80%")) == 1
 
 
+def test_a_reservation_that_lands_exactly_on_the_sub_cap_pages_at_100_not_80(
+    series: Any,
+) -> None:
+    """Round 1: an accepted reservation that reaches the cap exactly is 100% spent, and the
+    only page was the 80% one -- the 100% page needed a later, refused attempt."""
+    from whiskeyjack_bot.notify import notifier_context
+
+    budget = _budget(series)
+    notifier, pushes = _notifier(series)
+    with notifier_context(notifier):
+        budget.reserve("asknews", 0.975, {})
+        pushes.sent.clear()
+        budget.reserve("asknews", 0.025, {})  # exactly the sub-cap: accepted
+        assert pushes.titles() == ["whiskeyjack: AskNews sub-cap at 100%"]
+        # The refusal that follows is the same level on the same series: still one page.
+        with pytest.raises(AskNewsSubcapReached):
+            budget.reserve("asknews", 0.000001, {})
+    assert len(pushes.matching("AskNews sub-cap at 100%")) == 1
+
+
 def test_a_second_series_pages_on_its_own_levels(series: Any, tmp_path: Path) -> None:
     from whiskeyjack_bot.notify import notifier_context
 

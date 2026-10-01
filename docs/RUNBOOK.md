@@ -375,8 +375,9 @@ settles** — the same way the series ceiling counts — and, like it, only from
 
 - **80%.** One push, `whiskeyjack: AskNews sub-cap at 80%`, when the held-plus-settled AskNews
   spend first reaches 80% of the sub-cap. Nothing is refused yet.
-- **100%.** A reservation that would take AskNews spend past the sub-cap is refused, and one push,
-  `whiskeyjack: AskNews sub-cap at 100%`, says so. **That refusal does not fail the question.**
+- **100%.** One push, `whiskeyjack: AskNews sub-cap at 100%`, when a reservation takes AskNews
+  spend exactly to the sub-cap, or when one that would take it past is refused (whichever comes
+  first; the two share one throttled page). A refused reservation is not made. **That refusal does not fail the question.**
   Research stops asking AskNews and the Exa fallback runs (it runs whenever AskNews returns no
   document); the question is forecast on what Exa finds, or recorded evidence-poor
   (`no_documents`, [M1-349](#r1--research_failed)) if it finds nothing. This is the cap working,

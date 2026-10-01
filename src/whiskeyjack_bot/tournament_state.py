@@ -969,7 +969,11 @@ class Budget:
                             raise AskNewsSubcapReached(
                                 "AskNews sub-cap reached; no provider call made"
                             )
-                        if news_used * 100 >= self.asknews_ceiling * ASKNEWS_PAGE_PERCENT:
+                        if news_used >= self.asknews_ceiling:
+                            # Landing exactly on the sub-cap is accepted but is 100% spent:
+                            # the page cannot wait for a later, refused attempt.
+                            asknews_crossed = 100
+                        elif news_used * 100 >= self.asknews_ceiling * ASKNEWS_PAGE_PERCENT:
                             asknews_crossed = ASKNEWS_PAGE_PERCENT
                 crossed = budget_level_crossed(actual + held + amount, self.ceiling)
                 append(self.conn, "cost_reserved", self.scope, reservation)
