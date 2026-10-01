@@ -399,9 +399,13 @@ def test_when_exa_finds_nothing_either_the_question_is_recorded_evidence_poor_no
 def test_a_refused_pass_asks_once_not_once_per_query(
     series: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A refused reservation ends the AskNews pass; it is not retried for each further query
-    (which would also re-emit the page)."""
-    _, config, *_ = series
+    """A refused reservation ends the AskNews pass; it is not retried for each further query.
+    Production derives one query, so this drives ``retrieve_news`` with several directly."""
+    from whiskeyjack_bot.research.asknews import retrieve_news
+    from whiskeyjack_bot.tournament_state import budget_context
+
+    conn, config, _, news, _ = series
+    assert config.retrieval.max_queries_per_question >= 3
     asked: list[str] = []
     original = Budget.reserve
 
@@ -410,10 +414,18 @@ def test_a_refused_pass_asks_once_not_once_per_query(
         return original(self, provider, estimate, request)
 
     monkeypatch.setattr(Budget, "reserve", counting)
-    _seed(series, FIRST, "asknews", 20_000_000)
-    _poll_with_exa(series, _Exa(), answer(NEXT))
-    assert asked.count("asknews") == 1
-    assert config.retrieval.max_queries_per_question > 1
+    _seed(series, FIRST, "asknews", SUBCAP)
+    with budget_context(_budget(series, NEXT)):
+        result = retrieve_news(
+            news,
+            config,
+            question_id=91001,
+            queries=["first query", "second query", "third query"],
+            retrieval_run_id="run-subcap",
+            now=tournament_state.utcnow(),
+        )
+    assert asked == ["asknews"] and news.calls == 0
+    assert result.provider_failed is False and result.documents == ()
 
 
 def test_under_the_sub_cap_asknews_is_used_and_exa_is_not_bought(series: Any) -> None:
