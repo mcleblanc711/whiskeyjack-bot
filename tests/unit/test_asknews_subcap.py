@@ -396,6 +396,26 @@ def test_when_exa_finds_nothing_either_the_question_is_recorded_evidence_poor_no
     assert marker.get("reason") in (None, "no_documents")
 
 
+def test_a_refused_pass_asks_once_not_once_per_query(
+    series: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused reservation ends the AskNews pass; it is not retried for each further query
+    (which would also re-emit the page)."""
+    _, config, *_ = series
+    asked: list[str] = []
+    original = Budget.reserve
+
+    def counting(self: Budget, provider: str, estimate: float, request: Any) -> str:
+        asked.append(provider)
+        return original(self, provider, estimate, request)
+
+    monkeypatch.setattr(Budget, "reserve", counting)
+    _seed(series, FIRST, "asknews", 20_000_000)
+    _poll_with_exa(series, _Exa(), answer(NEXT))
+    assert asked.count("asknews") == 1
+    assert config.retrieval.max_queries_per_question > 1
+
+
 def test_under_the_sub_cap_asknews_is_used_and_exa_is_not_bought(series: Any) -> None:
     _, _, platform, news, _ = series
     exa = _Exa()

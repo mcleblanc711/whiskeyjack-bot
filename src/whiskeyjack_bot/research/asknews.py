@@ -230,9 +230,6 @@ class AskNewsRetrieval:
     # What the failed call was (M1-332), or None when no call failed. Set exactly when
     # `provider_failed` is: see `classify_failure`.
     failure: AskNewsFailure | None
-    # M1-355: a reservation was refused by the series' AskNews sub-cap, so the pass stopped
-    # early without a call. Not a failure: `provider_failed` stays False.
-    subcap_reached: bool = False
 
 
 def classify_failure(exc: BaseException) -> AskNewsFailure:
@@ -574,7 +571,6 @@ def retrieve_news(
         provider_failed=provider_failed,
         calls_attempted=calls_attempted,
         failure=failure,
-        subcap_reached=subcap_reached,
     )
 
 
