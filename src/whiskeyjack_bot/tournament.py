@@ -588,6 +588,18 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
                 "remaining_budget_usd": max(0, series.budget_microusd - series_actual - series_held)
                 / 1_000_000,
             }
+            subcap = series.asknews_budget_microusd
+            if subcap is None:
+                # Enabled before M1-355: no AskNews share was recorded, and none is invented.
+                data["series"]["asknews"] = None
+            else:
+                news_actual, news_held = series_spending(conn, series.series_id, "asknews")
+                data["series"]["asknews"] = {
+                    "sub_cap_usd": subcap / 1_000_000,
+                    "actual_cost_usd": news_actual / 1_000_000,
+                    "reserved_cost_usd": news_held / 1_000_000,
+                    "remaining_budget_usd": max(0, subcap - news_actual - news_held) / 1_000_000,
+                }
     # This is a local configuration/storage check, not live credential verification.
     try:
         require_activation(
@@ -812,6 +824,7 @@ def run_once(
             tuple(config.secret_env_var_names()),
             series_id=None if series is None else series.series_id,
             series_ceiling=0 if series is None else series.budget_microusd,
+            asknews_ceiling=None if series is None else series.asknews_budget_microusd,
         )
         try:
             prompt = load_prompt(

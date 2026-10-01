@@ -349,6 +349,11 @@ def build_parser() -> argparse.ArgumentParser:
                 help="ceiling across every project a followed series binds (follow mode)",
             )
             command.add_argument(
+                "--asknews-budget-usd",
+                type=float,
+                help="AskNews share of the series ceiling; required in follow mode (M1-355)",
+            )
+            command.add_argument(
                 "--series-ends",
                 help="UTC ISO timestamp after which the series binds nothing (follow mode)",
             )
@@ -2081,6 +2086,7 @@ def _run_tournament(args: argparse.Namespace) -> int:
                     ends=datetime.fromisoformat(args.ends.replace("Z", "+00:00")),
                     budget_usd=args.budget_usd,
                     series_budget_usd=args.series_budget_usd,
+                    asknews_budget_usd=args.asknews_budget_usd,
                     series_ends=(
                         None
                         if args.series_ends is None

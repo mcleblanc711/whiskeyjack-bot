@@ -107,6 +107,9 @@ AskNewsFailure = Literal[
     "provider_unavailable",
     "provider_error",
     "transient",
+    # Not a provider response: the series' AskNews sub-cap refused the reservation before
+    # any call was made (M1-355). Never produced by `classify_failure`.
+    "subcap_reached",
 ]
 
 # The module whose classes are matched, and the classes, by NAME. Restricted by module so a
@@ -132,9 +135,10 @@ _SDK_CLASSES: Final[dict[str, AskNewsFailure]] = {
 _HTTPX_CLASSES: Final[dict[str, AskNewsFailure]] = {
     "TimeoutException": "provider_unavailable",
 }
-assert set(_SDK_CLASSES.values()) | set(_HTTPX_CLASSES.values()) | {"transient"} == set(
-    get_args(AskNewsFailure)
-)
+assert set(_SDK_CLASSES.values()) | set(_HTTPX_CLASSES.values()) | {
+    "transient",
+    "subcap_reached",
+} == set(get_args(AskNewsFailure))
 
 # What each failure tells an operator, for the `provider_failed` alert (M1-332). Constants
 # only. "Quota" appears only where the class cannot rule it out, and never as a certainty.
@@ -165,6 +169,11 @@ FAILURE_ADVICE: Final[dict[AskNewsFailure, str]] = {
         "AskNews returned an error the pinned SDK does not name (a 5xx, or an unlisted "
         "status such as 402). It may be an outage or a billing refusal -- check the "
         "AskNews dashboard if it repeats."
+    ),
+    "subcap_reached": (
+        "The series' AskNews sub-cap refused the call before it was made; research "
+        "continued on the Exa fallback. Raise it by re-running `tournament enable` only if "
+        "the owner approves more AskNews spend."
     ),
     "transient": (
         "The call failed without a provider error response (a dropped connection or an "
@@ -438,6 +447,7 @@ def retrieve_news(
             break
         for strategy in _STRATEGIES:
             from whiskeyjack_bot.research.durable import begin_call, complete_call
+            from whiskeyjack_bot.tournament_state import AskNewsSubcapReached
 
             request: dict[str, Any] = {
                 "query": query,
@@ -447,15 +457,24 @@ def retrieve_news(
                 "hours_back": hours_back,
                 "historical": strategy == _STRATEGY_HISTORICAL,
             }
-            call_scope, cached = begin_call(
-                "asknews",
-                # M1-337: credits x rate, never a literal. Only the news pass is issued
-                # (M1-352), so there is one estimate.
-                NEWS_CALL_ESTIMATE_USD,
-                request,
-                question_id,
-                now_utc.isoformat(),
-            )
+            try:
+                call_scope, cached = begin_call(
+                    "asknews",
+                    # M1-337: credits x rate, never a literal. Only the news pass is issued
+                    # (M1-352), so there is one estimate.
+                    NEWS_CALL_ESTIMATE_USD,
+                    request,
+                    question_id,
+                    now_utc.isoformat(),
+                )
+            except AskNewsSubcapReached:
+                # M1-355 (D51). Refused before any call: nothing was billed for this
+                # request. Reported like a provider failure so the orchestrator runs the Exa
+                # fallback; an unanswered question is worth less than an evidence-poor one
+                # (M1-349). Only this subtype -- the round and series ceilings still raise.
+                failure = "subcap_reached"
+                provider_failed = True
+                break
             try:
                 if cached is not None:
                     from asknews_sdk.dto.news import SearchResponse
