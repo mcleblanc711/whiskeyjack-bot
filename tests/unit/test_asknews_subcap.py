@@ -290,6 +290,7 @@ class _Exa:
 
     def __init__(self) -> None:
         self.requests = 0
+        self.empty = False
         self.title = ""  # the polled question's own title, set by ``_poll_with_exa``
 
     def client(self) -> httpx.Client:
@@ -303,7 +304,9 @@ class _Exa:
                 json={
                     # Two sources: the fake model's reply cites `src-001` and `src-002`, and a
                     # packet that lacks the second is refused as schema-invalid.
-                    "results": [
+                    "results": []
+                    if self.empty
+                    else [
                         {
                             "title": self.title,
                             "url": url,
@@ -359,12 +362,38 @@ def test_the_primary_run_names_the_sub_cap_and_the_exa_run_is_recorded(series: A
     _seed(series, FIRST, "asknews", 20_000_000)
     _poll_with_exa(series, _Exa(), answer(NEXT))
     rows = conn.execute(
-        "SELECT provider, error_summary FROM research_runs ORDER BY started_at_utc, rowid"
+        "SELECT provider, error_summary, provider_config_json FROM research_runs"
     ).fetchall()
     providers = [row[0] for row in rows]
     assert providers.count("asknews") == 1 and providers.count("exa") == 1
     news = next(row for row in rows if row[0] == "asknews")
-    assert "subcap_reached" in news[1]
+    assert "AskNews sub-cap" in news[1] and "provider call failed" not in news[1]
+    # Not an outage, so the fallback's recorded reason must not claim one.
+    reasons = json.loads(next(row for row in rows if row[0] == "exa")[2])["fallback_reasons"]
+    assert "primary_returned_no_documents" in reasons
+    assert "primary_provider_failed" not in reasons
+
+
+def test_when_exa_finds_nothing_either_the_question_is_recorded_evidence_poor_not_failed(
+    series: Any,
+) -> None:
+    """The sub-cap is a skip, not an outage: nothing here is a transient `provider_error`
+    to retry, so the empty answer is `no_documents` and the question is forecast."""
+    conn, _, platform, *_ = series
+    _seed(series, FIRST, "asknews", 20_000_000)
+    exa = _Exa()
+    exa.empty = True
+    result = _poll_with_exa(series, exa, answer(NEXT))
+    qid = platform.raw["question"]["id"]
+    assert events(conn, "question_failure", f"{NEXT}:{qid}") == []
+    assert result["heartbeat"]["failures"] == 0 and platform.posts == 1
+    # Scoped to the record, so read by kind rather than by question.
+    (marker,) = [
+        json.loads(row[0])
+        for row in conn.execute("SELECT data FROM tournament_events WHERE kind='evidence_gap'")
+    ]
+    assert marker["code"] == "evidence_poor"
+    assert marker.get("reason") in (None, "no_documents")
 
 
 def test_under_the_sub_cap_asknews_is_used_and_exa_is_not_bought(series: Any) -> None:

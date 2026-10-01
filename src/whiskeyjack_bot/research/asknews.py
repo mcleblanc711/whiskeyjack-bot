@@ -107,9 +107,6 @@ AskNewsFailure = Literal[
     "provider_unavailable",
     "provider_error",
     "transient",
-    # Not a provider response: the series' AskNews sub-cap refused the reservation before
-    # any call was made (M1-355). Never produced by `classify_failure`.
-    "subcap_reached",
 ]
 
 # The module whose classes are matched, and the classes, by NAME. Restricted by module so a
@@ -135,10 +132,9 @@ _SDK_CLASSES: Final[dict[str, AskNewsFailure]] = {
 _HTTPX_CLASSES: Final[dict[str, AskNewsFailure]] = {
     "TimeoutException": "provider_unavailable",
 }
-assert set(_SDK_CLASSES.values()) | set(_HTTPX_CLASSES.values()) | {
-    "transient",
-    "subcap_reached",
-} == set(get_args(AskNewsFailure))
+assert set(_SDK_CLASSES.values()) | set(_HTTPX_CLASSES.values()) | {"transient"} == set(
+    get_args(AskNewsFailure)
+)
 
 # What each failure tells an operator, for the `provider_failed` alert (M1-332). Constants
 # only. "Quota" appears only where the class cannot rule it out, and never as a certainty.
@@ -169,11 +165,6 @@ FAILURE_ADVICE: Final[dict[AskNewsFailure, str]] = {
         "AskNews returned an error the pinned SDK does not name (a 5xx, or an unlisted "
         "status such as 402). It may be an outage or a billing refusal -- check the "
         "AskNews dashboard if it repeats."
-    ),
-    "subcap_reached": (
-        "The series' AskNews sub-cap refused the call before it was made; research "
-        "continued on the Exa fallback. Raise it by re-running `tournament enable` only if "
-        "the owner approves more AskNews spend."
     ),
     "transient": (
         "The call failed without a provider error response (a dropped connection or an "
@@ -239,6 +230,9 @@ class AskNewsRetrieval:
     # What the failed call was (M1-332), or None when no call failed. Set exactly when
     # `provider_failed` is: see `classify_failure`.
     failure: AskNewsFailure | None
+    # M1-355: a reservation was refused by the series' AskNews sub-cap, so the pass stopped
+    # early without a call. Not a failure: `provider_failed` stays False.
+    subcap_reached: bool = False
 
 
 def classify_failure(exc: BaseException) -> AskNewsFailure:
@@ -436,6 +430,7 @@ def retrieve_news(
     dropped = 0
     collapsed = 0
     provider_failed = False
+    subcap_reached = False
     failure: AskNewsFailure | None = None
     # Counted at the point of the request, so the one that raises is included: it
     # reached the provider and may well have been billed. Same rule as
@@ -443,7 +438,7 @@ def retrieve_news(
     calls_attempted = 0
 
     for query in capped_queries:
-        if provider_failed:
+        if provider_failed or subcap_reached:
             break
         for strategy in _STRATEGIES:
             from whiskeyjack_bot.research.durable import begin_call, complete_call
@@ -468,12 +463,15 @@ def retrieve_news(
                     now_utc.isoformat(),
                 )
             except AskNewsSubcapReached:
-                # M1-355 (D51). Refused before any call: nothing was billed for this
-                # request. Reported like a provider failure so the orchestrator runs the Exa
-                # fallback; an unanswered question is worth less than an evidence-poor one
-                # (M1-349). Only this subtype -- the round and series ceilings still raise.
-                failure = "subcap_reached"
-                provider_failed = True
+                # M1-355 (D51). Refused before any call, so nothing was billed for this
+                # request. The owner's own limit working, not the provider failing: not
+                # `provider_failed`, which would persist a `primary_provider_failed`
+                # fallback reason that is false and make an empty answer retry as a
+                # transient outage. With nothing retained the Exa fallback runs anyway
+                # (`primary_returned_no_documents`); an unanswered question is worth less
+                # than an evidence-poor one (M1-349). Only this subtype -- the round and
+                # series ceilings still raise.
+                subcap_reached = True
                 break
             try:
                 if cached is not None:
@@ -556,7 +554,9 @@ def retrieve_news(
             "started_at_utc": now_utc,
             "completed_at_utc": now_utc,
             "freshness_cutoff_utc": freshness_cutoff_utc,
-            "error_summary": _error_summary(failure=failure, retained=len(documents)),
+            "error_summary": _error_summary(
+                failure=failure, retained=len(documents), subcap_reached=subcap_reached
+            ),
             # Still None when calls were made. Since M1-336 each call's reservation
             # settles in the tournament journal from its own `usage.credits`; putting
             # the sum on the run row as well is deferred (see the M1-336 notes), and
@@ -574,10 +574,13 @@ def retrieve_news(
         provider_failed=provider_failed,
         calls_attempted=calls_attempted,
         failure=failure,
+        subcap_reached=subcap_reached,
     )
 
 
-def _error_summary(*, failure: AskNewsFailure | None, retained: int) -> str | None:
+def _error_summary(
+    *, failure: AskNewsFailure | None, retained: int, subcap_reached: bool = False
+) -> str | None:
     """Describe an actual failure, or return None for a successful run.
 
     Scoped to the schema's own meaning for this field — "set when the run failed
@@ -597,6 +600,8 @@ def _error_summary(*, failure: AskNewsFailure | None, retained: int) -> str | No
     if failure is not None:
         named = failure if failure in get_args(AskNewsFailure) else "transient"
         parts.append(f"provider call failed ({named}); retrieval stopped early")
+    if subcap_reached:
+        parts.append("stopped by the series AskNews sub-cap; no call made past it")
     if retained == 0:
         parts.append("no documents retained")
     return "; ".join(parts) if parts else None

@@ -411,7 +411,6 @@ def enable(
         # defaulted. At most the series ceiling; a whole number of micro-USD above zero.
         if (
             asknews_budget_usd is None
-            or not math.isfinite(asknews_budget_usd)
             or not 0 < asknews_budget_usd <= series_budget_usd
             or math.floor(asknews_budget_usd * 1_000_000) <= 0
         ):

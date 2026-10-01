@@ -644,14 +644,7 @@ def retrieve_for_question(
                 question_id,
                 ", ".join(decision.reasons),
             )
-            if (
-                "primary_provider_failed" in decision.reasons
-                and primary.failure != "subcap_reached"
-            ):
-                # Not on the series' own AskNews sub-cap (M1-355): that refusal has its own
-                # page, and a provider-failure alert per question would say the provider
-                # broke when the owner's own limit did exactly what it was set to do.
-                #
+            if "primary_provider_failed" in decision.reasons:
                 # The reason LIST, not the bare fact of a fallback (M1-327). A fallback on
                 # `official_source_required` is the design working -- the question named a
                 # resolution authority and Exa is how we look for it -- and paging on it
