@@ -16100,3 +16100,18 @@ One-line edits to `src/`, run after the work was committed, against `test_asknew
 - Properties in `tests/property/test_series_subcap_properties.py`: the stored value is read back
   iff an exact `int` in `1..budget`, only `StorageFailure` escapes, no value is echoed, and a
   reachability `find` for each of accept, refuse, bool and float.
+
+### Round 1 — CHANGES REQUESTED on `c8bcc02`, one blocker
+
+**The 100% page was missed when a reservation landed exactly on the sub-cap.** An accepted
+reservation that takes AskNews spend to exactly the sub-cap is 100% spent, but only the refusal
+path selected the 100% level, so the series could reach its cap with only an 80% page sent.
+Reproduced at the reviewed commit (975,000 held, 1,000,000 sub-cap, 25,000 estimate: one 80% page,
+no 100%), and the review named HEAD, so it was not stale. My earlier "no 100% page" mutant
+had died only on the refusal path, so the exact-landing case was never constructed.
+
+Fix: an accepted reservation with `news_used >= ceiling` pages at 100, otherwise at 80 when past
+the 80% line; both share the series' throttle, so the refusal that follows is not a second page.
+The runbook sentence that said the 100% page fires at a refusal is corrected. New test fails
+before the fix and passes after; four mutants on the new branch (`>=`→`>`, the 100 arm
+disabled, `elif`→`if`, the 80 band dropped) all die.
