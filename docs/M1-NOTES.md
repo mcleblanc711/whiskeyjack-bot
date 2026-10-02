@@ -16115,3 +16115,26 @@ the 80% line; both share the series' throttle, so the refusal that follows is no
 The runbook sentence that said the 100% page fires at a refusal is corrected. New test fails
 before the fix and passes after; four mutants on the new branch (`>=`→`>`, the 100 arm
 disabled, `elif`→`if`, the 80 band dropped) all die.
+
+### Round 2 — CHANGES REQUESTED on `1ceb65f`, one blocker, caused by the round-1 fix
+
+**The round-1 fix suppressed the 80% page.** The `if`/`elif` made the two levels exclusive, so a
+reservation from below 80% to exactly the sub-cap selected only 100; before the fix that landing
+selected 80, so the criterion's two pages became one on this branch. Reproduced at the reviewed
+commit by execution (sub-cap 1.00, one 1.00 reservation: one page, "at 100%", none at 80%). The
+review named `1ceb65f`, which was HEAD, so it was not stale. My round-1 test pre-seeded 0.975, which
+was already past 80%, so it never held the zero-to-cap case that makes both levels cross at once.
+
+Fix: `asknews_crossed` is a list, 80 and 100 selected independently and each emitted on its own
+subject (`series-<id>-asknews-<level>`), so the throttle holds each once. Only an exact landing
+reaches both: anything past the cap is refused, and a refusal carries 100 alone as before.
+New test `test_a_first_reservation_that_lands_exactly_on_the_sub_cap_pages_both_levels` fails before
+and passes after. Mutants: dropping the 80 half and dropping the 100 half both die (on older
+tests); the regression's own shape (100 replacing 80 at an exact landing) dies on the new test
+and on no other, which is the point of it.
+
+### Deliberate choices for round 3
+
+- A refusal pages at 100 only, without a back-filled 80. A series whose spend jumps from under 80%
+  straight to a refusal in one reservation never sent the 80% page. Deliberately left: it is
+  unchanged by this branch and the 100% page is the one that matters once research degrades.
