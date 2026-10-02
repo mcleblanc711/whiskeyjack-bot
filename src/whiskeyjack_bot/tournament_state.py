@@ -932,7 +932,7 @@ class Budget:
         # serialize every other process's budget check behind a third party's latency.
         crossed: int | None = None
         series_crossed: int | None = None
-        asknews_crossed: int | None = None
+        asknews_crossed: list[int] = []
         try:
             # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
             with storage_transaction(self.conn):
@@ -965,33 +965,35 @@ class Budget:
                         if news_used > self.asknews_ceiling:
                             # Its own refusal and its own exception: research degrades to
                             # the Exa fallback on this one and on no other.
-                            asknews_crossed = 100
+                            asknews_crossed = [100]
                             raise AskNewsSubcapReached(
                                 "AskNews sub-cap reached; no provider call made"
                             )
+                        # Independent, not exclusive: one reservation from below 80% to
+                        # exactly the sub-cap crosses both levels, and both pages are owed.
+                        if news_used * 100 >= self.asknews_ceiling * ASKNEWS_PAGE_PERCENT:
+                            asknews_crossed = [ASKNEWS_PAGE_PERCENT]
                         if news_used >= self.asknews_ceiling:
                             # Landing exactly on the sub-cap is accepted but is 100% spent:
                             # the page cannot wait for a later, refused attempt.
-                            asknews_crossed = 100
-                        elif news_used * 100 >= self.asknews_ceiling * ASKNEWS_PAGE_PERCENT:
-                            asknews_crossed = ASKNEWS_PAGE_PERCENT
+                            asknews_crossed.append(100)
                 crossed = budget_level_crossed(actual + held + amount, self.ceiling)
                 append(self.conn, "cost_reserved", self.scope, reservation)
         finally:
-            if asknews_crossed is not None and self.series_id is not None:
+            for level in asknews_crossed if self.series_id is not None else ():
                 # M1-355. Beside the series' own page, on its own subject so the two
                 # throttle independently; constants and the level only in the text.
                 emit(
                     "budget_threshold",
-                    subject=f"series-{self.series_id}-asknews-{asknews_crossed}",
-                    title=f"whiskeyjack: AskNews sub-cap at {asknews_crossed}%",
+                    subject=f"series-{self.series_id}-asknews-{level}",
+                    title=f"whiskeyjack: AskNews sub-cap at {level}%",
                     body=(
                         f"AskNews spending across the followed MiniBench series has reached "
-                        f"{asknews_crossed}% of its sub-cap. Reserved spend counts toward "
+                        f"{level}% of its sub-cap. Reserved spend counts toward "
                         f"this. "
                         + (
                             "The sub-cap is reached: research continues on the Exa fallback."
-                            if asknews_crossed == 100
+                            if level == 100
                             else "Check `tournament status` for the split."
                         )
                     ),

@@ -538,6 +538,28 @@ def test_a_reservation_that_lands_exactly_on_the_sub_cap_pages_at_100_not_80(
     assert len(pushes.matching("AskNews sub-cap at 100%")) == 1
 
 
+def test_a_first_reservation_that_lands_exactly_on_the_sub_cap_pages_both_levels(
+    series: Any,
+) -> None:
+    """Round 2: one reservation from zero to exactly the cap crosses 80% and 100% together.
+    The r1 fix picked 100 and could no longer select 80, so the criterion's two pages
+    became one."""
+    from whiskeyjack_bot.notify import notifier_context
+
+    budget = _budget(series)
+    notifier, pushes = _notifier(series)
+    with notifier_context(notifier):
+        budget.reserve("asknews", 1.0, {})  # zero -> exactly the sub-cap
+        assert sorted(pushes.titles()) == [
+            "whiskeyjack: AskNews sub-cap at 100%",
+            "whiskeyjack: AskNews sub-cap at 80%",
+        ]
+        with pytest.raises(AskNewsSubcapReached):
+            budget.reserve("asknews", 0.000001, {})
+    assert len(pushes.matching("AskNews sub-cap at 100%")) == 1
+    assert len(pushes.matching("AskNews sub-cap at 80%")) == 1
+
+
 def test_a_second_series_pages_on_its_own_levels(series: Any, tmp_path: Path) -> None:
     from whiskeyjack_bot.notify import notifier_context
 
