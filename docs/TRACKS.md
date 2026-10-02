@@ -58,7 +58,7 @@ near zero this time, with no other lane open when it started and one when it mer
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M0-008 | feat/m0-008-error-hygiene-sweep | whiskeyjack-m0-008 | no | none | 2026-09-25 |
-| M1-354 | feat/m1-354-auto-follow-minibench-series | whiskeyjack-m1-354 | no | none | 2026-09-27 |
+| M1-355 | feat/m1-355-asknews-series-subcap | whiskeyjack-m1-355 | no | none | 2026-10-01 |
 | M1-205 | feat/m1-205-discrete-questions | whiskeyjack-m1-205 | no | 013 | 2026-09-07 |
 | T-902 | feat/t-902-mock-metaculus | whiskeyjack-t-902 | no | none | 2026-09-04 |
 | M1-326 | fix/m1-326-deterministic-failure-gate | whiskeyjack-m1-326 | no | none | 2026-09-09 |

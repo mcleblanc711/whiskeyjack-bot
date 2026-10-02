@@ -124,6 +124,7 @@ def _enable_series(conn: Any, config: Any, **overrides: Any) -> str:
         "ends": utcnow() + timedelta(days=5),
         "budget_usd": 40,
         "series_budget_usd": 80,
+        "asknews_budget_usd": 20,
         "series_ends": utcnow() + timedelta(days=30),
     }
     arguments.update(overrides)

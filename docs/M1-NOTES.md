@@ -16005,3 +16005,136 @@ were mutation-checked against a non-atomic version, and both fail on it. `_rebin
 The partial-disable blocker is closed, and the reviewer confirmed the `enable` sibling is
 transactional and tested. The only change after the approved commit is this note and the
 backlog row flipped to `Done`.
+
+## M1-355 (D51) — An AskNews sub-cap inside the series
+
+### What shipped
+
+`tournament enable` on a following profile takes a required `--asknews-budget-usd`: above zero,
+at most `--series-budget-usd`, floored to whole micro-USD and stored on the series event as
+`asknews_budget_microusd`. A pinned profile that passes it is refused, like the other series
+options.
+
+`Budget.reserve` for provider `asknews` sums AskNews spend under the series
+(`series_spending(conn, series_id, "asknews")`: the same stamped `cost_reserved` rows, matched on
+the `provider` they already carry, settlements and corrections applied by reservation id) in the
+same `BEGIN IMMEDIATE` as the project and series checks. A reservation that would take it past
+the sub-cap raises `AskNewsSubcapReached`, a `TournamentError` subclass of its own, and writes
+nothing.
+
+`retrieve_news` catches exactly that subtype around `begin_call`, stops the pass, and returns
+what it has. It sets **no** failure flag (see the first decision). The orchestrator is unchanged:
+with nothing retained the Exa fallback already runs. `tournament status` reports
+`series.asknews` (`sub_cap_usd`, `actual_cost_usd`, `reserved_cost_usd`, `remaining_budget_usd`).
+Two pages, `AskNews sub-cap at 80%` and `at 100%`, each keyed on the series and the level. The
+runbook documents both and the degrade.
+
+### Decision — a sub-cap refusal is a skip, not a provider failure
+
+My first version set `provider_failed` and a new `subcap_reached` failure literal so the existing
+fallback would run. The mutation pass showed the flag was inert (Exa ran without it), and reading
+`pipeline_live` showed it was also wrong in two ways. `decide_fallback`'s own docstring forbids
+persisting `primary_provider_failed` when the primary did not fail, and `any_provider_failed`
+turns an empty result into a transient `provider_error` that retries until the last attempt, with
+Exa bought again each time. The sub-cap is the owner's limit working. So the primary run's
+`error_summary` says `stopped by the series AskNews sub-cap`, `provider_failed` stays False,
+and an empty Exa answer is `no_documents`: recorded evidence-poor at once, never retried. A test
+pins the recorded reasons and the `evidence_poor` marker.
+
+### Decision — only 80 and 100, not the shared levels
+
+`notify.BUDGET_THRESHOLD_PERCENTS` is `(80, 50)` and `budget_level_crossed` would have paged the
+sub-cap at 50%. D51 and the criterion say 80% and 100%, so the sub-cap has its own
+`ASKNEWS_PAGE_PERCENT = 80`; 100 is the refusal itself, as for the other ceilings. The throttle is
+the existing per-subject window (a day), keyed `series-<id>-asknews-<level>`. "Once" therefore
+means once per day while the condition holds, the same reading M1-354 gave the series page.
+
+### Decision — a series row with no sub-cap key reads back as "no sub-cap"
+
+The live series (`46a47ab5…`, enabled 2026-09-27) predates this item and has no such key.
+Refusing it would stop the worker at the next poll after deploy; inventing a value would invent an
+owner authorization. So an absent key is `None`, a present one must be an exact `int` in
+`1..budget`, and `tournament status` prints `series.asknews: null`. **Giving the live series a
+sub-cap means a new `enable`, which starts a new series, and its $80 counts from that moment.**
+That is an owner decision; see the standing risk.
+
+### Rejected — an `AppConfig` field for the sub-cap
+
+D41 and `docs/LESSONS.md`: any new field changes `config_sha256` and retires the live activation.
+The owner passes it at enable, as D51 says.
+
+### Rejected — an event that amends a series' sub-cap
+
+It would let the live series gain a cap without a new series. It is also a second writer of
+authorization state, with its own replay and approval story, for a one-off migration. Deferred
+below rather than built.
+
+### Deferred (do not read the absence as an omission)
+
+- **Amending the sub-cap on a live series.** See above; a backlog candidate if the owner does
+  not want the series' $80 to restart.
+- **Exa is not capped separately.** Only the series and project ceilings bound it.
+- **A sub-cap that is hit mid-question** keeps the AskNews documents from the calls already
+  made, and Exa runs only if those are empty or a named source is required. The live path has one
+  query and one strategy, so this is reachable only by calling `retrieve_news` directly.
+
+### Standing risk — not verifiable offline
+
+- **The live series has no sub-cap until the owner re-enables.** Deploying changes no `AppConfig`
+  field, so nothing retires, and nothing is bounded either.
+- The 80% page fires on a *reservation*, which is held at the 25000-micro-USD estimate until it
+  settles, so it can arrive a few calls before settled spend reaches 80%.
+
+### Mutation pass — thirty-eight mutants
+
+One-line edits to `src/`, run after the work was committed, against `test_asknews_subcap.py` and
+`test_follow.py`.
+- **Pass 1, 29 mutants: 27 dead, 2 survivors.** `math.isfinite` in `enable` was dead code (`nan` and
+  `inf` already fail `0 < x <= ceiling`), so I removed it. "No fallback flag" survived because Exa
+  runs on no documents anyway, which led to the first decision.
+- **Pass 2, nine mutants after the redesign: six dead, three survivors.** One was a dead result
+  field nothing read, now removed. One was `0 <` in the sub-cap check, an equivalent mutant: the
+  floor-to-zero guard refuses zero and negatives. One, the outer-loop `subcap_reached` check, was
+  unreachable through `run_once` because production derives one query; a test now drives
+  `retrieve_news` with three and counts reservation attempts, and it kills.
+- Properties in `tests/property/test_series_subcap_properties.py`: the stored value is read back
+  iff an exact `int` in `1..budget`, only `StorageFailure` escapes, no value is echoed, and a
+  reachability `find` for each of accept, refuse, bool and float.
+
+### Round 1 — CHANGES REQUESTED on `c8bcc02`, one blocker
+
+**The 100% page was missed when a reservation landed exactly on the sub-cap.** An accepted
+reservation that takes AskNews spend to exactly the sub-cap is 100% spent, but only the refusal
+path selected the 100% level, so the series could reach its cap with only an 80% page sent.
+Reproduced at the reviewed commit (975,000 held, 1,000,000 sub-cap, 25,000 estimate: one 80% page,
+no 100%), and the review named HEAD, so it was not stale. My earlier "no 100% page" mutant
+had died only on the refusal path, so the exact-landing case was never constructed.
+
+Fix: an accepted reservation with `news_used >= ceiling` pages at 100, otherwise at 80 when past
+the 80% line; both share the series' throttle, so the refusal that follows is not a second page.
+The runbook sentence that said the 100% page fires at a refusal is corrected. New test fails
+before the fix and passes after; four mutants on the new branch (`>=`→`>`, the 100 arm
+disabled, `elif`→`if`, the 80 band dropped) all die.
+
+### Round 2 — CHANGES REQUESTED on `1ceb65f`, one blocker, caused by the round-1 fix
+
+**The round-1 fix suppressed the 80% page.** The `if`/`elif` made the two levels exclusive, so a
+reservation from below 80% to exactly the sub-cap selected only 100; before the fix that landing
+selected 80, so the criterion's two pages became one on this branch. Reproduced at the reviewed
+commit by execution (sub-cap 1.00, one 1.00 reservation: one page, "at 100%", none at 80%). The
+review named `1ceb65f`, which was HEAD, so it was not stale. My round-1 test pre-seeded 0.975, which
+was already past 80%, so it never held the zero-to-cap case that makes both levels cross at once.
+
+Fix: `asknews_crossed` is a list, 80 and 100 selected independently and each emitted on its own
+subject (`series-<id>-asknews-<level>`), so the throttle holds each once. Only an exact landing
+reaches both: anything past the cap is refused, and a refusal carries 100 alone as before.
+New test `test_a_first_reservation_that_lands_exactly_on_the_sub_cap_pages_both_levels` fails before
+and passes after. Mutants: dropping the 80 half and dropping the 100 half both die (on older
+tests); the regression's own shape (100 replacing 80 at an exact landing) dies on the new test
+and on no other, which is the point of it.
+
+### Deliberate choices for round 3
+
+- A refusal pages at 100 only, without a back-filled 80. A series whose spend jumps from under 80%
+  straight to a refusal in one reservation never sent the 80% page. Deliberately left: it is
+  unchanged by this branch and the 100% page is the one that matters once research degrades.

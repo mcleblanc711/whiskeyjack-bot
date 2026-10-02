@@ -144,6 +144,7 @@ were written.
 | ntfy push `whiskeyjack: rollover check failed` | [P3](#when-the-rollover-check-itself-fails) — the detector is blind, the worker is not down |
 | ntfy push `whiskeyjack: MiniBench followed to a new project` | [P3](#follow-mode--the-worker-re-points-itself-m1-354) — the worker bound the new project; nothing to do |
 | ntfy push `whiskeyjack: series budget at N%` | [P3](#follow-mode--the-worker-re-points-itself-m1-354) — the followed series' own ceiling |
+| ntfy push `whiskeyjack: AskNews sub-cap at 80%` or `100%` | [P3](#the-asknews-sub-cap-and-the-exa-degrade-m1-355) — the AskNews share of the series; at 100% research is on Exa |
 | `series follow: <code>` in the tournament log | [P3](#follow-mode--the-worker-re-points-itself-m1-354) — the code table |
 | `operation artifact missing; platform reconciliation required` | [P2](#p2--a-ledger-copied-without-its-artifact-root-will-refuse) |
 | `ledger migration N does not match the checksum ...` | [C2](#c2--migration-checksum-mismatch) |
@@ -318,14 +319,16 @@ limits you set once (D51). You enable a **series**, not a project:
 ```bash
 uv run whiskeyjack-bot tournament enable --config config/tournament.yaml \
   --project-id '<current project id>' --starts '<UTC ISO timestamp>' --ends '<UTC ISO timestamp>' \
-  --budget-usd 40 --series-budget-usd 80 --series-ends '<UTC ISO timestamp>'
+  --budget-usd 40 --series-budget-usd 80 --asknews-budget-usd '<USD>' \
+  --series-ends '<UTC ISO timestamp>'
 ```
 
 `--project-id` must equal `metaculus.tournament.id`; that is the series' first project, bound as
 yours (`bound_by: owner`). `--series-budget-usd` is the ceiling across **every** project the
 series binds, at most USD 80, counted only from this command — spend already on the ledger does
 not count. `--budget-usd` is each project's own ceiling and may not exceed the series'. The
-activation window must end by `--series-ends`.
+activation window must end by `--series-ends`. `--asknews-budget-usd` is required with the
+series: see [the AskNews sub-cap](#the-asknews-sub-cap-and-the-exa-degrade-m1-355).
 
 At the start of each poll the worker asks Metaculus what `minibench` resolves to. When it has
 moved, the worker appends a new activation for the new project — `bound_by:
@@ -360,6 +363,39 @@ per poll that did anything but find the slug where it was:
 in one transaction; either refuses the call. `tournament status` reports the series under
 `series` (ceiling, actual, reserved, remaining). The series pages its own `series budget at N%`
 alongside the project's.
+
+#### The AskNews sub-cap and the Exa degrade (M1-355)
+
+AskNews is the tightest provider budget, so the series carries a second, smaller ceiling for it,
+set by you at `enable` with `--asknews-budget-usd` (required in follow mode; above zero, at most
+`--series-budget-usd`; stored as whole micro-USD on the series event). It counts every AskNews
+reservation made under the series, across every project it binds, **held at its estimate until it
+settles** — the same way the series ceiling counts — and, like it, only from the moment you ran
+`enable`.
+
+- **80%.** One push, `whiskeyjack: AskNews sub-cap at 80%`, when the held-plus-settled AskNews
+  spend first reaches 80% of the sub-cap. Nothing is refused yet.
+- **100%.** One push, `whiskeyjack: AskNews sub-cap at 100%`, when a reservation takes AskNews
+  spend exactly to the sub-cap, or when one that would take it past is refused (whichever comes
+  first; the two share one throttled page). A refused reservation is not made. **That refusal does not fail the question.**
+  Research stops asking AskNews and the Exa fallback runs (it runs whenever AskNews returns no
+  document); the question is forecast on what Exa finds, or recorded evidence-poor
+  (`no_documents`, [M1-349](#r1--research_failed)) if it finds nothing. This is the cap working,
+  not an outage: the primary `research_runs` row says `stopped by the series AskNews sub-cap`
+  rather than `provider call failed`, the Exa run's recorded reasons do not include
+  `primary_provider_failed`, and no `provider failed` push is sent. Exa and the model are not under
+  this cap; only the series and project ceilings bound them.
+- **Throttle.** Each page is keyed on the series and the level, so each fires once a day at most
+  while the spend stays past it, not once per poll.
+
+`tournament status` reports it under `series.asknews`: `sub_cap_usd`, `actual_cost_usd`,
+`reserved_cost_usd`, `remaining_budget_usd`. A series enabled **before** M1-355 recorded no
+sub-cap, so `series.asknews` is `null` and nothing bounds AskNews on its own account; the series
+ceiling still applies. Re-running `tournament enable` is the only way to give it one, and it starts
+a new series whose ceiling counts from that moment.
+
+To give AskNews more room, enable a new series with a larger `--asknews-budget-usd`. Do it only if
+you mean to spend more: the provider's own balance is the outer stop, and auto-reload is off.
 
 **Stopping it.** `tournament disable` disables the newest activation **and** its series, so no
 later rollover is bound. To change the configuration, set `metaculus.tournament.id` to the

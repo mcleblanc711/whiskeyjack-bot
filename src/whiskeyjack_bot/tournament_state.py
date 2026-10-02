@@ -36,6 +36,15 @@ class ActivationInactive(TournamentError):
     """An ordinary disabled or out-of-window activation, not invalid storage."""
 
 
+class AskNewsSubcapReached(TournamentError):
+    """A reservation was refused because it would take AskNews spend over the series sub-cap.
+
+    Its own type so research can degrade to the Exa fallback on exactly this refusal (M1-355,
+    D51) and never on the round or series ceilings, which stop the worker. The message is a
+    constant.
+    """
+
+
 class StorageFailure(TournamentError):
     """Stop the worker; continuing could lose evidence or spend."""
 
@@ -228,6 +237,12 @@ MAX_ACTIVATION_BUDGET_USD: Final = 80
 MAX_SERIES_BUDGET_USD: Final = 80
 
 
+# The one level, short of the refusal itself, at which the AskNews sub-cap pages (M1-355,
+# D51: "an 80% page ... at 100% the worker degrades"). Not `notify.BUDGET_THRESHOLD_PERCENTS`,
+# which also carries 50 for the ceilings: the owner asked for 80 and 100, not three.
+ASKNEWS_PAGE_PERCENT: Final = 80
+
+
 @dataclass(frozen=True)
 class Series:
     """One owner-enabled series authorization, as the journal stores it (M1-354).
@@ -244,6 +259,10 @@ class Series:
     ends: datetime
     config_sha256: str
     prompt_sha256: str
+    # M1-355 (D51): the AskNews share of ``budget_microusd``. ``None`` only for a series
+    # enabled before M1-355, whose journal row has no such key: it carries no sub-cap, and
+    # ``tournament status`` says so rather than inventing one.
+    asknews_budget_microusd: int | None = None
 
 
 def _series_from(data: object) -> Series:
@@ -269,6 +288,11 @@ def _series_from(data: object) -> Series:
         or type(fields.get("prompt_sha256")) is not str
     ):
         raise StorageFailure("cannot read series authorization")
+    subcap = fields.get("asknews_budget_microusd")
+    if "asknews_budget_microusd" in fields and (
+        type(subcap) is not int or subcap <= 0 or subcap > fields["budget_microusd"]
+    ):
+        raise StorageFailure("cannot read series authorization")
     return Series(
         series_id=fields["series_id"],
         account_id=fields["account_id"],
@@ -278,6 +302,7 @@ def _series_from(data: object) -> Series:
         ends=ends,
         config_sha256=fields["config_sha256"],
         prompt_sha256=fields["prompt_sha256"],
+        asknews_budget_microusd=subcap,
     )
 
 
@@ -334,6 +359,7 @@ def enable(
     budget_usd: float = 20.0,
     series_budget_usd: float | None = None,
     series_ends: datetime | None = None,
+    asknews_budget_usd: float | None = None,
 ) -> str:
     now = utcnow()
     if (
@@ -358,7 +384,9 @@ def enable(
     if config.environment != "production" and project_id != 32977:
         raise TournamentError("testing profiles may activate only project 32977")
     follow = config.metaculus.tournament.follow
-    if follow is None and (series_budget_usd is not None or series_ends is not None):
+    if follow is None and (
+        series_budget_usd is not None or series_ends is not None or asknews_budget_usd is not None
+    ):
         raise TournamentError("series options require a profile with tournament.follow set")
     if follow is not None:
         # M1-354 (D51). All or nothing: a following profile without a series would bind
@@ -379,6 +407,17 @@ def enable(
                 f"(maximum USD {MAX_SERIES_BUDGET_USD}; the project budget and window must "
                 "fit inside the series)"
             )
+        # M1-355 (D51): the AskNews share is set by the owner at enable and is never
+        # defaulted. At most the series ceiling; a whole number of micro-USD above zero.
+        if (
+            asknews_budget_usd is None
+            or not 0 < asknews_budget_usd <= series_budget_usd
+            or math.floor(asknews_budget_usd * 1_000_000) <= 0
+        ):
+            raise TournamentError(
+                "invalid AskNews sub-cap (a required amount above zero, no larger than the "
+                "series ceiling)"
+            )
     prior = events(conn, "activation", "account")
     if any(a["account_id"] != account_id for a in prior):
         raise TournamentError("this ledger is already bound to another bot account")
@@ -395,12 +434,14 @@ def enable(
     }
     if follow is not None:
         assert series_budget_usd is not None and series_ends is not None
+        assert asknews_budget_usd is not None
         series = {
             "series_id": uuid4().hex,
             "account_id": account_id,
             "follow": follow,
             "budget_microusd": math.floor(series_budget_usd * 1_000_000),
             "project_budget_microusd": data["budget_microusd"],
+            "asknews_budget_microusd": math.floor(asknews_budget_usd * 1_000_000),
             "ends": series_ends.isoformat(),
             **bound,
         }
@@ -536,8 +577,14 @@ def spending(conn: sqlite3.Connection, scope: str) -> tuple[int, int]:
     return actual, held
 
 
-def series_spending(conn: sqlite3.Connection, series_id: str) -> tuple[int, int]:
+def series_spending(
+    conn: sqlite3.Connection, series_id: str, provider: str | None = None
+) -> tuple[int, int]:
     """``(actual, held)`` micro-USD for every reservation made under one series (M1-354).
+
+    With ``provider``, only that provider's reservations (M1-355: the AskNews share). The
+    provider is stamped on the ``cost_reserved`` row itself, so the filter reads it there
+    and settlements follow by reservation id.
 
     A reservation belongs to a series when :meth:`Budget.reserve` stamped its id on it, so
     spend made before the series was enabled -- on the same project -- is not counted, which
@@ -545,7 +592,13 @@ def series_spending(conn: sqlite3.Connection, series_id: str) -> tuple[int, int]
     :func:`spending` applies them; they carry no series, and are matched by reservation.
     """
     rows = [data for _, data in _journal_rows(conn, "cost_reserved")]
-    mine = [row for row in rows if type(row) is dict and row.get("series_id") == series_id]
+    mine = [
+        row
+        for row in rows
+        if type(row) is dict
+        and row.get("series_id") == series_id
+        and (provider is None or row.get("provider") == provider)
+    ]
     reserved = _amounts(mine, "estimate_microusd")
     ids = {identifier for identifier, _ in reserved}
     settled = {
@@ -864,6 +917,9 @@ class Budget:
     # transaction as the per-project check.
     series_id: str | None = None
     series_ceiling: int = 0
+    # M1-355: the AskNews share of the series ceiling, or None for a series with no sub-cap
+    # recorded (enabled before M1-355) and for a pinned activation.
+    asknews_ceiling: int | None = None
 
     def reserve(self, provider: str, estimate: float, request: Any) -> str:
         if not math.isfinite(estimate) or estimate <= 0:
@@ -876,6 +932,7 @@ class Budget:
         # serialize every other process's budget check behind a third party's latency.
         crossed: int | None = None
         series_crossed: int | None = None
+        asknews_crossed: list[int] = []
         try:
             # BEGIN IMMEDIATE serializes budget checks across processes and restarts.
             with storage_transaction(self.conn):
@@ -900,9 +957,47 @@ class Budget:
                         raise TournamentError("series budget exhausted; no provider call made")
                     series_crossed = budget_level_crossed(series_used, self.series_ceiling)
                     reservation["series_id"] = self.series_id
+                    if provider == "asknews" and self.asknews_ceiling is not None:
+                        news_actual, news_held = series_spending(
+                            self.conn, self.series_id, "asknews"
+                        )
+                        news_used = news_actual + news_held + amount
+                        if news_used > self.asknews_ceiling:
+                            # Its own refusal and its own exception: research degrades to
+                            # the Exa fallback on this one and on no other.
+                            asknews_crossed = [100]
+                            raise AskNewsSubcapReached(
+                                "AskNews sub-cap reached; no provider call made"
+                            )
+                        # Independent, not exclusive: one reservation from below 80% to
+                        # exactly the sub-cap crosses both levels, and both pages are owed.
+                        if news_used * 100 >= self.asknews_ceiling * ASKNEWS_PAGE_PERCENT:
+                            asknews_crossed = [ASKNEWS_PAGE_PERCENT]
+                        if news_used >= self.asknews_ceiling:
+                            # Landing exactly on the sub-cap is accepted but is 100% spent:
+                            # the page cannot wait for a later, refused attempt.
+                            asknews_crossed.append(100)
                 crossed = budget_level_crossed(actual + held + amount, self.ceiling)
                 append(self.conn, "cost_reserved", self.scope, reservation)
         finally:
+            for level in asknews_crossed if self.series_id is not None else ():
+                # M1-355. Beside the series' own page, on its own subject so the two
+                # throttle independently; constants and the level only in the text.
+                emit(
+                    "budget_threshold",
+                    subject=f"series-{self.series_id}-asknews-{level}",
+                    title=f"whiskeyjack: AskNews sub-cap at {level}%",
+                    body=(
+                        f"AskNews spending across the followed MiniBench series has reached "
+                        f"{level}% of its sub-cap. Reserved spend counts toward "
+                        f"this. "
+                        + (
+                            "The sub-cap is reached: research continues on the Exa fallback."
+                            if level == 100
+                            else "Check `tournament status` for the split."
+                        )
+                    ),
+                )
             if series_crossed is not None and self.series_id is not None:
                 # The series' own threshold, beside the project's. The subject carries the
                 # series id so each series pages on its own levels; the id is never sent.

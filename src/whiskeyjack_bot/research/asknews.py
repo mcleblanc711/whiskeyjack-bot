@@ -427,6 +427,7 @@ def retrieve_news(
     dropped = 0
     collapsed = 0
     provider_failed = False
+    subcap_reached = False
     failure: AskNewsFailure | None = None
     # Counted at the point of the request, so the one that raises is included: it
     # reached the provider and may well have been billed. Same rule as
@@ -434,10 +435,11 @@ def retrieve_news(
     calls_attempted = 0
 
     for query in capped_queries:
-        if provider_failed:
+        if provider_failed or subcap_reached:
             break
         for strategy in _STRATEGIES:
             from whiskeyjack_bot.research.durable import begin_call, complete_call
+            from whiskeyjack_bot.tournament_state import AskNewsSubcapReached
 
             request: dict[str, Any] = {
                 "query": query,
@@ -447,15 +449,27 @@ def retrieve_news(
                 "hours_back": hours_back,
                 "historical": strategy == _STRATEGY_HISTORICAL,
             }
-            call_scope, cached = begin_call(
-                "asknews",
-                # M1-337: credits x rate, never a literal. Only the news pass is issued
-                # (M1-352), so there is one estimate.
-                NEWS_CALL_ESTIMATE_USD,
-                request,
-                question_id,
-                now_utc.isoformat(),
-            )
+            try:
+                call_scope, cached = begin_call(
+                    "asknews",
+                    # M1-337: credits x rate, never a literal. Only the news pass is issued
+                    # (M1-352), so there is one estimate.
+                    NEWS_CALL_ESTIMATE_USD,
+                    request,
+                    question_id,
+                    now_utc.isoformat(),
+                )
+            except AskNewsSubcapReached:
+                # M1-355 (D51). Refused before any call, so nothing was billed for this
+                # request. The owner's own limit working, not the provider failing: not
+                # `provider_failed`, which would persist a `primary_provider_failed`
+                # fallback reason that is false and make an empty answer retry as a
+                # transient outage. With nothing retained the Exa fallback runs anyway
+                # (`primary_returned_no_documents`); an unanswered question is worth less
+                # than an evidence-poor one (M1-349). Only this subtype -- the round and
+                # series ceilings still raise.
+                subcap_reached = True
+                break
             try:
                 if cached is not None:
                     from asknews_sdk.dto.news import SearchResponse
@@ -537,7 +551,9 @@ def retrieve_news(
             "started_at_utc": now_utc,
             "completed_at_utc": now_utc,
             "freshness_cutoff_utc": freshness_cutoff_utc,
-            "error_summary": _error_summary(failure=failure, retained=len(documents)),
+            "error_summary": _error_summary(
+                failure=failure, retained=len(documents), subcap_reached=subcap_reached
+            ),
             # Still None when calls were made. Since M1-336 each call's reservation
             # settles in the tournament journal from its own `usage.credits`; putting
             # the sum on the run row as well is deferred (see the M1-336 notes), and
@@ -558,7 +574,9 @@ def retrieve_news(
     )
 
 
-def _error_summary(*, failure: AskNewsFailure | None, retained: int) -> str | None:
+def _error_summary(
+    *, failure: AskNewsFailure | None, retained: int, subcap_reached: bool = False
+) -> str | None:
     """Describe an actual failure, or return None for a successful run.
 
     Scoped to the schema's own meaning for this field — "set when the run failed
@@ -578,6 +596,8 @@ def _error_summary(*, failure: AskNewsFailure | None, retained: int) -> str | No
     if failure is not None:
         named = failure if failure in get_args(AskNewsFailure) else "transient"
         parts.append(f"provider call failed ({named}); retrieval stopped early")
+    if subcap_reached:
+        parts.append("stopped by the series AskNews sub-cap; no call made past it")
     if retained == 0:
         parts.append("no documents retained")
     return "; ".join(parts) if parts else None
