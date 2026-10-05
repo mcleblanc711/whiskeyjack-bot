@@ -82,7 +82,7 @@ def test_report_writes_under_the_configured_export_root_and_prints_counts(
         MANIFEST_FILENAME,
     }
     out = capsys.readouterr().out
-    assert "schema:    version 17" in out
+    assert "schema:    version 18" in out
     assert "records:   16 (1 excluded, 15 included)" in out
     lines = out.splitlines()
     assert "        7 scored" in lines
