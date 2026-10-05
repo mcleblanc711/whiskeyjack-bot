@@ -81,10 +81,15 @@ JSON_VALUES = st.recursive(
 
 
 def _representable(value: object) -> bool:
-    """What `_read` accepts (M4-808, D52): a finite float, or an exact-type int a double holds."""
+    """What `_read` accepts (M4-808, D52): a finite float, or an exact-type int a double holds exactly."""
     if type(value) is float:
         return math.isfinite(value)
-    return type(value) is int and abs(value) <= 2**53
+    if type(value) is not int:
+        return False
+    try:
+        return int(float(value)) == value  # 2**60 is held exactly; 2**53 + 1 and 10**400 are not
+    except OverflowError:
+        return False
 
 
 def _bits(value: float) -> bytes:
@@ -200,6 +205,7 @@ def test_each_required_score_refuses_anything_but_a_finite_number(key: str, valu
 @given(value=st.integers(min_value=-(2**53), max_value=2**53))
 @example(value=0)
 @example(value=2**53)
+@example(value=-(2**53))
 def test_each_required_score_accepts_an_exactly_representable_integer_as_its_float(
     key: str, value: int
 ) -> None:
@@ -380,3 +386,12 @@ def test_the_property_module_really_crosses_a_file_backed_ledger(
     migrations' file-level behaviour the deployed worker runs under."""
     row = ledger.execute("PRAGMA database_list").fetchone()
     assert row is not None and row[2] != ""
+
+
+@pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
+@pytest.mark.parametrize("value", [2**60, -(2**60), 2**1023])
+def test_a_large_integer_a_double_holds_exactly_is_accepted(key: str, value: int) -> None:
+    """The boundary is exactness, not magnitude: these are far past 2**53 and still exact."""
+    payload = _payload()
+    payload["question"]["my_forecasts"]["score_data"][key] = value
+    assert _refusal(payload) is None
