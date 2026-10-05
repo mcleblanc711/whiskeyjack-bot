@@ -41,7 +41,7 @@ and bumping one never bumps another.
 
 | Constant | Value | Defined at | What it versions |
 | --- | --- | --- | --- |
-| `LEDGER_SCHEMA_VERSION` | `17` | `ledger.py:LEDGER_SCHEMA_VERSION` | The ledger schema: the number of the last migration this build applies. `connect_readonly` refuses a ledger ahead of or behind it. |
+| `LEDGER_SCHEMA_VERSION` | `18` | `ledger.py:LEDGER_SCHEMA_VERSION` | The ledger schema: the number of the last migration this build applies. `connect_readonly` refuses a ledger ahead of or behind it. |
 | `RECORD_SCHEMA_VERSION` | `1.0.0` | `forecast/record.py:RECORD_SCHEMA_VERSION` | The shape of `forecast_records.record_json` (`ForecastRecord`). Records stamped `1.1.0` are also accepted by the validator. |
 | `RESPONSE_SCHEMA_VERSION` | `1.0.0` | `forecast/schema.py:RESPONSE_SCHEMA_VERSION` | The model's output contract (`record_json.forecast`), not the prompt's version. |
 | `OBSERVATION_SCHEMA_VERSION` | `1.0.0` | `resolution.py:OBSERVATION_SCHEMA_VERSION` | `resolution_events.resolution_snapshot_json` (`ResolutionObservation`). |
