@@ -546,11 +546,12 @@ def test_migration_002_makes_the_document_storable(tmp_path: Path) -> None:
     # 7 from M1-602's 007_forecast_version_chain.sql, 8 from M1-406's
     # 008_forecast_raw_output.sql, 9 from M2-711's 009_submission_refetch_outcome.sql,
     # 10 from M2-708's 010_submission_key_reservations.sql, 16 from M2-713's
-    # 016_submission_reconciliations.sql, 17 from M4-803's 017_platform_score_events.sql.
+    # 016_submission_reconciliations.sql, 17 from M4-803's 017_platform_score_events.sql, 18 from M4-808's
+    # 018_platform_score_integer_values.sql.
     # The literal is kept rather
     # than dropped: it is the pin that says LEDGER_SCHEMA_VERSION tracks the migrations
     # actually on disk, and a constant compared only against itself pins nothing.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 18
 
     doc = validate_document(_document(document_id="doc-1"))
     run = validate_run(_run())

@@ -618,7 +618,7 @@ def test_a_ledger_at_014_with_resolutions_upgrades_to_015(
         record = seed_resolved_raw(connection, "rec-b", question_id=QUESTION_ID, post_id=POST_ID)
     finally:
         connection.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 18
     connection = connect(db)
     try:
         write = record_local_scores(connection, record_id=record, computed_at=SCORED_AT)

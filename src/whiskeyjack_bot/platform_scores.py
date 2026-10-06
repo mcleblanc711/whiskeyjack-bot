@@ -141,11 +141,21 @@ def _read(data: dict[str, object], key: str) -> float:
     if key not in data:
         raise PlatformScoreError(f"my_forecasts.score_data has no {key}")
     value = data[key]
-    # Exact type: a bool is an int, and neither is how the platform serializes a score (every
-    # one of the 140 live values observed 2026-09-23 was a float). An int would also be
-    # admitted by SQLite's `=` against a REAL while this module refuses it.
-    if type(value) is not float:
-        raise PlatformScoreError(f"my_forecasts.score_data.{key} must be a float")
+    # Exact type: a bool is an int and is refused. A JSON float is the usual serialization; a JSON
+    # integer is the same number written without a point (questions 45978 and 45971 carried 0,
+    # 2026-10-03 -- D52 amends D42), so it is read as the float it equals. An integer a double
+    # cannot hold exactly is refused rather than rounded: 018's trigger compares the stored REAL
+    # with the integer exactly and would refuse it anyway.
+    if type(value) is int:
+        try:
+            converted = float(value)
+        except OverflowError:
+            raise PlatformScoreError(f"my_forecasts.score_data.{key} must be a number") from None
+        if int(converted) != value:
+            raise PlatformScoreError(f"my_forecasts.score_data.{key} must be a number")
+        value = converted
+    elif type(value) is not float:
+        raise PlatformScoreError(f"my_forecasts.score_data.{key} must be a number")
     if not math.isfinite(value):
         raise PlatformScoreError(f"my_forecasts.score_data.{key} must be finite")
     return value

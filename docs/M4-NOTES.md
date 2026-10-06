@@ -1472,3 +1472,56 @@ led with the `bd55ab1`→HEAD delta). B1 closed; no blocking findings; all thirt
 marked safe. One non-blocking observation — `report.py`'s module docstring still said "one
 scored subject per question" — is fixed after approval ("within each population"). That
 docstring and this entry are the only change after the approved commit.
+
+## M4-808 — Accept integer-valued platform scores (D52, amends D42)
+
+Filed and merged first as PR #132 (row + D52), then built on `feat/m4-808-platform-score-int`.
+
+### What happened
+
+2026-10-03 12:28 MDT: `score` began exiting 4 (`records: 63 failed: 2`) and the watchdog paged
+every five minutes. Questions 45978 (binary) and 45971 (multiple_choice) carried
+`baseline_score` and `spot_baseline_score` as the JSON integer `0`. `platform_scores._read`
+required `type(value) is float` on the evidence of 140 floats seen 2026-09-23. The same two
+records were absent from the attribution report (n = 58 of 60 scored).
+
+### Decision — convert in the reader AND widen the trigger, and why
+
+The plan said "no migration". That was wrong, found before any code was written: 017's value
+clause requires `json_type(source, '$...score_data.<k>') = 'real'` (top level and group member),
+so a reader-only fix would pass in Python and be refused at INSERT. `018` is one DROP/CREATE of
+`score_events_validate_on_insert`, 017's text verbatim with the two `= 'real'` tests changed to
+`IN ('real', 'integer')` and one comment. The owner approved the migration at plan time
+(2026-10-05). `typeof(NEW.value) <> 'real'` is untouched: what is stored is still a REAL.
+
+### Decision — the boundary is exactness, not magnitude
+
+An exact-type `int` is accepted iff `float(v)` holds it exactly (`int(float(v)) == v`).
+`2**53 + 1` and `10**400` refuse as `PlatformScoreError` ("must be a number"); `2**60` is
+accepted because a double holds it. This is the same line the schema draws: SQLite compares an
+integer with a REAL exactly, so the trigger refuses exactly the integers the reader refuses.
+`bool` is refused (it is an `int`; `type(v) is int` excludes it).
+
+### Deviation
+
+The error text changed from "must be a float" to "must be a number" (the rule is no longer
+float-only). Tests that matched the old text were updated. `test_an_observation_without_a_real_score…`
+was renamed `…numeric_score…`: it pinned `{"peer_score": 3}` as refused, which is now admitted.
+
+### Rejected — and why not
+
+- *Hand-patch the two rows:* leaves the next integer-valued score to page again.
+- *Accept any numeric type:* admits `bool`.
+- *Record a quiet `no_platform_scores` gap:* reverses D42's loud-failure decision.
+
+### Standing risk — not verifiable offline
+
+The platform could send some other shape (a numeric string, a rational). That still fails loudly
+by design; D52's revisit trigger names it. The live path (apply 018 to the production ledger, then
+`score` over the two observations) is verified only after deploy — see below.
+
+### Deploy
+
+A merged migration stops the worker at the next poll: back the ledger up, merge between polls,
+run `init-ledger` at once, then `score`. Expected: 8 new `platform_*` rows, resolutions unit
+green, watchdog clear; regenerate the M5-804 report (n = 60).

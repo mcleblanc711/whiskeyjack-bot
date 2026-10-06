@@ -80,6 +80,18 @@ JSON_VALUES = st.recursive(
 )
 
 
+def _representable(value: object) -> bool:
+    """What `_read` accepts (M4-808, D52): a finite float, or an exact-type int a double holds exactly."""
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is not int:
+        return False
+    try:
+        return int(float(value)) == value  # 2**60 is held exactly; 2**53 + 1 and 10**400 are not
+    except OverflowError:
+        return False
+
+
 def _bits(value: float) -> bytes:
     return struct.pack("<d", value)
 
@@ -153,9 +165,10 @@ def test_a_corrupted_level_never_raises_outside_platform_score_error(
     message = _refusal(source)
     _record(message)
     if message is None:
-        # Only the one-score level can be accepted, and only with a finite float there.
+        # Only the one-score level can be accepted, and only with a finite float or an integer
+        # a double holds exactly there.
         assert level is _set_one_score
-        assert type(value) is float and math.isfinite(value)
+        assert _representable(value)
 
 
 @given(question_id=st.one_of(JSON_VALUES, st.integers()))
@@ -177,15 +190,48 @@ def test_a_malformed_question_id_is_refused_or_names_no_question(question_id: ob
 
 @pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
 @given(value=JSON_SCALARS)
-def test_each_required_score_refuses_anything_but_a_finite_float(key: str, value: object) -> None:
+def test_each_required_score_refuses_anything_but_a_finite_number(key: str, value: object) -> None:
     payload = _payload()
     payload["question"]["my_forecasts"]["score_data"][key] = value
     message = _refusal(payload)
     _record(message)
-    valid = type(value) is float and math.isfinite(value)
+    valid = _representable(value)
     assert (message is None) is valid
     if not valid:
         assert message is not None and key in message
+
+
+@pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
+@given(value=st.integers(min_value=-(2**53), max_value=2**53))
+@example(value=0)
+@example(value=2**53)
+@example(value=-(2**53))
+def test_each_required_score_accepts_an_exactly_representable_integer_as_its_float(
+    key: str, value: int
+) -> None:
+    """The scalar strategy draws ints from +-2**70, so it almost never lands in range; this does.
+
+    Accepted as the float of the same value, replay-stable, and equal to what a float payload
+    of that number yields."""
+    payload = _payload()
+    payload["question"]["my_forecasts"]["score_data"][key] = value
+    by_metric = {s.metric: s.value for s in extract_platform_scores(payload, QUESTION_ID)}
+    metric = next(m for m, k in SCORE_DATA_KEYS.items() if k == key)
+    assert type(by_metric[metric]) is float and by_metric[metric] == value
+    replayed = json.loads(canonical_json(payload))
+    again = {s.metric: s.value for s in extract_platform_scores(replayed, QUESTION_ID)}
+    assert again == by_metric
+
+
+@pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
+@pytest.mark.parametrize("value", [2**53 + 1, -(2**53) - 1, 10**400, -(10**400), True, False])
+def test_each_required_score_refuses_an_unrepresentable_integer_and_a_bool(
+    key: str, value: object
+) -> None:
+    """`float(10**400)` raises OverflowError; it must arrive as the module's own error."""
+    payload = _payload()
+    payload["question"]["my_forecasts"]["score_data"][key] = value
+    assert _refusal(payload) == f"my_forecasts.score_data.{key} must be a number"
 
 
 @pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
@@ -340,3 +386,12 @@ def test_the_property_module_really_crosses_a_file_backed_ledger(
     migrations' file-level behaviour the deployed worker runs under."""
     row = ledger.execute("PRAGMA database_list").fetchone()
     assert row is not None and row[2] != ""
+
+
+@pytest.mark.parametrize("key", sorted(SCORE_DATA_KEYS.values()))
+@pytest.mark.parametrize("value", [2**60, -(2**60), 2**1023])
+def test_a_large_integer_a_double_holds_exactly_is_accepted(key: str, value: int) -> None:
+    """The boundary is exactness, not magnitude: these are far past 2**53 and still exact."""
+    payload = _payload()
+    payload["question"]["my_forecasts"]["score_data"][key] = value
+    assert _refusal(payload) is None

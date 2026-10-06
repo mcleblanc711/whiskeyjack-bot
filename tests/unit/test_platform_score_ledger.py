@@ -186,10 +186,11 @@ def _with(key: str, value: object) -> Any:
         (["SENTINEL-list"], "must be a JSON object"),
         (_drop("peer_score"), "has no peer_score"),
         (_drop("spot_peer_score"), "has no spot_peer_score"),
-        (_with("baseline_score", 3), "baseline_score must be a float"),
-        (_with("spot_baseline_score", True), "spot_baseline_score must be a float"),
-        (_with("peer_score", "SENTINEL-12.5"), "peer_score must be a float"),
-        (_with("spot_peer_score", None), "spot_peer_score must be a float"),
+        (_with("baseline_score", 2**53 + 1), "baseline_score must be a number"),
+        (_with("baseline_score", 10**400), "baseline_score must be a number"),
+        (_with("spot_baseline_score", True), "spot_baseline_score must be a number"),
+        (_with("peer_score", "SENTINEL-12.5"), "peer_score must be a number"),
+        (_with("spot_peer_score", None), "spot_peer_score must be a number"),
     ],
 )
 def test_a_scorable_observation_without_readable_scores_fails_loudly(
@@ -375,21 +376,35 @@ def test_a_platform_row_must_hold_the_value_its_observation_holds(
         _platform_row(conn, scorable, value=value)
 
 
-@pytest.mark.parametrize("score_data", [{}, None, {"peer_score": 3}, {"peer_score": "3.5"}])
-def test_an_observation_without_a_real_score_admits_no_platform_row(
+@pytest.mark.parametrize("score_data", [{}, None, {"peer_score": "3.0"}, {"peer_score": 3.5}])
+def test_an_observation_without_a_numeric_score_admits_no_platform_row(
     conn: sqlite3.Connection, score_data: object
 ) -> None:
-    """An integer JSON score is refused too: SQLite's `=` would admit 3 against 3.0, and the
-    Python reader refuses it, so the schema must not be laxer than the reader."""
+    """Absent, null and string-typed scores admit nothing (an integer is admitted since 018)."""
     seed_submitted(conn, "rec-e", question_id=QUESTION_ID, post_id=POST_ID, question_type="numeric")
     payload = post_payload(
         "numeric", post_id=POST_ID, question_id=QUESTION_ID, score_data=score_data
     )
     columns = _payload_row(conn, "rec-e", payload)
     _insert_resolution(conn, columns)
-    for value in (3.0, 3.5):
+    for value in (3.0, 3.25):
         with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
             _platform_row(conn, "rec-e", value=value)
+
+
+def test_an_integer_score_admits_exactly_its_own_value_as_a_platform_row(
+    conn: sqlite3.Connection,
+) -> None:
+    """018 (D52): a JSON integer is admitted, equal to the REAL it becomes and to nothing else."""
+    seed_submitted(conn, "rec-i", question_id=QUESTION_ID, post_id=POST_ID, question_type="numeric")
+    payload = post_payload(
+        "numeric", post_id=POST_ID, question_id=QUESTION_ID, score_data={"peer_score": 3}
+    )
+    _insert_resolution(conn, _payload_row(conn, "rec-i", payload))
+    for value in (3.5, 0.0, 2.0):
+        with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
+            _platform_row(conn, "rec-i", value=value)
+    _platform_row(conn, "rec-i", value=3.0)
 
 
 def test_a_group_row_must_hold_its_own_members_value(conn: sqlite3.Connection) -> None:
@@ -401,15 +416,19 @@ def test_a_group_row_must_hold_its_own_members_value(conn: sqlite3.Connection) -
     _platform_row(conn, "rec-g", value=SCORE_DATA["peer_score"] * 2.0)
 
 
-def test_a_group_members_integer_score_admits_no_platform_row(conn: sqlite3.Connection) -> None:
-    """The group branch's `json_type = 'real'`, as the top-level branch's is pinned above."""
+def test_a_group_members_integer_score_admits_only_its_own_value(
+    conn: sqlite3.Connection,
+) -> None:
+    """The group branch's `json_type IN ('real', 'integer')`, as the top-level branch's is
+    pinned above (018, D52)."""
     member_scores = _scaled(1.0)
     member_scores["peer_score"] = 3  # type: ignore[assignment]
     post, question_ids = _group_payload([member_scores, _scaled(2.0), _scaled(3.0)])
     seed_submitted(conn, "rec-gi", question_id=question_ids[0], post_id=post["id"])
     _insert_resolution(conn, _payload_row(conn, "rec-gi", post))
     with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
-        _platform_row(conn, "rec-gi", value=3.0)
+        _platform_row(conn, "rec-gi", value=3.5)
+    _platform_row(conn, "rec-gi", value=3.0)
 
 
 def test_a_stored_top_level_question_with_another_id_admits_no_platform_row(
@@ -575,8 +594,8 @@ def test_a_ledger_at_016_with_local_scores_upgrades_to_017(
             _platform_row(connection, record)
     finally:
         connection.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 17
-    assert initialize_ledger(db) == 17
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 18
+    assert initialize_ledger(db) == 18
     connection = connect(db)
     try:
         assert read_local_scores(connection, record) == local.scores
@@ -632,3 +651,89 @@ def _insert_resolution(conn: sqlite3.Connection, columns: dict[str, object]) -> 
     )
     assert cursor.lastrowid is not None
     return cursor.lastrowid
+
+
+# ── M4-808 (D52): an integer-valued score, end to end ────────────────────────
+
+
+@pytest.mark.parametrize("question_type", ["binary", "multiple_choice"])
+def test_an_integer_zero_score_is_recorded_as_the_float_zero(
+    conn: sqlite3.Connection, question_type: str
+) -> None:
+    """Questions 45978 and 45971, 2026-10-03: baseline scores that arrived as the JSON integer 0.
+
+    Driven through the real writer and 018's trigger, so a Python-only fix would fail here."""
+    data = dict(SCORE_DATA)
+    data["baseline_score"] = 0
+    data["spot_baseline_score"] = 0
+    record = _observe(conn, "rec-z", question_type=question_type, score_data=data)
+    write = record_platform_scores(conn, record_id=record, computed_at=SCORED_AT)
+
+    assert write.outcome == "appended" and len(write.scores) == 4
+    by_metric = {s.metric: s.value for s in write.scores}
+    for metric in ("platform_baseline_score", "platform_spot_baseline_score"):
+        assert by_metric[metric] == 0.0 and type(by_metric[metric]) is float
+    assert read_platform_scores(conn, record) == write.scores
+    stored = conn.execute(
+        "SELECT typeof(value) FROM score_events WHERE metric = 'platform_baseline_score'"
+    ).fetchone()
+    assert stored is not None and stored[0] == "real"
+
+
+def test_a_group_members_integer_score_is_recorded(conn: sqlite3.Connection) -> None:
+    member_scores: dict[str, Any] = _scaled(1.0)
+    member_scores["peer_score"] = 3
+    post, question_ids = _group_payload([member_scores, _scaled(2.0), _scaled(3.0)])
+    seed_submitted(conn, "rec-gz", question_id=question_ids[0], post_id=post["id"])
+    record_resolution_observation(
+        conn, record_id="rec-gz", source_response=post, observed_at=RESOLVED_AT
+    )
+    write = record_platform_scores(conn, record_id="rec-gz", computed_at=SCORED_AT)
+    assert {s.metric: s.value for s in write.scores}["platform_peer_score"] == 3.0
+
+
+def test_the_trigger_and_the_reader_refuse_the_same_unrepresentable_integer(
+    conn: sqlite3.Connection,
+) -> None:
+    """2**53 + 1 has no double. The reader refuses it; so would the trigger, because SQLite
+    compares an integer with a REAL exactly (so the two layers agree rather than the schema
+    admitting a value the writer will not write)."""
+    seed_submitted(conn, "rec-u", question_id=QUESTION_ID, post_id=POST_ID, question_type="numeric")
+    payload = post_payload(
+        "numeric", post_id=POST_ID, question_id=QUESTION_ID, score_data={"peer_score": 2**53 + 1}
+    )
+    _insert_resolution(conn, _payload_row(conn, "rec-u", payload))
+    with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
+        _platform_row(conn, "rec-u", value=float(2**53 + 1))
+
+
+def test_a_ledger_at_017_refuses_an_integer_score_until_018_is_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live path: the migration is applied to an existing ledger, not a fresh one."""
+    db = tmp_path / "ledger.sqlite3"
+    packaged = ledger_module._load_migrations
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ledger_module, "_load_migrations", lambda: [m for m in packaged() if m[0] <= 17]
+        )
+        assert initialize_ledger(db) == 17
+    connection = connect(db)
+    try:
+        seed_submitted(
+            connection, "rec-v17", question_id=QUESTION_ID, post_id=POST_ID, question_type="numeric"
+        )
+        payload = post_payload(
+            "numeric", post_id=POST_ID, question_id=QUESTION_ID, score_data={"peer_score": 0}
+        )
+        _insert_resolution(connection, _payload_row(connection, "rec-v17", payload))
+        with pytest.raises(sqlite3.IntegrityError, match="the value its cited observation holds"):
+            _platform_row(connection, "rec-v17", value=0.0)
+    finally:
+        connection.close()
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 18
+    connection = connect(db)
+    try:
+        _platform_row(connection, "rec-v17", value=0.0)
+    finally:
+        connection.close()
