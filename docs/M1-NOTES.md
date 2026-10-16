@@ -16280,3 +16280,28 @@ One-line edits to `src/`, run after commit with `PYTHONDONTWRITEBYTECODE=1` and 
     it.
 
   Both now die.
+
+### Round 1 — CHANGES REQUESTED on `672df3a`, one blocker
+
+**B1: text written with a surrogate pair changed detection and overlap across a store and
+reload.** A letter spelled as a valid UTF-16 surrogate pair held as two Python code points
+(Mathematical Bold *i*, `𝐢`) did not match `Iran`. After a
+`model_dump(mode="json")` → JSON → load round trip, the pair was one scalar, NFKC folded it
+to `i`, and it did match. The same mechanism made a lens title `novel` in memory and
+`republication` after replay. Reproduced on `672df3a` with the reviewer's script, exactly as
+reported.
+
+This is M1-305's astral-versus-pair lesson, in a new function that normalizes text. The
+replay properties I had written passed because **their strategies never spelled a letter as a
+pair**. That is the vacuous-strategy class again, and the reviewer named it as a process
+finding.
+
+- **Fix:** `locales.comparison_form()` first puts text in the form JSON replay produces. A
+  UTF-16 `surrogatepass` encode/decode recombines valid pairs and keeps lone surrogates; a
+  test checks this against `json.loads(json.dumps(..., ensure_ascii=True))`. It then applies
+  NFKC and case folding. Detection triggers and question text, overlap title tokens and
+  publisher comparison all use it.
+- **Properties:** `strategies.spelled()` spells each letter as plain, bold scalar or bold
+  pair, independently. A new replay property in each suite failed on `672df3a`, passes now,
+  and kills the mutant that drops the recombination step. The reviewer's counterexample is
+  also pinned as a unit test in each module.

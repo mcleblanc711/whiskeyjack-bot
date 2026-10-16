@@ -380,3 +380,27 @@ def test_the_file_schema_version_is_the_documented_constant() -> None:
 
     annotation = _RegistryFile.model_fields["schema_version"].annotation
     assert get_args(annotation) == (REGISTRY_SCHEMA_VERSION,)
+
+
+def test_a_surrogate_pair_letter_matches_before_and_after_replay() -> None:
+    """Round 1, B1: the reviewer's counterexample, pinned."""
+    import json
+
+    question = _question("Will the strait close?", criteria="According to 𝐢ran officials")
+    stored = json.dumps(question.model_dump(mode="json"), ensure_ascii=True)
+    reloaded = CanonicalBinaryQuestion.model_validate(json.loads(stored))
+    registry = load_registry(COMMITTED)
+    assert [m.code for m in detect(question, registry)] == ["IR"]
+    assert detect(question, registry) == detect(reloaded, registry)
+
+
+def test_comparison_form_is_the_json_replay_form_and_keeps_lone_surrogates() -> None:
+    import json
+
+    from whiskeyjack_bot.research.locales import comparison_form
+
+    for text in ("𝐢ran", "\U0001d422ran", "x\ud800", "\udc22\ud835", "IRAN"):
+        replayed = json.loads(json.dumps(text, ensure_ascii=True))
+        assert comparison_form(text) == comparison_form(replayed)
+    assert comparison_form("𝐢ran") == "iran"
+    assert comparison_form("x\ud800") == "x\ud800"

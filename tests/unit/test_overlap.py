@@ -219,3 +219,14 @@ def test_comparable_reads_the_document_and_takes_the_title_from_the_caller() -> 
         comparable("doc", english_title=None)  # type: ignore[arg-type]
     with pytest.raises(OverlapError):
         comparable(document, english_title=3)  # type: ignore[arg-type]
+
+
+def test_a_surrogate_pair_title_classifies_the_same_after_replay() -> None:
+    """Round 1, B1: the reviewer's counterexample, pinned."""
+    import json
+
+    base = _item("base", "Iran tanker fire", run="b")
+    paired = _item("lens", "𝐢ran tanker fire")
+    replayed = _item("lens", json.loads(json.dumps(paired.english_title, ensure_ascii=True)))
+    assert classify([base], [paired]) == classify([base], [replayed])
+    assert classify([base], [paired]) == {paired.key: "republication"}
