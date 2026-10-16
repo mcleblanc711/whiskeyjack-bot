@@ -54,6 +54,7 @@ and bumping one never bumps another.
 | `SNAPSHOT_SCHEMA_VERSION` | `1.0.0` | `metaculus/snapshots.py:SNAPSHOT_SCHEMA_VERSION` | Question snapshot files written by `questions fetch` and the tournament worker. |
 | `EXPORT_SCHEMA_VERSION` | `1` | `export.py:EXPORT_SCHEMA_VERSION` | The export contract below. |
 | `REPORT_SCHEMA_VERSION` | `1` | `report.py:REPORT_SCHEMA_VERSION` | The report contract below. |
+| `REGISTRY_SCHEMA_VERSION` | `1` | `research/locales.py:REGISTRY_SCHEMA_VERSION` | The `schema_version` the locale registry (`config/locales.yaml`, M1-356) must declare. Not hashed into anything: a lens run records the registry file's own sha256. |
 
 The prompt's own version (the H1 of the prompt file) and each score's
 `implementation_version` are data, stored per row, not constants: see

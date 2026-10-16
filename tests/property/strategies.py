@@ -382,3 +382,45 @@ def persisted_run(run: ResearchRun) -> str:
 def round_trip_run(run: ResearchRun) -> ResearchRun:
     """Store and reload a run the way replay does."""
     return validate_run(json.loads(persisted_run(run)))
+
+
+# --- Three spellings of one letter (M1-356 round 1, B1) ----------------------------------
+#
+# Plain ASCII, a Mathematical Bold scalar (U+1D400 block, which NFKC folds to the plain
+# letter), and that scalar's UTF-16 surrogate-pair spelling as two Python code points.
+# ``json.dumps(ensure_ascii=True)`` escapes the last two identically and ``json.loads``
+# recombines the pair, so any comparison that normalizes text must agree across all three
+# or it changes its answer when its input is stored and reloaded.
+
+
+def _bold(char: str) -> str:
+    if "a" <= char <= "z":
+        return chr(0x1D41A + ord(char) - ord("a"))
+    if "A" <= char <= "Z":
+        return chr(0x1D400 + ord(char) - ord("A"))
+    return char
+
+
+def _pair(char: str) -> str:
+    """``char``'s UTF-16 surrogate-pair spelling, as two Python code points."""
+    units = char.encode("utf-16-le")
+    if len(units) != 4:
+        return char
+    high = int.from_bytes(units[:2], "little")
+    low = int.from_bytes(units[2:], "little")
+    return chr(high) + chr(low)
+
+
+@st.composite
+def spelled(draw: st.DrawFn, text: str) -> str:
+    """``text`` with each letter independently plain, a bold scalar, or a bold pair."""
+    out = []
+    for char in text:
+        form = draw(st.sampled_from(["plain", "scalar", "pair"]))
+        if form == "scalar":
+            out.append(_bold(char))
+        elif form == "pair":
+            out.append(_pair(_bold(char)))
+        else:
+            out.append(char)
+    return "".join(out)
