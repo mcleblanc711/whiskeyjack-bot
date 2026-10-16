@@ -4,8 +4,9 @@
   locales with local publishers, and does not depend on the registry file's order.
 - Every planned call asks only for bare hosts the locale lists as local -- never an external
   or path-prefixed entry -- which is the "locality is the publisher" rule in executable form.
-- ``locale_rows`` is total over arbitrary (untrusted) provider bodies: it never raises, every
-  row it returns validated, and every row describes a document it was given.
+- ``locale_rows`` is total over arbitrary (untrusted) provider bodies: it never raises, gives
+  every document exactly one row, and every value in a row -- labels included -- is text the
+  ledger can store and read back.
 """
 
 from __future__ import annotations
@@ -107,7 +108,38 @@ _DOCUMENTS = [
 ]
 
 
-@given(_BODIES, st.sampled_from(["asknews", "exa"]))
+# Articles that always match a document, with text fields dense in lone surrogates. The broad
+# strategy above reaches "a matched article carrying an unstorable value" too rarely: a mutant
+# that removed the storability check survived it (the vacuous-strategy class).
+_SURROGATE_TEXT = st.text(
+    st.sampled_from(["a", "b", " "]) | st.characters(categories=["Cs"]), min_size=1, max_size=6
+)
+_MATCHED_BODIES = st.lists(
+    st.fixed_dictionaries(
+        {
+            "as_dicts": st.lists(
+                st.fixed_dictionaries(
+                    {
+                        "article_url": st.sampled_from(
+                            ["https://timesofoman.com/a", "https://x.example/b"]
+                        ),
+                        "language": _SURROGATE_TEXT,
+                        "title": _SURROGATE_TEXT,
+                        "eng_title": _SURROGATE_TEXT,
+                        "reporting_voice": _SURROGATE_TEXT,
+                    }
+                ),
+                min_size=1,
+                max_size=3,
+            )
+        }
+    ),
+    min_size=1,
+    max_size=2,
+)
+
+
+@given(st.one_of(_BODIES, _MATCHED_BODIES), st.sampled_from(["asknews", "exa"]))
 def test_locale_rows_never_raise_and_describe_only_given_documents(
     bodies: list[Any], provider: str
 ) -> None:
@@ -116,12 +148,19 @@ def test_locale_rows_never_raise_and_describe_only_given_documents(
     call = LensCall("OM", provider, "q", "question", ("timesofoman.com",))  # type: ignore[arg-type]
     rows = locale_rows(call, entry, _DOCUMENTS, bodies)
     keys = {(d.retrieval_run_id, d.canonical_url, d.content_sha256) for d in _DOCUMENTS}
-    assert {row.key() for row in rows} <= keys
-    assert len({row.key() for row in rows}) == len(rows)
+    # Every document gets exactly one row: provider values the ledger could not read back are
+    # dropped from the row, never allowed to make the row -- or the paid run -- unwritable.
+    assert {row.key() for row in rows} == keys
+    assert len(rows) == len(_DOCUMENTS)
     for row in rows:
         for text in (row.language, row.native_title, row.english_title):
             if text is not None:
                 text.encode("utf-8")  # storable: never a lone surrogate
+        for label in (row.provider_labels or {}).values():
+            # JsonValue admits a lone surrogate where `str` fields do not (M1-357, B1), so
+            # labels are where an unchecked value would reach the store and refuse the run.
+            assert isinstance(label, str)
+            label.encode("utf-8")
         assert row.publisher_origin == (
             "local" if row.canonical_url.startswith("https://timesofoman.com") else "unclassified"
         )
