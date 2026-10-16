@@ -32,6 +32,7 @@ from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.research.dedup import dedup_key
 from whiskeyjack_bot.research.model import (
     DocumentLocale,
+    ResearchSchemaError,
     validate_document,
     validate_locale,
     validate_run,
@@ -242,7 +243,7 @@ def test_labels_either_refuse_atomically_or_replay_from_the_ledger(
                 "provider_labels": labels,
             }
         )
-    except Exception:
+    except ResearchSchemaError:
         return  # the model refused it; nothing reaches the store
     built = build_packet(9, [run], [document], [locale])
     try:

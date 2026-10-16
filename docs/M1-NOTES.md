@@ -16461,3 +16461,10 @@ one row committed, then `load_packet` raised.
   It failed on `ea91ec3`, passes now, and kills the mutant that removes the check. The earlier
   replay property only round-tripped JSON in memory with fixed labels, which is why it could
   not see the ledger's own refusal. The reviewer's reproduction is also pinned as a unit test.
+
+### Round 2 — APPROVE on `6727b26`, no blockers
+
+B1 closed. One non-blocking observation, taken after approval as a **test-only** change: the
+real-SQLite property caught every exception from `validate_locale`. It now catches only
+`ResearchSchemaError`, so an unexpected failure fails the property instead of passing it. No
+`src/` change follows the approved commit.
