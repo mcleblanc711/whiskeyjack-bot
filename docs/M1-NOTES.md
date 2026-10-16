@@ -16138,3 +16138,145 @@ and on no other, which is the point of it.
 - A refusal pages at 100 only, without a back-filled 80. A series whose spend jumps from under 80%
   straight to a refusal in one reservation never sent the 80% page. Deliberately left: it is
   unchanged by this branch and the 100% page is the one that matters once research degrades.
+
+## M1-356 (D53) — Locale registry, detection, publisher origin, overlap and census
+
+### What shipped
+
+The first item of the local-source lens. It has no paid caller and no `AppConfig` field, and
+nothing on the live path imports it. `docs/LOCAL-LENS-NOTES.md` is the lens's own running
+record, including the 2026-10-16 probe this design rests on.
+
+- **`config/locales.yaml`** holds twelve locales: IR, OM, AE, SA, RU, UA, CN, TW, TR, IL, CA
+  and CA-QC. Each lists its English triggers, ISO 639-1 languages, ccTLDs, curated
+  `local_domains` and `external_domains`, and native terms. Its identity is the sha256 of the
+  file bytes, which is `prompt.py`'s rule.
+- **`research/locales.py`** provides:
+  - a strict loader (`LocaleError`, path rendered, content never echoed, regular files only);
+  - `detect(question, registry)`, which does whole-word, NFKC- and case-folded matching over
+    the title, group parent title and resolution criteria;
+  - `publisher_origin(url, locale)`, which returns `local`, `external` or `unclassified`.
+- **`research/overlap.py`** provides:
+  - `classify`, which gives each lens document exactly one of `same_url`, `same_content`,
+    `republication`, `novel` or `unassessed`;
+  - `clusters`, a union-find over `near_duplicate` with a total-order representative;
+  - `independent_reports`.
+- **`research/census.py`** and **`whiskeyjack research language-census`** count, read-only,
+  over stored AskNews artifacts.
+
+**Census of the live ledger, 2026-10-16, registry `3d4926a8…`:**
+
+| Measure | Value |
+| --- | --- |
+| AskNews runs | 137 (0 unreadable, 0 malformed) |
+| Articles | 1,552 (1,301 unique URLs) |
+| Local to a registry locale | RU 56, UA 48, TR 19, TW 12, CN 5, IL 3, CA 2, AE 2, CA-QC 1, SA 1 |
+| Unclassified | 1,404 |
+
+Two readings follow:
+
+- **The census makes language-versus-locality concrete in our own data:** 98 articles are in
+  Russian and 56 are from Russian publishers.
+- **No stored article is from an Iranian publisher.**
+
+### Decision — locality is publisher origin, from the registry only
+
+Owner correction, 2026-10-16: "the goal was LOCAL sources (ie Iranian sources; not BBC
+Persian)". The probe showed both shortcuts failing:
+
+- **Language:** Exa's Persian results mixed Mehr, Defa Press, SNN and Tabnak with BBC Persian
+  and Iran International.
+- **AskNews's `country`:** `countries=["IR"]` returned AFP copy, because the tag marks the
+  story, not the publisher.
+
+So `publisher_origin` reads the URL against `local_domains`, `external_domains` and `cctlds`
+and nothing else. `external` is the class for outlets based outside a locale but aimed at it
+(exile, diaspora, a foreign state's language service). The class was named `diaspora` in the
+first draft of the D53 rows and renamed before they merged, because BBC Persian is not a
+diaspora outlet.
+
+### Decision — precedence: external entry, then local entry, then ccTLD
+
+An explicit list beats an inference. The case this decides is a foreign service hosted under
+the locale's TLD: the explicit `external` entry wins. A domain listed as both local and
+external in one locale is refused at load (`locale_domain_conflict`), so the order between
+those two lists is never observable.
+
+### Decision — detection reads title, parent title and resolution criteria; not fine print
+
+Fine print and background name places as context ("unlike Russia's 2022 default…"), and a
+lens call bought on context is money spent on nothing the question asks. A test pins both
+directions.
+
+### Decision — `unassessed` is its own class, never folded into `novel`
+
+An untranslated Exa document has no English title to compare, which describes every Persian
+local source until M1-361. Calling it `novel` would inflate exactly the number the lens is
+judged by. `independent_reports` counts a cluster only if a member is `novel` and **no**
+member is already held (`same_url`, `same_content` or `republication`). That is the
+conservative direction the request asks for: "multiple publications repeating one original
+report do not constitute independent confirmation."
+
+### Decision — two near-duplicate rules, with constants pinned by test
+
+- **Cross-publisher:** title-token Jaccard ≥ 0.6.
+- **Same publisher within 12 h:** Jaccard ≥ 0.3.
+
+The second rule exists because AskNews translates each language's copy of a wire story
+separately. On the probe's five AFP tanker copies (en, ar, es, pt, fr), pairwise Jaccard ran
+0.31–0.8, so the 0.6 rule alone joins only one pair. With the wire rule all five form one
+cluster (`test_five_language_copies_of_one_wire_story_are_one_report`), while a different
+AFP story the same day stays separate.
+
+### Rejected — the registry as an `AppConfig` field
+
+Any new field moves `config_sha256` and retires the live 33129 activation. M1-358 binds the
+registry *path* through `retrieval.local_lens` when it adds the opt-in; this item needs none.
+
+### Rejected — public-suffix domains in the registry
+
+`gov.cn` and `gov.il` were in the first draft. They are public suffixes, so they would make
+every host under them a single "domain"; they are refused at load. The ccTLD rule already
+covers them.
+
+### Deferred (do not read the absence as an omission)
+
+- **Claim-level novelty** (a new claim versus a new publication of an old one) is M1-360.
+  Titles cannot carry it. On the probe, two Arabic outlets reporting one Iranian declaration
+  scored 0.33 and are *not* merged.
+- **Folding language tags** (`en`, `en-US`, `en-us`): the census counts them as AskNews wrote
+  them, and the sidecar (M1-357) stores them verbatim.
+- **Registry coverage.** The US and UK are absent on purpose: the baseline already reaches
+  their press. Latin America, Europe and Africa are absent until a question needs them, which
+  is why 1,404 of the stored articles are `unclassified`, not unknown-local.
+
+### Standing risk — not verifiable offline
+
+- **The domain lists are curated by hand and will drift.** Outlets move, rebrand and change
+  hosts. A wrong entry misclassifies silently, so the census is the check.
+- **Whether AskNews indexes the Iranian domains** (`domain_url`) is unprobed. The probe's
+  authorized call count was used up.
+
+### Mutation pass — forty-one mutants, all dead after two fixes
+
+One-line edits to `src/`, run after commit with `PYTHONDONTWRITEBYTECODE=1` and every
+`__pycache__` removed before each run.
+
+- **Pass 1, 28 mutants across `locales.py`, `overlap.py` and `census.py`, against the item's
+  unit and property tests.** 25 died, two survived and one did not apply (ruff had reflowed
+  the line).
+  - *No lookbehind* survived: no test put a word character before a trigger. Fixed with
+    "Kiran".
+  - *Single-space join* survived because the line-break test was **vacuous**: the lone
+    `Hormuz` trigger selected both locales anyway, so the locale-level assertion passed
+    whether or not `Strait of Hormuz` matched. The test now asserts the trigger itself.
+- **Pass 2, 13 mutants, one per property, each run against that property alone.** 11 died
+  and two survived, both vacuous strategies:
+  - *Origin totality:* `https://{hostile text}` almost never spells an authority `urlsplit`
+    raises on, so a mutant removing the guard survived. A pool of broken authorities is now
+    drawn.
+  - *Symmetry:* the list strategy rarely produced same publisher, mid overlap and more than
+    the window apart at once, so dropping `abs` survived. A dense pair strategy now reaches
+    it.
+
+  Both now die.
