@@ -143,6 +143,10 @@ FallbackReason = Literal[
     "primary_provider_failed",
     "primary_returned_no_documents",
     "official_source_required",
+    # M1-358 (D53): a local-source lens call. Authorizing, but never emitted by
+    # decide_fallback -- only research/lens.py passes it, and a lens run never enters the
+    # packet a submitted forecast is built from, so it is not a fallback for the primary.
+    "local_source_lens",
 ]
 
 _FALLBACK_REASONS: Final[tuple[FallbackReason, ...]] = get_args(FallbackReason)
@@ -153,7 +157,12 @@ _FALLBACK_REASONS: Final[tuple[FallbackReason, ...]] = get_args(FallbackReason)
 # authorize a fallback call on its own -- retrieve_web enforces that directly,
 # since nothing upstream of it does yet.
 _AUTHORIZING_REASONS: Final[frozenset[FallbackReason]] = frozenset(
-    {"primary_provider_failed", "primary_returned_no_documents", "official_source_required"}
+    {
+        "primary_provider_failed",
+        "primary_returned_no_documents",
+        "official_source_required",
+        "local_source_lens",
+    }
 )
 
 _BASE_URL: Final = "https://api.exa.ai"
@@ -546,6 +555,7 @@ def retrieve_web(
     now: datetime,
     fallback_reasons: Sequence[FallbackReason],
     include_domains: Sequence[str] = (),
+    lens_record: dict[str, Any] | None = None,
 ) -> ExaRetrieval:
     """Retrieve web evidence for ``queries`` as normalized documents.
 
@@ -790,6 +800,9 @@ def retrieve_web(
                 # research_runs.provider_config_json, so the ledger alone answers
                 # why a second provider was engaged.
                 "fallback_reasons": list(reasons),
+                # M1-358: the lens's own record of why it ran (locale, registry digest, query
+                # source). Absent on every non-lens call, so their provider_config is unchanged.
+                **({} if lens_record is None else {"lens": lens_record}),
             },
             "queries": capped_queries,
             "started_at_utc": now_utc,
