@@ -395,6 +395,25 @@ def build_parser() -> argparse.ArgumentParser:
             "directory under storage.export_root. An existing report is never overwritten"
         ),
     )
+    research = subparsers.add_parser(
+        "research", help="read-only views of stored research evidence (M1-356)"
+    )
+    research_commands = research.add_subparsers(dest="research_command", required=True)
+    census = research_commands.add_parser(
+        "language-census",
+        help=(
+            "count the languages, AskNews story-countries and publisher origins of every "
+            "stored AskNews article; reads the ledger and artifacts, calls no provider, "
+            "writes nothing"
+        ),
+    )
+    census.add_argument("--config", default="config.yaml", type=Path)
+    census.add_argument(
+        "--registry",
+        default=Path("config/locales.yaml"),
+        type=Path,
+        help="locale registry used to classify publishers (default: config/locales.yaml)",
+    )
     return parser
 
 
@@ -1759,6 +1778,53 @@ def _run_report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_research(args: argparse.Namespace) -> int:
+    """Read-only research views (M1-356): today, the AskNews language census.
+
+    Prints one JSON object. Nothing here calls a provider or writes to the ledger: the
+    ledger is opened with ``ledger.connect_readonly`` (``mode=ro`` refuses every write) and
+    artifacts are read through ``artifacts.read_raw_responses``. The census reports counts
+    only, never an article's text, so it carries no provider content to the terminal.
+    """
+    import dataclasses
+    import json
+
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.ledger import LedgerError, connect_readonly
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+    from whiskeyjack_bot.research.census import CensusError, language_census
+    from whiskeyjack_bot.research.locales import LocaleError, load_registry
+
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    try:
+        registry = load_registry(args.registry)
+    except LocaleError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    try:
+        conn = connect_readonly(config.storage.sqlite_path)
+    except LedgerError as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
+    try:
+        census = language_census(conn, config.storage.artifact_root, registry)
+    except CensusError as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
+    finally:
+        conn.close()
+    print(json.dumps(dataclasses.asdict(census), indent=2, sort_keys=True))
+    return EXIT_OK
+
+
 def _open_existing_ledger(path: Path) -> sqlite3.Connection | None:
     """Open an existing ledger, or print why not and return ``None`` (M2-701).
 
@@ -2193,6 +2259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_export(args)
     if args.command == "report":
         return _run_report(args)
+    if args.command == "research":
+        return _run_research(args)
     raise AssertionError(f"unhandled command: {args.command}")
 
 

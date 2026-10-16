@@ -1,0 +1,194 @@
+# Locale registry for the local-source lens (M1-356, D53).
+#
+# What this file is: a curated, versioned map from the places a forecasting question can be
+# about to the publishers BASED there. Locality is publisher origin, never document language:
+# a Persian-language service run from London is `external` to Iran, not `local` (owner,
+# 2026-10-16). Its sha256 is recorded on every lens run, so editing it is visible in the
+# ledger as a different registry, not a silent reinterpretation.
+#
+# Fields per locale:
+#   code             ISO 3166-1 alpha-2 for a country; COUNTRY-REGION (ISO 3166-2) for a region.
+#   parent           a region's country code; a region inherits nothing implicitly.
+#   triggers         English names, demonyms, places and institutions. Matched whole-word and
+#                    case-insensitively against the question title, group parent title and
+#                    resolution criteria. A trigger listed under several locales (a strait, a
+#                    shared border) selects every one of them.
+#   languages        ISO 639-1 codes of the locale's local-language press.
+#   cctlds           country-code TLDs whose hosts count as local publishers.
+#   local_domains    publishers and institutions based in the locale. State, semi-official,
+#                    independent and opposition outlets alike: NO credibility weighting here.
+#   external_domains outlets based outside the locale but aimed at it (exile, diaspora, a
+#                    foreign state's language service). `host` or `host/path-prefix`.
+#   native_terms     trigger -> the local name of that place or institution, used to build a
+#                    native-language query. Not a translation of the question.
+#
+# Deliberately absent: locales whose only language is English and whose press the baseline
+# already reaches (the United States, the United Kingdom). A lens there buys nothing the
+# baseline does not, so a question about them triggers no lens call.
+
+schema_version: 1
+locales:
+  - code: IR
+    triggers: [Iran, Iranian, Iranians, Tehran, Islamic Republic, IRGC, Revolutionary Guard,
+               Revolutionary Guards, Khamenei, Pezeshkian, Majlis, Strait of Hormuz, Hormuz,
+               Gulf of Oman, Persian Gulf, Bandar Abbas, Isfahan, Natanz, Fordow]
+    languages: [fa]
+    cctlds: [ir]
+    local_domains: [irna.ir, isna.ir, mehrnews.com, tasnimnews.com, farsnews.ir,
+                    tehrantimes.com, presstv.ir, president.ir, khamenei.ir, leader.ir,
+                    defapress.ir, snn.ir, tabnak.ir, hamshahrionline.ir, khabaronline.ir,
+                    entekhab.ir, iribnews.ir]
+    external_domains: [iranintl.com, radiofarda.com, bbc.com/persian, iranwire.com,
+                       manototv.com]
+    native_terms:
+      Iran: ایران
+      Iranian: ایران
+      Tehran: تهران
+      Strait of Hormuz: تنگه هرمز
+      Hormuz: هرمز
+      IRGC: سپاه پاسداران
+      Revolutionary Guard: سپاه پاسداران
+      Revolutionary Guards: سپاه پاسداران
+      Khamenei: خامنه‌ای
+      Majlis: مجلس
+      Persian Gulf: خلیج فارس
+      Gulf of Oman: دریای عمان
+
+  - code: OM
+    triggers: [Oman, Omani, Muscat, Strait of Hormuz, Hormuz, Gulf of Oman, Musandam]
+    languages: [ar]
+    cctlds: [om]
+    local_domains: [omannews.gov.om, timesofoman.com, omanobserver.om]
+    external_domains: []
+    native_terms:
+      Oman: عمان
+      Strait of Hormuz: مضيق هرمز
+      Hormuz: هرمز
+      Gulf of Oman: خليج عمان
+
+  - code: AE
+    triggers: [United Arab Emirates, UAE, Emirati, Abu Dhabi, Dubai, Strait of Hormuz, Hormuz,
+               Fujairah]
+    languages: [ar]
+    cctlds: [ae]
+    local_domains: [wam.ae, thenationalnews.com, gulfnews.com, khaleejtimes.com, albayan.ae,
+                    alkhaleej.ae, emaratalyoum.com]
+    external_domains: []
+    native_terms:
+      United Arab Emirates: الإمارات
+      UAE: الإمارات
+      Strait of Hormuz: مضيق هرمز
+      Hormuz: هرمز
+
+  - code: SA
+    triggers: [Saudi Arabia, Saudi, Riyadh, Jeddah, Aramco, Mohammed bin Salman]
+    languages: [ar]
+    cctlds: [sa]
+    local_domains: [spa.gov.sa, arabnews.com, okaz.com.sa, alriyadh.com]
+    external_domains: []
+    native_terms:
+      Saudi Arabia: السعودية
+      Saudi: السعودية
+      Riyadh: الرياض
+      Aramco: أرامكو
+
+  - code: RU
+    triggers: [Russia, Russian, Russians, Moscow, Kremlin, Putin, Duma, Rosneft, Gazprom]
+    languages: [ru]
+    cctlds: [ru]
+    local_domains: [tass.ru, ria.ru, interfax.ru, kommersant.ru, rbc.ru, vedomosti.ru,
+                    kremlin.ru, mid.ru, rg.ru]
+    external_domains: [meduza.io, novayagazeta.eu, tvrain.tv, svoboda.org]
+    native_terms:
+      Russia: Россия
+      Russian: Россия
+      Moscow: Москва
+      Kremlin: Кремль
+      Putin: Путин
+      Duma: Госдума
+
+  - code: UA
+    triggers: [Ukraine, Ukrainian, Ukrainians, Kyiv, Kiev, Zelensky, Zelenskyy, Kharkiv,
+               Odesa, Odessa, Donbas, Zaporizhzhia]
+    languages: [uk]
+    cctlds: [ua]
+    local_domains: [ukrinform.ua, pravda.com.ua, unian.ua, president.gov.ua,
+                    kyivindependent.com, suspilne.media]
+    external_domains: []
+    native_terms:
+      Ukraine: Україна
+      Ukrainian: Україна
+      Kyiv: Київ
+      Kiev: Київ
+      Zelensky: Зеленський
+      Zelenskyy: Зеленський
+
+  - code: CN
+    triggers: [China, Chinese, Beijing, Xi Jinping, PRC, CCP, Shanghai, Shenzhen, Politburo]
+    languages: [zh]
+    cctlds: [cn]
+    local_domains: [xinhuanet.com, news.cn, people.com.cn, chinadaily.com.cn, globaltimes.cn,
+                    caixin.com, thepaper.cn]
+    external_domains: []
+    native_terms:
+      China: 中国
+      Chinese: 中国
+      Beijing: 北京
+      Xi Jinping: 习近平
+
+  - code: TW
+    triggers: [Taiwan, Taiwanese, Taipei, Lai Ching-te, Taiwan Strait]
+    languages: [zh]
+    cctlds: [tw]
+    local_domains: [focustaiwan.tw, cna.com.tw, taipeitimes.com, udn.com, ltn.com.tw]
+    external_domains: []
+    native_terms:
+      Taiwan: 台灣
+      Taiwanese: 台灣
+      Taipei: 台北
+      Taiwan Strait: 台灣海峽
+
+  - code: TR
+    triggers: [Turkey, Türkiye, Turkiye, Turkish, Ankara, Istanbul, Erdogan, Erdoğan]
+    languages: [tr]
+    cctlds: [tr]
+    local_domains: [aa.com.tr, hurriyet.com.tr, dailysabah.com, sabah.com.tr,
+                    cumhuriyet.com.tr, bianet.org]
+    external_domains: []
+    native_terms:
+      Turkey: Türkiye
+      Turkish: Türkiye
+      Ankara: Ankara
+      Erdogan: Erdoğan
+
+  - code: IL
+    triggers: [Israel, Israeli, Israelis, Jerusalem, Tel Aviv, Netanyahu, Knesset, IDF]
+    languages: [he]
+    cctlds: [il]
+    local_domains: [timesofisrael.com, haaretz.com, ynetnews.com, jpost.com]
+    external_domains: []
+    native_terms:
+      Israel: ישראל
+      Israeli: ישראל
+      Knesset: כנסת
+      Netanyahu: נתניהו
+
+  - code: CA
+    triggers: [Canada, Canadian, Canadians, Ottawa, Carney, Bank of Canada]
+    languages: [en, fr]
+    cctlds: [ca]
+    local_domains: [cbc.ca, radio-canada.ca, theglobeandmail.com, ledevoir.com, lapresse.ca,
+                    canada.ca]
+    external_domains: []
+    native_terms: {}
+
+  - code: CA-QC
+    parent: CA
+    triggers: [Quebec, Québec, Quebecer, Montreal, Montréal]
+    languages: [fr]
+    cctlds: []
+    local_domains: [ledevoir.com, lapresse.ca, quebec.ca, radio-canada.ca]
+    external_domains: []
+    native_terms:
+      Quebec: Québec
+      Montreal: Montréal
