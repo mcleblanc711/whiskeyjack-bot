@@ -48,7 +48,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -147,6 +147,22 @@ def _languages(entry: LocaleEntry) -> frozenset[str]:
     return frozenset(entry.languages)
 
 
+def _distinct_terms(terms: Iterable[str]) -> list[str]:
+    """Native terms in order, dropping one whose words an earlier kept term already says.
+
+    "Strait of Hormuz" and "Hormuz" are two triggers with two native terms, and the second
+    is a word of the first; repeating it adds nothing to a keyword query but weight.
+    """
+    kept: list[str] = []
+    said: set[str] = set()
+    for term in terms:
+        words = set(term.split())
+        if words and not words <= said:
+            kept.append(term)
+            said |= words
+    return kept
+
+
 def plan(
     question: CanonicalQuestion, registry: LocaleRegistry, *, max_calls: int
 ) -> tuple[LensCall, ...]:
@@ -178,12 +194,10 @@ def plan(
                 )
             )
         else:
-            natives = list(
-                dict.fromkeys(
-                    entry.native_terms[trigger]
-                    for trigger in match.triggers
-                    if trigger in entry.native_terms
-                )
+            natives = _distinct_terms(
+                entry.native_terms[trigger]
+                for trigger in match.triggers
+                if trigger in entry.native_terms
             )
             calls.append(
                 LensCall(
