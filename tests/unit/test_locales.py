@@ -132,6 +132,8 @@ def test_detection_is_whole_word_and_case_insensitive() -> None:
     # "Iranian" is its own trigger; "Iranic" contains "Iran" but is not that word.
     assert detect(_question("Will an Iranic language be recognised?"), registry) == ()
     assert detect(_question("Will Omaninvest list shares?"), registry) == ()
+    # A word character on the left is a different word too: "Kiran" is not "Iran".
+    assert detect(_question("Will Kiran Rao resign?"), registry) == ()
 
 
 def test_detection_reports_triggers_in_order_of_appearance() -> None:
@@ -167,8 +169,12 @@ def test_detection_folds_unicode_spellings() -> None:
 
 
 def test_detection_tolerates_a_line_break_inside_a_multiword_trigger() -> None:
+    # Asserted on the trigger, not the locale: the lone "Hormuz" trigger would select both
+    # locales anyway, so a locale-level assertion passes whether or not the multi-word
+    # trigger matched (it did, against a single-space mutant).
     found = detect(_question("Q?", criteria="traffic through the Strait of\nHormuz"), _registry())
     assert {m.code for m in found} == {"IR", "OM"}
+    assert all("Strait of Hormuz" in m.triggers for m in found)
 
 
 @pytest.mark.parametrize("bad", [None, "Iran", object()])
