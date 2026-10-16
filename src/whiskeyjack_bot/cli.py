@@ -414,6 +414,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="locale registry used to classify publishers (default: config/locales.yaml)",
     )
+    lens_report = research_commands.add_parser(
+        "lens-report",
+        help=(
+            "summarize what the local-source lens collected and what it added over baseline "
+            "research (M1-358); reads the ledger, calls no provider, writes nothing"
+        ),
+    )
+    lens_report.add_argument("--config", default="config.yaml", type=Path)
     return parser
 
 
@@ -1779,7 +1787,8 @@ def _run_report(args: argparse.Namespace) -> int:
 
 
 def _run_research(args: argparse.Namespace) -> int:
-    """Read-only research views (M1-356): today, the AskNews language census.
+    """Read-only research views: the AskNews language census (M1-356) and the local-source
+    lens report (M1-358).
 
     Prints one JSON object. Nothing here calls a provider or writes to the ledger: the
     ledger is opened with ``ledger.connect_readonly`` (``mode=ro`` refuses every write) and
@@ -1804,6 +1813,23 @@ def _run_research(args: argparse.Namespace) -> int:
     except AllowlistError as exc:
         print(exc)
         return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    if args.research_command == "lens-report":
+        from whiskeyjack_bot.research.lens_report import LensReportError, lens_report
+
+        try:
+            conn = connect_readonly(config.storage.sqlite_path)
+        except LedgerError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        try:
+            report = lens_report(conn)
+        except LensReportError as exc:
+            print(f"refused: {exc}")
+            return EXIT_REFUSED
+        finally:
+            conn.close()
+        print(json.dumps(dataclasses.asdict(report), indent=2, sort_keys=True))
+        return EXIT_OK
     try:
         registry = load_registry(args.registry)
     except LocaleError as exc:
