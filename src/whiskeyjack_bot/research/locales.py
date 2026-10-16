@@ -106,7 +106,9 @@ def _require_domain_entry(value: str) -> str:
             "must name something registrable, not a bare public suffix",
         )
     if slash and not _PATH_PREFIX.fullmatch("/" + path):
-        raise authored_error("locale_domain_invalid", "path prefix must be a plain URL path")
+        raise authored_error(
+            "locale_domain_path_invalid", "a domain's path prefix must be a plain URL path"
+        )
     return value
 
 

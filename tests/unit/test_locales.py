@@ -262,7 +262,7 @@ def _mutated(path: list[Any], value: Any) -> dict[str, Any]:
         (["locales", 0, "local_domains"], ["com"], "locale_domain_invalid"),
         (["locales", 0, "local_domains"], ["co.uk"], "locale_domain_not_registrable"),
         (["locales", 0, "local_domains"], ["Mehrnews.com"], "locale_domain_invalid"),
-        (["locales", 0, "local_domains"], ["mehrnews.com/a b"], "locale_domain_invalid"),
+        (["locales", 0, "local_domains"], ["mehrnews.com/a b"], "locale_domain_path_invalid"),
         (["locales", 0, "local_domains"], ["x.com", "x.com"], "locale_domain_duplicate"),
         (["locales", 0, "external_domains"], ["mehrnews.com"], "locale_domain_conflict"),
         (["locales", 0, "native_terms"], {"Tehran": "تهران"}, "locale_native_term_orphan"),
@@ -371,3 +371,12 @@ def test_content_failures_are_not_filesystem_errors_and_do_not_echo(
         load_registry(target)
     assert not caught.value.is_filesystem_error
     assert SECRET not in str(caught.value)
+
+
+def test_the_file_schema_version_is_the_documented_constant() -> None:
+    from typing import get_args
+
+    from whiskeyjack_bot.research.locales import REGISTRY_SCHEMA_VERSION, _RegistryFile
+
+    annotation = _RegistryFile.model_fields["schema_version"].annotation
+    assert get_args(annotation) == (REGISTRY_SCHEMA_VERSION,)
