@@ -219,9 +219,32 @@ class _RegistryFile(_StrictModel):
         return self
 
 
+def comparison_form(text: str) -> str:
+    """The form two pieces of text are compared in. Total over any ``str``.
+
+    Three steps, and the first is the one round 1 found missing:
+
+    1. **The form JSON replay produces.** A valid UTF-16 surrogate pair held as two Python
+       code points is recombined into its scalar; a lone surrogate is left as it is. That is
+       exactly what ``json.dumps(ensure_ascii=True)`` then ``json.loads`` does to a string,
+       so text compared in this form compares the same before and after a store and reload.
+       Without it, ``"\\ud835\\udc22ran"`` (a Mathematical Bold *i*, spelled as a pair) did
+       not match ``Iran`` while the replayed scalar did -- detection and overlap answered
+       differently for a question or document read back from the ledger (M1-356 round 1).
+    2. **NFKC**, which folds compatibility forms (fullwidth, Mathematical Alphanumeric) onto
+       the plain letter.
+    3. **Case folding.**
+
+    The UTF-16 ``surrogatepass`` round trip is the whole of step 1: encoding writes each code
+    point's units, pairs included, and decoding reads a high-low pair as one scalar and any
+    other surrogate as itself.
+    """
+    scalar = text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+    return unicodedata.normalize("NFKC", scalar).casefold()
+
+
 def _normalize(text: str) -> str:
-    """The form triggers and question text are compared in: NFKC, then case-folded."""
-    return unicodedata.normalize("NFKC", text).casefold()
+    return comparison_form(text)
 
 
 def _trigger_pattern(trigger: str) -> re.Pattern[str]:

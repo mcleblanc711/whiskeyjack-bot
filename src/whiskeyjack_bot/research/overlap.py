@@ -50,13 +50,13 @@ Pure and deterministic: no I/O, results independent of input order (property-tes
 from __future__ import annotations
 
 import re
-import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 
 from whiskeyjack_bot.research.dedup import dedup_key
+from whiskeyjack_bot.research.locales import comparison_form
 from whiskeyjack_bot.research.model import ResearchDocument
 
 OverlapClass = Literal["same_url", "same_content", "republication", "novel", "unassessed"]
@@ -116,10 +116,10 @@ def comparable(document: ResearchDocument, *, english_title: str | None) -> Comp
 
 
 def title_tokens(title: str | None) -> frozenset[str]:
-    """The comparable words of a title: NFKC, case-folded, alphanumeric runs of 3+, no stop words."""
+    """The comparable words of a title: ``locales.comparison_form``, then word runs of 3+, no stop words."""
     if title is None:
         return frozenset()
-    words = re.findall(r"\w+", unicodedata.normalize("NFKC", title).casefold())
+    words = re.findall(r"\w+", comparison_form(title))
     return frozenset(word for word in words if len(word) >= 3 and word not in _STOP)
 
 
@@ -132,10 +132,7 @@ def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
 def _same_publisher(left: Comparable, right: Comparable) -> bool:
     if left.publisher is None or right.publisher is None:
         return False
-    return (
-        unicodedata.normalize("NFKC", left.publisher).casefold().strip()
-        == unicodedata.normalize("NFKC", right.publisher).casefold().strip()
-    )
+    return comparison_form(left.publisher).strip() == comparison_form(right.publisher).strip()
 
 
 def _within_wire_window(left: Comparable, right: Comparable) -> bool:
