@@ -18,18 +18,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
 
 from hypothesis import given, strategies as st
 from strategies import HOSTILE_TEXT, TIMESTAMPS, research_documents, research_runs
 
+from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.research.dedup import dedup_key
-from whiskeyjack_bot.research.model import DocumentLocale, validate_locale
+from whiskeyjack_bot.research.model import (
+    DocumentLocale,
+    validate_document,
+    validate_locale,
+    validate_run,
+)
 from whiskeyjack_bot.research.packet import (
     PacketError,
     build_packet,
     canonical_packet_json,
     packet_sha256,
 )
+from whiskeyjack_bot.research.store import StoreError, load_packet, persist_retrieval
 
 
 def _oracle_v1_0(packet: object) -> str:
@@ -175,20 +188,6 @@ def test_a_repeated_or_foreign_locale_refuses_with_packet_error(
 # committed unchecked could not be loaded back, and the packet could not be replayed. This
 # property writes through the real store into a real ledger and reads back.
 
-import sqlite3  # noqa: E402
-import uuid  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
-from pathlib import Path  # noqa: E402
-
-import pytest  # noqa: E402
-
-from whiskeyjack_bot.ledger import connect, initialize_ledger  # noqa: E402
-from whiskeyjack_bot.research.model import validate_document, validate_run  # noqa: E402
-from whiskeyjack_bot.research.store import (  # noqa: E402
-    StoreError,
-    load_packet,
-    persist_retrieval,
-)
 
 _WHEN = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 _LABEL_VALUES = st.recursive(

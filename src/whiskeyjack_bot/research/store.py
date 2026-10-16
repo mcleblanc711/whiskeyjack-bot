@@ -502,9 +502,12 @@ def _locale_parameters(
         "english_title": locale.english_title,
         "translation_source": locale.translation_source,
         "provider_first_seen_at_utc": _optional_utc_text(locale.provider_first_seen_at_utc),
+        # `_checked_json` first, as the run's JSON columns do (round 1, B1): a label the model
+        # accepts can still hold a lone surrogate, which `_load_json` refuses on the way back
+        # out. Committing it would store evidence the packet could never be replayed from.
         "provider_labels_json": None
         if labels is None
-        else _canonical_json(labels, "provider_labels"),
+        else _canonical_json(_checked_json(labels, "provider_labels"), "provider_labels"),
         "created_at_utc": created_at_utc,
     }
 
