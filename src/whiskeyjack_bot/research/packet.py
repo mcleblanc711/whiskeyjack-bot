@@ -55,6 +55,16 @@ The rule is versioned for the same reason ``hashing.content_sha256`` is: every p
 already hashed keeps its old digest, so if the rule must change it changes as a new
 versioned function alongside this one, never as an edit to this one.
 
+**Version 1.1.0 is that, for locale rows (M1-357).** The local-source lens records
+per-document locale facts in their own table, because a new document field would move every
+stored hash (``019_research_document_locales.sql``). A packet that carries locale rows hashes
+under :func:`_canonical_v1_1`: the 1.0.0 payload, plus the sorted rows, under version
+``1.1.0``. A packet with **no** locale rows hashes under :func:`_canonical_v1_0`, which is the
+1.0.0 rule moved into a function of its own and not otherwise changed -- so every packet the
+ledger held before 019, and every packet built from runs that wrote no locale rows, keeps the
+digest it already has. ``tests/unit/test_packet_versions.py`` pins golden digests computed on
+the pre-019 code, and the item notes record the same check over every stored forecast.
+
 Error hygiene follows the rest of the package: :class:`PacketError` never echoes a
 run's or a document's content, every raise here uses a constant message, and wrapped
 raises use ``from None``.
@@ -68,14 +78,18 @@ import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TypeVar
 
 from whiskeyjack_bot.research.dedup import dedup_key
-from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
+from whiskeyjack_bot.research.model import DocumentLocale, ResearchDocument, ResearchRun
 
 # Bumping this changes every digest, which is the point: a rule change must be
 # visible as a different hash rather than silently reinterpreting stored packets.
 # It is part of the hashed payload, so the version and the rule cannot drift apart.
 PACKET_SCHEMA_VERSION = "1.0.0"
+# The rule for a packet that carries locale rows (M1-357). Not a replacement for the
+# version above: a packet with none still hashes under 1.0.0, byte for byte.
+PACKET_LOCALES_SCHEMA_VERSION = "1.1.0"
 
 # Excluded from the digest. See the module docstring for why each one is here; the
 # names are checked against the models at import time by _assert_fields_exist, so a
@@ -117,6 +131,9 @@ def _assert_fields_exist() -> None:
 _assert_fields_exist()
 
 
+_Model = TypeVar("_Model", ResearchRun, ResearchDocument, DocumentLocale)
+
+
 @dataclass(frozen=True)
 class ResearchPacket:
     """One question's retrieval runs and their deduplicated documents.
@@ -141,6 +158,9 @@ class ResearchPacket:
     question_id: int
     runs: tuple[ResearchRun, ...]
     documents: tuple[ResearchDocument, ...]
+    # Locale rows for some of ``documents`` (M1-357); empty for every packet built before
+    # the local-source lens, and for every run that wrote none. See the module docstring.
+    locales: tuple[DocumentLocale, ...] = ()
 
     def __post_init__(self) -> None:
         # type() is str/int-style exact gates rather than isinstance: bool is an int
@@ -155,6 +175,11 @@ class ResearchPacket:
         for document in self.documents:
             if not isinstance(document, ResearchDocument):
                 raise PacketError("every document must be a ResearchDocument")
+        if not isinstance(self.locales, tuple):
+            raise PacketError("locales must be a tuple")
+        for locale in self.locales:
+            if not isinstance(locale, DocumentLocale):
+                raise PacketError("every locale must be a DocumentLocale")
 
         # Deep-copy every run and document before anything else touches them. Both
         # models are plain (unfrozen) pydantic models with mutable list/dict fields
@@ -169,8 +194,10 @@ class ResearchPacket:
         # packet's own copies.
         frozen_runs = tuple(_deep_copy(run, "run") for run in self.runs)
         frozen_documents = tuple(_deep_copy(document, "document") for document in self.documents)
+        frozen_locales = tuple(_deep_copy(locale, "locale") for locale in self.locales)
         object.__setattr__(self, "runs", frozen_runs)
         object.__setattr__(self, "documents", frozen_documents)
+        object.__setattr__(self, "locales", frozen_locales)
 
         run_ids: set[str] = set()
         for run in self.runs:
@@ -198,9 +225,20 @@ class ResearchPacket:
                     "documents must be deduplicated: two share the ledger's dedup key"
                 )
             keys.add(key)
+        described: set[tuple[str, str, str]] = set()
+        for locale in self.locales:
+            key = locale.key()
+            if key not in keys:
+                # The same attribution rule as for documents: a locale row describing
+                # evidence the packet does not carry is a claim nobody can check.
+                raise PacketError("every locale must describe a document the packet carries")
+            if key in described:
+                # 019 keys a locale row by document_id, so one document has at most one.
+                raise PacketError("a document may carry at most one locale")
+            described.add(key)
 
 
-def _deep_copy(model: ResearchRun | ResearchDocument, kind: str) -> ResearchRun | ResearchDocument:
+def _deep_copy(model: _Model, kind: str) -> _Model:
     """Return an independent copy of ``model``, detached from the caller's reference.
 
     ``kind`` is one of this module's own literals ("run"/"document"), not row
@@ -218,7 +256,9 @@ def _deep_copy(model: ResearchRun | ResearchDocument, kind: str) -> ResearchRun 
         ) from None
 
 
-def _dump(model: ResearchRun | ResearchDocument, excluded: frozenset[str]) -> dict[str, object]:
+def _dump(
+    model: ResearchRun | ResearchDocument | DocumentLocale, excluded: frozenset[str]
+) -> dict[str, object]:
     """Render one model into its stored form, minus the excluded fields.
 
     ``warnings=False`` for the reason M1-302 round 1 established: a pydantic
@@ -246,10 +286,19 @@ def canonical_packet_json(packet: ResearchPacket) -> str:
 
     Exposed for tests and diagnostics the way ``hashing.normalize_content`` is: a
     hash that cannot be inspected is a hash whose disagreements cannot be explained.
+
+    Dispatches on whether the packet carries locale rows; see the module docstring.
     """
     if not isinstance(packet, ResearchPacket):
         raise PacketError("packet must be a ResearchPacket")
-    payload = {
+    if packet.locales:
+        return _render(_canonical_v1_1(packet))
+    return _render(_canonical_v1_0(packet))
+
+
+def _canonical_v1_0(packet: ResearchPacket) -> dict[str, object]:
+    """The 1.0.0 payload. Moved here from ``canonical_packet_json``, otherwise unchanged."""
+    return {
         "packet_schema_version": PACKET_SCHEMA_VERSION,
         "question_id": packet.question_id,
         # Sorted so packet identity does not depend on the order runs and documents
@@ -265,6 +314,19 @@ def canonical_packet_json(packet: ResearchPacket) -> str:
             for document in sorted(packet.documents, key=dedup_key)
         ],
     }
+
+
+def _canonical_v1_1(packet: ResearchPacket) -> dict[str, object]:
+    """The 1.1.0 payload: 1.0.0's, plus the locale rows sorted by the key they describe."""
+    payload = _canonical_v1_0(packet)
+    payload["packet_schema_version"] = PACKET_LOCALES_SCHEMA_VERSION
+    payload["document_locales"] = [
+        _dump(locale, frozenset()) for locale in sorted(packet.locales, key=DocumentLocale.key)
+    ]
+    return payload
+
+
+def _render(payload: dict[str, object]) -> str:
     try:
         # ensure_ascii escapes lone surrogates rather than failing to encode them
         # (M1-305 round 2); sort_keys and the compact separators make the rendering
@@ -297,6 +359,7 @@ def build_packet(
     question_id: int,
     runs: Iterable[ResearchRun],
     documents: Iterable[ResearchDocument],
+    locales: Iterable[DocumentLocale] = (),
 ) -> ResearchPacket:
     """Build a validated packet from any iterables; raises :class:`PacketError`.
 
@@ -307,6 +370,9 @@ def build_packet(
     try:
         run_tuple = tuple(runs)
         document_tuple = tuple(documents)
+        locale_tuple = tuple(locales)
     except TypeError:
-        raise PacketError("runs and documents must be iterable") from None
-    return ResearchPacket(question_id=question_id, runs=run_tuple, documents=document_tuple)
+        raise PacketError("runs, documents and locales must be iterable") from None
+    return ResearchPacket(
+        question_id=question_id, runs=run_tuple, documents=document_tuple, locales=locale_tuple
+    )

@@ -529,3 +529,80 @@ def validate_run(data: Any) -> ResearchRun:
         return ResearchRun.model_validate(data)
     except ValidationError as exc:
         raise _sanitize(exc, ResearchRun) from None
+
+
+# --- Document locales (M1-357) -----------------------------------------------------
+#
+# The local-source lens's per-document facts, stored in their own append-only table
+# (``019_research_document_locales.sql``) rather than as fields on ResearchDocument: the
+# packet hash dumps every document field, so a new one would move every stored packet's
+# hash and refuse every pending approval. See that migration's header.
+
+# Mirrors ``research/locales.py:PublisherOrigin``; a test asserts the two agree. Restated
+# here rather than imported because this module is the schema layer every adapter imports,
+# and the locale module pulls in the question model and the registry loader.
+PublisherOrigin = Literal["local", "external", "unclassified"]
+
+# Who produced ``english_title``. ``provider:asknews`` is AskNews's own translation, model
+# undisclosed; ``none`` means the pipeline holds no translation (M1-361 adds its own).
+TranslationSource = Literal["provider:asknews", "none"]
+
+_LOCALE_CODE = r"^[A-Z]{2}(?:-[A-Z0-9]{1,3})?$"
+
+
+class DocumentLocale(_StrictModel):
+    """One document's locale facts, keyed by the document's dedup identity.
+
+    Keyed by ``(retrieval_run_id, canonical_url, content_sha256)`` -- the ledger's own
+    UNIQUE key for a document -- rather than by ``document_id``, for the reason
+    ``packet.py`` excludes ``document_id`` from the hash: the uuid says when a row was
+    written, not what the evidence is. The writer resolves the key to a ``document_id``
+    inside the transaction that mints it.
+
+    Provider facts are carried exactly as the provider reported them and ``None`` where it
+    said nothing. ``publisher_origin`` is ours, from ``research/locales.py``, relative to
+    ``locale_code``.
+    """
+
+    retrieval_run_id: IdentifierString
+    canonical_url: HttpUrlString
+    content_sha256: str = Field(pattern=_SHA256_HEX)
+
+    locale_code: str = Field(pattern=_LOCALE_CODE)
+    publisher_origin: PublisherOrigin
+
+    language: str | None = None
+    provider_story_country: str | None = None
+    native_title: str | None = None
+    english_title: str | None = None
+    translation_source: TranslationSource
+    provider_first_seen_at_utc: UtcDatetime | None = None
+    provider_labels: dict[str, PersistableJson] | None = None
+
+    @model_validator(mode="after")
+    def _untranslated_rows_carry_no_translation(self) -> DocumentLocale:
+        # An English title on an untranslated row must be the native title itself (an
+        # English-language original); anything else would be a translation with no source.
+        if (
+            self.translation_source == "none"
+            and self.english_title is not None
+            and self.english_title != self.native_title
+        ):
+            raise authored_error(
+                "locale_translation_unsourced",
+                "an untranslated locale row may carry an English title only when it is the "
+                "native title",
+            )
+        return self
+
+    def key(self) -> tuple[str, str, str]:
+        """The dedup key of the document this row describes."""
+        return (self.retrieval_run_id, self.canonical_url, self.content_sha256)
+
+
+def validate_locale(data: Any) -> DocumentLocale:
+    """Validate a locale payload; raises ResearchSchemaError on failure."""
+    try:
+        return DocumentLocale.model_validate(data)
+    except ValidationError as exc:
+        raise _sanitize(exc, DocumentLocale) from None

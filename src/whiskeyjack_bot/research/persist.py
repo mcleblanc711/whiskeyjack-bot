@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from whiskeyjack_bot.research.artifacts import ArtifactError, write_raw_responses
-from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
+from whiskeyjack_bot.research.model import DocumentLocale, ResearchDocument, ResearchRun
 from whiskeyjack_bot.research.store import StoreError, complete_run, persist_retrieval
 
 if TYPE_CHECKING:
@@ -157,6 +157,7 @@ def persist_paid_run(
     raw_responses: Sequence[dict[str, Any]],
     written_at_utc: datetime | None = None,
     run_opened: bool = False,
+    locales: Iterable[DocumentLocale] = (),
 ) -> PaidRunPersistence:
     """Store one paid run's raw artifact and its ledger rows, in that order.
 
@@ -220,10 +221,16 @@ def persist_paid_run(
                 artifact_error,
             )
 
+    # ``locales`` are written in the documents' own transaction (M1-357); a run with none
+    # (every run but a local-source lens run) writes exactly what it wrote before 019.
     if run_opened:
-        document_ids = complete_run(conn, validated, documents, raw_response_path=path)
+        document_ids = complete_run(
+            conn, validated, documents, raw_response_path=path, locales=locales
+        )
     else:
-        document_ids = persist_retrieval(conn, validated, documents, raw_response_path=path)
+        document_ids = persist_retrieval(
+            conn, validated, documents, raw_response_path=path, locales=locales
+        )
     return PaidRunPersistence(
         document_ids=document_ids,
         raw_response_path=path,

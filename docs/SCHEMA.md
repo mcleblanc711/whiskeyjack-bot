@@ -41,11 +41,12 @@ and bumping one never bumps another.
 
 | Constant | Value | Defined at | What it versions |
 | --- | --- | --- | --- |
-| `LEDGER_SCHEMA_VERSION` | `18` | `ledger.py:LEDGER_SCHEMA_VERSION` | The ledger schema: the number of the last migration this build applies. `connect_readonly` refuses a ledger ahead of or behind it. |
+| `LEDGER_SCHEMA_VERSION` | `19` | `ledger.py:LEDGER_SCHEMA_VERSION` | The ledger schema: the number of the last migration this build applies. `connect_readonly` refuses a ledger ahead of or behind it. |
 | `RECORD_SCHEMA_VERSION` | `1.0.0` | `forecast/record.py:RECORD_SCHEMA_VERSION` | The shape of `forecast_records.record_json` (`ForecastRecord`). Records stamped `1.1.0` are also accepted by the validator. |
 | `RESPONSE_SCHEMA_VERSION` | `1.0.0` | `forecast/schema.py:RESPONSE_SCHEMA_VERSION` | The model's output contract (`record_json.forecast`), not the prompt's version. |
 | `OBSERVATION_SCHEMA_VERSION` | `1.0.0` | `resolution.py:OBSERVATION_SCHEMA_VERSION` | `resolution_events.resolution_snapshot_json` (`ResolutionObservation`). |
-| `PACKET_SCHEMA_VERSION` | `1.0.0` | `research/packet.py:PACKET_SCHEMA_VERSION` | The research-packet digest rule behind `record_json.research_packet_sha256`; part of the hashed payload. |
+| `PACKET_SCHEMA_VERSION` | `1.0.0` | `research/packet.py:PACKET_SCHEMA_VERSION` | The research-packet digest rule behind `record_json.research_packet_sha256`; part of the hashed payload. Still the rule for every packet that carries no locale rows. |
+| `PACKET_LOCALES_SCHEMA_VERSION` | `1.1.0` | `research/packet.py:PACKET_LOCALES_SCHEMA_VERSION` | The digest rule for a research packet that carries `research_document_locales` rows (M1-357): the 1.0.0 payload plus the sorted rows. Used only when a packet has some, so no 1.0.0 digest moves. |
 | `KEY_SCHEMA_VERSION` | `1.0.0` | `submission.py:KEY_SCHEMA_VERSION` | The idempotency-key derivation (`submission_attempts.idempotency_key`, `submission_key_reservations.idempotency_key`); part of the hashed payload and the key prefix. |
 | `VERIFICATION_SCHEMA_VERSION` | `1.2.0` | `submission_live.py:VERIFICATION_SCHEMA_VERSION` | The envelope stored in `submission_attempts.refetched_forecast_snapshot`. |
 | `ARTIFACT_SCHEMA_VERSION` (submission) | `1.1.0` | `submission_gateway.py:ARTIFACT_SCHEMA_VERSION` | The submission receipt artifact written under `storage.artifact_root`. |
@@ -193,6 +194,28 @@ URL, content hash, retrieval time, provenance and source type are fixed at creat
 | `reliability_tag` | TEXT | 001 | Source-trust tag (`research/model.py:ReliabilityTag`); required on `social` documents. |
 | `original_url` | TEXT | 002 | The URL exactly as the provider returned it. |
 | `provenance` | TEXT | 002 | `direct_api` (fetched by the pipeline) or `llm_reported` (reported by a research agent; content and timestamps are claims). |
+
+### `research_document_locales`
+
+**Introduced:** `019`. **Mutability:** append-only. The local-source lens's facts about one
+document (D53, M1-357). A side table rather than columns on `research_documents`, because the
+packet digest dumps every document field and a new one would move every stored packet's hash.
+Written in the same transaction as its document, and only for documents a lens run supplied
+facts for. A packet carrying any of these rows hashes under `PACKET_LOCALES_SCHEMA_VERSION`.
+
+| Column | Type | Since | Definition |
+| --- | --- | --- | --- |
+| `document_id` | TEXT | 019 | The `research_documents` row described; primary key, so at most one row per document. |
+| `locale_code` | TEXT | 019 | The registry locale the lens run targeted (`config/locales.yaml`), e.g. `IR`, `CA-QC`. |
+| `publisher_origin` | TEXT | 019 | `local`, `external` or `unclassified`, relative to `locale_code` (`research/locales.py:publisher_origin`): from the registry's domain lists and ccTLDs only, never from language or a provider country tag. |
+| `language` | TEXT | 019 | The document language exactly as the provider reported it (`en`, `en-US` and `en-us` are kept apart); NULL if it reported none. |
+| `provider_story_country` | TEXT | 019 | The provider's country tag, verbatim. For AskNews this marks the story, not the publisher (probe, 2026-10-16). |
+| `native_title` | TEXT | 019 | The title in the document's own language, as reported. |
+| `english_title` | TEXT | 019 | An English title; on a `none` row it may only equal `native_title` (an English original). |
+| `translation_source` | TEXT | 019 | Who produced `english_title`: `provider:asknews` (model undisclosed) or `none`. |
+| `provider_first_seen_at_utc` | TEXT | 019 | When the provider first saw the document (AskNews `crawl_date`); not when the pipeline retrieved it. |
+| `provider_labels_json` | TEXT | 019 | Provider-assigned descriptive labels (e.g. AskNews `reporting_voice`), attributed to the provider; canonical JSON object or NULL. |
+| `created_at_utc` | TEXT | 019 | When the row was written. |
 
 ### `research_runs`
 

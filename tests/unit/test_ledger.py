@@ -22,6 +22,7 @@ LEDGER_TABLES = {
     "forecast_records",
     "research_runs",
     "research_documents",
+    "research_document_locales",
     "approval_events",
     "submission_attempts",
     "submission_verifications",
