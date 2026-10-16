@@ -22,7 +22,7 @@ contract**, and three consequences follow that a dump would not have:
   type, a non-finite REAL, a BLOB, or text that is not valid UTF-8 is refused with an
   :class:`ExportError` rather than repaired into something that would no longer round-trip.
 
-**All fifteen tables are exported, and none is excluded.** ``schema_migrations`` is in
+**All sixteen tables are exported, and none is excluded.** ``schema_migrations`` is in
 deliberately: it is what lets a consumer tell which schema produced the files it is
 holding. The joined per-forecast view that ``lifecycle.py`` and ``forecast/record.py``
 anticipate "at read/export time" is **not** here: assembling one record with its history
@@ -116,7 +116,7 @@ class TableSpec:
 
     ``identifier`` is the single-column primary key, and it does double duty: it is the
     ``ORDER BY`` that makes the export byte-deterministic, and it is the key the acceptance
-    criterion's set-equality check compares. All fifteen tables have one, so no table
+    criterion's set-equality check compares. All sixteen tables have one, so no table
     needs a composite or a synthetic ordering.
     """
 
@@ -241,6 +241,24 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("detail_code", "TEXT"),
             Column("retrieval_run_id", "TEXT"),
             Column("occurred_at_utc", "TEXT"),
+            Column("created_at_utc", "TEXT"),
+        ),
+    ),
+    TableSpec(
+        name="research_document_locales",
+        identifier="document_id",
+        columns=(
+            # 019_research_document_locales.sql
+            Column("document_id", "TEXT"),
+            Column("locale_code", "TEXT"),
+            Column("publisher_origin", "TEXT"),
+            Column("language", "TEXT"),
+            Column("provider_story_country", "TEXT"),
+            Column("native_title", "TEXT"),
+            Column("english_title", "TEXT"),
+            Column("translation_source", "TEXT"),
+            Column("provider_first_seen_at_utc", "TEXT"),
+            Column("provider_labels_json", "TEXT"),
             Column("created_at_utc", "TEXT"),
         ),
     ),

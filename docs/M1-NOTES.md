@@ -16348,6 +16348,12 @@ approved commit.
   - `load_locales` reads them back; `load_packet` carries them.
 - **`research/quality.py`.** `usable_packet` and `without_future` keep the locale rows of the
   documents they keep.
+- **`export.py`.** M1-604's ledger export covers every table, and a test fails if the seed
+  leaves any table empty, so the new table is exported, in name order. `EXPORT_SCHEMA_VERSION`
+  stays 1: the manifest's `ledger_schema_version` says which tables to expect, as it did when
+  016 added `submission_reconciliations`.
+- **Schema-version tripwires** in eight test files move from 18 to 19, as M4-808 moved them
+  from 17.
 
 No producer yet: M1-358 writes the rows. `ResearchDocument` and `ResearchRun` are unchanged.
 

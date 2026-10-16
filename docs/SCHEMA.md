@@ -491,7 +491,7 @@ rather than clamped at zero. `spot_peer` is MiniBench's ranking score.
 (`export.py:export_ledger`). Opens the ledger read-only and reads every table in one
 snapshot; never mutates the `.db` or `-wal`.
 
-- **Files:** one `<table>.jsonl` or `<table>.parquet` per ledger table -- all fifteen tables
+- **Files:** one `<table>.jsonl` or `<table>.parquet` per ledger table -- all sixteen tables
   above, `schema_migrations` included -- plus `manifest.json`, written last. A directory
   without a manifest is not an export. Nothing is overwritten.
 - **Rows:** every column of every row, as `export.py:EXPORTED_TABLES` declares them, read
