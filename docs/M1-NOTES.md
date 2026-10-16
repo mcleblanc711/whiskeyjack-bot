@@ -16318,3 +16318,121 @@ formatting cannot collapse. With recombination removed, all three now fail
 `test_comparison_form_is_the_json_replay_form_and_keeps_lone_surrogates` and
 `test_a_surrogate_pair_title_classifies_the_same_after_replay`). No `src/` change follows the
 approved commit.
+
+## M1-357 (D53) — Document-locale sidecar (019) and research packet hash 1.1.0
+
+### What shipped
+
+- **`019_research_document_locales.sql`.** An append-only table keyed to `document_id`. It
+  holds the local-source lens's per-document facts, all verbatim from the provider:
+  `language`, `provider_story_country`, `native_title`, `english_title`,
+  `translation_source`, `provider_first_seen_at_utc` and `provider_labels_json`. It also
+  holds our `locale_code` and the `publisher_origin` relative to it. Insert triggers check
+  that the document exists, plus the two vocabularies, a non-blank locale code and the
+  "untranslated rows carry no translation" rule. UPDATE and DELETE abort.
+- **`research/model.py`.** `DocumentLocale` is keyed by the document's dedup key, and
+  `validate_locale`.
+- **`research/packet.py`.** `PACKET_LOCALES_SCHEMA_VERSION = "1.1.0"`. `canonical_packet_json`
+  dispatches:
+  - **no locale rows:** `_canonical_v1_0`, which is the 1.0.0 payload moved into a function
+    of its own and otherwise unchanged;
+  - **any locale rows:** `_canonical_v1_1`, which is that payload plus the rows sorted by key,
+    under `1.1.0`.
+
+  The constructor refuses a row for a document the packet does not carry, or a second row
+  for one document, and it deep-copies the rows.
+- **`research/store.py` and `persist.py`.**
+  - `persist_retrieval`, `complete_run` and `persist_paid_run` take `locales=()`.
+  - The rows are checked before any write and inserted in the documents' transaction,
+    against the `document_id` just minted.
+  - `load_locales` reads them back; `load_packet` carries them.
+- **`research/quality.py`.** `usable_packet` and `without_future` keep the locale rows of the
+  documents they keep.
+
+No producer yet: M1-358 writes the rows. `ResearchDocument` and `ResearchRun` are unchanged.
+
+### Decision — a side table, not document fields
+
+`packet_sha256` dumps every document field, and `submission_policy.require_research_artifacts`
+recomputes it from stored rows before approving. A new field would appear as `null` in every
+stored document's dump, move every stored packet hash, and refuse every pending approval. That
+is the whole reason for the table.
+
+### Decision — 1.1.0 only when a packet carries rows
+
+The `packet.py` header has said since M1-306 that a rule change "changes as a new versioned
+function alongside this one, never as an edit to this one". `_canonical_v1_0` is that
+function: the 1.0.0 payload construction cut out of `canonical_packet_json` and not edited.
+`_canonical_v1_1` builds on it.
+
+**Verified three ways:**
+1. Golden digests for three fixed packets, computed by the code on master `eeeb1d8` before
+   this item and pinned as literals (`tests/unit/test_packet_versions.py`).
+2. A property comparing the new code against a hand-written copy of the 1.0.0 rule *inside
+   the test file*, a witness outside the program, over generated packets without locales.
+3. **Every forecast record in a copy of the live ledger** (127 records, 2026-10-16), migrated
+   to 019 with this branch, reproduces its stored `research_packet_sha256` through the same
+   path as on master: 44 raw, 83 via `usable_packet`. The results digest is identical on both
+   (`fe593726…`). The script mirrors `require_research_artifacts`' three paths and opens the
+   copy read-only.
+
+### Decision — keyed by the dedup key in the packet, by `document_id` in the table
+
+In the packet, a row is identified by `(retrieval_run_id, canonical_url, content_sha256)`, the
+ledger's UNIQUE key for a document. The packet hash excludes `document_id` because the uuid
+records when a row was written, not what the evidence is. In the table, the row is keyed by
+`document_id` (one row per document, as a primary key) and the writer resolves the key inside
+the transaction that mints the id.
+
+### Decision — `publisher_origin` is stored, not re-derived
+
+Deriving it reads `config/locales.yaml`. A later edit to the registry must not change what an
+old row says, and the run records only the registry's sha256, not its contents.
+
+### Decision — the filters carry rows, or the policy refuses its own forecasts
+
+`submission_policy` reproduces a record's hash through `usable_packet` (83 of 127 live
+records match on that path) and through `without_future`. If a filter dropped the locale rows
+of the documents it kept, a forecast hashed under 1.1.0 would be checked against a 1.0.0
+rebuild and refused. One test per path builds three documents that the three paths keep in
+three different subsets and runs the real `require_research_artifacts` against each digest.
+
+### Rejected — re-deriving locale facts from the raw artifact at read time
+
+The AskNews artifact holds `language`, `country`, the native title and `crawl_date`. But an
+artifact can fail to write (M1-312 degrades rather than blocks), it is not hash-bound, and
+`read_raw_responses` is deliberately not on the replay path. Evidence the forecaster may one
+day read has to be in the ledger.
+
+### Rejected — excluding the new fields from the dump when `None`
+
+A dump that omits a field only when it is empty puts one rule under one version string, and
+the stored digest then depends on whether a value happens to be absent. Versioned dispatch
+says which rule hashed which packet.
+
+### Deferred (do not read the absence as an omission)
+
+- **Any producer of locale rows**, the AppConfig opt-in, and the lens pass: M1-358.
+- **Locale rows for baseline (non-lens) documents.** Writing them would move production
+  packets to 1.1.0 with no owner decision; D53 keeps Phase 1 collect-only.
+- **Rendering locale facts to the forecaster:** M1-359's shadow arm.
+- **A translation model column:** M1-361, when the pipeline translates for itself.
+
+### Standing risk — not verifiable offline
+
+- **The live ledger must be migrated with `init-ledger` at deploy.** A merged migration stops
+  the worker at its next poll until the ledger is upgraded (lesson recorded 2026-09-14):
+  back up, merge between polls, and run `init-ledger` at once.
+- `persist_paid_run`'s locale path is exercised by tests only until M1-358 calls it.
+
+### Mutation pass — twenty-five mutants
+
+- **Pass 1, 20 mutants across `packet.py`, `store.py`, `quality.py`, `persist.py`,
+  `model.py` and `019`, against the item's tests.** 17 died.
+  - Two survivors were the store's run-id and duplicate pre-checks. Each is behaviourally
+    subsumed: the dedup-key check and 019's primary key refuse the same inputs with
+    `StoreError` and nothing written. What the pre-checks add is a message that says which
+    rule was broken, so the test now asserts the message.
+  - The third survivor was real: `persist_paid_run` dropping `locales` on the
+    `run_opened=True` path, the worker's path, which no test covered. It is covered now.
+- **Pass 2, 5 mutants, one per property, each run against that property alone.** All 5 died.
