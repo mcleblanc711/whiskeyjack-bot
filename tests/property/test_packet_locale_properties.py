@@ -166,3 +166,96 @@ def test_a_repeated_or_foreign_locale_refuses_with_packet_error(
         except PacketError:
             continue
         raise AssertionError("an invalid locale set was accepted")
+
+
+# --- Round 1, B1: a real SQLite round trip for provider labels -------------------------
+#
+# The properties above replay a locale row through JSON in memory. That cannot see what the
+# ledger does: `store._load_json` refuses a stored lone surrogate, so labels the writer
+# committed unchecked could not be loaded back, and the packet could not be replayed. This
+# property writes through the real store into a real ledger and reads back.
+
+import sqlite3  # noqa: E402
+import uuid  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+
+from whiskeyjack_bot.ledger import connect, initialize_ledger  # noqa: E402
+from whiskeyjack_bot.research.model import validate_document, validate_run  # noqa: E402
+from whiskeyjack_bot.research.store import (  # noqa: E402
+    StoreError,
+    load_packet,
+    persist_retrieval,
+)
+
+_WHEN = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+_LABEL_VALUES = st.recursive(
+    st.none() | st.booleans() | st.integers(-5, 5) | HOSTILE_TEXT,
+    lambda inner: st.lists(inner, max_size=3) | st.dictionaries(HOSTILE_TEXT, inner, max_size=3),
+    max_leaves=6,
+)
+_LABELS = st.none() | st.dictionaries(HOSTILE_TEXT, _LABEL_VALUES, max_size=3)
+
+
+@pytest.fixture(scope="module")
+def _ledger(tmp_path_factory: pytest.TempPathFactory) -> sqlite3.Connection:
+    db = Path(tmp_path_factory.mktemp("locale-ledger")) / "ledger.sqlite3"
+    initialize_ledger(db)
+    return connect(db)
+
+
+@given(labels=_LABELS)
+def test_labels_either_refuse_atomically_or_replay_from_the_ledger(
+    _ledger: sqlite3.Connection, labels: object
+) -> None:
+    run_id = f"run-{uuid.uuid4().hex}"
+    run = validate_run(
+        {
+            "retrieval_run_id": run_id,
+            "question_id": 9,
+            "provider": "asknews",
+            "started_at_utc": _WHEN,
+            "completed_at_utc": _WHEN,
+        }
+    )
+    document = validate_document(
+        {
+            "retrieval_run_id": run_id,
+            "original_url": "https://irna.ir/news/1",
+            "canonical_url": "https://irna.ir/news/1",
+            "retrieved_at_utc": _WHEN,
+            "source_type": "news",
+            "provenance": "direct_api",
+            "content_sha256": "a" * 64,
+        }
+    )
+    try:
+        locale = validate_locale(
+            {
+                "retrieval_run_id": run_id,
+                "canonical_url": document.canonical_url,
+                "content_sha256": document.content_sha256,
+                "locale_code": "IR",
+                "publisher_origin": "local",
+                "translation_source": "none",
+                "provider_labels": labels,
+            }
+        )
+    except Exception:
+        return  # the model refused it; nothing reaches the store
+    built = build_packet(9, [run], [document], [locale])
+    try:
+        persist_retrieval(_ledger, run, [document], locales=[locale])
+    except StoreError:
+        # Refused: then nothing of this run may have been committed.
+        assert (
+            _ledger.execute(
+                "SELECT count(*) FROM research_runs WHERE retrieval_run_id = ?", (run_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        return
+    loaded = load_packet(_ledger, question_id=9, retrieval_run_ids=[run_id])
+    assert packet_sha256(loaded) == packet_sha256(built)
