@@ -64,12 +64,14 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from whiskeyjack_bot.lifecycle import LifecycleError, transaction
-from whiskeyjack_bot.research.dedup import deduplicate
+from whiskeyjack_bot.research.dedup import dedup_key, deduplicate
 from whiskeyjack_bot.research.model import (
+    DocumentLocale,
     ResearchDocument,
     ResearchRun,
     ResearchSchemaError,
     validate_document,
+    validate_locale,
     validate_run,
 )
 from whiskeyjack_bot.research.packet import ResearchPacket, build_packet
@@ -114,6 +116,22 @@ _DOCUMENT_COLUMNS = (
     "summary",
     "raw_artifact_path",
     "reliability_tag",
+)
+
+# research_document_locales (019, M1-357). ``provider_labels`` is stored serialized, the
+# way ``provider_config`` is.
+_LOCALE_COLUMNS = (
+    "document_id",
+    "locale_code",
+    "publisher_origin",
+    "language",
+    "provider_story_country",
+    "native_title",
+    "english_title",
+    "translation_source",
+    "provider_first_seen_at_utc",
+    "provider_labels_json",
+    "created_at_utc",
 )
 
 # The columns complete_run may write. Everything absent from this tuple is either
@@ -462,6 +480,38 @@ def _document_parameters(document: ResearchDocument, *, document_id: str) -> dic
     }
 
 
+def _locale_parameters(
+    locale: DocumentLocale, *, document_id: str, created_at_utc: str
+) -> dict[str, object]:
+    for field in (
+        "locale_code",
+        "language",
+        "provider_story_country",
+        "native_title",
+        "english_title",
+    ):
+        _require_storable_text(getattr(locale, field), field)
+    labels = locale.provider_labels
+    return {
+        "document_id": document_id,
+        "locale_code": locale.locale_code,
+        "publisher_origin": locale.publisher_origin,
+        "language": locale.language,
+        "provider_story_country": locale.provider_story_country,
+        "native_title": locale.native_title,
+        "english_title": locale.english_title,
+        "translation_source": locale.translation_source,
+        "provider_first_seen_at_utc": _optional_utc_text(locale.provider_first_seen_at_utc),
+        # `_checked_json` first, as the run's JSON columns do (round 1, B1): a label the model
+        # accepts can still hold a lone surrogate, which `_load_json` refuses on the way back
+        # out. Committing it would store evidence the packet could never be replayed from.
+        "provider_labels_json": None
+        if labels is None
+        else _canonical_json(_checked_json(labels, "provider_labels"), "provider_labels"),
+        "created_at_utc": created_at_utc,
+    }
+
+
 def _execute(conn: sqlite3.Connection, sql: str, parameters: Sequence[object]) -> sqlite3.Cursor:
     """Run one statement, translating every database failure into a ``StoreError``.
 
@@ -626,6 +676,34 @@ def _insert_documents(
     return tuple(ids)
 
 
+def _insert_locales(
+    conn: sqlite3.Connection,
+    documents: Sequence[ResearchDocument],
+    document_ids: Sequence[str],
+    locales: Sequence[DocumentLocale],
+) -> None:
+    """Insert each locale row against the ``document_id`` just minted for its document.
+
+    Called inside the transaction that inserted the documents, so a document and the
+    locale facts known when it was written commit or roll back together.
+    """
+    if not locales:
+        return
+    ids = {
+        dedup_key(document): document_id
+        for document, document_id in zip(documents, document_ids, strict=True)
+    }
+    columns = ", ".join(_LOCALE_COLUMNS)
+    placeholders = ", ".join("?" for _ in _LOCALE_COLUMNS)
+    sql = f"INSERT INTO research_document_locales ({columns}) VALUES ({placeholders})"
+    created = _utc_text(_utcnow())
+    for locale in locales:
+        parameters = _locale_parameters(
+            locale, document_id=ids[locale.key()], created_at_utc=created
+        )
+        _execute(conn, sql, [parameters[column] for column in _LOCALE_COLUMNS])
+
+
 @contextmanager
 def _atomic(conn: sqlite3.Connection) -> Iterator[None]:
     """``lifecycle.transaction`` with its errors translated to this module's type.
@@ -705,6 +783,7 @@ def complete_run(
     documents: Iterable[ResearchDocument],
     *,
     raw_response_path: str | None = None,
+    locales: Iterable[DocumentLocale] = (),
 ) -> tuple[str, ...]:
     """Fill in what a previously opened run learned, and insert its documents.
 
@@ -721,6 +800,7 @@ def complete_run(
     if validated.completed_at_utc is None:
         raise StoreError("complete_run requires a run carrying completed_at_utc")
     prepared = _prepare_documents(validated, documents)
+    prepared_locales = _prepare_locales(validated, prepared, locales)
     parameters = _run_parameters(
         validated,
         completed=True,
@@ -763,7 +843,9 @@ def complete_run(
                 "been completed, or its identity (question_id, provider, "
                 "started_at_utc) differs from the row that was opened"
             )
-        return _insert_documents(conn, prepared)
+        document_ids = _insert_documents(conn, prepared)
+        _insert_locales(conn, prepared, document_ids, prepared_locales)
+        return document_ids
 
 
 def persist_retrieval(
@@ -772,6 +854,7 @@ def persist_retrieval(
     documents: Iterable[ResearchDocument],
     *,
     raw_response_path: str | None = None,
+    locales: Iterable[DocumentLocale] = (),
 ) -> tuple[str, ...]:
     """Write a completed run and its documents in one transaction.
 
@@ -784,6 +867,7 @@ def persist_retrieval(
     if validated.completed_at_utc is None:
         raise StoreError("persist_retrieval requires a run carrying completed_at_utc")
     prepared = _prepare_documents(validated, documents)
+    prepared_locales = _prepare_locales(validated, prepared, locales)
     parameters = _run_parameters(
         validated,
         completed=True,
@@ -792,7 +876,9 @@ def persist_retrieval(
     )
     with _atomic(conn):
         _insert_run(conn, parameters)
-        return _insert_documents(conn, prepared)
+        document_ids = _insert_documents(conn, prepared)
+        _insert_locales(conn, prepared, document_ids, prepared_locales)
+        return document_ids
 
 
 def _prepare_documents(
@@ -812,6 +898,38 @@ def _prepare_documents(
             # existing run -- silently filing evidence under the wrong retrieval.
             raise StoreError("every document must carry this run's retrieval_run_id")
     return deduplicate(candidates).documents
+
+
+def _prepare_locales(
+    run: ResearchRun,
+    documents: Sequence[ResearchDocument],
+    locales: Iterable[DocumentLocale],
+) -> tuple[DocumentLocale, ...]:
+    """Check every locale row against the documents about to be written, before any write.
+
+    Each must describe one of *this run's* documents, after dedup, and no document may
+    have two: ``019`` keys the table by ``document_id``, and a second row would fail the
+    primary key inside the transaction -- after the run's spend was already committed to
+    being recorded. Refused here instead, as this module's own error.
+    """
+    try:
+        candidates = tuple(locales)
+    except TypeError:
+        raise StoreError("locales must be iterable") from None
+    keys = {dedup_key(document) for document in documents}
+    seen: set[tuple[str, str, str]] = set()
+    for locale in candidates:
+        if not isinstance(locale, DocumentLocale):
+            raise StoreError("every locale must be a DocumentLocale")
+        if locale.retrieval_run_id != run.retrieval_run_id:
+            raise StoreError("every locale must carry this run's retrieval_run_id")
+        key = locale.key()
+        if key not in keys:
+            raise StoreError("every locale must describe one of this run's documents")
+        if key in seen:
+            raise StoreError("a document may carry at most one locale")
+        seen.add(key)
+    return candidates
 
 
 def load_run(conn: sqlite3.Connection, retrieval_run_id: str) -> ResearchRun:
@@ -853,6 +971,53 @@ def load_documents(conn: sqlite3.Connection, retrieval_run_id: str) -> tuple[Res
     return tuple(
         _document_from_row(dict(zip(_DOCUMENT_COLUMNS, tuple(row), strict=True))) for row in rows
     )
+
+
+def load_locales(conn: sqlite3.Connection, retrieval_run_id: str) -> tuple[DocumentLocale, ...]:
+    """Read one run's locale rows back as validated models, ordered by document key."""
+    _require_identifier(retrieval_run_id, "retrieval_run_id")
+    _require_storable_text(retrieval_run_id, "retrieval_run_id")
+    columns = ", ".join(f"l.{column}" for column in _LOCALE_COLUMNS if column != "document_id")
+    rows = _fetch_all(
+        conn,
+        f"SELECT d.retrieval_run_id, d.canonical_url, d.content_sha256, {columns} "
+        "FROM research_document_locales AS l "
+        "JOIN research_documents AS d ON d.document_id = l.document_id "
+        "WHERE d.retrieval_run_id = ? ORDER BY d.canonical_url, d.content_sha256",
+        (retrieval_run_id,),
+    )
+    names = ("retrieval_run_id", "canonical_url", "content_sha256") + tuple(
+        column for column in _LOCALE_COLUMNS if column != "document_id"
+    )
+    return tuple(_locale_from_row(dict(zip(names, tuple(row), strict=True))) for row in rows)
+
+
+def _locale_from_row(row: dict[str, Any]) -> DocumentLocale:
+    """Rebuild a locale row, type-checking each column first. See :func:`_run_from_row`."""
+    payload = {
+        "retrieval_run_id": _stored_text(row["retrieval_run_id"], "retrieval_run_id"),
+        "canonical_url": _stored_text(row["canonical_url"], "canonical_url"),
+        "content_sha256": _stored_text(row["content_sha256"], "content_sha256"),
+        "locale_code": _stored_text(row["locale_code"], "locale_code"),
+        "publisher_origin": _stored_text(row["publisher_origin"], "publisher_origin"),
+        "language": _stored_text(row["language"], "language"),
+        "provider_story_country": _stored_text(
+            row["provider_story_country"], "provider_story_country"
+        ),
+        "native_title": _stored_text(row["native_title"], "native_title"),
+        "english_title": _stored_text(row["english_title"], "english_title"),
+        "translation_source": _stored_text(row["translation_source"], "translation_source"),
+        "provider_first_seen_at_utc": _parse_utc(
+            row["provider_first_seen_at_utc"], "provider_first_seen_at_utc"
+        ),
+        "provider_labels": _load_json(
+            row["provider_labels_json"], "provider_labels_json", expect=dict
+        ),
+    }
+    try:
+        return validate_locale(payload)
+    except ResearchSchemaError as exc:
+        raise StoreError(f"stored document locale does not validate: {exc}") from None
 
 
 def _run_from_row(row: dict[str, Any]) -> ResearchRun:
@@ -1051,7 +1216,8 @@ def load_packet(
                 # No ids in the message; a question id is row content.
                 raise StoreError("a named run belongs to a different question")
         documents = [document for run_id in requested for document in load_documents(conn, run_id)]
-    return build_packet(question_id, runs, documents)
+        locales = [locale for run_id in requested for locale in load_locales(conn, run_id)]
+    return build_packet(question_id, runs, documents, locales)
 
 
 def replay_research(

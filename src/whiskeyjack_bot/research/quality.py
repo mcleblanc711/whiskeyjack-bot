@@ -11,6 +11,7 @@ function for the two live questions that argument was settled on.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
@@ -18,6 +19,7 @@ from urllib.parse import urlsplit
 
 from whiskeyjack_bot.questions.model import CanonicalQuestion
 from whiskeyjack_bot.research.canonical import host_identity
+from whiskeyjack_bot.research.dedup import dedup_key
 from whiskeyjack_bot.research.model import ResearchDocument
 from whiskeyjack_bot.research.packet import ResearchPacket
 
@@ -210,24 +212,33 @@ def usable_packet(
     packet: ResearchPacket, question: CanonicalQuestion, now: datetime, days: int
 ) -> ResearchPacket:
     """Select model inputs without modifying retained research or legacy hashing."""
-    return ResearchPacket(
-        question_id=packet.question_id,
-        runs=packet.runs,
-        documents=tuple(d for d in packet.documents if usable(d, question, now, days)),
-    )
+    return _keep(packet, lambda d: usable(d, question, now, days))
 
 
 def without_future(packet: ResearchPacket, now: datetime) -> ResearchPacket:
+    return _keep(
+        packet,
+        lambda d: all(
+            t <= now
+            for t in (d.published_at_utc, d.updated_at_utc, d.retrieved_at_utc)
+            if t is not None
+        ),
+    )
+
+
+def _keep(packet: ResearchPacket, keep: Callable[[ResearchDocument], bool]) -> ResearchPacket:
+    """``packet`` with only the documents ``keep`` accepts, and only their locale rows.
+
+    The locale rows travel with their documents (M1-357). ``submission_policy`` reproduces a
+    record's hash through this filter, so a filtered packet that dropped the locale rows of
+    the documents it kept would hash under 1.0.0 while the record was hashed under 1.1.0 --
+    an approval refused for a packet that is exactly what the forecast saw.
+    """
+    documents = tuple(d for d in packet.documents if keep(d))
+    kept = {dedup_key(d) for d in documents}
     return ResearchPacket(
         question_id=packet.question_id,
         runs=packet.runs,
-        documents=tuple(
-            d
-            for d in packet.documents
-            if all(
-                t <= now
-                for t in (d.published_at_utc, d.updated_at_utc, d.retrieved_at_utc)
-                if t is not None
-            )
-        ),
+        documents=documents,
+        locales=tuple(locale for locale in packet.locales if locale.key() in kept),
     )

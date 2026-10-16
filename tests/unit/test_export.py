@@ -3,7 +3,7 @@
 The acceptance criterion is *"Exports round-trip record IDs/counts and never mutate
 SQLite"*, and both halves are stricter than they read:
 
-- **Round-trip** is set equality of primary identifiers, per table, for all fifteen --
+- **Round-trip** is set equality of primary identifiers, per table, for all sixteen --
   not a count, and not a one-sided subset. A one-sided check passes on an export that
   drops rows, which is the vacuity M1-501 lost a round to. It is also worth nothing on an
   empty table, so `test_the_seed_reaches_every_table` refuses to let that pass unnoticed.
@@ -61,7 +61,7 @@ FAKE_SECRET = "privateFAKE123456"
 
 
 def _seed_every_table(conn: sqlite3.Connection) -> None:
-    """Write at least one row into each of the fifteen exported tables.
+    """Write at least one row into each of the sixteen exported tables.
 
     Raw SQL rather than the production writers, and deliberately: the point here is the
     *schema's* full surface, including tables whose writers are still Not Started
@@ -85,6 +85,12 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         "retrieved_at_utc, content_sha256, original_url, provenance, source_type) "
         "VALUES ('doc-1', 'run-1', ?, ?, ?, ?, 'direct_api', 'news')",
         ("https://example.org/a", TS, SHA, "https://example.org/a?utm=x"),
+    )
+    conn.execute(
+        "INSERT INTO research_document_locales (document_id, locale_code, publisher_origin, "
+        "language, native_title, translation_source, provider_labels_json, created_at_utc) "
+        "VALUES ('doc-1', 'IR', 'local', 'fa', ?, 'none', ?, ?)",
+        ("تنگه هرمز", '{"reporting_voice":"Objective"}', TS),
     )
     conn.execute(
         "INSERT INTO forecast_records ("
@@ -289,7 +295,7 @@ def test_the_hand_written_spec_matches_the_schema_column_by_column(ledger_path: 
 def test_the_export_round_trips_every_identifier_in_every_table(
     ledger_path: Path, tmp_path: Path, export_format: str
 ) -> None:
-    """Set equality per table, both directions, for all fifteen.
+    """Set equality per table, both directions, for all sixteen.
 
     Equality rather than `<=` or `>=`: a subset check passes on an export that drops rows
     and a superset check passes on one that invents them, and the criterion means neither.
