@@ -478,6 +478,8 @@ version: 11
 | `ingest-resolutions` | appends resolution rows and `resolved` events | **GET**; an ntfy push per `withheld` record (M4-807) | no |
 | `score` | appends local and platform score rows and `scored` events | no | no |
 | `report` | **read-only**; writes the report under `storage.export_root` | no | no |
+| `research language-census` | **read-only**; reads AskNews artifacts | no | no |
+| `research lens-report` | **read-only** | no | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 | `tournament correct-costs` | **read-only** | no | no |
@@ -727,6 +729,56 @@ earlier report. The contract is `docs/SCHEMA.md`.
 - `refused:` and exit `4` mean a stored row did not verify (a hash, a digest or a score that
   no longer matches its evidence) or the output directory already holds a report. The message
   names the rule, never the value.
+
+### 9. The local-source lens (opt-in, collect-only)
+
+The lens (M1-358, D53, `docs/LOCAL-LENS-NOTES.md`) buys extra retrieval aimed at **publishers
+based in the places a question is about**. Examples: Iranian outlets for a Strait of Hormuz
+question, and Omani and Emirati ones beside them. The places and publishers come from
+`config/locales.yaml`.
+
+It is **collect-only**: lens runs are recorded beside the question's research but never enter
+the packet the forecast is built from, so what is posted is exactly what it would have been
+without the lens.
+
+**It ships disabled.** Enabling it is an owner decision:
+
+1. Set `retrieval.local_lens.enabled: true` in the profile's config.
+2. The field is part of `config_sha256`, so the live activation **retires** (C5), and a
+   following series stops binding new projects until it is re-enabled. Run
+   `tournament enable` again as C5 describes, and re-enable the series if one is following.
+3. Each triggered question then buys at most `max_calls_per_question` (default 2) more calls:
+   - one AskNews credit per AskNews call;
+   - one Exa search per Exa call (about USD 0.007; reserved at USD 0.05).
+
+   All of it is under the same budget, and AskNews calls count against the series AskNews
+   sub-cap. A question about no registry place buys nothing.
+
+The lens runs after the question's forecast, approval and post, in its own 120-second bound.
+None of the following stops the poll or fails the question: a missing registry, a refused
+reservation, a provider failure or that time bound. Each is recorded on the
+`local_lens_checkpoint` event as `error_type`, and logged.
+
+```bash
+uv run whiskeyjack-bot research lens-report --config config/tournament.yaml
+uv run whiskeyjack-bot research language-census --config config/tournament.yaml
+```
+
+`lens-report` reads the ledger only. Per question, it prints:
+- the calls and requests made, Exa's reported cost and the elapsed time;
+- documents by publisher origin (`local`, `external`, `unclassified`);
+- the overlap with baseline research (`same_url`, `same_content`, `republication`, `novel`,
+  `unassessed`);
+- **independent reports**: clusters of copies that are new, counted once, and counted only
+  if no copy was already in the baseline.
+
+Persian documents arrive untranslated, so they read `unassessed`, never `novel`.
+`language-census` counts the languages and publisher origins of every stored AskNews article.
+Both print JSON, never document text. Neither measures forecast accuracy; that is Phase 2
+(M1-359, M5-805).
+
+To turn it off, set `enabled: false`. That also moves `config_sha256`, so re-enable the
+tournament the same way.
 
 ### Scheduled ingestion and scoring
 

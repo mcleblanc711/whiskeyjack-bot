@@ -57,8 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-357 | feat/m1-357-document-locale-sidecar | whiskeyjack-m1-357 | no | 019 | 2026-10-16 |
-| M1-356 | feat/m1-356-locale-registry-overlap | whiskeyjack-m1-356 | no | none | 2026-10-16 |
+| M1-358 | feat/m1-358-local-source-lens | whiskeyjack-m1-358 | no | none | 2026-10-16 |
 | M4-808 | feat/m4-808-platform-score-int | whiskeyjack-m4-808 | no | 018 | 2026-10-05 |
 | M0-008 | feat/m0-008-error-hygiene-sweep | whiskeyjack-m0-008 | no | none | 2026-09-25 |
 | M1-355 | feat/m1-355-asknews-series-subcap | whiskeyjack-m1-355 | no | none | 2026-10-01 |

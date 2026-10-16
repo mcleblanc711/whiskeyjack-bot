@@ -121,3 +121,23 @@ def test_an_invalid_registry_is_a_config_failure(
     bad.write_text("schema_version: 1\nlocales: []\n", encoding="utf-8")
     code = main(["research", "language-census", "--config", str(seeded), "--registry", str(bad)])
     assert code == EXIT_CONFIG_INVALID
+
+
+def test_the_lens_report_is_read_only_and_empty_on_a_ledger_without_lens_runs(
+    seeded: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ledger = load_config(seeded).storage.sqlite_path
+    before = ledger.read_bytes()
+    assert main(["research", "lens-report", "--config", str(seeded)]) == EXIT_OK
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["questions"] == []
+    assert printed["totals"]["checkpoints"] == 0
+    assert ledger.read_bytes() == before
+
+
+def test_the_lens_report_refuses_a_missing_ledger(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ledger = load_config(config_file).storage.sqlite_path
+    assert main(["research", "lens-report", "--config", str(config_file)]) == EXIT_REFUSED
+    assert not ledger.exists()
