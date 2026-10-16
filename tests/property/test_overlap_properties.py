@@ -23,7 +23,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from hypothesis import given, strategies as st
-from strategies import research_documents
+from strategies import research_documents, spelled
 
 from whiskeyjack_bot.research.model import validate_document
 from whiskeyjack_bot.research.overlap import (
@@ -167,3 +167,55 @@ def test_classification_survives_a_store_and_reload(base_docs: list, lens_docs: 
     )
     assert classify(*before) == classify(*after)
     assert clusters(before[1]) == clusters(after[1])
+
+
+# --- Round 1, B1: surrogate-pair spellings ---------------------------------------------
+# See tests/property/test_locales_properties.py for the three spellings of one letter.
+
+
+def _replayed(text: str | None) -> str | None:
+    return None if text is None else json.loads(json.dumps(text, ensure_ascii=True))
+
+
+@st.composite
+def _spelled_items(draw: st.DrawFn, run: str) -> list[Comparable]:
+    count = draw(st.integers(1, 4))
+    result: list[Comparable] = []
+    for index in range(count):
+        words = draw(st.lists(st.sampled_from(_WORDS[:5]), min_size=2, max_size=4))
+        title = " ".join(draw(spelled(word)) for word in words)
+        result.append(
+            Comparable(
+                key=(run, f"https://e.org/{run}/{index}", f"{index:064x}"),
+                canonical_url=f"https://e.org/{run}/{index}",
+                content_sha256=f"{index + (100 if run == 'run-b' else 0):064x}",
+                publisher=draw(spelled("AFP")),
+                published_at_utc=T0,
+                english_title=title,
+            )
+        )
+    return result
+
+
+def _reload_all(items: list[Comparable]) -> list[Comparable]:
+    return [
+        Comparable(
+            key=item.key,
+            canonical_url=item.canonical_url,
+            content_sha256=item.content_sha256,
+            publisher=_replayed(item.publisher),
+            published_at_utc=item.published_at_utc,
+            english_title=_replayed(item.english_title),
+        )
+        for item in items
+    ]
+
+
+@given(_spelled_items("run-b"), _spelled_items("run-l"))
+def test_overlap_survives_reload_of_surrogate_pair_spellings(
+    base: list[Comparable], lens: list[Comparable]
+) -> None:
+    after_base, after_lens = _reload_all(base), _reload_all(lens)
+    assert classify(base, lens) == classify(after_base, after_lens)
+    assert clusters(lens) == clusters(after_lens)
+    assert independent_reports(base, lens) == independent_reports(after_base, after_lens)

@@ -22,7 +22,7 @@ import json
 from typing import Any, get_args
 
 from hypothesis import given, strategies as st
-from strategies import HOSTILE_TEXT
+from strategies import HOSTILE_TEXT, spelled
 
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 from whiskeyjack_bot.research.locales import (
@@ -235,3 +235,31 @@ def test_origin_is_total_and_stays_in_its_vocabulary(url: Any) -> None:
     iran = build_registry(_BASE, sha256=DIGEST).get("IR")
     assert iran is not None
     assert publisher_origin(url, iran) in get_args(PublisherOrigin)
+
+
+# --- Round 1, B1: surrogate-pair spellings ---------------------------------------------
+#
+# A letter can be written three ways that JSON replay does not keep apart: plain ASCII, a
+# Mathematical Bold scalar (U+1D400 block, which NFKC folds to the plain letter), and that
+# scalar's UTF-16 surrogate-pair spelling. ``json.dumps(ensure_ascii=True)`` escapes the last
+# two identically and ``json.loads`` recombines the pair, so a stored question can read back
+# with different characters from the one that was detected on. The properties above drew no
+# such letters, which is why round 1 had to find this.
+
+
+_SPELLED_CRITERIA = st.lists(
+    st.sampled_from(["Iran", "Oman", "Strait of Hormuz", "Quebec", "the", "officials"]).flatmap(
+        spelled
+    ),
+    min_size=1,
+    max_size=4,
+).map(" ".join)
+
+
+@given(_SPELLED_CRITERIA)
+def test_detection_survives_reload_of_surrogate_pair_spellings(criteria: str) -> None:
+    registry = build_registry(_BASE, sha256=DIGEST)
+    question = _question("Will the strait close?", None, criteria)
+    stored = json.dumps(question.model_dump(mode="json"), ensure_ascii=True, sort_keys=True)
+    reloaded = CanonicalBinaryQuestion.model_validate(json.loads(stored))
+    assert detect(question, registry) == detect(reloaded, registry)
