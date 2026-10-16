@@ -214,7 +214,23 @@ def test_origin_does_not_depend_on_how_the_host_is_spelled(
     assert publisher_origin(left, iran) == publisher_origin(right, iran)
 
 
-@given(st.one_of(HOSTILE_TEXT, HOSTILE_TEXT.map("https://{}".format), st.integers(), st.none()))
+# Authorities ``urlsplit`` itself raises on. Hostile text behind ``https://`` almost never
+# spells one, so without this pool the guard in ``_host_and_path`` was unreachable and a
+# mutant removing it survived the property.
+_BROKEN_AUTHORITIES = st.sampled_from(
+    ["https://[abc/x", "http://[::1", "https://[v1.x]/", "https://a]b/", "https://[::1]:99999/"]
+)
+
+
+@given(
+    st.one_of(
+        HOSTILE_TEXT,
+        HOSTILE_TEXT.map("https://{}".format),
+        _BROKEN_AUTHORITIES,
+        st.integers(),
+        st.none(),
+    )
+)
 def test_origin_is_total_and_stays_in_its_vocabulary(url: Any) -> None:
     iran = build_registry(_BASE, sha256=DIGEST).get("IR")
     assert iran is not None

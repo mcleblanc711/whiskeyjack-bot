@@ -87,6 +87,38 @@ def test_every_lens_document_has_one_class_and_one_cluster(
     assert sorted(grouped) == sorted(item.key for item in lens)
 
 
+@st.composite
+def _pair_item(draw: st.DrawFn, name: str) -> Comparable:
+    """One document from pools dense enough that every branch of the rule is reached.
+
+    One publisher spelled two ways, times either side of the wire window, and titles from
+    four words so mid-range overlap is common. The list strategy above reaches the wire
+    rule's asymmetric case (same publisher, mid overlap, more than the window apart) too
+    rarely: a mutant dropping ``abs`` from the window check survived it.
+    """
+    digest = f"{draw(st.integers(0, 2)):064x}"
+    url = f"https://e.org/{draw(st.integers(0, 2))}"
+    return Comparable(
+        key=(name, url, digest),
+        canonical_url=url,
+        content_sha256=digest,
+        publisher=draw(st.sampled_from(["AFP", "afp", None])),
+        published_at_utc=draw(
+            st.none() | st.sampled_from([0, 6, 12, 13, 30]).map(lambda h: T0 + timedelta(hours=h))
+        ),
+        english_title=draw(
+            st.lists(
+                st.sampled_from(["iran", "tanker", "fire", "oman"]), min_size=1, max_size=4
+            ).map(" ".join)
+        ),
+    )
+
+
+@given(_pair_item("a"), _pair_item("b"))
+def test_near_duplicate_is_symmetric(left: Comparable, right: Comparable) -> None:
+    assert near_duplicate(left, right) == near_duplicate(right, left)
+
+
 @given(_items("run-l"))
 def test_near_duplicate_is_symmetric_and_clusters_respect_it(lens: list[Comparable]) -> None:
     for left in lens:
