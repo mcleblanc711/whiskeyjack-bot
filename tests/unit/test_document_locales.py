@@ -399,3 +399,15 @@ def test_mutating_a_locale_after_construction_cannot_move_the_hash() -> None:
     assert locale.provider_labels is not None
     locale.provider_labels["reporting_voice"] = "Persuasive"
     assert packet_sha256(packet) == before
+
+
+def test_unstorable_provider_labels_are_refused_atomically(ledger: sqlite3.Connection) -> None:
+    """Round 1, B1: the reviewer's reproduction, pinned. A label holding a lone surrogate
+    passes the model but cannot be read back, so the writer must refuse it, not commit it."""
+    lone = chr(0xD800)  # built with chr(): a formatter could rewrite an escape literal
+    locale = _locale(RELEVANT, provider_labels={"label": lone})
+    packet_sha256(build_packet(QUESTION, [_run()], [RELEVANT], [locale]))  # hashing is fine
+    with pytest.raises(StoreError, match="lone surrogate"):
+        persist_retrieval(ledger, _run(), [RELEVANT], locales=[locale])
+    for table in ("research_runs", "research_documents", "research_document_locales"):
+        assert ledger.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0

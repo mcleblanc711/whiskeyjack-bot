@@ -16442,3 +16442,22 @@ says which rule hashed which packet.
   - The third survivor was real: `persist_paid_run` dropping `locales` on the
     `run_opened=True` path, the worker's path, which no test covered. It is covered now.
 - **Pass 2, 5 mutants, one per property, each run against that property alone.** All 5 died.
+
+### Round 1 — CHANGES REQUESTED on `ea91ec3`, one blocker
+
+**B1: provider labels holding a lone surrogate were committed but could not be read back.**
+The locale writer serialized `provider_labels` with `_canonical_json` alone. The run's JSON
+columns go through `_checked_json` first. A lone surrogate inside a label passes the model,
+since `PersistableJson` admits it and the hash renders it as an escape. So the row committed,
+and then `_load_json` refused it on the way out: the packet could not be replayed, and an
+approval could not be reconstructed from it. Reproduced on `ea91ec3` exactly as reported:
+one row committed, then `load_packet` raised.
+
+- **Fix:** labels go through `_checked_json` before serialization. The write is refused with
+  `StoreError` inside its transaction, so no run, document or locale row is committed.
+- **Property:** `test_labels_either_refuse_atomically_or_replay_from_the_ledger` writes
+  through the real store into a real ledger. It draws nested label keys and values from the
+  hostile-text pool and asserts either an atomic refusal or an identical digest after load.
+  It failed on `ea91ec3`, passes now, and kills the mutant that removes the check. The earlier
+  replay property only round-tripped JSON in memory with fixed labels, which is why it could
+  not see the ledger's own refusal. The reviewer's reproduction is also pinned as a unit test.
