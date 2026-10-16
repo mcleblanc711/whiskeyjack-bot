@@ -16305,3 +16305,16 @@ finding.
   pair, independently. A new replay property in each suite failed on `672df3a`, passes now,
   and kills the mutant that drops the recombination step. The reviewer's counterexample is
   also pinned as a unit test in each module.
+
+### Round 2 — APPROVE on `85d6aaa`, no blockers
+
+B1 closed. One non-blocking observation, taken after approval as a **test-only** change: the
+pinned round-1 regressions held the scalar 𝐢, not the two-code-point pair. **`ruff format`
+rewrites a `"𝐢"` escape pair in a string literal into the one-scalar literal**, so
+the tests I wrote as pairs reached the repository as the case that already worked, and passed
+with recombination removed. They now build the pair with `chr(0xD835) + chr(0xDC22)`, which
+formatting cannot collapse. With recombination removed, all three now fail
+(`test_a_surrogate_pair_letter_matches_before_and_after_replay`,
+`test_comparison_form_is_the_json_replay_form_and_keeps_lone_surrogates` and
+`test_a_surrogate_pair_title_classifies_the_same_after_replay`). No `src/` change follows the
+approved commit.

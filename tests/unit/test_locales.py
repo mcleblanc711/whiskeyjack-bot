@@ -21,6 +21,10 @@ from whiskeyjack_bot.research.locales import (
     publisher_origin,
 )
 
+# Mathematical Bold small i as its UTF-16 surrogate pair: two code points. Built with chr()
+# because `ruff format` rewrites a "\ud835\udc22" escape pair into the one-scalar literal,
+# which silently turned these round-1 regressions into the case that already worked.
+PAIR_I = chr(0xD835) + chr(0xDC22)
 REPO = Path(__file__).resolve().parents[2]
 COMMITTED = REPO / "config" / "locales.yaml"
 DIGEST = "0" * 64
@@ -386,7 +390,9 @@ def test_a_surrogate_pair_letter_matches_before_and_after_replay() -> None:
     """Round 1, B1: the reviewer's counterexample, pinned."""
     import json
 
-    question = _question("Will the strait close?", criteria="According to 𝐢ran officials")
+    question = _question(
+        "Will the strait close?", criteria="According to " + PAIR_I + "ran officials"
+    )
     stored = json.dumps(question.model_dump(mode="json"), ensure_ascii=True)
     reloaded = CanonicalBinaryQuestion.model_validate(json.loads(stored))
     registry = load_registry(COMMITTED)
@@ -399,8 +405,8 @@ def test_comparison_form_is_the_json_replay_form_and_keeps_lone_surrogates() -> 
 
     from whiskeyjack_bot.research.locales import comparison_form
 
-    for text in ("𝐢ran", "\U0001d422ran", "x\ud800", "\udc22\ud835", "IRAN"):
+    for text in (PAIR_I + "ran", "\U0001d422ran", "x\ud800", "\udc22\ud835", "IRAN"):
         replayed = json.loads(json.dumps(text, ensure_ascii=True))
         assert comparison_form(text) == comparison_form(replayed)
-    assert comparison_form("𝐢ran") == "iran"
+    assert comparison_form(PAIR_I + "ran") == "iran"
     assert comparison_form("x\ud800") == "x\ud800"

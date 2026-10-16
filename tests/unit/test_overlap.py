@@ -20,6 +20,10 @@ from whiskeyjack_bot.research.overlap import (
     title_tokens,
 )
 
+# Mathematical Bold small i as its UTF-16 surrogate pair: two code points. Built with chr()
+# because `ruff format` rewrites a "\ud835\udc22" escape pair into the one-scalar literal,
+# which silently turned these round-1 regressions into the case that already worked.
+PAIR_I = chr(0xD835) + chr(0xDC22)
 T0 = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
 
@@ -226,7 +230,7 @@ def test_a_surrogate_pair_title_classifies_the_same_after_replay() -> None:
     import json
 
     base = _item("base", "Iran tanker fire", run="b")
-    paired = _item("lens", "𝐢ran tanker fire")
+    paired = _item("lens", PAIR_I + "ran tanker fire")
     replayed = _item("lens", json.loads(json.dumps(paired.english_title, ensure_ascii=True)))
     assert classify([base], [paired]) == classify([base], [replayed])
     assert classify([base], [paired]) == {paired.key: "republication"}
