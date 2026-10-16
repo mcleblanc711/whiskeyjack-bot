@@ -249,21 +249,54 @@ def test_a_run_without_locales_writes_no_locale_rows(ledger: sqlite3.Connection)
 
 
 @pytest.mark.parametrize(
-    "locales",
+    ("locales", "message"),
     [
-        (_locale(RELEVANT), _locale(RELEVANT)),  # one document described twice
-        (_locale(RELEVANT, content_sha256="f" * 64),),  # describes no carried document
-        (_locale(RELEVANT, retrieval_run_id="run-other"),),  # another run's document
-        ("not a locale",),
+        ((_locale(RELEVANT), _locale(RELEVANT)), "at most one locale"),
+        ((_locale(RELEVANT, content_sha256="f" * 64),), "one of this run's documents"),
+        ((_locale(RELEVANT, retrieval_run_id="run-other"),), "this run's retrieval_run_id"),
+        (("not a locale",), "must be a DocumentLocale"),
     ],
 )
 def test_a_misattributed_locale_is_refused_before_anything_is_written(
-    ledger: sqlite3.Connection, locales: tuple[Any, ...]
+    ledger: sqlite3.Connection, locales: tuple[Any, ...], message: str
 ) -> None:
-    with pytest.raises(StoreError):
+    # The message is asserted, not just the type: 019's primary key and the dedup-key check
+    # would also refuse the first and third shapes, but inside the transaction and with a
+    # message that cannot say which document or why. The pre-checks exist to say so.
+    with pytest.raises(StoreError, match=message):
         persist_retrieval(ledger, _run(), DOCUMENTS, locales=locales)
     assert ledger.execute("SELECT count(*) FROM research_runs").fetchone()[0] == 0
     assert ledger.execute("SELECT count(*) FROM research_documents").fetchone()[0] == 0
+
+
+def test_an_opened_run_completes_with_its_locale_rows(
+    ledger: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The worker's shape: the run row is opened before the billable call, then completed."""
+    from whiskeyjack_bot.research.store import open_run
+
+    config = _config(tmp_path)
+    config.storage.artifact_root.mkdir(parents=True, exist_ok=True)
+    opening = validate_run(
+        {
+            "retrieval_run_id": RUN,
+            "question_id": QUESTION,
+            "provider": "asknews",
+            "started_at_utc": NOW,
+        }
+    )
+    open_run(ledger, opening)
+    persist_paid_run(
+        ledger,
+        config,
+        _run(),
+        DOCUMENTS,
+        raw_responses=({"as_dicts": []},),
+        written_at_utc=NOW,
+        run_opened=True,
+        locales=LOCALES,
+    )
+    assert load_locales(ledger, RUN) == tuple(sorted(LOCALES, key=DocumentLocale.key))
 
 
 def test_a_locale_insert_failure_rolls_back_the_run_and_its_documents(
