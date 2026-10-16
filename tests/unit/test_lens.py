@@ -322,6 +322,10 @@ def test_run_lens_buys_each_planned_call_and_records_runs_and_locale_rows(
         "query_source": "native_terms",
         "baseline_run_ids": ["run-baseline"],
     }
+    uae_run = load_run(ledger, outcome.runs[1].retrieval_run_id or "")
+    assert uae_run.provider_config is not None
+    assert uae_run.provider_config["lens"]["locale"] == "AE"
+    assert "wam.ae" in uae_run.provider_config["domain_url"]
     (row,) = load_locales(ledger, outcome.runs[0].retrieval_run_id or "")
     assert (row.locale_code, row.publisher_origin) == ("IR", "local")
     packet = load_packet(
@@ -418,3 +422,67 @@ def test_decide_fallback_never_emits_the_lens_reason() -> None:
                     official_source_required=official,
                 )
                 assert "local_source_lens" not in decision.reasons
+
+
+def test_the_lens_is_disabled_unless_a_config_says_otherwise() -> None:
+    from whiskeyjack_bot.config import LocalLensConfig
+
+    assert LocalLensConfig().enabled is False
+    data = yaml.safe_load((REPO / "config.example.yaml").read_text("utf-8"))
+    data["model"]["name"] = "openrouter/test-model"
+    del data["retrieval"]["local_lens"]
+    assert validate_config_data(data).retrieval.local_lens.enabled is False
+    for path in ("config.example.yaml", "config/tournament.yaml", "config/tournament-cup.yaml"):
+        committed = yaml.safe_load((REPO / path).read_text("utf-8"))
+        assert committed["retrieval"]["local_lens"]["enabled"] is False
+
+
+def test_the_report_compares_a_lens_document_without_a_locale_row_conservatively(
+    config: AppConfig, ledger: sqlite3.Connection
+) -> None:
+    """A lens document with no locale row: AskNews's stored title is English, so it can be
+    called new; an Exa page title is not known to be, so it is `unassessed`, never `novel`."""
+    from whiskeyjack_bot.research.lens_report import lens_report
+    from whiskeyjack_bot.research.model import validate_run
+    from whiskeyjack_bot.research.store import persist_retrieval
+    from whiskeyjack_bot.tournament_state import append
+
+    def run(run_id: str, provider: str) -> Any:
+        return validate_run(
+            {
+                "retrieval_run_id": run_id,
+                "question_id": 4242,
+                "provider": provider,
+                "started_at_utc": NOW,
+                "completed_at_utc": NOW,
+                "cost_usd": 0.007 if provider == "exa" else None,
+            }
+        )
+
+    persist_retrieval(ledger, run("run-base", "asknews"), [])
+    persist_retrieval(
+        ledger,
+        run("run-ask", "asknews"),
+        [_document("https://wam.ae/x", "UAE ports reopen after storm", run="run-ask")],
+    )
+    persist_retrieval(
+        ledger,
+        run("run-exa", "exa"),
+        [_document("https://irna.ir/y", "Ports reopen after storm", run="run-exa")],
+    )
+    append(
+        ledger,
+        "local_lens_checkpoint",
+        "q",
+        {
+            "at": NOW.isoformat(),
+            "question_id": 4242,
+            "baseline_run_ids": ["run-base"],
+            "lens_run_ids": ["run-ask", "run-exa"],
+            "calls": [{"requests": 1}, {"requests": 1}],
+        },
+    )
+    (summary,) = lens_report(ledger).questions
+    assert summary.overlap == {"novel": 1, "unassessed": 1}
+    assert summary.origins == {"no_locale_row": 2}
+    assert summary.exa_cost_usd == 0.007 and summary.requests == 2

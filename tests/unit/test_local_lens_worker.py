@@ -284,3 +284,43 @@ def test_the_lens_time_bound_is_recorded_and_the_question_still_succeeds(
     assert result["forecast_confirmed"] == 1 and result["heartbeat"]["failures"] == 0
     (event,) = _lens_events(conn)
     assert event["error_type"] == "TournamentError"
+
+
+def test_a_second_lens_for_the_same_research_checkpoint_buys_nothing(enabled_case: Any) -> None:
+    """The guard itself. A full second poll never reaches it -- the question is already
+    posted and skipped -- so the helper is driven directly with the same checkpoint."""
+    from datetime import datetime
+
+    from whiskeyjack_bot.tournament_state import question_fingerprint
+
+    transport = ExaTransport()
+    _poll(enabled_case, transport)
+    conn, config, _, news, _ = enabled_case
+    (event,) = _lens_events(conn)
+    question = next(iter(_questions(enabled_case)))
+    fingerprint = question_fingerprint(question)
+    calls = (len(news.requests), len(transport.bodies))
+    web = httpx.Client(base_url="https://api.exa.ai", transport=httpx.MockTransport(transport))
+    whiskeyjack_tournament._collect_local_lens(  # noqa: SLF001
+        conn,
+        config,
+        budget=Budget(conn, config.storage.artifact_root, "42:32977", 1_000_000),
+        question=question,
+        now=datetime.fromisoformat(event["at"]),
+        fingerprint=fingerprint,
+        news_client=news,
+        web_client=web,
+    )
+    assert (len(news.requests), len(transport.bodies)) == calls
+    assert len(_lens_events(conn)) == 1
+
+
+def _questions(case: Any) -> list[Any]:
+    from forecasting_tools.data_models.data_organizer import DataOrganizer
+
+    from whiskeyjack_bot.questions.normalize import normalize_questions
+
+    platform = case[2]
+    return list(
+        normalize_questions([DataOrganizer.get_question_from_post_json(platform.raw)]).questions
+    )

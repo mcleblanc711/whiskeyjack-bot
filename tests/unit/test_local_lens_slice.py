@@ -124,6 +124,19 @@ UAE_ARTICLES = [
         full_text="بيان إماراتي بشأن الملاحة في مضيق هرمز.",
         reporting_voice="Objective",
     ),
+    # New reporting, but from a publisher NOT local to the UAE: independent, yet not local.
+    _article(
+        _url("www.almasryalyoum.com", "egypt-view"),
+        title="مصر تدعو إلى ضبط النفس في مضيق هرمز",
+        eng_title="Egypt urges restraint over Strait of Hormuz shipping",
+        language="ar",
+        country="EG",
+        source_id="Al Masry Al Youm",
+        pub_date=NOW - timedelta(hours=3),
+        crawl_date=NOW - timedelta(hours=2),
+        summary="Egypt urged restraint over Hormuz shipping.",
+        full_text="دعت مصر إلى ضبط النفس.",
+    ),
     # A FUTURE publication time: a provider claim the lens stores but replay filters out.
     _article(
         _url("www.khaleejtimes.com", "future"),
@@ -342,7 +355,11 @@ def test_the_vertical_slice(config: AppConfig) -> None:
         (summary,) = report.questions
         assert summary.origins["local"] >= 5
         assert summary.overlap["unassessed"] == 3 and summary.overlap["same_url"] == 1
-        assert summary.local_independent_reports >= 1
+        # WAM's statement, Khaleej Times's (future-dated) report and the Egyptian view are new;
+        # only the first two are local to the UAE.
+        assert summary.independent_reports == 3
+        assert summary.local_independent_reports == 2
+        assert summary.origins["unclassified"] == 1
     finally:
         conn.close()
 

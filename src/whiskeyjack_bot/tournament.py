@@ -1035,9 +1035,6 @@ def run_once(
             # The checkpoint window this attempt runs in, once one is established below;
             # None on the recovery path, which buys nothing and so is never paced.
             window_start: datetime | None = None
-            # M1-358: set when this iteration ran the question's own research, so the
-            # local-source lens may follow it (collect-only; see _collect_local_lens).
-            lens_due = False
             try:
                 require_activation(conn, config, account_id=account, project_id=project)
                 if existing:
@@ -1075,7 +1072,6 @@ def run_once(
                             web_client=web_client,
                             forecaster=forecaster,
                         )
-                    lens_due = True
                     with budget_context(budget), phase_timeout(480):
                         outcome = _attempt_question(
                             conn,
@@ -1205,9 +1201,11 @@ def run_once(
                     # window (`PricedClient`'s repeat guard), so pacing it spends nothing
                     # differently; what it stops is a failed poll every five minutes.
                     _append_retry_wait(conn, scope, fingerprint, activation, window_start)
-            if lens_due and clients is not None and config.retrieval.local_lens.enabled:
+            if clients is not None and config.retrieval.local_lens.enabled:
                 # Outside the question's try/except on purpose: a lens failure is not a
-                # question failure, and nothing the lens does may be recorded as one.
+                # question failure, and nothing the lens does may be recorded as one. Whether
+                # this poll bought research the lens may follow is _collect_local_lens's
+                # question: only a research checkpoint at this poll's `now` qualifies.
                 _collect_local_lens(
                     conn,
                     config,
