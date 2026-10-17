@@ -217,6 +217,14 @@ class ModelConfig(_StrictModel):
         return _require_env_var_name(v)
 
 
+# AskNews's pay-as-you-go price, USD 0.025 per credit, in integer micro-USD (owner, 2026-09-23;
+# M1-336). The default for ``microusd_per_credit`` below; the committed profiles state it.
+ASKNEWS_DEFAULT_MICROUSD_PER_CREDIT = 25_000
+# Far above any plausible per-credit price (USD 1) and far below anything that makes a
+# settled micro-USD figure unwieldy.
+ASKNEWS_MAX_MICROUSD_PER_CREDIT = 1_000_000
+
+
 class RetrievalProviderConfig(_StrictModel):
     provider: Literal["asknews", "exa"]
     api_key_env: str
@@ -225,11 +233,42 @@ class RetrievalProviderConfig(_StrictModel):
     # SDK's own (retries=3) and the social block's timeout_seconds.
     timeout_seconds: float = Field(60.0, gt=0)
     retries: int = Field(3, ge=0)
+    # M1-353 (D41, D54): what one AskNews credit costs, in integer micro-USD, so a settled
+    # call is exactly ``usage.credits * microusd_per_credit`` with no float in between
+    # (``research/asknews_cost.py``). Strict: ``true`` and ``25000.0`` are refused, not
+    # coerced. AskNews only -- Exa reports its own dollar cost, so a rate there is refused
+    # rather than ignored. Omitted on AskNews, it is the owner-confirmed default; after
+    # validation an AskNews provider always carries an int and any other carries None, so a
+    # ``model_dump`` reloads to the same model.
+    microusd_per_credit: int | None = Field(
+        None, strict=True, ge=1, le=ASKNEWS_MAX_MICROUSD_PER_CREDIT
+    )
 
     @field_validator("api_key_env")
     @classmethod
     def _key_env_is_name(cls, v: str) -> str:
         return _require_env_var_name(v)
+
+    @model_validator(mode="after")
+    def _rate_prices_asknews_only(self) -> RetrievalProviderConfig:
+        if self.provider != "asknews":
+            if self.microusd_per_credit is not None:
+                raise authored_error(
+                    "credit_rate_not_asknews",
+                    "microusd_per_credit prices AskNews credits and is refused on any other "
+                    "provider",
+                )
+        elif self.microusd_per_credit is None:
+            if "microusd_per_credit" in self.model_fields_set:
+                # An explicit null (a bare ``microusd_per_credit:`` in YAML) is a rate the
+                # operator meant to state and did not; omitting the key is the default.
+                raise authored_error(
+                    "credit_rate_missing",
+                    "microusd_per_credit is null; omit the key for the default rate or "
+                    "state an integer micro-USD figure",
+                )
+            self.microusd_per_credit = ASKNEWS_DEFAULT_MICROUSD_PER_CREDIT
+        return self
 
 
 class SocialRetrievalConfig(_StrictModel):

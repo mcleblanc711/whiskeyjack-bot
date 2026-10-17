@@ -313,6 +313,7 @@ def test_client_refuses_to_build_when_config_names_another_fallback(
     """Running Exa while config says AskNews *is* the silent switch."""
     data = config.model_dump()
     data["retrieval"]["fallback"]["provider"] = "asknews"
+    data["retrieval"]["fallback"].pop("microusd_per_credit")  # Exa dumps it as null (M1-353)
     custom = validate_config_data(data)
     monkeypatch.setenv("EXA_API_KEY", FAKE_KEY)
     with pytest.raises(ExaFallbackError):
@@ -324,6 +325,7 @@ def test_provider_mismatch_is_checked_before_the_credential(
 ) -> None:
     data = config.model_dump()
     data["retrieval"]["fallback"]["provider"] = "asknews"
+    data["retrieval"]["fallback"].pop("microusd_per_credit")  # Exa dumps it as null (M1-353)
     custom = validate_config_data(data)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     with pytest.raises(ExaFallbackError):
@@ -336,6 +338,7 @@ def test_client_refuses_when_the_primary_is_not_asknews(
     """Exa naming itself as primary too would let it 'fall back' to itself."""
     data = config.model_dump()
     data["retrieval"]["primary"]["provider"] = "exa"
+    data["retrieval"]["primary"].pop("microusd_per_credit")  # an AskNews-only field (M1-353)
     custom = validate_config_data(data)
     monkeypatch.setenv("EXA_API_KEY", FAKE_KEY)
     with pytest.raises(ExaFallbackError):
@@ -347,6 +350,7 @@ def test_primary_mismatch_is_checked_before_the_credential(
 ) -> None:
     data = config.model_dump()
     data["retrieval"]["primary"]["provider"] = "exa"
+    data["retrieval"]["primary"].pop("microusd_per_credit")  # an AskNews-only field (M1-353)
     custom = validate_config_data(data)
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     with pytest.raises(ExaFallbackError):
@@ -359,6 +363,7 @@ def test_retrieve_web_refuses_when_fallback_provider_is_not_exa(config: AppConfi
     refusal is not the only path to this function."""
     data = config.model_dump()
     data["retrieval"]["fallback"]["provider"] = "asknews"
+    data["retrieval"]["fallback"].pop("microusd_per_credit")  # Exa dumps it as null (M1-353)
     custom = validate_config_data(data)
     handler = _Exchange()
     with pytest.raises(ExaFallbackError):
@@ -369,6 +374,7 @@ def test_retrieve_web_refuses_when_fallback_provider_is_not_exa(config: AppConfi
 def test_retrieve_web_refuses_when_primary_is_not_asknews(config: AppConfig) -> None:
     data = config.model_dump()
     data["retrieval"]["primary"]["provider"] = "exa"
+    data["retrieval"]["primary"].pop("microusd_per_credit")  # an AskNews-only field (M1-353)
     custom = validate_config_data(data)
     handler = _Exchange()
     with pytest.raises(ExaFallbackError):

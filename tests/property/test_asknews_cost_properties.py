@@ -5,7 +5,7 @@ out of the ledger. ``classify_failure`` names an arbitrary exception. The back-f
 ``correct_costs`` reads both back from the journal. The properties:
 
 1. ``credits_microusd`` never raises on any JSON, and returns either None or exactly
-   ``credits * 25000`` for an exact int count in range -- never a figure the response does
+   ``credits * rate`` for an exact int count in range, at any configured rate (M1-353) -- never a figure the response does
    not carry, so an unknown count is never settled as free or as anything else.
 2. It is replay-stable across the persisted form (``canonical`` -> ``json.loads``).
 3. ``classify_failure`` is total over generated exception classes, always lands in the
@@ -105,14 +105,19 @@ RESPONSE = st.integers(0, 5).flatmap(
 )
 
 
-def _oracle(response: object) -> int | None:
+# The owner-confirmed rate, and every rate the config field admits (M1-353).
+RATE = 25_000
+RATES = st.integers(1, 1_000_000)
+
+
+def _oracle(response: object, rate: int = RATE) -> int | None:
     """The spec, written out: an exact int in [0, 10**6] at $0.025 per credit."""
     if not isinstance(response, dict) or not isinstance(response.get("usage"), dict):
         return None
     count = response["usage"].get("credits")
     if isinstance(count, bool) or not isinstance(count, int):
         return None
-    return count * 25_000 if 0 <= count <= 10**6 else None
+    return count * rate if 0 <= count <= 10**6 else None
 
 
 def _persistable(value: object) -> bool:
@@ -123,18 +128,20 @@ def _persistable(value: object) -> bool:
     return True
 
 
-@given(response=RESPONSE)
-def test_the_settled_figure_is_exactly_what_the_count_implies(response: object) -> None:
-    found = credits_microusd(response)
+@given(response=RESPONSE, rate=RATES)
+def test_the_settled_figure_is_exactly_what_the_count_implies(response: object, rate: int) -> None:
+    found = credits_microusd(response, microusd_per_credit=rate)
     event("settles" if found is not None else "held")
-    assert found == _oracle(response)
+    assert found == _oracle(response, rate)
     assert found is None or type(found) is int
 
 
-@given(response=RESPONSE)
-def test_the_settled_figure_is_replay_stable(response: object) -> None:
+@given(response=RESPONSE, rate=RATES)
+def test_the_settled_figure_is_replay_stable(response: object, rate: int) -> None:
     if _persistable(response):
-        assert credits_microusd(json.loads(canonical(response))) == credits_microusd(response)
+        assert credits_microusd(
+            json.loads(canonical(response)), microusd_per_credit=rate
+        ) == credits_microusd(response, microusd_per_credit=rate)
 
 
 def test_the_response_strategy_reaches_both_branches() -> None:
@@ -143,7 +150,7 @@ def test_the_response_strategy_reaches_both_branches() -> None:
     @settings(max_examples=400, database=None, derandomize=True)
     @given(response=RESPONSE)
     def draw(response: object) -> None:
-        found = credits_microusd(response)
+        found = credits_microusd(response, microusd_per_credit=RATE)
         hits["settles"] += found is not None
         hits["held"] += found is None
         hits["nonzero"] += bool(found)
@@ -388,11 +395,11 @@ def test_the_back_fill_is_exact_scoped_replay_stable_and_idempotent(
         before = {scope: spending(conn, scope) for scope in SCOPES}
         rows = conn.execute("SELECT count(*) FROM tournament_events").fetchone()[0]
 
-        dry = correct_costs(conn)
+        dry = correct_costs(conn, microusd_per_credit=RATE)
         assert {s.reservation_id: (s.scope, s.actual_microusd) for s in dry.asknews} == expected
         assert conn.execute("SELECT count(*) FROM tournament_events").fetchone()[0] == rows
 
-        applied = correct_costs(conn, apply=True)
+        applied = correct_costs(conn, microusd_per_credit=RATE, apply=True)
         assert applied.asknews_written == len(expected)
         for scope in SCOPES:
             mine = {r: a for r, (s, a) in expected.items() if s == scope}
@@ -402,9 +409,9 @@ def test_the_back_fill_is_exact_scoped_replay_stable_and_idempotent(
                 assert (row["basis"], row["backfilled"]) == ("asknews_credits", True)
             actual, held = spending(conn, scope)
             assert actual == before[scope][0] + sum(mine.values()) >= before[scope][0]
-            assert held == before[scope][1] - 25_000 * len(mine)
+            assert held == before[scope][1] - RATE * len(mine)
 
         after = {scope: spending(conn, scope) for scope in SCOPES}
-        again = correct_costs(conn, apply=True)
+        again = correct_costs(conn, microusd_per_credit=RATE, apply=True)
         assert (again.asknews, again.asknews_written) == ((), 0)
         assert {scope: spending(conn, scope) for scope in SCOPES} == after

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ from asknews_sdk.dto.news import SearchResponse, SearchResponseDictItem, Usage
 from test_asknews import _article as _full_article  # type: ignore[import-not-found]
 from test_tournament import case as tournament_case  # type: ignore[import-not-found]
 from whiskeyjack_bot.cli import main
+from whiskeyjack_bot.config import ASKNEWS_MAX_MICROUSD_PER_CREDIT, RetrievalProviderConfig
 from whiskeyjack_bot.research import asknews
 from whiskeyjack_bot.research.asknews import (
     FAILURE_ADVICE,
@@ -41,8 +43,9 @@ from whiskeyjack_bot.research.asknews import (
 from whiskeyjack_bot.research.asknews_cost import (
     CREDITS_PER_NEWS_CALL,
     MAX_CREDITS,
-    MICROUSD_PER_CREDIT,
     credits_microusd,
+    microusd_per_credit,
+    news_call_estimate_usd,
 )
 from whiskeyjack_bot.research.durable import begin_call
 from whiskeyjack_bot.tournament_state import (
@@ -57,6 +60,8 @@ from whiskeyjack_bot.tournament_state import (
 SCOPE = "42:32977"
 NOW = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
 SENTINEL = "SENTINEL-asknews-0001"
+# The owner-confirmed rate (2026-09-23), written out rather than read back from config.
+RATE = 25_000
 ABSENT = object()
 
 
@@ -234,6 +239,104 @@ def test_settle_microusd_refuses_anything_but_an_exact_non_negative_int(
     assert spending(conn, SCOPE) == (0, 0), "a real zero settles"
 
 
+# --- M1-353: the rate is configuration ----------------------------------------------------
+
+# A prime, so no product with a small credit count is mistaken for the default's.
+CONFIGURED = 7_919
+
+
+def _at_rate(config: Any, rate: int) -> Any:
+    """``config`` with ``retrieval.primary.microusd_per_credit`` set, through validation."""
+    primary = RetrievalProviderConfig.model_validate(
+        {**config.retrieval.primary.model_dump(), "microusd_per_credit": rate}
+    )
+    return config.model_copy(
+        update={"retrieval": config.retrieval.model_copy(update={"primary": primary})}
+    )
+
+
+@pytest.mark.parametrize("credits", [1, 3, 5, 0])
+def test_a_configured_rate_settles_a_planted_credit_count_at_its_conversion(
+    case: Any, credits: int
+) -> None:
+    """M1-353's criterion: a configured per-credit rate converts ``usage.credits`` to dollars
+    and settles the reservation; ``spending()`` then reports actual, not held. At a rate that
+    is not the default, so a figure computed from a leftover constant cannot pass."""
+    conn, config, *_ = case
+    configured = _at_rate(config, CONFIGURED)
+    _retrieve(conn, configured, _News(Usage(credits=credits)))
+    reservation, reserved = _held_one_call(conn)
+    assert reserved["estimate_microusd"] == CONFIGURED
+    assert events(conn, "cost_settled", SCOPE) == [
+        {
+            "reservation_id": reservation,
+            "actual_microusd": credits * CONFIGURED,
+            "basis": "asknews_credits",
+        }
+    ]
+    assert spending(conn, SCOPE) == (credits * CONFIGURED, 0), "actual, not held"
+
+
+@pytest.mark.parametrize("usage", [ABSENT, None, {"credits": None}])
+def test_at_a_configured_rate_no_usage_block_still_keeps_the_hold(case: Any, usage: Any) -> None:
+    """The criterion's last clause: no usage block degrades to the existing hold -- held at
+    the configured estimate, never settled and never a crash."""
+    conn, config, *_ = case
+    result = _retrieve(
+        conn,
+        _at_rate(config, CONFIGURED),
+        _News(usage if usage is ABSENT or usage is None else Usage.model_construct(**usage)),
+    )
+    assert result.provider_failed is False
+    assert events(conn, "cost_settled", SCOPE) == []
+    assert spending(conn, SCOPE) == (0, CONFIGURED)
+
+
+def test_the_estimate_reserves_exactly_one_call_at_every_admitted_rate() -> None:
+    """``Budget.reserve`` ceils ``estimate * 1e6``. A naive ``rate / 1e6`` misrounds 11,555 of
+    the admitted rates (123 reserves 124); the estimate must reserve exactly what one call
+    bills, for every one."""
+    naive = [rate for rate in range(1, 1_000_001) if math.ceil(rate / 1e6 * 1e6) != rate]
+    assert len(naive) == 11_555 and naive[0] == 123
+    for rate in range(1, ASKNEWS_MAX_MICROUSD_PER_CREDIT + 1):
+        assert math.ceil(news_call_estimate_usd(rate) * 1_000_000) == CREDITS_PER_NEWS_CALL * rate
+
+
+def test_a_rate_the_naive_estimate_misrounds_reserves_exactly(case: Any) -> None:
+    conn, config, *_ = case
+    _retrieve(conn, _at_rate(config, 123), _News(None))
+    _, reserved = _held_one_call(conn)
+    assert reserved["estimate_microusd"] == 123
+
+
+def test_the_back_fill_settles_at_the_configured_rate(case: Any) -> None:
+    conn, config, *_ = case
+    held = _pre_m1_336_call(conn, config, {"usage": {"credits": 5}})
+    correct_costs(conn, microusd_per_credit=CONFIGURED, apply=True)
+    (settled,) = events(conn, "cost_settled", SCOPE)
+    assert (settled["reservation_id"], settled["actual_microusd"]) == (held, 5 * CONFIGURED)
+
+
+def test_the_cli_back_fill_reads_the_configured_rate(
+    case: Any,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one caller outside the adapter: ``tournament correct-costs`` takes the rate from
+    the profile it is pointed at, not from a constant."""
+    import yaml
+
+    monkeypatch.setattr("whiskeyjack_bot.logging_setup.configure_logging", lambda config: None)
+    conn, config, *_ = case
+    _pre_m1_336_call(conn, config, {"usage": {"credits": 2}})
+    path = tmp_path / "operator.yaml"
+    path.write_text(yaml.safe_dump(_at_rate(config, CONFIGURED).model_dump(mode="json")))
+    assert main(["tournament", "correct-costs", "--config", str(path)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["asknews_total_usd"] == 2 * CONFIGURED / 1_000_000
+
+
 # --- M1-337: the estimate is credits x rate ----------------------------------------------
 
 
@@ -242,10 +345,10 @@ def test_the_one_estimate_is_credits_per_news_call_times_the_rate(case: Any) -> 
     _retrieve(conn, config, _News(None))
     _, reserved = _held_one_call(conn)
     assert reserved["provider"] == "asknews"
-    assert reserved["estimate_microusd"] == CREDITS_PER_NEWS_CALL * MICROUSD_PER_CREDIT
+    assert reserved["estimate_microusd"] == CREDITS_PER_NEWS_CALL * microusd_per_credit(config)
     # The owner's figures (2026-09-23), written out rather than read back from the module:
     # $0.025 per credit, and a news search is one credit.
-    assert (MICROUSD_PER_CREDIT, CREDITS_PER_NEWS_CALL) == (25_000, 1)
+    assert (microusd_per_credit(config), CREDITS_PER_NEWS_CALL) == (RATE, 1)
 
 
 def test_the_adapter_carries_no_price_literal() -> None:
@@ -286,13 +389,15 @@ def test_the_adapter_carries_no_price_literal() -> None:
     ],
 )
 def test_credits_microusd_converts_exactly_or_refuses(response: object, expected: object) -> None:
-    assert credits_microusd(response) == expected
+    assert credits_microusd(response, microusd_per_credit=RATE) == expected
 
 
 def test_the_conversion_is_exact_for_every_credit_count() -> None:
     """The float rate misrounds 3, 6, 7, 12 ... ; integer micro-USD has no such count."""
     for count in range(0, 20_001):
-        assert credits_microusd({"usage": {"credits": count}}) == count * 25_000
+        assert credits_microusd({"usage": {"credits": count}}, microusd_per_credit=RATE) == (
+            count * RATE
+        )
 
 
 # --- M1-332: the failure classifier ------------------------------------------------------
@@ -478,12 +583,12 @@ def test_the_back_fill_is_a_dry_run_until_applied_then_idempotent(case: Any) -> 
     assert spending(conn, SCOPE) == (0, 6 * 25_000)
     rows = conn.execute("SELECT count(*) FROM tournament_events").fetchone()[0]
 
-    dry = correct_costs(conn).as_dict(applied=False)
+    dry = correct_costs(conn, microusd_per_credit=RATE).as_dict(applied=False)
     assert (dry["asknews_settlements"], dry["asknews_total_usd"]) == (2, 0.15)
     assert (dry["asknews_refused_no_credits"], dry["asknews_written"]) == (3, 0)
     assert conn.execute("SELECT count(*) FROM tournament_events").fetchone()[0] == rows
 
-    applied = correct_costs(conn, apply=True)
+    applied = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert applied.asknews_written == 2
     assert events(conn, "cost_settled", SCOPE) == [
         {
@@ -501,7 +606,7 @@ def test_the_back_fill_is_a_dry_run_until_applied_then_idempotent(case: Any) -> 
     ]
     assert spending(conn, SCOPE) == (150_000, 4 * 25_000)
 
-    again = correct_costs(conn, apply=True)
+    again = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert (again.asknews, again.asknews_written, again.asknews_refused) == ((), 0, 3)
     assert _settled_rows(conn) == 2
     assert spending(conn, SCOPE) == (150_000, 4 * 25_000)
@@ -511,7 +616,7 @@ def test_the_back_fill_settles_in_each_reservation_s_own_scope(case: Any) -> Non
     conn, config, *_ = case
     old = _pre_m1_336_call(conn, config, {"usage": {"credits": 5}}, scope="42:33122")
     new = _pre_m1_336_call(conn, config, {"usage": {"credits": 1}}, scope="42:33125")
-    correct_costs(conn, apply=True)
+    correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert [row["reservation_id"] for row in events(conn, "cost_settled", "42:33122")] == [old]
     assert [row["reservation_id"] for row in events(conn, "cost_settled", "42:33125")] == [new]
     assert spending(conn, "42:33122") == (125_000, 0)
@@ -522,7 +627,7 @@ def test_the_back_fill_never_resettles_a_live_settlement(case: Any) -> None:
     """A call settled by the adapter already carries the guard; the back-fill skips it."""
     conn, config, *_ = case
     _retrieve(conn, config, _News(Usage(credits=3)))
-    report = correct_costs(conn, apply=True)
+    report = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert (report.asknews, report.asknews_refused, report.asknews_written) == ((), 0, 0)
     assert _settled_rows(conn) == 1
 
@@ -539,16 +644,18 @@ def test_the_back_fill_rechecks_the_guard_inside_its_transaction(
     real = tournament_state._asknews_settlements
     raced: list[int] = []
 
-    def plan_then_race(conn: Any) -> Any:
-        found = real(conn)
+    def plan_then_race(conn: Any, rate: int) -> Any:
+        found = real(conn, rate)
         if not raced:
             monkeypatch.setattr(tournament_state, "_asknews_settlements", real)
             with connect(config.storage.sqlite_path) as other:
-                raced.append(correct_costs(other, apply=True).asknews_written)
+                raced.append(
+                    correct_costs(other, microusd_per_credit=RATE, apply=True).asknews_written
+                )
         return found
 
     monkeypatch.setattr(tournament_state, "_asknews_settlements", plan_then_race)
-    report = correct_costs(conn, apply=True)
+    report = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert raced == [1]
     assert len(report.asknews) == 1 and report.asknews_written == 0
     assert _settled_rows(conn) == 1
