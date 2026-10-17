@@ -16720,3 +16720,16 @@ number, and an `int` that overflows a float. It is used for both `cost_usd` and
 `progress.in_flight = None` after a finished call. It is **equivalent**: a stale `in_flight`
 always names a run that already finished, and `outcome()` drops it. The clear stays for
 readability.
+
+### Round 2 — APPROVE on `a48cc1e`, no blockers
+
+B1 and B2 are closed. The reviewer executed the real hook, adapters, persistence, timeout and
+report for B1, and both `10**400` payloads for B2. There were no new findings and no
+backlog candidates.
+
+The reviewer noted one limitation: pytest could not start in its read-only sandbox, which has
+no writable temp directory. It therefore did not independently re-run the full `run_once` or
+budget-settlement tests. The gate passed locally on `a48cc1e` at request generation.
+
+After approval, this commit changes only these notes and the backlog row. There is no `src/`
+or test change after the approved commit.
