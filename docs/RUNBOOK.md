@@ -847,7 +847,13 @@ interpreter as the tournament poll.
   record's latest observation is `withheld`. The last line of step 6 counts them
   (`withheld: N`). One is a platform access fact about that question; every resolved record
   reading `withheld` means the account cannot see its own resolutions (step 6).
-- **The Cup profile is not scheduled.** Its ledger is still at schema 13.
+- **The Cup profile has its own pair** (M4-806): `whiskeyjack-resolutions-cup.{service,timer}`,
+  the same two commands against `config/tournament-cup.yaml` and its ledger
+  (`data/cup/ledger.sqlite3`). It runs at 03:23, 09:23, 15:23 and 21:23, three hours out of
+  phase with the MiniBench run. Its push reads `whiskeyjack: whiskeyjack-resolutions-cup failed`,
+  and it is handled exactly as below with `-cup` on the unit name. The Cup's *poll* stays
+  disabled and its activation stays retired; neither command reads an activation. See
+  [the Cup schedule](#the-cup-resolution-schedule) for its one-time ledger upgrade.
 
 When the push arrives:
 
@@ -883,6 +889,51 @@ systemctl --user show whiskeyjack-resolutions.service -p Result -p ExecMainStatu
 systemctl --user enable --now whiskeyjack-resolutions.timer
 systemctl --user list-timers whiskeyjack-resolutions.timer
 ```
+
+#### The Cup resolution schedule
+
+Install it the same way, once the Cup ledger is at the current schema. Its ledger was last
+written at schema 13, and both commands refuse a ledger behind the code (C-series above), so
+upgrade it first, behind a verified backup. The Cup timer and poll are already disabled, so
+nothing else is writing it:
+
+```bash
+cd ~/projects/whiskeyjack-bot
+systemctl --user is-enabled whiskeyjack-tournament-cup.timer        # expect: disabled
+mkdir -p "$HOME/whiskeyjack-backups"
+backup="$HOME/whiskeyjack-backups/cup-pre-init-$(date -u +%Y%m%dT%H%M%SZ).sqlite3"
+if sqlite3 data/cup/ledger.sqlite3 ".backup '$backup'" \
+   && [ "$(sqlite3 "$backup" 'PRAGMA integrity_check')" = ok ] \
+   && .venv/bin/python -m whiskeyjack_bot.cli init-ledger --config config/tournament-cup.yaml; then
+  echo "UPGRADED behind verified backup $backup"
+else
+  echo "STOPPED: no verified backup, or init-ledger failed. Do not install the units." >&2
+fi
+```
+
+The upgrade runs **only** if the backup was written and `integrity_check` printed exactly `ok`
+(`tests/unit/test_deploy_resolutions_unit.py` runs this block with a failing backup and checks
+that `init-ledger` is never reached). Continue only after `UPGRADED`:
+
+```bash
+.venv/bin/python -m whiskeyjack_bot.cli tournament status --config config/tournament-cup.yaml
+                                                                    # still retired / disabled
+cp deploy/systemd/whiskeyjack-resolutions-cup.service deploy/systemd/whiskeyjack-resolutions-cup.timer \
+   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start whiskeyjack-resolutions-cup.service
+systemctl --user show whiskeyjack-resolutions-cup.service -p Result -p ExecMainStatus
+systemctl --user enable --now whiskeyjack-resolutions-cup.timer
+```
+
+`init-ledger` only applies migrations; it does not touch the retired activation. **After any
+later migration merges, run `init-ledger` on the Cup ledger too**, or the Cup unit refuses at its
+next run and pages.
+
+**The watchdog does not watch the Cup timer** (M4-806 Deferred). `deploy/wj-watchdog` checks
+`whiskeyjack-resolutions.timer` only, so a stopped Cup timer goes quiet rather than paging.
+Check `systemctl --user list-timers whiskeyjack-resolutions-cup.timer` when you check the
+MiniBench one.
 
 **Timers are not self-healing, and the watchdog is what now notices** (M1-341). A disabled or
 stopped `whiskeyjack-resolutions.timer` never runs, so it never fails, so the `OnFailure` pager

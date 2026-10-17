@@ -70,7 +70,7 @@ from whiskeyjack_bot.questions.model import (
 )
 from whiskeyjack_bot.submission import SubmissionError, submission_key_for_approved_record
 from whiskeyjack_bot.submission_gateway import canonical_payload_json, payload_sha256
-from whiskeyjack_bot.submission_live import plan_from_payload
+from whiskeyjack_bot.submission_live import continuous_cdf_sha256, plan_from_payload
 from whiskeyjack_bot.submission_payload import (
     BUILDABLE_QUESTION_TYPES,
     AuthorizedPayload,
@@ -813,6 +813,19 @@ def test_the_conversion_record_is_outside_what_an_approval_binds() -> None:
     assert "percentiles_used" not in authorized.canonical
     assert authorized.sha256 == payload_sha256(authorized.payload)
     assert authorized.sha256 == payload_sha256_for_record(record, calibration=CALIBRATION)
+
+
+def test_the_conversion_record_names_the_cdf_its_payload_carries() -> None:
+    """M2-717: the binding is taken from the same ``cdf.values`` the payload's
+    ``continuous_cdf`` is, so the record a real derivation produces always describes its
+    own payload -- and survives the canonical round trip ``submission_live`` checks it
+    against."""
+    authorized = authorized_payload(_tied_numeric_record(), calibration=CALIBRATION)
+    assert authorized.conversion is not None
+    posted = json.loads(authorized.canonical)["continuous_cdf"]
+    assert authorized.conversion["continuous_cdf_points"] == len(posted)
+    assert authorized.conversion["continuous_cdf_sha256"] == continuous_cdf_sha256(posted)
+    assert "continuous_cdf_sha256" not in authorized.canonical
 
 
 def test_only_a_bounded_type_carries_a_conversion_record() -> None:
