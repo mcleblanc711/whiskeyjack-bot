@@ -16811,3 +16811,10 @@ Seven mutants, all killed:
   was parametrized over a configured rate; it survived before);
 - the Exa refusal removed;
 - the explicit-null refusal removed.
+
+### Round 1 — approved
+
+`9d7ba0d`: APPROVE, no blocking findings. The reviewer's one backlog candidate is the deferred
+historical-rate limit already recorded above: *"Preserve historical AskNews pricing for
+back-fill"*, so that held calls made under an earlier rate either settle at that rate or refuse
+an ambiguous conversion. It is not filed yet, because the configured rate has never changed.
