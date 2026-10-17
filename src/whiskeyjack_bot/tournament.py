@@ -723,7 +723,7 @@ def _collect_local_lens(
     poll's ``now`` names, and a ``local_lens_checkpoint`` already written for that ``now`` makes
     a retry within the same window a no-op -- the lens is bought once per bought research.
     """
-    from whiskeyjack_bot.research.lens import run_lens
+    from whiskeyjack_bot.research.lens import LensProgress, run_lens
     from whiskeyjack_bot.research.locales import load_registry
 
     at = now.isoformat()
@@ -737,11 +737,14 @@ def _collect_local_lens(
         "question_id": question.question_id,
         "baseline_run_ids": list(research[-1].get("run_ids", [])),
     }
+    # Owned here, not by run_lens, so what completed before an exception still reaches the
+    # checkpoint (round 1, B1): this is the only checkpoint this research will get.
+    progress = LensProgress(question.question_id)
     try:
         registry = load_registry(config.retrieval.local_lens.registry_path)
         payload["registry_sha256"] = registry.sha256
         with budget_context(budget), phase_timeout(LENS_TIMEOUT_SECONDS):
-            outcome = run_lens(
+            run_lens(
                 conn,
                 config,
                 question=question,
@@ -750,23 +753,8 @@ def _collect_local_lens(
                 baseline_run_ids=payload["baseline_run_ids"],
                 news_client=news_client,
                 web_client=web_client,
+                progress=progress,
             )
-        payload["lens_run_ids"] = list(outcome.retrieval_run_ids)
-        payload["elapsed_seconds"] = outcome.elapsed_seconds
-        payload["calls"] = [
-            {
-                "locale": run.locale_code,
-                "provider": run.provider,
-                "retrieval_run_id": run.retrieval_run_id,
-                "documents": run.documents,
-                "locales": run.locales,
-                "requests": run.calls,
-                "cost_usd": run.cost_usd,
-                "provider_failed": run.provider_failed,
-                "skipped": run.skipped,
-            }
-            for run in outcome.runs
-        ]
     except Exception as exc:
         payload["error_type"] = type(exc).__name__
         _LOGGER.warning(
@@ -774,6 +762,24 @@ def _collect_local_lens(
             question.question_id,
             type(exc).__name__,
         )
+    outcome = progress.outcome()
+    payload["lens_run_ids"] = list(outcome.retrieval_run_ids)
+    payload["elapsed_seconds"] = outcome.elapsed_seconds
+    payload["calls"] = [
+        {
+            "locale": run.locale_code,
+            "provider": run.provider,
+            "retrieval_run_id": run.retrieval_run_id,
+            "documents": run.documents,
+            "locales": run.locales,
+            "requests": run.calls,
+            "cost_usd": run.cost_usd,
+            "provider_failed": run.provider_failed,
+            "skipped": run.skipped,
+            "interrupted": run.interrupted,
+        }
+        for run in outcome.runs
+    ]
     try:
         append(conn, "local_lens_checkpoint", fingerprint, payload)
     except Exception as exc:

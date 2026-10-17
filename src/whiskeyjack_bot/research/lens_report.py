@@ -103,6 +103,22 @@ def _checkpoints(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return found
 
 
+def _amount(value: object) -> float | None:
+    """A non-negative finite number read back from a checkpoint, else ``None``.
+
+    Checkpoint values are untrusted ledger reads. ``bool`` is excluded (it is an ``int``), and
+    an ``int`` too large for a float is ``None`` rather than an ``OverflowError`` escaping the
+    report's error contract (round 1, B2).
+    """
+    if type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
 def _id_list(value: object) -> list[str]:
     if not isinstance(value, list) or any(type(item) is not str for item in value):
         raise LensReportError("a lens checkpoint names its runs in an unexpected shape")
@@ -160,12 +176,15 @@ def _summarize(conn: sqlite3.Connection, event: dict[str, Any]) -> QuestionLens:
     cost = 0.0
     unknown = 0
     for call in calls:
-        value = call.get("cost_usd")
-        if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+        value = _amount(call.get("cost_usd"))
+        if value is not None:
             cost += value
-        elif type(call.get("requests")) is int and call["requests"] > 0:
+        elif call.get("interrupted") is True or (
+            type(call.get("requests")) is int and call["requests"] > 0
+        ):
+            # Made requests, or was cut off mid-call (round 1, B1): billed or not, unknown.
             unknown += 1
-    elapsed = event.get("elapsed_seconds")
+    elapsed = _amount(event.get("elapsed_seconds"))
     error = event.get("error_type")
     return QuestionLens(
         question_id=question_id,
@@ -176,7 +195,7 @@ def _summarize(conn: sqlite3.Connection, event: dict[str, Any]) -> QuestionLens:
         requests=requests,
         cost_usd=round(cost, 6),
         cost_unknown_calls=unknown,
-        elapsed_seconds=float(elapsed) if isinstance(elapsed, (int, float)) else None,
+        elapsed_seconds=elapsed,
         lens_documents=len(lens),
         origins=dict(sorted(origins.items())),
         overlap=dict(sorted(Counter(verdicts.values()).items())),

@@ -49,7 +49,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -112,17 +112,23 @@ class LensCall:
 
 @dataclass(frozen=True)
 class LensRun:
-    """One lens call as it happened. ``skipped`` names why a planned call was not made."""
+    """One lens call as it happened. ``skipped`` names why a planned call was not made.
+
+    ``interrupted`` marks a call whose run was opened but which did not finish -- the lens's
+    time bound, or any other failure, landed during it. Whether its request was sent, and so
+    billed, is unknown: ``calls`` and ``cost_usd`` are ``None``, never a guessed zero.
+    """
 
     locale_code: str
     provider: LensProvider
     retrieval_run_id: str | None
     documents: int
     locales: int
-    calls: int
+    calls: int | None
     cost_usd: float | None
     provider_failed: bool
     skipped: str | None = None
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,37 @@ class LensOutcome:
     @property
     def retrieval_run_ids(self) -> tuple[str, ...]:
         return tuple(run.retrieval_run_id for run in self.runs if run.retrieval_run_id)
+
+
+@dataclass
+class LensProgress:
+    """What :func:`run_lens` has done so far, kept by the caller (round 1, B1).
+
+    Mutable on purpose: it is the one object that survives an exception out of ``run_lens``.
+    A call that completed and settled must reach the checkpoint even when a later call is cut
+    off by the time bound -- the checkpoint is written once per research, so a summary lost
+    here is lost for good. :meth:`outcome` is what the lens did, in plan order, with the
+    in-flight call (if any) last and marked ``interrupted``.
+    """
+
+    question_id: int
+    started: float = field(default_factory=time.monotonic)
+    runs: list[LensRun] = field(default_factory=list)
+    in_flight: LensRun | None = None
+
+    def outcome(self) -> LensOutcome:
+        runs = list(self.runs)
+        # A signal can land between recording a finished call and clearing `in_flight`; the
+        # finished record wins, so a call is never listed twice.
+        if self.in_flight is not None and all(
+            run.retrieval_run_id != self.in_flight.retrieval_run_id for run in runs
+        ):
+            runs.append(self.in_flight)
+        return LensOutcome(
+            question_id=self.question_id,
+            runs=tuple(runs),
+            elapsed_seconds=round(time.monotonic() - self.started, 3),
+        )
 
 
 def _bare_hosts(domains: Sequence[str]) -> tuple[str, ...]:
@@ -371,6 +408,7 @@ def run_lens(
     baseline_run_ids: Sequence[str],
     news_client: Any | None,
     web_client: Any | None,
+    progress: LensProgress | None = None,
 ) -> LensOutcome:
     """Buy and record every planned lens call for ``question``.
 
@@ -378,10 +416,13 @@ def run_lens(
     not raised. A provider failure is the adapter's to record on its run, as on the baseline
     path. Each call's run row is opened before its billable request, so a process that dies
     mid-call still leaves the spend on the ledger.
+
+    ``progress``, when given, is updated as each call opens and finishes, so a caller that
+    catches an exception out of here still knows what completed (round 1, B1).
     """
-    started = time.monotonic()
+    progress = progress if progress is not None else LensProgress(question.question_id)
     calls = plan(question, registry, max_calls=config.retrieval.local_lens.max_calls_per_question)
-    results: list[LensRun] = []
+    results = progress.runs
     for call in calls:
         entry = registry.get(call.locale_code)
         if entry is None:  # unreachable: plan() only names registry locales
@@ -395,6 +436,11 @@ def run_lens(
         run_id = _RUN_ID_PREFIX + uuid.uuid4().hex
         record = lens_record(call, entry, registry, baseline_run_ids)
         open_run(conn, _opening(run_id, question.question_id, call.provider, now))
+        # Set only once the run row exists, so an interrupted call never names a run the
+        # report cannot load.
+        progress.in_flight = LensRun(
+            call.locale_code, call.provider, run_id, 0, 0, None, None, False, interrupted=True
+        )
         if call.provider == "asknews":
             news = retrieve_news(
                 client,
@@ -448,8 +494,5 @@ def run_lens(
                 provider_failed=failed,
             )
         )
-    return LensOutcome(
-        question_id=question.question_id,
-        runs=tuple(results),
-        elapsed_seconds=round(time.monotonic() - started, 3),
-    )
+        progress.in_flight = None
+    return progress.outcome()

@@ -28,6 +28,8 @@ from whiskeyjack_bot.research.lens import (
     LENS_RECORD_KEYS,
     LensCall,
     LensError,
+    LensProgress,
+    LensRun,
     asknews_cost_usd,
     locale_rows,
     plan,
@@ -641,3 +643,61 @@ def test_a_number_too_large_for_a_float_is_ignored_not_raised(
         conn.close()
     assert summary.cost_usd == 0.0 and summary.elapsed_seconds is None
     assert summary.cost_unknown_calls == len(payload.get("calls", []))  # type: ignore[arg-type]
+
+
+def _enabled(config: AppConfig) -> AppConfig:
+    lens = config.retrieval.local_lens.model_copy(update={"enabled": True})
+    return config.model_copy(
+        update={"retrieval": config.retrieval.model_copy(update={"local_lens": lens})}
+    )
+
+
+def test_progress_never_lists_a_finished_call_twice() -> None:
+    """The time bound can land after a finished call is recorded but before `in_flight` is
+    cleared; the finished record wins (round 1, B1)."""
+    done = LensRun("IR", "exa", "run-a", 1, 1, 1, 0.007, False)
+    progress = LensProgress(4242, runs=[done])
+    progress.in_flight = LensRun("IR", "exa", "run-a", 0, 0, None, None, False, interrupted=True)
+    assert progress.outcome().runs == (done,)
+    other = LensRun("AE", "asknews", "run-b", 0, 0, None, None, False, interrupted=True)
+    progress.in_flight = other
+    assert progress.outcome().runs == (done, other)
+
+
+def test_a_call_whose_run_never_opened_is_not_named_as_interrupted(
+    config: AppConfig, ledger: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger failure opening the second run (a reachable local I/O condition) leaves the
+    first call recorded and names no run that does not exist, so the report can load every
+    run the checkpoint names."""
+    from whiskeyjack_bot.research import lens as lens_module
+    from whiskeyjack_bot.research.store import StoreError
+
+    real_open = lens_module.open_run
+    opened: list[str] = []
+
+    def failing_second(conn: sqlite3.Connection, run: Any) -> None:
+        if opened:
+            raise StoreError("the ledger refused the write")
+        opened.append(run.retrieval_run_id)
+        real_open(conn, run)
+
+    monkeypatch.setattr(lens_module, "open_run", failing_second)
+    progress = LensProgress(4242)
+    with pytest.raises(StoreError):
+        run_lens(
+            ledger,
+            _enabled(config),
+            question=_question(criteria="per Oman's maritime authority"),
+            now=NOW,
+            registry=_registry(),
+            baseline_run_ids=["run-baseline"],
+            news_client=_news(),
+            web_client=_exa_client(_Exa()),
+            progress=progress,
+        )
+    outcome = progress.outcome()
+    assert [(run.locale_code, run.interrupted) for run in outcome.runs] == [("IR", False)]
+    assert outcome.retrieval_run_ids == tuple(opened)
+    for run_id in outcome.retrieval_run_ids:
+        load_run(ledger, run_id)  # every named run exists
