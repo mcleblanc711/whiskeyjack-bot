@@ -6,6 +6,7 @@ import fcntl
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -708,7 +709,7 @@ def _collect_local_lens(
     fingerprint: str,
     news_client: Any | None,
     web_client: Any | None,
-) -> None:
+) -> tuple[str, dict[str, Any]] | None:
     """Run the local-source lens once for the research this poll bought (M1-358, D53).
 
     **Collect-only, and never fatal.** It runs after the question's forecast, approval and
@@ -722,6 +723,10 @@ def _collect_local_lens(
     **Once per research checkpoint.** The lens is due only for the ``research_checkpoint`` this
     poll's ``now`` names, and a ``local_lens_checkpoint`` already written for that ``now`` makes
     a retry within the same window a no-op -- the lens is bought once per bought research.
+
+    Returns the checkpoint's journal event id and payload when this call wrote one, for the
+    shadow arm (M1-359) to read; ``None`` when the lens was not due or the checkpoint could
+    not be recorded -- a shadow is never built on lens runs the journal does not name.
     """
     from whiskeyjack_bot.research.lens import LensProgress, run_lens
     from whiskeyjack_bot.research.locales import load_registry
@@ -729,9 +734,9 @@ def _collect_local_lens(
     at = now.isoformat()
     research = [e for e in events(conn, "research_checkpoint", fingerprint) if e.get("at") == at]
     if not research:
-        return
+        return None
     if any(e.get("at") == at for e in events(conn, "local_lens_checkpoint", fingerprint)):
-        return
+        return None
     payload: dict[str, Any] = {
         "at": at,
         "question_id": question.question_id,
@@ -781,9 +786,88 @@ def _collect_local_lens(
         for run in outcome.runs
     ]
     try:
-        append(conn, "local_lens_checkpoint", fingerprint, payload)
+        return append(conn, "local_lens_checkpoint", fingerprint, payload), payload
     except Exception as exc:
         _LOGGER.warning("local-source lens checkpoint not recorded (%s)", type(exc).__name__)
+        return None
+
+
+# Wall-clock bound for the shadow arm's model call (M1-359): its own phase, after the lens's,
+# for the lens's reason -- `phase_timeout` cannot nest, and the shadow must never eat the
+# control's time. Two attempts at the model's own timeout plus the numeric conversion.
+SHADOW_TIMEOUT_SECONDS: Final = 300
+
+
+def _collect_shadow_forecast(
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    *,
+    budget: Budget,
+    question: CanonicalQuestion,
+    tournament_id: str,
+    now: datetime,
+    fingerprint: str,
+    control_record_id: str,
+    lens: tuple[str, dict[str, Any]],
+    forecaster: Any,
+) -> None:
+    """Generate the shadow forecast for the lens checkpoint just written (M1-359, D53).
+
+    **Never fatal, and never the control's.** It runs only after the control was recorded in
+    this poll and the lens wrote its checkpoint, outside the question's ``try``, under the same
+    budget and its own time bound. Every exception -- the prompt missing, a refused
+    reservation, ``ModelOutcomeUnknown``, the time bound, a ledger refusal -- is logged and
+    recorded by class on a ``shadow_forecast_checkpoint`` event, and the question loop goes on.
+
+    **Once per lens checkpoint, success or not.** The lens returns a checkpoint only when it
+    wrote one, which is once per bought research, so a failed shadow is not bought again on
+    the next poll; 020's UNIQUE ``local_lens_checkpoint_id`` holds the same line in the ledger.
+    """
+    from whiskeyjack_bot.forecast.shadow import SHADOW_CHECKPOINT_KIND, run_shadow_forecast
+
+    lens_checkpoint_id, lens_checkpoint = lens
+    payload: dict[str, Any] = {
+        "at": now.isoformat(),
+        "question_id": question.question_id,
+        "control_record_id": control_record_id,
+        "local_lens_checkpoint_id": lens_checkpoint_id,
+    }
+    started = time.monotonic()
+    try:
+        with budget_context(budget), phase_timeout(SHADOW_TIMEOUT_SECONDS):
+            result = run_shadow_forecast(
+                conn,
+                config,
+                question=question,
+                tournament_id=tournament_id,
+                now=now,
+                control_record_id=control_record_id,
+                lens_checkpoint_id=lens_checkpoint_id,
+                lens_checkpoint=lens_checkpoint,
+                forecaster=forecaster,
+            )
+    except Exception as exc:
+        payload["error_type"] = type(exc).__name__
+        _LOGGER.warning(
+            "shadow forecast failed for question %d (%s); the forecast is unaffected",
+            question.question_id,
+            type(exc).__name__,
+        )
+    else:
+        payload.update(
+            outcome=result.outcome,
+            shadow_forecast_id=result.shadow_forecast_id,
+            retrieval_run_ids=list(result.retrieval_run_ids),
+            lens_documents=result.lens_documents,
+            failure_code=result.failure_code,
+            cost_usd=result.cost_usd,
+            model_invocations=result.model_invocations,
+        )
+    payload["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    try:
+        append(conn, SHADOW_CHECKPOINT_KIND, fingerprint, payload)
+    except Exception as exc:
+        _LOGGER.warning("shadow forecast checkpoint not recorded (%s)", type(exc).__name__)
 
 
 def run_once(
@@ -1041,6 +1125,10 @@ def run_once(
             # The checkpoint window this attempt runs in, once one is established below;
             # None on the recovery path, which buys nothing and so is never paced.
             window_start: datetime | None = None
+            # M1-359: the control recorded in *this* poll, which is the only forecast a shadow
+            # may be paired with. A record found on the recovery path was not made from the
+            # research the lens follows.
+            shadow_control: str | None = None
             try:
                 require_activation(conn, config, account_id=account, project_id=project)
                 if existing:
@@ -1141,6 +1229,7 @@ def run_once(
                     if outcome.status != "recorded" or outcome.record_id is None:
                         raise TournamentError(_failed_outcome_reason(outcome))
                     record_id = outcome.record_id
+                    shadow_control = record_id
                 record = read_forecast_record(conn, record_id)
                 if record.question != question:
                     raise TournamentError("saved forecast has changed question inputs")
@@ -1212,7 +1301,7 @@ def run_once(
                 # question failure, and nothing the lens does may be recorded as one. Whether
                 # this poll bought research the lens may follow is _collect_local_lens's
                 # question: only a research checkpoint at this poll's `now` qualifies.
-                _collect_local_lens(
+                lens = _collect_local_lens(
                     conn,
                     config,
                     budget=budget,
@@ -1222,6 +1311,23 @@ def run_once(
                     news_client=clients[1],
                     web_client=clients[2],
                 )
+                if (
+                    lens is not None
+                    and shadow_control is not None
+                    and config.retrieval.local_lens.shadow.enabled
+                ):
+                    _collect_shadow_forecast(
+                        conn,
+                        config,
+                        budget=budget,
+                        question=question,
+                        tournament_id=project,
+                        now=now,
+                        fingerprint=fingerprint,
+                        control_record_id=shadow_control,
+                        lens=lens,
+                        forecaster=clients[0],
+                    )
             heartbeat["at"] = utcnow().isoformat()
             append(conn, "heartbeat", "worker", heartbeat)
         heartbeat["complete"] = True

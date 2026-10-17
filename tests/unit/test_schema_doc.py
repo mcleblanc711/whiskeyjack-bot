@@ -158,7 +158,7 @@ def test_every_table_and_column_is_documented_and_nothing_else(fresh_ledger: Pat
             assert definition, (table, column)
             documented.add((table, _code(column), declared))
     assert documented == actual
-    assert len(actual) == 181  # the count is a witness that both sides are non-trivial
+    assert len(actual) == 197  # the count is a witness that both sides are non-trivial
 
 
 def test_each_since_is_the_migration_that_introduced_it(
@@ -185,7 +185,7 @@ def test_each_since_is_the_migration_that_introduced_it(
             for column in columns:
                 first_column.setdefault((table, column), version)
     # Witness that the replay really stepped: tables and columns arrive at many versions.
-    assert len(first_table) == 16 and len(set(first_column.values())) >= 8
+    assert len(first_table) == 17 and len(set(first_column.values())) >= 8
 
     documented_tables = _documented_tables()
     assert {table: int(since) for table, (since, _, _) in documented_tables.items()} == first_table

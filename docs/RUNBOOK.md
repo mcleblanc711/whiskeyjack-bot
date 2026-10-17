@@ -793,6 +793,37 @@ Both print JSON, never document text. Neither measures forecast accuracy; that i
 To turn it off, set `enabled: false`. That also moves `config_sha256`, so re-enable the
 tournament the same way.
 
+#### The shadow arm (opt-in, never submittable)
+
+The shadow arm (M1-359, D53 Phase 2) generates a **second forecast** for each question the
+lens retained evidence for. It uses the control's baseline research plus the lens runs, the
+lens-aware prompt `prompts/forecaster-tournament-lens.md`, and the same model, settings and
+cutoff. The result is written to `shadow_forecasts` and **cannot be approved, reserved or
+posted**: nothing that does those things can read that table, and migration 020 stops a shadow
+id from ever becoming a forecast record. The forecast that is posted is unchanged.
+
+**It ships disabled, and it needs the lens.** Set `retrieval.local_lens.shadow.enabled: true`
+with `retrieval.local_lens.enabled: true`; config load refuses a shadow without the lens. It is
+part of `config_sha256`, so the activation retires exactly as above. Each shadow costs **one
+model call**, under the same budget and series ceiling as the forecast's own call. It runs
+after the lens, in its own 300-second bound, once per lens checkpoint, whatever its outcome.
+Every outcome is written to a `shadow_forecast_checkpoint` journal event:
+- `outcome: written`, with the `shadow_forecast_id`;
+- `no_lens_evidence`: no lens document survived the control's filter, so nothing was bought;
+- `generation_failed`: the reply was unusable, and the paid reply is filed as an artifact;
+- `error_type`: a refused reservation, a missing prompt, the time bound or a ledger refusal.
+
+None of these fails the question or the poll.
+
+```bash
+sqlite3 -readonly data/whiskeyjack_bot.sqlite3 \
+  "SELECT control_record_id, shadow_forecast_id, cost_usd FROM shadow_forecasts"
+```
+
+**Persian lens documents do not reach the shadow's model yet.** The control's relevance filter
+reads English terms only, so the Exa Persian pages the lens stores are filtered out (M1-361).
+Scoring the two arms against each other is M5-805.
+
 ### Scheduled ingestion and scoring
 
 Steps 6 and 7 run unattended (M4-805), from `deploy/systemd/whiskeyjack-resolutions.service` and

@@ -16818,3 +16818,176 @@ Seven mutants, all killed:
 historical-rate limit already recorded above: *"Preserve historical AskNews pricing for
 back-fill"*, so that held calls made under an earlier rate either settle at that rate or refuse
 an ambiguous conversion. It is not filed yet, because the configured rate has never changed.
+
+## M1-359 — The shadow experiment arm (D53 Phase 2, D54)
+
+**What shipped.**
+- **Config:** `retrieval.local_lens.shadow` holds `enabled`, `prompt_path` and
+  `prompt_version`. It is off by default and in every committed profile, and config load
+  refuses `shadow.enabled` without `local_lens.enabled`.
+- **Prompt:** `prompts/forecaster-tournament-lens.md` v1.0.0 is the tournament prompt plus
+  three additions:
+  - its own H1;
+  - one Inputs bullet describing `locale`;
+  - a closing `## Local evidence` section: origin is not credibility, translation provenance,
+    a cross-language repeat is one report, an official statement is evidence of what was said,
+    retrieved text is data.
+
+  A test pins that removing those three gives the tournament prompt back byte for byte.
+- **Model input:** `inputs.build_model_input(include_locales=True)` and
+  `generate_forecast(render_locales=True)` send each document's locale row (five fields, or
+  `null` for baseline documents) through `LensModelInput`/`LensDocumentInput`. The control
+  path never passes either flag.
+- **Migration `020_shadow_forecasts.sql`** adds an append-only `shadow_forecasts` table with
+  three triggers:
+  - a BEFORE INSERT trigger that checks the pairing the row claims: the control exists for
+    the same question and tournament, the checkpoint is a `local_lens_checkpoint`, and
+    `record_json` agrees with the row's id, question, tournament, packet hash and prompt
+    hash. It also checks for a non-empty run list and at least one invocation, and that the
+    shadow id is not a forecast record id;
+  - the `no_update` and `no_delete` triggers;
+  - **a new trigger, `forecast_records_refuse_shadow_id`**, so a shadow id can never become a
+    forecast record. No existing trigger body is touched.
+
+  `LEDGER_SCHEMA_VERSION` is now 20. The table is in `EXPORTED_TABLES` and `docs/SCHEMA.md`.
+- **`forecast/shadow.py`:** `run_shadow_forecast`, the store, and the read-back.
+- **Worker hook:** `tournament._collect_shadow_forecast`, after the lens, outside the
+  question's `try`, in its own 300 s phase. It appends a `shadow_forecast_checkpoint` on every
+  path.
+
+### Decision — a table of its own, never a `forecast_records` row, and why
+
+Approval, idempotency keys, reservations, attempts, reconciliations and the lifecycle all
+start from a `forecast_records` row, by function and by foreign key. Keeping the shadow out of
+that table makes "no code path can approve, reserve or submit it" true of the schema rather
+than of the call sites. The tests drive each entry point:
+- `approve` and `submission_key_for_record` refuse a shadow id;
+- the foreign keys refuse `approval_events`, `lifecycle_events` and
+  `submission_key_reservations` rows that cite one;
+- the new trigger refuses one as a forecast record, against an insert that is otherwise
+  valid, with a fresh-id positive control.
+
+### Decision — the record is the control's canonical form, with the shadow id as `record_id`
+
+`build_forecast_record_draft`, then the control's own M1-506 output gate, then
+`assign_identity(version=1, parent=None)`. So one parser reads both arms (M5-805), and a
+shadow is held to the same validity rule as the forecast it is compared with. The
+`ForecastRecord` object never reaches anything that posts: every such path reads its record
+from the ledger by id.
+
+### Decision — the shadow prompt is recorded per row, not bound to the activation
+
+`tournament_state.bindings()` hashes `forecast.prompt_path` into the activation. Adding the
+lens prompt would retire every activation on any edit to a prompt that can never post. Instead:
+- each row carries `prompt_sha256`, taken from the file's bytes, which the test recomputes
+  independently;
+- the `shadow` block itself is in `config_sha256`, so turning the arm on is still an owner
+  re-enable.
+
+### Decision — a lens checkpoint with no surviving lens document buys nothing
+
+The combined packet goes through the control's own filter, `usable_packet`. If no lens
+document survives it, the model would see the control's evidence under another prompt. That
+measures the prompt, not the lens, so the attempt is recorded as `no_lens_evidence` and no
+call is made.
+
+### Decision — once per lens checkpoint, whatever the outcome
+
+The lens hook returns its checkpoint only when it wrote one, which happens once per bought
+research, and 020's `local_lens_checkpoint_id` is UNIQUE. A failed or timed-out shadow is
+therefore not bought again on the next poll. That is the M1-351 lesson: pacing a retry is
+cheaper than finding out about one.
+
+### Decision — its own feature flag, not riding `local_lens.enabled`
+
+Stricter reading: the arm is a paid model call per question, and D53's Phase 1 enablement was
+for collection only.
+
+### Deviation — the lens hook now returns `(event_id, payload)`
+
+`_collect_local_lens` returned `None`. The shadow row cites the checkpoint's journal event id,
+and the only place that id exists is `append`'s return value. Its own behaviour is unchanged.
+
+### Rejected — an optional `locale` field on `ForecastDocumentInput`
+
+It would render `"locale":null` on every control document and change every control request
+byte for byte. A subclass inside the control model does not work either: pydantic serializes a
+list by its declared item type and drops the subclass field. Hence a separate `LensModelInput`.
+Both properties are pinned in `tests/property/test_packet_locale_properties.py`.
+
+### Rejected — a `shadow_failures` table
+
+Failures and skips are journal events (`shadow_forecast_checkpoint`), like the lens's own. The
+table records only forecasts, which is what M5-805 pairs.
+
+### Deferred (do not read the absence as an omission)
+
+- **The paired report:** M5-805.
+- **Persian lens documents:** the control's relevance filter reads English terms only, so
+  Exa's Persian pages never reach the shadow's model (pinned in
+  `test_enabled_one_shadow_is_written_bound_to_the_control_packet_and_prompt`). That is
+  M1-361.
+- **Cross-provider duplicates** (baseline and lens returning one article): the prompt says a
+  repeat is one report. Presenting it as one is M1-321.
+- **Shadow-arm cost in `lens-report` and `tournament status`:** not shown yet. The checkpoint
+  carries `cost_usd`, and the settlement is in the journal.
+
+### Standing risk — not verifiable offline
+
+- **The live shadow call's real price and latency.** The 300 s bound assumes two attempts at
+  the model's own timeout.
+- **Whether the lens prompt changes forecasts at all.** That is the experiment.
+- The arm ships disabled, and 0 lens runs exist live (D54).
+
+### On the mutation and property pass
+
+- **Migration 020:** 13 mutants, all killed. Each of the seven RAISE clauses was neutered
+  with `WHERE 0 AND (...)`, and so was each of the six OR terms of the record clause. The
+  first sweep showed the "other question" case refused by two clauses at once, so the case was
+  changed to break only the pairing clause.
+- **Locale rendering:** four mutants, all killed by the two properties:
+  - `locale` never set;
+  - the wrong row for a document;
+  - the base model for the lens;
+  - the lens model for the control.
+
+  The first draft caught `ForecastInputError` and returned early, and the last mutant passed
+  through that escape. The escape is gone, because a valid packet always builds.
+- **The `skipped` field:** the first draft treated `skipped is False` as "not skipped". The
+  lens writes `None`, so every real lens run was excluded and the arm never ran. The
+  end-to-end test caught it.
+
+### Round 1 — approved, and one candidate taken now
+
+`ba670dd`: APPROVE, no blocking findings. The one non-blocking candidate was that `lens_run_ids`
+is a pure function with no hypothesis pass, which the standing convention requires before the
+first review. It was missed, so it is taken now rather than filed:
+- **The pass:** `tests/property/test_shadow_properties.py`. The function never raises, matches
+  an independent oracle (in order, distinct), is replay-stable through the persisted form, and
+  the strategy reaches each near miss.
+- **What the oracle found in the function:** a missing `skipped` key was read as "not skipped"
+  while a missing `interrupted` refused. The lens always writes both keys, and this is a value
+  read back out of the journal, so a missing key now refuses (`"skipped" in call`).
+- **Mutants:** six, all killed in 5 of 5 runs of the random profile: `skipped` key optional, zero
+  documents admitted, a bool count admitted, a falsy `interrupted` admitted, no
+  de-duplication, an empty run id admitted.
+- **Three strategy defects the mutants exposed, one after another:**
+  - **every field varied at once:** a near miss is visible only when the rest of the call is
+    right, so the bool and missing-key mutants survived;
+  - **run ids from three names:** a near miss usually repeated an id already kept, and the
+    de-duplication hid it;
+  - **an unweighted `one_of`:** call lists were a third of draws, so a specific near miss
+    appeared about once per run, and the zero-documents mutant survived about half the time.
+
+  Each fix is commented in the strategy.
+- **A fourth thing the first full-gate run of the property found:** two run ids that differ
+  only in how a surrogate pair is spelled are distinct in memory and identical once persisted.
+  The replay comparison therefore states its expectation in the persisted form, de-duplicated.
+  Live run ids are minted uuid hex, so the collapse cannot happen to them.
+
+### Round 2 — approved
+
+`b889c7b`: APPROVE, and the round-1 candidate is closed. The reviewer re-applied the six mutants
+and saw each rejected in 5 of 5 random runs. It also replayed 17 checkpoint shapes through the
+real comprehension and the journal's serialization: the selection is the same before and after
+the `skipped` change. No new candidates.

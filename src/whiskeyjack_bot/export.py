@@ -22,7 +22,7 @@ contract**, and three consequences follow that a dump would not have:
   type, a non-finite REAL, a BLOB, or text that is not valid UTF-8 is refused with an
   :class:`ExportError` rather than repaired into something that would no longer round-trip.
 
-**All sixteen tables are exported, and none is excluded.** ``schema_migrations`` is in
+**All seventeen tables are exported, and none is excluded.** ``schema_migrations`` is in
 deliberately: it is what lets a consumer tell which schema produced the files it is
 holding. The joined per-forecast view that ``lifecycle.py`` and ``forecast/record.py``
 anticipate "at read/export time" is **not** here: assembling one record with its history
@@ -116,7 +116,7 @@ class TableSpec:
 
     ``identifier`` is the single-column primary key, and it does double duty: it is the
     ``ORDER BY`` that makes the export byte-deterministic, and it is the key the acceptance
-    criterion's set-equality check compares. All sixteen tables have one, so no table
+    criterion's set-equality check compares. All seventeen tables have one, so no table
     needs a composite or a synthetic ordering.
     """
 
@@ -354,6 +354,29 @@ EXPORTED_TABLES: Final[tuple[TableSpec, ...]] = (
             Column("comparison_baseline", "TEXT"),
             Column("computed_at_utc", "TEXT"),
             Column("resolution_event_id", "INTEGER"),
+        ),
+    ),
+    TableSpec(
+        name="shadow_forecasts",
+        identifier="shadow_forecast_id",
+        columns=(
+            # 020_shadow_forecasts.sql
+            Column("shadow_forecast_id", "TEXT"),
+            Column("control_record_id", "TEXT"),
+            Column("question_id", "INTEGER"),
+            Column("tournament_id", "TEXT"),
+            Column("local_lens_checkpoint_id", "TEXT"),
+            Column("research_packet_sha256", "TEXT"),
+            Column("packet_schema_version", "TEXT"),
+            Column("retrieval_run_ids_json", "TEXT"),
+            Column("prompt_version", "TEXT"),
+            Column("prompt_sha256", "TEXT"),
+            Column("record_json", "TEXT"),
+            Column("record_sha256", "TEXT"),
+            Column("raw_output_path", "TEXT"),
+            Column("cost_usd", "REAL"),
+            Column("model_invocations", "INTEGER"),
+            Column("created_at_utc", "TEXT"),
         ),
     ),
     TableSpec(

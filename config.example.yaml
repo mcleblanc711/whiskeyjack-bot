@@ -73,6 +73,13 @@ retrieval:
     enabled: false
     registry_path: config/locales.yaml
     max_calls_per_question: 2
+    # Shadow experiment arm (M1-359, D53 Phase 2): a second, never-submittable forecast from
+    # baseline plus lens evidence, with the lens-aware prompt. One paid model call per question
+    # the lens retained evidence for; requires local_lens.enabled. Part of config_sha256.
+    shadow:
+      enabled: false
+      prompt_path: prompts/forecaster-tournament-lens.md
+      prompt_version: "1.0.0"
 forecast:
   supported_question_types:
     - "binary"

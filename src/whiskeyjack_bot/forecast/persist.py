@@ -199,6 +199,33 @@ def persist_raw_output(
     )
 
 
+def write_generation_artifact(
+    config: AppConfig,
+    *,
+    attempt_id: str,
+    question_id: int,
+    generation: ForecastGeneration,
+    written_at: datetime,
+) -> str | None:
+    """The artifact half alone, for a reply whose row is not a ``forecast_records`` row.
+
+    M1-359's shadow arm: its forecast is stored in ``shadow_forecasts``, so neither
+    :func:`persist_generation` (which appends a forecast version) nor
+    :func:`persist_raw_output` (which refuses a successful generation) fits. Same writer, same
+    path layout, same degrade-not-raise rule: an artifact failure returns ``None`` and is
+    logged, because the spend has happened. Returns the relative path, or ``None``.
+    """
+    _require_generation(generation)
+    path, _outcome, _error = _write_artifact(
+        config,
+        attempt_id=attempt_id,
+        question_id=question_id,
+        generation=generation,
+        written_at=written_at,
+    )
+    return path
+
+
 def persist_generation(
     conn: sqlite3.Connection,
     config: AppConfig,

@@ -3,7 +3,7 @@
 The acceptance criterion is *"Exports round-trip record IDs/counts and never mutate
 SQLite"*, and both halves are stricter than they read:
 
-- **Round-trip** is set equality of primary identifiers, per table, for all sixteen --
+- **Round-trip** is set equality of primary identifiers, per table, for all seventeen --
   not a count, and not a one-sided subset. A one-sided check passes on an export that
   drops rows, which is the vacuity M1-501 lost a round to. It is also worth nothing on an
   empty table, so `test_the_seed_reaches_every_table` refuses to let that pass unnoticed.
@@ -61,7 +61,7 @@ FAKE_SECRET = "privateFAKE123456"
 
 
 def _seed_every_table(conn: sqlite3.Connection) -> None:
-    """Write at least one row into each of the sixteen exported tables.
+    """Write at least one row into each of the seventeen exported tables.
 
     Raw SQL rather than the production writers, and deliberately: the point here is the
     *schema's* full surface, including tables whose writers are still Not Started
@@ -166,6 +166,36 @@ def _seed_every_table(conn: sqlite3.Connection) -> None:
         "INSERT INTO tournament_events (event_id, kind, scope, data, created_at_utc) "
         "VALUES ('tev-1', 'heartbeat', 'minibench', ?, ?)",
         ('{"polled": 3}', TS),
+    )
+    # 020 (M1-359): a shadow forecast, paired with `rec-1` and citing a lens checkpoint. The
+    # validation trigger reads these four record fields, so the JSON carries them.
+    conn.execute(
+        "INSERT INTO tournament_events (event_id, kind, scope, data, created_at_utc) "
+        "VALUES ('tev-lens', 'local_lens_checkpoint', 'fp-1', ?, ?)",
+        ('{"at": "2026-08-01T00:00:00+00:00"}', TS),
+    )
+    conn.execute(
+        "INSERT INTO shadow_forecasts (shadow_forecast_id, control_record_id, question_id, "
+        "tournament_id, local_lens_checkpoint_id, research_packet_sha256, "
+        "packet_schema_version, retrieval_run_ids_json, prompt_version, prompt_sha256, "
+        "record_json, record_sha256, raw_output_path, cost_usd, model_invocations, "
+        "created_at_utc) VALUES ('shadow-1', 'rec-1', 100, 'minibench', 'tev-lens', ?, "
+        "'1.1.0', '[\"run-1\"]', '1.0.0', ?, ?, ?, NULL, 0.01, 1, ?)",
+        (
+            SHA,
+            SHA,
+            json.dumps(
+                {
+                    "record_id": "shadow-1",
+                    "question_id": 100,
+                    "tournament_id": "minibench",
+                    "research_packet_sha256": SHA,
+                    "model_settings": {"prompt_sha256": SHA},
+                }
+            ),
+            SHA,
+            TS,
+        ),
     )
     # 016 (M2-713): a reconciliation belongs to a post the ledger never recorded, so it needs
     # a second record on a question `rec-1`'s attempt does not hold (012's whole-question guard).
@@ -295,7 +325,7 @@ def test_the_hand_written_spec_matches_the_schema_column_by_column(ledger_path: 
 def test_the_export_round_trips_every_identifier_in_every_table(
     ledger_path: Path, tmp_path: Path, export_format: str
 ) -> None:
-    """Set equality per table, both directions, for all sixteen.
+    """Set equality per table, both directions, for all seventeen.
 
     Equality rather than `<=` or `>=`: a subset check passes on an export that drops rows
     and a superset check passes on one that invents them, and the criterion means neither.
