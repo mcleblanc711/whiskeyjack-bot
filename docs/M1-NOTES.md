@@ -16468,3 +16468,217 @@ B1 closed. One non-blocking observation, taken after approval as a **test-only**
 real-SQLite property caught every exception from `validate_locale`. It now catches only
 `ResearchSchemaError`, so an unexpected failure fails the property instead of passing it. No
 `src/` change follows the approved commit.
+
+## M1-358 (D53) — The local-source lens in the tournament worker, collect-only
+
+### What shipped
+
+- **`config.py`.** `retrieval.local_lens` (`LocalLensConfig`): `enabled` (default `false`),
+  `registry_path` (default `config/locales.yaml`), and `max_calls_per_question` (default 2,
+  `ge=1, le=4`). All four committed AppConfigs ship `enabled: false`; the test finds them by
+  glob rather than by list.
+- **`research/lens.py`.** Three parts:
+  - `plan`: pure. It runs detection and gives at most one call per matched locale, in
+    detection order, up to the cap.
+  - `locale_rows`: per-document sidecar rows. AskNews facts are read from the run's own raw
+    response, by URL.
+  - `run_lens`: opens each run before its billable request, buys the call through the
+    ordinary adapter, and persists through `persist_paid_run(..., run_opened=True,
+    locales=rows)`.
+  - `lens_record` is the lens's account of each call (see the provider_config decision
+    below). `asknews_cost_usd` is AskNews's settled cost.
+- **Adapters.**
+  - `retrieve_news(..., lens=LensRequest(domains, record))` adds `domain_url` to the request.
+  - `retrieve_web(..., lens_record=...)` takes a new authorizing reason, `local_source_lens`.
+    `decide_fallback` never emits it.
+  - With no lens, both send, reserve and record exactly what they did before. Pinned three
+    ways; see the next decision.
+- **`tournament.py`.** `_collect_local_lens` runs after the question's forecast, approval and
+  post, under `budget_context` and in its own 120 s `phase_timeout`. It writes the lens runs
+  and one `local_lens_checkpoint` event naming the baseline and lens run ids. Every exception
+  is recorded on the checkpoint by class name (never by message) and logged, and the question
+  loop continues.
+- **`research/lens_report.py` and `whiskeyjack research lens-report`.** Read-only
+  (`connect_readonly`). Per question it gives: whether the lens triggered; calls and requests;
+  cost and `cost_unknown_calls`; elapsed time; lens documents; publisher-origin counts;
+  overlap classes; and independent reports (all of them, and those from local publishers).
+- **`docs/RUNBOOK.md` § 9.** How to enable the lens (it retires the activation, so
+  `tournament enable` follows), what it costs, what it records, and both report commands.
+- **No migration.** 019 (M1-357) already holds the rows.
+
+### Decision — disabled is today's run, pinned against master, not only against itself
+
+The AC: disabled, "the research checkpoint, packet hash and forecast record are identical to
+the same run without the field". `test_disabled_is_the_same_run_as_a_config_without_the_field`
+runs the real `run_once` twice, once with no `local_lens` key and once with `enabled: false`.
+It compares the research checkpoint, the canonical packet JSON and `record_json`. Before the
+comparison it replaces each ledger's own random identifiers (run, record, attempt and document
+ids), the packet digest computed over them, and clock readings. Every other value is compared
+verbatim: provider, model and policy.
+
+Both of those runs execute this branch's code, so on its own the comparison proves only that
+pydantic applies the default. The witness outside the program is
+`tests/fixtures/local_lens/baseline_before_lens.json`. It holds the checkpoint and packet that
+the same helper observed on **master `acbcdeb`, before the lens existed**. When it was taken,
+master's and the branch's normalized observations were byte-identical (5,168 bytes), the record
+included.
+
+The adapters' baseline requests and `provider_config` reach the forecast only through the
+packet. A mutant that adds `"lens": null` to the baseline AskNews `provider_config` therefore
+fails this test, and only on the golden assertion, because the absent and disabled runs then
+agree with each other.
+
+The record is left out of the golden on purpose: it carries `prompt_sha256`, so a golden that
+included it would churn with every prompt bump. The two unit tests in
+`test_lens.py` § "the baseline path is untouched" also pin the baseline AskNews request keys,
+the AskNews `provider_config` keys and the absence of any lens key on a baseline Exa run.
+
+### Decision — the lens runs after the post, in its own phase, and only once per research
+
+- **Order.** It runs after the forecast, approval and post, so nothing it does can be read by
+  them.
+- **Its own phase.** `phase_timeout` cannot nest, and the lens must never consume the
+  forecast's time.
+- **Outside the question's `try`.** A lens failure is not a question failure, and recording it
+  as one would feed `recent_question_failures` and the deterministic-refusal gate.
+- **Once per research.** The lens is due only when this poll wrote a `research_checkpoint` at
+  this poll's `now`. A `local_lens_checkpoint` already written for that `now` makes a retry a
+  no-op. So the lens is bought once per bought research, never once per poll. An
+  evidence-poor retry that buys new research (M1-349) gets a new lens, because it is new
+  research.
+
+The worker test drives that guard directly. A second full poll never reaches it, since the
+question is already posted and skipped.
+
+### Decision — a timeout is a `TournamentError`, so `except Exception` is the right width
+
+`phase_timeout` raises its private `BaseException` (M1-514: an `except Exception` inside the
+phase must not swallow it) and converts it to `TournamentError` at the context boundary. The
+hook's `except Exception` therefore catches the time bound and nothing wider. `KeyboardInterrupt`
+and `SystemExit` still stop the worker. Pinned by
+`test_the_lens_time_bound_is_recorded_and_the_question_still_succeeds`.
+
+### Decision — `provider_config` carries the lens record flat, beside the adapter's own keys
+
+The AC: lens runs' `provider_config` "records lens local, locale codes, languages, domains and
+the registry sha256". `docs/LOCAL-LENS-NOTES.md` and M1-357's fixture both anticipated
+`lens: "local"` as a flat key. So `lens_record` adds `lens`, `locales`, `languages`,
+`domains`, `registry_sha256`, `query_source` and `baseline_run_ids` beside the adapter's keys
+(`LENS_RECORD_KEYS`).
+
+`test_the_lens_record_never_overwrites_an_adapter_key` runs both adapters and asserts the two
+key sets are disjoint, so the record can never silently replace the provider's own account of
+the call.
+
+`domains` repeats `domain_url` (AskNews) or `include_domains` (Exa) on purpose. It is the
+provider-neutral key a later reader can query without knowing which adapter wrote the run.
+
+### Decision — AskNews where it reads every locale language, Exa otherwise
+
+`ASKNEWS_LANGUAGES` is what this project has *observed* AskNews return: the 2026-10-16 census,
+18 languages, with no Persian or Hebrew. It is not a claim about what AskNews indexes.
+
+- **AskNews** gets the locale when every language of the locale is in that set. It uses the
+  question's own English query, because AskNews searches its English translations, plus
+  `domain_url`.
+- **Exa** gets the rest. It uses the registry's native terms for the triggers that matched,
+  de-duplicated by words, and falls back to the English title. It also uses `includeDomains`.
+
+On the shipped registry, IR and IL go to Exa and the other ten locales go to AskNews. Neither
+call sets a language filter: locality is the publisher (owner, 2026-10-16).
+
+### Decision — AskNews cost is the settled credits, recorded on the checkpoint
+
+An AskNews run row carries `cost_usd: null`, as on the baseline path, because AskNews settles
+per credit in the journal (M1-336). Leaving it there made the report's cost Exa-only, which
+falls short of the AC's "cost". `asknews_cost_usd` computes, from each response's own
+`usage.credits` at the pinned rate, the figure `complete_call` settled the reservation from.
+The lens puts that figure on the checkpoint; the report sums both providers.
+
+- **Unknown is never free.** The result is `None` when any attempted request has no response
+  or any response's credits fail to convert. The report counts such calls in
+  `cost_unknown_calls`, and `cost_usd` is then a floor.
+- **A response replayed from the durable call journal counts.** The checkpoint guard makes a
+  replay reachable only after a pass that died before writing its checkpoint, so this is the
+  only checkpoint that will ever carry that spend.
+
+That second point came from the mutation pass. The first version returned `0.0` whenever no
+request was attempted, and a survivor showed that branch mattered only for a replay, where
+`0.0` under-reports. A property checks the function against a hand-written oracle.
+
+### Deviation — a locale with no bare-host `local_domains` plans no call
+
+The AC triggers the lens for a question "whose detected locales have local_domains **or** a
+language other than English". `plan` triggers only on the first condition.
+
+With no publisher to aim at, an Exa call has an empty `includeDomains`. That is a
+native-language search across every publisher: a local-*language* lens. The owner's
+2026-10-16 correction rejected exactly that ("the goal is LOCAL sources … not local-LANGUAGE
+sources"). The same rule drops path-prefixed entries such as `bbc.com/persian`, because both
+providers filter by host only.
+
+**Unreachable on the shipped registry.** All 12 locales have 3 to 17 bare-host domains
+(checked 2026-10-17). It becomes live only if a future registry entry lists languages and no
+domains. **Flagged for the owner in the PR** rather than decided silently: if a
+language-only trigger is wanted, it is a two-line change to `plan`.
+
+### Rejected — the lens before the forecast, or inside its phase
+
+That would let the lens's time and failures reach the forecast. It would also put lens
+spending ahead of the forecast the tournament pays for. D53 Phase 1 is collect-only, so the
+lens has nothing to give the forecast.
+
+### Rejected — AskNews `languages=`, or the AskNews `country` tag, as the locality filter
+
+The 2026-10-16 probe settled both (`docs/LOCAL-LENS-NOTES.md` § 2).
+
+- `languages=["fa"]` is refused with HTTP 422. A language filter would also admit foreign
+  services that publish in the language, and drop local outlets that publish in English.
+- `country` tags the *story*. It returned AFP wire copies in five languages.
+
+### Rejected — reporting AskNews cost by re-reading the raw artifact at report time
+
+An artifact can fail to write (M1-312 degrades rather than blocks), and the report is meant to
+read the ledger only. The lens already holds the response when the call settles.
+
+### Deferred (do not read the absence as an omission)
+
+- **The shadow arm**, a never-submittable forecast from baseline plus lens evidence: M1-359,
+  `Deferred` until this lands.
+- **Translating Exa's native-language documents:** M1-361. Until then an untranslated lens
+  document is `unassessed`, never `novel`. That is the conservative direction for "what did
+  the lens add".
+- **Widening `ASKNEWS_LANGUAGES` beyond what has been observed.** A paid probe, per
+  language, if the owner wants it.
+- **Enabling the lens in a live profile.** An owner action, and it retires the activation.
+  See the deploy note below.
+
+### Standing risk — not verifiable offline
+
+- **AskNews `domain_url` against real local domains.** The 2026-10-16 probe exercised
+  `languages` and `countries`, not `domain_url`. The offline tests prove the request is sent
+  and recorded. Whether AskNews filters by these hosts (host matching, the `www.` prefix, a
+  cap on list length) is known only after the first live lens call. The lens-report's
+  per-origin counts are the place to read it.
+- **Exa result quality for a native-term query with `includeDomains`.** The probe returned
+  Iranian outlets for a Persian query *without* a domain filter. Adding a filter can only
+  narrow that set, but by how much is unmeasured.
+- **Deploy.** Merging adds a field to `AppConfig`, so `config_sha256` moves and the live
+  activation retires at the next poll (first seen live 2026-09-09).
+  Merge between batches and run `tournament enable` at once, even with the lens left
+  disabled. The follow policy rebound to project 33132 on 2026-10-16, 18:50 UTC, so it is
+  that activation that retires, not 33129's.
+
+### Mutation pass
+
+- **Before this section was written** (commit `50cdb33`), a pass closed survivors in the
+  once-per-checkpoint guard, the AskNews record, the disabled default, the report's branches
+  and its exact counts. The number of mutants in that pass was not recorded.
+- **Pass 2, 14 mutants**, against the four lens test files. They covered the AskNews cost,
+  the record fields, a baseline lens leak in each adapter, a lens record missing from each
+  adapter, the report's trigger, unknown-cost counting, the call-shape check and the
+  trigger total. 13 died. The survivor was the `attempted == 0` branch described above. It
+  was a wrong rule, not a test gap, and the replacement rule's three branches each died.
+- **Pass 3, 4 mutants.** Three were run against the new cost property alone (sum, length
+  check, unknown-to-skip); all three died, so the property is not vacuous. The fourth was the
+  report's negative-count guard, against its unit test; it died.
