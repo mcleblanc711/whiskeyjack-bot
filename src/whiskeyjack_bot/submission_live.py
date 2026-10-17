@@ -569,9 +569,7 @@ def _conversion_context_or_refuse(conversion: object, plan: PostPlan) -> dict[st
             "the conversion record does not say which CDF it describes (it needs "
             "continuous_cdf_points and continuous_cdf_sha256); nothing was posted"
         )
-    if points != len(plan.continuous_cdf) or claimed != continuous_cdf_sha256(
-        plan.continuous_cdf
-    ):
+    if points != len(plan.continuous_cdf) or claimed != continuous_cdf_sha256(plan.continuous_cdf):
         raise LiveSubmissionError(
             "the conversion record describes a different CDF than the payload being posted "
             "(detail withheld: it can echo percentile values); nothing was posted"

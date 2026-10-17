@@ -39,19 +39,21 @@ import re
 import traceback
 from typing import Any
 
-from hypothesis import assume, given
+from hypothesis import assume, event, given
 from hypothesis import strategies as st
 from strategies import HOSTILE_TEXT
 
 from whiskeyjack_bot.bounds import MAX_BODY_LENGTH, MAX_IDENTIFIER_LENGTH
-from whiskeyjack_bot.submission_gateway import GatewayError
+from whiskeyjack_bot.submission_gateway import GatewayError, canonical_payload_json
 from whiskeyjack_bot.submission_live import (
     _CATEGORY_SUM_TOLERANCE,
+    _conversion_context_or_refuse,
     _LIVE_ERROR_TYPES,
     _MAX_CATEGORIES,
     _MAX_OPTION_LABEL,
     _MAX_SNAPSHOT_VALUES,
     BinaryPost,
+    DiscretePost,
     ForecastEntry,
     ForecastHistory,
     LiveSubmissionError,
@@ -61,6 +63,7 @@ from whiskeyjack_bot.submission_live import (
     build_verification_snapshot,
     classify_error,
     classify_refetch,
+    continuous_cdf_sha256,
     expected_option_labels,
     expected_values,
     live_attempt_id,
@@ -850,3 +853,84 @@ def test_a_malformed_key_is_refused_as_this_modules_error(key: Any) -> None:
     except LiveSubmissionError:
         return
     assert isinstance(key, str)
+
+
+# --- M2-717: the conversion record's binding to the posted CDF --------------------------
+
+_CDF_VALUES = st.lists(
+    st.floats(min_value=0.0, max_value=1.0, allow_nan=False), min_size=1, max_size=12
+).map(sorted)
+
+
+@given(values=st.lists(st.floats(allow_nan=False, allow_infinity=False), max_size=12))
+def test_the_cdf_digest_is_replay_stable_across_the_persisted_form(values: list[float]) -> None:
+    """The writer digests ``cdf.values``; the checker digests the floats it parsed back out
+    of the canonical payload. The two only agree if the digest survives that round trip,
+    for every float the renderer accepts (``-0.0`` and subnormals included)."""
+    try:
+        rendered = canonical_payload_json({"continuous_cdf": values})
+    except GatewayError:
+        return
+    parsed = json.loads(rendered)["continuous_cdf"]
+    assert continuous_cdf_sha256(parsed) == continuous_cdf_sha256(values)
+
+
+_JSON_SCALAR = st.none() | st.booleans() | st.integers() | st.text(max_size=8)
+
+
+@st.composite
+def _binding(draw: st.DrawFn, values: list[float]) -> tuple[object, object]:
+    """A (points, digest) pair aimed at each way a record can fail to bind, plus the right
+    one: an off-by-k, float, bool or text length, and the digest of a *different* CDF -- a
+    well-formed string only the digest comparison can refuse. (The first draft drew wrong
+    values from ``ANY_VALUE``; nearly all failed to render first, so neutering either
+    comparison left it green -- lesson 5.)"""
+    right_points, right_digest = len(values), continuous_cdf_sha256(values)
+    other = [*values, 1.0] if draw(st.booleans()) else [0.5, *values]
+    points = {
+        "right": right_points,
+        "off": right_points + draw(st.sampled_from([-1, 1, 2])),
+        "float": float(right_points),
+        "bool": True,
+        "text": str(right_points),
+    }[draw(st.sampled_from(["right", "off", "float", "bool", "text"]))]
+    digest = {
+        "right": right_digest,
+        "other": continuous_cdf_sha256(other),
+        "short": right_digest[:-1],
+        "int": 0,
+    }[draw(st.sampled_from(["right", "other", "short", "int"]))]
+    return points, digest
+
+
+@given(
+    data=st.data(),
+    values=_CDF_VALUES,
+    discrete=st.booleans(),
+    extra=st.dictionaries(st.text(max_size=8), _JSON_SCALAR, max_size=2),
+)
+def test_a_conversion_record_is_accepted_exactly_when_it_names_the_planned_cdf(
+    data: st.DataObject, values: list[float], discrete: bool, extra: dict[str, Any]
+) -> None:
+    """Accepted iff both binding fields equal what the plan's ``continuous_cdf`` yields, in
+    both directions, and every refusal is this module's error naming no value."""
+    plan = DiscretePost(tuple(values)) if discrete else NumericPost(tuple(values))
+    right_points, right_digest = len(values), continuous_cdf_sha256(values)
+    points, digest = data.draw(_binding(values))
+    conversion: dict[str, Any] = {
+        key: value for key, value in extra.items() if not key.startswith("continuous")
+    }
+    conversion["continuous_cdf_points"] = points
+    conversion["continuous_cdf_sha256"] = digest
+    binds = type(points) is int and points == right_points and digest == right_digest
+    event(f"binds={binds}")
+    try:
+        context = _conversion_context_or_refuse(conversion, plan)
+    except LiveSubmissionError as exc:
+        assert not binds
+        assert right_digest not in str(exc)
+        return
+    assert binds
+    assert context is not None
+    assert context["continuous_cdf_sha256"] == right_digest
+    assert context["continuous_cdf_points"] == right_points

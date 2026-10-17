@@ -3575,3 +3575,78 @@ are marked CLOSED; the round found no new blocking findings and no non-blocking 
 and it recorded the blank-assertion observation as resolved. All five remediation risk claims
 came back Safe. The reviewer ran the affected unit modules, both property suites, ruff and strict
 mypy rather than reading them. Two rounds.
+
+---
+
+## M2-717 — Bind conversion metadata to its CDF (D48, D54)
+
+**What shipped.** `submission_payload.conversion_record` now names the array it describes,
+with `continuous_cdf_points` and `continuous_cdf_sha256`. Both come from the same
+`cdf.values` the payload's `continuous_cdf` is built from. `submission_live._conversion_context_or_refuse`
+now takes the `PostPlan` instead of the record's question type. It refuses, before
+`prepare_live_policy` and therefore before any post, a record that:
+- lacks either binding field;
+- carries a binding field of the wrong exact type (a bool or float length, a non-string
+  digest); or
+- names a different CDF from the plan's `continuous_cdf`, which is parsed from the canonical
+  payload, the bytes actually posted.
+
+The digest is `continuous_cdf_sha256(values)`: SHA-256 over
+`canonical_payload_json({"continuous_cdf": values})`. The writer and the checker share that
+one function and the one payload renderer.
+
+### Decision — a digest of the array, compared against the canonical payload, and why
+
+The criterion is "reject conversion metadata that does not describe the CDF in the
+authorized payload". The record already held `percentiles_used` and `adjusted` and nothing
+that identified an array. Checking the percentiles against the CDF directly would mean
+evaluating the posted CDF at each value. That needs the question's scale mapping, which lives
+in the SDK, and this module must not import the SDK (module docstring). A digest plus a length
+needs nothing but the renderer. The comparison side is the canonical payload rather than
+`payload["continuous_cdf"]`, because the canonical bytes are what is posted and digested
+(the M2-703 second-source rule).
+
+**What the digest does and does not prove (the M2-707 lesson).** A matching digest
+establishes which CDF the record *claims* to describe. It cannot establish that the
+percentiles beside it derived that CDF: a caller that builds a record by hand can digest any
+array it likes. Derivation stays by construction. `conversion_record` takes the percentiles
+and the array from one `NumericCdf`. The check closes the case D48 named, a caller sourcing
+the metadata separately from the payload's derivation, which then describes a different CDF.
+
+### Decision — the length is checked separately, and exact-typed
+
+The digest alone would refuse a wrong length too. The length is carried anyway because it
+is the one binding field a reader of an artifact can check by eye. Each comparison is
+mutation-checked separately: neutering the length comparison is caught by the
+"right digest, wrong length" case, and neutering the digest comparison by "digest of a
+different CDF of the same length". `type(points) is int` refuses `True` and `201.0`, the
+M1-203 rule.
+
+### Rejected — removing the `conversion=` parameter and deriving it inside `post_approved_forecast`
+
+This is the M2-703 cure for a second source of truth. It is unavailable here: deriving the
+record needs `forecast.cdf`, which imports the SDK, and keeping that import out of
+`submission_live` is a checked property (M1-508).
+
+### Deferred (do not read the absence as an omission)
+
+- **Live artifacts written before this item** carry no binding fields. Nothing reads
+  `numeric_conversion` back (grepped), so no reader has to tolerate both shapes yet. A future
+  reader must treat their absence as "written before M2-717", not as unbound.
+- **`submit --payload-file`** still passes no conversion record (`None`), unchanged.
+
+### Standing risk — not verifiable offline
+
+None that is new. The approval digest is untouched: the conversion record sits outside
+`canonical` and `sha256` (`test_the_conversion_record_is_outside_what_an_approval_binds`), so
+no pending approval moves.
+
+### On the mutation and property pass
+
+- **Mutants:** three, all killed by both the unit table and the property. They neutered the
+  length comparison, the digest comparison, and the exact-type gate on the length.
+- **The first draft of the property was vacuous** and survived all three. It drew the wrong
+  values from `ANY_VALUE`. The renderer refused about 55% of those draws first, and a
+  well-formed wrong digest was almost never drawn. The shipped strategy draws each failure
+  shape on purpose, including the digest of a different real CDF. Measured reach is about 30%
+  accepted and about 47% refused (lesson 5).
