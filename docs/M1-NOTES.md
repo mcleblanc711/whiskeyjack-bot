@@ -16682,3 +16682,41 @@ read the ledger only. The lens already holds the response when the call settles.
 - **Pass 3, 4 mutants.** Three were run against the new cost property alone (sum, length
   check, unknown-to-skip); all three died, so the property is not vacuous. The fourth was the
   report's negative-count guard, against its unit test; it died.
+
+### Round 1 — CHANGES REQUESTED on `c823390`, two blockers
+
+Before any fix, both findings were reproduced by execution on `c823390`. Each reproduction is
+a test committed on its own in `05094c6`, which fails before the fix.
+
+**B1: a time bound after a completed call dropped that call from the checkpoint.**
+- **What happened.** The hook built `lens_run_ids`, `calls` and `elapsed_seconds` only from
+  `run_lens`'s return value, so an exception lost everything that had already completed.
+- **The reproduction.** The IR Exa call completes and settles $0.007. The AE AskNews call then
+  stalls past the bound.
+- **Before the fix**, the checkpoint carried only `error_type`, and the report showed
+  `triggered=False` with zero calls, cost and documents. The once-per-checkpoint guard then
+  made the loss permanent.
+- **The fix.** `run_lens` records into a `LensProgress` that the hook owns. Whatever cuts it
+  off, the checkpoint now carries:
+  - the completed calls;
+  - the in-flight call, with `interrupted: true` and `requests` and `cost_usd` null (whether
+    its request was billed is unknown);
+  - every run id;
+  - the elapsed time.
+
+  The report counts an interrupted call in `cost_unknown_calls`.
+- **Two edges, each with a test.**
+  - `in_flight` is set only after its run row exists, so the report can load every run a
+    checkpoint names. The test uses a ledger failure opening the second run.
+  - A finished record wins over an `in_flight` entry for the same run. A signal can land
+    between appending the finished call and clearing `in_flight`.
+
+**B2: an `int` too large for a float escaped as `OverflowError`.** Checkpoint values are
+untrusted ledger reads. `_amount` now returns `None` for a bool, a non-finite or negative
+number, and an `int` that overflows a float. It is used for both `cost_usd` and
+`elapsed_seconds`.
+
+**Mutation pass on the remediation: 7 mutants, 6 killed.** The survivor removes the explicit
+`progress.in_flight = None` after a finished call. It is **equivalent**: a stale `in_flight`
+always names a run that already finished, and `outcome()` drops it. The clear stays for
+readability.
