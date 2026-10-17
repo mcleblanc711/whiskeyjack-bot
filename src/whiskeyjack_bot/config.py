@@ -287,7 +287,7 @@ class ShadowForecastConfig(_StrictModel):
     def _shadow_version_is_bare(cls, v: str) -> str:
         if not BARE_VERSION_RE.fullmatch(v):
             raise authored_error(
-                "prompt_version_not_bare",
+                "shadow_prompt_version_not_bare",
                 "retrieval.local_lens.shadow.prompt_version must be a bare MAJOR.MINOR.PATCH "
                 "version with no 'v' prefix",
             )
