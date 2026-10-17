@@ -16873,3 +16873,27 @@ table records only forecasts, which is what M5-805 pairs.
 - **The `skipped` field:** the first draft treated `skipped is False` as "not skipped". The
   lens writes `None`, so every real lens run was excluded and the arm never ran. The
   end-to-end test caught it.
+
+### Round 1 — approved, and one candidate taken now
+
+`ba670dd`: APPROVE, no blocking findings. The one non-blocking candidate was that `lens_run_ids`
+is a pure function with no hypothesis pass, which the standing convention requires before the
+first review. It was missed, so it is taken now rather than filed:
+- **The pass:** `tests/property/test_shadow_properties.py`. The function never raises, matches
+  an independent oracle (in order, distinct), is replay-stable through the persisted form, and
+  the strategy reaches each near miss.
+- **What the oracle found in the function:** a missing `skipped` key was read as "not skipped"
+  while a missing `interrupted` refused. The lens always writes both keys, and this is a value
+  read back out of the journal, so a missing key now refuses (`"skipped" in call`).
+- **Mutants:** six, all killed in 5 of 5 runs of the random profile: `skipped` key optional, zero
+  documents admitted, a bool count admitted, a falsy `interrupted` admitted, no
+  de-duplication, an empty run id admitted.
+- **Three strategy defects the mutants exposed, one after another:**
+  - **every field varied at once:** a near miss is visible only when the rest of the call is
+    right, so the bool and missing-key mutants survived;
+  - **run ids from three names:** a near miss usually repeated an id already kept, and the
+    de-duplication hid it;
+  - **an unweighted `one_of`:** call lists were a third of draws, so a specific near miss
+    appeared about once per run, and the zero-documents mutant survived about half the time.
+
+  Each fix is commented in the strategy.

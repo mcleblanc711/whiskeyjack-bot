@@ -138,8 +138,10 @@ def lens_run_ids(lens_checkpoint: dict[str, Any]) -> tuple[str, ...]:
             and type(documents) is int
             and documents > 0
             and call.get("interrupted") is False
-            # A reason string when the planned call was not made; None when it was.
-            and call.get("skipped") is None
+            # A reason string when the planned call was not made; None when it was. The key
+            # must be present: the lens always writes it, so its absence is a malformed entry.
+            and "skipped" in call
+            and call["skipped"] is None
             and run_id not in found
         ):
             found.append(run_id)
