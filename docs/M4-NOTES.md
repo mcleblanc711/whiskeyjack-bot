@@ -1603,3 +1603,9 @@ round-1 text.
 
 Non-blocking: the reviewer suggested watchdog coverage for the Cup timer as a backlog
 candidate. It is already listed under Deferred above.
+
+### Round 2 — approved
+
+`aaca885`: APPROVE, with B1 closed. The reviewer ran the extracted block under shims for seven
+outcomes, including a failing integrity command and a failing upgrade. No new candidates; Cup
+watchdog coverage stays Deferred.
