@@ -259,3 +259,92 @@ def test_labels_either_refuse_atomically_or_replay_from_the_ledger(
         return
     loaded = load_packet(_ledger, question_id=9, retrieval_run_ids=[run_id])
     assert packet_sha256(loaded) == packet_sha256(built)
+
+
+# --- M1-359: what the shadow arm's model is shown ---------------------------------------------
+
+
+def _persisted(value: object) -> object:
+    return json.loads(json.dumps(value, ensure_ascii=True))
+
+
+def _question_for(packet: object) -> object:
+    from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
+
+    return CanonicalBinaryQuestion(
+        question_id=packet.question_id,  # type: ignore[attr-defined]
+        post_id=7,
+        title="Will X happen?",
+    )
+
+
+@given(_packets())
+def test_a_document_carries_a_locale_exactly_when_the_packet_holds_its_row(
+    drawn: tuple[object, list[DocumentLocale]],
+) -> None:
+    """The lens render (``include_locales=True``): every document has a ``locale`` key, and the
+    set rendered non-null is the set with a row -- both directions, so neither "every document
+    gets one" nor "none does" passes. Each rendered locale is its row's five shown fields."""
+    from whiskeyjack_bot.forecast.inputs import build_model_input, render_model_input
+
+    packet, locales = drawn
+    with_locales = build_packet(packet.question_id, packet.runs, packet.documents, locales)  # type: ignore[attr-defined]
+    # No ``except ForecastInputError: return`` here or below: a valid packet always builds, and
+    # an escape for a refusal let a mutant that broke every build pass both properties.
+    built = build_model_input(
+        question=_question_for(packet),  # type: ignore[arg-type]
+        packet=with_locales,
+        tournament_id="minibench",
+        as_of=_WHEN,
+        include_locales=True,
+    )
+    rendered = render_model_input(built)
+    assert rendered.isascii()
+    documents = json.loads(rendered)["research_documents"]
+    assert all("locale" in document for document in documents)
+    by_url_and_source = {
+        (reference.canonical_url, reference.content_sha256): reference.source_id
+        for reference in built.sources
+    }
+    expected = {by_url_and_source[(row.canonical_url, row.content_sha256)]: row for row in locales}
+    shown = {d["source_id"]: d["locale"] for d in documents if d["locale"] is not None}
+    assert set(shown) == set(expected)
+    for source_id, locale in shown.items():
+        row = expected[source_id]
+        # In the persisted form (``json.dumps`` -> ``json.loads``): a surrogate pair held as two
+        # code units renders as an escaped pair that reads back as one character (M1-306).
+        assert locale == _persisted(
+            {
+                "locale_code": row.locale_code,
+                "publisher_origin": row.publisher_origin,
+                "language": row.language,
+                "native_title": row.native_title,
+                "translation_source": row.translation_source,
+            }
+        )
+
+
+@given(_packets())
+def test_the_control_render_does_not_depend_on_locale_rows(
+    drawn: tuple[object, list[DocumentLocale]],
+) -> None:
+    """``include_locales`` off -- every control forecast: the bytes sent are the same whether
+    or not the packet carries locale rows, and no ``locale`` key appears anywhere. A packet
+    with lens rows changes the packet hash (above) and nothing the control's model sees."""
+    from whiskeyjack_bot.forecast.inputs import build_model_input, render_model_input
+
+    packet, locales = drawn
+    with_locales = build_packet(packet.question_id, packet.runs, packet.documents, locales)  # type: ignore[attr-defined]
+    plain, located = (
+        render_model_input(
+            build_model_input(
+                question=_question_for(packet),  # type: ignore[arg-type]
+                packet=candidate,  # type: ignore[arg-type]
+                tournament_id="minibench",
+                as_of=_WHEN,
+            )
+        )
+        for candidate in (packet, with_locales)
+    )
+    assert plain == located
+    assert all("locale" not in d for d in json.loads(plain)["research_documents"])

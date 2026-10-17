@@ -160,6 +160,8 @@ Near-duplicates among lens documents form syndication clusters with one represen
 
 ## 4. Evaluation design (Phase 2: M1-359, M5-805)
 
+*Status (2026-10-17):* M1-359 shipped the shadow arm, disabled (D54): `retrieval.local_lens.shadow`, the `shadow_forecasts` table (020) and `prompts/forecaster-tournament-lens.md`. Persian lens documents are filtered out before the shadow's model sees them, because the relevance filter is English-only (M1-361). See `docs/M1-NOTES.md` § M1-359.
+
 - **Arms.** *Control:* the forecast the worker submits today, from baseline research.
   *Experiment:* a shadow forecast generated in the same worker pass, from baseline plus lens
   runs, at the same `now` cutoff, with the same model, model settings and config. It uses a

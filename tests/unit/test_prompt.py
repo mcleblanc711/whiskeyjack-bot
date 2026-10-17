@@ -692,3 +692,45 @@ def test_a_block_boundary_ends_a_sentence_that_has_no_punctuation(boundary: str)
         "- Probability guidance for binary questions\n" + boundary
     )
     assert parse_declared_probability_bounds(body) == _SHIPPED
+
+
+# --- M1-359: the shadow arm's lens-aware prompt ----------------------------------------------
+
+LENS_PROMPT = REPO_ROOT / "prompts" / "forecaster-tournament-lens.md"
+TOURNAMENT_PROMPT = REPO_ROOT / "prompts" / "forecaster-tournament.md"
+RELEASED_LENS_PROMPT_SHA256 = {
+    "1.0.0": "298664782a74640c95de49fc8960ec918ec320c019b865eee6ed25c119fa0efb",
+}
+
+
+def test_the_lens_prompt_bytes_match_the_pinned_digest() -> None:
+    """Every shadow row records this file's hash; a body edit without a version bump would
+    leave two different instruction sets under one ``prompt_version`` (D04)."""
+    from whiskeyjack_bot.config import ShadowForecastConfig
+
+    declared = ShadowForecastConfig().prompt_version
+    loaded = load_prompt(LENS_PROMPT, declared, min_probability=0.001, max_probability=0.999)
+    assert loaded.sha256 == RELEASED_LENS_PROMPT_SHA256[loaded.version], (
+        "prompts/forecaster-tournament-lens.md changed; bump its version and the default "
+        "retrieval.local_lens.shadow.prompt_version, and pin the new digest"
+    )
+
+
+def test_the_lens_prompt_is_the_tournament_prompt_plus_the_local_evidence_rules_only() -> None:
+    """D53/LOCAL-LENS-NOTES §4: the experiment arm's prompt "differs from the control prompt only
+    in a section on local evidence" -- so a paired difference measures the lens, not a second
+    prompt. Pinned as a diff: removing the lens's three additions from the lens prompt gives
+    the tournament prompt back, byte for byte, apart from the H1."""
+    lens = LENS_PROMPT.read_text(encoding="utf-8")
+    control = TOURNAMENT_PROMPT.read_text(encoding="utf-8")
+    locale_input = next(line for line in lens.splitlines(keepends=True) if "`locale`" in line)
+    section = lens[lens.index("\n## Local evidence\n") :]
+    stripped = lens.replace(locale_input, "", 1).replace(section, "", 1)
+    assert stripped.split("\n", 1)[1] == control.split("\n", 1)[1]
+    assert lens.split("\n", 1)[0] != control.split("\n", 1)[0]
+    assert section.count("\n## ") == 1, "the local-evidence section is the last one"
+
+
+def test_the_lens_prompt_declares_the_committed_range() -> None:
+    bounds = parse_declared_probability_bounds(LENS_PROMPT.read_text(encoding="utf-8"))
+    assert (bounds.low, bounds.high) == (0.001, 0.999)

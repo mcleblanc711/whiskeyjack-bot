@@ -85,6 +85,10 @@ retrieval:
     enabled: false
     registry_path: config/locales.yaml
     max_calls_per_question: 2
+    shadow:
+      enabled: false
+      prompt_path: prompts/forecaster-tournament-lens.md
+      prompt_version: "1.0.0"
 forecast:
   supported_question_types:
   - binary

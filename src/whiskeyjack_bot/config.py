@@ -267,6 +267,33 @@ class SocialRetrievalConfig(_StrictModel):
         return self
 
 
+class ShadowForecastConfig(_StrictModel):
+    """The shadow experiment arm (M1-359, D53 Phase 2): a second, never-submittable forecast
+    from baseline plus lens evidence, generated in the same worker pass as the control.
+
+    One paid model call per question the lens retained evidence for, so it has its own
+    opt-in rather than riding ``local_lens.enabled``, and it requires the lens (there is
+    nothing for it to add without lens runs). Shipped disabled. ``prompt_path`` names the
+    lens-aware prompt; its hash is recorded on every shadow row rather than bound into the
+    activation, because the arm can never post (``docs/M1-NOTES.md`` § M1-359).
+    """
+
+    enabled: bool = False
+    prompt_path: Path = Path("prompts/forecaster-tournament-lens.md")
+    prompt_version: str = "1.0.0"
+
+    @field_validator("prompt_version")
+    @classmethod
+    def _shadow_version_is_bare(cls, v: str) -> str:
+        if not BARE_VERSION_RE.fullmatch(v):
+            raise authored_error(
+                "prompt_version_not_bare",
+                "retrieval.local_lens.shadow.prompt_version must be a bare MAJOR.MINOR.PATCH "
+                "version with no 'v' prefix",
+            )
+        return v
+
+
 class LocalLensConfig(_StrictModel):
     """The local-source lens (M1-358, D53): extra retrieval aimed at publishers based in the
     places a question is about. **Collect-only** in this phase -- lens runs never enter the
@@ -283,6 +310,18 @@ class LocalLensConfig(_StrictModel):
     # Lens calls per question. Each is one AskNews credit or one Exa search; the cap bounds
     # what a cross-border question (Hormuz: Iran, Oman, the UAE) can buy.
     max_calls_per_question: int = Field(default=2, ge=1, le=4)
+    # M1-359: the shadow arm, which reads what the lens collected. Off unless both are on.
+    shadow: ShadowForecastConfig = Field(default_factory=ShadowForecastConfig)
+
+    @model_validator(mode="after")
+    def _shadow_needs_the_lens(self) -> LocalLensConfig:
+        if self.shadow.enabled and not self.enabled:
+            raise authored_error(
+                "shadow_without_lens",
+                "retrieval.local_lens.shadow.enabled requires retrieval.local_lens.enabled: "
+                "the shadow arm forecasts from what the lens collected",
+            )
+        return self
 
 
 class RetrievalConfig(_StrictModel):

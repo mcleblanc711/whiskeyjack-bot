@@ -41,7 +41,7 @@ and bumping one never bumps another.
 
 | Constant | Value | Defined at | What it versions |
 | --- | --- | --- | --- |
-| `LEDGER_SCHEMA_VERSION` | `19` | `ledger.py:LEDGER_SCHEMA_VERSION` | The ledger schema: the number of the last migration this build applies. `connect_readonly` refuses a ledger ahead of or behind it. |
+| `LEDGER_SCHEMA_VERSION` | `20` | `ledger.py:LEDGER_SCHEMA_VERSION` | The ledger schema: the number of the last migration this build applies. `connect_readonly` refuses a ledger ahead of or behind it. |
 | `RECORD_SCHEMA_VERSION` | `1.0.0` | `forecast/record.py:RECORD_SCHEMA_VERSION` | The shape of `forecast_records.record_json` (`ForecastRecord`). Records stamped `1.1.0` are also accepted by the validator. |
 | `RESPONSE_SCHEMA_VERSION` | `1.0.0` | `forecast/schema.py:RESPONSE_SCHEMA_VERSION` | The model's output contract (`record_json.forecast`), not the prompt's version. |
 | `OBSERVATION_SCHEMA_VERSION` | `1.0.0` | `resolution.py:OBSERVATION_SCHEMA_VERSION` | `resolution_events.resolution_snapshot_json` (`ResolutionObservation`). |
@@ -294,6 +294,35 @@ one resolution observation. Written only when the record's latest observation is
 | `computed_at_utc` | TEXT | 001 | When the row was computed; never before the observation. |
 | `resolution_event_id` | INTEGER | 015 | The `resolution_events` row the score was computed against. |
 
+### `shadow_forecasts`
+
+**Introduced:** `020`. **Mutability:** append-only. One never-submittable forecast from the
+shadow experiment arm (M1-359, D53 Phase 2): baseline plus local-source lens evidence, with
+the lens-aware prompt, paired with the control forecast recorded in the same poll. Kept out of
+`forecast_records` so nothing that approves, reserves or posts can reach it: every such path
+starts from a `forecast_records` row, and 020 adds `forecast_records_refuse_shadow_id` so a
+shadow id can never become one. A failed or skipped shadow writes no row; the
+`shadow_forecast_checkpoint` journal event records it.
+
+| Column | Type | Since | Definition |
+| --- | --- | --- | --- |
+| `shadow_forecast_id` | TEXT | 020 | Row identity; also the `record_id` inside `record_json`. Never a `forecast_records` id. |
+| `control_record_id` | TEXT | 020 | The control forecast this one is paired with (same question and tournament). |
+| `question_id` | INTEGER | 020 | The question forecast. |
+| `tournament_id` | TEXT | 020 | The tournament it was forecast for. |
+| `local_lens_checkpoint_id` | TEXT | 020 | The `local_lens_checkpoint` journal event whose runs it read; UNIQUE, so one shadow per lens checkpoint. |
+| `research_packet_sha256` | TEXT | 020 | Digest of the combined packet the model was shown (baseline plus lens runs, after the control's freshness filter). |
+| `packet_schema_version` | TEXT | 020 | The packet digest rule used: `1.1.0` when the packet carries locale rows, else `1.0.0`. |
+| `retrieval_run_ids_json` | TEXT | 020 | The runs in the combined packet, as a JSON array: baseline first, then lens. |
+| `prompt_version` | TEXT | 020 | Version declared by the lens-aware prompt (`retrieval.local_lens.shadow.prompt_version`). |
+| `prompt_sha256` | TEXT | 020 | Digest of the lens-aware prompt's bytes; not bound to the activation. |
+| `record_json` | TEXT | 020 | The forecast in the control's canonical record form (`forecast/record.py:canonical_record_json`). |
+| `record_sha256` | TEXT | 020 | Digest of `record_json`, by the control's `forecast_sha256` rule. |
+| `raw_output_path` | TEXT | 020 | Path of the raw model-output artifact (forecast `ARTIFACT_SCHEMA_VERSION`); NULL if retention is off or the write failed. |
+| `cost_usd` | REAL | 020 | What the model call cost, as the control's column records it; NULL if unpriced. |
+| `model_invocations` | INTEGER | 020 | Billed model calls, the initial one plus any repair. |
+| `created_at_utc` | TEXT | 020 | When the row was written. |
+
 ### `submission_attempts`
 
 **Introduced:** `001`. **Mutability:** append-only. One post of a forecast to the platform,
@@ -491,7 +520,7 @@ rather than clamped at zero. `spot_peer` is MiniBench's ranking score.
 (`export.py:export_ledger`). Opens the ledger read-only and reads every table in one
 snapshot; never mutates the `.db` or `-wal`.
 
-- **Files:** one `<table>.jsonl` or `<table>.parquet` per ledger table -- all sixteen tables
+- **Files:** one `<table>.jsonl` or `<table>.parquet` per ledger table -- all seventeen tables
   above, `schema_migrations` included -- plus `manifest.json`, written last. A directory
   without a manifest is not an export. Nothing is overwritten.
 - **Rows:** every column of every row, as `export.py:EXPORTED_TABLES` declares them, read
