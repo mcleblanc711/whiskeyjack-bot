@@ -1525,3 +1525,61 @@ by design; D52's revisit trigger names it. The live path (apply 018 to the produ
 A merged migration stops the worker at the next poll: back the ledger up, merge between polls,
 run `init-ledger` at once, then `score`. Expected: 8 new `platform_*` rows, resolutions unit
 green, watchdog clear; regenerate the M5-804 report (n = 60).
+
+---
+
+## M4-806 — Schedule resolution ingestion for the Cup profile (D40, D54)
+
+**What shipped.**
+- **Units:** `deploy/systemd/whiskeyjack-resolutions-cup.{service,timer}`. They are M4-805's
+  pair with three differences: both `ExecStart` lines name `config/tournament-cup.yaml`, the
+  descriptions, and an `OnCalendar` of `03/6:23` instead of `00/6:23`.
+- **Tests:** `tests/unit/test_deploy_resolutions_unit.py` runs every contract once per
+  profile, against that profile's own tournament poll: pager parity, environment parity, the
+  ExecStart contract, the timer, and the driven measurement that reaches nothing paid or
+  posting. One new test pins that the two profiles name distinct configs, distinct ledgers
+  and distinct hours.
+- **Runbook:** the "Cup is not scheduled" line is replaced by the Cup schedule, with its
+  one-time backup-then-`init-ledger` procedure.
+
+### Decision — a second unit pair, not a second `ExecStart` pair in one unit, and why
+
+One unit running both profiles would chain them. systemd runs a later line only after the
+earlier one exits 0, so a Cup failure would stop MiniBench scoring, or the other way round,
+and the page would not say which profile failed. Separate units page separately
+(`whiskeyjack-resolutions-cup failed`), and each profile's failure is its own.
+
+### Decision — parity is checked against each profile's own poll
+
+The Cup unit's config path is compared with `whiskeyjack-tournament-cup.service`'s, not with a
+literal. A Cup unit left pointing at `config/tournament.yaml` fails two tests (mutation-checked).
+That is the M4-805 witness rule, applied per profile.
+
+### Decision — three hours out of phase
+
+The two runs touch different ledgers, so they cannot contend on a lock. The offset keeps the
+two profiles' Metaculus GETs out of the same window, and it keeps minute 23, which is clear
+of the poll (`*:0/5`) and the watchdog (`*:2/5`).
+
+### Deviation — the row said "init-ledger upgrades it to 15"
+
+When M4-806 was filed the head was 15. The Cup ledger is still at 13 and the head is now 19,
+or 20 once M1-359's `020` merges, so the upgrade is to the current head (D54 amends the row).
+The runbook says to run `init-ledger` on the Cup ledger after **every** later migration,
+because the Cup unit otherwise refuses and pages at its next run.
+
+### Deferred (do not read the absence as an omission)
+
+- **Watchdog coverage of the Cup timer.** `deploy/wj-watchdog` hard-codes
+  `RESOLUTIONS_UNIT = "whiskeyjack-resolutions"`. The criterion asks that a *failure* page
+  through the existing notify template, which `OnFailure=` gives. A stopped Cup timer goes
+  quiet instead, as the MiniBench timer did before M1-341. The runbook says so at the point
+  of use.
+- **The live upgrade and install** are an operator step after merge, done behind a verified
+  backup. They are not a test, because CI has no Cup ledger.
+
+### Standing risk — not verifiable offline
+
+Whether the five posted Cup questions come back from Metaculus as resolved observations. The
+platform masks resolutions unless the account predicted (M4-801), and it did predict all five.
+q45572 (Nobel) was due 2026-10-09 and is the first live check.
