@@ -16901,3 +16901,10 @@ first review. It was missed, so it is taken now rather than filed:
   only in how a surrogate pair is spelled are distinct in memory and identical once persisted.
   The replay comparison therefore states its expectation in the persisted form, de-duplicated.
   Live run ids are minted uuid hex, so the collapse cannot happen to them.
+
+### Round 2 — approved
+
+`b889c7b`: APPROVE, and the round-1 candidate is closed. The reviewer re-applied the six mutants
+and saw each rejected in 5 of 5 random runs. It also replayed 17 checkpoint shapes through the
+real comprehension and the journal's serialization: the selection is the same before and after
+the `skipped` change. No new candidates.
