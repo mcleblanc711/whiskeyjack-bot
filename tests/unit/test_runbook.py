@@ -166,7 +166,7 @@ DOCUMENTED_COMMANDS: Final = frozenset(
         "verify-submission",
     }
 )
-DOCUMENTED_INVOCATION_COUNT: Final = 21
+DOCUMENTED_INVOCATION_COUNT: Final = 22
 
 
 def subparsers_of(parser: ArgumentParser) -> dict[str, ArgumentParser]:
