@@ -601,3 +601,23 @@ def test_a_negative_request_count_read_back_is_not_subtracted(tmp_path: Path) ->
     finally:
         conn.close()
     assert (summary.requests, summary.cost_unknown_calls) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"question_id": "7"}, "integer question_id"),
+        ({"question_id": True}, "integer question_id"),
+        ({"question_id": 7, "baseline_run_ids": "run-1"}, "unexpected shape"),
+        ({"question_id": 7, "lens_run_ids": [1]}, "unexpected shape"),
+    ],
+)
+def test_a_malformed_checkpoint_is_refused_as_the_reports_error(
+    tmp_path: Path, payload: dict[str, object], message: str
+) -> None:
+    conn = _checkpoint_ledger(tmp_path, payload)
+    try:
+        with pytest.raises(LensReportError, match=message):
+            lens_report(conn)
+    finally:
+        conn.close()

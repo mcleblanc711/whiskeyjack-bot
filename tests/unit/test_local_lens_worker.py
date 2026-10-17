@@ -31,7 +31,7 @@ from whiskeyjack_bot import tournament as whiskeyjack_tournament
 from whiskeyjack_bot.config import validate_config_data
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.research.packet import canonical_packet_json, packet_sha256
-from whiskeyjack_bot.research.store import load_locales, load_packet
+from whiskeyjack_bot.research.store import load_documents, load_locales, load_packet
 from whiskeyjack_bot.tournament import run_once
 from whiskeyjack_bot.tournament_state import (
     AskNewsSubcapReached,
@@ -209,13 +209,27 @@ def test_enabled_the_lens_runs_after_the_forecast_and_never_reaches_it(enabled_c
     # names only the baseline runs, and the model was shown none of the lens's documents.
     assert not lens_ids & _research_run_ids(conn)
     assert set(event["baseline_run_ids"]) == _research_run_ids(conn)
+    # Positive controls first, so the disjointness below cannot pass on an empty side: the
+    # model was shown baseline documents, and the Exa lens run stored its Iranian page. (The
+    # fake AskNews answers every query with the baseline's own article, so only the Exa URL
+    # is distinct from the baseline.)
     shown = {doc["url"] for request in model.requests for doc in request["research_documents"]}
-    assert "https://mehrnews.com/news/6974299" not in shown
+    assert shown
+    exa_run = next(c["retrieval_run_id"] for c in event["calls"] if c["provider"] == "exa")
+    lens_urls = {document.canonical_url for document in load_documents(conn, exa_run)}
+    assert lens_urls == {"https://www.mehrnews.com/news/6974299"}
+    assert not lens_urls & shown
+    # And the two sides speak the same URL form: a baseline document's stored URL is in `shown`.
+    baseline_urls = {
+        document.canonical_url
+        for run_id in event["baseline_run_ids"]
+        for document in load_documents(conn, run_id)
+    }
+    assert baseline_urls & shown
     # The lens bought what it planned: one Exa search, one AskNews search for local domains.
     assert len(transport.bodies) == 1 and "mehrnews.com" in transport.bodies[0]["includeDomains"]
     assert [("domain_url" in request) for request in news.requests] == [False, True]
     # And recorded locale rows the 1.1.0 packet carries.
-    exa_run = next(c["retrieval_run_id"] for c in event["calls"] if c["provider"] == "exa")
     (row,) = load_locales(conn, exa_run)
     assert (row.locale_code, row.publisher_origin) == ("IR", "local")
     assert load_packet(conn, question_id=row_question(conn), retrieval_run_ids=[exa_run]).locales
