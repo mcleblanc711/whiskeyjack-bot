@@ -193,7 +193,7 @@ _RESPONSES = st.one_of(
 )
 
 
-def _oracle(responses: list[Any], attempted: int) -> float | None:
+def _oracle(responses: list[Any], attempted: int, rate: int) -> float | None:
     if len(responses) < attempted:
         return None
     credits = []
@@ -203,13 +203,13 @@ def _oracle(responses: list[Any], attempted: int) -> float | None:
         if type(value) is not int or not 0 <= value <= MAX_CREDITS:
             return None
         credits.append(value)
-    return sum(credits) * 25_000 / 1_000_000
+    return sum(credits) * rate / 1_000_000
 
 
-@given(st.lists(_RESPONSES, max_size=4), st.integers(0, 5))
+@given(st.lists(_RESPONSES, max_size=4), st.integers(0, 5), st.integers(1, 1_000_000))
 def test_an_asknews_lens_cost_is_the_credits_or_unknown(
-    responses: list[Any], attempted: int
+    responses: list[Any], attempted: int, rate: int
 ) -> None:
-    cost = asknews_cost_usd(responses, attempted)
-    assert cost == _oracle(responses, attempted)
+    cost = asknews_cost_usd(responses, attempted, microusd_per_credit=rate)
+    assert cost == _oracle(responses, attempted, rate)
     assert cost is None or cost >= 0

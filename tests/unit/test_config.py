@@ -262,6 +262,35 @@ def test_social_enabled_with_real_model_accepted(valid_data: dict) -> None:
     assert config.retrieval.social.agent_model == "grok-fixture"
 
 
+# ── M1-353: the AskNews per-credit rate ──────────────────────────────────────
+
+
+def test_the_asknews_rate_defaults_to_the_owner_confirmed_figure(valid_data: dict) -> None:
+    valid_data["retrieval"]["primary"].pop("microusd_per_credit", None)
+    config = validate_config_data(valid_data)
+    assert config.retrieval.primary.microusd_per_credit == 25_000
+
+
+def test_a_configured_asknews_rate_is_read(valid_data: dict) -> None:
+    valid_data["retrieval"]["primary"]["microusd_per_credit"] = 7_919
+    assert validate_config_data(valid_data).retrieval.primary.microusd_per_credit == 7_919
+
+
+@pytest.mark.parametrize("rate", [0, -1, 1_000_001, True, 25_000.0, "25000", None])
+def test_an_asknews_rate_that_is_not_an_exact_int_in_range_is_refused(
+    valid_data: dict, rate: object
+) -> None:
+    """Strict: a float or bool rate would make a settled figure inexact or a credit free."""
+    valid_data["retrieval"]["primary"]["microusd_per_credit"] = rate
+    expect_rejection(valid_data, "microusd_per_credit")
+
+
+def test_a_credit_rate_on_a_provider_that_is_not_asknews_is_refused(valid_data: dict) -> None:
+    """Exa reports its own dollar cost; a rate there would be silently ignored, so refused."""
+    valid_data["retrieval"]["fallback"]["microusd_per_credit"] = 25_000
+    expect_rejection(valid_data, "credit_rate_not_asknews")
+
+
 # ── bounds and enums ─────────────────────────────────────────────────────────
 
 

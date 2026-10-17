@@ -19,7 +19,7 @@ import yaml
 from asknews_sdk.dto.news import Usage
 from test_research_orchestrate import _SDK, _article
 
-from whiskeyjack_bot.config import AppConfig, validate_config_data
+from whiskeyjack_bot.config import AppConfig, RetrievalProviderConfig, validate_config_data
 from whiskeyjack_bot.ledger import connect, initialize_ledger
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 from whiskeyjack_bot.research import asknews, exa
@@ -283,8 +283,9 @@ def _news() -> Any:
     )
 
 
+@pytest.mark.parametrize("rate", [25_000, 7_919], ids=["default rate", "configured rate"])
 def test_run_lens_buys_each_planned_call_and_records_runs_and_locale_rows(
-    config: AppConfig, ledger: sqlite3.Connection
+    config: AppConfig, ledger: sqlite3.Connection, rate: int
 ) -> None:
     config = config.model_copy(
         update={
@@ -292,7 +293,11 @@ def test_run_lens_buys_each_planned_call_and_records_runs_and_locale_rows(
                 update={
                     "local_lens": config.retrieval.local_lens.model_copy(
                         update={"enabled": True, "max_calls_per_question": 2}
-                    )
+                    ),
+                    # M1-353: the lens prices AskNews credits at the configured rate.
+                    "primary": RetrievalProviderConfig.model_validate(
+                        {**config.retrieval.primary.model_dump(), "microusd_per_credit": rate}
+                    ),
                 }
             )
         }
@@ -347,9 +352,9 @@ def test_run_lens_buys_each_planned_call_and_records_runs_and_locale_rows(
     assert uae_run.provider_config["locales"] == ["AE"]
     assert uae_run.provider_config["domains"] == request["domain_url"]
     assert "wam.ae" in uae_run.provider_config["domain_url"]
-    # Cost as the lens saw it: Exa's costDollars, and AskNews's credits at the pinned rate --
-    # the AskNews run row itself carries none, as on the baseline path.
-    assert [run.cost_usd for run in outcome.runs] == [0.007, 0.025]
+    # Cost as the lens saw it: Exa's costDollars, and AskNews's credits at the configured
+    # rate -- the AskNews run row itself carries none, as on the baseline path.
+    assert [run.cost_usd for run in outcome.runs] == [0.007, rate / 1_000_000]
     assert uae_run.cost_usd is None
     (row,) = load_locales(ledger, outcome.runs[0].retrieval_run_id or "")
     assert (row.locale_code, row.publisher_origin) == ("IR", "local")
@@ -554,7 +559,7 @@ def test_the_report_compares_a_lens_document_without_a_locale_row_conservatively
 def test_an_asknews_lens_cost_is_the_settled_credits_or_unknown(
     raw: list[object], attempted: int, expected: float | None
 ) -> None:
-    assert asknews_cost_usd(raw, attempted) == expected
+    assert asknews_cost_usd(raw, attempted, microusd_per_credit=25_000) == expected
 
 
 def _checkpoint_ledger(tmp_path: Path, payload: dict[str, object]) -> sqlite3.Connection:
