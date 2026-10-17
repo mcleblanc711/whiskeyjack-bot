@@ -129,8 +129,14 @@ def test_lens_run_ids_is_replay_stable_through_the_persisted_form(
     except (ValueError, TypeError):
         return
     # Compared in the persisted form: a surrogate pair held as two code units reads back as one
-    # character (M1-306), and the journal only ever hands this function the persisted form.
-    assert list(lens_run_ids(persisted)) == json.loads(json.dumps(list(lens_run_ids(checkpoint))))
+    # character (M1-306), so two ids distinct in memory can become one id on disk, and the
+    # de-duplication then keeps it once. The journal only ever hands this function the
+    # persisted form, so that is the form the expectation is stated in.
+    expected: list[str] = []
+    for run in json.loads(json.dumps(list(lens_run_ids(checkpoint)))):
+        if run not in expected:
+            expected.append(run)
+    assert list(lens_run_ids(persisted)) == expected
 
 
 def test_the_checkpoint_strategy_reaches_both_branches() -> None:

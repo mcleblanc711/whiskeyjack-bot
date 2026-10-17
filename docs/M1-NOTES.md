@@ -16897,3 +16897,7 @@ first review. It was missed, so it is taken now rather than filed:
     appeared about once per run, and the zero-documents mutant survived about half the time.
 
   Each fix is commented in the strategy.
+- **A fourth thing the first full-gate run of the property found:** two run ids that differ
+  only in how a surrogate pair is spelled are distinct in memory and identical once persisted.
+  The replay comparison therefore states its expectation in the persisted form, de-duplicated.
+  Live run ids are minted uuid hex, so the collapse cannot happen to them.
