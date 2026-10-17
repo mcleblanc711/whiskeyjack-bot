@@ -16733,3 +16733,88 @@ budget-settlement tests. The gate passed locally on `a48cc1e` at request generat
 
 After approval, this commit changes only these notes and the backlog row. There is no `src/`
 or test change after the approved commit.
+
+---
+
+## M1-353 — The AskNews per-credit rate is configuration (D41, D54)
+
+**What shipped.**
+- **The field.** `retrieval.primary.microusd_per_credit` is a strict int in micro-USD,
+  between 1 and 1,000,000.
+  - Omitted on an AskNews provider, it is the owner-confirmed 25,000 (USD 0.025).
+  - Any non-null value is refused on any other provider, as is an explicit null on AskNews.
+  - All three committed profiles state 25000.
+- **`research/asknews_cost.py`.** The module constant `MICROUSD_PER_CREDIT` is gone.
+  - `credits_microusd(response, *, microusd_per_credit)` takes the rate.
+  - `microusd_per_credit(config)` reads it.
+  - `news_call_estimate_usd(rate)` replaces the `NEWS_CALL_ESTIMATE_USD` constant.
+- **Every reader threads the rate.**
+  - The adapter: its estimate and its settlement.
+  - The lens: its checkpoint cost.
+  - `tournament correct-costs`: its back-fill, through `_asknews_settlements`.
+
+### Decision — on the provider block, and why
+
+The criterion says the rate belongs "beside the provider it prices". AskNews is only ever
+`retrieval.primary`, because `research/orchestrate.py` refuses any other primary. So the field
+sits on `RetrievalProviderConfig`, and a validator keeps it off Exa: Exa reports
+`costDollars` itself, so a rate there would be silently ignored, and is refused instead.
+
+### Decision — optional, filled by validation, so a dump reloads
+
+The first draft gave the field a plain `int` default and refused it on Exa when it appeared in
+`model_fields_set`. That broke every fixture that round-trips a config through
+`model_dump(mode="json")`, because the dump writes the default onto Exa too, about 40 setup
+errors. Now:
+- after validation an AskNews provider always carries an int and any other provider carries
+  `None`, so a dump reloads to the same model;
+- `microusd_per_credit(config)` maps the one remaining `None` to the same default constant.
+  That case is reachable only through `model_copy`, which skips validators.
+
+### Decision — the estimate is corrected to the exact micro-USD, not divided
+
+`Budget.reserve` takes dollars and ceils `estimate * 1e6`. The old constant estimate
+(`25000 / 1e6`) happened to round-trip. `rate / 1e6` misrounds **11,555** of the
+1,000,000 admitted rates: rate 123 reserves 124. `news_call_estimate_usd` steps the float
+with `nextafter` until it ceils back to exactly `CREDITS_PER_NEWS_CALL * rate`. A test checks
+every admitted rate, and the naive count is pinned, so the case stays visible.
+
+### Rejected — recording the rate on each `cost_settled` event
+
+That would make a settlement auditable without the config. But `cost_settled` is one shape
+shared by every provider, read by `spending`, `series_spending` and the reports, and
+`settle_microusd` takes the micro-USD figure only. The activation's `config_sha256` already
+binds the config the rate came from, and the committed YAML is in git.
+
+### Deferred (do not read the absence as an omission)
+
+- **The back-fill prices held calls at the *configured* rate.** The rate a past call was
+  billed at is not on the journal. That is correct while the configured rate is the only one
+  ever used, which is true today (25,000 since M1-336). The `_asknews_settlements` docstring
+  says so. A rate change plus a back-fill of pre-change calls would need the historical rate,
+  and that would be a new row.
+
+### Standing risk — not verifiable offline
+
+None that is new. Merging this changes `config_sha256` (a new field) and retires the live
+activation until `tournament enable`. It merges between batches, back to back with M1-359,
+so there is one re-enable (D54).
+
+### On the mutation pass
+
+Seven mutants, all killed:
+- settle at the literal 25,000;
+- the adapter estimate at the literal;
+- the naive `exact / 1e6` estimate;
+- the back-fill at the literal;
+- the lens cost at the literal (killed only after `test_run_lens_buys_each_planned_call...`
+  was parametrized over a configured rate; it survived before);
+- the Exa refusal removed;
+- the explicit-null refusal removed.
+
+### Round 1 — approved
+
+`9d7ba0d`: APPROVE, no blocking findings. The reviewer's one backlog candidate is the deferred
+historical-rate limit already recorded above: *"Preserve historical AskNews pricing for
+back-fill"*, so that held calls made under an earlier rate either settle at that rate or refuse
+an ambiguous conversion. It is not filed yet, because the configured rate has never changed.

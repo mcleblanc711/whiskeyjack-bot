@@ -41,6 +41,9 @@ SCOPE = "42:32977"
 UPSTREAM = 0.18273
 PROMPT = [{"role": "user", "content": "the one prompt"}]
 
+# The owner-confirmed AskNews rate (M1-353's default; config.ASKNEWS_DEFAULT_MICROUSD_PER_CREDIT).
+RATE = 25_000
+
 
 def byok_usage(**changes: Any) -> dict[str, Any]:
     """The live Astra ``usage`` shape; ``changes`` overrides keys, None deletes one."""
@@ -328,7 +331,7 @@ def test_correct_costs_is_a_dry_run_until_applied_then_idempotent(case: Any) -> 
     before = spending(conn, SCOPE)
     assert before == (250_000, 0)
 
-    dry = correct_costs(conn)
+    dry = correct_costs(conn, microusd_per_credit=RATE)
     assert dry.as_dict(applied=False) == {
         "applied": False,
         "reservations": 1,
@@ -345,13 +348,13 @@ def test_correct_costs_is_a_dry_run_until_applied_then_idempotent(case: Any) -> 
     assert [c.reservation_id for c in dry.corrections] == [byok]
     assert _corrected(conn) == 0 and spending(conn, SCOPE) == before
 
-    applied = correct_costs(conn, apply=True)
+    applied = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert applied.written == 1 and _corrected(conn) == 1
     assert spending(conn, SCOPE) == (250_000 + 182_730, 0)
     (row,) = events(conn, "cost_corrected", SCOPE)
     assert row == {"reservation_id": byok, "actual_microusd": 182_730, "basis": "upstream_byok"}
 
-    again = correct_costs(conn, apply=True)
+    again = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert (again.written, again.already_corrected, again.corrections) == (0, 1, ())
     assert _corrected(conn) == 1, "a second run must write no second correction"
     assert spending(conn, SCOPE) == (432_730, 0)
@@ -372,11 +375,11 @@ def test_the_write_rechecks_the_guard_inside_its_transaction(case: Any, monkeypa
         if not raced:
             monkeypatch.setattr(tournament_state, "_correction", real)
             with connect(config.storage.sqlite_path) as other:
-                raced.append(correct_costs(other, apply=True).written)
+                raced.append(correct_costs(other, microusd_per_credit=RATE, apply=True).written)
         return found
 
     monkeypatch.setattr(tournament_state, "_correction", plan_then_race)
-    report = correct_costs(conn, apply=True)
+    report = correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert raced == [1]
     assert len(report.corrections) == 1 and report.written == 0
     assert _corrected(conn) == 1
@@ -411,7 +414,7 @@ def test_status_reports_actual_spend_including_corrections(case: Any) -> None:
     conn, config, *_ = case
     _settle(conn, config, 0.0, byok_usage())
     assert status(conn, config)["actual_cost_usd"] == 0
-    correct_costs(conn, apply=True)
+    correct_costs(conn, microusd_per_credit=RATE, apply=True)
     assert status(conn, config)["actual_cost_usd"] == 0.18273
 
 
@@ -438,7 +441,7 @@ def test_a_malformed_stored_settlement_refuses_the_correction_run(case: Any) -> 
     conn, *_ = case
     append(conn, "cost_settled", SCOPE, {"reservation_id": "r"})
     with pytest.raises(StorageFailure, match="^cannot read tournament spending$"):
-        correct_costs(conn)
+        correct_costs(conn, microusd_per_credit=RATE)
 
 
 # --- The command ------------------------------------------------------------------------

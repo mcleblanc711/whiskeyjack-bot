@@ -765,7 +765,9 @@ def _correction(conn: sqlite3.Connection, scope: str, identifier: str) -> CostCo
     return CostCorrection(scope, identifier, amount)
 
 
-def correct_costs(conn: sqlite3.Connection, *, apply: bool = False) -> CorrectionReport:
+def correct_costs(
+    conn: sqlite3.Connection, *, microusd_per_credit: int, apply: bool = False
+) -> CorrectionReport:
     """Correct every reservation settled at 0 that has a valid upstream BYOK figure (M1-348).
 
     Dry run unless ``apply``. Append-only: each correction is a ``cost_corrected`` event in
@@ -812,7 +814,7 @@ def correct_costs(conn: sqlite3.Connection, *, apply: bool = False) -> Correctio
                 )
                 append(conn, "cost_corrected_id", correction.reservation_id, {})
                 written += 1
-    settlements, asknews_refused = _asknews_settlements(conn)
+    settlements, asknews_refused = _asknews_settlements(conn, microusd_per_credit)
     asknews_written = 0
     if apply:
         for settlement in settlements:
@@ -857,7 +859,7 @@ def _journal_rows(conn: sqlite3.Connection, kind: str) -> list[tuple[Any, Any]]:
 
 
 def _asknews_settlements(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection, microusd_per_credit: int
 ) -> tuple[tuple[AskNewsSettlement, ...], int]:
     """Every held AskNews reservation with a stored credit count, and how many had none (M1-336).
 
@@ -867,6 +869,11 @@ def _asknews_settlements(
     response, ``usage.credits`` included. This reads only the journal -- no network call --
     and converts with the same :func:`credits_microusd` the adapter settles with today, so a
     back-filled settlement is exactly the one a live call would have written.
+
+    At the **configured** rate (M1-353): the rate a held call was billed at is not on the
+    journal, so the back-fill is correct only while the configured rate is the one those
+    calls were made under. Every AskNews call to date was billed at 25,000 micro-USD per
+    credit, the only rate ever configured.
 
     Refused, and left held: a reservation with no single ``retrieval_started`` naming it, a
     call scope without exactly one ``retrieval_completed`` (the outcome is unknown), or a
@@ -894,7 +901,7 @@ def _asknews_settlements(
         calls = started.get(identifier, [])
         completed = events(conn, "retrieval_completed", calls[0]) if len(calls) == 1 else []
         amount = (
-            credits_microusd(completed[0].get("response"))
+            credits_microusd(completed[0].get("response"), microusd_per_credit=microusd_per_credit)
             if len(completed) == 1 and type(completed[0]) is dict
             else None
         )

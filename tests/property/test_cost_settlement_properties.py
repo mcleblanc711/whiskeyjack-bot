@@ -96,6 +96,9 @@ LIVE_SHAPE = st.builds(
 # in it was measured at 17 valid-BYOK draws in 400.
 USAGE = st.integers(0, 3).flatmap(lambda pick: (LIVE_SHAPE, LIVE_SHAPE, STRUCTURED, ANY_JSON)[pick])
 
+# The owner-confirmed AskNews rate (M1-353's default; config.ASKNEWS_DEFAULT_MICROUSD_PER_CREDIT).
+RATE = 25_000
+
 
 def _valid(value: object) -> bool:
     """The oracle, written independently of the implementation's helper."""
@@ -282,12 +285,12 @@ def test_a_correction_is_exact_replay_stable_and_idempotent(
         before = spending(conn, SCOPE)
         rows = conn.execute("SELECT count(*) FROM tournament_events").fetchone()[0]
 
-        dry = correct_costs(conn)
+        dry = correct_costs(conn, microusd_per_credit=RATE)
         assert {c.reservation_id: c.actual_microusd for c in dry.corrections} == expected
         assert dry.written == 0
         assert conn.execute("SELECT count(*) FROM tournament_events").fetchone()[0] == rows
 
-        applied = correct_costs(conn, apply=True)
+        applied = correct_costs(conn, microusd_per_credit=RATE, apply=True)
         assert applied.written == len(expected) == _rows(conn, "cost_corrected")
         # Replay-stable: each correction is what the rule re-derives from the stored form.
         for row in events(conn, "cost_corrected", SCOPE):
@@ -298,7 +301,7 @@ def test_a_correction_is_exact_replay_stable_and_idempotent(
         after = spending(conn, SCOPE)
         assert after == (before[0] + sum(expected.values()), before[1])
 
-        again = correct_costs(conn, apply=True)
+        again = correct_costs(conn, microusd_per_credit=RATE, apply=True)
         assert again.written == 0 and again.corrections == ()
         assert again.already_corrected == len(expected)
         assert _rows(conn, "cost_corrected") == len(expected)
@@ -341,7 +344,7 @@ def test_actual_spending_never_decreases_over_appends(
                 elif operation == "response":
                     append(conn, "model_response", target, {"usage": value})
                 elif operation == "correct":
-                    correct_costs(conn, apply=True)
+                    correct_costs(conn, microusd_per_credit=RATE, apply=True)
                 else:
                     append(
                         conn,

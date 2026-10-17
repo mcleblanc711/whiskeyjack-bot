@@ -2127,7 +2127,7 @@ def _run_show(args: argparse.Namespace) -> int:
         connection.close()
 
 
-def _correct_costs(path: Path, *, apply: bool) -> int:
+def _correct_costs(path: Path, *, microusd_per_credit: int, apply: bool) -> int:
     """``tournament correct-costs`` (M1-348): no activation, no network, no config binding.
 
     The dry run opens the ledger with ``connect_readonly`` -- it must be safe to run against
@@ -2140,7 +2140,7 @@ def _correct_costs(path: Path, *, apply: bool) -> int:
 
     connection = open_verified_ledger(path) if apply else connect_readonly(path)
     try:
-        report = correct_costs(connection, apply=apply)
+        report = correct_costs(connection, microusd_per_credit=microusd_per_credit, apply=apply)
     finally:
         connection.close()
     print(json.dumps(report.as_dict(applied=apply), indent=2))
@@ -2164,7 +2164,13 @@ def _run_tournament(args: argparse.Namespace) -> int:
         if args.tournament_command == "enable":
             initialize_ledger(config.storage.sqlite_path)
         if args.tournament_command == "correct-costs":
-            return _correct_costs(config.storage.sqlite_path, apply=args.apply)
+            from whiskeyjack_bot.research.asknews_cost import microusd_per_credit
+
+            return _correct_costs(
+                config.storage.sqlite_path,
+                microusd_per_credit=microusd_per_credit(config),
+                apply=args.apply,
+            )
         connection = open_verified_ledger(config.storage.sqlite_path)
         try:
             if args.tournament_command == "enable":
