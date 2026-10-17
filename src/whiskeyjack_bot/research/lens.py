@@ -332,13 +332,14 @@ def asknews_cost_usd(raw_responses: Sequence[object], attempted: int) -> float |
 
     The same figure ``complete_call`` settles the reservation from (M1-336); the run row's
     ``cost_usd`` stays ``None`` for AskNews, as on the baseline path, so the lens records it on
-    its checkpoint instead. Unknown is never free: ``None`` unless every attempted request
-    returned a response whose credits convert. No request attempted (a refused reservation)
-    is ``0.0``.
+    its checkpoint instead. Unknown is never free: ``None`` if any attempted request has no
+    response, or any response's credits do not convert.
+
+    A response replayed from the durable call journal counts too. It was billed once, by a pass
+    that died before writing its checkpoint -- the checkpoint guard makes a replay reachable
+    only then -- so this checkpoint is the only one that will ever carry that spend.
     """
-    if attempted == 0:
-        return 0.0
-    if len(raw_responses) != attempted:
+    if len(raw_responses) < attempted:
         return None
     total = 0
     for response in raw_responses:

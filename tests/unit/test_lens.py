@@ -541,6 +541,7 @@ def test_the_report_compares_a_lens_document_without_a_locale_row_conservatively
     ("raw", "attempted", "expected"),
     [
         ([], 0, 0.0),  # a refused reservation bought nothing
+        ([{"usage": {"credits": 1}}], 0, 0.025),  # replayed: billed by a pass that left no record
         ([{"usage": {"credits": 1}}], 1, 0.025),
         ([{"usage": {"credits": 1}}, {"usage": {"credits": 5}}], 2, 0.15),
         ([{"usage": {"credits": 1}}, {"usage": {}}], 2, None),  # one unknown: all unknown
