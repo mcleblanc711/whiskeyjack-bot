@@ -267,6 +267,24 @@ class SocialRetrievalConfig(_StrictModel):
         return self
 
 
+class LocalLensConfig(_StrictModel):
+    """The local-source lens (M1-358, D53): extra retrieval aimed at publishers based in the
+    places a question is about. **Collect-only** in this phase -- lens runs never enter the
+    packet a submitted forecast is built from.
+
+    Disabled by default, and every committed config ships it disabled. The field exists in
+    ``AppConfig`` (and so in ``config_sha256``) on purpose: whether the lens ran is part of
+    what an activation authorized, so turning it on is an owner action that re-enables the
+    tournament, not a silent switch.
+    """
+
+    enabled: bool = False
+    registry_path: Path = Path("config/locales.yaml")
+    # Lens calls per question. Each is one AskNews credit or one Exa search; the cap bounds
+    # what a cross-border question (Hormuz: Iran, Oman, the UAE) can buy.
+    max_calls_per_question: int = Field(default=2, ge=1, le=4)
+
+
 class RetrievalConfig(_StrictModel):
     primary: RetrievalProviderConfig
     fallback: RetrievalProviderConfig
@@ -278,6 +296,7 @@ class RetrievalConfig(_StrictModel):
     deduplicate_by: list[Literal["canonical_url", "content_sha256"]] = Field(min_length=1)
     structured_sources_enabled: bool = True
     social: SocialRetrievalConfig
+    local_lens: LocalLensConfig = Field(default_factory=LocalLensConfig)
 
 
 # Spec (CODEX_HANDOFF.md § Configuration schema): 0.001 <= min < max <= 0.999. Named

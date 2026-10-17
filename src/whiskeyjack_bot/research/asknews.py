@@ -345,6 +345,22 @@ def _to_document(article: Any, *, retrieval_run_id: str, retrieved_at: datetime)
     }
 
 
+@dataclass(frozen=True)
+class LensRequest:
+    """What the local-source lens adds to one AskNews call (M1-358).
+
+    ``domains`` become the request's ``domain_url``: the lens asks for the locale's local
+    publishers, never for a language. That is the owner's correction of 2026-10-16 -- the target
+    is publishers based in the place, and a language filter would both admit foreign services
+    in that language and drop local outlets that publish in English. ``record`` is the lens's
+    account of why the call was made (``research.lens.lens_record``), merged flat into the
+    run's ``provider_config`` so the packet hash covers it.
+    """
+
+    domains: tuple[str, ...]
+    record: dict[str, Any]
+
+
 def retrieve_news(
     client: AskNewsSDK,
     config: AppConfig,
@@ -353,8 +369,16 @@ def retrieve_news(
     queries: Sequence[str],
     retrieval_run_id: str,
     now: datetime,
+    lens: LensRequest | None = None,
 ) -> AskNewsRetrieval:
     """Retrieve current news for ``queries`` as normalized documents.
+
+    ``lens`` is the local-source lens's addition (M1-358, D53) and is ``None`` on every
+    baseline call, which then sends, reserves and records exactly what it did before the
+    lens existed -- the request dict, and therefore the durable reservation scope that digests
+    it, and the run's ``provider_config``. With a lens, the request gains ``domain_url`` (the
+    locale's local publishers) and the run's ``provider_config`` gains the lens's own record
+    of why it ran; see :class:`LensRequest`.
 
     **Current only since M1-352.** The historical ("news knowledge") pass is no longer
     issued; see ``_STRATEGIES``. Stored runs from before that change still record both.
@@ -449,6 +473,8 @@ def retrieve_news(
                 "hours_back": hours_back,
                 "historical": strategy == _STRATEGY_HISTORICAL,
             }
+            if lens is not None:
+                request["domain_url"] = list(lens.domains)
             try:
                 call_scope, cached = begin_call(
                     "asknews",
@@ -546,6 +572,7 @@ def retrieve_news(
                 "n_articles": retrieval.max_documents_per_query,
                 "hours_back": hours_back,
                 "return_type": "dicts",
+                **({} if lens is None else {"domain_url": list(lens.domains), **lens.record}),
             },
             "queries": capped_queries,
             "started_at_utc": now_utc,

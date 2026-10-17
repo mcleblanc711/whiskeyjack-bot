@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, get_args
+from typing import TYPE_CHECKING, Any, Final, get_args
 from uuid import uuid4
 
 from whiskeyjack_bot.approval import approve
@@ -83,6 +84,11 @@ from whiskeyjack_bot.tournament_state import (
 # Split, rather than gating on "any failure", because a provider outage must not
 # permanently retire a question -- and gated on the question FINGERPRINT, so an edited
 # question is a new question and qualifies again.
+if TYPE_CHECKING:
+    from whiskeyjack_bot.questions.model import CanonicalQuestion
+
+_LOGGER = logging.getLogger(__name__)
+
 DETERMINISTIC_FAILURE_CODES: Final = frozenset(
     {"no_evidence", "stale_evidence", "schema_invalid", "calibration_invalid"}
 )
@@ -687,6 +693,99 @@ def _recent_question_failures(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return found
 
 
+# Wall-clock bound for one question's lens calls (M1-358). Its own phase, after the
+# question's: `phase_timeout` cannot nest, and the lens must never eat the forecast's time.
+LENS_TIMEOUT_SECONDS: Final = 120
+
+
+def _collect_local_lens(
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    *,
+    budget: Budget,
+    question: CanonicalQuestion,
+    now: datetime,
+    fingerprint: str,
+    news_client: Any | None,
+    web_client: Any | None,
+) -> None:
+    """Run the local-source lens once for the research this poll bought (M1-358, D53).
+
+    **Collect-only, and never fatal.** It runs after the question's forecast, approval and
+    post are done, under the same budget, in its own time bound. It writes lens runs and one
+    ``local_lens_checkpoint`` event; it never touches ``research_checkpoint``, so the forecast's
+    packet is unchanged. Every exception -- a missing registry, a refused reservation, a
+    provider or ledger failure, the time bound -- is logged by class and recorded on the
+    checkpoint, and the question loop continues. The class is recorded, not the message: the
+    message of a third-party error can quote a request.
+
+    **Once per research checkpoint.** The lens is due only for the ``research_checkpoint`` this
+    poll's ``now`` names, and a ``local_lens_checkpoint`` already written for that ``now`` makes
+    a retry within the same window a no-op -- the lens is bought once per bought research.
+    """
+    from whiskeyjack_bot.research.lens import LensProgress, run_lens
+    from whiskeyjack_bot.research.locales import load_registry
+
+    at = now.isoformat()
+    research = [e for e in events(conn, "research_checkpoint", fingerprint) if e.get("at") == at]
+    if not research:
+        return
+    if any(e.get("at") == at for e in events(conn, "local_lens_checkpoint", fingerprint)):
+        return
+    payload: dict[str, Any] = {
+        "at": at,
+        "question_id": question.question_id,
+        "baseline_run_ids": list(research[-1].get("run_ids", [])),
+    }
+    # Owned here, not by run_lens, so what completed before an exception still reaches the
+    # checkpoint (round 1, B1): this is the only checkpoint this research will get.
+    progress = LensProgress(question.question_id)
+    try:
+        registry = load_registry(config.retrieval.local_lens.registry_path)
+        payload["registry_sha256"] = registry.sha256
+        with budget_context(budget), phase_timeout(LENS_TIMEOUT_SECONDS):
+            run_lens(
+                conn,
+                config,
+                question=question,
+                now=now,
+                registry=registry,
+                baseline_run_ids=payload["baseline_run_ids"],
+                news_client=news_client,
+                web_client=web_client,
+                progress=progress,
+            )
+    except Exception as exc:
+        payload["error_type"] = type(exc).__name__
+        _LOGGER.warning(
+            "local-source lens failed for question %d (%s); the forecast is unaffected",
+            question.question_id,
+            type(exc).__name__,
+        )
+    outcome = progress.outcome()
+    payload["lens_run_ids"] = list(outcome.retrieval_run_ids)
+    payload["elapsed_seconds"] = outcome.elapsed_seconds
+    payload["calls"] = [
+        {
+            "locale": run.locale_code,
+            "provider": run.provider,
+            "retrieval_run_id": run.retrieval_run_id,
+            "documents": run.documents,
+            "locales": run.locales,
+            "requests": run.calls,
+            "cost_usd": run.cost_usd,
+            "provider_failed": run.provider_failed,
+            "skipped": run.skipped,
+            "interrupted": run.interrupted,
+        }
+        for run in outcome.runs
+    ]
+    try:
+        append(conn, "local_lens_checkpoint", fingerprint, payload)
+    except Exception as exc:
+        _LOGGER.warning("local-source lens checkpoint not recorded (%s)", type(exc).__name__)
+
+
 def run_once(
     conn: sqlite3.Connection,
     config: AppConfig,
@@ -1108,6 +1207,21 @@ def run_once(
                     # window (`PricedClient`'s repeat guard), so pacing it spends nothing
                     # differently; what it stops is a failed poll every five minutes.
                     _append_retry_wait(conn, scope, fingerprint, activation, window_start)
+            if clients is not None and config.retrieval.local_lens.enabled:
+                # Outside the question's try/except on purpose: a lens failure is not a
+                # question failure, and nothing the lens does may be recorded as one. Whether
+                # this poll bought research the lens may follow is _collect_local_lens's
+                # question: only a research checkpoint at this poll's `now` qualifies.
+                _collect_local_lens(
+                    conn,
+                    config,
+                    budget=budget,
+                    question=question,
+                    now=now,
+                    fingerprint=fingerprint,
+                    news_client=clients[1],
+                    web_client=clients[2],
+                )
             heartbeat["at"] = utcnow().isoformat()
             append(conn, "heartbeat", "worker", heartbeat)
         heartbeat["complete"] = True

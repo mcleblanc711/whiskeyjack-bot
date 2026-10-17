@@ -78,6 +78,13 @@ retrieval:
     max_agent_calls_per_question: 2
     max_posts_per_call: 25
     est_cost_per_tool_call_usd: 0.005
+  # Local-source lens (M1-358, D53): extra retrieval aimed at publishers based in the places a
+  # question is about. Collect-only -- lens runs never reach the submitted forecast. Part of
+  # config_sha256, so turning it on retires the activation until `tournament enable`.
+  local_lens:
+    enabled: false
+    registry_path: config/locales.yaml
+    max_calls_per_question: 2
 forecast:
   supported_question_types:
   - binary
