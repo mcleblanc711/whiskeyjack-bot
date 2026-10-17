@@ -3650,3 +3650,10 @@ no pending approval moves.
   well-formed wrong digest was almost never drawn. The shipped strategy draws each failure
   shape on purpose, including the digest of a different real CDF. Measured reach is about 30%
   accepted and about 47% refused (lesson 5).
+
+### Round 1 — approved
+
+`1d69716`: APPROVE, no blocking findings and no backlog candidates. Every risk area was checked
+safe. The reviewer's sandbox had no writable temp directory, so it read but did not rerun the
+filesystem-dependent tests, the posted-artifact positive control among them. They pass in the
+local gate.
