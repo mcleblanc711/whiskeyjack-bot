@@ -318,15 +318,24 @@ limits you set once (D51). You enable a **series**, not a project:
 
 ```bash
 uv run whiskeyjack-bot tournament enable --config config/tournament.yaml \
-  --project-id '<current project id>' --starts '<UTC ISO timestamp>' --ends '<UTC ISO timestamp>' \
-  --budget-usd 40 --series-budget-usd 80 --asknews-budget-usd '<USD>' \
+  --project-id '<metaculus.tournament.id>' --starts '<UTC ISO timestamp>' \
+  --ends '<UTC ISO timestamp>' --budget-usd 40 --series-budget-usd 80 --asknews-budget-usd '<USD>' \
   --series-ends '<UTC ISO timestamp>'
 ```
 
-`--project-id` must equal `metaculus.tournament.id`; that is the series' first project, bound as
-yours (`bound_by: owner`). `--series-budget-usd` is the ceiling across **every** project the
-series binds, at most USD 80, counted only from this command — spend already on the ledger does
-not count. `--budget-usd` is each project's own ceiling and may not exceed the series'. The
+`--project-id` must equal `metaculus.tournament.id`, which is the series' first project. It is
+bound as yours (`bound_by: owner`).
+- This holds **even when MiniBench has since moved on** to a later project. `enable` refuses any
+  other id with `activation requires the concrete configured project ID`.
+- You do not need to edit the config to the current project. At the start of the next poll, the
+  worker follows the slug to the current project (`series follow: rebound`) and forecasts there
+  in the same poll.
+
+`--series-budget-usd` is the ceiling across **every** project the series binds, at most USD 80,
+counted only from this command — spend already on the ledger does not count. **Every `enable`
+in follow mode starts a new series**, so its ceiling starts again from zero. To keep an overall
+total across a re-enable, pass what the old series has left (`tournament status` →
+`series.remaining_budget_usd`), not the full ceiling. `--budget-usd` is each project's own ceiling and may not exceed the series'. The
 activation window must end by `--series-ends`. `--asknews-budget-usd` is required with the
 series: see [the AskNews sub-cap](#the-asknews-sub-cap-and-the-exa-degrade-m1-355).
 
@@ -1240,6 +1249,33 @@ you are running has stopped running.
 
 **Recovery.** Re-run `tournament enable` for the affected profile, with the `--config` that
 profile uses, and re-enable its timer. Nothing else clears it.
+
+**A following profile** (`metaculus.tournament.follow` set, M1-354) is re-enabled with the
+series command in [P3](#follow-mode--the-worker-re-points-itself-m1-354), not the single-project
+one. Three things differ from what you might expect:
+
+- **`--project-id` is `metaculus.tournament.id`**, the series' first project, not the project
+  the worker is on now. Anything else is refused with
+  `activation requires the concrete configured project ID`. The next poll logs
+  `series follow: rebound` and moves back to the current project by itself.
+- **It starts a new series**, whose ceiling counts from zero. To keep the old total, pass the old
+  series' `remaining_budget_usd` from `tournament status` as `--series-budget-usd`.
+- **`--asknews-budget-usd` is required.** A series enabled before M1-355 had no AskNews sub-cap;
+  the re-enable is where it gets one.
+
+Worked example, 2026-10-17. Merging M1-358 added an `AppConfig` field and retired the activation
+on project 33132; `metaculus.tournament.id` was 33125, and the old series had USD 66.77 left:
+
+```bash
+uv run whiskeyjack-bot tournament enable --config config/tournament.yaml \
+  --project-id 33125 --starts 2026-10-17T13:00:00Z --ends 2026-11-06T00:00:00Z \
+  --budget-usd 40 --series-budget-usd 66.77 --asknews-budget-usd 10 \
+  --series-ends 2027-01-01T00:00:00Z
+```
+
+The 08:00 MDT poll refused, as expected before the re-enable. The 08:05 poll logged
+`series follow: rebound` and was on 33132 under the new series. A first attempt with
+`--project-id 33132` was refused before writing anything.
 
 **Never.** Do not reach into `tournament_events` to re-point the stored digests at the current
 config. That row is the evidence that a human authorized *this* configuration to spend money
