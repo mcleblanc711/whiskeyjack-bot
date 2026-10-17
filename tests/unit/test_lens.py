@@ -589,3 +589,15 @@ def test_a_malformed_call_list_is_refused_as_the_reports_error(
             lens_report(conn)
     finally:
         conn.close()
+
+
+def test_a_negative_request_count_read_back_is_not_subtracted(tmp_path: Path) -> None:
+    conn = _checkpoint_ledger(
+        tmp_path,
+        {"question_id": 7, "calls": [{"requests": 1, "cost_usd": 0.025}, {"requests": -5}]},
+    )
+    try:
+        (summary,) = lens_report(conn).questions
+    finally:
+        conn.close()
+    assert (summary.requests, summary.cost_unknown_calls) == (1, 0)

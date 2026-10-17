@@ -7,6 +7,9 @@
 - ``locale_rows`` is total over arbitrary (untrusted) provider bodies: it never raises, gives
   every document exactly one row, and every value in a row -- labels included -- is text the
   ledger can store and read back.
+- ``asknews_cost_usd`` is total over arbitrary response bodies and agrees with a hand-written
+  oracle: the sum of the credits at the pinned rate when every attempted request has a response
+  and every response's credits convert, otherwise ``None`` -- never a guessed zero.
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ from hypothesis import given, strategies as st
 from strategies import HOSTILE_TEXT
 
 from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
-from whiskeyjack_bot.research.lens import LensCall, locale_rows, plan
+from whiskeyjack_bot.research.asknews_cost import MAX_CREDITS
+from whiskeyjack_bot.research.lens import LensCall, asknews_cost_usd, locale_rows, plan
 from whiskeyjack_bot.research.locales import build_registry
 from whiskeyjack_bot.research.model import validate_document
 
@@ -164,3 +168,48 @@ def test_locale_rows_never_raise_and_describe_only_given_documents(
         assert row.publisher_origin == (
             "local" if row.canonical_url.startswith("https://timesofoman.com") else "unclassified"
         )
+
+
+_JSON = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.floats() | st.text(max_size=4),
+    lambda inner: (
+        st.lists(inner, max_size=3) | st.dictionaries(st.text(max_size=8), inner, max_size=3)
+    ),
+    max_leaves=6,
+)
+_CREDITS = st.one_of(
+    st.integers(0, MAX_CREDITS),  # valid, and most draws: the summing branch is reached
+    st.integers(0, MAX_CREDITS),
+    st.integers(),
+    st.booleans(),
+    st.floats(),
+    _JSON,
+)
+_RESPONSES = st.one_of(
+    st.builds(lambda credits: {"usage": {"credits": credits}}, _CREDITS),
+    st.builds(lambda credits: {"usage": {"credits": credits}}, st.integers(0, MAX_CREDITS)),
+    st.builds(lambda usage: {"usage": usage}, _JSON),
+    _JSON,
+)
+
+
+def _oracle(responses: list[Any], attempted: int) -> float | None:
+    if len(responses) < attempted:
+        return None
+    credits = []
+    for response in responses:
+        usage = response.get("usage") if type(response) is dict else None
+        value = usage.get("credits") if type(usage) is dict else None
+        if type(value) is not int or not 0 <= value <= MAX_CREDITS:
+            return None
+        credits.append(value)
+    return sum(credits) * 25_000 / 1_000_000
+
+
+@given(st.lists(_RESPONSES, max_size=4), st.integers(0, 5))
+def test_an_asknews_lens_cost_is_the_credits_or_unknown(
+    responses: list[Any], attempted: int
+) -> None:
+    cost = asknews_cost_usd(responses, attempted)
+    assert cost == _oracle(responses, attempted)
+    assert cost is None or cost >= 0

@@ -152,7 +152,11 @@ def _summarize(conn: sqlite3.Connection, event: dict[str, Any]) -> QuestionLens:
     verdicts = classify(baseline, lens)
     groups = clusters(lens)
     independent = independent_reports(baseline, lens)
-    requests = sum(call["requests"] for call in calls if type(call.get("requests")) is int)
+    requests = sum(
+        call["requests"]
+        for call in calls
+        if type(call.get("requests")) is int and call["requests"] >= 0
+    )
     cost = 0.0
     unknown = 0
     for call in calls:
