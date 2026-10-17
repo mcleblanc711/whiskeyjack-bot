@@ -484,3 +484,68 @@ def test_a_missing_token_fails_the_unit_before_any_request(
 
     assert run_unit(config_file) == [("ingest-resolutions", EXIT_ENV_MISSING)]
     assert wire.gets == [] and wire.reached == []
+
+
+# ── the Cup ledger upgrade waits for a verified backup (M4-806, round 1) ──────
+
+
+def _cup_upgrade_block() -> str:
+    """The runbook's Cup upgrade block, exactly as an operator would paste it."""
+    text = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    start = text.index("#### The Cup resolution schedule")
+    # Up to the next heading, so a later section's code block cannot be picked up.
+    end = min(i for i in (text.find("\n### ", start), text.find("\n#### ", start + 1)) if i > 0)
+    section = text[start:end]
+    blocks = section.split("```bash\n")[1:]
+    (block,) = [b.split("```", 1)[0] for b in blocks if "init-ledger" in b.split("```", 1)[0]]
+    return block
+
+
+@pytest.mark.parametrize(
+    ("backup", "integrity", "reached"),
+    [
+        pytest.param("ok", "ok", True, id="verified backup: the upgrade runs"),
+        pytest.param("fail", "ok", False, id="backup write fails"),
+        pytest.param("ok", "*** in database main ***", False, id="integrity check not ok"),
+        pytest.param("ok", "", False, id="integrity check prints nothing"),
+    ],
+)
+def test_the_cup_upgrade_runs_only_behind_a_verified_backup(
+    tmp_path: Path, backup: str, integrity: str, reached: bool
+) -> None:
+    """Round 1's blocker, as an execution: the block is run by bash with ``sqlite3`` and the
+    interpreter replaced by shims, so what is measured is the block's own control flow. The
+    first case is the positive control -- without it, a block that never upgrades passes."""
+    import subprocess
+
+    shims, home, work = tmp_path / "bin", tmp_path / "home", tmp_path / "work"
+    (work / ".venv" / "bin").mkdir(parents=True)
+    shims.mkdir()
+    home.mkdir()
+    marker = tmp_path / "init-ledger-reached"
+    sqlite3 = shims / "sqlite3"
+    sqlite3.write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        f"  .backup*) [ {backup!r} = ok ] || exit 1 ;;\n"
+        f"  PRAGMA*) printf '%s\\n' {integrity!r} ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    python = work / ".venv" / "bin" / "python"
+    python.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    systemctl = shims / "systemctl"
+    systemctl.write_text("#!/bin/sh\necho disabled\n", encoding="utf-8")
+    for shim in (sqlite3, python, systemctl):
+        shim.chmod(0o755)
+    block = _cup_upgrade_block().replace("cd ~/projects/whiskeyjack-bot\n", "")
+    completed = subprocess.run(
+        ["bash", "-c", block],
+        cwd=work,
+        env={"HOME": str(home), "PATH": f"{shims}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert marker.exists() is reached, completed.stderr
+    assert ("UPGRADED" in completed.stdout) is reached
+    assert ("STOPPED" in completed.stderr) is not reached

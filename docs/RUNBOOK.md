@@ -869,10 +869,22 @@ nothing else is writing it:
 ```bash
 cd ~/projects/whiskeyjack-bot
 systemctl --user is-enabled whiskeyjack-tournament-cup.timer        # expect: disabled
-ts=$(date -u +%Y%m%dT%H%M%SZ)
-sqlite3 data/cup/ledger.sqlite3 ".backup '$HOME/whiskeyjack-backups/cup-pre-init-$ts.sqlite3'"
-sqlite3 "$HOME/whiskeyjack-backups/cup-pre-init-$ts.sqlite3" "PRAGMA integrity_check"   # ok
-.venv/bin/python -m whiskeyjack_bot.cli init-ledger --config config/tournament-cup.yaml
+mkdir -p "$HOME/whiskeyjack-backups"
+backup="$HOME/whiskeyjack-backups/cup-pre-init-$(date -u +%Y%m%dT%H%M%SZ).sqlite3"
+if sqlite3 data/cup/ledger.sqlite3 ".backup '$backup'" \
+   && [ "$(sqlite3 "$backup" 'PRAGMA integrity_check')" = ok ] \
+   && .venv/bin/python -m whiskeyjack_bot.cli init-ledger --config config/tournament-cup.yaml; then
+  echo "UPGRADED behind verified backup $backup"
+else
+  echo "STOPPED: no verified backup, or init-ledger failed. Do not install the units." >&2
+fi
+```
+
+The upgrade runs **only** if the backup was written and `integrity_check` printed exactly `ok`
+(`tests/unit/test_deploy_resolutions_unit.py` runs this block with a failing backup and checks
+that `init-ledger` is never reached). Continue only after `UPGRADED`:
+
+```bash
 .venv/bin/python -m whiskeyjack_bot.cli tournament status --config config/tournament-cup.yaml
                                                                     # still retired / disabled
 cp deploy/systemd/whiskeyjack-resolutions-cup.service deploy/systemd/whiskeyjack-resolutions-cup.timer \
