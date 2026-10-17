@@ -54,7 +54,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from whiskeyjack_bot.research.asknews import LensRequest, retrieve_news
-from whiskeyjack_bot.research.asknews_cost import credits_microusd
+from whiskeyjack_bot.research.asknews_cost import credits_microusd, microusd_per_credit
 from whiskeyjack_bot.research.exa import retrieve_web
 from whiskeyjack_bot.research.locales import LocaleEntry, LocaleRegistry, detect, publisher_origin
 from whiskeyjack_bot.research.model import (
@@ -364,7 +364,9 @@ def lens_record(
     }
 
 
-def asknews_cost_usd(raw_responses: Sequence[object], attempted: int) -> float | None:
+def asknews_cost_usd(
+    raw_responses: Sequence[object], attempted: int, *, microusd_per_credit: int
+) -> float | None:
     """What a lens AskNews call billed, from each response's own ``usage.credits``.
 
     The same figure ``complete_call`` settles the reservation from (M1-336); the run row's
@@ -380,7 +382,7 @@ def asknews_cost_usd(raw_responses: Sequence[object], attempted: int) -> float |
         return None
     total = 0
     for response in raw_responses:
-        microusd = credits_microusd(response)
+        microusd = credits_microusd(response, microusd_per_credit=microusd_per_credit)
         if microusd is None:
             return None
         total += microusd
@@ -454,7 +456,7 @@ def run_lens(
             run, documents, raw = news.run, news.documents, news.raw_responses
             dropped, collapsed = news.documents_dropped, news.duplicates_collapsed
             failed, attempted = news.provider_failed, news.calls_attempted
-            cost = asknews_cost_usd(raw, attempted)
+            cost = asknews_cost_usd(raw, attempted, microusd_per_credit=microusd_per_credit(config))
         else:
             web = retrieve_web(
                 client,

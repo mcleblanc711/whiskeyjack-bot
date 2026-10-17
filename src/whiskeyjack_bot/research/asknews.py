@@ -58,7 +58,11 @@ from asknews_sdk import AskNewsSDK
 
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.credentials import MissingCredentialError
-from whiskeyjack_bot.research.asknews_cost import NEWS_CALL_ESTIMATE_USD, credits_microusd
+from whiskeyjack_bot.research.asknews_cost import (
+    credits_microusd,
+    microusd_per_credit,
+    news_call_estimate_usd,
+)
 from whiskeyjack_bot.research.hashing import ContentHashError, content_sha256
 from whiskeyjack_bot.research.model import (
     ResearchDocument,
@@ -424,6 +428,7 @@ def retrieve_news(
     )
 
     retrieval = config.retrieval
+    rate = microusd_per_credit(config)
     capped_queries = validated_queries[: retrieval.max_queries_per_question]
     hours_back = retrieval.freshness_days_default * _HOURS_PER_DAY
     try:
@@ -478,9 +483,9 @@ def retrieve_news(
             try:
                 call_scope, cached = begin_call(
                     "asknews",
-                    # M1-337: credits x rate, never a literal. Only the news pass is issued
-                    # (M1-352), so there is one estimate.
-                    NEWS_CALL_ESTIMATE_USD,
+                    # M1-337: credits x the configured rate (M1-353), never a literal. Only
+                    # the news pass is issued (M1-352), so there is one estimate.
+                    news_call_estimate_usd(rate),
                     request,
                     question_id,
                     now_utc.isoformat(),
@@ -528,7 +533,7 @@ def retrieve_news(
             complete_call(
                 call_scope,
                 raw,
-                actual_microusd=credits_microusd(raw),
+                actual_microusd=credits_microusd(raw, microusd_per_credit=rate),
                 basis="asknews_credits",
             )
             raw_responses.append(raw)

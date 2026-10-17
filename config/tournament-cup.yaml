@@ -52,6 +52,7 @@ retrieval:
     api_key_env: ASKNEWS_API_KEY
     timeout_seconds: 60
     retries: 0
+    microusd_per_credit: 25000
   fallback:
     provider: exa
     api_key_env: EXA_API_KEY
