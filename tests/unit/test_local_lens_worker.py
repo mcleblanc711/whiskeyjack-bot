@@ -89,8 +89,16 @@ class ExaTransport:
         )
 
 
-def _build(tmp_path: Path, *, enabled: bool | None, registry: Path | None = None) -> Any:
-    """``enabled=None`` builds the config with no ``local_lens`` key at all."""
+def _build(
+    tmp_path: Path,
+    *,
+    enabled: bool | None,
+    registry: Path | None = None,
+    shadow: dict[str, Any] | None = None,
+    model: type[Model] = Model,
+) -> Any:
+    """``enabled=None`` builds the config with no ``local_lens`` key at all. ``shadow`` is
+    M1-359's ``local_lens.shadow`` block, and ``model`` the fake forecaster to answer with."""
     config = base_config.__wrapped__(tmp_path)
     data = config.model_dump(mode="json")
     prompt = tmp_path / "forecaster.md"
@@ -113,6 +121,8 @@ def _build(tmp_path: Path, *, enabled: bool | None, registry: Path | None = None
             "registry_path": str(registry or ROOT / "config" / "locales.yaml"),
             "max_calls_per_question": 2,
         }
+        if shadow is not None:
+            data["retrieval"]["local_lens"]["shadow"] = shadow
     config = validate_config_data(data)
     initialize_ledger(config.storage.sqlite_path)
     conn = connect(config.storage.sqlite_path)
@@ -128,7 +138,7 @@ def _build(tmp_path: Path, *, enabled: bool | None, registry: Path | None = None
         starts=utcnow() - timedelta(minutes=1),
         ends=utcnow() + timedelta(days=1),
     )
-    return conn, config, Platform(raw), RecordingNews(raw), Model(raw)
+    return conn, config, Platform(raw), RecordingNews(raw), model(raw)
 
 
 @pytest.fixture

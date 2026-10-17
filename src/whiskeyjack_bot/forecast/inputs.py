@@ -62,7 +62,7 @@ from pydantic import Field
 from whiskeyjack_bot.config import SupportedQuestionType, _StrictModel
 from whiskeyjack_bot.questions.model import CanonicalQuestion, _CanonicalQuestionBase
 from whiskeyjack_bot.research.dedup import dedup_key
-from whiskeyjack_bot.research.model import ResearchDocument
+from whiskeyjack_bot.research.model import DocumentLocale, ResearchDocument
 from whiskeyjack_bot.research.packet import ResearchPacket
 
 # Zero-padded to three digits, matching the prompt's own ``src-001``. Three digits
@@ -128,6 +128,35 @@ class ForecastDocumentInput(_StrictModel):
     reliability_tag: str | None = None
 
 
+class ForecastLocaleInput(_StrictModel):
+    """What the shadow arm's model is told about a lens document's locale (M1-359).
+
+    Five of ``DocumentLocale``'s fields, named as the lens prompt names them. Left out on
+    purpose: ``provider_story_country``, because the 2026-10-16 probe showed it tags the
+    story rather than the publisher and the prompt must not read it as locality (D53);
+    ``english_title``, because it is the document's ``title`` already; and the provider's
+    first-seen time and labels, which no prompt rule reads.
+    """
+
+    locale_code: str
+    publisher_origin: str
+    language: str | None = None
+    native_title: str | None = None
+    translation_source: str
+
+
+class LensDocumentInput(ForecastDocumentInput):
+    """A document as the shadow arm's model sees it: the control's fields plus ``locale``.
+
+    A subclass in a model of its own (:class:`LensModelInput`), never an optional field on
+    :class:`ForecastDocumentInput`: an optional field renders as ``"locale":null`` on every
+    document, which would change every control request byte for byte. ``None`` here means
+    ordinary retrieval -- a baseline document with no locale row.
+    """
+
+    locale: ForecastLocaleInput | None = None
+
+
 class ForecastModelInput(_StrictModel):
     """The whole reasoning packet, in the prompt's vocabulary.
 
@@ -172,6 +201,17 @@ class ForecastModelInput(_StrictModel):
     # on the wrong scale. Also a candidate for the prompt's next version bump.
     unit_of_measure: str | None = None
     research_documents: list[ForecastDocumentInput] = Field(default_factory=list)
+
+
+class LensModelInput(ForecastModelInput):
+    """The shadow arm's reasoning packet (M1-359): every document carries its ``locale``.
+
+    Its own model so the field is declared where it is serialized -- pydantic serializes a
+    list by its declared item type, so a :class:`LensDocumentInput` inside
+    ``ForecastModelInput.research_documents`` would silently lose ``locale``.
+    """
+
+    research_documents: list[LensDocumentInput] = Field(default_factory=list)  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -219,19 +259,36 @@ def _document_input(document: ResearchDocument, source_id: str) -> ForecastDocum
     )
 
 
+def _locale_input(locale: DocumentLocale) -> ForecastLocaleInput:
+    return ForecastLocaleInput(
+        locale_code=locale.locale_code,
+        publisher_origin=locale.publisher_origin,
+        language=locale.language,
+        native_title=locale.native_title,
+        translation_source=locale.translation_source,
+    )
+
+
 def build_model_input(
     *,
     question: CanonicalQuestion,
     packet: ResearchPacket,
     tournament_id: str,
     as_of: datetime,
+    include_locales: bool = False,
 ) -> ModelInput:
     """Build the reasoning packet for one question; raises :class:`ForecastInputError`.
 
     Arguments are checked before anything is built, and the checks are repeated at the
     spending site in ``forecast.generate`` for the reason ``research/exa.py`` repeats
     its own: a value carries no memory of which caller validated it.
+
+    ``include_locales`` (M1-359) is the shadow arm's switch: each document then carries
+    the locale row the packet holds for it, or ``None``. Off -- every control forecast --
+    the packet built is the one built before the switch existed, field for field.
     """
+    if type(include_locales) is not bool:
+        raise ForecastInputError("include_locales must be a bool")
     if not isinstance(question, _CanonicalQuestionBase):
         raise ForecastInputError("question must be a canonical question")
     if not isinstance(packet, ResearchPacket):
@@ -253,10 +310,26 @@ def build_model_input(
         )
         for index, document in enumerate(ordered, start=1)
     )
-    documents = [
-        _document_input(document, reference.source_id)
-        for document, reference in zip(ordered, sources, strict=True)
-    ]
+    documents: list[ForecastDocumentInput]
+    if include_locales:
+        by_key = {
+            (locale.retrieval_run_id, locale.canonical_url, locale.content_sha256): locale
+            for locale in packet.locales
+        }
+        documents = []
+        for document, reference in zip(ordered, sources, strict=True):
+            row = by_key.get(dedup_key(document))
+            documents.append(
+                LensDocumentInput(
+                    **_document_input(document, reference.source_id).model_dump(),
+                    locale=None if row is None else _locale_input(row),
+                )
+            )
+    else:
+        documents = [
+            _document_input(document, reference.source_id)
+            for document, reference in zip(ordered, sources, strict=True)
+        ]
 
     fields: dict[str, Any] = {
         "as_of_utc": as_of_utc,
@@ -297,7 +370,7 @@ def build_model_input(
         fields["zero_point"] = question.zero_point
 
     try:
-        built = ForecastModelInput(**fields)
+        built = (LensModelInput if include_locales else ForecastModelInput)(**fields)
     except Exception:
         # Deliberately broad and scoped to this one call, the M1-308 round-7 rule:
         # a pydantic failure here is a bug in this function rather than bad user

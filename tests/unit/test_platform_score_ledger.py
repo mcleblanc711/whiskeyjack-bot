@@ -594,8 +594,8 @@ def test_a_ledger_at_016_with_local_scores_upgrades_to_017(
             _platform_row(connection, record)
     finally:
         connection.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 19
-    assert initialize_ledger(db) == 19
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 20
+    assert initialize_ledger(db) == 20
     connection = connect(db)
     try:
         assert read_local_scores(connection, record) == local.scores
@@ -731,7 +731,7 @@ def test_a_ledger_at_017_refuses_an_integer_score_until_018_is_applied(
             _platform_row(connection, "rec-v17", value=0.0)
     finally:
         connection.close()
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 19
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 20
     connection = connect(db)
     try:
         _platform_row(connection, "rec-v17", value=0.0)

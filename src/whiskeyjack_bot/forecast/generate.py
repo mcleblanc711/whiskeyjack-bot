@@ -352,8 +352,12 @@ def generate_forecast(
     tournament_id: str,
     now: datetime,
     client: Forecaster | None = None,
+    render_locales: bool = False,
 ) -> ForecastGeneration:
     """Call the configured model once, with at most one bounded repair.
+
+    ``render_locales`` is the shadow arm's (M1-359): each document is sent with its locale
+    row (``inputs.build_model_input``). Every control forecast leaves it off.
 
     Never raises on provider or model failure: those are reported on the returned
     :class:`ForecastGeneration`, because a repair means two billed calls and raising
@@ -526,7 +530,11 @@ def generate_forecast(
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(
-        question=question, packet=packet, tournament_id=tournament_id, now=now
+        question=question,
+        packet=packet,
+        tournament_id=tournament_id,
+        now=now,
+        include_locales=render_locales,
     )
 
     if client is None:
@@ -592,11 +600,20 @@ def _response_model_or_refuse(question_type: str) -> type[ForecastResponse]:
 
 
 def _model_input_or_refuse(
-    *, question: CanonicalQuestion, packet: ResearchPacket, tournament_id: str, now: datetime
+    *,
+    question: CanonicalQuestion,
+    packet: ResearchPacket,
+    tournament_id: str,
+    now: datetime,
+    include_locales: bool = False,
 ) -> ModelInput:
     try:
         return build_model_input(
-            question=question, packet=packet, tournament_id=tournament_id, as_of=now
+            question=question,
+            packet=packet,
+            tournament_id=tournament_id,
+            as_of=now,
+            include_locales=include_locales,
         )
     except ForecastInputError:
         # The preflight above covers what these two share; this is the net for the

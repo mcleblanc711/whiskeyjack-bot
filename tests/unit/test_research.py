@@ -551,7 +551,7 @@ def test_migration_002_makes_the_document_storable(tmp_path: Path) -> None:
     # The literal is kept rather
     # than dropped: it is the pin that says LEDGER_SCHEMA_VERSION tracks the migrations
     # actually on disk, and a constant compared only against itself pins nothing.
-    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 19
+    assert initialize_ledger(db) == LEDGER_SCHEMA_VERSION == 20
 
     doc = validate_document(_document(document_id="doc-1"))
     run = validate_run(_run())
