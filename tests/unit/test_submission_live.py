@@ -69,6 +69,7 @@ from whiskeyjack_bot.submission_live import (
     MultipleChoicePost,
     NumericPost,
     build_verification_snapshot,
+    continuous_cdf_sha256,
     classify_refetch,
     expected_option_labels,
     expected_values,
@@ -2081,6 +2082,120 @@ def test_a_conversion_record_for_a_binary_forecast_is_refused_before_the_post(
             conversion={"adjusted": False, "percentiles_used": []},
         )
     assert poster.posts == 0
+
+
+def _rebound(conversion: Any, **changes: object) -> dict[str, object]:
+    """``conversion`` with its binding fields changed or (``None``) removed (M2-717)."""
+    rebound = dict(conversion)
+    for key, value in changes.items():
+        if value is None:
+            rebound.pop(key, None)
+        else:
+            rebound[key] = value
+    return rebound
+
+
+def _nudged(cdf: list[float]) -> list[float]:
+    """The same CDF with one interior value moved by a hair: a *different* CDF of the same
+    length, which only the digest can tell apart."""
+    moved = list(cdf)
+    moved[len(moved) // 2] = moved[len(moved) // 2] + 1e-9
+    assert moved != cdf
+    return moved
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        pytest.param(
+            lambda cdf: {"continuous_cdf_sha256": continuous_cdf_sha256(_nudged(cdf))},
+            "describes a different CDF",
+            id="digest of a different CDF of the same length",
+        ),
+        pytest.param(
+            lambda cdf: {"continuous_cdf_points": len(cdf) - 1},
+            "describes a different CDF",
+            id="right digest, wrong length",
+        ),
+        pytest.param(
+            lambda cdf: {
+                "continuous_cdf_sha256": continuous_cdf_sha256(cdf[:-1]),
+                "continuous_cdf_points": len(cdf) - 1,
+            },
+            "describes a different CDF",
+            id="a self-consistent record for a shorter CDF",
+        ),
+        pytest.param(
+            lambda cdf: {"continuous_cdf_sha256": None},
+            "does not say which CDF",
+            id="no digest",
+        ),
+        pytest.param(
+            lambda cdf: {"continuous_cdf_points": None},
+            "does not say which CDF",
+            id="no length",
+        ),
+        pytest.param(
+            lambda cdf: {"continuous_cdf_points": float(len(cdf))},
+            "does not say which CDF",
+            id="length as a float",
+        ),
+        pytest.param(
+            lambda cdf: {"continuous_cdf_points": True},
+            "does not say which CDF",
+            id="length as a bool",
+        ),
+        pytest.param(
+            lambda cdf: {"continuous_cdf_sha256": 0},
+            "does not say which CDF",
+            id="digest not a string",
+        ),
+    ],
+)
+def test_a_conversion_record_that_does_not_describe_the_posted_cdf_is_refused(
+    ledger: sqlite3.Connection, live_config: AppConfig, change: Any, match: str
+) -> None:
+    """M2-717's criterion: before posting, conversion metadata that does not describe the
+    CDF in the authorized payload is refused, and nothing is posted. Each case changes the
+    record the real derivation produced, so the matching case below is the positive
+    control: the same record unchanged posts."""
+    from whiskeyjack_bot.submission_payload import authorized_payload
+
+    record = _approved_numeric(ledger, _TIED)
+    authorized = authorized_payload(record, calibration=CALIBRATION)
+    cdf = list(authorized.payload["continuous_cdf"])  # type: ignore[call-overload]
+    conversion = _rebound(authorized.conversion, **change(cdf))
+    poster = FakePoster(after=FakeQuestion(history=[_entry(NEW_START, cdf)]))
+    with pytest.raises(LiveSubmissionError, match=match) as excinfo:
+        post_approved_forecast(
+            ledger,
+            record_id=record.record_id,
+            payload=authorized.payload,
+            poster=poster,
+            config=live_config,
+            occurred_at=OCCURRED,
+            clock=lambda: OCCURRED,
+            sleep=lambda _seconds: None,
+            conversion=conversion,
+        )
+    assert poster.posts == 0
+    message = str(excinfo.value)
+    assert all(repr(value) not in message for value in cdf if value not in (0.0, 1.0))
+    assert continuous_cdf_sha256(cdf) not in message
+
+
+def test_the_derived_conversion_record_names_the_cdf_it_is_posted_beside(
+    ledger: sqlite3.Connection, live_config: AppConfig
+) -> None:
+    """The positive control for the refusals above: the record the real derivation
+    produced carries the digest and length of exactly the posted array, and posts."""
+    recorded, authorized = _post_numeric(ledger, live_config, with_conversion=True)
+    assert recorded.artifact_path is not None
+    envelope = read_live_artifact(live_config.storage.artifact_root, recorded.artifact_path)
+    posted = envelope["request_payload"]["continuous_cdf"]
+    written = envelope["context"]["numeric_conversion"]
+    assert written["continuous_cdf_points"] == len(posted)
+    assert written["continuous_cdf_sha256"] == continuous_cdf_sha256(posted)
 
 
 @pytest.mark.parametrize(
