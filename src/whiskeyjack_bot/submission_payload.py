@@ -86,7 +86,11 @@ from whiskeyjack_bot.questions.model import (
 )
 from whiskeyjack_bot.submission import SubmissionError
 from whiskeyjack_bot.submission_gateway import GatewayError, canonical_payload_json
-from whiskeyjack_bot.submission_live import LiveSubmissionError, plan_from_payload
+from whiskeyjack_bot.submission_live import (
+    LiveSubmissionError,
+    continuous_cdf_sha256,
+    plan_from_payload,
+)
 
 __all__ = [
     "AuthorizedPayload",
@@ -181,10 +185,17 @@ def conversion_record(cdf: NumericCdf) -> dict[str, object]:
     only that the payload was not derived here (``submit --payload-file``), never that
     nothing was adjusted. The values are the SDK's own, unrounded; an artifact is a content
     store and the declared values beside them are already in the ledger.
+
+    ``continuous_cdf_points`` and ``continuous_cdf_sha256`` name the array this record
+    describes, taken from the same ``cdf.values`` the payload's ``continuous_cdf`` is
+    (M2-717, D48), so ``submission_live`` can refuse a record that does not describe the
+    CDF it is about to post.
     """
     return {
         "adjusted": cdf.adjusted,
         "percentiles_used": [[level, value] for level, value in cdf.percentiles_used],
+        "continuous_cdf_points": len(cdf.values),
+        "continuous_cdf_sha256": continuous_cdf_sha256(cdf.values),
     }
 
 

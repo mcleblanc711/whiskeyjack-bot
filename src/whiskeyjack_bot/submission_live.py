@@ -513,19 +513,40 @@ def plan_from_payload(payload: Mapping[str, object], *, expected_cdf_points: int
     )
 
 
-def _conversion_context_or_refuse(
-    conversion: object, question_type: str
-) -> dict[str, object] | None:
+def continuous_cdf_sha256(values: Sequence[float]) -> str:
+    """The digest a conversion record carries for the CDF it describes (M2-717, D48).
+
+    Taken over :func:`canonical_payload_json` of ``{"continuous_cdf": values}`` -- the one
+    payload renderer -- so the side that writes the record
+    (``submission_payload.conversion_record``, from the ``NumericCdf``) and the side that
+    checks it (:func:`_conversion_context_or_refuse`, from the canonical payload about to
+    be posted) cannot render the same floats two ways.
+    """
+    rendered = canonical_payload_json({"continuous_cdf": list(values)})
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _conversion_context_or_refuse(conversion: object, plan: PostPlan) -> dict[str, object] | None:
     """The M1-508 conversion record as plain JSON data, or a refusal before the post.
 
     Rendered here, once, through the payload renderer, so the value that reaches the
     artifact is exactly JSON and cannot fail to render after the post -- where a failure
     would cost the artifact (M1-312) and stop the worker. A record for a type with no
     conversion is a caller mistake, not something to write down. No message names a value.
+
+    **Bound to the CDF about to be posted (M2-717, D48).** A record must carry
+    ``continuous_cdf_sha256`` and ``continuous_cdf_points``, and both must equal what the
+    plan's ``continuous_cdf`` -- parsed from the canonical payload, the bytes that are
+    posted -- yields. That is what lets the artifact claim the percentiles beside the array
+    are the ones *that* array was built from: a caller that sourced the record separately
+    from the payload's derivation is refused here rather than writing a ``numeric_conversion``
+    that describes a different CDF. The digest establishes which CDF the record claims to
+    describe, not that the percentiles derive it; that half stays by construction in
+    ``conversion_record``, which takes both from one ``NumericCdf``.
     """
     if conversion is None:
         return None
-    if question_type not in ("numeric", "discrete"):
+    if plan.question_type not in ("numeric", "discrete"):
         raise LiveSubmissionError(
             "a conversion record was supplied for a forecast with no CDF conversion; "
             "nothing was posted"
@@ -540,7 +561,22 @@ def _conversion_context_or_refuse(
             "it can echo percentile values); nothing was posted"
         ) from None
     # ``canonical_payload_json`` accepts only a JSON object, so this is one.
-    return cast(dict[str, object], json.loads(rendered))
+    context = cast(dict[str, object], json.loads(rendered))
+    points = context.get("continuous_cdf_points")
+    claimed = context.get("continuous_cdf_sha256")
+    if type(points) is not int or type(claimed) is not str:
+        raise LiveSubmissionError(
+            "the conversion record does not say which CDF it describes (it needs "
+            "continuous_cdf_points and continuous_cdf_sha256); nothing was posted"
+        )
+    if points != len(plan.continuous_cdf) or claimed != continuous_cdf_sha256(
+        plan.continuous_cdf
+    ):
+        raise LiveSubmissionError(
+            "the conversion record describes a different CDF than the payload being posted "
+            "(detail withheld: it can echo percentile values); nothing was posted"
+        )
+    return context
 
 
 def _canonical_or_refuse(payload: Mapping[str, object]) -> str:
@@ -1994,7 +2030,7 @@ def post_approved_forecast(
             f"{record.question_type}; nothing was posted"
         )
 
-    conversion_context = _conversion_context_or_refuse(conversion, record.question_type)
+    conversion_context = _conversion_context_or_refuse(conversion, plan)
 
     before_post = prepare_live_policy(conn, config, poster, record, payload, digest)
 

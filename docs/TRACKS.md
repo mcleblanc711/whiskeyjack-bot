@@ -57,6 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
+| M2-717 | feat/m2-717-bind-conversion-to-cdf | whiskeyjack-m2-717 | no | none | 2026-10-17 |
 | M1-358 | feat/m1-358-local-source-lens | whiskeyjack-m1-358 | no | none | 2026-10-16 |
 | M4-808 | feat/m4-808-platform-score-int | whiskeyjack-m4-808 | no | 018 | 2026-10-05 |
 | M0-008 | feat/m0-008-error-hygiene-sweep | whiskeyjack-m0-008 | no | none | 2026-09-25 |
