@@ -1583,3 +1583,23 @@ because the Cup unit otherwise refuses and pages at its next run.
 Whether the five posted Cup questions come back from Metaculus as resolved observations. The
 platform masks resolutions unless the account predicted (M4-801), and it did predict all five.
 q45572 (Nobel) was due 2026-10-09 and is the first live check.
+
+### Round 1 — one blocking finding, reproduced and closed
+
+On `b4baeaa`, the reviewer found **B1**: the runbook's Cup block ran `init-ledger` even when the
+backup failed. The commands were separate lines, and bash carries on past a failed one.
+Reproduced by execution: `sqlite3` and the interpreter were replaced with shims and the backup
+made to fail, the init-ledger marker was still written, and the block exited 0.
+
+**Fix:**
+- `init-ledger` runs inside an `if`, gated on the backup being written **and**
+  `integrity_check` printing exactly `ok`.
+- The install steps are a second block, run only after `UPGRADED`.
+
+**Test:** `test_the_cup_upgrade_runs_only_behind_a_verified_backup` runs the runbook's own
+block under shims. It has a positive control and three failure cases: the write fails, the
+check prints an error, the check prints nothing. All three failure cases fail against the
+round-1 text.
+
+Non-blocking: the reviewer suggested watchdog coverage for the Cup timer as a backlog
+candidate. It is already listed under Deferred above.
