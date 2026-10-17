@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 import pytest
 import yaml
+from asknews_sdk.dto.news import Usage
 from test_research_orchestrate import _SDK, _article
 
 from whiskeyjack_bot.config import AppConfig, validate_config_data
@@ -24,12 +25,15 @@ from whiskeyjack_bot.questions.model import CanonicalBinaryQuestion
 from whiskeyjack_bot.research import asknews, exa
 from whiskeyjack_bot.research.lens import (
     ASKNEWS_LANGUAGES,
+    LENS_RECORD_KEYS,
     LensCall,
     LensError,
+    asknews_cost_usd,
     locale_rows,
     plan,
     run_lens,
 )
+from whiskeyjack_bot.research.lens_report import LensReportError, lens_report
 from whiskeyjack_bot.research.locales import LocaleRegistry, load_registry
 from whiskeyjack_bot.research.model import validate_document
 from whiskeyjack_bot.research.store import load_locales, load_packet, load_run
@@ -292,6 +296,14 @@ def test_run_lens_buys_each_planned_call_and_records_runs_and_locale_rows(
         }
     )
     news, transport = _news(), _Exa()
+    search = news.news.search_news
+
+    def billed(**kwargs: Any) -> Any:  # the live response's `usage` block: one credit
+        response = search(**kwargs)
+        response.usage = Usage(credits=1)
+        return response
+
+    news.news.search_news = billed
     outcome = run_lens(
         ledger,
         config,
@@ -316,16 +328,27 @@ def test_run_lens_buys_each_planned_call_and_records_runs_and_locale_rows(
     iran_run = load_run(ledger, outcome.runs[0].retrieval_run_id or "")
     assert iran_run.provider_config is not None
     assert iran_run.provider_config["fallback_reasons"] == ["local_source_lens"]
-    assert iran_run.provider_config["lens"] == {
-        "locale": "IR",
+    iran = _registry().get("IR")
+    assert iran is not None
+    assert {key: iran_run.provider_config[key] for key in LENS_RECORD_KEYS} == {
+        "lens": "local",
+        "locales": ["IR"],
+        "languages": list(iran.languages),
+        "domains": list(body["includeDomains"]),
         "registry_sha256": _registry().sha256,
         "query_source": "native_terms",
         "baseline_run_ids": ["run-baseline"],
     }
     uae_run = load_run(ledger, outcome.runs[1].retrieval_run_id or "")
     assert uae_run.provider_config is not None
-    assert uae_run.provider_config["lens"]["locale"] == "AE"
+    assert uae_run.provider_config["lens"] == "local"
+    assert uae_run.provider_config["locales"] == ["AE"]
+    assert uae_run.provider_config["domains"] == request["domain_url"]
     assert "wam.ae" in uae_run.provider_config["domain_url"]
+    # Cost as the lens saw it: Exa's costDollars, and AskNews's credits at the pinned rate --
+    # the AskNews run row itself carries none, as on the baseline path.
+    assert [run.cost_usd for run in outcome.runs] == [0.007, 0.025]
+    assert uae_run.cost_usd is None
     (row,) = load_locales(ledger, outcome.runs[0].retrieval_run_id or "")
     assert (row.locale_code, row.publisher_origin) == ("IR", "local")
     packet = load_packet(
@@ -412,6 +435,27 @@ def test_a_baseline_exa_call_records_no_lens(config: AppConfig) -> None:
     assert "lens" not in result.run.provider_config
 
 
+def test_the_lens_record_never_overwrites_an_adapter_key(config: AppConfig) -> None:
+    """The record merges flat into ``provider_config``; a shared key would silently replace the
+    provider's own account of the call. Checked against what each adapter actually writes."""
+    news = asknews.retrieve_news(
+        _news(), config, question_id=1, queries=["q"], retrieval_run_id="run-1", now=NOW
+    )
+    web = exa.retrieve_web(
+        _exa_client(_Exa()),
+        config,
+        question_id=1,
+        queries=["q"],
+        retrieval_run_id="run-2",
+        now=NOW,
+        fallback_reasons=["primary_returned_no_documents"],
+    )
+    for run in (news.run, web.run):
+        assert run.provider_config is not None
+        assert not set(run.provider_config) & LENS_RECORD_KEYS
+    assert "domain_url" not in LENS_RECORD_KEYS
+
+
 def test_decide_fallback_never_emits_the_lens_reason() -> None:
     for failed in (True, False):
         for documents in (0, 3):
@@ -432,9 +476,13 @@ def test_the_lens_is_disabled_unless_a_config_says_otherwise() -> None:
     data["model"]["name"] = "openrouter/test-model"
     del data["retrieval"]["local_lens"]
     assert validate_config_data(data).retrieval.local_lens.enabled is False
-    for path in ("config.example.yaml", "config/tournament.yaml", "config/tournament-cup.yaml"):
-        committed = yaml.safe_load((REPO / path).read_text("utf-8"))
-        assert committed["retrieval"]["local_lens"]["enabled"] is False
+    # Every committed AppConfig, found rather than listed: a new config file is covered the
+    # day it lands. `config/locales.yaml` and `config/x_accounts.yaml` are not AppConfigs.
+    committed = [REPO / "config.example.yaml", *sorted((REPO / "config").glob("tournament*.yaml"))]
+    assert len(committed) == 4
+    for path in committed:
+        data = yaml.safe_load(path.read_text("utf-8"))
+        assert data["retrieval"]["local_lens"]["enabled"] is False, path.name
 
 
 def test_the_report_compares_a_lens_document_without_a_locale_row_conservatively(
@@ -442,7 +490,6 @@ def test_the_report_compares_a_lens_document_without_a_locale_row_conservatively
 ) -> None:
     """A lens document with no locale row: AskNews's stored title is English, so it can be
     called new; an Exa page title is not known to be, so it is `unassessed`, never `novel`."""
-    from whiskeyjack_bot.research.lens_report import lens_report
     from whiskeyjack_bot.research.model import validate_run
     from whiskeyjack_bot.research.store import persist_retrieval
     from whiskeyjack_bot.tournament_state import append
@@ -479,10 +526,65 @@ def test_the_report_compares_a_lens_document_without_a_locale_row_conservatively
             "question_id": 4242,
             "baseline_run_ids": ["run-base"],
             "lens_run_ids": ["run-ask", "run-exa"],
-            "calls": [{"requests": 1}, {"requests": 1}],
+            "calls": [{"requests": 1, "cost_usd": None}, {"requests": 1, "cost_usd": 0.007}],
         },
     )
     (summary,) = lens_report(ledger).questions
     assert summary.overlap == {"novel": 1, "unassessed": 1}
     assert summary.origins == {"no_locale_row": 2}
-    assert summary.exa_cost_usd == 0.007 and summary.requests == 2
+    assert summary.triggered and summary.requests == 2
+    # The AskNews call's cost is unknown: counted, never read as free.
+    assert (summary.cost_usd, summary.cost_unknown_calls) == (0.007, 1)
+
+
+@pytest.mark.parametrize(
+    ("raw", "attempted", "expected"),
+    [
+        ([], 0, 0.0),  # a refused reservation bought nothing
+        ([{"usage": {"credits": 1}}], 1, 0.025),
+        ([{"usage": {"credits": 1}}, {"usage": {"credits": 5}}], 2, 0.15),
+        ([{"usage": {"credits": 1}}, {"usage": {}}], 2, None),  # one unknown: all unknown
+        ([], 1, None),  # attempted, no response: billed or not, unknown
+        ([{"usage": {"credits": True}}], 1, None),
+    ],
+)
+def test_an_asknews_lens_cost_is_the_settled_credits_or_unknown(
+    raw: list[object], attempted: int, expected: float | None
+) -> None:
+    assert asknews_cost_usd(raw, attempted) == expected
+
+
+def _checkpoint_ledger(tmp_path: Path, payload: dict[str, object]) -> sqlite3.Connection:
+    from whiskeyjack_bot.ledger import connect, initialize_ledger
+    from whiskeyjack_bot.tournament_state import append
+
+    path = tmp_path / "ledger.sqlite3"
+    initialize_ledger(path)
+    conn = connect(path)
+    append(conn, "local_lens_checkpoint", "q", {"at": NOW.isoformat(), **payload})
+    return conn
+
+
+def test_a_question_no_locale_matched_reports_untriggered(tmp_path: Path) -> None:
+    conn = _checkpoint_ledger(
+        tmp_path, {"question_id": 7, "baseline_run_ids": [], "lens_run_ids": [], "calls": []}
+    )
+    try:
+        report = lens_report(conn)
+    finally:
+        conn.close()
+    (summary,) = report.questions
+    assert (summary.triggered, summary.calls, summary.cost_usd) == (False, 0, 0.0)
+    assert report.totals["triggered"] == 0 and report.totals["checkpoints"] == 1
+
+
+@pytest.mark.parametrize("calls", [["not a call"], [None], [1.5], "calls"])
+def test_a_malformed_call_list_is_refused_as_the_reports_error(
+    tmp_path: Path, calls: object
+) -> None:
+    conn = _checkpoint_ledger(tmp_path, {"question_id": 7, "calls": calls})
+    try:
+        with pytest.raises(LensReportError, match="unexpected shape"):
+            lens_report(conn)
+    finally:
+        conn.close()

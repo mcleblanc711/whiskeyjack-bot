@@ -765,7 +765,11 @@ uv run whiskeyjack-bot research language-census --config config/tournament.yaml
 ```
 
 `lens-report` reads the ledger only. Per question, it prints:
-- the calls and requests made, Exa's reported cost and the elapsed time;
+- whether the lens triggered (planned any call);
+- the calls and requests made, and the elapsed time;
+- the cost: Exa's reported `costDollars` plus AskNews's settled credits. A call that made
+  requests with no usable cost is counted in `cost_unknown_calls`, and `cost_usd` is then a
+  floor;
 - documents by publisher origin (`local`, `external`, `unclassified`);
 - the overlap with baseline research (`same_url`, `same_content`, `republication`, `novel`,
   `unassessed`);

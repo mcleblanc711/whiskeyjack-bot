@@ -15,6 +15,7 @@ AskNews call for the UAE. What is asserted is the acceptance criterion's contrac
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterator
 from datetime import timedelta
@@ -29,6 +30,7 @@ from test_tournament import Model, News, Platform
 from whiskeyjack_bot import tournament as whiskeyjack_tournament
 from whiskeyjack_bot.config import validate_config_data
 from whiskeyjack_bot.ledger import connect, initialize_ledger
+from whiskeyjack_bot.research.packet import canonical_packet_json, packet_sha256
 from whiskeyjack_bot.research.store import load_locales, load_packet
 from whiskeyjack_bot.tournament import run_once
 from whiskeyjack_bot.tournament_state import (
@@ -84,7 +86,8 @@ class ExaTransport:
         )
 
 
-def _build(tmp_path: Path, *, enabled: bool, registry: Path | None = None) -> Any:
+def _build(tmp_path: Path, *, enabled: bool | None, registry: Path | None = None) -> Any:
+    """``enabled=None`` builds the config with no ``local_lens`` key at all."""
     config = base_config.__wrapped__(tmp_path)
     data = config.model_dump(mode="json")
     prompt = tmp_path / "forecaster.md"
@@ -99,11 +102,14 @@ def _build(tmp_path: Path, *, enabled: bool, registry: Path | None = None) -> An
     )
     data["retrieval"]["primary"]["retries"] = 0
     data["retrieval"]["fallback"]["retries"] = 0
-    data["retrieval"]["local_lens"] = {
-        "enabled": enabled,
-        "registry_path": str(registry or ROOT / "config" / "locales.yaml"),
-        "max_calls_per_question": 2,
-    }
+    if enabled is None:
+        data["retrieval"].pop("local_lens", None)
+    else:
+        data["retrieval"]["local_lens"] = {
+            "enabled": enabled,
+            "registry_path": str(registry or ROOT / "config" / "locales.yaml"),
+            "max_calls_per_question": 2,
+        }
     config = validate_config_data(data)
     initialize_ledger(config.storage.sqlite_path)
     conn = connect(config.storage.sqlite_path)
@@ -324,3 +330,71 @@ def _questions(case: Any) -> list[Any]:
     return list(
         normalize_questions([DataOrganizer.get_question_from_post_json(platform.raw)]).questions
     )
+
+
+_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?")
+
+
+def _observed(conn: Any) -> dict[str, str]:
+    """What the AC compares, with this ledger's own random identifiers (run, record, attempt and
+    document ids), the packet digest over them, and clock readings replaced by placeholders.
+    Everything else -- every provider, model and policy value -- is compared verbatim."""
+    (subject,) = conn.execute(
+        "SELECT DISTINCT scope FROM tournament_events WHERE kind = 'research_checkpoint'"
+    ).fetchone()
+    (checkpoint,) = events(conn, "research_checkpoint", subject)
+    run_ids = list(checkpoint["run_ids"])
+    (record_id, record) = conn.execute(
+        "SELECT record_id, record_json FROM forecast_records"
+    ).fetchone()
+    packet = load_packet(conn, question_id=row_question(conn), retrieval_run_ids=run_ids)
+    names = {
+        packet_sha256(packet): "<packet>",
+        record_id: "<record>",
+        json.loads(record)["attempt_id"]: "<attempt>",
+    }
+    names.update({run_id: f"<run{index}>" for index, run_id in enumerate(run_ids)})
+    documents = conn.execute(
+        "SELECT document_id FROM research_documents ORDER BY content_sha256, canonical_url"
+    ).fetchall()
+    names.update({document_id: f"<doc{index}>" for index, (document_id,) in enumerate(documents)})
+
+    def normal(text: str) -> str:
+        for value, name in names.items():
+            text = text.replace(value, name)
+        return _TIMESTAMP.sub("<t>", text)
+
+    return {
+        "research_checkpoint": normal(json.dumps(checkpoint, sort_keys=True)),
+        "packet": normal(canonical_packet_json(packet)),
+        "forecast_record": normal(record),
+    }
+
+
+def test_disabled_is_the_same_run_as_a_config_without_the_field(tmp_path: Path) -> None:
+    """The AC's equivalence: `enabled: false` and no `local_lens` key at all produce the same
+    research checkpoint, packet and forecast record, up to this run's own ids and clock.
+
+    Both runs execute this branch's code, so on its own that comparison only proves pydantic
+    applies the default. The witness outside the program is the golden: the checkpoint and
+    packet the same helper observed on master ``acbcdeb``, before the lens existed. The
+    adapters' baseline requests and ``provider_config`` reach the forecast only through the
+    packet, so a lens change that leaked into baseline research moves it. The record is left
+    out of the golden on purpose -- it carries the prompt hash and churns with every prompt
+    bump -- and matched master byte-for-byte when the golden was taken.
+    """
+    observed = []
+    for name, enabled in (("absent", None), ("disabled", False)):
+        (tmp_path / name).mkdir()
+        case = _build(tmp_path / name, enabled=enabled)
+        try:
+            assert _poll(case, ExaTransport())["forecast_confirmed"] == 1
+            observed.append(_observed(case[0]))
+        finally:
+            case[0].close()
+    absent, disabled = observed
+    assert absent == disabled
+    golden = json.loads((ROOT / "tests/fixtures/local_lens/baseline_before_lens.json").read_text())
+    assert absent["research_checkpoint"] == golden["research_checkpoint"]
+    assert absent["packet"] == golden["packet"]
+    assert "<run0>" in absent["forecast_record"] and "<packet>" in absent["forecast_record"]

@@ -6,11 +6,12 @@ the lens finds **local publishers** the baseline did not -- and the input M5-805
 report will extend with scores once M1-359's shadow arm exists. It makes no claim about
 forecast accuracy; Phase 1 has no arm to compare.
 
-Per question it reports what the lens bought (calls, requests, Exa's reported cost, elapsed
-time), what it found (documents, and their publisher origin relative to the targeted locale),
-and what was new against the baseline, using ``research/overlap.py``'s conservative rules:
-a cluster of copies is one report, a report any copy of which the baseline already held adds
-nothing, and an untranslated document is ``unassessed`` rather than ``novel``.
+Per question it reports whether the lens triggered (planned any call), what it bought
+(calls, requests, cost, elapsed time), what it found (documents, and their publisher origin
+relative to the targeted locale), and what was new against the baseline, using
+``research/overlap.py``'s conservative rules: a cluster of copies is one report, a report any
+copy of which the baseline already held adds nothing, and an untranslated document is
+``unassessed`` rather than ``novel``.
 
 **What "English title" means here.** Overlap compares English titles. An AskNews document's
 stored ``title`` is AskNews's English title, and a lens locale row carries it explicitly; an
@@ -19,12 +20,18 @@ is compared on nothing and reported ``unassessed``. Baseline documents are compa
 stored title -- which for AskNews is English and for Exa is usually English, an approximation
 stated here rather than hidden in the number.
 
-AskNews's cost is not on its run row (it settles per credit in the journal, M1-336), so a
-lens AskNews call is reported by request count; Exa's ``costDollars`` is on its run.
+**Cost** is read from the checkpoint, which records each call's cost as the lens saw it:
+Exa's ``costDollars`` (also on its run), and for AskNews the response's own
+``usage.credits`` at the pinned per-credit rate -- the figure the budget settled from,
+M1-336 -- because an AskNews run row carries no cost. A call that made requests but has no
+usable cost is counted in ``cost_unknown_calls`` and contributes nothing to ``cost_usd``:
+the total is then a floor, and says so, rather than reading an unknown as free.
 """
 
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
@@ -57,9 +64,11 @@ class QuestionLens:
     question_id: int
     at: str
     error_type: str | None
+    triggered: bool
     calls: int
     requests: int
-    exa_cost_usd: float
+    cost_usd: float
+    cost_unknown_calls: int
     elapsed_seconds: float | None
     lens_documents: int
     origins: dict[str, int]
@@ -76,8 +85,6 @@ class LensReport:
 
 
 def _checkpoints(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    import json
-
     try:
         rows = conn.execute(
             "SELECT data FROM tournament_events WHERE kind = 'local_lens_checkpoint' ORDER BY seq"
@@ -113,7 +120,7 @@ def _summarize(conn: sqlite3.Connection, event: dict[str, Any]) -> QuestionLens:
     baseline_ids = _id_list(event.get("baseline_run_ids", []))
     lens_ids = _id_list(event.get("lens_run_ids", []))
     calls = event.get("calls", [])
-    if not isinstance(calls, list):
+    if not isinstance(calls, list) or any(not isinstance(call, dict) for call in calls):
         raise LensReportError("a lens checkpoint lists its calls in an unexpected shape")
 
     baseline = [
@@ -123,11 +130,8 @@ def _summarize(conn: sqlite3.Connection, event: dict[str, Any]) -> QuestionLens:
     lens: list[Comparable] = []
     origin_of: dict[tuple[str, str, str], str] = {}
     origins: Counter[str] = Counter()
-    exa_cost = 0.0
     for run_id in lens_ids:
         run = load_run(conn, run_id)
-        if run.provider == "exa" and run.cost_usd is not None:
-            exa_cost += run.cost_usd
         locales: dict[tuple[str, str, str], DocumentLocale] = {
             locale.key(): locale for locale in load_locales(conn, run_id)
         }
@@ -148,20 +152,26 @@ def _summarize(conn: sqlite3.Connection, event: dict[str, Any]) -> QuestionLens:
     verdicts = classify(baseline, lens)
     groups = clusters(lens)
     independent = independent_reports(baseline, lens)
-    requests = sum(
-        call.get("requests", 0)
-        for call in calls
-        if isinstance(call, dict) and type(call.get("requests")) is int
-    )
+    requests = sum(call["requests"] for call in calls if type(call.get("requests")) is int)
+    cost = 0.0
+    unknown = 0
+    for call in calls:
+        value = call.get("cost_usd")
+        if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            cost += value
+        elif type(call.get("requests")) is int and call["requests"] > 0:
+            unknown += 1
     elapsed = event.get("elapsed_seconds")
     error = event.get("error_type")
     return QuestionLens(
         question_id=question_id,
         at=str(event.get("at", "")),
         error_type=error if isinstance(error, str) else None,
+        triggered=bool(calls),
         calls=len(calls),
         requests=requests,
-        exa_cost_usd=round(exa_cost, 6),
+        cost_usd=round(cost, 6),
+        cost_unknown_calls=unknown,
         elapsed_seconds=float(elapsed) if isinstance(elapsed, (int, float)) else None,
         lens_documents=len(lens),
         origins=dict(sorted(origins.items())),
@@ -185,9 +195,11 @@ def lens_report(conn: sqlite3.Connection) -> LensReport:
     totals: dict[str, Any] = {
         "checkpoints": len(questions),
         "failed": sum(1 for q in questions if q.error_type is not None),
+        "triggered": sum(1 for q in questions if q.triggered),
         "calls": sum(q.calls for q in questions),
         "requests": sum(q.requests for q in questions),
-        "exa_cost_usd": round(sum(q.exa_cost_usd for q in questions), 6),
+        "cost_usd": round(sum(q.cost_usd for q in questions), 6),
+        "cost_unknown_calls": sum(q.cost_unknown_calls for q in questions),
         "lens_documents": sum(q.lens_documents for q in questions),
         "independent_reports": sum(q.independent_reports for q in questions),
         "local_independent_reports": sum(q.local_independent_reports for q in questions),

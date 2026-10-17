@@ -800,9 +800,10 @@ def retrieve_web(
                 # research_runs.provider_config_json, so the ledger alone answers
                 # why a second provider was engaged.
                 "fallback_reasons": list(reasons),
-                # M1-358: the lens's own record of why it ran (locale, registry digest, query
-                # source). Absent on every non-lens call, so their provider_config is unchanged.
-                **({} if lens_record is None else {"lens": lens_record}),
+                # M1-358: the lens's own record of why it ran (research.lens.lens_record),
+                # merged flat. Absent on every non-lens call, so their provider_config is
+                # unchanged.
+                **({} if lens_record is None else lens_record),
             },
             "queries": capped_queries,
             "started_at_utc": now_utc,

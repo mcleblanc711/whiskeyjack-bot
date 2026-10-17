@@ -353,7 +353,7 @@ class LensRequest:
     publishers, never for a language. That is the owner's correction of 2026-10-16 -- the target
     is publishers based in the place, and a language filter would both admit foreign services
     in that language and drop local outlets that publish in English. ``record`` is the lens's
-    account of why the call was made (locale, registry digest, query source), stored on the
+    account of why the call was made (``research.lens.lens_record``), merged flat into the
     run's ``provider_config`` so the packet hash covers it.
     """
 
@@ -572,7 +572,7 @@ def retrieve_news(
                 "n_articles": retrieval.max_documents_per_query,
                 "hours_back": hours_back,
                 "return_type": "dicts",
-                **({} if lens is None else {"domain_url": list(lens.domains), "lens": lens.record}),
+                **({} if lens is None else {"domain_url": list(lens.domains), **lens.record}),
             },
             "queries": capped_queries,
             "started_at_utc": now_utc,

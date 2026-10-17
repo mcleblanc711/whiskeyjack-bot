@@ -54,6 +54,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from whiskeyjack_bot.research.asknews import LensRequest, retrieve_news
+from whiskeyjack_bot.research.asknews_cost import credits_microusd
 from whiskeyjack_bot.research.exa import retrieve_web
 from whiskeyjack_bot.research.locales import LocaleEntry, LocaleRegistry, detect, publisher_origin
 from whiskeyjack_bot.research.model import (
@@ -294,6 +295,60 @@ def locale_rows(
     return tuple(rows)
 
 
+# The keys :func:`lens_record` adds to a lens run's ``provider_config``, flat beside the
+# adapter's own. Disjoint from every key either adapter writes (asserted by a test), so a lens
+# run carries the provider's full account of the call and the lens's account of why.
+LENS_RECORD_KEYS: Final = frozenset(
+    {"lens", "locales", "languages", "domains", "registry_sha256", "query_source",
+     "baseline_run_ids"}
+)  # fmt: skip
+
+
+def lens_record(
+    call: LensCall,
+    entry: LocaleEntry,
+    registry: LocaleRegistry,
+    baseline_run_ids: Sequence[str],
+) -> dict[str, Any]:
+    """The lens's account of one call, stored on its run's ``provider_config``.
+
+    ``lens: "local"`` marks the run as a local-source lens run -- the ledger alone answers
+    which runs were collect-only -- and the rest says which locale, which of its languages,
+    which publishers, under which registry, from which query source, beside which baseline.
+    """
+    return {
+        "lens": "local",
+        "locales": [entry.code],
+        "languages": list(entry.languages),
+        "domains": list(call.domains),
+        "registry_sha256": registry.sha256,
+        "query_source": call.query_source,
+        "baseline_run_ids": list(baseline_run_ids),
+    }
+
+
+def asknews_cost_usd(raw_responses: Sequence[object], attempted: int) -> float | None:
+    """What a lens AskNews call billed, from each response's own ``usage.credits``.
+
+    The same figure ``complete_call`` settles the reservation from (M1-336); the run row's
+    ``cost_usd`` stays ``None`` for AskNews, as on the baseline path, so the lens records it on
+    its checkpoint instead. Unknown is never free: ``None`` unless every attempted request
+    returned a response whose credits convert. No request attempted (a refused reservation)
+    is ``0.0``.
+    """
+    if attempted == 0:
+        return 0.0
+    if len(raw_responses) != attempted:
+        return None
+    total = 0
+    for response in raw_responses:
+        microusd = credits_microusd(response)
+        if microusd is None:
+            return None
+        total += microusd
+    return total / 1_000_000
+
+
 def _opening(run_id: str, question_id: int, provider: LensProvider, now: datetime) -> Any:
     return validate_run(
         {
@@ -337,12 +392,7 @@ def run_lens(
             )
             continue
         run_id = _RUN_ID_PREFIX + uuid.uuid4().hex
-        record: dict[str, Any] = {
-            "locale": call.locale_code,
-            "registry_sha256": registry.sha256,
-            "query_source": call.query_source,
-            "baseline_run_ids": list(baseline_run_ids),
-        }
+        record = lens_record(call, entry, registry, baseline_run_ids)
         open_run(conn, _opening(run_id, question.question_id, call.provider, now))
         if call.provider == "asknews":
             news = retrieve_news(
@@ -357,6 +407,7 @@ def run_lens(
             run, documents, raw = news.run, news.documents, news.raw_responses
             dropped, collapsed = news.documents_dropped, news.duplicates_collapsed
             failed, attempted = news.provider_failed, news.calls_attempted
+            cost = asknews_cost_usd(raw, attempted)
         else:
             web = retrieve_web(
                 client,
@@ -372,6 +423,7 @@ def run_lens(
             run, documents, raw = web.run, web.documents, web.raw_responses
             dropped, collapsed = web.documents_dropped, web.duplicates_collapsed
             failed, attempted = web.provider_failed, web.calls_attempted
+            cost = run.cost_usd
         rows = locale_rows(call, entry, documents, raw)
         persist_paid_run(
             conn,
@@ -391,7 +443,7 @@ def run_lens(
                 documents=len(documents),
                 locales=len(rows),
                 calls=attempted,
-                cost_usd=run.cost_usd,
+                cost_usd=cost,
                 provider_failed=failed,
             )
         )
