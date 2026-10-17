@@ -621,3 +621,23 @@ def test_a_malformed_checkpoint_is_refused_as_the_reports_error(
             lens_report(conn)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Round 1, B2: JSON integers the journal writer accepts, too large for a float.
+        {"question_id": 7, "calls": [{"requests": 1, "cost_usd": 10**400}]},
+        {"question_id": 7, "elapsed_seconds": 10**400},
+    ],
+)
+def test_a_number_too_large_for_a_float_is_ignored_not_raised(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    conn = _checkpoint_ledger(tmp_path, payload)
+    try:
+        (summary,) = lens_report(conn).questions
+    finally:
+        conn.close()
+    assert summary.cost_usd == 0.0 and summary.elapsed_seconds is None
+    assert summary.cost_unknown_calls == len(payload.get("calls", []))  # type: ignore[arg-type]

@@ -51,9 +51,12 @@ class RecordingNews(News):
     def __init__(self, raw: dict[str, Any]) -> None:
         super().__init__(raw)
         self.requests: list[dict[str, Any]] = []
+        self.lens_delay = 0.0
 
     def search_news(self, **kwargs: Any) -> Any:
         self.requests.append(kwargs)
+        if self.lens_delay and "domain_url" in kwargs:
+            time.sleep(self.lens_delay)  # a provider stall on the lens call only
         return super().search_news(**kwargs)
 
 
@@ -304,6 +307,40 @@ def test_the_lens_time_bound_is_recorded_and_the_question_still_succeeds(
     assert result["forecast_confirmed"] == 1 and result["heartbeat"]["failures"] == 0
     (event,) = _lens_events(conn)
     assert event["error_type"] == "TournamentError"
+
+
+def test_a_time_bound_after_a_completed_call_keeps_that_call_on_the_checkpoint(
+    enabled_case: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1, B1. The IR Exa call completes and settles; the AE AskNews call then stalls
+    past the bound. The checkpoint must still name the completed run and its cost, mark the
+    interrupted call's cost unknown, and record the elapsed time -- the report reads nothing
+    else, and the once-per-checkpoint guard means there is no second chance to write it."""
+    from whiskeyjack_bot.research.lens_report import lens_report
+
+    monkeypatch.setattr(whiskeyjack_tournament, "LENS_TIMEOUT_SECONDS", 0.5)
+    conn, _, _, news, _ = enabled_case
+    news.lens_delay = 2.0
+    result = _poll(enabled_case, ExaTransport())
+    assert result["forecast_confirmed"] == 1 and result["heartbeat"]["failures"] == 0
+
+    (event,) = _lens_events(conn)
+    assert event["error_type"] == "TournamentError"
+    exa, asknews = event["calls"]
+    assert (exa["locale"], exa["provider"], exa["cost_usd"], exa["documents"]) == (
+        "IR",
+        "exa",
+        0.007,
+        1,
+    )
+    assert (asknews["locale"], asknews["provider"]) == ("AE", "asknews")
+    assert asknews["interrupted"] is True and asknews["cost_usd"] is None
+    assert exa["retrieval_run_id"] in event["lens_run_ids"]
+    assert isinstance(event["elapsed_seconds"], float) and event["elapsed_seconds"] >= 0.5
+
+    (summary,) = lens_report(conn).questions
+    assert summary.triggered and summary.calls == 2 and summary.lens_documents == 1
+    assert (summary.cost_usd, summary.cost_unknown_calls) == (0.007, 1)
 
 
 def test_a_second_lens_for_the_same_research_checkpoint_buys_nothing(enabled_case: Any) -> None:
