@@ -1405,10 +1405,16 @@ def test_nothing_is_clamped_by_the_conversion(
 # Small pools, so a citation that resolves and one that does not are both drawn often
 # rather than by luck. ``src-009`` is never supplied.
 _SUPPLIABLE = ["src-001", "src-002", "src-003"]
-# M1-362: the reserved id and one near miss ride in the pool, so the exact-equality branch is
+# M1-362: the reserved id and two near misses (case, and a prefix extension) ride in the pool, so the exact-equality branch is
 # reached from the strategy rather than assumed. The literals are written out here, not
 # imported: importing the constant would pass whatever the constant says.
-_CITABLE = [*_SUPPLIABLE, "src-009", "question-background", "Question-Background"]
+_CITABLE = [
+    *_SUPPLIABLE,
+    "src-009",
+    "question-background",
+    "Question-Background",
+    "question-background-2",
+]
 
 _ADJUSTMENT = VALID_PAYLOAD["evidence_adjustments"][0]
 _FACT = VALID_PAYLOAD["load_bearing_facts"][0]
