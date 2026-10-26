@@ -62,7 +62,7 @@ from whiskeyjack_bot.tournament_state import TournamentError, events
 
 ROOT = Path(__file__).resolve().parents[2]
 LENS_PROMPT = ROOT / "prompts" / "forecaster-tournament-lens.md"
-SHADOW_ON = {"enabled": True, "prompt_path": str(LENS_PROMPT), "prompt_version": "1.0.0"}
+SHADOW_ON = {"enabled": True, "prompt_path": str(LENS_PROMPT), "prompt_version": "1.2.0"}
 
 
 def _is_shadow(request: dict[str, Any]) -> bool:
@@ -196,7 +196,7 @@ def test_enabled_one_shadow_is_written_bound_to_the_control_packet_and_prompt(
     # Its own prompt, by the file's bytes.
     digest = hashlib.sha256(LENS_PROMPT.read_bytes()).hexdigest()
     assert shadow.prompt_sha256 == digest == shadow.record.model_settings.prompt_sha256
-    assert shadow.prompt_version == "1.0.0"
+    assert shadow.prompt_version == "1.2.0"
     # The control's prompt is the activation's, not the lens prompt.
     assert json.loads(_control(conn)[1])["model_settings"]["prompt_sha256"] != digest
 

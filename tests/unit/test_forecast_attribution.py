@@ -30,7 +30,9 @@ import yaml
 
 from whiskeyjack_bot.config import ForecastConfig, validate_config_data
 from whiskeyjack_bot.forecast.attribution import (
+    BACKGROUND_SOURCE_ID,
     AttributionFieldError,
+    is_background_only,
     attribution_problems,
     validate_attribution_fields,
 )
@@ -602,3 +604,166 @@ def test_a_supplied_source_id_reaches_no_message_either() -> None:
     )
     assert problems
     assert all(SECRET not in problem for problem in problems)
+
+
+# --- M1-362: the question's own background is citable (D55) ------------------------------
+#
+# Written from the row's acceptance criteria, before the implementation was re-read.
+
+_CLAIM_FIELDS = ["evidence_adjustments", "load_bearing_facts"]
+
+
+def test_the_reserved_id_is_the_literal_the_prompts_teach() -> None:
+    """The id is introduced in the validator and in the two tournament prompts, and in no
+    other prompt: ``forecaster.md`` is the baseline prompt and the reserved id is not part
+    of its contract (AC1)."""
+    assert BACKGROUND_SOURCE_ID == "question-background"
+    prompts = REPO_ROOT / "prompts"
+    for name in ("forecaster-tournament.md", "forecaster-tournament-lens.md"):
+        assert BACKGROUND_SOURCE_ID in (prompts / name).read_text(encoding="utf-8"), name
+    assert BACKGROUND_SOURCE_ID not in PROMPT_TEXT
+
+
+@pytest.mark.parametrize("field", _CLAIM_FIELDS)
+def test_a_claim_may_cite_only_the_question_background(field: str) -> None:
+    forecast = validate_forecast_response(
+        _cite(_payload(), field, [BACKGROUND_SOURCE_ID]), BinaryForecastResponse
+    )
+    assert _problems(forecast) == []
+
+
+@pytest.mark.parametrize("field", _CLAIM_FIELDS)
+def test_a_claim_may_cite_the_background_beside_a_document(field: str) -> None:
+    forecast = validate_forecast_response(
+        _cite(_payload(), field, ["src-001", BACKGROUND_SOURCE_ID]), BinaryForecastResponse
+    )
+    assert _problems(forecast) == []
+
+
+def test_the_background_is_not_citable_from_a_base_rate() -> None:
+    """The stricter reading: the row names adjustments and load-bearing facts only."""
+    forecast = validate_forecast_response(
+        _cite(_payload(), "base_rate", [BACKGROUND_SOURCE_ID]), BinaryForecastResponse
+    )
+    assert (
+        "base_rate.source_ids: must name only source_ids supplied in research_documents"
+        in " ".join(_problems(forecast))
+    )
+
+
+@pytest.mark.parametrize("field", _CLAIM_FIELDS)
+@pytest.mark.parametrize(
+    "near_miss",
+    [
+        "Question-Background",
+        "question-background ",
+        "question_background",
+        "question-backgroun",
+        "question-background-2",
+        "src-009",
+        "background",
+    ],
+)
+def test_only_the_exact_reserved_id_is_accepted(field: str, near_miss: str) -> None:
+    forecast = validate_forecast_response(
+        _cite(_payload(), field, [near_miss]), BinaryForecastResponse
+    )
+    assert f"{field}.0.source_ids: must name only source_ids" in " ".join(_problems(forecast))
+
+
+@pytest.mark.parametrize("field", _CLAIM_FIELDS)
+def test_an_invented_id_beside_the_background_still_fails(field: str) -> None:
+    forecast = validate_forecast_response(
+        _cite(_payload(), field, [BACKGROUND_SOURCE_ID, "src-009"]), BinaryForecastResponse
+    )
+    assert f"{field}.0.source_ids: must name only source_ids" in " ".join(_problems(forecast))
+
+
+@pytest.mark.parametrize("field", _CLAIM_FIELDS)
+def test_citing_the_background_twice_is_still_a_repeat(field: str) -> None:
+    forecast = validate_forecast_response(
+        _cite(_payload(), field, [BACKGROUND_SOURCE_ID, BACKGROUND_SOURCE_ID]),
+        BinaryForecastResponse,
+    )
+    assert f"{field}.0.source_ids: must not repeat a source_id" in _problems(forecast)
+
+
+@pytest.mark.parametrize("field", _CLAIM_FIELDS)
+def test_an_empty_citation_list_is_still_refused_when_documents_were_supplied(field: str) -> None:
+    forecast = validate_forecast_response(_cite(_payload(), field, []), BinaryForecastResponse)
+    assert f"{field}.0.source_ids: must cite at least one source_id" in " ".join(
+        _problems(forecast)
+    )
+
+
+def test_empty_load_bearing_facts_is_still_refused_when_documents_were_supplied() -> None:
+    """The reserved id relaxes where a fact may point, not whether one is required."""
+    forecast = validate_forecast_response(_payload(load_bearing_facts=[]), BinaryForecastResponse)
+    assert "load_bearing_facts: must not be empty" in _problems(forecast)
+
+
+def test_the_reserved_id_is_never_a_supplied_document() -> None:
+    """It counts as a citation, not as evidence: a packet that supplied nothing still has
+    the evidence rules stand down, and the reserved id does not turn them back on."""
+    payload = _cite(_payload(), "load_bearing_facts", [BACKGROUND_SOURCE_ID])
+    payload = _cite(payload, "base_rate", [])
+    payload = _cite(payload, "evidence_adjustments", [BACKGROUND_SOURCE_ID])
+    forecast = validate_forecast_response(payload, BinaryForecastResponse)
+    assert _problems(forecast, sources=()) == []
+    emptied = validate_forecast_response(
+        _cite(payload, "load_bearing_facts", []), BinaryForecastResponse
+    )
+    assert _problems(emptied, sources=()) == []
+    assert _problems(emptied, sources=("src-001",)) != []
+
+
+@pytest.mark.parametrize(
+    ("ids", "expected"),
+    [
+        ([BACKGROUND_SOURCE_ID], True),
+        ([BACKGROUND_SOURCE_ID, BACKGROUND_SOURCE_ID], True),
+        ([], False),
+        (["src-001"], False),
+        ([BACKGROUND_SOURCE_ID, "src-001"], False),
+        (["Question-Background"], False),
+    ],
+)
+def test_is_background_only_separates_the_two_kinds_of_claim(
+    ids: list[str], expected: bool
+) -> None:
+    assert is_background_only(ids) is expected
+
+
+def test_the_reserved_id_reaches_no_problem_message() -> None:
+    """AC5: not the reserved id, not a supplied one. Every failing shape is rendered."""
+    shapes = [
+        _cite(_payload(), "evidence_adjustments", []),
+        _cite(_payload(), "load_bearing_facts", []),
+        _cite(_payload(), "base_rate", [BACKGROUND_SOURCE_ID]),
+        _cite(_payload(), "evidence_adjustments", [BACKGROUND_SOURCE_ID, "src-009"]),
+        _payload(load_bearing_facts=[]),
+    ]
+    for payload in shapes:
+        forecast = validate_forecast_response(payload, BinaryForecastResponse)
+        problems = _problems(forecast)
+        assert problems
+        assert all(BACKGROUND_SOURCE_ID not in problem for problem in problems)
+
+
+def test_a_stored_forecast_validates_exactly_as_before(
+    golden: dict[str, Any], golden_sources: tuple[str, ...]
+) -> None:
+    """AC3, additive: a forecast that never mentions the reserved id gets the same verdict
+    it always did. The committed golden fixture is the stored shape."""
+    assert BACKGROUND_SOURCE_ID not in json.dumps(golden)
+    forecast = validate_forecast_response(golden, BinaryForecastResponse)
+    assert (
+        attribution_problems(forecast, question_id=golden["question_id"], source_ids=golden_sources)
+        == []
+    )
+    stripped = copy.deepcopy(golden)
+    stripped["load_bearing_facts"][0]["source_ids"] = []
+    refused = validate_forecast_response(stripped, BinaryForecastResponse)
+    assert attribution_problems(
+        refused, question_id=golden["question_id"], source_ids=golden_sources
+    )

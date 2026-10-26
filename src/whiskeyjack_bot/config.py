@@ -319,7 +319,7 @@ class ShadowForecastConfig(_StrictModel):
 
     enabled: bool = False
     prompt_path: Path = Path("prompts/forecaster-tournament-lens.md")
-    prompt_version: str = "1.0.0"
+    prompt_version: str = "1.2.0"
 
     @field_validator("prompt_version")
     @classmethod

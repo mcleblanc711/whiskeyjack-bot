@@ -89,7 +89,7 @@ retrieval:
     shadow:
       enabled: false
       prompt_path: prompts/forecaster-tournament-lens.md
-      prompt_version: "1.0.0"
+      prompt_version: "1.2.0"
 forecast:
   supported_question_types:
   - binary
@@ -103,7 +103,7 @@ forecast:
   fail_on_stale_research: true
   flag_on_stale_research: true
   prompt_path: /home/cleblanc/projects/whiskeyjack-bot/prompts/forecaster-tournament.md
-  prompt_version: 1.2.0
+  prompt_version: 1.4.0
 numeric_calibration:
   use_forecasting_tools_standardization: true
   expected_cdf_points: 201

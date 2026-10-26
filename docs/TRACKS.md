@@ -57,7 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
-| M1-359 | feat/m1-359-shadow-forecast-arm | whiskeyjack-m1-359 | no | 020 | 2026-10-17 |
+| M1-362 | feat/m1-362-background-attribution | whiskeyjack-m1-362 | no | none | 2026-10-26 |
 | M4-808 | feat/m4-808-platform-score-int | whiskeyjack-m4-808 | no | 018 | 2026-10-05 |
 | M0-008 | feat/m0-008-error-hygiene-sweep | whiskeyjack-m0-008 | no | none | 2026-09-25 |
 | M1-355 | feat/m1-355-asknews-series-subcap | whiskeyjack-m1-355 | no | none | 2026-10-01 |
