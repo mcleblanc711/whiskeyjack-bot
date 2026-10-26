@@ -1405,7 +1405,10 @@ def test_nothing_is_clamped_by_the_conversion(
 # Small pools, so a citation that resolves and one that does not are both drawn often
 # rather than by luck. ``src-009`` is never supplied.
 _SUPPLIABLE = ["src-001", "src-002", "src-003"]
-_CITABLE = [*_SUPPLIABLE, "src-009"]
+# M1-362: the reserved id and one near miss ride in the pool, so the exact-equality branch is
+# reached from the strategy rather than assumed. The literals are written out here, not
+# imported: importing the constant would pass whatever the constant says.
+_CITABLE = [*_SUPPLIABLE, "src-009", "question-background", "Question-Background"]
 
 _ADJUSTMENT = VALID_PAYLOAD["evidence_adjustments"][0]
 _FACT = VALID_PAYLOAD["load_bearing_facts"][0]
@@ -1624,26 +1627,38 @@ def _expected_attribution_problems(
     if not response.failure_modes:
         expected.add("failure_modes: must not be empty")
 
-    lists: list[tuple[str, list[str], bool]] = [
-        ("base_rate.source_ids", list(response.base_rate.source_ids), False)
+    # M1-362: the question's background is citable from an adjustment or a fact, never from
+    # the base rate, and only as that exact literal.
+    lists: list[tuple[str, list[str], bool, bool]] = [
+        ("base_rate.source_ids", list(response.base_rate.source_ids), False, False)
     ]
     if require_one and not response.evidence_adjustments:
         expected.add("evidence_adjustments: must not be empty")
     for index, adjustment in enumerate(response.evidence_adjustments):
         lists.append(
-            (f"evidence_adjustments.{index}.source_ids", list(adjustment.source_ids), require_one)
+            (
+                f"evidence_adjustments.{index}.source_ids",
+                list(adjustment.source_ids),
+                require_one,
+                True,
+            )
         )
     if require_one and not response.load_bearing_facts:
         expected.add("load_bearing_facts: must not be empty")
     for index, fact in enumerate(response.load_bearing_facts):
-        lists.append((f"load_bearing_facts.{index}.source_ids", list(fact.source_ids), require_one))
+        lists.append(
+            (f"load_bearing_facts.{index}.source_ids", list(fact.source_ids), require_one, True)
+        )
 
-    for location, cited, needs_one in lists:
+    for location, cited, needs_one, background_ok in lists:
         if needs_one and not cited:
             expected.add(
                 f"{location}: must cite at least one source_id supplied in research_documents"
             )
-        if any(value not in available for value in cited):
+        if any(
+            value not in available and not (background_ok and value == "question-background")
+            for value in cited
+        ):
             expected.add(
                 f"{location}: must name only source_ids supplied in research_documents "
                 "(offending input withheld)"
@@ -2541,3 +2556,28 @@ def test_an_unregistered_question_type_is_refused_rather_than_passed(
         ]
     else:
         raise AssertionError("an unregistered question type was validated")
+
+
+# --- M1-362: is_background_only ---------------------------------------------------------
+
+
+@given(st.lists(st.one_of(st.sampled_from(_CITABLE), HOSTILE_TEXT), max_size=4))
+def test_is_background_only_matches_its_statement_and_never_raises(ids: list[str]) -> None:
+    """Non-empty, and every entry the exact reserved literal. The oracle is written out, and the
+    pool carries the near miss, so a prefix or case-insensitive comparison is visible."""
+    from whiskeyjack_bot.forecast.attribution import is_background_only
+
+    expected = bool(ids) and all(value == "question-background" for value in ids)
+    assert is_background_only(ids) is expected
+    # Replay-stable: the verdict is the same on the persisted, reloaded form.
+    reloaded = json.loads(json.dumps(ids, ensure_ascii=True, sort_keys=True))
+    assert is_background_only(reloaded) is expected
+
+
+@given(attribution_cases())
+def test_the_reserved_id_reaches_no_problem_in_any_drawn_case(
+    case: tuple[BinaryForecastResponse, int, tuple[str, ...]],
+) -> None:
+    response, question_id, supplied = case
+    problems = attribution_problems(response, question_id=question_id, source_ids=supplied)
+    assert all("question-background" not in problem.lower() for problem in problems)
