@@ -941,3 +941,51 @@ def test_no_refusal_echoes_the_content_it_refused(
 def test_the_planted_value_would_be_visible_if_it_leaked() -> None:
     assert _leaks(ForecastRecordError(f"stored value was {PLANTED}"))
     assert _leaks(ArtifactError(f"model reply was {PLANTED}"))
+
+
+# --------------------------------------------------------------------------------------
+# M1-362: a stored forecast replays the same whichever prompt version produced it
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("version", ["1.1.0", "1.2.0", "1.3.0", "1.4.0"])
+def test_a_stored_record_replays_identically_for_every_released_prompt_version(
+    version: str, conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    """Additive (AC3): a record stored under 1.1.0 or 1.2.0, which can never cite the reserved
+    id, replays through the same validator to the same hash it was stored with, and so does one
+    stored under a version that teaches the id. The stored settings carry the version; the
+    verdict must not depend on it."""
+    config = _config(tmp_path, artifacts)
+    generation = _generation(settings=_settings(prompt_version=version))
+    stored = _persist(conn, config, generation)
+    assert stored.record is not None
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+    assert result.matches
+    assert result.problems == ()
+    assert result.replayed_sha256 == record_sha256(stored.record)
+
+
+def test_a_stored_background_only_record_replays(
+    conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
+) -> None:
+    payload = _payload()
+    payload["load_bearing_facts"] = [
+        {**payload["load_bearing_facts"][0], "source_ids": ["question-background"]}
+    ]
+    payload["evidence_adjustments"] = [
+        {**payload["evidence_adjustments"][0], "source_ids": ["question-background"]}
+    ]
+    reply = json.dumps(payload)
+    forecast = validate_forecast_response(payload, response_model_for("binary"))
+    config = _config(tmp_path, artifacts)
+    generation = _generation(
+        forecast=forecast,
+        settings=_settings(prompt_version="1.4.0"),
+        raw_responses=(reply,),
+    )
+    stored = _persist(conn, config, generation)
+    assert stored.record is not None
+    result = replay_forecast(conn, config, record_id=stored.record.record_id)
+    assert result.matches
+    assert result.problems == ()

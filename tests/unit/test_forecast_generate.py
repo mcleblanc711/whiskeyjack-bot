@@ -2314,3 +2314,69 @@ def test_an_invented_id_still_fails_and_the_repair_turn_names_no_id(
     assert len(sent) == 2
     assert result.failure_code == "schema_invalid"
     assert all("question-background" not in problem for problem in result.failure_problems)
+
+
+# Numeric: where all four live failures were (M1-362 round 1). The decisive anchor in a numeric
+# question is a number in the background, so the billed-call bound is asserted here too.
+
+
+def _numeric_failing_shape(name: str) -> str:
+    payload = json.loads(numeric_reply())
+    if name == "empty_facts":
+        payload["load_bearing_facts"] = []
+    elif name == "fact_without_source":
+        payload["load_bearing_facts"] = [{**payload["load_bearing_facts"][0], "source_ids": []}]
+    else:
+        payload["evidence_adjustments"] = [{**payload["evidence_adjustments"][0], "source_ids": []}]
+    return json.dumps(payload)
+
+
+def _numeric_background_reply() -> str:
+    payload = json.loads(numeric_reply())
+    payload["evidence_adjustments"] = [
+        {**payload["evidence_adjustments"][0], "source_ids": ["question-background"]}
+    ]
+    payload["load_bearing_facts"] = [
+        {**payload["load_bearing_facts"][0], "source_ids": ["question-background"]}
+    ]
+    return json.dumps(payload)
+
+
+_NUMERIC_SHAPES = ["empty_facts", "fact_without_source", "adjustment_without_source"]
+
+
+@pytest.mark.parametrize("shape", _NUMERIC_SHAPES)
+def test_each_numeric_failing_shape_still_fails_when_nothing_is_cited(
+    shape: str, config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, sent = _counting_client(monkeypatch, _numeric_failing_shape(shape))
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert len(sent) == 2
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"
+
+
+@pytest.mark.parametrize("shape", _NUMERIC_SHAPES)
+def test_each_numeric_failing_shape_reaches_a_forecast_within_two_billed_calls(
+    shape: str, config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, sent = _counting_client(
+        monkeypatch, _numeric_failing_shape(shape), _numeric_background_reply()
+    )
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert len(sent) == 2
+    assert result.invocations == 2
+    assert result.failure_code is None
+    assert result.forecast is not None
+    assert result.forecast.question_type == "numeric"
+    assert result.forecast.load_bearing_facts[0].source_ids == ["question-background"]
+
+
+def test_a_numeric_background_only_reply_needs_no_repair(
+    config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, sent = _counting_client(monkeypatch, _numeric_background_reply())
+    result = _generate(client, config, prompt, question=_numeric_question())
+    assert len(sent) == 1
+    assert result.repair_attempted is False
+    assert result.failure_code is None

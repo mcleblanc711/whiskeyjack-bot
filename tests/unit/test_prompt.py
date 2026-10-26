@@ -3,6 +3,7 @@ config and its content hash is over raw bytes, so any changed byte -- including 
 whitespace reflow -- produces a new hash. Errors arrive as PromptError and never
 echo prompt contents."""
 
+import re
 import traceback
 from pathlib import Path
 from typing import Any
@@ -702,6 +703,8 @@ RELEASED_LENS_PROMPT_SHA256 = {
     "1.0.0": "298664782a74640c95de49fc8960ec918ec320c019b865eee6ed25c119fa0efb",
     # M1-362: the reserved ``question-background`` citation id (D55).
     "1.1.0": "ed7d3ba0be4305d40949048e3cbe9dbad1d1fe2610d2dd442b8c8aa520cff6b7",
+    # M1-362 r1: the closing "Cite only the supplied source IDs" sentence now names the exception.
+    "1.2.0": "139d03acec1b232bd74f75787c98080b7ceeb7523dde77834e75c18a99b47d16",
 }
 
 
@@ -736,3 +739,20 @@ def test_the_lens_prompt_is_the_tournament_prompt_plus_the_local_evidence_rules_
 def test_the_lens_prompt_declares_the_committed_range() -> None:
     bounds = parse_declared_probability_bounds(LENS_PROMPT.read_text(encoding="utf-8"))
     assert (bounds.low, bounds.high) == (0.001, 0.999)
+
+
+@pytest.mark.parametrize("path", [TOURNAMENT_PROMPT, LENS_PROMPT], ids=["control", "lens"])
+def test_no_citation_instruction_in_a_tournament_prompt_contradicts_the_background_id(
+    path: Path,
+) -> None:
+    """M1-362 round 1: the closing paragraph said "Cite only the supplied source IDs" after the
+    shared-fields section had introduced ``question-background``, two instructions a model could
+    not both follow. Every sentence that restricts citations to supplied ids must carry the
+    exception, and the instruction itself must be stated more than once."""
+    text = path.read_text(encoding="utf-8")
+    restricting = [
+        sentence for sentence in re.split(r"(?<=[.])\s", text) if "cite only" in sentence.lower()
+    ]
+    assert restricting, "the closing instruction is gone; this test would be vacuous"
+    assert all("question-background" in sentence for sentence in restricting)
+    assert text.count("question-background") >= 3

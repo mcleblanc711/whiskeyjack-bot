@@ -17008,7 +17008,7 @@ equality, never added to the supplied set, and never part of a packet, document 
 hash. Loosening the validator instead (allowing empty `source_ids`) would let any unsupported
 claim through, which is the thing M1-501 exists to stop. The emptiness rules stand: with
 documents supplied, an empty `load_bearing_facts` still fails, so the model's way out is a fact
-that cites the background. The prompts say so (tournament 1.2.0 to 1.3.0, lens 1.0.0 to 1.1.0;
+that cites the background. The prompts say so (tournament 1.2.0 to 1.4.0, lens 1.0.0 to 1.2.0;
 the lens-equals-control-plus-section test still holds because both got the same two edits).
 
 ### Decision — not citable from `base_rate`, and why
@@ -17053,6 +17053,18 @@ change, so `config_sha256` moves and the live activation retires when this merge
 between batches and leave `tournament enable` to the owner. `config/tournament.yaml`,
 `tournament-cup.yaml` and `tournament-cup-rehearsal.yaml` are bumped in this PR; the example
 config's shadow default moves 1.0.0 to 1.1.0.
+
+### Round 1 — APPROVE on `2ccc58b`, one real observation taken
+
+The reviewer found that the closing paragraph of both prompts still said "Cite only the supplied
+source IDs", contradicting the exception the shared-fields section had just introduced. Reproduced
+by reading the committed prompts at `2ccc58b`; fixed in both (tournament 1.3.0 to 1.4.0, lens 1.1.0
+to 1.2.0, the lens digest re-pinned) and pinned by a test that every restricting sentence names the
+exception. It was missed because the self-check bullet was edited and the closing paragraph was not.
+The other observation was also taken: the billed-call tests now run on numeric questions, where the
+live failures were, and a replay test covers records stored under 1.1.0 through 1.4.0 and a
+background-only record. No committed fixture holds a real stored 1.2.0 record, so the replay test
+proves the verdict does not depend on the stored version, not that a specific old row replays.
 
 ### Mutants
 
