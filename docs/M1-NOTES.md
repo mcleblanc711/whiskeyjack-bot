@@ -17070,3 +17070,10 @@ proves the verdict does not depend on the stored version, not that a specific ol
 
 Three, each killed on the first run: exact comparison replaced by `startswith("question")`;
 exact comparison replaced by `True`; the flag never passed to either claim list.
+
+### Round 2 — approved
+
+`c3b0260`: APPROVE. Both round-1 observations closed; no blockers. One new non-blocking candidate,
+not taken: commit sanitized historical 1.1.0 and 1.2.0 record fixtures and assert unchanged replay
+verdicts and hashes. Unclaimed by any backlog row; the replay test states its limit (it proves
+version independence on newly persisted records).
