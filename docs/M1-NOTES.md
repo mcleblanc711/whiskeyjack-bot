@@ -16991,3 +16991,70 @@ first review. It was missed, so it is taken now rather than filed:
 and saw each rejected in 5 of 5 random runs. It also replayed 17 checkpoint shapes through the
 real comprehension and the journal's serialization: the selection is the same before and after
 the `skipped` change. No new candidates.
+
+
+## M1-362 — a claim that rests only on the question background (D55)
+
+Live 2026-10-19 on 33132: four numeric questions (46363, 46365, 46369, 46380) each spent both
+model calls, about USD 0.82 in all, and produced no forecast. The decisive anchor was a number in
+`background_info`, which the prompt lists as an input but gives no way to cite, so the model wrote
+`source_ids: []` or left `load_bearing_facts` empty and the single repair could not fix it.
+
+### Decision — a reserved citation id, not a looser validator, and why
+
+`forecast/attribution.py:BACKGROUND_SOURCE_ID = "question-background"`. It is accepted in
+`evidence_adjustments[*].source_ids` and `load_bearing_facts[*].source_ids`, compared by exact
+equality, never added to the supplied set, and never part of a packet, document list or packet
+hash. Loosening the validator instead (allowing empty `source_ids`) would let any unsupported
+claim through, which is the thing M1-501 exists to stop. The emptiness rules stand: with
+documents supplied, an empty `load_bearing_facts` still fails, so the model's way out is a fact
+that cites the background. The prompts say so (tournament 1.2.0 to 1.3.0, lens 1.0.0 to 1.1.0;
+the lens-equals-control-plus-section test still holds because both got the same two edits).
+
+### Decision — not citable from `base_rate`, and why
+
+The row names adjustments and load-bearing facts. A base rate may already cite nothing, so it
+has no need of the id, and the stricter reading keeps the new id out of the one field that was
+never failing. A model that cites it there is told the id does not resolve.
+
+### Decision — repair messages stay constant
+
+AC5: no message renders the reserved id. The model learns it from the prompt, not from the
+repair turn, so the repair message for an empty list is unchanged. One consequence: a model that
+fails on an empty list is told to cite a supplied source and not told about the background; the
+prompt carries that.
+
+### Deviation — AC4 is satisfied by the stored record, not a new field
+
+"Recorded as such so the ledger and the M5-804 report can separate" is met because the stored
+`record_json` carries `source_ids: ["question-background"]` verbatim, and
+`attribution.is_background_only` is the single reading of it. No column, no migration, no report
+axis. A report axis (background-anchored share by cell) is not built here.
+
+### Deferred (do not read the absence as an omission)
+
+- A report axis for background-anchored claims. It has no data until a 1.3.0 forecast exists.
+- The 45764 history (six `schema_invalid`) is unchecked and may be a different cause.
+- No forecast already in the ledger is touched. Stored 1.1.0 and 1.2.0 records replay exactly as
+  before: the change is additive and the golden fixtures validate unchanged.
+
+### Standing risk — not verifiable offline
+
+Whether the live model actually cites `question-background` when the anchor is in the background.
+The tests prove the validator accepts it and the repair loop reaches a forecast; they cannot
+prove the model follows the prompt. The first numeric question after re-enable is the evidence.
+Also: a model could cite the background for a claim it does not state. The id proves where the
+claim says it came from, not that the background says it.
+
+### Deployment — retires the activation
+
+The prompt bytes and `forecast.prompt_version` (and, for the lens, the shadow prompt version)
+change, so `config_sha256` moves and the live activation retires when this merges. Land it
+between batches and leave `tournament enable` to the owner. `config/tournament.yaml`,
+`tournament-cup.yaml` and `tournament-cup-rehearsal.yaml` are bumped in this PR; the example
+config's shadow default moves 1.0.0 to 1.1.0.
+
+### Mutants
+
+Three, each killed on the first run: exact comparison replaced by `startswith("question")`;
+exact comparison replaced by `True`; the flag never passed to either claim list.

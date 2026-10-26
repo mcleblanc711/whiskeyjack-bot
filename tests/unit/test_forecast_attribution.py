@@ -645,8 +645,9 @@ def test_the_background_is_not_citable_from_a_base_rate() -> None:
     forecast = validate_forecast_response(
         _cite(_payload(), "base_rate", [BACKGROUND_SOURCE_ID]), BinaryForecastResponse
     )
-    assert "base_rate.source_ids: must name only source_ids supplied in research_documents" in " ".join(
-        _problems(forecast)
+    assert (
+        "base_rate.source_ids: must name only source_ids supplied in research_documents"
+        in " ".join(_problems(forecast))
     )
 
 
@@ -697,9 +698,7 @@ def test_an_empty_citation_list_is_still_refused_when_documents_were_supplied(fi
 
 def test_empty_load_bearing_facts_is_still_refused_when_documents_were_supplied() -> None:
     """The reserved id relaxes where a fact may point, not whether one is required."""
-    forecast = validate_forecast_response(
-        _payload(load_bearing_facts=[]), BinaryForecastResponse
-    )
+    forecast = validate_forecast_response(_payload(load_bearing_facts=[]), BinaryForecastResponse)
     assert "load_bearing_facts: must not be empty" in _problems(forecast)
 
 
@@ -758,7 +757,10 @@ def test_a_stored_forecast_validates_exactly_as_before(
     it always did. The committed golden fixture is the stored shape."""
     assert BACKGROUND_SOURCE_ID not in json.dumps(golden)
     forecast = validate_forecast_response(golden, BinaryForecastResponse)
-    assert attribution_problems(forecast, question_id=golden["question_id"], source_ids=golden_sources) == []
+    assert (
+        attribution_problems(forecast, question_id=golden["question_id"], source_ids=golden_sources)
+        == []
+    )
     stripped = copy.deepcopy(golden)
     stripped["load_bearing_facts"][0]["source_ids"] = []
     refused = validate_forecast_response(stripped, BinaryForecastResponse)

@@ -2220,7 +2220,9 @@ def test_a_satisfiable_option_count_at_the_edge_reaches_the_model(
 # than recorded rows or a double's own counter.
 
 
-def _counting_client(monkeypatch: pytest.MonkeyPatch, *replies: str) -> tuple[GeneralLlm, list[str]]:
+def _counting_client(
+    monkeypatch: pytest.MonkeyPatch, *replies: str
+) -> tuple[GeneralLlm, list[str]]:
     sent: list[str] = []
 
     async def _fake(self: Any, prompt: Any) -> _Reply:
@@ -2263,7 +2265,9 @@ def _failing_shape(name: str) -> str:
     return json.dumps(payload)
 
 
-@pytest.mark.parametrize("shape", ["empty_facts", "fact_without_source", "adjustment_without_source"])
+@pytest.mark.parametrize(
+    "shape", ["empty_facts", "fact_without_source", "adjustment_without_source"]
+)
 def test_each_failing_shape_still_fails_without_the_reserved_id(
     shape: str, config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2276,7 +2280,9 @@ def test_each_failing_shape_still_fails_without_the_reserved_id(
     assert result.failure_code == "schema_invalid"
 
 
-@pytest.mark.parametrize("shape", ["empty_facts", "fact_without_source", "adjustment_without_source"])
+@pytest.mark.parametrize(
+    "shape", ["empty_facts", "fact_without_source", "adjustment_without_source"]
+)
 def test_each_failing_shape_reaches_a_forecast_within_the_two_existing_calls(
     shape: str, config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
 ) -> None:
