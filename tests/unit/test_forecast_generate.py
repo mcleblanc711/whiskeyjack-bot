@@ -2210,3 +2210,101 @@ def test_a_satisfiable_option_count_at_the_edge_reaches_the_model(
     client = _Model(good_reply())
     _generate(client, _bounded_forecast(config, minimum, maximum), prompt, question=_options(count))
     assert client.calls != []
+
+
+# --- M1-362: a claim that rests only on the question's background (D55) -------------------
+#
+# Live 2026-10-19 on 33132: four numeric questions spent both calls and produced no forecast,
+# because the decisive anchor was in ``background_info`` and the model could cite nothing.
+# These count calls that reach the SDK's network-facing method -- the billed ones -- rather
+# than recorded rows or a double's own counter.
+
+
+def _counting_client(monkeypatch: pytest.MonkeyPatch, *replies: str) -> tuple[GeneralLlm, list[str]]:
+    sent: list[str] = []
+
+    async def _fake(self: Any, prompt: Any) -> _Reply:
+        sent.append(str(prompt))
+        return _Reply(replies[min(len(sent) - 1, len(replies) - 1)])
+
+    monkeypatch.setattr(GeneralLlm, "_mockable_direct_call_to_model", _fake)
+    client = GeneralLlm(
+        model=MODEL_NAME,
+        temperature=0.0,
+        timeout=5,
+        allowed_tries=1,
+        max_tokens=100,
+        api_key=FAKE_KEY,
+        pass_through_unknown_kwargs=False,
+    )
+    return client, sent
+
+
+def _background_reply(**overrides: Any) -> str:
+    payload = json.loads(good_reply())
+    payload["evidence_adjustments"] = [
+        {**payload["evidence_adjustments"][0], "source_ids": ["question-background"]}
+    ]
+    payload["load_bearing_facts"] = [
+        {"claim": payload["load_bearing_facts"][0]["claim"], "source_ids": ["question-background"]}
+    ]
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def _failing_shape(name: str) -> str:
+    payload = json.loads(good_reply())
+    if name == "empty_facts":
+        payload["load_bearing_facts"] = []
+    elif name == "fact_without_source":
+        payload["load_bearing_facts"] = [{**payload["load_bearing_facts"][0], "source_ids": []}]
+    else:
+        payload["evidence_adjustments"] = [{**payload["evidence_adjustments"][0], "source_ids": []}]
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize("shape", ["empty_facts", "fact_without_source", "adjustment_without_source"])
+def test_each_failing_shape_still_fails_without_the_reserved_id(
+    shape: str, config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression for the four live failures: with nothing to cite the reply is refused,
+    twice, and nothing is posted. The loosened validator must not turn this into a pass."""
+    client, sent = _counting_client(monkeypatch, _failing_shape(shape))
+    result = _generate(client, config, prompt)
+    assert len(sent) == 2
+    assert result.forecast is None
+    assert result.failure_code == "schema_invalid"
+
+
+@pytest.mark.parametrize("shape", ["empty_facts", "fact_without_source", "adjustment_without_source"])
+def test_each_failing_shape_reaches_a_forecast_within_the_two_existing_calls(
+    shape: str, config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, sent = _counting_client(monkeypatch, _failing_shape(shape), _background_reply())
+    result = _generate(client, config, prompt)
+    assert len(sent) == 2, "exactly the two billed calls M1-402 budgets"
+    assert result.invocations == 2
+    assert result.failure_code is None
+    assert isinstance(result.forecast, BinaryForecastResponse)
+    assert result.forecast.load_bearing_facts[0].source_ids == ["question-background"]
+
+
+def test_a_background_only_reply_needs_no_repair(
+    config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, sent = _counting_client(monkeypatch, _background_reply())
+    result = _generate(client, config, prompt)
+    assert len(sent) == 1
+    assert result.repair_attempted is False
+    assert result.failure_code is None
+
+
+def test_an_invented_id_still_fails_and_the_repair_turn_names_no_id(
+    config: AppConfig, prompt: LoadedPrompt, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reply = _citing("load_bearing_facts", ["src-009"])
+    client, sent = _counting_client(monkeypatch, reply)
+    result = _generate(client, config, prompt)
+    assert len(sent) == 2
+    assert result.failure_code == "schema_invalid"
+    assert all("question-background" not in problem for problem in result.failure_problems)

@@ -1,4 +1,4 @@
-"""The common attribution fields, and the citations that make them auditable (M1-501).
+"""The common attribution fields, and the citations that make them auditable (M1-501, M1-362).
 
 ``forecast/schema.py`` accepts a response whose evidence lists are all empty and whose
 citations name documents that were never supplied. It says so at the fields --
@@ -89,6 +89,24 @@ gutted, and M1-406's import-graph test now pins ``forecast.inputs`` clean alongs
 module. The signature stays as it is anyway: taking primitives is what makes this
 module's independence a property of its own interface rather than of another package's
 ``__init__.py``, which is exactly the thing that changed underneath it once already.
+
+**The question's own background is citable, as one reserved id (M1-362, D55).** The prompt
+lists ``background_info`` as an input, and on numeric questions the decisive anchor is often a
+number printed there, but every adjustment and every load-bearing fact had to cite a supplied
+research document and the background is not one. A model that said so honestly wrote
+``source_ids: []`` and failed ``schema_invalid`` through both calls (q46363, q46365, q46369,
+q46380 on 33132). The disagreement was between prompt and validator, and the fix that does
+not weaken attribution is to give the claim somewhere true to point:
+:data:`BACKGROUND_SOURCE_ID`. It is accepted in ``evidence_adjustments`` and
+``load_bearing_facts`` and **nowhere else** -- not in ``base_rate.source_ids``, which keeps
+M1-501's reading. It satisfies "cite at least one" and nothing more: it is compared by exact
+equality, never added to the supplied set, and never a research document, so no packet,
+document list or packet hash changes and every stored forecast validates as before. It cannot
+collide with a minted id (``src-NNN``). The emptiness rules stand: with documents supplied, an
+empty ``load_bearing_facts`` still fails, and the model's way out is a fact citing the
+background. A claim whose only citation is the reserved id is separable from a document-backed
+one in the stored ``record_json`` verbatim; :func:`is_background_only` is the one reading of
+that.
 """
 
 from __future__ import annotations
@@ -110,6 +128,11 @@ _FAILURE_MODES_LOC = "failure_modes"
 _ADJUSTMENTS_LOC = "evidence_adjustments"
 _FACTS_LOC = "load_bearing_facts"
 _BASE_RATE_SOURCES_LOC = "base_rate.source_ids"
+
+# The one citation id that is not a research document: the question's own ``background_info``
+# (M1-362, D55). Introduced here and in the two tournament prompts, nowhere else. Compared by
+# exact equality only.
+BACKGROUND_SOURCE_ID = "question-background"
 
 # Every message below is a constant. The offending value is never interpolated, and the
 # supplied id set is never rendered either -- see the module docstring for why that
@@ -156,8 +179,23 @@ def _supplied_ids(source_ids: Sequence[str]) -> frozenset[str]:
     return frozenset(source_ids)
 
 
+def is_background_only(source_ids: Sequence[str]) -> bool:
+    """Whether a claim's citations are exactly the question's background and nothing else.
+
+    The one reading the ledger and the attribution report use to separate a
+    background-anchored claim from a document-backed one (M1-362). A claim citing the
+    background *and* a document is document-backed, so it is not background-only.
+    """
+    return len(source_ids) > 0 and all(value == BACKGROUND_SOURCE_ID for value in source_ids)
+
+
 def _citation_problems(
-    cited: Sequence[str], location: str, supplied: frozenset[str], *, require_one: bool
+    cited: Sequence[str],
+    location: str,
+    supplied: frozenset[str],
+    *,
+    require_one: bool,
+    allow_background: bool = False,
 ) -> list[str]:
     """Every problem with one ``source_ids`` list, at most one per rule.
 
@@ -176,7 +214,7 @@ def _citation_problems(
         if value in seen:
             repeated = True
         seen.add(value)
-        if value not in supplied:
+        if value not in supplied and not (allow_background and value == BACKGROUND_SOURCE_ID):
             unresolved = True
     if unresolved:
         problems.append(f"{location}: {_UNRESOLVED}")
@@ -221,6 +259,7 @@ def _problems(
                 f"{_ADJUSTMENTS_LOC}.{index}.source_ids",
                 supplied,
                 require_one=require_citations,
+                allow_background=True,
             )
         )
     if require_citations and not forecast.load_bearing_facts:
@@ -232,6 +271,7 @@ def _problems(
                 f"{_FACTS_LOC}.{index}.source_ids",
                 supplied,
                 require_one=require_citations,
+                allow_background=True,
             )
         )
     return problems

@@ -700,6 +700,8 @@ LENS_PROMPT = REPO_ROOT / "prompts" / "forecaster-tournament-lens.md"
 TOURNAMENT_PROMPT = REPO_ROOT / "prompts" / "forecaster-tournament.md"
 RELEASED_LENS_PROMPT_SHA256 = {
     "1.0.0": "298664782a74640c95de49fc8960ec918ec320c019b865eee6ed25c119fa0efb",
+    # M1-362: the reserved ``question-background`` citation id (D55).
+    "1.1.0": "ed7d3ba0be4305d40949048e3cbe9dbad1d1fe2610d2dd442b8c8aa520cff6b7",
 }
 
 
