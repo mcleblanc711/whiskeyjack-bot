@@ -255,7 +255,12 @@ def test_question_refusal_refuses_exactly_what_the_spending_site_refuses(
         assert calls > 0
     else:
         assert message == refusal.message, "a refusal the spending site does not make"
-        assert refusal.detail_code in ("schema_invalid", "calibration_invalid")
+        # The recorded code, derived independently of the module: a type this configuration
+        # does not enable has no response schema at all; every other question-only refusal
+        # is about what the configured output can express. Asserting membership in the pair
+        # alone let both swaps of the mapping survive the mutation pass.
+        unsupported = question.qtype not in config.forecast.supported_question_types
+        assert refusal.detail_code == ("schema_invalid" if unsupported else "calibration_invalid")
 
 
 @settings(deadline=None)
