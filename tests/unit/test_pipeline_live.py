@@ -465,6 +465,129 @@ def test_a_question_no_reply_could_answer_is_refused_before_any_retrieval(
     ), "no run row: nothing was bought for it"
 
 
+class _Tripwire:
+    """A provider client that records every attribute anyone reads from it.
+
+    ``web_client=object()`` cannot count an Exa call -- one would surface as an
+    ``AttributeError`` and be recorded as a failure, which a test expecting a failure would
+    read as success. This records the access instead, so "zero calls" is an observation.
+    """
+
+    def __init__(self) -> None:
+        self.touched: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.touched.append(name)
+        raise AssertionError(f"provider client used: {name}")
+
+
+def _refusal_case(name: str, config: AppConfig) -> tuple[AppConfig, CanonicalQuestion, str]:
+    """One question per question-only refusal family (M1-364 AC1), with its recorded code."""
+    from forecasting_tools.data_models.data_organizer import DataOrganizer
+
+    from whiskeyjack_bot.questions.model import (
+        CanonicalBinaryQuestion,
+        CanonicalMultipleChoiceQuestion,
+        CanonicalNumericQuestion,
+    )
+
+    def forecast(**update: Any) -> AppConfig:
+        return config.model_copy(update={"forecast": config.forecast.model_copy(update=update)})
+
+    def numeric(**fields: Any) -> CanonicalNumericQuestion:
+        base: dict[str, Any] = {
+            "question_id": 7001,
+            "post_id": 7001,
+            "title": "How many?",
+            "lower_bound": 5.0,
+            "upper_bound": 100.0,
+            "open_lower_bound": False,
+            "open_upper_bound": False,
+            "cdf_size": 201,
+        }
+        return CanonicalNumericQuestion(**{**base, **fields})
+
+    if name == "unsupported type":
+        question: CanonicalQuestion = CanonicalBinaryQuestion(
+            question_id=7001, post_id=7001, title="Will X?"
+        )
+        return forecast(supported_question_types=["multiple_choice"]), question, "schema_invalid"
+    if name == "zero_point":
+        return config, numeric(zero_point=9.5), "calibration_invalid"
+    if name == "numeric grid":
+        return config, numeric(cdf_size=101), "calibration_invalid"
+    if name == "discrete grid (q46095)":
+        raw = json.loads(
+            (REPO_ROOT / "tests/fixtures/api_posts/discrete_shapes/post_45913.json").read_text(
+                "utf-8"
+            )
+        )
+        question = normalize_questions([DataOrganizer.get_question_from_post_json(raw)]).questions[
+            0
+        ]
+        return config, question, "calibration_invalid"
+    assert name == "option count"
+    question = CanonicalMultipleChoiceQuestion(
+        question_id=7001,
+        post_id=7001,
+        title="Which X?",
+        options=[f"Option {index}" for index in range(21)],
+    )
+    return forecast(min_probability=0.05, max_probability=0.95), question, "calibration_invalid"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["unsupported type", "zero_point", "numeric grid", "discrete grid (q46095)", "option count"],
+)
+def test_every_question_only_refusal_touches_no_provider(
+    config: AppConfig, ledger: Any, name: str
+) -> None:
+    """M1-364 AC1, per refusal family: zero AskNews, Exa and model calls, counted.
+
+    Round 1's observation: the live-path tests covered two of the four families, and both
+    passed ``web_client=object()``, which cannot count an Exa call. Driven through
+    ``_attempt_question`` because that is where the preflight sits, with a tripwire for each
+    of the three clients.
+    """
+    from whiskeyjack_bot.pipeline_live import _attempt_question
+    from whiskeyjack_bot.prompt import load_prompt
+
+    cfg, question, code = _refusal_case(name, config)
+    # Loaded under the unnarrowed pair: the prompt declares 0.001 to 0.999 and load_prompt
+    # refuses a pair that disagrees with it. The option-count case narrows only the config,
+    # M1-512's construction, so the refusal is the option count and not the prompt bounds.
+    prompt = load_prompt(
+        config.forecast.prompt_path,
+        config.forecast.prompt_version,
+        min_probability=config.forecast.min_probability,
+        max_probability=config.forecast.max_probability,
+    )
+    news, web, model = _Tripwire(), _Tripwire(), _Tripwire()
+    outcome = _attempt_question(
+        ledger,
+        cfg,
+        question=question,
+        tournament_id="33129",
+        prompt=prompt,
+        now=NOW,
+        refresh=False,
+        news_client=news,
+        web_client=web,
+        forecaster=model,
+    )
+    assert (news.touched, web.touched, model.touched) == ([], [], [])
+    assert (outcome.status, outcome.detail_code, outcome.retrieval_run_ids) == (
+        "research_failed",
+        code,
+        (),
+    )
+    assert rows(
+        ledger, "SELECT event_type, detail_code, retrieval_run_id FROM pipeline_failure_events"
+    ) == [("research_failed", code, None)]
+    assert rows(ledger, "SELECT 1 FROM research_runs") == []
+
+
 # --- the research sufficiency gate (M1-504) ----------------------------------------------
 
 

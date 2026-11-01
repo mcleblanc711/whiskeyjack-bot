@@ -1429,8 +1429,27 @@ def test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought(
     monkeypatch.setattr(tournament_state, "utcnow", lambda: clock["now"])
     monkeypatch.setattr(whiskeyjack_tournament, "utcnow", lambda: clock["now"])
 
+    # Exa is a tripwire rather than ``poll``'s ``object()``: an Exa call on ``object()`` is an
+    # AttributeError recorded as a failure, which the blocking poll -- expected to fail --
+    # would hide (round 1's observation).
+    from tests.unit.test_pipeline_live import _Tripwire
+
+    web = _Tripwire()
+
+    def counted_poll() -> dict[str, Any]:
+        return run_once(
+            conn,
+            config,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=web,
+            forecaster=model,
+        )
+
     pushes = _recording(monkeypatch, config)
-    first = poll(case)
+    first = counted_poll()
+    assert web.touched == [], "no Exa call either"
     assert news.calls == 0, "nothing may be bought for a question no reply can convert"
     assert model.calls == platform.posts == 0
     assert first["heartbeat"]["failures"] == 1, "the blocking poll still fails, as M1-326's do"
@@ -1457,8 +1476,8 @@ def test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought(
     for minutes in (5, 31, 62):
         clock["now"] = real_now + timedelta(minutes=minutes)
         silent = _recording(monkeypatch, config, tmp_path / f"poll-{minutes}")
-        later = poll(case)
-        assert news.calls == 0 and model.calls == 0
+        later = counted_poll()
+        assert news.calls == 0 and model.calls == 0 and web.touched == []
         assert later["heartbeat"]["failures"] == 0, "declining is not failing"
         assert later["heartbeat"]["blocked"] == 1
         assert silent.matching("question blocked") == []

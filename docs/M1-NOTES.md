@@ -17088,7 +17088,12 @@ three times, 35 minutes apart, bought research each time and paged each time, un
 `transient_attempts_exhausted`. Found in the 2026-10-31 audit of never-answered questions
 (PR #146, which also filed M1-363 and D56). The live payload is frozen as
 `tests/fixtures/api_posts/discrete_shapes/post_45913.json`, beside M1-206's three discrete shapes,
-with the same trimming.
+with the same trimming. Its source is question 46095's `api_json` in the MiniBench profile's poll
+snapshot `data/artifacts/snapshots/poll-59cba2f68c2d4f9396faeef1a80e6217.json` (tournament 33129,
+`fetched_at_utc` 2026-10-05T10:35:20Z, six questions, file sha256 `676a0974…3fd6d87c`). That
+artifact is operator-local and not in the repository, so the digest is what lets this machine
+re-check the fixture; the trimming keeps exactly the key set of `post_45775.json`, with
+`description` and `fine_print` stripped.
 
 ### Decision — one preflight, two callers, and why
 
@@ -17205,3 +17210,16 @@ case, an unsupported type and the configured 201.
 
 No config, prompt, `AppConfig` field or migration changes, so the live activation is not retired.
 Deploy is the merge plus a fast-forward of the main checkout between polls.
+
+### Round 1 — APPROVE on `3d66931`, the observation taken
+
+No blockers. One non-blocking observation, taken because it is a gap in AC1's own wording: AC1
+names AskNews, Exa *and* the model, but both live-path tests passed `web_client=object()`, which
+cannot count an Exa call. An Exa call there is an `AttributeError` recorded as a failure, and the
+blocking poll is *expected* to fail, so it would have hidden one. `_Tripwire` records any attribute
+read instead. `test_every_question_only_refusal_touches_no_provider` drives `_attempt_question`
+for each refusal family (type, `zero_point`, numeric grid, the q46095 discrete grid, option count)
+with a tripwire for all three clients; all five fail with the preflight neutered. The worker-level
+q46095 test now passes a tripwire Exa client and asserts it untouched at every poll. The reviewer
+also marked fixture provenance "partially verified", since the snapshot is not in the repository;
+the source file and its digest are now recorded above.
