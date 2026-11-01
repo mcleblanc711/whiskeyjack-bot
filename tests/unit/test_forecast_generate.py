@@ -29,6 +29,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 from forecasting_tools.ai_models.general_llm import GeneralLlm
+from forecasting_tools.data_models.data_organizer import DataOrganizer
 
 from whiskeyjack_bot.config import (
     MAX_CONVERSION_TIMEOUT_SECONDS,
@@ -41,8 +42,10 @@ from whiskeyjack_bot.config import (
 from whiskeyjack_bot.forecast.generate import (
     ForecastGeneration,
     ForecastGenerationError,
+    QuestionRefusal,
     build_forecaster_client,
     generate_forecast,
+    question_refusal,
 )
 from whiskeyjack_bot.forecast.multiple_choice import _SUM_TOLERANCE
 from whiskeyjack_bot.forecast.numeric import DECLARED_PERCENTILE_LEVELS
@@ -61,6 +64,7 @@ from whiskeyjack_bot.questions.model import (
     CanonicalDiscreteQuestion,
     CanonicalNumericQuestion,
 )
+from whiskeyjack_bot.questions.normalize import normalize_questions
 from whiskeyjack_bot.research.model import ResearchDocument, ResearchRun
 from whiskeyjack_bot.research.packet import ResearchPacket, build_packet
 
@@ -2380,3 +2384,114 @@ def test_a_numeric_background_only_reply_needs_no_repair(
     assert len(sent) == 1
     assert result.repair_attempted is False
     assert result.failure_code is None
+
+
+# --- M1-364: a question no reply could forecast, named before anything is bought ---------
+
+# q46095 (MiniBench 33129, 2026-10-05), frozen from the live poll snapshot: a discrete
+# question with 201 inbound outcomes, so ``cdf_size`` 202 -- one above the envelope
+# ``cdf._cdf_rules`` admits. Live, the refusal came after research was bought and was
+# recorded ``internal_error``, so it was retried three times at full price.
+_POST_45913 = REPO_ROOT / "tests" / "fixtures" / "api_posts" / "discrete_shapes" / "post_45913.json"
+
+
+def _q46095() -> CanonicalDiscreteQuestion:
+    raw = json.loads(_POST_45913.read_text(encoding="utf-8"))
+    question = normalize_questions([DataOrganizer.get_question_from_post_json(raw)]).questions[0]
+    assert isinstance(question, CanonicalDiscreteQuestion)
+    return question
+
+
+def _types(config: AppConfig, supported: list[str]) -> AppConfig:
+    return config.model_copy(
+        update={
+            "forecast": config.forecast.model_copy(update={"supported_question_types": supported})
+        }
+    )
+
+
+def _refusing(name: str, config: AppConfig) -> tuple[AppConfig, Any, str]:
+    """``(config, question, expected detail code)`` for each question-only refusal."""
+    cases: dict[str, tuple[AppConfig, Any, str]] = {
+        "unsupported type": (_types(config, ["multiple_choice"]), _question(), "schema_invalid"),
+        "zero_point not below lower_bound": (
+            config,
+            _numeric_question(lower_bound=5.0, zero_point=9.5),
+            "calibration_invalid",
+        ),
+        "numeric cdf_size off the configured length": (
+            config,
+            _numeric_question(cdf_size=101),
+            "calibration_invalid",
+        ),
+        "discrete grid above the envelope (q46095)": (config, _q46095(), "calibration_invalid"),
+        "option count the bounds cannot serve": (
+            _bounded_forecast(config, 0.05, 0.95),
+            _options(21),
+            "calibration_invalid",
+        ),
+    }
+    return cases[name]
+
+
+_REFUSING = [
+    "unsupported type",
+    "zero_point not below lower_bound",
+    "numeric cdf_size off the configured length",
+    "discrete grid above the envelope (q46095)",
+    "option count the bounds cannot serve",
+]
+
+
+@pytest.mark.parametrize("name", _REFUSING)
+def test_question_refusal_is_exactly_what_generate_forecast_refuses(
+    config: AppConfig, prompt: LoadedPrompt, name: str
+) -> None:
+    """One source of truth for the refusal, asked for by two callers.
+
+    ``pipeline_live`` asks ``question_refusal`` *before* retrieval; ``generate_forecast``
+    still refuses at the spending site. The two must agree on the message, or the ledger
+    and the log would describe one refusal two ways -- so the witness is the spending
+    site's own raise, compared as text, not a second copy of the rule.
+    """
+    cfg, question, code = _refusing(name, config)
+    refusal = question_refusal(cfg, question)
+    assert isinstance(refusal, QuestionRefusal)
+    assert refusal.detail_code == code
+
+    client = _Model(good_reply())
+    with pytest.raises(ForecastGenerationError) as caught:
+        _generate(client, cfg, prompt, question=question, packet=_packet(question.question_id))
+    assert client.calls == []
+    assert str(caught.value) == refusal.message
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        pytest.param(_question(), id="binary"),
+        pytest.param(_numeric_question(), id="numeric at the configured length"),
+        pytest.param(_numeric_question(lower_bound=5.0, zero_point=1.0), id="satisfiable zero"),
+        pytest.param(_discrete_question(), id="discrete inside the envelope"),
+        pytest.param(_options(3), id="three options"),
+    ],
+)
+def test_question_refusal_is_none_for_a_question_some_reply_can_answer(
+    config: AppConfig, question: Any
+) -> None:
+    """The companion: a question the model can answer must reach the model."""
+    assert question_refusal(config, question) is None
+
+
+def test_the_q46095_grid_refusal_names_none_of_the_questions_numbers(config: AppConfig) -> None:
+    """The payload is Metaculus content, so the message carries none of it (numeric.py's rule)."""
+    refusal = question_refusal(config, _q46095())
+    assert refusal is not None
+    for needle in ("202", "201", "79.495", "81.505", "46095"):
+        assert needle not in refusal.message
+
+
+def test_question_refusal_refuses_a_caller_mistake_as_this_modules_error(config: AppConfig) -> None:
+    """Not a question at all is a caller mistake, never a refusal to record."""
+    with pytest.raises(ForecastGenerationError):
+        question_refusal(config, object())  # type: ignore[arg-type]

@@ -419,6 +419,52 @@ def test_a_provider_that_found_nothing_is_no_evidence_not_provider_error(
     assert batch.records_written == 2
 
 
+def test_a_question_no_reply_could_answer_is_refused_before_any_retrieval(
+    config: AppConfig, ledger: Any
+) -> None:
+    """M1-364: the question-only refusal runs ahead of the purchase, not after it.
+
+    Before, ``generate_forecast`` refused the question only once ``_research`` had already
+    bought its evidence, and the refusal was recorded ``generation_failed/internal_error`` --
+    a transient code, so the worker bought it again on each counted attempt (q46095: three
+    attempts, three AskNews and Exa purchases). Narrowing ``supported_question_types`` is
+    the reachable instance here: an operator may configure it, and the snapshot's
+    multiple-choice question then has no reply this configuration accepts.
+
+    Measured on the provider calls that carried the refused question's title -- billed
+    calls, never ``research_runs`` rows (M1-326).
+    """
+    narrowed = config.model_copy(
+        update={
+            "forecast": config.forecast.model_copy(
+                update={"supported_question_types": ["binary", "numeric"]}
+            )
+        }
+    )
+    sdk = _TrackingSDK()
+    batch = live(ledger, narrowed, limit=3, news_client=sdk)
+
+    title = questions()[MULTIPLE_CHOICE].title
+    assert [call for call in sdk.news.calls if title in str(call.get("query", ""))] == []
+    assert len(sdk.news.calls) > 0, "the other two questions were still retrieved"
+    assert batch.records_written == 2
+    failed = [o for o in batch.outcomes if o.status != "recorded"]
+    assert [o.question_id for o in failed] == [MULTIPLE_CHOICE]
+    assert failed[0].status == "research_failed"
+    assert failed[0].detail_code == "schema_invalid"
+    assert failed[0].retrieval_run_ids == ()
+    assert failed[0].research_reused is False
+    events = rows(
+        ledger,
+        "SELECT event_type, detail_code, question_id, retrieval_run_id "
+        "FROM pipeline_failure_events",
+    )
+    assert events == [("research_failed", "schema_invalid", MULTIPLE_CHOICE, None)]
+    assert (
+        rows(ledger, f"SELECT 1 FROM research_runs WHERE question_id = {MULTIPLE_CHOICE}") == []
+    ), "no run row: nothing was bought for it"
+
+
 # --- the research sufficiency gate (M1-504) ----------------------------------------------
 
 

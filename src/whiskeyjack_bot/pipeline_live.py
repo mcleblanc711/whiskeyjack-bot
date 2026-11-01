@@ -66,6 +66,7 @@ from whiskeyjack_bot.forecast.generate import (
     ForecastGenerationError,
     build_forecaster_client,
     generate_forecast,
+    question_refusal,
 )
 from whiskeyjack_bot.forecast.inputs import ForecastInputError
 from whiskeyjack_bot.forecast.persist import ArtifactOutcome, persist_generation, persist_raw_output
@@ -595,6 +596,44 @@ def _attempt_question(
     """
     attempt_id = mint_record_id()
     question_id = question.question_id
+
+    # M1-364: a question no reply could be forecast for is refused here, before anything is
+    # bought. `generate_forecast` refuses the same question at its own preflight -- it still
+    # does, as the spending site -- but that ran only after `_research` had paid, and the
+    # handler below records every such raise as `internal_error`, a transient code, so the
+    # worker paid again on each counted attempt (q46095, 2026-10-05: three attempts, three
+    # AskNews and Exa purchases, three pages). Recorded as `research_failed` with no run,
+    # the documented shape for a failure that precedes any `research_runs` row, and under a
+    # deterministic code, so `tournament.py` blocks it and later polls decline it for free.
+    try:
+        refusal = question_refusal(config, question)
+    except ForecastGenerationError:
+        # A caller mistake, which `generate_forecast` would refuse identically further down;
+        # left to it so this function's never-raises contract is not this check's to keep.
+        refusal = None
+    if refusal is not None:
+        _LOGGER.error("question %d refused before research: %s", question_id, refusal.message)
+        note = _record_pre_forecast(
+            conn,
+            attempt_id=attempt_id,
+            question_id=question_id,
+            tournament_id=tournament_id,
+            event_type="research_failed",
+            detail_code=refusal.detail_code,
+            retrieval_run_id=None,
+            occurred_at=now,
+        )
+        return QuestionOutcome(
+            question_id=question_id,
+            status="research_failed",
+            attempt_id=attempt_id,
+            retrieval_run_ids=(),
+            document_count=0,
+            research_reused=False,
+            detail_code=refusal.detail_code,
+            problems=(refusal.message,),
+            note=note,
+        )
 
     try:
         research = _research(

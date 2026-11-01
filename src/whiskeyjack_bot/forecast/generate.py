@@ -101,9 +101,10 @@ import asyncio
 import logging
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from forecasting_tools.ai_models.general_llm import GeneralLlm
 from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
@@ -371,10 +372,9 @@ def generate_forecast(
         # Exact-type, not isinstance: an IntEnum satisfies isinstance and would break
         # the %d safety claim on the log line below (M1-303 round 5).
         raise ForecastGenerationError("question_id must be an int")
-    if question.qtype not in config.forecast.supported_question_types:
-        raise ForecastGenerationError(
-            "question type is not in forecast.supported_question_types (offending input withheld)"
-        )
+    unsupported = _type_refusal(config, question)
+    if unsupported is not None:
+        raise ForecastGenerationError(unsupported)
     if not isinstance(prompt, LoadedPrompt):
         raise ForecastGenerationError("prompt must be a LoadedPrompt")
     if prompt.version != config.forecast.prompt_version:
@@ -398,9 +398,8 @@ def generate_forecast(
             "model.allowed_tries exceeds the one-repair bound; a malformed response "
             "may cost at most one initial call and one repair"
         )
-    if isinstance(question, _BOUNDED) and (
-        question.zero_point is not None and question.lower_bound <= question.zero_point
-    ):
+    unsatisfiable = _zero_point_refusal(question)
+    if unsatisfiable is not None:
         # ``forecast.numeric._require_question`` refuses this too; repeated at the spending
         # site for the reason the two checks around it are. A log-scaled question whose zero
         # point is at or above its lower bound is one the pinned SDK refuses outright
@@ -410,13 +409,9 @@ def generate_forecast(
         # supplied. ``isinstance`` here is nowhere near the ``DiscreteQuestion`` gotcha:
         # ``CanonicalNumericQuestion`` is this project's own leaf model with no subclass, and
         # the dispatch that matters keyed on ``question.qtype`` two checks above.
-        raise ForecastGenerationError(
-            "the question's zero_point is not strictly below its lower_bound; no "
-            "percentile set could satisfy it"
-        )
-    if isinstance(question, _BOUNDED) and not _grid_is_convertible(
-        question, config.numeric_calibration
-    ):
+        raise ForecastGenerationError(unsatisfiable)
+    unconvertible = _grid_refusal(config, question)
+    if unconvertible is not None:
         # M1-503, and the same shape as the check directly above: ``cdf.
         # _require_question`` refuses it too, and it is repeated here because it is
         # unsatisfiable by any reply. ``get_cdf`` returns ``cdf_size`` points, so a
@@ -426,10 +421,7 @@ def generate_forecast(
         # M1-502 round-1 shape rather than a repair loop. ``cdf_size`` reaches
         # ``CanonicalNumericQuestion`` from a Metaculus payload as a plain ``int``, and
         # that model defers the check to this item by name.
-        raise ForecastGenerationError(
-            "the question's cdf_size does not match numeric_calibration."
-            "expected_cdf_points; no percentile set could convert to a submittable CDF"
-        )
+        raise ForecastGenerationError(unconvertible)
     if isinstance(question, _BOUNDED) and not can_bound_conversion():
         # M1-514, and the same category as the two checks above -- unsatisfiable by any
         # reply, so refused before anything is spent -- but the reason is about this
@@ -498,35 +490,15 @@ def generate_forecast(
         # checked at load time is not provably the pair in this ``config``. Refused before
         # any billable call.
         raise ForecastGenerationError(prompt_bounds_problem)
-    if question.qtype == "multiple_choice" and isinstance(
-        question, CanonicalMultipleChoiceQuestion
-    ):
-        # M1-512, the same category as the preflights above: a pair of facts no reply can
-        # satisfy. Every option must be at least ``min_probability`` (and at most
-        # ``max_probability``) and the vector must sum to 1, which stops being possible
-        # past roughly ``1 / min_probability`` options -- 1000 at the committed default,
-        # 20 at 0.05. Left to the checker it would refuse every reply, and the question
-        # would cost the initial call and the repair to fail. The bound and the count are
-        # both named: the bound is validated operator configuration (D46) and the count is
-        # an ``int``, so neither can carry question or model content.
-        try:
-            admitted = admits_a_distribution(len(question.options), config.forecast)
-        except MultipleChoiceOutputError:
-            # Unreachable past the envelope check above, which refuses every config
-            # ``_require_config`` would; converted rather than trusted, so this function's
-            # contract -- every raise is a ForecastGenerationError, before any spend --
-            # does not rest on the ordering of two checks.
-            raise ForecastGenerationError(
-                "forecast.min_probability/forecast.max_probability cannot bound a "
-                "multiple-choice forecast (configured pair withheld)"
-            ) from None
-        if not admitted:
-            raise ForecastGenerationError(
-                f"the question's {len(question.options)} options cannot form a distribution "
-                f"with every probability between forecast.min_probability "
-                f"{config.forecast.min_probability!r} and forecast.max_probability "
-                f"{config.forecast.max_probability!r}; no reply could satisfy them"
-            )
+    # M1-512, the same category as the preflights above: a pair of facts no reply can
+    # satisfy. Every option must be at least ``min_probability`` (and at most
+    # ``max_probability``) and the vector must sum to 1, which stops being possible past
+    # roughly ``1 / min_probability`` options -- 1000 at the committed default, 20 at 0.05.
+    # Left to the checker it would refuse every reply, and the question would cost the
+    # initial call and the repair to fail. See ``_options_refusal`` for the message.
+    unanswerable = _options_refusal(config, question)
+    if unanswerable is not None:
+        raise ForecastGenerationError(unanswerable)
 
     response_model = _response_model_or_refuse(question.qtype)
     model_input = _model_input_or_refuse(
@@ -644,6 +616,134 @@ def _grid_is_convertible(question: BoundedQuestion, calibration: NumericCalibrat
     except NumericCdfError:
         return False
     return True
+
+
+# --- M1-364: the refusals that are facts about the question alone ------------------------
+
+# The detail code a question-only refusal is recorded under when ``pipeline_live`` makes it
+# before retrieval. Both are existing deterministic members of ``PreForecastFailureCode``,
+# so ``tournament.DETERMINISTIC_FAILURE_CODES`` blocks the question and no migration is
+# needed (``pipeline_failure_events.detail_code`` is a column CHECK, and widening one is a
+# rebuild of an append-only table). ``calibration_invalid`` for the three rules that are
+# about what the configured output can express -- the CDF grid, the log scaling, the
+# probability bounds over an option count -- and ``schema_invalid`` for the one that is
+# about which response schemas this configuration enables at all.
+QuestionRefusalCode = Literal["schema_invalid", "calibration_invalid"]
+
+_UNSUPPORTED_TYPE = (
+    "question type is not in forecast.supported_question_types (offending input withheld)"
+)
+_ZERO_POINT_UNSATISFIABLE = (
+    "the question's zero_point is not strictly below its lower_bound; no "
+    "percentile set could satisfy it"
+)
+_GRID_UNCONVERTIBLE = (
+    "the question's cdf_size does not match numeric_calibration."
+    "expected_cdf_points; no percentile set could convert to a submittable CDF"
+)
+_OPTIONS_UNBOUNDABLE = (
+    "forecast.min_probability/forecast.max_probability cannot bound a "
+    "multiple-choice forecast (configured pair withheld)"
+)
+
+
+@dataclass(frozen=True)
+class QuestionRefusal:
+    """A question no reply could be forecast for under this configuration (M1-364).
+
+    ``message`` is exactly the text :func:`generate_forecast` raises for the same question,
+    because both read it from the helpers below -- one rule, asked for by two callers, and
+    the property suite compares the two as text. ``detail_code`` is what the refusal is
+    recorded under; see :data:`QuestionRefusalCode`.
+    """
+
+    message: str
+    detail_code: QuestionRefusalCode
+
+
+def _type_refusal(config: AppConfig, question: CanonicalQuestion) -> str | None:
+    if question.qtype not in config.forecast.supported_question_types:
+        return _UNSUPPORTED_TYPE
+    return None
+
+
+def _zero_point_refusal(question: CanonicalQuestion) -> str | None:
+    if isinstance(question, _BOUNDED) and (
+        question.zero_point is not None and question.lower_bound <= question.zero_point
+    ):
+        return _ZERO_POINT_UNSATISFIABLE
+    return None
+
+
+def _grid_refusal(config: AppConfig, question: CanonicalQuestion) -> str | None:
+    if isinstance(question, _BOUNDED) and not _grid_is_convertible(
+        question, config.numeric_calibration
+    ):
+        return _GRID_UNCONVERTIBLE
+    return None
+
+
+def _options_refusal(config: AppConfig, question: CanonicalQuestion) -> str | None:
+    """M1-512's two refusals for an option count the configured pair cannot serve.
+
+    The bound and the count are both named: the bound is validated operator configuration
+    (D46) and the count is an ``int``, so neither can carry question or model content.
+    """
+    if question.qtype != "multiple_choice" or not isinstance(
+        question, CanonicalMultipleChoiceQuestion
+    ):
+        return None
+    try:
+        admitted = admits_a_distribution(len(question.options), config.forecast)
+    except MultipleChoiceOutputError:
+        # Unreachable for a config that passed load validation, and in ``generate_forecast``
+        # also past the envelope check that runs first; converted rather than trusted, so
+        # neither caller's contract rests on the ordering of two checks.
+        return _OPTIONS_UNBOUNDABLE
+    if admitted:
+        return None
+    return (
+        f"the question's {len(question.options)} options cannot form a distribution "
+        f"with every probability between forecast.min_probability "
+        f"{config.forecast.min_probability!r} and forecast.max_probability "
+        f"{config.forecast.max_probability!r}; no reply could satisfy them"
+    )
+
+
+def question_refusal(config: AppConfig, question: CanonicalQuestion) -> QuestionRefusal | None:
+    """The refusal :func:`generate_forecast` would make from the question alone, or ``None``.
+
+    M1-364. ``generate_forecast`` refuses a question no reply could be forecast for before
+    its first model call, but on the live path that is *after* retrieval has been bought,
+    and its caller recorded every such raise as ``internal_error`` -- a transient code, so
+    the worker bought the same research again on every counted attempt (q46095: a discrete
+    question with 201 outcomes, three attempts, three AskNews and Exa purchases).
+    ``pipeline_live`` asks this first, before any provider call.
+
+    Exactly the question-dependent subset of ``generate_forecast``'s preflight, in its order:
+    the supported type, the ``zero_point``, the CDF grid, the option count. The rest of that
+    preflight is about the prompt, the packet, the client, the thread or the configuration
+    alone -- identical for every question in a run, so none of it is a verdict about *this*
+    question and none of it belongs in a per-question block.
+
+    Pure: no I/O, no clock, no provider. Raises :class:`ForecastGenerationError` only for a
+    caller mistake (not an ``AppConfig``, not a canonical question).
+    """
+    if not isinstance(config, AppConfig):
+        raise ForecastGenerationError("config must be an AppConfig")
+    if not isinstance(question, _CanonicalQuestionBase):
+        raise ForecastGenerationError("question must be a canonical question")
+    unsupported = _type_refusal(config, question)
+    if unsupported is not None:
+        return QuestionRefusal(unsupported, "schema_invalid")
+    for message in (
+        _zero_point_refusal(question),
+        _grid_refusal(config, question),
+        _options_refusal(config, question),
+    ):
+        if message is not None:
+            return QuestionRefusal(message, "calibration_invalid")
+    return None
 
 
 def _conversion_problems(
