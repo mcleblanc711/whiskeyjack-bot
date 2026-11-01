@@ -17090,7 +17090,8 @@ three times, 35 minutes apart, bought research each time and paged each time, un
 `tests/fixtures/api_posts/discrete_shapes/post_45913.json`, beside M1-206's three discrete shapes,
 with the same trimming. Its source is question 46095's `api_json` in the MiniBench profile's poll
 snapshot `data/artifacts/snapshots/poll-59cba2f68c2d4f9396faeef1a80e6217.json` (tournament 33129,
-`fetched_at_utc` 2026-10-05T10:35:20Z, six questions, file sha256 `676a0974…3fd6d87c`). That
+`fetched_at_utc` 2026-10-05T10:35:20Z, six questions, file sha256
+`676a097431ea974f0daa57c223cbccf2192c1b3c9e52b93fdda6016c3fd6d87c`). That
 artifact is operator-local and not in the repository, so the digest is what lets this machine
 re-check the fixture; the trimming keeps exactly the key set of `post_45775.json`, with
 `description` and `fine_print` stripped.
@@ -17223,3 +17224,12 @@ with a tripwire for all three clients; all five fail with the preflight neutered
 q46095 test now passes a tripwire Exa client and asserts it untouched at every poll. The reviewer
 also marked fixture provenance "partially verified", since the snapshot is not in the repository;
 the source file and its digest are now recorded above.
+
+### Round 2 — APPROVE on `66deee8`
+
+No blockers; round 1's observation closed (all five refusal shapes, three clients counted, the Exa
+tripwire asserted at every poll of the worker-level test). One new non-blocking note, taken in the
+post-approval commit because it is a docs-only correction: the snapshot digest above was
+abbreviated and is now the full sha256, so the comparison is exact. The reviewer could not rerun
+pytest (its sandbox refused a loopback address); the gates were run by `review-request.py` for both
+rounds' HEADs and by CI.
