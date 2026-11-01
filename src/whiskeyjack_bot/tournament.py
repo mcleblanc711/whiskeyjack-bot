@@ -79,8 +79,10 @@ from whiskeyjack_bot.tournament_state import (
 # same answer at full price. `research/quality.py`'s verdict and
 # `research/sufficiency.py`'s are both explicitly pure over a stored packet and a fixed
 # `now`; `schema_invalid`/`calibration_invalid` are a model response failing a fixed
-# schema. The transient half is genuinely worth another attempt: a provider, a socket or
-# an unlucky sample.
+# schema -- or, since M1-364, a question `forecast.generate.question_refusal` refused before
+# any research was bought, because no reply could answer it under this configuration (a
+# `research_failed` row citing no run). The transient half is genuinely worth another
+# attempt: a provider, a socket or an unlucky sample.
 #
 # Split, rather than gating on "any failure", because a provider outage must not
 # permanently retire a question -- and gated on the question FINGERPRINT, so an edited

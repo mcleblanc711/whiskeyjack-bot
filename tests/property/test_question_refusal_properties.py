@@ -245,6 +245,19 @@ def _spending_site(config: AppConfig, question: Any) -> tuple[str | None, int]:
     config=_configured(["multiple_choice"], 0.001, 0.999),
     question=CanonicalBinaryQuestion(question_id=46095, post_id=45913, title="Will X?"),
 )
+@example(
+    config=BASE,
+    question=CanonicalNumericQuestion(
+        question_id=46095,
+        post_id=45913,
+        title="the configured grid, which must reach the model",
+        lower_bound=0.0,
+        upper_bound=100.0,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        cdf_size=201,
+    ),
+)
 def test_question_refusal_refuses_exactly_what_the_spending_site_refuses(
     config: AppConfig, question: Any
 ) -> None:

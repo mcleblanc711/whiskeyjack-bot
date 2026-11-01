@@ -17077,3 +17077,131 @@ exact comparison replaced by `True`; the flag never passed to either claim list.
 not taken: commit sanitized historical 1.1.0 and 1.2.0 record fixtures and assert unchanged replay
 verdicts and hashes. Unclaimed by any backlog row; the replay test states its limit (it proves
 version independence on newly persisted records).
+
+## M1-364 — a question no reply could answer, refused before research is bought
+
+Live 2026-10-05 on 33129: discrete q46095 declared 201 inbound outcomes, so `cdf_size` 202, one
+above the envelope `forecast/cdf._cdf_rules` admits. `generate_forecast` refused it before any
+model call, but only after `_research` had bought AskNews and Exa, and `_attempt_question`
+recorded the raise as `generation_failed/internal_error`. That is transient, so the worker tried
+three times, 35 minutes apart, bought research each time and paged each time, until
+`transient_attempts_exhausted`. Found in the 2026-10-31 audit of never-answered questions
+(PR #146, which also filed M1-363 and D56). The live payload is frozen as
+`tests/fixtures/api_posts/discrete_shapes/post_45913.json`, beside M1-206's three discrete shapes,
+with the same trimming.
+
+### Decision — one preflight, two callers, and why
+
+`forecast.generate.question_refusal(config, question)` returns a frozen `QuestionRefusal(message,
+detail_code)` or `None`. It is the question-dependent subset of `generate_forecast`'s preflight,
+in its order. `generate_forecast` still refuses at the spending site (this module's standing
+pattern: every check is repeated where the money is), but each check now reads its message from
+the same helper (`_type_refusal`, `_zero_point_refusal`, `_grid_refusal`, `_options_refusal`), so
+the two callers cannot describe one refusal two ways. The property
+`test_question_refusal_refuses_exactly_what_the_spending_site_refuses` uses the spending site's
+own raise as its oracle, compared as text, over generated questions of all four types and
+generated configurations. `pipeline_live._attempt_question` asks first, before `_research`.
+
+### Decision — `research_failed`, no run, existing deterministic codes, and why
+
+- **Event type.** The `pipeline_failure_events` insert trigger requires a `retrieval_run_id` on a
+  `generation_failed` row, so a refusal made before retrieval cannot be one. `research_failed`
+  with no run is the documented shape for a failure that precedes any `research_runs` row, and
+  `_attempt_question` already uses it for an `OrchestrationError` refused before any provider call.
+- **Codes.** `calibration_invalid` for the grid, the `zero_point` and the option count: all three
+  are about what the configured output can express. `schema_invalid` for an unsupported type:
+  this configuration enables no response schema for it. Both are already in
+  `tournament.DETERMINISTIC_FAILURE_CODES`, so the worker blocks the question with no change to
+  `tournament.py`'s logic (only its comment), and no migration is needed:
+  `pipeline_failure_events.detail_code` is a column CHECK, and widening it means rebuilding an
+  append-only table (M2-711's reasoning).
+- `calibration_invalid` had **no producer** before this item; it had been declared in the
+  vocabulary since 004 and never written. RUNBOOK R1 now says what it means on a `research_failed`
+  row that cites no run. R2's reading (a model reply that broke a bound) still holds for
+  `generation_failed`.
+
+### Decision — which checks are question-only (the enumeration AC1 asks for)
+
+Walked from `generate_forecast`'s entry point, in order:
+
+| check | depends on | in the preflight? |
+| --- | --- | --- |
+| canonical question; `question_id` an exact `int` | caller | no: a caller mistake, not a verdict |
+| type in `forecast.supported_question_types` | question × config | **yes** (`schema_invalid`) |
+| prompt is a `LoadedPrompt`; version matches config | prompt | no |
+| packet type; packet belongs to the question | packet | no |
+| `allowed_tries` within the one-repair bound | config | no |
+| `zero_point` strictly below `lower_bound` | question | **yes** |
+| CDF grid convertible (`_grid_is_convertible`) | question × `numeric_calibration` | **yes** |
+| conversion boundable on this thread | thread | no |
+| `min_probability < max_probability`; inside the spec envelope | config | no |
+| configured pair inside the prompt's declared bounds | prompt × config | no |
+| option count admits a distribution | question × config | **yes** |
+| a response model exists for the type | question type | no: unreachable once the type check passes, because `SUPPORTED_RESPONSE_TYPES` is built from the same `SupportedQuestionType` literal as the config field |
+| model input builds (`build_model_input`) | question × packet | no: needs the packet |
+
+The excluded rows are the same for every question in a run, or they need the packet. None of
+them is a verdict about *this* question, so none belongs in a per-question block.
+
+### Decision — the alert pair is unchanged, and asserted across the window
+
+AC2 as amended in #146. In the blocking poll the worker sends the `question_blocked` push and the
+failed-unit push, the pair every deterministic verdict has sent since M1-326; it sends neither
+afterwards. `test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought` polls
+again at +5, +31 and +62 minutes. The last two cross the 1800 s checkpoint window, which is
+exactly where the old code started a fresh, billed attempt. It asserts no provider call, no
+failure, no push and no new failure row at each.
+
+### Rejected — skipping an unsupported-type question silently
+
+An operator who narrows `supported_question_types` now gets one block and its alert pair per
+question of the removed type, not a silent skip. A skip would change the operator-visible
+contract (`skipped` rather than a failure) for a configuration choice, which is a separate
+decision. The verdict is scoped to the activation, so restoring the type and running `tournament
+enable` re-qualifies every such question.
+
+### Rejected — admitting `cdf_size` 202
+
+AC4: the envelope is unchanged and a 202-point discrete question is still refused. Evidence for
+the owner's decision, not acted on: the frozen q46095 payload records `nr_forecasters: 224`, so
+Metaculus accepted forecasts on a 201-outcome discrete question. What forecasting-tools 0.2.92
+produces for 202 points, and what the server validates for that length, are both unverified.
+
+### Deferred (do not read the absence as an omission)
+
+- The envelope decision above (owner).
+- `_notify_blocked`'s body says re-running `tournament enable` "costs one retry". For a refusal
+  made before research the retry costs nothing. The text is shared by every verdict and was not
+  changed here.
+- q46095 itself: it closed 2026-10-05, so there is nothing to re-attempt.
+
+### Standing risk — not verifiable offline
+
+No 201-outcome discrete question has been seen live since q46095; the next one is the live
+evidence. The blocking path after the outcome is M1-326's, unchanged, and is observed live on
+other verdicts.
+
+### On the mutation and property pass
+
+Before the fix, the `pipeline_live` test failed on its first assertion (the refused question's
+title reached AskNews), the tournament test failed on `news.calls == 0` (it was 1), and the
+`generate` tests failed at import. Ten mutants, all killed by the targeted suite:
+
+- the preflight drops the grid rule, the `zero_point` rule, the option-count rule, or the type rule;
+- the type refusal is recorded as `calibration_invalid`, or the bounded refusals as `schema_invalid`;
+- the preflight refuses every question;
+- `pipeline_live` never asks the preflight;
+- `pipeline_live` records the refusal as `internal_error`, or reports the outcome as `internal_error`.
+
+Run against the property file **alone**, the first draft killed five of the seven `generate.py`
+mutants: both code swaps survived. It asserted only that the code was one of the two, a
+membership check the swaps satisfy. It now derives the expected code independently from the
+question and the configuration, and kills all seven. A further mutant, the grid message
+rendering `cdf_size`, is killed by `test_a_bounded_refusal_renders_none_of_the_questions_numbers`.
+Branches are weighted with `st.integers`, and four `@example`s pin the q46095 grid, the 21-option
+case, an unsupported type and the configured 201.
+
+### Deployment
+
+No config, prompt, `AppConfig` field or migration changes, so the live activation is not retired.
+Deploy is the merge plus a fast-forward of the main checkout between polls.

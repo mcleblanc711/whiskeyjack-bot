@@ -1393,6 +1393,17 @@ immediately will likely reproduce it.
 counts its spend in the batch total, and the failure event cites the research run that was
 paid for. A failure before any provider call cites no run.
 
+**A question refused before research (M1-364).** `calibration_invalid` or `schema_invalid` on
+a `research_failed` row that cites no run means the question itself cannot be forecast under
+this configuration, so nothing was bought for it. The log line `question N refused before
+research: ...` names the rule: the type is not in `forecast.supported_question_types`
+(`schema_invalid`); the question's `zero_point` is not below its `lower_bound`; its CDF grid
+cannot convert to a submittable array (a discrete question with more than 200 outcomes, for
+one); or its option count cannot satisfy `forecast.min_probability`/`max_probability` (all
+`calibration_invalid`). Re-running the question reproduces it at no cost. The tournament
+worker records it as a deterministic verdict and declines the question on later polls; a
+config change plus `tournament enable` re-qualifies it.
+
 **Never.** Do not pass `--refresh-research` reflexively when retrying — without it, a rerun
 repeats no paid retrieval call for research the ledger already holds. With it, you pay
 again.
