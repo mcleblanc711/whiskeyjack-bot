@@ -1404,6 +1404,86 @@ def test_a_deterministic_block_pushes_once_and_the_next_poll_is_silent(
     assert silent.matching("question blocked") == []
 
 
+def test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """M1-364, on the live payload: q46095 (33129, 2026-10-05), frozen from the poll snapshot.
+
+    A discrete question with 201 inbound outcomes, so ``cdf_size`` 202 -- above the envelope
+    ``cdf._cdf_rules`` admits, so no reply could convert to a submittable CDF. Live, the
+    refusal came after research was bought and was recorded ``internal_error``: three
+    counted attempts 35 minutes apart, three AskNews and Exa purchases, a failed poll and a
+    page each time. Now it is refused before any provider call, recorded as a deterministic
+    verdict, alerted in that one poll, and declined for free afterwards -- including after
+    the checkpoint window that used to start a fresh, billed attempt.
+    """
+    conn, config, platform, news, model = case
+    raw = json.loads(
+        (ROOT / "tests/fixtures/api_posts/discrete_shapes/post_45913.json").read_text("utf-8")
+    )
+    raw["projects"]["default_project"]["id"] = 32977
+    real_now = utcnow()
+    raw["question"]["scheduled_close_time"] = (real_now + timedelta(hours=8)).isoformat()
+    platform.raw = news.raw = model.raw = raw
+    clock = {"now": real_now}
+    monkeypatch.setattr(tournament_state, "utcnow", lambda: clock["now"])
+    monkeypatch.setattr(whiskeyjack_tournament, "utcnow", lambda: clock["now"])
+
+    # Exa is a tripwire rather than ``poll``'s ``object()``: an Exa call on ``object()`` is an
+    # AttributeError recorded as a failure, which the blocking poll -- expected to fail --
+    # would hide (round 1's observation).
+    from tests.unit.test_pipeline_live import _Tripwire
+
+    web = _Tripwire()
+
+    def counted_poll() -> dict[str, Any]:
+        return run_once(
+            conn,
+            config,
+            client=platform,
+            poster=platform,
+            news_client=news,
+            web_client=web,
+            forecaster=model,
+        )
+
+    pushes = _recording(monkeypatch, config)
+    first = counted_poll()
+    assert web.touched == [], "no Exa call either"
+    assert news.calls == 0, "nothing may be bought for a question no reply can convert"
+    assert model.calls == platform.posts == 0
+    assert first["heartbeat"]["failures"] == 1, "the blocking poll still fails, as M1-326's do"
+    failures = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT event_type, detail_code, retrieval_run_id FROM pipeline_failure_events"
+        )
+    ]
+    assert failures == [("research_failed", "calibration_invalid", None)]
+    blocked = [
+        json.loads(row[0])
+        for row in conn.execute("SELECT data FROM tournament_events WHERE kind='question_blocked'")
+    ]
+    assert [(b["reason"], b["detail_code"]) for b in blocked] == [
+        ("deterministic_verdict", "calibration_invalid")
+    ]
+    assert len(pushes.matching("question blocked")) == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM tournament_events WHERE kind='retry_wait'").fetchone()[0]
+        == 0
+    ), "a deterministic verdict is not paced as a transient failure"
+
+    for minutes in (5, 31, 62):
+        clock["now"] = real_now + timedelta(minutes=minutes)
+        silent = _recording(monkeypatch, config, tmp_path / f"poll-{minutes}")
+        later = counted_poll()
+        assert news.calls == 0 and model.calls == 0 and web.touched == []
+        assert later["heartbeat"]["failures"] == 0, "declining is not failing"
+        assert later["heartbeat"]["blocked"] == 1
+        assert silent.matching("question blocked") == []
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_failure_events").fetchone()[0] == 1
+
+
 def test_the_daily_digest_fires_on_a_normal_poll(
     case: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
