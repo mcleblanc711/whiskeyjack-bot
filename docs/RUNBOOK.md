@@ -1810,8 +1810,9 @@ is above 0, read the record's declared size (`show` does not print it):
 sqlite3 -readonly data/whiskeyjack_bot.sqlite3 "SELECT json_extract(record_json, '$.question.cdf_size') FROM forecast_records WHERE record_id = '<REC>'"
 ```
 
-`202` means Metaculus refused the length. D57's revisit trigger has fired, so take it to the owner.
-Do not edit anything to retry that question.
+`202` means a 202-point post was refused. That shows what was attempted, not why it was refused:
+a 401 or 403 would read the same. Treat it as D57's revisit trigger and take it to the owner. Do
+not edit anything to retry that question.
 
 ### L2 — A standing key reservation
 

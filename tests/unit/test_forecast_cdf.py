@@ -47,7 +47,7 @@ from whiskeyjack_bot.config import (
 from whiskeyjack_bot.forecast import cdf as cdf_module
 from whiskeyjack_bot.forecast.cdf import (
     _NOT_CONVERTIBLE,
-    _NOT_WELL_FORMED,
+    _TIE_AT_BOUND,
     NumericCdfError,
     NumericCdfTimeoutError,
     build_numeric_cdf,
@@ -588,12 +588,8 @@ def test_an_input_that_does_not_terminate_in_the_sdk_is_refused_first(
         _with_values(*values), _calibration(), _question(**question_fields)
     )
     assert cdf is None
-    assert problems == [
-        "final_prediction.percentiles: the declared percentiles do not produce a "
-        "well-formed cumulative distribution; return strictly increasing values spread "
-        "more widely across the question's range (detail withheld: the conversion echoes "
-        "the values it refused)"
-    ]
+    # Both inputs repeat a value at or beyond a bound, so they get M1-363's specific text.
+    assert problems == [f"final_prediction.percentiles: {_TIE_AT_BOUND}"]
 
 
 def test_the_guard_is_skipped_when_standardization_is_off() -> None:
@@ -610,7 +606,7 @@ def test_the_guard_is_skipped_when_standardization_is_off() -> None:
         _question(**fields),
     )
     assert cdf is None
-    assert problems == [f"final_prediction.percentiles: {_NOT_CONVERTIBLE}"]
+    assert problems == [f"final_prediction.percentiles: {_TIE_AT_BOUND}"]
 
 
 def test_a_well_formed_reply_still_converts_and_pays_only_one_extra_probe() -> None:
@@ -733,7 +729,7 @@ def test_the_guard_is_still_the_fast_path_and_the_bound_is_the_backstop() -> Non
             _question(**fields),
         )
         assert cdf is None
-        assert problems == [f"final_prediction.percentiles: {_NOT_WELL_FORMED}"]
+        assert problems == [f"final_prediction.percentiles: {_TIE_AT_BOUND}"]
         assert time.monotonic() - started < 1.0
 
 

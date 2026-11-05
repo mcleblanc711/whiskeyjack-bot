@@ -705,6 +705,8 @@ RELEASED_LENS_PROMPT_SHA256 = {
     "1.1.0": "ed7d3ba0be4305d40949048e3cbe9dbad1d1fe2610d2dd442b8c8aa520cff6b7",
     # M1-362 r1: the closing "Cite only the supplied source IDs" sentence now names the exception.
     "1.2.0": "139d03acec1b232bd74f75787c98080b7ceeb7523dde77834e75c18a99b47d16",
+    # M1-363: no repeated value at a bound, and load_bearing_facts is required.
+    "1.3.0": "765ad2fb87298b401ba731b635789b95e7a18c36588f181fa9e29f58ab328a2d",
 }
 
 
