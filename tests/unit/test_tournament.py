@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from asknews_sdk.dto.news import SearchResponse
 
@@ -1531,9 +1532,83 @@ def test_a_question_with_201_outcomes_reaches_exactly_one_post_of_202_values(
     assert platform.posts == 1
     assert [len(cdf) for cdf in platform.cdfs] == [202]
     assert result["forecast_confirmed"] == 1
-    assert (
-        conn.execute("SELECT COUNT(*) FROM pipeline_failure_events").fetchone()[0] == 0
-    ), "no refusal on the way to the post"
+    assert conn.execute("SELECT COUNT(*) FROM pipeline_failure_events").fetchone()[0] == 0, (
+        "no refusal on the way to the post"
+    )
+
+
+class _RefusingPlatform(_CdfPlatform):
+    """Metaculus answering a post with an HTTP error, with nothing landing."""
+
+    status_code = 400
+
+    def post_numeric_question_prediction(self, question_id: int, cdf_values: list[float]) -> None:
+        self.posts += 1
+        response = requests.Response()
+        response.status_code = self.status_code
+        raise requests.HTTPError(str(self.status_code), response=response)
+
+
+def _polling_a_refused_post(case: Any, status_code: int) -> tuple[Any, _RefusingPlatform]:
+    conn, config, _platform, news, model = case
+    raw = json.loads(
+        (ROOT / "tests/fixtures/api_posts/discrete_shapes/post_46390.json").read_text("utf-8")
+    )
+    raw["projects"]["default_project"]["id"] = 32977
+    raw["question"]["status"] = "open"
+    raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(hours=8)).isoformat()
+    platform = _RefusingPlatform(raw)
+    platform.status_code = status_code
+    news.raw = model.raw = raw
+    return (conn, config, platform, news, model), platform
+
+
+def test_a_refused_post_pages_once_and_does_not_fail_every_later_poll(case: Any) -> None:
+    """M1-365 AC11. A 202-point post is unproven on the wire, so its refusal must be survivable.
+
+    ``failed`` is terminal and the journal is append-only, so nothing could ever clear this.
+    Before this item, ``unresolved`` counted it forever: the poll exited 1 and the unit failed
+    and paged every five minutes. Counts posts and billed calls, because the other wrong answer
+    to a refused post is to try again and spend again.
+    """
+    polls, platform = _polling_a_refused_post(case, 400)
+    conn, _config, _platform, news, model = polls
+
+    first = poll(polls)
+    assert first["heartbeat"]["failures"] == 1, "the poll that met the refusal fails and pages"
+    assert first["refused_posts"] == 1
+    assert first["unresolved"] == 0
+    assert [failure["reason"] for failure in first["recent_question_failures"]] == [
+        "the platform refused the forecast post"
+    ]
+    statuses = [
+        tuple(row) for row in conn.execute("SELECT to_status, detail_code FROM lifecycle_events")
+    ]
+    assert statuses[-1] == ("failed", "http_error")
+
+    for _ in range(2):
+        later = poll(polls)
+        assert later["heartbeat"]["failures"] == 0, "a standing refusal is not a failing poll"
+        assert later["unresolved"] == 0
+        assert later["refused_posts"] == 1
+    assert platform.posts == 1, "never posted again"
+    assert model.calls == 1 and news.calls == 1, "never bought again"
+    assert platform.comment_posts == 0
+
+
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 503])
+def test_a_status_that_is_not_a_refusal_stays_unresolved(case: Any, status_code: int) -> None:
+    """The narrow half of AC11: these can still land, and later polls are what would record it.
+
+    An absent refetch after one of these is not a conclusion, the same reason
+    ``test_lost_forecast_response_reconciles_without_another_post`` holds for a timeout.
+    """
+    polls, platform = _polling_a_refused_post(case, status_code)
+    first = poll(polls)
+    assert first["refused_posts"] == 0
+    assert first["unresolved"] == 1
+    assert poll(polls)["unresolved"] == 1
+    assert platform.posts == 1
 
 
 def test_the_daily_digest_fires_on_a_normal_poll(

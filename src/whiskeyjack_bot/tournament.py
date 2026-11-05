@@ -347,6 +347,24 @@ def _notify_poll_summary(data: dict[str, Any]) -> None:
     )
 
 
+# Whether the platform refused a record's forecast post outright (M1-365): the post came back
+# 4xx and the refetch saw nothing. A timeout or a 5xx with an absent refetch also lands on
+# `failed`, but that post can still appear later, and the recovery loop in `run_once` is what
+# records it, so those stay open. 408, 425 and 429 ask for a retry rather than refuse the body.
+_POST_REFUSED_SQL: Final = (
+    "EXISTS (SELECT 1 FROM lifecycle_events l "
+    "JOIN submission_attempts a ON a.attempt_id = l.submission_attempt_id "
+    "WHERE l.forecast_record_id = {record} AND l.to_status = 'failed' "
+    "AND l.detail_code = 'http_error' AND a.http_status BETWEEN 400 AND 499 "
+    "AND a.http_status NOT IN (408, 425, 429))"
+)
+
+
+def _post_refused(conn: sqlite3.Connection, record_id: str) -> bool:
+    query = "SELECT " + _POST_REFUSED_SQL.format(record="?")
+    return bool(conn.execute(query, (record_id,)).fetchone()[0])
+
+
 def reconcile_forecast(
     conn: sqlite3.Connection, config: AppConfig, poster: Any, record_id: str
 ) -> bool:
@@ -635,9 +653,21 @@ def status(conn: sqlite3.Connection, config: AppConfig) -> dict[str, Any]:
         data[key] = conn.execute(
             "SELECT count(DISTINCT scope) FROM tournament_events WHERE kind=?", (kind,)
         ).fetchone()[0]
+    # A forecast whose post the platform refused is not unresolved (M1-365). Nothing can close
+    # its intent, and this count is the poll's exit code: counting it would fail the unit and
+    # page on every poll for good. The poll that met the refusal still fails and pages;
+    # `refused_posts` is the standing count afterwards.
+    refused = _POST_REFUSED_SQL.format(record="i.scope")
     data["unresolved"] = conn.execute(
-        "SELECT count(DISTINCT scope) FROM tournament_events i WHERE kind IN ('forecast_intent','comment_intent') "
-        "AND NOT EXISTS (SELECT 1 FROM tournament_events c WHERE c.scope=i.scope AND c.kind='comment_confirmed')"
+        "SELECT count(DISTINCT scope) FROM tournament_events i "
+        "WHERE kind IN ('forecast_intent','comment_intent') "
+        "AND NOT EXISTS (SELECT 1 FROM tournament_events c "
+        "WHERE c.scope=i.scope AND c.kind='comment_confirmed') "
+        f"AND NOT {refused}"
+    ).fetchone()[0]
+    data["refused_posts"] = conn.execute(
+        f"SELECT count(DISTINCT scope) FROM tournament_events i "
+        f"WHERE kind='forecast_intent' AND {refused}"
     ).fetchone()[0]
     data["restored_question_holds"] = conn.execute(
         "SELECT count(DISTINCT scope) FROM tournament_events WHERE kind='restored_question_hold'"
@@ -964,6 +994,9 @@ def run_once(
             intent = events(conn, "forecast_intent", row[0])[-1]
             if str(intent["project_id"]) != project:
                 continue
+            if _post_refused(conn, row[0]):
+                # M1-365: there is nothing to reconcile and no comment to attach. See `status`.
+                continue
             try:
                 with phase_timeout(240):
                     if not reconcile_forecast(conn, config, poster, row[0]) or not complete_comment(
@@ -1271,6 +1304,8 @@ def run_once(
                 )
                 if result.artifact_error:
                     raise StorageFailure("submission artifact failed; worker stopped")
+                if _post_refused(conn, record_id):
+                    raise TournamentError("the platform refused the forecast post")
                 if not reconcile_forecast(conn, config, poster, record_id) or not complete_comment(
                     conn, config, poster, record_id
                 ):
