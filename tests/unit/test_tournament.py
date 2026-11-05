@@ -1409,9 +1409,9 @@ def test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought(
 ) -> None:
     """M1-364, on the live payload: q46095 (33129, 2026-10-05), frozen from the poll snapshot.
 
-    A discrete question with 201 inbound outcomes, so ``cdf_size`` 202 -- above the envelope
-    ``cdf._cdf_rules`` admits, so no reply could convert to a submittable CDF. Live, the
-    refusal came after research was bought and was recorded ``internal_error``: three
+    Moved one outcome finer by M1-365, because the payload as it arrived now converts: 202
+    inbound outcomes, so ``cdf_size`` 203, above the envelope ``cdf._cdf_rules`` admits. Live,
+    the refusal came after research was bought and was recorded ``internal_error``: three
     counted attempts 35 minutes apart, three AskNews and Exa purchases, a failed poll and a
     page each time. Now it is refused before any provider call, recorded as a deterministic
     verdict, alerted in that one poll, and declined for free afterwards -- including after
@@ -1421,6 +1421,7 @@ def test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought(
     raw = json.loads(
         (ROOT / "tests/fixtures/api_posts/discrete_shapes/post_45913.json").read_text("utf-8")
     )
+    raw["question"]["scaling"]["inbound_outcome_count"] = 202
     raw["projects"]["default_project"]["id"] = 32977
     real_now = utcnow()
     raw["question"]["scheduled_close_time"] = (real_now + timedelta(hours=8)).isoformat()
@@ -1482,6 +1483,57 @@ def test_a_question_no_reply_could_convert_is_blocked_before_anything_is_bought(
         assert later["heartbeat"]["blocked"] == 1
         assert silent.matching("question blocked") == []
     assert conn.execute("SELECT COUNT(*) FROM pipeline_failure_events").fetchone()[0] == 1
+
+
+class _CdfPlatform(Platform):
+    """Records a CDF post, which the base platform's binary-only surface has no method for."""
+
+    def __init__(self, raw: dict[str, Any]):
+        super().__init__(raw)
+        self.cdfs: list[list[float]] = []
+
+    def post_numeric_question_prediction(self, question_id: int, cdf_values: list[float]) -> None:
+        assert question_id == self.raw["question"]["id"]
+        self.cdfs.append(list(cdf_values))
+        self.posts += 1
+
+    def get_question_by_post_id(self, post_id: int) -> Any:
+        """The read-back carries the array that was posted, as the platform's would."""
+        raw = copy.deepcopy(self.raw)
+        if self.cdfs:
+            raw["question"]["my_forecasts"] = {
+                "history": [{"start_time": utcnow().timestamp(), "forecast_values": self.cdfs[-1]}]
+            }
+        return DataOrganizer.get_question_from_post_json(raw)
+
+
+@pytest.mark.parametrize("post", ["post_45913.json", "post_46390.json"])
+def test_a_question_with_201_outcomes_reaches_exactly_one_post_of_202_values(
+    case: Any, post: str
+) -> None:
+    """M1-365 AC4, on both live payloads: q46095 (33129) and q46623 (33135).
+
+    Each was refused live, so each lost its question. Counts billed model calls and platform
+    posts rather than recorded rows, and reads the length off the array that reached the wire.
+    """
+    conn, config, _platform, news, model = case
+    raw = json.loads((ROOT / "tests/fixtures/api_posts/discrete_shapes" / post).read_text("utf-8"))
+    raw["projects"]["default_project"]["id"] = 32977
+    raw["question"]["status"] = "open"
+    raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(hours=8)).isoformat()
+    platform = _CdfPlatform(raw)
+    news.raw = model.raw = raw
+
+    result = poll((conn, config, platform, news, model))
+
+    assert result["heartbeat"]["failures"] == 0
+    assert model.calls == 1
+    assert platform.posts == 1
+    assert [len(cdf) for cdf in platform.cdfs] == [202]
+    assert result["forecast_confirmed"] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM pipeline_failure_events").fetchone()[0] == 0
+    ), "no refusal on the way to the post"
 
 
 def test_the_daily_digest_fires_on_a_normal_poll(

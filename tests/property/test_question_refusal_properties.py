@@ -141,15 +141,17 @@ def _bounded(draw: Any, qtype: str) -> CanonicalNumericQuestion | CanonicalDiscr
         3: lower + 0.125,
     }[zero_case]
     # cdf_size: weighted toward the edges that matter -- the configured 201, the
-    # q46095 202, the envelope's floor 2 and its neighbours, and arbitrary sizes.
-    size_case = draw(st.integers(0, 5))
+    # q46095 202 and the first size above it, the envelope's floor 2 and its neighbours, and
+    # arbitrary sizes.
+    size_case = draw(st.integers(0, 6))
     cdf_size = {
         0: 201,
         1: 202,
         2: draw(st.integers(-3, 3)),
         3: draw(st.integers(4, 200)),
-        4: draw(st.integers(203, 400)),
+        4: draw(st.integers(204, 400)),
         5: 16,
+        6: 203,
     }[size_case]
     model = CanonicalNumericQuestion if qtype == "numeric" else CanonicalDiscreteQuestion
     return model(
@@ -293,3 +295,36 @@ def test_a_bounded_refusal_renders_none_of_the_questions_numbers(
     # Stronger than the needles, and what makes this not depend on how a float is printed:
     # no bounded or type refusal carries a digit at all.
     assert not any(character.isdigit() for character in refusal.message)
+
+
+@settings(deadline=None)
+@given(
+    qtype=st.sampled_from(["numeric", "discrete"]),
+    cdf_size=st.one_of(
+        st.sampled_from([-1, 0, 1, 2, 3, 200, 201, 202, 203, 204]),
+        st.integers(-10, 1_000),
+    ),
+)
+def test_the_grid_decision_is_exactly_the_written_rule(qtype: str, cdf_size: int) -> None:
+    """M1-365 AC5. The oracle is the rule written out here, not the code's own constant.
+
+    A discrete question may declare 2 to 202 points; a numeric one exactly 201. The spending
+    site agreement above cannot catch a moved bound, because both callers read the same one.
+    """
+    model: Any = CanonicalNumericQuestion if qtype == "numeric" else CanonicalDiscreteQuestion
+    question = model(
+        question_id=46095,
+        post_id=45913,
+        title="How much?",
+        lower_bound=79.5,
+        upper_bound=281.5,
+        open_lower_bound=True,
+        open_upper_bound=True,
+        zero_point=None,
+        cdf_size=cdf_size,
+    )
+    allowed = cdf_size == 201 if qtype == "numeric" else 2 <= cdf_size <= 202
+    refusal = question_refusal(BASE, question)
+    assert (refusal is None) is allowed
+    if refusal is not None:
+        assert not any(character.isdigit() for character in refusal.message)

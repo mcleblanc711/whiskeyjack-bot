@@ -2388,17 +2388,20 @@ def test_a_numeric_background_only_reply_needs_no_repair(
 
 # --- M1-364: a question no reply could forecast, named before anything is bought ---------
 
-# q46095 (MiniBench 33129, 2026-10-05), frozen from the live poll snapshot: a discrete
-# question with 201 inbound outcomes, so ``cdf_size`` 202 -- one above the envelope
-# ``cdf._cdf_rules`` admits. Live, the refusal came after research was bought and was
-# recorded ``internal_error``, so it was retried three times at full price.
+# q46095 (MiniBench 33129, 2026-10-05), frozen from the live poll snapshot, with one outcome
+# added: 202 inbound outcomes, so ``cdf_size`` 203 -- one above the envelope ``cdf._cdf_rules``
+# admits. The payload as it arrived (``cdf_size`` 202) is convertible since M1-365 (D57); live,
+# its refusal came after research was bought and was recorded ``internal_error``, so it was
+# retried three times at full price.
 _POST_45913 = REPO_ROOT / "tests" / "fixtures" / "api_posts" / "discrete_shapes" / "post_45913.json"
 
 
-def _q46095() -> CanonicalDiscreteQuestion:
+def _above_the_envelope() -> CanonicalDiscreteQuestion:
     raw = json.loads(_POST_45913.read_text(encoding="utf-8"))
+    raw["question"]["scaling"]["inbound_outcome_count"] = 202
     question = normalize_questions([DataOrganizer.get_question_from_post_json(raw)]).questions[0]
     assert isinstance(question, CanonicalDiscreteQuestion)
+    assert question.cdf_size == 203
     return question
 
 
@@ -2424,7 +2427,11 @@ def _refusing(name: str, config: AppConfig) -> tuple[AppConfig, Any, str]:
             _numeric_question(cdf_size=101),
             "calibration_invalid",
         ),
-        "discrete grid above the envelope (q46095)": (config, _q46095(), "calibration_invalid"),
+        "discrete grid above the envelope": (
+            config,
+            _above_the_envelope(),
+            "calibration_invalid",
+        ),
         "option count the bounds cannot serve": (
             _bounded_forecast(config, 0.05, 0.95),
             _options(21),
@@ -2438,7 +2445,7 @@ _REFUSING = [
     "unsupported type",
     "zero_point not below lower_bound",
     "numeric cdf_size off the configured length",
-    "discrete grid above the envelope (q46095)",
+    "discrete grid above the envelope",
     "option count the bounds cannot serve",
 ]
 
@@ -2483,11 +2490,11 @@ def test_question_refusal_is_none_for_a_question_some_reply_can_answer(
     assert question_refusal(config, question) is None
 
 
-def test_the_q46095_grid_refusal_names_none_of_the_questions_numbers(config: AppConfig) -> None:
+def test_the_grid_refusal_names_none_of_the_questions_numbers(config: AppConfig) -> None:
     """The payload is Metaculus content, so the message carries none of it (numeric.py's rule)."""
-    refusal = question_refusal(config, _q46095())
+    refusal = question_refusal(config, _above_the_envelope())
     assert refusal is not None
-    for needle in ("202", "201", "79.495", "81.505", "46095"):
+    for needle in ("203", "202", "201", "79.495", "81.505", "46095"):
         assert needle not in refusal.message
 
 

@@ -163,14 +163,18 @@ _LOGGER = logging.getLogger(__name__)
 _PERCENTILES_LOC = "final_prediction.percentiles"
 
 # Two points is the minimum a cumulative distribution can have, and the divisor
-# ``points - 1`` is why the floor is enforced rather than assumed. The ceiling is
-# ``expected_cdf_points``: a discrete grid finer than the continuous case it specialises is
-# not a question this pipeline has seen or can justify converting, and the scaling block it
-# arrives in is untrusted Metaculus payload where an unbounded value is an unbounded
-# allocation inside the SDK.
+# ``points - 1`` is why the floor is enforced rather than assumed. The ceiling is a fixed
+# number because the scaling block it guards is untrusted Metaculus payload, where an
+# unbounded value is an unbounded allocation inside the SDK.
+#
+# 202 is 201 outcomes plus one (M1-365, D57), the finest grid MiniBench has actually posted:
+# q46095 and q46623 were each refused at 202, with 224 and 342 forecasters on the platform,
+# when this ceiling was the numeric ``expected_cdf_points``. It applies to a discrete question
+# only. A numeric question stays pinned to ``expected_cdf_points`` exactly.
 _MIN_CDF_POINTS = 2
+_MAX_DISCRETE_CDF_POINTS = 202
 _CDF_SIZE_OUTSIDE_ENVELOPE = (
-    "question: cdf_size must be between 2 and numeric_calibration.expected_cdf_points "
+    "question: cdf_size is outside the range this pipeline can convert "
     "(offending input withheld)"
 )
 
@@ -456,7 +460,7 @@ def _cdf_rules(
     # "every malformed shape arrives as the module's own error type" rule broken by the
     # remediation that introduced the division. Guarding the arithmetic rather than its
     # callers is what makes that true for every entry point, including the next one.
-    if not _MIN_CDF_POINTS <= points <= calibration.expected_cdf_points:
+    if not _MIN_CDF_POINTS <= points <= _MAX_DISCRETE_CDF_POINTS:
         raise NumericCdfError([_CDF_SIZE_OUTSIDE_ENVELOPE])
     # Metaculus's own rule, and it subsumes both types rather than special-casing one:
     # the server validator caps an adjacent step at ``0.2 * 200 / inbound_outcome_count``,
