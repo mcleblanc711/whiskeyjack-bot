@@ -111,6 +111,12 @@ def _repeats_at_a_bound(values: tuple[float, ...]) -> bool:
 
 
 @settings(deadline=None)
+@example(values=(LOWER,) * 9, open_lower=True, open_upper=True)
+@example(
+    values=(-2004.0, *(LOWER - 10.0,) * 6, 2395.0, 2836.0),
+    open_lower=True,
+    open_upper=True,
+)
 @example(values=(LOWER,) * 9, open_lower=False, open_upper=False)
 @example(values=(UPPER,) * 9, open_lower=False, open_upper=False)
 @example(values=(LOWER, *(500.0,) * 8), open_lower=False, open_upper=False)

@@ -17314,3 +17314,59 @@ Mutations, each caught, judged by pytest's exit code: the ceiling at 201 and at 
 property alone catches both); the numeric pin removed in `generate`, in `cdf`, and in both at once;
 and in `tournament.py` the 4xx range widened to 599, 429 dropped from the exclusions, the recovery
 loop's skip removed, the `unresolved` exclusion removed, and the failure reason's check removed.
+
+## M1-363 — a value repeated at a bound, told as such; two prompt lines
+
+q46395 (33132, 2026-10-20) lost its question: the reply put its 0.01 to 0.25 percentiles on the
+open lower bound, the SDK's tie rewrite broke the curve's order, `_standardization_can_converge`
+refused it correctly, and the repair turn's generic "spread more widely" text produced the same
+percentiles again. Payload frozen as `tests/fixtures/api_posts/numeric_post_q46395_tie_at_bound.json`
+from `data/artifacts/snapshots/poll-a5bdcb6a598f40f38971742695d316c4.json` (tournament 33132,
+`fetched_at_utc` 2026-10-20T06:10:20Z, four questions, file sha256
+`b4656d0da776caf755a831638adf6ec5197485707a1bb975bf61920abdf2f582`), with M1-364's trimming. The
+percentiles come from `data/artifacts/forecast/46395/01a157ee-bbdf-7621-b27b-5de8a0e0d5b4.json`
+and are transcribed as literals in the test.
+
+### Decision — a selector for the message, never for the verdict, and why
+
+`_repeats_a_value_at_a_bound` chooses text at the conversion's refusal sites and decides nothing.
+The row's probes show a repeat at a bound often converts (narrow tail, 7086 instead of 7085, open
+upper), so a verdict keyed on it would refuse good forecasts, and `cdf.py` already argues against
+enumerating triggers. The message says "may not convert" for the same reason. The rule was
+asserted against an oracle composed from the conversion's own steps, so the property cannot see
+the selector.
+
+### Rejected — naming the repeat in an `_array_problems` refusal, and why not
+
+The first draft appended the specific text there. A 6,000-case search found no reply repeating a
+value at a bound that reaches that branch: all refusals landed at `_distribution` (607) or the
+guard (228). So the branch was deleted as unreached, and the existing array text stands if one
+ever does.
+
+### Deviation
+
+The two tie-shaped hang fixtures in `tests/unit/test_forecast_cdf.py` now expect `_TIE_AT_BOUND`,
+including `_HANGS_LOG_SCALED_SPAN`, whose values also repeat below its lower bound. The verdicts
+are unchanged; that is the row's AC3. A repeat beyond a bound (not only at one) gets the text,
+per the row. Reworded from M1-365's r1 observation: RUNBOOK L1 no longer says a refused 202-point
+post "means Metaculus refused the length", because a 401 or 403 reads the same.
+
+### Deferred (do not read the absence as an omission)
+
+D56's second citation id stays held. A refused reply that repeats a value at the upper bound was
+not found by search, so that half of the selector is covered directly, not through the conversion.
+
+### Standing risk — not verifiable offline
+
+Whether the wording changes what the model does. The scripted two-call test proves the message
+reaches the repair turn, not that a live model follows it. `load_bearing_facts` is a wording fix:
+q46384's failure did not recur in the 2026-10-31 replay. **This is a prompt-hash change, so merging
+retires the live activation (AC9).** It must land between batches, and re-enabling is the owner's.
+
+Mutations, each caught and judged by pytest's exit code: the selector's use neutered at the site,
+the repeat test removed, each bound half removed in turn, exact equality instead of at-or-beyond,
+any repeat named; and each of the three refusal sites reverted to generic text. An earlier
+"every mutant caught" reading was wrong: the property file failed at collection (exit 2) because it
+imported from `tests.unit`, so it now stands alone and is judged by exit 1. Its first strategy was
+also vacuous for four mutants, because refused replies were rare, which is why it now aims at them.
+
