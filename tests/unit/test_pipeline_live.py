@@ -516,12 +516,14 @@ def _refusal_case(name: str, config: AppConfig) -> tuple[AppConfig, CanonicalQue
         return config, numeric(zero_point=9.5), "calibration_invalid"
     if name == "numeric grid":
         return config, numeric(cdf_size=101), "calibration_invalid"
-    if name == "discrete grid (q46095)":
+    if name == "discrete grid":
         raw = json.loads(
             (REPO_ROOT / "tests/fixtures/api_posts/discrete_shapes/post_45913.json").read_text(
                 "utf-8"
             )
         )
+        # One outcome finer than q46095, whose own 202 points convert since M1-365.
+        raw["question"]["scaling"]["inbound_outcome_count"] = 202
         question = normalize_questions([DataOrganizer.get_question_from_post_json(raw)]).questions[
             0
         ]
@@ -538,7 +540,7 @@ def _refusal_case(name: str, config: AppConfig) -> tuple[AppConfig, CanonicalQue
 
 @pytest.mark.parametrize(
     "name",
-    ["unsupported type", "zero_point", "numeric grid", "discrete grid (q46095)", "option count"],
+    ["unsupported type", "zero_point", "numeric grid", "discrete grid", "option count"],
 )
 def test_every_question_only_refusal_touches_no_provider(
     config: AppConfig, ledger: Any, name: str

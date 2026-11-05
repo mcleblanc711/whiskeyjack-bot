@@ -638,8 +638,8 @@ _ZERO_POINT_UNSATISFIABLE = (
     "percentile set could satisfy it"
 )
 _GRID_UNCONVERTIBLE = (
-    "the question's cdf_size does not match numeric_calibration."
-    "expected_cdf_points; no percentile set could convert to a submittable CDF"
+    "the question's cdf_size is not one this pipeline can convert; no percentile "
+    "set could convert to a submittable CDF"
 )
 _OPTIONS_UNBOUNDABLE = (
     "forecast.min_probability/forecast.max_probability cannot bound a "
