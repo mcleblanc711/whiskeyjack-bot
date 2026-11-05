@@ -45,6 +45,7 @@ from whiskeyjack_bot.config import (
 from whiskeyjack_bot.forecast.cdf import (
     _NOT_CONVERTIBLE,
     _NOT_WELL_FORMED,
+    _TIE_AT_BOUND,
     _NOT_IN_UNIT_INTERVAL,
     _NOT_MONOTONE,
     _STEP_TOO_TALL,
@@ -1162,6 +1163,7 @@ _CDF_MESSAGES = frozenset(
     {
         _NOT_CONVERTIBLE,
         _NOT_WELL_FORMED,
+        _TIE_AT_BOUND,
         _WRONG_LENGTH,
         _NOT_IN_UNIT_INTERVAL,
         _NOT_MONOTONE,

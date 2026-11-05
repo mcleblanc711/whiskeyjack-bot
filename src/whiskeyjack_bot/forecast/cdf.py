@@ -211,6 +211,13 @@ _NOT_WELL_FORMED = (
     "return strictly increasing values spread more widely across the question's range "
     "(detail withheld: the conversion echoes the values it refused)"
 )
+# M1-363. An authored constant, naming the fields and rendering no value and no bound, because
+# a bound is Metaculus payload the model was already sent (``forecast/numeric.py``'s rule).
+_TIE_AT_BOUND = (
+    "the declared percentiles repeat one value at or beyond the question's lower_bound or "
+    "upper_bound, and a value repeated there may not convert; to place probability at a "
+    "bound, return strictly increasing values just inside it (detail withheld)"
+)
 _LOWER_ENDPOINT = (
     "the converted CDF must start at 0 for a question whose lower_bound is closed "
     "(offending input withheld)"
@@ -588,6 +595,31 @@ def _percentiles_used(distribution: NumericDistribution) -> tuple[tuple[float, f
     return tuple((point.percentile, point.value) for point in distribution.declared_percentiles)
 
 
+def _repeats_a_value_at_a_bound(
+    forecast: NumericForecastResponse, question: BoundedQuestion
+) -> bool:
+    """Whether the reply repeats a value at or beyond the question's bound (M1-363).
+
+    Selects a message and never a verdict. Replies with this shape often convert, depending on
+    the rest of the tail: q46395 failed with four values on its open lower bound and a wide
+    tail, and passes with a narrow one. :func:`_standardization_can_converge` explains why the
+    refusal stays on the mechanism. This only tells a refused reply the one thing it can act on.
+    """
+    values = [value for _, value in _declared(forecast)]
+    return any(
+        values.count(value) > 1 and (value <= question.lower_bound or value >= question.upper_bound)
+        for value in values
+    )
+
+
+def _refusal(
+    generic: str, forecast: NumericForecastResponse, question: BoundedQuestion
+) -> tuple[None, list[str]]:
+    """The conversion's refusal, naming a repeat at a bound when the reply has one."""
+    message = _TIE_AT_BOUND if _repeats_a_value_at_a_bound(forecast, question) else generic
+    return None, [f"{_PERCENTILES_LOC}: {message}"]
+
+
 def _standardization_can_converge(distribution: NumericDistribution) -> bool:
     """Whether ``_standardize_cdf``'s scale search can terminate for this distribution.
 
@@ -842,7 +874,7 @@ def numeric_cdf_or_problems(
     with _bounded(calibration.conversion_timeout_seconds):
         distribution = _distribution(forecast, calibration, question)
         if distribution is None:
-            return None, [f"{_PERCENTILES_LOC}: {_NOT_CONVERTIBLE}"]
+            return _refusal(_NOT_CONVERTIBLE, forecast, question)
         used = _percentiles_used(distribution)
         if calibration.use_forecasting_tools_standardization and not _standardization_can_converge(
             distribution
@@ -858,10 +890,10 @@ def numeric_cdf_or_problems(
             # two outcomes differ: this is deterministic, costs one interpolation, and
             # gives the model a repair turn, where the bound costs the whole deadline and
             # gives the question a terminal ``timeout``. Fast path first, backstop second.
-            return None, [f"{_PERCENTILES_LOC}: {_NOT_WELL_FORMED}"]
+            return _refusal(_NOT_WELL_FORMED, forecast, question)
         values = _values(distribution)
     if values is None:
-        return None, [f"{_PERCENTILES_LOC}: {_NOT_CONVERTIBLE}"]
+        return _refusal(_NOT_CONVERTIBLE, forecast, question)
     problems = _array_problems(values, calibration, question)
     if problems:
         return None, problems

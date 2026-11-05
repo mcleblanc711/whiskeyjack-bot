@@ -948,7 +948,7 @@ def test_the_planted_value_would_be_visible_if_it_leaked() -> None:
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("version", ["1.1.0", "1.2.0", "1.3.0", "1.4.0"])
+@pytest.mark.parametrize("version", ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"])
 def test_a_stored_record_replays_identically_for_every_released_prompt_version(
     version: str, conn: sqlite3.Connection, tmp_path: Path, artifacts: Path
 ) -> None:
