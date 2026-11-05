@@ -310,7 +310,12 @@ def test_the_step_cap_is_the_platform_rule_scaled_to_the_grid() -> None:
     )
     assert _cdf_rules(numeric, calibration) == (201, base)
 
-    for outcomes, platform_cap in ((16, 2.5), (71, 0.2 * 200 / 71), (200, 0.2)):
+    for outcomes, platform_cap in (
+        (16, 2.5),
+        (71, 0.2 * 200 / 71),
+        (200, 0.2),
+        (201, 0.2 * 200 / 201),
+    ):
         points, cap = _cdf_rules(_discrete_question(outcomes), calibration)
         assert points == outcomes + 1
         assert cap == pytest.approx(min(1.0, platform_cap))
@@ -354,7 +359,7 @@ def test_the_scaled_cap_admits_a_confident_forecast_the_flat_numeric_cap_refuses
     assert max(steps) > flat_cap
 
 
-@pytest.mark.parametrize("cdf_size", [1, 0, -1, 202, 10_000])
+@pytest.mark.parametrize("cdf_size", [1, 0, -1, 203, 10_000])
 def test_a_discrete_cdf_size_outside_the_envelope_is_refused_as_a_caller_mistake(
     cdf_size: int,
 ) -> None:
@@ -372,7 +377,7 @@ def test_a_discrete_cdf_size_outside_the_envelope_is_refused_as_a_caller_mistake
     assert all(SECRET not in problem for problem in caught.value.problems)
 
 
-@pytest.mark.parametrize("cdf_size", [1, 0, -1, 202, 10_000])
+@pytest.mark.parametrize("cdf_size", [1, 0, -1, 203, 10_000])
 def test_the_public_length_helper_refuses_an_invalid_grid_rather_than_dividing(
     cdf_size: int,
 ) -> None:
