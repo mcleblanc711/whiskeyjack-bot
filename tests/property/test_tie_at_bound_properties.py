@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from hypothesis import given, settings, strategies as st
+from hypothesis import example, given, settings, strategies as st
 
 from whiskeyjack_bot.config import NumericCalibrationConfig, validate_config_data
 from whiskeyjack_bot.forecast.schema import NumericForecastResponse, validate_forecast_response
@@ -73,29 +73,34 @@ def _forecast(values: tuple[float, ...]) -> NumericForecastResponse:
 
 @st.composite
 def _values_with_repeats(draw: Any) -> tuple[float, ...]:
-    """Nine non-decreasing values, with a run on a bound drawn often."""
-    tail = sorted(
-        draw(
+    """Nine values, weighted toward what the conversion refuses.
+
+    Refused replies are rare among uniform draws, and the assertion about the message is only
+    reached on a refusal. So a run sits on or beyond a bound with a tail of random width, which
+    is q46395's shape, or eight values sit inside the range with one lone value on a bound,
+    which is refused and must not be named: the lone value is not repeated.
+    """
+    shape = draw(st.integers(0, 2))
+    if shape == 0:
+        drawn = draw(
             st.lists(
                 st.floats(min_value=LOWER - 50, max_value=UPPER + 500, allow_nan=False, width=32),
                 min_size=9,
                 max_size=9,
             )
         )
-    )
-    values = [float(value) for value in tail]
-    shape = draw(st.integers(0, 4))
-    run = draw(st.integers(2, 4))
+        return tuple(sorted(float(value) for value in drawn))
     if shape == 1:
-        values[:run] = [LOWER] * run
-    elif shape == 2:
-        values[-run:] = [UPPER] * run
-    elif shape == 3:
-        values[:run] = [LOWER - 10.0] * run
-    elif shape == 4:
-        middle = values[4]
-        values[3 : 3 + run] = [middle] * run
-    return tuple(sorted(values))
+        anchor = draw(st.sampled_from([LOWER, UPPER, LOWER - 10.0, UPPER + 10.0]))
+        run = draw(st.integers(2, 9))
+        width = draw(st.sampled_from([1.0, 5.0, 30.0, 300.0, 900.0, 3000.0]))
+        tail = draw(
+            st.lists(st.floats(-1.0, 1.0, allow_nan=False, width=32), min_size=9 - run, max_size=9)
+        )
+        return tuple(sorted([anchor] * run + [anchor + width * float(t) for t in tail[: 9 - run]]))
+    lone = draw(st.sampled_from([LOWER, UPPER]))
+    middle = draw(st.sampled_from([500.0, 123.25, 987.5]))
+    return tuple(sorted([lone] + [middle] * 8))
 
 
 def _repeats_at_a_bound(values: tuple[float, ...]) -> bool:
@@ -104,6 +109,11 @@ def _repeats_at_a_bound(values: tuple[float, ...]) -> bool:
 
 
 @settings(deadline=None)
+@example(values=(LOWER,) * 9, open_lower=True, open_upper=True)
+@example(values=(UPPER,) * 9, open_lower=True, open_upper=True)
+@example(values=(LOWER, *(500.0,) * 8), open_lower=True, open_upper=True)
+@example(values=(*(500.0,) * 8, UPPER), open_lower=True, open_upper=True)
+@example(values=(500.0,) * 9, open_lower=True, open_upper=True)
 @given(
     values=_values_with_repeats(),
     open_lower=st.booleans(),

@@ -897,10 +897,6 @@ def numeric_cdf_or_problems(
         return _refusal(_NOT_CONVERTIBLE, forecast, question)
     problems = _array_problems(values, calibration, question)
     if problems:
-        if _repeats_a_value_at_a_bound(forecast, question):
-            # Added rather than substituted: these name the array rule that broke, which is
-            # actionable on its own and which the three sites above have no equivalent of.
-            problems = [*problems, f"{_PERCENTILES_LOC}: {_TIE_AT_BOUND}"]
         return None, problems
 
     adjusted = used != _declared(forecast)
