@@ -355,7 +355,7 @@ _POST_REFUSED_SQL: Final = (
     "EXISTS (SELECT 1 FROM lifecycle_events l "
     "JOIN submission_attempts a ON a.attempt_id = l.submission_attempt_id "
     "WHERE l.forecast_record_id = {record} AND l.to_status = 'failed' "
-    "AND l.detail_code = 'http_error' AND a.http_status BETWEEN 400 AND 499 "
+    "AND a.http_status BETWEEN 400 AND 499 "
     "AND a.http_status NOT IN (408, 425, 429))"
 )
 

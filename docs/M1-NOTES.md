@@ -17233,3 +17233,84 @@ post-approval commit because it is a docs-only correction: the snapshot digest a
 abbreviated and is now the full sha256, so the comparison is exact. The reviewer could not rerun
 pytest (its sandbox refused a loopback address); the gates were run by `review-request.py` for both
 rounds' HEADs and by CI.
+
+## M1-365 — a discrete question with 201 outcomes, at 202 points (D57)
+
+Live on 33129 (q46095, 2026-10-05) and 33135 (q46623, 2026-11-02): `cdf_size` 202 was one above
+the envelope in `forecast/cdf._cdf_rules`, so the question was refused and lost. The 2026-11-05
+audit compared all 300 questions on the platform against the journal: 235 answered, 51 closed
+before the bot was bound, 2 launch-day discrete, 12 pipeline refusals. This was the one cause left
+that misses every time it occurs. q46623's payload is frozen as
+`tests/fixtures/api_posts/discrete_shapes/post_46390.json`, with M1-364's trimming, from
+`data/artifacts/snapshots/poll-90c4a29c6c624b6bbfddfeab8f7d0bfc.json` (tournament 33135,
+`fetched_at_utc` 2026-11-02T08:45:20Z, ten questions, file sha256
+`42b67b7cd949d28bc071bfe2ed7ee37cdbe2320f18f2f31d436b6c4515174f8e`).
+
+### Decision — a fixed ceiling of 202, for discrete questions only, and why
+
+`_MAX_DISCRETE_CDF_POINTS = 202`. It stays a number because the scaling block is untrusted payload
+and an unbounded value is an unbounded allocation in the SDK. `_cdf_rules` compares `points`
+against it for both types, and that is safe: for a numeric question `points` *is*
+`expected_cdf_points`, so the comparison cannot fail, and the numeric pin is held separately in
+`cdf._require_question` and `generate._grid_is_convertible`. Those two pins are mutated
+separately and together below. `expected_cdf_points` stays `Literal[201]`. The cap formula needed
+no change: `0.2 * 200 / 201` is what it already computes at 202.
+
+### Decision — a refused post is a standing count, not an unresolved one, and why
+
+Checking AC10 by execution found the reason this could not be only a one-line ceiling. With a fake
+platform answering 400, the poll made one post and one model call, as it should, but `unresolved`
+stayed 1 on every later poll. That count is the poll's exit code, and it asks only whether an
+intent has a `comment_confirmed`, which a refused post can never get. So one refusal would have
+failed the unit and pushed every five minutes for good. The condition predates this branch (0 of
+235 live posts have met it), but this branch makes such a post reachable by design, so it is fixed
+here. AC11 was added to the row for it. `_post_refused` is the one definition, used in the recovery
+loop, in the failure reason, and in `status`.
+
+### Rejected — treating every `failed` lifecycle status as closed, and why not
+
+That was the first draft, and `test_lost_forecast_response_reconciles_without_another_post`
+refused it. A timeout with an absent refetch also lands on `failed`, and that post can still appear
+later; the recovery loop is what records it, through `forecast_confirmed`. So the definition keys
+on the attempt's `http_status`: 4xx other than 408, 425 and 429. 5xx stays open for the same reason
+as a timeout. A `detail_code = 'http_error'` clause was also dropped: a mutation showed nothing
+needed it, because only an HTTP error carries a status.
+
+### Rejected — re-forecasting after a refused post, and why not
+
+A new version would buy another model call for a body the platform has just refused, and for the
+202 case the same shape would be refused again. The question stays lost and visible.
+
+### Deviation
+
+AC11 was not in the row as filed on PR #148; it was added on this branch when execution showed the
+consequence. The `_GRID_UNCONVERTIBLE` and `_CDF_SIZE_OUTSIDE_ENVELOPE` messages were reworded,
+because both named `expected_cdf_points`, which no longer describes the discrete rule. Both still
+carry no digit. M1-364's refusal tests moved to `inbound_outcome_count` 202 (`cdf_size` 203), so
+they keep their force on q46095's real payload, one outcome finer.
+
+### Deferred (do not read the absence as an omission)
+
+A 4xx loses the question for good, including a 401 or 403 from an operational fault, as it did
+before this item. Telling those apart from a refused body, and a re-forecast path for them, are
+not this row; no live post has ever met one. M1-363 (the tie at a bound) is the next branch.
+
+### Standing risk — not verifiable offline
+
+**Metaculus's acceptance of 202 values is unproven until the first live post.** The evidence: 224
+and 342 forecasters on the two questions; the discrete grids already posted carry
+`inbound_outcome_count + 1` values, though the largest of the 50 stored is 162; and the pinned
+SDK's `post_numeric_question_prediction` has no length check. RUNBOOK L1 says how to read the first
+one. An early offline probe with no per-case time limit hit its 200-second limit. The same seed
+and shapes then passed 300 of 300 at 202 and at 201 with a limit in place, so the hang did not
+recur and its cause was not identified; M1-514's wall-clock bound applies to every conversion.
+
+Checked for AC8, not assumed: `digest(config.model_dump(mode="json"))` and the prompt sha256 for
+`config/tournament.yaml` are the same on master and on this branch (`173672d8…` and `00efd302…`),
+so the activation is not retired. For AC7, none of the 50 stored discrete records declares more
+than 162 points, so none is near the changed bound.
+
+Mutations, each caught, judged by pytest's exit code: the ceiling at 201 and at 203 (the written-rule
+property alone catches both); the numeric pin removed in `generate`, in `cdf`, and in both at once;
+and in `tournament.py` the 4xx range widened to 599, 429 dropped from the exclusions, the recovery
+loop's skip removed, the `unresolved` exclusion removed, and the failure reason's check removed.

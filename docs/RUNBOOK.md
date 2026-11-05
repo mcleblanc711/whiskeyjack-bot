@@ -1793,6 +1793,21 @@ version and approve it if you still want to submit for that question.
 **Never.** Do not attempt to resubmit the same record — it is no longer `approved` and the
 attempt will be refused.
 
+**In the worker (M1-365).** A post answered with an HTTP 4xx other than 408, 425 or 429 is a
+refusal: the poll that met it exits `1`, records `the platform refused the forecast post` and
+sends the failed-unit push. Later polls exit `0`, and `tournament status` keeps the count in
+`refused_posts`. The question is not posted or bought again. Any other `failed` post (a timeout or
+a 5xx with an absent refetch) stays in `unresolved`, because it can still land and later polls
+are what record it.
+
+**The first 202-point post.** A discrete question with 201 outcomes converts to 202 values since
+M1-365, and Metaculus's acceptance of that length is proven only by the first live post. Run
+`tournament status --config config/tournament.yaml` after the batch: `refused_posts: 0`, and a
+`whiskeyjack: forecast confirmed` push for the question, means it was accepted. If `refused_posts`
+is above 0 and `show --record-id` reports that record's question has `cdf_size` 202, Metaculus
+refused the length. D57's revisit trigger has fired, so take it to the owner. Do not edit anything
+to retry that question.
+
 ### L2 — A standing key reservation
 
 **What you see.** After a `submit` refusal:
