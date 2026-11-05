@@ -4,6 +4,7 @@ Over generated percentile sets, open and closed bounds, with and without repeats
 
 - **the verdict did not move**: the conversion refuses exactly when the steps it is made of
   refuse. The oracle composes those steps directly, so it cannot see the selector;
+- **the selector is the written rule**, tested directly as well as through the conversion;
 - **the message is the selector's**: a refused reply that repeats a value at or beyond a bound
   gets the specific text, and every other refusal has none of it.
 
@@ -28,6 +29,7 @@ from whiskeyjack_bot.forecast.cdf import (
     _TIE_AT_BOUND,
     _array_problems,
     _distribution,
+    _repeats_a_value_at_a_bound,
     _standardization_can_converge,
     _values,
     numeric_cdf_or_problems,
@@ -109,11 +111,11 @@ def _repeats_at_a_bound(values: tuple[float, ...]) -> bool:
 
 
 @settings(deadline=None)
-@example(values=(LOWER,) * 9, open_lower=True, open_upper=True)
-@example(values=(UPPER,) * 9, open_lower=True, open_upper=True)
-@example(values=(LOWER, *(500.0,) * 8), open_lower=True, open_upper=True)
-@example(values=(*(500.0,) * 8, UPPER), open_lower=True, open_upper=True)
-@example(values=(500.0,) * 9, open_lower=True, open_upper=True)
+@example(values=(LOWER,) * 9, open_lower=False, open_upper=False)
+@example(values=(UPPER,) * 9, open_lower=False, open_upper=False)
+@example(values=(LOWER, *(500.0,) * 8), open_lower=False, open_upper=False)
+@example(values=(*(500.0,) * 8, UPPER), open_lower=False, open_upper=False)
+@example(values=(500.0,) * 9, open_lower=False, open_upper=False)
 @given(
     values=_values_with_repeats(),
     open_lower=st.booleans(),
@@ -151,3 +153,29 @@ def test_the_selector_picks_a_message_and_never_a_verdict(
         assert named is _repeats_at_a_bound(values)
     else:
         assert problems == []
+
+
+@settings(deadline=None)
+@example(values=(*(500.0,) * 7, UPPER, UPPER))
+@example(values=(*(500.0,) * 7, UPPER + 10.0, UPPER + 10.0))
+@example(values=(LOWER, LOWER, *(500.0,) * 7))
+@example(values=(LOWER - 10.0, LOWER - 10.0, *(500.0,) * 7))
+@example(values=(LOWER, *(500.0,) * 8))
+@example(values=(*(500.0,) * 8, UPPER))
+@example(values=(500.0,) * 9)
+@given(values=_values_with_repeats())
+def test_the_selector_is_exactly_the_written_rule(values: tuple[float, ...]) -> None:
+    """Direct, because a refused reply repeating a value at the upper bound was not found in a
+    search of the conversion, so the first property cannot reach that half of the rule."""
+    question = CanonicalNumericQuestion(
+        question_id=46395,
+        post_id=46166,
+        title="How much?",
+        resolution_criteria="Resolves to the amount.",
+        lower_bound=LOWER,
+        upper_bound=UPPER,
+        open_lower_bound=True,
+        open_upper_bound=True,
+        cdf_size=201,
+    )
+    assert _repeats_a_value_at_a_bound(_forecast(values), question) is _repeats_at_a_bound(values)
