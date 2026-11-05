@@ -174,8 +174,7 @@ _PERCENTILES_LOC = "final_prediction.percentiles"
 _MIN_CDF_POINTS = 2
 _MAX_DISCRETE_CDF_POINTS = 202
 _CDF_SIZE_OUTSIDE_ENVELOPE = (
-    "question: cdf_size is outside the range this pipeline can convert "
-    "(offending input withheld)"
+    "question: cdf_size is outside the range this pipeline can convert (offending input withheld)"
 )
 
 # ``get_cdf`` falls back to this when ``cdf_size`` is unset. Not reachable through this

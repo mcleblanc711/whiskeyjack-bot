@@ -16,7 +16,7 @@ import pytest
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 
 from tests.unit.test_forecast_cdf import _calibration, _with_values
-from tests.unit.test_forecast_generate import config  # noqa: F401 (a shared fixture)
+from tests.unit.test_forecast_generate import config as generate_config
 from whiskeyjack_bot.config import AppConfig
 from whiskeyjack_bot.forecast.cdf import (
     NumericCdf,
@@ -39,6 +39,12 @@ SHAPES = ROOT / "tests" / "fixtures" / "api_posts" / "discrete_shapes"
 # Metaculus's rules for 201 inbound outcomes, written out: 0.2 * 200 / 201 and 0.01 / 201.
 MAX_STEP = 0.2 * 200 / 201
 MIN_STEP = 0.01 / 201
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> AppConfig:
+    built: AppConfig = generate_config.__wrapped__(tmp_path)  # type: ignore[attr-defined]
+    return built
 
 
 def _live(post: str) -> CanonicalDiscreteQuestion:

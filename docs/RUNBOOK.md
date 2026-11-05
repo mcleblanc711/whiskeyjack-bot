@@ -1804,9 +1804,14 @@ are what record it.
 M1-365, and Metaculus's acceptance of that length is proven only by the first live post. Run
 `tournament status --config config/tournament.yaml` after the batch: `refused_posts: 0`, and a
 `whiskeyjack: forecast confirmed` push for the question, means it was accepted. If `refused_posts`
-is above 0 and `show --record-id` reports that record's question has `cdf_size` 202, Metaculus
-refused the length. D57's revisit trigger has fired, so take it to the owner. Do not edit anything
-to retry that question.
+is above 0, read the record's declared size (`show` does not print it):
+
+```bash
+sqlite3 -readonly data/whiskeyjack_bot.sqlite3 "SELECT json_extract(record_json, '$.question.cdf_size') FROM forecast_records WHERE record_id = '<REC>'"
+```
+
+`202` means Metaculus refused the length. D57's revisit trigger has fired, so take it to the owner.
+Do not edit anything to retry that question.
 
 ### L2 — A standing key reservation
 
