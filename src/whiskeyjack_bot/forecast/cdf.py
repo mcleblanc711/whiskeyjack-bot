@@ -607,8 +607,7 @@ def _repeats_a_value_at_a_bound(
     """
     values = [value for _, value in _declared(forecast)]
     return any(
-        values.count(value) > 1
-        and (value <= question.lower_bound or value >= question.upper_bound)
+        values.count(value) > 1 and (value <= question.lower_bound or value >= question.upper_bound)
         for value in values
     )
 
