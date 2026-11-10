@@ -186,11 +186,15 @@ paid-call controls, or the rule that malformed shapes arrive as the module's own
   where to find the code may not. Do not trim the diffs back out.
 - **Run the round with `scripts/run-review.sh <ITEM> --round N [--previous-reviewed <sha>]`.** It
   generates the request (same gates, same refusals) and hands it to the local reviewer with
-  `codex exec --sandbox read-only`, writing the answer to `GPT_REVIEW_RESPONSE_<ITEM>_r<N>.md`.
-  The sandbox flag is **advisory on this machine** — bubblewrap needs an unprivileged user
-  namespace and `kernel.apparmor_restrict_unprivileged_userns=1` refuses one, so codex warns and
-  runs unconfined. The script says so at the point of use rather than letting the flag imply a
-  guarantee. Nothing in the workflow depends on the confinement.
+  `codex exec` with an explicit reviewer permission profile, writing an accepted answer to
+  `GPT_REVIEW_RESPONSE_<ITEM>_r<N>.md`. The reviewer has read-only repo/runtime access,
+  secret-file denials, no tool network access, and no inherited user configuration.
+  Project `.codex/config.toml` files are refused to prevent inherited tools or hooks.
+  The actual Codex sandbox must pass preflight before an API call. A response must name
+  the pinned HEAD, issue an explicit verdict, and have successful brief-inspection events.
+  Failed candidates and logs remain in `GPT_REVIEW_ATTEMPT_*` directories; they do not
+  consume a round. Read-only is enforced, never treated as advisory. On Ubuntu, bwrap
+  may require its own AppArmor `userns` profile; do not disable the global restriction.
   It uses plain `codex exec` pointed at the request, **not `codex exec review`** — that subcommand
   builds its own diff and its own framing, which discards the contract the request spent PRs
   #18/#19/#20 building and turns the round into the unbounded hardening exercise the contract
