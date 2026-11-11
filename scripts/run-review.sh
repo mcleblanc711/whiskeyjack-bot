@@ -15,9 +15,8 @@
 # cost this project has spent the most rounds on. So: plain `codex exec`, pointed at the
 # request, told to follow it exactly.
 #
-# Note on the sandbox: --sandbox read-only is requested, and on a host where bubblewrap can
-# create a user namespace it is enforced. This machine is not such a host (see the preflight
-# below), so treat it as advisory. Nothing in this workflow relies on it.
+# The reviewer uses an enforced read-only permission profile with secret denials.
+# Sandbox preflight and positive response validation must pass before accepting a round.
 #
 # It does not live inside review-request.py. That script has one job -- emit a request it
 # has verified -- and it is unit-tested on the assumption that it never acts outward.
@@ -99,51 +98,9 @@ if ! command -v codex >/dev/null 2>&1; then
   exit 1
 fi
 
-# The brief is the file. Everything the reviewer needs to bound the review is already in
-# it, so this prompt adds no criteria of its own -- it only insists the file is followed.
-read -r -d '' prompt <<PROMPT || true
-Perform the cross-model review specified in ./${request}.
-
-That file is the complete brief. It contains the review-round contract, the scope tests
-that bound a blocking finding, the authoritative spec for this item, the standing
-conventions, the branch diff, and the required output format. Follow it exactly.
-
-Review only what it asks you to review. Do not broaden this into a general hardening
-audit, and do not apply criteria the brief does not state -- the brief's own rules about
-what makes a finding blocking are the ones that decide, not your priors about what good
-code should defend against.
-
-Begin your response by stating the exact commit hash you examined.
-PROMPT
-
-# --sandbox read-only asks codex to confine the reviewer to reads. On this machine it
-# cannot: bubblewrap needs an unprivileged user namespace, and Ubuntu's
-# kernel.apparmor_restrict_unprivileged_userns=1 refuses to create one, so codex prints a
-# warning and proceeds unconfined. Say so rather than let the flag imply a guarantee it is
-# not providing -- a check whose failure mode is a silent pass is decoration
-# (docs/LESSONS.md, lesson 7). Nothing here depends on the confinement: the reviewer is
-# asked to read and answer, and the operator is not an attacker under this project's
-# threat boundary. It is the claim that has to be accurate, not the sandbox.
-if command -v unshare >/dev/null 2>&1 && ! unshare --user --map-root-user true 2>/dev/null; then
-  echo "    note: unprivileged user namespaces are blocked on this host, so codex's"
-  echo "          --sandbox read-only is ADVISORY here, not enforced. The bubblewrap"
-  echo "          warning codex prints below is expected and is not an error."
-fi
-
-echo "==> running the reviewer (read-only requested, no session files persisted)"
-# stdin is redirected from /dev/null deliberately. Run from a terminal, codex exec
-# behaves; run it where stdin is a pipe or a socket -- any non-interactive harness,
-# CI, or a backgrounded shell -- and it blocks before doing any work. Observed
-# 2026-08-18 on M1-306 round 1: 57 minutes elapsed, 00:00:00 of CPU time, no output,
-# no response file. It is indistinguishable from a slow API call until you look at
-# CPU time, which is the tell: a reviewer that is really working accumulates some.
-codex exec \
-  -C "$repo_root" \
-  --sandbox read-only \
-  --ephemeral \
-  "${model[@]}" \
-  -o "$response" \
-  "$prompt" < /dev/null
+# The runner preflights the exact policy, preserves failed attempts, and only publishes
+# the canonical response after validating both the answer and execution evidence.
+python3 scripts/review-runner.py "$request" "$response" "${model[@]}"
 
 echo
 echo "==> round $round for $item_id"
