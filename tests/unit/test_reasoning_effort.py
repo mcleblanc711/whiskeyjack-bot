@@ -9,6 +9,7 @@ client journaled for that call. The expected value is the literal ``"high"``, no
 from __future__ import annotations
 
 import asyncio
+import math
 import json
 from typing import Any
 
@@ -132,3 +133,32 @@ def test_a_pre_m1_367_response_without_the_field_still_settles_on_replay(
         assert asyncio.run(PricedClient(config).invoke(PROMPT)) == "ok"
     assert posted == []
     assert spending(conn, SCOPE) == (50_000, 0)
+
+
+@pytest.mark.parametrize("model", sorted(PRICED_MODELS))
+def test_the_estimate_moves_only_by_the_effort_strings_bytes(model: str) -> None:
+    """AC6 as corrected after review round 1 (B1).
+
+    The estimator bounds input by the request's UTF-8 bytes, so "high" (2 bytes shorter
+    than "medium") reserves exactly two bytes of input less, and the output term does not
+    move. The expected figures are literals, not recomputed from the estimator.
+    """
+    from copy import deepcopy
+
+    from whiskeyjack_bot.forecast.priced import reservation_estimate_usd
+
+    priced = PRICED_MODELS[model]
+    high = build_request(PROMPT, priced)
+    medium = deepcopy(high)
+    medium["reasoning"]["effort"] = "medium"
+    micro = {
+        effort: math.ceil(reservation_estimate_usd(request, priced) * 1_000_000)
+        for effort, request in (("medium", medium), ("high", high))
+    }
+    expected = {
+        "openrouter/openai/gpt-5.6-sol": {"medium": 68_702, "high": 68_698},
+        "openrouter/openai/gpt-6-astra": {"medium": 343_520, "high": 343_500},
+    }[model]
+    assert micro == expected
+    # Two bytes of input at the model's prompt price, and nothing from the output term.
+    assert micro["medium"] - micro["high"] == 2 * priced.prompt_usd_per_mtok
