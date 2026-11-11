@@ -17420,6 +17420,20 @@ Any new `AppConfig` field retires the live activation and stops the worker until
 re-enabled. What attribution needs is the value actually sent, per call, which the journal now
 holds. The effort stays code, like `MAX_OUTPUT_TOKENS`.
 
+### Decision — round 1's B1 corrects AC6 instead of padding the estimator, and why
+Round 1 (on `34de6d0`) found that AC6's "reservation estimates are unchanged" is false:
+`"high"` is two bytes shorter than `"medium"`, and `reservation_estimate_usd` bounds input by
+the request's UTF-8 bytes, so a call now reserves 20 micro-USD less on Astra (343,520 -> 343,500)
+and 4 less on Sol (68,702 -> 68,698). Reproduced by execution. The code is the design working:
+the input term is *derived from the request*, and the estimate stays an upper bound. What AC6
+existed to guarantee is that the output term, the $0.30 the series ceiling actually checks
+against, does not move with effort, and it does not. The reviewer's smallest fix, a two-byte
+legacy allowance, would special-case the estimator to keep a number stable for no safety
+reason. The owner chose (2026-11-10) to correct the criterion, which now states the two-byte
+delta, and `test_the_estimate_moves_only_by_the_effort_strings_bytes` pins it with literal
+figures for both models. Two mutants: the two-byte pad itself and a shifted output term, both
+killed.
+
 ### Rejected — raising `MAX_OUTPUT_TOKENS` with the effort, and why not
 Reasoning tokens count against `max_tokens` on OpenRouter. Measured on the live journal at
 medium, over 298 Astra `model_response` events: completion tokens p50 1,199, p90 1,467, p99
