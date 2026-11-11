@@ -721,7 +721,7 @@ def test_sol_price_parameters_response_recovery_and_unknown_cost(
     def request(req: Any) -> httpx.Response:
         body = json.loads(req.content)
         calls.append(body)
-        assert body["reasoning"]["effort"] == "medium"
+        assert body["reasoning"]["effort"] == "high"  # M1-367, D59
         assert body["max_tokens"] == 6000 and "temperature" not in body
         assert body["provider"]["max_price"] == {"prompt": 2, "completion": 10}
         return httpx.Response(200, json={"choices": [{"message": {"content": "saved output"}}]})

@@ -58,6 +58,7 @@ near zero this time, with no other lane open when it started and one when it mer
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
 | M1-363 | feat/m1-363-prompt-tie-at-bound | whiskeyjack-m1-363 | no | none | 2026-11-05 |
+| M1-367 | feat/m1-367-reasoning-effort-high | whiskeyjack-m1-367 | no | none | 2026-11-10 |
 | M1-365 | feat/m1-365-discrete-202-point-cdf | whiskeyjack-m1-365 | no | none | 2026-11-05 |
 | M1-364 | feat/m1-364-question-refusal-preflight | whiskeyjack-m1-364 | no | none | 2026-10-31 |
 | M1-362 | feat/m1-362-background-attribution | whiskeyjack-m1-362 | no | none | 2026-10-26 |

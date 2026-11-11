@@ -86,14 +86,17 @@ def test_the_request_carries_the_registered_id_and_prices(messages: list[Any]) -
 
 
 @given(messages=MESSAGES)
-def test_a_sol_request_is_byte_identical_to_launchs_literal(messages: list[Any]) -> None:
+def test_a_sol_request_is_launchs_literal_with_only_the_effort_raised(messages: list[Any]) -> None:
     """The request's digest keys every `model_started`/`model_completed` cache scope in a
-    live ledger. Identical bytes mean a Sol call made before this refactor is still found
-    as the same call after it -- neither re-bought nor orphaned mid-outcome."""
+    live ledger. M1-408 kept Launch's bytes so a call made before it was still found after it
+    -- neither re-bought nor orphaned mid-outcome. M1-367 (D59) moves the digest **on
+    purpose**, for one field: `reasoning.effort` goes from Launch's "medium" to "high" and
+    nothing else changes. A call journaled at medium is therefore not found by the new
+    digest, which is why M1-367 deploys only in a window with no open question."""
     launch = {
         "model": "openai/gpt-5.6-sol",
         "messages": messages,
-        "reasoning": {"effort": "medium", "exclude": True},
+        "reasoning": {"effort": "high", "exclude": True},
         "max_tokens": 6000,
         "provider": {
             "max_price": {"prompt": 2, "completion": 10},
