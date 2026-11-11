@@ -112,3 +112,69 @@ def test_publication_and_retry(tmp_path, monkeypatch, valid):
         assert not Path(response).exists()
         assert len(list(tmp_path.glob("GPT_REVIEW_ATTEMPT_*"))) == 2
         assert len(list(tmp_path.glob("GPT_REVIEW_ATTEMPT_*/candidate.md"))) == 2
+
+
+def _inspection(output, exit_code=0):
+    return {
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": f"cat {REQUEST}",
+            "aggregated_output": output,
+            "exit_code": exit_code,
+            "status": "completed",
+        },
+    }
+
+
+def test_a_request_whose_diff_quotes_the_failure_strings_is_accepted():
+    """The brief embeds the branch diff; a branch touching this runner prints its patterns."""
+    output = f'- **Request HEAD:** `{HEAD}`\n+    r"bwrap:|Failed RTM_NEW"\n'
+    runner.validate(
+        f"Reviewed commit: {HEAD}\nVerdict: APPROVE",
+        [_inspection(output), {"type": "turn.completed"}],
+        "",
+        HEAD,
+        REQUEST,
+    )
+
+
+def test_a_failed_command_printing_a_sandbox_failure_is_rejected():
+    evidence = events() + [_inspection("bwrap: loopback: Failed RTM_NEWADDR", exit_code=1)]
+    with pytest.raises(ValueError, match="sandbox tool failed"):
+        runner.validate(f"Reviewed commit: {HEAD}\nVerdict: APPROVE", evidence, "", HEAD, REQUEST)
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "The reviewer cannot read `.env`, which is the point of the denial.",
+        "A non-review that says `please paste` is retained, never published.",
+        "> I couldn't read the brief.\n\nThat quoted reply is the failure this catches.",
+        "```\nPlease paste the request here.\n```",
+        "The worker cannot access the ledger while the lock is held.",
+    ],
+)
+def test_prose_about_other_things_is_not_a_refusal(prose):
+    runner.validate(
+        f"Reviewed commit: {HEAD}\nVerdict: APPROVE\n\n{prose}\n", events(), "", HEAD, REQUEST
+    )
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "I could not read the request file.",
+        "I was unable to inspect the pinned revision.",
+        "I did not review the diff.",
+    ],
+)
+def test_a_refusal_about_the_reviews_own_inputs_is_rejected(prose):
+    with pytest.raises(ValueError, match="unavailable context"):
+        runner.validate(
+            f"Reviewed commit: {HEAD}\nVerdict: APPROVE\n\n{prose}\n",
+            events(),
+            "",
+            HEAD,
+            REQUEST,
+        )

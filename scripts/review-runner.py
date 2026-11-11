@@ -17,11 +17,25 @@ FAILURE = re.compile(
     r"MCP tool call requires approval|error building bubblewrap",
     re.I,
 )
+# Phrases a reviewer uses when it could not do the review, about the review's OWN inputs.
+# Matched only outside code spans, fences and quotes (see `_prose`): a legitimate review
+# routinely quotes these patterns or says what some other process "cannot read".
 REFUSAL = re.compile(
-    r"please paste|(?:couldn.t|cannot|can.t|unable to) (?:read|review|access)|"
-    r"haven.t reviewed|have not reviewed",
+    r"please paste|"
+    r"(?:couldn.t|could not|cannot|can.t|unable to) (?:read|review|access|open|inspect) "
+    r"(?:the |this )?(?:brief|request|review request|repo(?:sitory)?|code|diff|files?|"
+    r"pinned (?:revision|commit|head))\b|"
+    r"(?:haven.t|have not|did not|didn.t) (?:reviewed|review|read|inspect(?:ed)?) "
+    r"(?:the |this )?(?:brief|request|code|branch|diff|pinned (?:revision|commit|head))\b",
     re.I,
 )
+
+
+def _prose(answer):
+    """The answer with fenced blocks, inline code and blockquotes removed."""
+    answer = re.sub(r"^(```|~~~).*?^\1[^\n]*$", "", answer, flags=re.M | re.S)
+    answer = re.sub(r"`[^`\n]*`", "", answer)
+    return "\n".join(line for line in answer.splitlines() if not line.lstrip().startswith(">"))
 
 
 def validate(answer, events, diagnostics, head, request):
@@ -31,7 +45,7 @@ def validate(answer, events, diagnostics, head, request):
         raise ValueError("missing or mismatched reviewed commit")
     if not re.search(r"^Verdict: (APPROVE|CHANGES REQUESTED)$", answer, re.M):
         raise ValueError("missing explicit verdict")
-    if REFUSAL.search(answer):
+    if REFUSAL.search(_prose(answer)):
         raise ValueError("reviewer reports unavailable context")
     if FAILURE.search(diagnostics):
         raise ValueError("sandbox infrastructure failed")
@@ -47,14 +61,17 @@ def validate(answer, events, diagnostics, head, request):
         if item.get("type") in {"error", "file_change", "mcp_tool_call", "web_search"}:
             raise ValueError("unexpected tool or error in confined review")
         if item.get("type") == "command_execution":
-            if FAILURE.search(item.get("aggregated_output", "")):
+            output = item.get("aggregated_output", "")
+            succeeded = item.get("status") == "completed" and item.get("exit_code") == 0
+            # A sandbox failure fails the command (bwrap exits non-zero). Only a failed
+            # command's output is evidence of one: a successful `cat` of a request whose
+            # diff touches this file prints these very strings.
+            if not succeeded and FAILURE.search(output):
                 raise ValueError("sandbox tool failed")
             # The prompt requires this exact first inspection. Require actual output,
             # rather than accepting a command that merely mentions the request path.
-            output = item.get("aggregated_output", "")
             inspected |= (
-                item.get("status") == "completed"
-                and item.get("exit_code") == 0
+                succeeded
                 and request in item.get("command", "")
                 and head in output
                 and "Request HEAD:" in output
