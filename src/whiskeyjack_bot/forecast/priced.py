@@ -1,7 +1,8 @@
 """Bounded, explicitly priced OpenRouter requests with auditable effective parameters (M1-408).
 
 M1-348 settles a bring-your-own-key call from its upstream figure; see
-:func:`whiskeyjack_bot.tournament_state.settled_cost`.
+:func:`whiskeyjack_bot.tournament_state.settled_cost`. M1-367 raises the reasoning effort to
+``high`` (D59) and records the effort sent on every billed call's ``model_response``.
 
 Launch shipped this as a Sol-only client, with the model ID, the OpenRouter ``max_price`` and
 the budget reservation estimate each hard-coded from Sol's prices. M1-408 moves the tournament
@@ -41,6 +42,13 @@ from whiskeyjack_bot.tournament_state import (
 )
 from whiskeyjack_bot.redaction import redact_secrets
 
+# Reasoning effort sent on every priced call (M1-367, D59; was "medium" from Launch to M1-367).
+# Code, not an AppConfig field: a new config field retires the live activation, and what
+# attribution needs is the value actually sent, which each `model_response` now records.
+# Reasoning tokens bill as output and count against `max_tokens`; at medium, 298 live Astra
+# responses used at most 1,781 of MAX_OUTPUT_TOKENS (reasoning max 480), all `stop`.
+REASONING_EFFORT: Final = "high"
+
 # Output ceiling per call. `tournament.run_once` also requires model.max_output_tokens to
 # equal this, so the reservation below and the request cannot disagree about it.
 MAX_OUTPUT_TOKENS: Final = 6000
@@ -77,7 +85,7 @@ def build_request(messages: Any, model: PricedModel) -> dict[str, Any]:
     return {
         "model": model.openrouter_id,
         "messages": messages,
-        "reasoning": {"effort": "medium", "exclude": True},
+        "reasoning": {"effort": REASONING_EFFORT, "exclude": True},
         "max_tokens": MAX_OUTPUT_TOKENS,
         "provider": {
             "max_price": {
@@ -246,9 +254,12 @@ class PricedClient:
                     redact_secrets(
                         canonical(
                             {
-                                "schema_version": "1.0.0",
+                                # 1.1.0 (M1-367): adds `reasoning_effort`, read off the
+                                # request this call actually posted, not the constant.
+                                "schema_version": "1.1.0",
                                 "id": data.get("id"),
                                 "model": data.get("model"),
+                                "reasoning_effort": request["reasoning"]["effort"],
                                 "usage": usage,
                                 "finish_reason": data["choices"][0].get("finish_reason"),
                                 "content": text,
