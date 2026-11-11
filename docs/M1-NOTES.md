@@ -17440,14 +17440,17 @@ medium, over 298 Astra `model_response` events: completion tokens p50 1,199, p90
 1,622, max 1,781; reasoning tokens mean 109, max 480; every `finish_reason` was `stop`. Even 5x
 the reasoning keeps the worst observed call near 3,700 of 6,000. Raising the cap would also
 raise every reservation estimate, which bounds output at `MAX_OUTPUT_TOKENS` (Astra: $0.30 of
-output per call at 6,000) and is what the series ceiling checks against. Reservation estimates
-are unchanged by this item.
+output per call at 6,000) and is what the series ceiling checks against. This item leaves the
+estimator's formula and output term unchanged; its input term falls by the two bytes `"high"`
+saves over `"medium"` (see round 1's B1 above).
 
 ### Deferred (do not read the absence as an omission)
 - Recording effort in the forecast record or artifact `model_settings`: the meta review's
   "record effort per forecast" groundwork item.
 - The controlled medium vs high comparison on frozen packets: the replay harness's first
   experiment (migration 021), per the owner's 2026-11-10 ordering. D59's revisit trigger names it.
+
+Round 2 (on `34cbb9f`): APPROVE, B1 closed. Round 1 (on `34de6d0`): CHANGES REQUESTED, B1 only.
 
 ### Standing risk — not verifiable offline
 - **A `finish_reason: length` reply.** `PricedClient` does not read `finish_reason`; it stores
