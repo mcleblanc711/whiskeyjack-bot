@@ -17370,3 +17370,80 @@ any repeat named; and each of the three refusal sites reverted to generic text. 
 imported from `tests.unit`, so it now stands alone and is judged by exit 1. Its first strategy was
 also vacuous for four mutants, because refused replies were rare, which is why it now aims at them.
 
+
+## M1-367 — reasoning effort high, and the effort recorded on every billed call
+
+Owner decision 2026-11-10 (D59), after the 2026-11-08 meta review. `forecast/priced.py` sent
+`"reasoning": {"effort": "medium"}` on every priced call from Launch onward, and **nothing
+recorded it**: not the forecast record, not the raw-output artifact's `model_settings` (an
+eight-field set the reader checks by set equality), not the tournament journal, whose
+reservations store only an estimate and a provider. A forecast made at one effort was
+indistinguishable from one made at another except by date. The change is one named constant,
+`REASONING_EFFORT = "high"`, used in `build_request`, plus `reasoning_effort` on each
+`model_response` journal event, read off the request that call actually posted. That event's
+`schema_version` goes from 1.0.0 to 1.1.0.
+
+### Decision — record the effort on `model_response`, not in `model_settings`, and why
+`model_response` is written once per billed call, append-only, in the same transaction scope
+as the settlement, and every reader of it (`priced._replayed_cost`,
+`tournament_state._correction`) uses `.get`, so one more key changes nothing they read — a
+pre-M1-367 1.0.0 event with no effort still settles on replay
+(`test_a_pre_m1_367_response_without_the_field_still_settles_on_replay`). The artifact's
+`model_settings` is the better long-term home, but its reader refuses any key set other than
+the eight (`test_the_reader_refuses_extra_settings_fields`), so adding a ninth is an artifact
+schema bump with a reader for both versions. That is the meta review's "record effort per
+forecast" groundwork item, deliberately not folded into this one.
+
+### Decision — the journaled value is read off the posted request, and why
+`request["reasoning"]["effort"]`, not `REASONING_EFFORT`. The record is a claim about what was
+*sent*; reading the constant would stay correct only while `build_request` uses it.
+`test_the_effort_posted_is_high_and_is_what_the_journal_records` reads the effort out of the
+JSON body the mock transport received and out of the journal, and compares both to the literal
+`"high"`. Mutation check, `__pycache__` cleared before each, five mutants, five killed: the
+constant back to `"medium"`; the request literal `"medium"` with the journal following the
+request; the journal hard-coding `"medium"`; the journal field dropped; the schema version not
+bumped. The Launch-literal property also fails on the constant reverting.
+
+### Deviation — the request digest moves, on purpose, for one field
+The request's digest keys every `model_started`/`model_completed` cache scope.
+M1-408 kept Sol's bytes identical to Launch's so that a call journaled before it was still found
+after it. This item moves the digest deliberately, and only through `reasoning.effort`;
+`test_a_sol_request_is_launchs_literal_with_only_the_effort_raised` pins that nothing else
+changed. The consequence is that a call journaled at medium is **not found** under the new
+digest. For a completed call that means a re-purchase instead of a replay. For a call with an
+unknown outcome (`model_started`, no `model_completed`) it means a purchase where the old code
+refused with "no repeat purchase". **So M1-367 merges and deploys only in a window with no open
+question**, when no question can be mid-flight.
+
+### Rejected — an `AppConfig` field for the effort, and why not
+Any new `AppConfig` field retires the live activation and stops the worker until it is
+re-enabled. What attribution needs is the value actually sent, per call, which the journal now
+holds. The effort stays code, like `MAX_OUTPUT_TOKENS`.
+
+### Rejected — raising `MAX_OUTPUT_TOKENS` with the effort, and why not
+Reasoning tokens count against `max_tokens` on OpenRouter. Measured on the live journal at
+medium, over 298 Astra `model_response` events: completion tokens p50 1,199, p90 1,467, p99
+1,622, max 1,781; reasoning tokens mean 109, max 480; every `finish_reason` was `stop`. Even 5x
+the reasoning keeps the worst observed call near 3,700 of 6,000. Raising the cap would also
+raise every reservation estimate, which bounds output at `MAX_OUTPUT_TOKENS` (Astra: $0.30 of
+output per call at 6,000) and is what the series ceiling checks against. Reservation estimates
+are unchanged by this item.
+
+### Deferred (do not read the absence as an omission)
+- Recording effort in the forecast record or artifact `model_settings`: the meta review's
+  "record effort per forecast" groundwork item.
+- The controlled medium vs high comparison on frozen packets: the replay harness's first
+  experiment (migration 021), per the owner's 2026-11-10 ordering. D59's revisit trigger names it.
+
+### Standing risk — not verifiable offline
+- **A `finish_reason: length` reply.** `PricedClient` does not read `finish_reason`; it stores
+  it on `model_response` and returns `content`. A truncated reply therefore reaches the parser as
+  malformed output, which takes the existing bounded repair (`allowed_tries` 2 = one call plus
+  one repair, `forecast/generate.py`) and, failing that, the `schema_invalid` generation-failure
+  path. That is a costed failure, not a silent one, and it is visible in the journal. Watch the
+  first live high-effort `model_response` events' `finish_reason` and
+  `completion_tokens_details.reasoning_tokens`.
+- **Cost.** Reasoning tokens bill as output ($50/M on Astra). At medium the live mean was $0.179
+  per forecast over 1.3 calls. The high-effort figure is not knowable offline; record it from the
+  first live forecasts.
+- **Deploy time.** Recorded at merge, with the first live forecast at high.
