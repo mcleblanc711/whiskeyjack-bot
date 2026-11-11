@@ -36,7 +36,8 @@ files, applied in M0-R7. Suite is 68 tests after the remediation below.**
    only as the tournament id and in docs.
 2. **The full spec (`CODEX_HANDOFF.md`) is missing from the repo.** The Codex
    verification brief lives at `CODEX_PROMPT.md` (restored to its original name after a
-   transient rename). The "full spec" both briefs cite — ledger DDL, submission seam
+   transient rename; moved to `docs/archive/` on 2026-11-11 once Codex was retired as an
+   owner). The "full spec" both briefs cite — ledger DDL, submission seam
    detail, § "Prohibited implementation claims" — **does not exist in the repo.** M0
    was fully specifiable without it; M1's ledger (M1-601) and M2's submission seam are
    where it becomes load-bearing. **If you have that document, add it as
