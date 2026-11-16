@@ -53,7 +53,7 @@ REFUSALS = frozenset(
         "zero_point does not define a usable log scale",
         "open_lower_bound must be a boolean",
         "open_upper_bound must be a boolean",
-        "inbound_outcome_count must be a positive integer or absent",
+        "inbound_outcome_count must be a positive integer within the scorer's limit, or absent",
         "cdf must be a list of numbers",
         "cdf must have one more point than the question has inbound outcomes",
         "a cdf point must be a probability in [0, 1]",

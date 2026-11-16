@@ -278,6 +278,11 @@ ABOVE_UPPER_BOUND: Final = "above_upper_bound"
 
 # `Question.get_inbound_outcome_count`: a numeric question with no count of its own has 200.
 _DEFAULT_INBOUND_OUTCOME_COUNT: Final = 200
+# The count is untrusted payload and sizes the CDF this module walks, so it is bounded. The
+# largest a live question has carried is 200; the bucket rule's epsilon is exact only while
+# one ulp of the count stays far below it (true to about 100,000), so this leaves that
+# margin and the rule needs no separate branch for a resolution exactly on the upper bound.
+_MAX_INBOUND_OUTCOME_COUNT: Final = 10_000
 # `unscaled_location_to_bucket_index`'s own constant: a resolution exactly on a bucket edge
 # belongs to the lower bucket.
 _BUCKET_EPSILON: Final = 1e-10
@@ -343,8 +348,10 @@ def _require_flag(value: object, field: str) -> bool:
 def _inbound_outcome_count(value: object) -> int:
     if value is None:
         return _DEFAULT_INBOUND_OUTCOME_COUNT
-    if type(value) is not int or value < 1:
-        raise ScoreError("inbound_outcome_count must be a positive integer or absent")
+    if type(value) is not int or not 1 <= value <= _MAX_INBOUND_OUTCOME_COUNT:
+        raise ScoreError(
+            "inbound_outcome_count must be a positive integer within the scorer's limit, or absent"
+        )
     return value
 
 
@@ -367,11 +374,13 @@ def _require_cdf(cdf: object, inbound: int) -> tuple[float, ...]:
 def _unscaled_location(value: float, low: float, high: float, zero_point: float | None) -> float:
     """Where a value inside ``[low, high]`` sits in the range: 0 at ``low``, 1 at ``high``.
 
-    The platform's ``scaled_location_to_unscaled_location``. The caller has already placed a
-    value outside the range, so the result is clamped to ``[0, 1]``: on a linear scale the
-    clamp never acts (``(value - low) / (high - low)`` is exact enough to stay inside), and on
-    a log scale it absorbs the last-bit rounding that would otherwise put a value at the upper
-    bound a hair above it.
+    The platform's ``scaled_location_to_unscaled_location``, clamped to ``[0, 1]``. The
+    caller has already placed a value outside the range, so anything outside ``[0, 1]`` here
+    is rounding. On a linear scale the clamp never acts. On a log scale it does: the two
+    logarithms cancel, and when the zero point is very far from the range their difference is
+    a few units in the last place divided by a divisor of the same size (range ``[3, 6]``
+    with a zero point near 6e15 puts 5.98 at 1.2). Without the clamp such a value would index
+    a bucket the CDF does not have.
     """
     width = high - low
     if zero_point is None:
@@ -380,19 +389,21 @@ def _unscaled_location(value: float, low: float, high: float, zero_point: float 
         ratio = (high - zero_point) / (low - zero_point)
         argument = (value - low) * (ratio - 1.0) + width
         if not argument > 0.0:
-            # Reached only by rounding, at the far end of a scale whose zero point sits just
-            # past the upper bound: mathematically the argument is `width * ratio` there.
+            # Reached only by rounding, at the upper end of a scale whose ratio underflows:
+            # mathematically the argument there is `width * ratio`, which is positive.
             return 1.0
         location = (math.log(argument) - math.log(width)) / math.log(ratio)
     return min(max(location, 0.0), 1.0)
 
 
 def _bucket_index(location: float, inbound: int) -> int:
-    """The platform's ``unscaled_location_to_bucket_index`` for a location in ``[0, 1]``."""
-    if location == 1.0:
-        return inbound
-    # Clamped to 1: exactly the lower bound is inbound, never "below". The epsilon is the
-    # platform's own: a resolution exactly on a bucket edge belongs to the lower bucket.
+    """The platform's ``unscaled_location_to_bucket_index`` for a location in ``[0, 1]``.
+
+    ``max(int(u * N + 1 - 1e-10), 1)``. The epsilon is the platform's: a resolution exactly on
+    a bucket edge belongs to the lower bucket, which also puts exactly the upper bound
+    (``u == 1``) in the last inbound bucket for every count this module accepts. The clamp
+    to 1 keeps exactly the lower bound inbound, never "below".
+    """
     return max(int(location * inbound + 1.0 - _BUCKET_EPSILON), 1)
 
 

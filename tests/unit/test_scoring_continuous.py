@@ -439,6 +439,8 @@ def test_a_malformed_resolution_is_refused(resolution: object) -> None:
         {"zero_point": 0.0},  # on the lower bound
         {"zero_point": 100.0},  # on the upper bound
         {"zero_point": 50.0},  # inside the range
+        {"zero_point": -1e300},  # so far away that the scale's ratio is exactly 1
+        {"range_max": 1.7e308, "zero_point": -1.7e308},  # the ratio overflows
         {"open_lower_bound": 1},
         {"open_upper_bound": None},
         {"open_lower_bound": "true"},
@@ -448,11 +450,69 @@ def test_a_malformed_resolution_is_refused(resolution: object) -> None:
         {"inbound_outcome_count": True},
         {"inbound_outcome_count": "4"},
         {"inbound_outcome_count": 5},  # does not match the CDF
+        {"inbound_outcome_count": 10_001},  # beyond what this module scores
     ],
 )
 def test_malformed_scaling_is_refused(overrides: dict[str, object]) -> None:
     with pytest.raises(ScoreError):
         _score("30", **overrides)
+
+
+def test_a_count_of_zero_is_refused_even_with_a_cdf_that_would_match_it() -> None:
+    """The length check alone would pass a one-point CDF for a count of zero."""
+    with pytest.raises(ScoreError, match="inbound_outcome_count"):
+        _score("30", [0.5], inbound_outcome_count=0)
+
+
+def test_a_log_scale_whose_ratio_underflows_to_zero_is_refused() -> None:
+    """A zero point one denormal above the upper bound of a range 1e308 wide.
+
+    The resolution is inside the range, so the refusal has to come from the scale: an
+    outside value would be placed by comparison before the scale was ever used.
+    """
+    with pytest.raises(ScoreError, match="usable log scale"):
+        _score("-5", range_min=-1e308, range_max=0.0, zero_point=5e-324)
+
+
+@pytest.mark.parametrize(
+    ("low", "high", "zero_point", "value"),
+    [
+        # Each unscales, by the platform's formula in floats, to the location in the comment.
+        (3.0, 6.0, 6000000000000006.0, "5.979337069251501"),  # 1.2
+        (0.0, 1.3, 6500000000000001.0, "1.048452576641855"),  # 1.5
+        (12.5, 18.0, 2.7500000000000016e16, "17.058704579668582"),  # 2.0
+        (12.5, 112.5, 5.000000000000001e17, "71.05618635076388"),  # 4.0
+    ],
+)
+def test_a_value_inside_the_range_is_inbound_however_the_log_scale_rounds(
+    low: float, high: float, zero_point: float, value: str
+) -> None:
+    """A zero point about 1e15 range-widths away: the two logarithms cancel to a few ulps.
+
+    Unclamped, these locations index a bucket the CDF does not have (an ``IndexError``, not
+    a ``ScoreError``) or the "above" bucket for a value that is inside the range.
+    """
+    assert low < float(value) < high
+    score = _score(value, range_min=low, range_max=high, zero_point=zero_point)
+    assert 1 <= score.bucket <= 4
+
+
+def test_exactly_the_upper_bound_is_the_last_inbound_bucket_at_the_largest_count() -> None:
+    """The platform has a branch for a location of exactly 1; the epsilon covers it here.
+
+    ``int(N + 1 - 1e-10)`` is ``N`` while one ulp of ``N + 1`` is below the epsilon, which
+    holds with room to spare at the largest count this module accepts.
+    """
+    inbound = 10_000
+    cdf = [(index + 1) / (inbound + 2) for index in range(inbound + 1)]
+    for resolution, bucket in (
+        ("100", inbound),
+        ("0", 1),
+        ("50", inbound // 2),
+        ("100.5", inbound + 1),
+    ):
+        score = _score(resolution, cdf, inbound_outcome_count=inbound)
+        assert score.bucket == bucket
 
 
 def test_no_refusal_reprints_a_value() -> None:
