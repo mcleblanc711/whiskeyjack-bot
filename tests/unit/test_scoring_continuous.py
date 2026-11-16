@@ -10,6 +10,8 @@ Metaculus computed -- a witness outside this program.
 
 from __future__ import annotations
 
+import array
+import collections
 import json
 import math
 from pathlib import Path
@@ -289,6 +291,10 @@ def test_the_baseline_scale_by_hand() -> None:
     )
     # Out of range: baseline 0.05, and this forecast put exactly 0.05 there.
     assert platform_baseline_points(_score(BELOW_LOWER_BOUND)) == pytest.approx(0.0, abs=1e-12)
+    # The same above the upper bound: only a property reached that bucket's baseline before.
+    assert platform_baseline_points(_score(ABOVE_UPPER_BOUND)) == pytest.approx(0.0, abs=1e-12)
+    assert _score(ABOVE_UPPER_BOUND).out_of_range and _score(BELOW_LOWER_BOUND).out_of_range
+    assert not _score("30").out_of_range
     # One open bound: baseline (1 - 0.05) / 4 = 0.2375; the mass in bucket 1 is 0.2.
     one_open = _score("10", [0.0, 0.2, 0.45, 0.7, 0.95], open_lower_bound=False)
     assert platform_baseline_points(one_open) == pytest.approx(
@@ -458,10 +464,66 @@ def test_malformed_scaling_is_refused(overrides: dict[str, object]) -> None:
         _score("30", **overrides)
 
 
+class _ListSubclass(list[float]):
+    """A list in every way but its exact type."""
+
+
+@pytest.mark.parametrize(
+    "container",
+    [
+        _ListSubclass(CDF),
+        dict.fromkeys(CDF),
+        collections.deque(CDF),
+        array.array("d", CDF),
+        frozenset(CDF),
+        range(5),
+    ],
+)
+def test_a_container_of_the_right_length_that_is_not_a_list_or_tuple_is_refused(
+    container: object,
+) -> None:
+    """Five items each, so the length rule passes and only the type rule can refuse.
+
+    A mutation run found the gap: every other malformed container in this file also had the
+    wrong length, so a type rule loosened to "anything with a length" survived.
+    """
+    assert len(container) == len(CDF)  # type: ignore[arg-type]
+    with pytest.raises(ScoreError, match="cdf must be a list of numbers"):
+        _score("30", container)
+    # The two exact types are both accepted and agree.
+    assert _score("30", tuple(CDF)) == _score("30", list(CDF))
+
+
+def test_a_count_beyond_the_limit_is_refused_even_with_a_cdf_that_would_match_it() -> None:
+    """Found by the same run: with a five-point CDF the length rule refused first."""
+    inbound = 10_001
+    cdf = [(index + 1) / (inbound + 2) for index in range(inbound + 1)]
+    with pytest.raises(ScoreError, match="inbound_outcome_count"):
+        _score("30", cdf, inbound_outcome_count=inbound)
+
+
 def test_a_count_of_zero_is_refused_even_with_a_cdf_that_would_match_it() -> None:
     """The length check alone would pass a one-point CDF for a count of zero."""
     with pytest.raises(ScoreError, match="inbound_outcome_count"):
         _score("30", [0.5], inbound_outcome_count=0)
+
+
+def test_the_upper_bound_of_a_log_scale_whose_ratio_vanishes_against_one() -> None:
+    """Zero point 1e-20 above the upper bound of ``[-1, 0]``: the ratio is 1e-20, not zero.
+
+    ``ratio - 1.0`` is then exactly ``-1.0``, so at the upper bound the platform's argument
+    ``(value - low) * (ratio - 1) + width`` is ``-1 + 1``: zero, whose logarithm does not
+    exist (``math.log`` raises ``ValueError``; numpy gives ``-inf``). Mathematically it is
+    ``width * ratio`` and the location is 1: the last inbound bucket.
+    """
+    scale = {"range_min": -1.0, "range_max": 0.0, "zero_point": 1e-20}
+    assert _score("0", **scale).bucket == 4
+    assert _score("-0.0", **scale).bucket == 4
+    # ln(0.5) / ln(1e-20) is about 0.015 of the range: the first inbound bucket.
+    assert _score("-0.5", **scale).bucket == 1
+    assert _score("-1", **scale).bucket == 1
+    assert _score("-1.5", **scale).bucket == 0
+    assert _score("0.5", **scale).bucket == 5
 
 
 def test_a_log_scale_whose_ratio_underflows_to_zero_is_refused() -> None:
