@@ -52,8 +52,10 @@ from whiskeyjack_bot.scoring import (
     binary_log_v1,
     multiclass_brier_v1,
     multiclass_log_v1,
+    peer_points_per_nat,
     recompute,
     score_binary,
+    score_continuous,
     score_multiple_choice,
 )
 
@@ -366,24 +368,79 @@ MESSAGE_PROBES: tuple[Callable[[], object], ...] = (
     lambda: recompute("local_log_binary/1", f"{SENTINEL}-metric", CANARY, "yes"),  # metric mismatch
 )
 
+# M4-809's sites, in source order: 17 more raise statements and 19 more messages. One
+# message interpolates a field name across four fields from three statements (a wrong type,
+# a non-finite value, an integer too large for a float), and one across two fields, so those
+# get a probe per field. Every probe input carries a canary the same way: the sentinel for
+# text, and `123456789` in the digits of every number, which the test below looks for as
+# well as the probability canaries' reprs.
+_CONTINUOUS_CDF = [0.05, 0.25, 0.5, 0.75, 0.95]
+_TOO_LARGE_FOR_A_FLOAT = int("123456789" * 40)
+
+
+def _continuous_probe(
+    cdf: object = _CONTINUOUS_CDF, resolution: object = "30", **overrides: object
+) -> object:
+    scaling: dict[str, object] = {
+        "range_min": 0.0,
+        "range_max": 100.0,
+        "zero_point": None,
+        "open_lower_bound": True,
+        "open_upper_bound": True,
+        "inbound_outcome_count": 4,
+    }
+    return score_continuous(cdf, resolution, **{**scaling, **overrides})
+
+
+CONTINUOUS_MESSAGE_PROBES: tuple[Callable[[], object], ...] = (
+    lambda: _continuous_probe([*_CONTINUOUS_CDF[:4], _TOO_LARGE_FOR_A_FLOAT]),  # a cdf point ...
+    lambda: _continuous_probe(range_min=NOT_A_FLOAT),  # range_min must be a finite number
+    lambda: _continuous_probe(range_max=float("inf")),  # range_max must be a finite number
+    lambda: _continuous_probe(zero_point=NOT_A_FLOAT),  # zero_point must be a finite number
+    lambda: _continuous_probe(open_lower_bound=NOT_A_FLOAT),  # open_lower_bound ... boolean
+    lambda: _continuous_probe(open_upper_bound=SENTINEL),  # open_upper_bound ... boolean
+    lambda: _continuous_probe(inbound_outcome_count=CANARY),  # ... positive integer or absent
+    lambda: _continuous_probe(NOT_A_FLOAT),  # cdf must be a list of numbers
+    lambda: _continuous_probe([CANARY, 0.5]),  # one more point than ... inbound outcomes
+    lambda: _continuous_probe([*_CONTINUOUS_CDF[:4], 1.123456789]),  # ... probability in [0, 1]
+    lambda: _continuous_probe([0.05, 0.25, 0.5, CANARY, 0.95]),  # cdf must not decrease
+    lambda: _continuous_probe(resolution=[SENTINEL]),  # resolution must be a non-empty string
+    lambda: _continuous_probe(resolution=f"{SENTINEL}-thirty"),  # ... decimal or a bound marker
+    lambda: _continuous_probe(resolution="1.123456789e999"),  # resolution must be finite
+    lambda: _continuous_probe(range_min=100.123456789, range_max=0.123456789),  # ... exceed
+    lambda: _continuous_probe(zero_point=50.123456789),  # zero_point must lie outside ...
+    lambda: _continuous_probe(zero_point=-1.123456789e300),  # ... no usable log scale
+    lambda: _continuous_probe(  # the log score is undefined: the resolved bucket ...
+        [0.0, CANARY, 0.5, 0.75, 1.0], "below_lower_bound", open_lower_bound=False
+    ),
+    lambda: peer_points_per_nat(f"{SENTINEL}-type"),  # question_type has no peer scale ...
+)
+
 
 def test_no_canary_repr_collides_with_any_refusal_message() -> None:
     """No canary's repr, and no probe input, is a substring of *any* message the module emits.
 
     The counts are the tripwire: a new ``raise ScoreError`` fails this test until its probe
     is added here and the canaries are re-checked against its text, which is the step
-    M1-346 existed because nobody had to take. 14 raise sites, 15 distinct messages -- two
-    sites share the sequence-shape text, and two interpolate a field name.
+    M1-346 existed because nobody had to take. M4-802: 14 raise sites, 15 distinct messages --
+    two sites share the sequence-shape text, and two interpolate a field name. M4-809 adds 17
+    sites and 19 messages (see ``CONTINUOUS_MESSAGE_PROBES``): 31 and 34.
     """
     messages: set[str] = set()
     for probe in MESSAGE_PROBES:
         with pytest.raises(ScoreError) as excinfo:
             probe()
         messages.add(str(excinfo.value))
-    assert inspect.getsource(scoring).count("raise ScoreError") == 14
     assert len(messages) == 15
+    for probe in CONTINUOUS_MESSAGE_PROBES:
+        with pytest.raises(ScoreError) as excinfo:
+            probe()
+        messages.add(str(excinfo.value))
+    assert inspect.getsource(scoring).count("raise ScoreError") == 31
+    assert len(messages) == 34
     for message in messages:
         assert SENTINEL not in message
+        assert "123456789" not in message
         for probability in PROBABILITY_CANARIES:
             assert repr(probability) not in message
     # And the completeness argument behind the canary set, as an assertion rather than a
