@@ -589,6 +589,9 @@ def test_no_refusal_reprints_a_value() -> None:
         (CDF, "30", {"inbound_outcome_count": 123456789}),
         ([0.0, CANARY, 0.5, 0.75, 1.0], BELOW_LOWER_BOUND, {}),
         (CDF, "30", {"open_lower_bound": CANARY_TEXT}),
+        (CDF, "30", {"range_min": CANARY_TEXT}),  # the number rule, by a wrong type
+        (CDF, "30", {"zero_point": float("inf")}),  # and by a value that is not finite
+        ([0.05, 0.25, 0.5, 0.75, int("123456789" * 40)], "30", {}),  # and by overflow
     ]
     for cdf, resolution, overrides in attempts:
         with pytest.raises(ScoreError) as caught:
