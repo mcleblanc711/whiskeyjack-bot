@@ -17464,3 +17464,17 @@ Round 2 (on `34cbb9f`): APPROVE, B1 closed. Round 1 (on `34de6d0`): CHANGES REQU
   per forecast over 1.3 calls. The high-effort figure is not knowable offline; record it from the
   first live forecasts.
 - **Deploy time.** Recorded at merge, with the first live forecast at high.
+
+### Recorded after deploy (AC7), 2026-11-15
+Read from the live ledger read-only on 2026-11-16 02:27 UTC.
+
+- **Deployed** 2026-11-11 01:42:44 UTC (merge `989e674`), in a window with no open question.
+- **First live forecast at high:** 2026-11-16 00:05 UTC, the first question of project 33169.
+  No question opened between the deploy and then.
+- **Six forecasts, six billed calls** (no repair turn): every `model_response` carries
+  `reasoning_effort: high` and `finish_reason: stop`.
+- **Tokens:** completion 1,857 to 3,594 of the 6,000 cap; reasoning 887 to 2,070 (at medium:
+  mean 109, max 480). The headroom estimate above held: the worst call used 60% of the cap.
+- **Cost:** mean $0.238 per forecast (range $0.197 to $0.287), against $0.179 at medium over
+  1.3 calls. Six forecasts is a small sample; the wave-27 budget (D64) assumes $0.245.
+- No `length` reply so far, so D59's revisit trigger has not fired.
