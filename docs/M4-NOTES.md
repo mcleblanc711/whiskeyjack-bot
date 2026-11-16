@@ -1609,3 +1609,241 @@ candidate. It is already listed under Deferred above.
 `aaca885`: APPROVE, with B1 closed. The reviewer ran the extracted block under shims for seven
 outcomes, including a failing integrity command and a failing upgrade. No new candidates; Cup
 watchdog coverage stays Deferred.
+
+## M4-809 — A local log score for numeric and discrete forecasts
+
+Wave 27 (owner decisions 2026-11-15, D62). Every experiment arm this wave plans, the replay
+arms of M5-806 and the live arms of M1-614, is a forecast that was never posted, so Metaculus
+never scores it. `scoring.py` scored binary and multiple-choice forecasts locally (M4-802).
+Numeric and discrete forecasts are 105 of the 229 scored so far (46%) and had no local score,
+so half the questions could not enter a paired comparison.
+
+### Delivered
+
+- `scoring.score_continuous`: the natural log of the probability a stored CDF puts on the
+  resolved bucket, with the bucket and the open-bound count it was read with
+  (`ContinuousScore`). `scoring.continuous_log_v1` returns the number alone.
+- `scoring.platform_baseline_points`: that score on Metaculus's spot baseline scale, so it can
+  be checked against the platform's own number. Nothing stores it.
+- `scoring.peer_points_per_nat`: 100 for binary and multiple choice, 50 for numeric and
+  discrete (AC3).
+- `tests/fixtures/scoring/continuous_platform_scores.json`: 61 cases extracted read-only from
+  the live ledger, numbers only, by `scripts/regenerate_continuous_score_fixture.py`.
+- No migration, no `score_events` row, no `AppConfig` field, nothing the worker runs (AC4).
+
+### What was established by execution before designing
+
+Measured read-only on the live ledger (`mode=ro`), 2026-11-15.
+
+- **A candidate rule reproduces every platform score.** For all 105 numeric and discrete
+  records that hold a `platform_spot_baseline_score`, the posted CDF
+  (`question.my_forecasts.latest.forecast_values` in the stored resolution observation), the
+  stored `scaling` block and the stored resolution give Metaculus's number with a largest
+  absolute difference of 4.3e-14 points.
+- **Two records fix the edge rule.** A plain floor-plus-one bucket rule reproduces 103 of 105.
+  The two it misses resolve exactly on a bucket edge: q45747 (215.65 in [190, 235], where
+  `u * 200` computes to 114.00000000000003) and q45962 (70250 in [65000, 95000], exactly
+  35.0). The platform scores both from the lower bucket.
+- **The source says the same.** Metaculus's `main` at `7b47f09` (2026-11-15):
+  `utils/the_math/formulas.py` (last changed `b8e6cf4`), `scoring/score_math.py` (`8d7ac79`)
+  and `questions/models.py` (`7e4489e`). `unscaled_location_to_bucket_index` is
+  `max(int(u * N + 1 - 1e-10), 1)` with `u < 0` giving 0, `u > 1` giving `N + 1` and `u == 1`
+  giving `N`; `get_pmf` is `cdf[0]`, the differences, then `1 - cdf[-1]`; the continuous
+  baseline is `100 * ln(pmf[b] / baseline) / 2` with a baseline of 0.05 outside a bound and
+  `(1 - 0.05 * open_bounds) / (len(pmf) - 2)` inside. Ledger and source agree, so nothing was
+  adapted and there was nothing to stop and ask about.
+- **Our own record gives the platform's CDF.** `authorized_payload(record,
+  calibration=...)` rebuilt from each stored `forecast_records` row yields a
+  `continuous_cdf` bit-identical to the one the platform holds, on all 105. An experiment arm
+  can therefore be scored from its own record with no platform round trip.
+- **What the payload looks like.** `inbound_outcome_count` is present on all 105 (200 for
+  every numeric question; 6 to 161 for discrete). `range_min` and `range_max` arrive as JSON
+  integers on about half. A closed lower bound's `cdf[0]` is the JSON integer `0` on 33.
+  `zero_point` is null on all 105: no live question is log-scaled.
+
+### Decision — the score is the log of the bucket's mass, and the platform scales are helpers
+
+The stored quantity for binary and multiple choice is `ln p` (M4-802). The continuous score
+follows it: `ln` of the mass on the resolved bucket, with no baseline and no halving. The
+baseline scale needs the bucket count, whether the bucket is outside a bound and the number
+of open bounds, so `ContinuousScore` carries those and `platform_baseline_points` derives the
+platform's number from it. A caller that wants peer points multiplies a difference of two
+`log_mass` values by `peer_points_per_nat`.
+
+### Decision — the paired identity, stated (AC3)
+
+For two forecasts on one question, with every other forecaster fixed:
+
+    spot peer(A) - spot peer(B) = k * (ln mass_A - ln mass_B)
+
+with `k = 100` for binary and multiple choice and `k = 50` for numeric and discrete. The
+platform's peer score is `100 * (n / (n - 1)) * ln(p / gm)`, where `gm` is the geometric mean
+over all `n` forecasters including this one. Because `ln gm = (ln p + sum of the others) / n`,
+that expression is exactly `100 * (ln p - mean of the others' ln p)`: the `n / (n - 1)` factor
+removes this forecaster's own share of the mean. The others' term is the same for A and B and
+cancels. Numeric, date and discrete scores are then halved. The same difference appears on
+the baseline scale, because A and B share one baseline. `test_scoring_continuous.py` checks
+this against the platform formula written out in the test, not against this module.
+
+### Deviation — four places where the text differs from the platform's, on purpose
+
+All four coincide with the platform on a linear scale, which is every live question, and that
+is what the 105-of-105 reproduction shows. They differ only where the platform's float
+arithmetic has no meaningful answer.
+
+1. **The bound markers go straight to their buckets.** The platform maps
+   `below_lower_bound` to `range_min - 1.0` and `above_upper_bound` to `range_max + 1.0` and
+   unscales those; on a log scale with `range_min - zero_point < 1` the first is the logarithm
+   of a negative number.
+2. **A value outside the range is decided by comparison, before unscaling.** Found by the
+   property pass, before review: with range `[3.6e-229, 1]` and zero point `-1`, the value
+   `0.0` is below the range, but `(value - low) * (ratio - 1) + width` loses a difference of
+   3.6e-229 against a width of 1, the location computes to exactly 0, and the value was scored
+   in the first inbound bucket. The platform itself writes a value below `range_min` as the
+   marker (`scaled_location_to_string_location`), so the comparison is the rule.
+3. **A value inside the range is always inbound: the location is clamped to `[0, 1]`.** On a
+   log scale whose zero point is about 1e15 range-widths away, the two logarithms cancel to a
+   few units in the last place and are divided by a divisor of the same size. Range `[3, 6]`
+   with zero point `6000000000000006.0` puts `5.979337069251501` at 1.2; three more witnesses
+   give 1.5, 2.0 and 4.0. Unclamped, those index a bucket the CDF does not have (an
+   `IndexError`, not a `ScoreError`). On a linear scale the clamp never acts.
+4. **No separate branch for `u == 1`.** The platform returns `N` there explicitly.
+   `int(N + 1 - 1e-10)` is already `N` while one ulp of `N + 1` is far below the epsilon,
+   which holds to about 100,000; the count is bounded at 10,000 (next decision), so the
+   branch would be unreachable-in-effect and unkillable by any test.
+
+### Decision — the outcome count is bounded at 10,000
+
+`inbound_outcome_count` is untrusted payload and sizes the CDF the function walks. The
+largest a live question has carried is 200 (D57 admits 201 for one discrete shape). 10,000
+leaves a fifty-fold margin and keeps the epsilon rule exact.
+
+### Decision — the CDF must have exactly `inbound_outcome_count + 1` points
+
+The bucket rule multiplies by the question's inbound outcome count; the PMF is read by
+index. A CDF of any other length would be scored against buckets it does not have, so it is
+refused. An absent count means the platform's default of 200.
+
+### Decision — an integer is a number here, a bool is not
+
+M4-802's probabilities are exact `float`s because the forecast schema stores floats. This
+function reads Metaculus payload, where a closed bound's CDF end and a whole-number range are
+JSON integers. Exact `int` and exact `float` are accepted; `bool`, `str` and everything else
+refuse. An integer too large for a float refuses as `ScoreError`, never `OverflowError`.
+
+### Decision — a resolution string is matched, not handed to `float()`
+
+`float()` accepts `nan`, `inf`, `1_0`, surrounding whitespace and non-ASCII digits. A
+resolution is matched against an ASCII decimal pattern first, bounded in length, and must
+then be finite.
+
+### Rejected — and why not
+
+- **A new stored metric.** `score_events.metric` is closed by 017/018's trigger. Posted
+  numeric records already carry the platform's own scores, and the forecasts this score
+  exists for have no `score_events` row to hold one.
+- **Reading the ledger inside the scorer.** `scoring.py` is pure; the caller supplies the CDF
+  and the scaling.
+- **Clamping a zero-mass bucket.** Same reason as M4-802: a clamp makes the function total by
+  changing the score it reports. A posted CDF cannot have an empty inbound bucket (the
+  platform enforces a minimum step); a closed bound's outside bucket is empty by
+  construction, and an outcome there is refused.
+- **Returning the baseline-scale number as the score.** It bakes the platform's baseline and
+  halving into a stored-looking value; the log mass is what a paired comparison needs.
+- **Refusing an ill-conditioned log scale.** It needs a conditioning threshold the platform
+  does not define, and any number chosen here would refuse some question the platform
+  accepts. The clamp makes such a scale safe; see the standing risk for what it does not make
+  it.
+
+### Deferred (do not read the absence as an omission)
+
+- Local `score_events` rows for posted numeric and discrete records: a vocabulary migration
+  and its own row, if wanted.
+- Date questions. The platform treats them as continuous; this project does not forecast
+  them (`forecast.supported_question_types`).
+- The spot peer score itself. It needs the other forecasters' PMFs, which the ledger does not
+  hold; only differences between our own forecasts are computable, which is what AC3 states.
+
+### Standing risk — not verifiable offline
+
+- **The log-scale branch.** No live question has a `zero_point`, so that branch rests on the
+  source text and on hand-computed cases, not on a platform score.
+- **An ill-conditioned log scale scores without error, in a bucket rounding decides.** With
+  the zero point about 1e15 range-widths away, the computed location of a mid-range value is
+  quantized to a handful of values. The platform has the same arithmetic and no rule against
+  such a scale. None has been seen.
+- **The platform changing its rule.** The bucket epsilon and the baseline constants are
+  restated here from the commits named above. The fixture pins today's behaviour; a platform
+  change would show up as posted records whose platform score no longer matches.
+- **Spot, not coverage-weighted.** The fixture compares against `spot_baseline_score`. The
+  time-weighted `baseline_score` multiplies by coverage and is not reproduced.
+
+### Property tests
+
+`tests/property/test_scoring_continuous_properties.py`, fourteen tests over nine properties. Reach is
+recorded with `hypothesis.event` across the three scale kinds (linear, zero point below,
+zero point above) and the three bucket kinds.
+
+1. Nothing but `ScoreError` escapes arbitrary input, and every refusal's text is one of 19
+   sentences written out in the test, so no message can carry a value. A second property
+   puts junk in one argument at a time behind valid neighbours, so each guard is reached.
+2. On valid input the score is `ln` of the mass an independently derived PMF puts on the
+   returned bucket, and the only refusal is an empty resolved bucket.
+3. The resolved value lies inside its bucket, with the edges rebuilt through the platform's
+   *inverse* scaling (which this module does not contain); the two outside buckets are
+   exactly the two strict inequalities on every scale.
+4. An exact edge of a linear scale belongs to the lower bucket; edge 0 is bucket 1.
+5. A larger resolution never lands in an earlier bucket.
+6. One resolution per bucket recovers all the mass: the masses sum to one.
+7. More mass on the resolved bucket scores higher; mass moved between other buckets changes
+   nothing.
+8. The persisted JSON form replays to the same score, a tuple scores as a list, and an
+   integer 0 or 1 scores as the float does.
+9. `platform_baseline_points` equals the platform's formula restated in the test.
+
+M4-802's raise-site tripwire (`test_no_canary_repr_collides_with_any_refusal_message`)
+counted 14 `raise ScoreError` statements and failed on the fifteenth, as designed. It now
+holds a probe for each of the 17 new sites (31 sites, 34 distinct messages), every probe
+input carrying a canary.
+
+### Mutation testing
+
+53 mutants of `scoring.py`, each one exact text replacement, committed first, `__pycache__`
+cleared before every run. The unit file, the property file (fast profile, 25 draws) and
+M4-802's tripwire test ran together and kills were attributed per file. A replacement whose
+text did not occur exactly once would have been counted as skipped, apart from survivors;
+none was.
+
+- **First run, 51 mutants: 49 killed, 2 alive.** Both survivors were the same shape: another
+  guard refused first, so the guard under test was never the one deciding.
+  - *Any container with a length accepted as a CDF.* Every malformed container in the tests
+    also had the wrong length. Six containers of the right length that are not a list or a
+    tuple (a list subclass, a dict, a deque, an array, a frozenset, a range) now refuse.
+  - *Outcome count unbounded above.* The over-limit count was only offered with a five-point
+    CDF, which the length rule refuses. It is now offered with a CDF that matches it.
+- **Two mutants added** for a branch a proofread found untested: the log-scale guard for a
+  ratio too small to register against 1, where the platform's argument is exactly zero at the
+  upper bound. Mutated to return the lower end, and removed; both killed.
+- **One kill moved down a level.** A mutant that scored the above-bound bucket on the inbound
+  baseline was killed only by a property; the hand-computed baseline test now covers both
+  outside buckets. A mutant that echoed a number field's value was killed by the property and
+  the tripwire but by no unit test; the unit canary list now reaches the number rule.
+- **Final: 53 of 53 killed, 0 skipped.** Every mutant is killed by a unit test; 27 also by a
+  property at 25 draws; 10 also by the tripwire.
+
+The mutants cover: the edge epsilon (zeroed, sign flipped), the clamp to bucket 1, the two
+comparisons (loosened and removed), the location clamp, the log-scale formula (ratio
+inverted, `ln(width)` dropped, scale ignored), both bound markers, the three mass reads, the
+empty-bucket refusal, each CDF rule, each type gate, each scaling refusal, the count's two
+bounds and its default, the resolution pattern, length and finiteness, the baseline's
+constant, open-bound term, spread and halving, the peer factors, and two messages rewritten
+to echo their input.
+
+Running it cost one lesson worth keeping: a mutant that fails a property makes hypothesis
+shrink, so a run is about 10 seconds per mutant when tests pass and minutes when they do not.
+51 mutants did not fit a ten-minute slot, and an interrupted harness leaves the source file
+mutated; `git checkout -- <file>` and a `git status` check follow every run.
+
+### Review
+
+Round 1 pending at the time these notes were written.
