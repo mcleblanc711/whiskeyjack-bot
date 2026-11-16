@@ -1657,7 +1657,7 @@ Measured read-only on the live ledger (`mode=ro`), 2026-11-15.
   `continuous_cdf` bit-identical to the one the platform holds, on all 105. An experiment arm
   can therefore be scored from its own record with no platform round trip.
 - **What the payload looks like.** `inbound_outcome_count` is present on all 105 (200 for
-  every numeric question; 6 to 161 for discrete). `range_min` and `range_max` arrive as JSON
+  every numeric question; 3 to 161 for discrete). `range_min` and `range_max` arrive as JSON
   integers on about half. A closed lower bound's `cdf[0]` is the JSON integer `0` on 33.
   `zero_point` is null on all 105: no live question is log-scaled.
 
@@ -1708,9 +1708,10 @@ arithmetic has no meaningful answer.
    give 1.5, 2.0 and 4.0. Unclamped, those index a bucket the CDF does not have (an
    `IndexError`, not a `ScoreError`). On a linear scale the clamp never acts.
 4. **No separate branch for `u == 1`.** The platform returns `N` there explicitly.
-   `int(N + 1 - 1e-10)` is already `N` while one ulp of `N + 1` is far below the epsilon,
-   which holds to about 100,000; the count is bounded at 10,000 (next decision), so the
-   branch would be unreachable-in-effect and unkillable by any test.
+   `int(N + 1 - 1e-10)` is already `N` while half an ulp of `N + 1` is below the epsilon,
+   which holds to about one million (measured: still `N` at 1,000,000, `N + 1` at
+   4,000,000); the count is bounded at 10,000 (next decision), so the branch would change
+   no result and no test could kill it.
 
 ### Decision — the outcome count is bounded at 10,000
 

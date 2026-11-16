@@ -279,9 +279,10 @@ ABOVE_UPPER_BOUND: Final = "above_upper_bound"
 # `Question.get_inbound_outcome_count`: a numeric question with no count of its own has 200.
 _DEFAULT_INBOUND_OUTCOME_COUNT: Final = 200
 # The count is untrusted payload and sizes the CDF this module walks, so it is bounded. The
-# largest a live question has carried is 200; the bucket rule's epsilon is exact only while
-# one ulp of the count stays far below it (true to about 100,000), so this leaves that
-# margin and the rule needs no separate branch for a resolution exactly on the upper bound.
+# largest a live question has carried is 200. The bucket rule's epsilon stops registering
+# once half an ulp of the count reaches it, near one million; this bound is a hundredfold
+# inside that, so the rule needs no separate branch for a resolution exactly on the upper
+# bound.
 _MAX_INBOUND_OUTCOME_COUNT: Final = 10_000
 # `unscaled_location_to_bucket_index`'s own constant: a resolution exactly on a bucket edge
 # belongs to the lower bucket.
@@ -389,8 +390,9 @@ def _unscaled_location(value: float, low: float, high: float, zero_point: float 
         ratio = (high - zero_point) / (low - zero_point)
         argument = (value - low) * (ratio - 1.0) + width
         if not argument > 0.0:
-            # Reached only by rounding, at the upper end of a scale whose ratio underflows:
-            # mathematically the argument there is `width * ratio`, which is positive.
+            # Reached only by rounding, at the upper end of a scale whose ratio is too small
+            # to register against 1 (`ratio - 1.0` is exactly -1.0): mathematically the
+            # argument there is `width * ratio`, which is positive.
             return 1.0
         location = (math.log(argument) - math.log(width)) / math.log(ratio)
     return min(max(location, 0.0), 1.0)

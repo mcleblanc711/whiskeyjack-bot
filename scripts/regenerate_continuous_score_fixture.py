@@ -13,11 +13,13 @@ The test reads the JSON and calls the scorer; it does not import this module.
 **Read-only, and numbers only.** The ledger is opened with ``mode=ro``. A case holds no
 title and no text: a question id, its type, numbers, two flags and the resolution string.
 
-**Selection is deterministic**, in ``question_id`` order: every discrete record (their CDFs
-are short), and twelve numeric records -- the two whose resolution sits exactly on a bucket
-edge (q45747, q45962), every fourth closed-lower-bound record, and an even spread of the
-rest. Re-running against a ledger that has grown adds cases; it never changes one, because a
-posted forecast, its question's scaling and its score are fixed once the question resolves.
+**Selection is deterministic for a given ledger**, in ``question_id`` order: every discrete
+record (their CDFs are short), and about a dozen numeric records -- the two whose resolution
+sits exactly on a bucket edge (q45747, q45962), every fourth closed-lower-bound record, and
+an even spread of the rest. The spread is by position, so a ledger that has grown selects
+some different numeric records and ``--check`` then reports a difference. What never changes
+is a case's content: a posted forecast, its question's scaling and its score are fixed once
+the question resolves. Regenerating is a deliberate act, as with the CDF golden.
 
 Run it against a **copy or the live ledger read-only**; never against a ledger a test built.
 """
