@@ -1404,8 +1404,12 @@ def _forecast_standing(my_forecasts: object, now: datetime) -> bool | None:
     when we have (1,677) -- and an answered question's `latest.end_time` is null. So:
 
     - `latest` present and null: not answered.
-    - `latest` an object whose `end_time` is null, or in the future: answered.
+    - `latest` an object whose `end_time` is null: answered. Only this, per AC2.
     - `latest` an object whose `end_time` has passed: withdrawn, so not answered.
+    - `latest` an object whose `end_time` is still to come: None. AC2 admits "answered" only with
+      no end time, and a forecast scheduled to end is not one this program ever makes, so it is
+      not evidence either way (round 1, B3: this used to read as answered, a green on no
+      evidence).
     - anything else -- no `my_forecasts`, no `latest` KEY (an unauthenticated or differently
       shaped answer), a non-object, an `end_time` that is not a time: None.
 
@@ -1433,11 +1437,20 @@ def _forecast_standing(my_forecasts: object, now: datetime) -> bool | None:
         ends = _aware_stamp(end)
         if ends is None:
             return None
-    return ends > now
+    return False if ends <= now else None
 
 
-def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
-    """`(question, post, opened, closes, answered)` per open question, or a problem code. Pure.
+def _open_questions(
+    payload: object, now: datetime
+) -> tuple[tuple[tuple, ...], frozenset[int]] | str:
+    """`((question, post, opened, closes, answered), ...)` per open question, plus the ids of
+    listed questions that are NOT open and carry a standing forecast of ours; or a code. Pure.
+
+    The second part is round 1's B2. A group post stays open while its members close one by one,
+    so a closed member is still listed, with its own `my_forecasts`. Dropped unread, it looked to
+    the step like a watched question that had vanished after its close, and paged MISSED on a
+    question we had answered. Only positive evidence goes in: a closed member whose forecast this
+    cannot read is left to the step's ordinary freshness rule, and it does not blind the check.
 
     Total over any parsed JSON. Walks each post's `question`, or each sub-question of its
     `group_of_questions` (MiniBench publishes both shapes; the worker unpacks groups the same
@@ -1460,6 +1473,7 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
         return "page_full"
     found: list[tuple] = []
     listed: set[int] = set()
+    settled: set[int] = set()
     for post in results:
         if not isinstance(post, dict):
             return "posts_unreadable"
@@ -1485,6 +1499,10 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
                     return "posts_unreadable"
                 listed.add(question_id)
             if question["status"] != "open":
+                if question_id is not None and (
+                    _forecast_standing(question.get("my_forecasts"), now) is True
+                ):
+                    settled.add(question_id)
                 continue
             opened = _aware_stamp(question.get("open_time"))
             closes = _aware_stamp(question.get("scheduled_close_time"))
@@ -1494,7 +1512,7 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
             if answered is None:
                 return "forecasts_unreadable"
             found.append((question_id, post_id, opened, closes, answered))
-    return tuple(found)
+    return tuple(found), frozenset(settled)
 
 
 def _watched(raw: object) -> dict[int, tuple[int, datetime, datetime]]:
@@ -1560,6 +1578,7 @@ def _unanswered_step(
     observed: tuple[tuple, ...],
     excluded: frozenset[int],
     now: datetime,
+    settled: frozenset[int] = frozenset(),
 ) -> tuple[
     dict[int, tuple[int, datetime, datetime]],
     list[tuple],
@@ -1579,7 +1598,8 @@ def _unanswered_step(
       its close (an early close, or a withdrawal), and one whose last observation is too old to
       say it closed unanswered.
 
-    A question answered now leaves `watching` silently; that is the ordinary path.
+    A question answered now leaves `watching` silently; that is the ordinary path. So does one
+    in `settled`: listed but no longer open, with a standing forecast of ours (round 1, B2).
     """
     watching: dict[int, tuple[int, datetime, datetime]] = {}
     at_risk: list[tuple] = []
@@ -1597,7 +1617,7 @@ def _unanswered_step(
         if now - opened >= UNANSWERED_AFTER and question not in excluded:
             at_risk.append((question, post, opened, closes))
     for question, (post, closes, seen) in sorted(watched.items()):
-        if question in listed:
+        if question in listed or question in settled:
             continue
         if closes > now:
             notes.append(f"NOTE: q{question} left the open list before its close; not paged")
@@ -1638,10 +1658,11 @@ def _unanswered_observation(deadline: float, now: datetime) -> tuple | str:
         )
     except Exception:
         return "posts_unreadable"
-    observed = _open_questions(payload, now)
-    if isinstance(observed, str):
-        return observed
-    return (project, activation_id, excluded, observed)
+    parsed = _open_questions(payload, now)
+    if isinstance(parsed, str):
+        return parsed
+    observed, settled = parsed
+    return (project, activation_id, excluded, observed, settled)
 
 
 def _read_unanswered(now: datetime) -> tuple | str:
@@ -1757,7 +1778,7 @@ def _check_unanswered(
     if isinstance(reading, str):
         return _unanswered_blind(state, stored_check, reading, now)
     state["unanswered_check"] = {}
-    project, activation_id, excluded, observed = reading
+    project, activation_id, excluded, observed, settled = reading
 
     rebound = stored.get("project") != project or stored.get("activation_id") != activation_id
     watched = {} if rebound else _watched(stored.get("watching"))
@@ -1771,15 +1792,24 @@ def _check_unanswered(
     # Kept across a rebind: a miss is a fact about the project it happened in.
     pending = _missed_entries(stored.get("pending_missed"))
     missed_last = _aware_stamp(stored.get("missed_last_alert"))
+    # Round 1, B1: misses held while WORKER DOWN stood are owed at the first run after recovery,
+    # whatever the hourly batch says (AC4). True only, so a hand-edited value cannot owe a push.
+    held = stored.get("missed_held") is True
+    # Round 1, non-blocking: each miss is sent ONCE. A question still listed overdue on the next
+    # poll would otherwise be enqueued again after its delivery. Kept across a rebind, like
+    # `pending`, and pruned on the same 48 h.
+    sent = _missed_entries(stored.get("missed_sent"))
 
-    watching, at_risk, missed, notes = _unanswered_step(watched, observed, excluded, now)
+    watching, at_risk, missed, notes = _unanswered_step(watched, observed, excluded, now, settled)
     for note in notes:
         _say(note)
-    pending.update(missed)
-    for question, (_post, closes) in sorted(pending.items()):
-        if now - closes > UNANSWERED_RETENTION:
-            _say(f"NOTE: q{question} was missed and never delivered; dropped after 48 h")
-            del pending[question]
+    pending.update({question: entry for question, entry in missed.items() if question not in sent})
+    for record in (pending, sent):
+        for question, (_post, closes) in sorted(record.items()):
+            if now - closes > UNANSWERED_RETENTION:
+                if record is pending:
+                    _say(f"NOTE: q{question} was missed and never delivered; dropped after 48 h")
+                del record[question]
     at_risk_ids = {question for question, *_ in at_risk}
     paged &= at_risk_ids
     # Decided before any push: a miss delivered this run is still a fault this run reported.
@@ -1787,6 +1817,8 @@ def _check_unanswered(
 
     if tournament_down and (at_risk or pending):
         _say("HELD: question pages wait while WORKER DOWN stands")
+    if tournament_down and pending:
+        held = True
     if at_risk and not tournament_down:
         fresh = at_risk_ids - paged
         if fresh or last_alert is None or now - last_alert >= UNANSWERED_REALERT_AFTER:
@@ -1816,7 +1848,7 @@ def _check_unanswered(
                 paged = set(at_risk_ids)
                 last_alert = _now()
     if pending and not tournament_down:
-        if missed_last is None or now - missed_last >= MISSED_REALERT_AFTER:
+        if held or missed_last is None or now - missed_last >= MISSED_REALERT_AFTER:
             lines = [
                 f"- q{question}: closed {closes.strftime('%Y-%m-%d %H:%M')}Z  "
                 + QUESTION_URL.format(post=post)
@@ -1838,7 +1870,9 @@ def _check_unanswered(
                 tags="x",
                 timeout=UNANSWERED_PUSH_TIMEOUT_SECONDS,
             ):
+                sent.update(pending)
                 pending = {}
+                held = False
                 missed_last = _now()
 
     state["unanswered"] = {
@@ -1849,6 +1883,8 @@ def _check_unanswered(
         "last_alert": None if last_alert is None else last_alert.isoformat(),
         "pending_missed": _missed_form(pending),
         "missed_last_alert": None if missed_last is None else missed_last.isoformat(),
+        "missed_held": held and bool(pending),
+        "missed_sent": _missed_form(sent),
     }
     if at_risk:
         _say("UNANSWERED: " + ", ".join(f"q{question}" for question in sorted(at_risk_ids)))

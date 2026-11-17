@@ -3138,3 +3138,71 @@ def test_every_missed_question_check_code_has_a_sentence() -> None:
         "timed_out",
     }
     assert all(module.UNANSWERED_CHECK_PROBLEMS.values())
+
+
+# ── M1-366 round 1: the reviewer's reproductions, as regressions ─────────────────────
+
+
+def test_r1_recovery_flushes_a_held_miss_inside_the_hourly_window(watchdog: Harness) -> None:
+    """Round-1 B1 (AC4): the hourly MISSED batch must not delay the recovery flush."""
+    _open_for(watchdog, 181, closes_in=-1, question_id=46800, post_id=46600)
+    watchdog.run()
+    assert len(watchdog.titled(MISSED)) == 1  # 12:00, delivered
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    _later(watchdog, 5)
+    _open_for(watchdog, 176, closes_in=4)  # unanswered, closes at 12:09
+    watchdog.run()
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()  # 12:10: missed, held
+    assert len(watchdog.titled(MISSED)) == 1
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "active"
+    _later(watchdog, 5)
+    watchdog.run()  # 12:15: recovery
+    missed = watchdog.titled(MISSED)
+    assert len(missed) == 2 and "q46900" in missed[1]["body"]
+    assert watchdog.state()["unanswered"]["pending_missed"] == []
+
+
+def test_r1_a_group_member_closed_with_a_standing_forecast_is_not_missed(watchdog: Harness) -> None:
+    """Round-1 B2 (AC2): a closed member still listed in an open group carries its own answer."""
+    now = watchdog.instant[0]
+    opened = now - timedelta(minutes=176)
+    member = _question(46910, opened=opened, closes=now + timedelta(minutes=4))
+    sibling = _question(46911, opened=now - timedelta(minutes=30), closes=now + timedelta(hours=2))
+    group = {"id": 46705, "group_of_questions": {"questions": [member, sibling]}}
+    watchdog.open_posts[0] = _listing(group)
+    watchdog.run()
+    _later(watchdog, 5)
+    answered = dict(member, status="closed")
+    answered["my_forecasts"] = {"history": [], "latest": dict(STANDING), "score_data": {}}
+    group = {"id": 46705, "group_of_questions": {"questions": [answered, sibling]}}
+    watchdog.open_posts[0] = _listing(group)
+    watchdog.run()
+    assert watchdog.titled(MISSED) == []
+
+
+@pytest.mark.parametrize("form", ["epoch", "iso"])
+def test_r1_a_future_end_time_is_not_a_standing_forecast(watchdog: Harness, form: str) -> None:
+    """Round-1 B3 (AC2): answered only with NO end_time; a future one is not evidence."""
+    ends = watchdog.instant[0] + timedelta(minutes=10)
+    end_time: object = ends.timestamp() if form == "epoch" else ends.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _open_for(watchdog, 30, latest=dict(STANDING, end_time=end_time))
+    assert watchdog.run() == 1
+    assert watchdog.state()["unanswered_check"]["key"] == "unanswered_check_failed"
+
+
+def test_r1_a_miss_listed_overdue_on_two_polls_is_sent_once(watchdog: Harness) -> None:
+    """Round-1 non-blocking: a delivered miss is not re-enqueued by a later overdue listing."""
+    _open_for(watchdog, 181, closes_in=-1)
+    watchdog.run()
+    _later(watchdog, 5)
+    _open_for(watchdog, 186, closes_in=-6)
+    watchdog.run()
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()
+    watchdog.instant[0] = watchdog.instant[0] + timedelta(hours=2)
+    _beat(watchdog)
+    watchdog.run()
+    assert len(watchdog.titled(MISSED)) == 1

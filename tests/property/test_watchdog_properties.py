@@ -810,12 +810,15 @@ def test_the_open_question_parser_is_total_and_never_guesses_unanswered(
     payload: object, now: datetime
 ) -> None:
     """Never raises; a code from the closed vocabulary, or tuples of exactly checked values; and
-    a question is unanswered only where its own `latest` is present and says so."""
-    found = watchdog._open_questions(payload, now)
-    if isinstance(found, str):
-        assert found in watchdog.UNANSWERED_CHECK_PROBLEMS
+    a question is unanswered only where its own `latest` is present and says so, and answered
+    only where it is present with NO end time (AC2; round 1, B3). A settled id is a listed
+    question that is not open and carries exactly that standing forecast (round 1, B2)."""
+    parsed = watchdog._open_questions(payload, now)
+    if isinstance(parsed, str):
+        assert parsed in watchdog.UNANSWERED_CHECK_PROBLEMS
         return
-    assert isinstance(found, tuple)
+    found, settled = parsed
+    assert isinstance(found, tuple) and isinstance(settled, frozenset)
     assert len({entry[0] for entry in found}) == len(found), "a question id is listed once"
     by_id = {}
     for post in payload["results"]:  # type: ignore[index]
@@ -825,19 +828,27 @@ def test_the_open_question_parser_is_total_and_never_guesses_unanswered(
             else post.get("group_of_questions", {}).get("questions", [])
         )
         for question in questions:
-            by_id[question["id"]] = question
+            # Keyed by type too: `True == 1`, so a junk `true` id would overwrite question 1.
+            by_id[(type(question["id"]), question["id"])] = question
     for question_id, post_id, opened, closes, answered in found:
         assert type(question_id) is int and question_id > 0
         assert type(post_id) is int and post_id > 0
         assert opened.tzinfo is not None and closes.tzinfo is not None
         assert type(answered) is bool
-        source = by_id[question_id]
+        source = by_id[(int, question_id)]
         assert source["status"] == "open"
         latest = source["my_forecasts"]["latest"]
-        if not answered:
+        if answered:
+            assert isinstance(latest, dict) and latest["end_time"] is None
+        else:
             assert latest is None or (
                 isinstance(latest, dict) and latest.get("end_time") is not None
             )
+    assert not settled & {entry[0] for entry in found}
+    for question_id in settled:
+        source = by_id[(int, question_id)]
+        assert source["status"] != "open"
+        assert source["my_forecasts"]["latest"]["end_time"] is None
 
 
 @given(my_forecasts=FORECASTS, now=STAMPS)
@@ -850,7 +861,9 @@ def test_a_forecast_shape_without_a_latest_key_is_never_an_answer_either_way(
     elif my_forecasts["latest"] is None:
         assert verdict is False
     else:
-        assert verdict in (True, False, None)
+        latest = my_forecasts["latest"]
+        standing = isinstance(latest, dict) and "end_time" in latest and latest["end_time"] is None
+        assert (verdict is True) == standing, "answered exactly when end_time is null (AC2)"
 
 
 OBSERVED = st.lists(
