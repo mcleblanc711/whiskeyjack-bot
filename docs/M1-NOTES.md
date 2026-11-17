@@ -17762,3 +17762,10 @@ stated reason. Each fix was then mutation-checked, and all five mutants were kil
 Property-test detail: the parser property's source index is now keyed by `(type, id)`, because
 JSON `true == 1` let a junk `true` id overwrite question 1's entry in the test's own lookup
 table.
+
+### Round 2 — APPROVE on `f0dfe5a`
+
+B1, B2, B3 and the round-1 observation are all closed. The reviewer re-ran the five regression
+cases against `94e4692`, where they fail, and against `f0dfe5a`, where they pass. There are no
+new blocking findings and no new backlog candidates. The live endpoint shape and the owner's
+phone test remain deploy checks (AC11).
