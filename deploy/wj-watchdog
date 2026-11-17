@@ -1446,6 +1446,10 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
     string status is not an answer. A post with neither shape carries no question this check
     can read, and the API's other post kinds (notebooks, conditionals) are not MiniBench
     questions; it is skipped rather than blinding the check for every question beside it.
+
+    A question id listed twice is not an answer either: two entries can disagree about whether we
+    answered, and which one wins would then be iteration order. The worker refuses a duplicate id
+    for the same reason (M1-202). Found by the property suite at the gate's profile.
     """
     if not isinstance(payload, dict):
         return "posts_unreadable"
@@ -1478,6 +1482,8 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
             opened = _aware_stamp(question.get("open_time"))
             closes = _aware_stamp(question.get("scheduled_close_time"))
             if question_id is None or opened is None or closes is None:
+                return "posts_unreadable"
+            if any(entry[0] == question_id for entry in found):
                 return "posts_unreadable"
             answered = _forecast_standing(question.get("my_forecasts"), now)
             if answered is None:

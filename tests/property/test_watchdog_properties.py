@@ -816,6 +816,7 @@ def test_the_open_question_parser_is_total_and_never_guesses_unanswered(
         assert found in watchdog.UNANSWERED_CHECK_PROBLEMS
         return
     assert isinstance(found, tuple)
+    assert len({entry[0] for entry in found}) == len(found), "a question id is listed once"
     by_id = {}
     for post in payload["results"]:  # type: ignore[index]
         questions = (

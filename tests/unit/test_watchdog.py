@@ -2993,6 +2993,19 @@ def test_a_group_pages_only_its_unanswered_sub_question(watchdog: Harness) -> No
     _no_title_leak(watchdog)
 
 
+def test_a_question_listed_twice_is_blind_whichever_entry_comes_first(watchdog: Harness) -> None:
+    """Found by the property suite: two entries for one id can disagree about our answer."""
+    now = watchdog.instant[0]
+    opened, closes = now - timedelta(minutes=60), now + timedelta(hours=2)
+    unanswered = _single(46700, _question(46900, opened=opened, closes=closes))
+    answered = _single(46701, _question(46900, opened=opened, closes=closes, latest=STANDING))
+    for order in ((unanswered, answered), (answered, unanswered)):
+        watchdog.open_posts[0] = _listing(*order)
+        assert watchdog.run() == 1
+        assert watchdog.titled(UNANSWERED) == []
+        assert watchdog.state()["unanswered_check"]["key"] == "unanswered_check_failed"
+
+
 def test_a_full_page_is_blind_because_it_may_be_truncated(watchdog: Harness) -> None:
     now = watchdog.instant[0]
     watchdog.open_posts[0] = _listing(

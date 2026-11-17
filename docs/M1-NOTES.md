@@ -17584,6 +17584,14 @@ having left. At most 12 have ever been open at once, so a full page is an anomal
 touches only `unanswered_check`, so it neither clears a watched question nor re-keys a throttle
 (M1-343/M1-347).
 
+### Decision — a question id listed twice is a blind read
+
+Found by the property suite at the gate's `dev` profile, not by the `fast` one. Two entries for
+one question id can disagree about whether we answered, and the step then reads them in list
+order, so whether it pages would be an accident of ordering. The parser now returns
+`posts_unreadable` for any repeated id. That is the worker's own rule: `normalize_questions`
+refuses a duplicate id (M1-202). The unit test runs both orders.
+
 ### Decision — MISSED needs a fresh last observation
 
 A question gone from the list after its close counts as missed only if this check last saw it
