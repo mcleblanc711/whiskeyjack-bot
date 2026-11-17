@@ -27,7 +27,7 @@ Review round 1 found two defects this file could not reach. The bound flags were
 independently of the CDF's endpoints, so no property could say what a closed bound means;
 and every scale was within 1e6 of zero, so no product could overflow. ``valid_inputs`` now
 builds the CDF from the flags and property 9 draws them apart on purpose. Scales come in
-five sizes: the original one, a zero point up to 1e15 range-widths away, the size of a real
+five sizes: the original one, a zero point 1e9 to 1e15 range-widths away, the size of a real
 question, anywhere a float reaches, and the corner where the platform's own product
 overflows. And the check that found nothing was in value space with a slack of a millionth
 of the range, which on a wide log scale is wider than most buckets; the exact-location
@@ -146,16 +146,25 @@ def _moderate_scale(draw: st.DrawFn, kind: str) -> tuple[float, float, float | N
 
 
 def _far_scale(draw: st.DrawFn, kind: str) -> tuple[float, float, float | None]:
-    """Within 1e6 of zero, with the zero point up to 1e15 range-widths away.
+    """Within 1e6 of zero, with the zero point 1e9 to 1e15 range-widths away.
 
     A log scale this far from its zero point is the linear scale to one part in the distance.
-    The platform's expression loses a digit of location for every decade of that distance.
+    The platform's expression loses a digit of location for every decade of that distance,
+    and a scorer that keeps it picks a wrong bucket for 3 values in a thousand at 1e12
+    range-widths, 3 in a hundred at 1e13 and 3 in ten at 1e14 (measured, uniform values).
+
+    The decade is drawn as an integer, so the far end is reached as often as the near end.
+    `st.floats` favours small values, and with a float decade from 0 to 15 this file's
+    exact-location property failed against such a scorer in 1 of 10 seeded runs.
     """
     low = draw(st.floats(min_value=-1e6, max_value=1e6))
     width = draw(st.floats(min_value=1e-3, max_value=1e6))
     if kind == "linear":
         return low, low + width, None
-    gap = width * 10.0 ** draw(st.floats(min_value=0.0, max_value=15.0))
+    decade = draw(st.integers(min_value=9, max_value=14)) + draw(
+        st.floats(min_value=0.0, max_value=1.0)
+    )
+    gap = width * 10.0**decade
     return low, low + width, low - gap if kind == "zero_below" else low + width + gap
 
 
@@ -510,9 +519,17 @@ def test_the_resolved_value_lies_inside_the_bucket_it_was_assigned(
 _EDGE_TOLERANCE = Decimal("1e-9")
 
 
+# "far" three times: it is the one size where a wrong scorer is right for most values (see
+# `_far_scale`), so it needs the draws. Measured against a scorer that keeps the platform's
+# expression behind an overflow fallback, over ten seeds at 200 draws: 7 failures with one
+# share in five, 9 with three in seven. The unit file's far-zero-point cases are the
+# deterministic check; this is the one that looks where nobody chose to.
+_LOG_SIZES = ("far", "far", "far", "moderate", *_SIZES)
+
+
 @given(
     data=st.data(),
-    scaling=scalings(kinds=("zero_below", "zero_above")),
+    scaling=scalings(kinds=("zero_below", "zero_above"), sizes=_LOG_SIZES),
     inbound=INBOUND,
 )
 def test_a_log_scale_bucket_holds_the_exact_location_of_its_value(

@@ -1629,6 +1629,9 @@ so half the questions could not enter a paired comparison.
   discrete (AC3).
 - `tests/fixtures/scoring/continuous_platform_scores.json`: 61 cases extracted read-only from
   the live ledger, numbers only, by `scripts/regenerate_continuous_score_fixture.py`.
+- `scripts/measure_log_scale_location.py`: prints the log-scale location's distance from exact
+  arithmetic by regime, and its bucket agreement with the platform's expression in floats.
+  Seeded, reads and writes nothing, about four minutes. Added in review round 1.
 - No migration, no `score_events` row, no `AppConfig` field, nothing the worker runs (AC4).
 
 ### What was established by execution before designing
@@ -1660,6 +1663,11 @@ Measured read-only on the live ledger (`mode=ro`), 2026-11-15.
   every numeric question; 3 to 161 for discrete). `range_min` and `range_max` arrive as JSON
   integers on about half. A closed lower bound's `cdf[0]` is the JSON integer `0` on 33.
   `zero_point` is null on all 105: no live question is log-scaled.
+- **A closed bound's end of the CDF is exact on every live record** (measured read-only on
+  2026-11-16, for review round 1). 33 of the 105 have a closed lower bound and `cdf[0]` is `0`
+  on all 33; 6 have a closed upper bound and `cdf[-1]` is `1` on all 6. The 72 open lower
+  bounds all hold `cdf[0] > 0` and the 99 open upper bounds all hold `cdf[-1] < 1`. The fixture
+  carries 28 of the closed lower bounds and all 6 closed upper ones, and a test asserts them.
 
 ### Decision — the score is the log of the bucket's mass, and the platform scales are helpers
 
@@ -1688,8 +1696,8 @@ this against the platform formula written out in the test, not against this modu
 ### Deviation — four places where the text differs from the platform's, on purpose
 
 All four coincide with the platform on a linear scale, which is every live question, and that
-is what the 105-of-105 reproduction shows. They differ only where the platform's float
-arithmetic has no meaningful answer.
+is what the 105-of-105 reproduction shows. They differ only on a log scale, in the cases
+named, where the platform's float arithmetic has no meaningful answer.
 
 1. **The bound markers go straight to their buckets.** The platform maps
    `below_lower_bound` to `range_min - 1.0` and `above_upper_bound` to `range_max + 1.0` and
@@ -1701,17 +1709,51 @@ arithmetic has no meaningful answer.
    3.6e-229 against a width of 1, the location computes to exactly 0, and the value was scored
    in the first inbound bucket. The platform itself writes a value below `range_min` as the
    marker (`scaled_location_to_string_location`), so the comparison is the rule.
-3. **A value inside the range is always inbound: the location is clamped to `[0, 1]`.** On a
-   log scale whose zero point is about 1e15 range-widths away, the two logarithms cancel to a
-   few units in the last place and are divided by a divisor of the same size. Range `[3, 6]`
-   with zero point `6000000000000006.0` puts `5.979337069251501` at 1.2; three more witnesses
-   give 1.5, 2.0 and 4.0. Unclamped, those index a bucket the CDF does not have (an
-   `IndexError`, not a `ScoreError`). On a linear scale the clamp never acts.
+3. **A log scale's location is computed in a different form, from the bound nearest the zero
+   point.** Rewritten in review round 1; it replaces a clamp. The platform computes
+   `(ln((x - min) * (ratio - 1) + (max - min)) - ln(max - min)) / ln(ratio)` with
+   `ratio = (max - zero) / (min - zero)`. This module computes
+   `ln(1 + (offset / width) * (R - 1)) / ln(R)`, both logarithms as `log1p`, where `offset` is
+   the distance from the bound nearest the zero point and `R > 1` is the far bound's distance
+   from the zero point over the near bound's; with the zero point above the range the result
+   is reflected (`1 - ...`). In exact arithmetic the two are the same number. In floats the
+   platform's fails in three ways. Each has a unit witness that executes the platform's
+   expression, restated in the test file, and asserts the failure:
+   - **Its product overflows** (review round 1, B2). Range `[1, 1e200]`, zero point 0, value
+     1e150: the product is 1e350 and the location is infinite. The true location is 0.75.
+   - **Its sum cancels when the zero point is above the range** (found while fixing B2). The
+     platform measures from `min`, which is then the far bound. Zero point 1e-200 above
+     `[-1, 0]`, value -1e-60: `value - min` is exactly 1.0 and the sum is exactly 0. The true
+     location is 0.3. Round 1's code turned that zero into the last bucket, through a guard
+     written for the upper bound alone.
+   - **Its two logarithms cancel when the zero point is far from the range.** Round 1 listed
+     this as a standing risk at "about 1e15 range-widths". Measured, it starts far sooner:
+     the error is 1.6e-11 of the range at 1e3 range-widths, 1.7e-8 at 1e6, 1.6e-5 at 1e9, 1.7%
+     at 1e12, and more than the whole range from 1e14. Round 1 clamped the result to `[0, 1]`,
+     which kept the bucket inside the CDF and said nothing about whether it was the right
+     bucket. The same clamp is what turned B2's infinity into a score.
+
+   The form used here is within 4e-16 of the exact location in every one of those regimes and
+   inside `[0, 1]` on every draw: `scripts/measure_log_scale_location.py`, 180,000 scales
+   against 60-digit arithmetic. So there is no clamp, no guard and no second branch.
+
+   What it costs is agreement with the platform's own rounding at one kind of point. On scales
+   the size of a real question (width 1e-3 to 1e6, ratio up to 1e9, 200 buckets), the bucket
+   is the one the platform's expression gives in floats for every interior value measured:
+   600,000 of 600,000, both orientations. For a value exactly on a bucket edge it is the same
+   with the zero point below the range (299,999 of 300,000), and with the zero point above the
+   range it differs in 0 of 100,000 at ratios up to 1e3, 675 of 100,000 up to 1e6 and 5,009 of
+   100,000 up to 1e9. Those are the points where the platform's own location is up to 5.6e-9 of
+   the range from exact, against an edge epsilon worth 5e-13 of the range, so which side of
+   the edge its floats land on is decided by its rounding and not by its rule. See the
+   standing risk.
 4. **No separate branch for `u == 1`.** The platform returns `N` there explicitly.
    `int(N + 1 - 1e-10)` is already `N` while half an ulp of `N + 1` is below the epsilon,
    which holds to about one million (measured: still `N` at 1,000,000, `N + 1` at
    4,000,000); the count is bounded at 10,000 (next decision), so the branch would change
    no result and no test could kill it.
+   The same epsilon and the clamp to bucket 1 also place a location one ulp outside `[0, 1]`,
+   which item 3's form can produce: an ulp past 1 times the largest count is 2e-12.
 
 ### Decision — the outcome count is bounded at 10,000
 
@@ -1724,6 +1766,34 @@ leaves a fifty-fold margin and keeps the epsilon rule exact.
 The bucket rule multiplies by the question's inbound outcome count; the PMF is read by
 index. A CDF of any other length would be scored against buckets it does not have, so it is
 refused. An absent count means the platform's default of 200.
+
+### Decision — a closed bound pins its end of the CDF (review round 1, B1)
+
+A closed lower bound means no outcome exists below it, so `cdf[0]` must be 0; a closed upper
+bound means `cdf[-1]` must be 1. Round 1 read the two flags for the baseline and never
+compared them with the CDF, so a CDF with 5% of its mass outside a closed bound scored as if
+the bound were open. Each end is now refused with its own sentence, the lower bound first,
+after the CDF's shape rules and before the resolution is looked at.
+
+- **Exact, no tolerance.** `forecast/cdf.py` builds the endpoints with `!=`, and all 39 closed
+  bounds on the 105 live records hold exactly 0 or 1 (above). The JSON integers `0` and `1`,
+  which are what the platform stores, and `-0.0` compare equal and pass.
+- **One way only.** An open bound with no mass outside it is not refused. It is still a
+  distribution over this question's outcomes, and an outcome outside that bound is refused as
+  probability 0 by the rule that was already there. Whether the platform accepts such a CDF
+  at posting was not looked into: the scorer is not a posting validator, and does not check
+  the minimum step either.
+
+### Decision — a log scale is usable when the ratio it is evaluated with is finite and above 1
+
+Changed in review round 1, with deviation 3. Round 1 tested the platform's `deriv_ratio`
+(finite, positive, not 1). With the zero point above the range that is the reciprocal of the
+ratio now used, so a scale whose `deriv_ratio` was 1e-310 passed, and its reciprocal does not
+fit a float. The rule is now stated on the ratio the location is computed with: the far
+bound's distance from the zero point over the near bound's must be finite and above 1. That
+refuses two things, with the one sentence round 1 already had: bounds whose distances from
+the zero point differ by a factor beyond 1.8e308, either way up, and a zero point so far away
+(about 1e16 range-widths) that the two distances are equal in floats.
 
 ### Decision — an integer is a number here, a bool is not
 
@@ -1753,8 +1823,17 @@ then be finite.
   halving into a stored-looking value; the log mass is what a paired comparison needs.
 - **Refusing an ill-conditioned log scale.** It needs a conditioning threshold the platform
   does not define, and any number chosen here would refuse some question the platform
-  accepts. The clamp makes such a scale safe; see the standing risk for what it does not make
-  it.
+  accepts. Deviation 3 removes the need: the form used has no ill-conditioned regime short of
+  a ratio that is exactly 1 in floats (a zero point about 1e16 range-widths away), and that
+  was already refused, because the logarithm that divides is then zero.
+- **The reviewer's minimal fix for B2: keep the platform's expression and change form only
+  when it overflows.** Built first (`5a88000`), then replaced (`a765849`). It repairs the
+  overflow and leaves the platform's expression in use where its two logarithms cancel, which
+  needs the clamp back, and the clamp is what hid B2. A mutant that puts that expression and
+  its upper clamp back is in the mutation run below.
+- **A tolerance on a closed bound's endpoint.** No live record needs one, our own builder is
+  exact, and a tolerance would be a second definition of "closed".
+- **Refusing an open bound that has no mass outside it.** See the endpoint decision.
 
 ### Deferred (do not read the absence as an omission)
 
@@ -1769,10 +1848,15 @@ then be finite.
 
 - **The log-scale branch.** No live question has a `zero_point`, so that branch rests on the
   source text and on hand-computed cases, not on a platform score.
-- **An ill-conditioned log scale scores without error, in a bucket rounding decides.** With
-  the zero point about 1e15 range-widths away, the computed location of a mid-range value is
-  quantized to a handful of values. The platform has the same arithmetic and no rule against
-  such a scale. None has been seen.
+- **On a log scale, an outcome exactly on a bucket edge may be scored one bucket from the
+  platform's.** Measured against the platform's expression restated in Python floats, never
+  against the platform: with the zero point above the range, 675 of 100,000 edge values at
+  ratios up to 1e6 and 5,009 of 100,000 up to 1e9 land in the neighbouring bucket (deviation
+  3). This module's bucket there is the one the exact location gives. The platform's is
+  whatever its floats round to, and whether its floats and Python's agree to the last bit at
+  such a point has not been checked. A paired comparison scores both arms in one bucket
+  either way. If a log-scaled question is ever forecast and resolves on an edge, compare the
+  platform's score before relying on the local one.
 - **The platform changing its rule.** The bucket epsilon and the baseline constants are
   restated here from the commits named above. The fixture pins today's behaviour; a platform
   change would show up as posted records whose platform score no longer matches.
@@ -1781,11 +1865,11 @@ then be finite.
 
 ### Property tests
 
-`tests/property/test_scoring_continuous_properties.py`, fourteen tests over nine properties. Reach is
-recorded with `hypothesis.event` across the three scale kinds (linear, zero point below,
-zero point above) and the three bucket kinds.
+`tests/property/test_scoring_continuous_properties.py`, sixteen tests. Reach is recorded with
+`hypothesis.event`: scale kind (linear, zero point below, zero point above) and size, bucket
+kind, closed bounds, whether the platform's own product overflowed, and refusals.
 
-1. Nothing but `ScoreError` escapes arbitrary input, and every refusal's text is one of 19
+1. Nothing but `ScoreError` escapes arbitrary input, and every refusal's text is one of 21
    sentences written out in the test, so no message can carry a value. A second property
    puts junk in one argument at a time behind valid neighbours, so each guard is reached.
 2. On valid input the score is `ln` of the mass an independently derived PMF puts on the
@@ -1793,19 +1877,48 @@ zero point above) and the three bucket kinds.
 3. The resolved value lies inside its bucket, with the edges rebuilt through the platform's
    *inverse* scaling (which this module does not contain); the two outside buckets are
    exactly the two strict inequalities on every scale.
-4. An exact edge of a linear scale belongs to the lower bucket; edge 0 is bucket 1.
-5. A larger resolution never lands in an earlier bucket.
-6. One resolution per bucket recovers all the mass: the masses sum to one.
-7. More mass on the resolved bucket scores higher; mass moved between other buckets changes
+4. On every log scale the bucket holds the value's exact location to a billionth of a
+   bucket. The location is the platform's formula in 60-digit decimal arithmetic over exact
+   rational distances. Values are drawn evenly over the locations, a hair either side of a
+   bucket edge (from a third of a bucket down to 1e-8 of one), uniformly, and on the bounds.
+   Added in review round 1.
+5. An exact edge of a linear scale belongs to the lower bucket; edge 0 is bucket 1.
+6. A larger resolution never lands in an earlier bucket.
+7. One resolution per bucket recovers all the mass: the masses sum to one.
+8. More mass on the resolved bucket scores higher; mass moved between other buckets changes
    nothing.
-8. The persisted JSON form replays to the same score, a tuple scores as a list, and an
+9. The persisted JSON form replays to the same score, a tuple scores as a list, and an
    integer 0 or 1 scores as the float does.
-9. `platform_baseline_points` equals the platform's formula restated in the test.
+10. `platform_baseline_points` equals the platform's formula restated in the test.
+11. A closed bound refuses exactly when the CDF puts mass outside it, with that bound's
+    sentence, the lower bound first. The flags are drawn independently of the CDF here and
+    nowhere else. Added in review round 1.
+
+**Why round 1's pass missed both blockers, and what changed.** Two causes in what the
+strategies could reach, and one in what a property could see.
+
+- The bound flags were drawn independently of the CDF's ends, so no property could say what
+  a closed bound means. `valid_inputs` now builds the CDF from the flags, and property 11
+  draws them apart on purpose.
+- Every scale was within 1e6 of zero with a ratio of at most about 1e9, so no product could
+  overflow.
+  Scales now come in five sizes: that one; the same ranges with the zero point 1e9 to 1e15
+  range-widths away; the size of a real question; any width from 1e-280 to 1e280 with a
+  ratio up to 1e300; and the corner where the platform's product overflows.
+- Property 3 checks in value space with a slack of a millionth of the range, which on a wide
+  log scale is wider than most buckets. Checked by execution: it would have refused B2's own
+  case had it drawn the scale (1e150 is far below the last bucket), but it accepts 1e100 in
+  bucket 150 of that scale, and it accepts the mirror defect's -1e-60 in the last bucket of
+  four. Property 4 is in location space.
+
+Run against round 1's scorer (`bbab3ca`'s `scoring.py`, in a copy of the tree) at the 25-draw
+profile, properties 4, 7 and 11 fail, and so do 14 unit cases in 7 tests.
 
 M4-802's raise-site tripwire (`test_no_canary_repr_collides_with_any_refusal_message`)
 counted 14 `raise ScoreError` statements and failed on the fifteenth, as designed. It now
-holds a probe for each of the 17 new sites (31 sites, 34 distinct messages), every probe
-input carrying a canary.
+holds a probe for each of M4-809's 19 sites (33 sites, 36 distinct messages), every probe
+input carrying a canary. The two endpoint sites were added in review round 1, and the test
+failed on the count until their probes were.
 
 ### Mutation testing
 
@@ -1845,6 +1958,64 @@ shrink, so a run is about 10 seconds per mutant when tests pass and minutes when
 51 mutants did not fit a ten-minute slot, and an interrupted harness leaves the source file
 mutated; `git checkout -- <file>` and a `git status` check follow every run.
 
+**Second run, for review round 1's fixes.** 73 mutants against `1ecd02a` (`scoring.py` has
+not changed since): 47 of the 53 above, 5 of them reworded for changed text, and 26 new. The
+6 dropped are for code that no longer exists: the location clamp (two), the platform's
+`ln(width)` term, the zero-ratio check and the vanishing-ratio guard (two). **73 of 73
+killed, 0 skipped, every one by a unit test**; 48 also by a property at 25 draws, 18 also by
+the tripwire. This run worked on `git archive` copies of the tree, one per worker, so an
+interrupted run cannot leave the worktree mutated.
+
+- **The endpoint rule, 11 new mutants:** each check removed, each given a tolerance of 1e-12,
+  each keyed on the other bound's flag, each applied to open bounds instead, the upper rule
+  reading the first point, and each message rewritten to echo the point.
+- **The log-scale location, 14 mutants, 13 of them new:** the width not divided out, `log`
+  for `log1p` in the numerator and in the denominator, the division by `ln(ratio)` dropped,
+  the ratio used for `ratio - 1`, the offset fraction inverted, each orientation measured
+  from the wrong bound or reflected wrongly, the scale ignored, and the platform's
+  expression put back two ways.
+- **The ratio and the flags, 4 mutants, 2 of them new:** each orientation's ratio inverted,
+  the side test flipped, and the open-bound count.
+
+One mutant deserves its own line, because it is the code this branch nearly shipped: the
+platform's expression behind an overflow fallback, which is `5a88000`'s. It picks a wrong
+bucket only when the zero point is far away, and even there it is right for most values.
+Measured with the mutant applied to a copy of the tree, 4,000 uniform values per distance: 0
+wrong at 1e10 range-widths, 1 at 1e11, 13 at 1e12, 131 at 1e13 and 1,160 at 1e14. The eight
+far-zero-point unit cases kill it every time. The exact-location property killed it in 1 of
+10 seeded runs at 200 draws as first written. Its far scales are now drawn from 1e9
+range-widths outward, with the decade drawn as an integer and three shares in seven, and it
+kills it in 9 of 10 at 200 draws and 5 of 10 at 25. That is the same lesson as the two
+blockers, met a third time: a property is only as good as the draws that reach the defect,
+and the reach has to be measured against a scorer that has the defect.
+
 ### Review
 
-Round 1 pending at the time these notes were written.
+**Round 1, on `bbab3ca`: CHANGES REQUESTED, two blocking findings.** Both were reproduced by
+execution on that commit before any change. No non-blocking observations were raised.
+
+- **B1: closed-bound CDF endpoints are not validated.** Reproduced: `[0.05, 0.25, 0.5, 0.75,
+  0.95]` with both bounds closed scored `below_lower_bound` in bucket 0 with `ln(0.05)` and
+  0.0 baseline points. Closed in `5a88000`: see the endpoint decision above.
+- **B2: overflow puts an interior log-scale resolution in the last bucket.** Reproduced: range
+  `[1, 1e200]`, zero point 0, value 1e150 scored bucket 200 with `log_mass` -4.6077, where
+  bucket 150 and -4.8962 are right. Closed in `5a88000` by the reviewer's minimal fix, which
+  `a765849` then replaced with deviation 3's single form, for the reason under Rejected.
+
+**Found while closing B2, not raised by the review.** Both are the same kind of defect as B2,
+an interior value scored in a bucket it is not in, and both are closed by deviation 3.
+
+- With the zero point above the range, the platform's sum cancels where B2's product
+  overflows. Zero point 1e-200 above `[-1, 0]` put -1e-100, which is at 0.5, in the last
+  bucket. This was live in `bbab3ca`.
+- With the zero point far from the range, the two logarithms cancel. Round 1 carried this as
+  a standing risk at "about 1e15 range-widths" and clamped the result. Measured, the location
+  is 1.7% of the range out by 1e12 range-widths. Eight unit cases now assert the exact bucket
+  where round 1 asserted only "inbound".
+
+**What goes beyond the review.** The reviewer asked for the normalized expression "when the
+existing intermediate overflows". `a765849` uses it everywhere and removes the clamp, which
+changes the arithmetic on every log scale, not only an overflowing one. Deviation 3 gives the
+measurement behind that and what it costs.
+
+Round 2 pending at the time these notes were written.
