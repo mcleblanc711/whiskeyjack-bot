@@ -17726,3 +17726,39 @@ verdict is not one an enable should clear.
   existing `unrecorded_post` page.
 - The phone's treatment of an urgent page (sound, bypassing do-not-disturb) is a device setting.
   AC11's one deliberate test push confirms it at deploy.
+
+### Round 1 — CHANGES REQUESTED on `94e4692`; three blockers and one observation, all fixed
+
+Each finding was reproduced by execution before any fix. The reviewer's scenario was written
+as a regression (`test_r1_*` in `tests/unit/test_watchdog.py`) and failed on `94e4692` for the
+stated reason. Each fix was then mutation-checked, and all five mutants were killed.
+
+- **B1 (AC4) — recovery did not always flush held misses.** The hourly MISSED batch applied on
+  recovery too. With a miss delivered at 12:00 and another held during a WORKER DOWN at 12:10,
+  recovery at 12:15 sent nothing. **Fix:** a held miss sets `missed_held`, which bypasses the
+  batch at the first run after recovery and clears on delivery. The hourly batch now applies only
+  to misses that were not held. **Regression:**
+  `test_r1_recovery_flushes_a_held_miss_inside_the_hourly_window`.
+- **B2 (AC2) — an answered, closed group member paged MISSED.** A group post stays open while its
+  members close, so a closed member is still listed with its own `my_forecasts`. The parser
+  dropped every non-open question unread, and the step then read a watched member as having
+  vanished after its close. **Fix:** `_open_questions` also returns `settled`, the listed,
+  non-open ids carrying a standing forecast, and the step drops those from the watch silently.
+  Only positive evidence counts. A closed member whose forecast cannot be read still falls to
+  the freshness rule and does not blind the check. **Regression:**
+  `test_r1_a_group_member_closed_with_a_standing_forecast_is_not_missed`.
+- **B3 (AC2) — a future `end_time` read as answered.** AC2 says "answered only when ...
+  `latest` is present with no `end_time`". This was my reading drifting from the criterion: I
+  had admitted a future end as standing. **Fix:** `_forecast_standing` is True only for
+  `end_time: null`; a future end time is blind (None), and a past one stays unanswered
+  (withdrawn). **Regression:** `test_r1_a_future_end_time_is_not_a_standing_forecast[epoch|iso]`.
+  The property now asserts "answered" exactly when `end_time` is null.
+- **Non-blocking — a miss listed overdue on two polls was sent twice.** It was classed
+  non-blocking because the ACs limit pushes per run, not per miss. It is fixed anyway, because
+  these notes and RUNBOOK W3 both claim that every miss is sent once. A delivered miss is
+  recorded in `missed_sent`, kept across a rebind and pruned at 48 h, and is not re-enqueued.
+  **Regression:** `test_r1_a_miss_listed_overdue_on_two_polls_is_sent_once`.
+
+Property-test detail: the parser property's source index is now keyed by `(type, id)`, because
+JSON `true == 1` let a junk `true` id overwrite question 1's entry in the test's own lookup
+table.

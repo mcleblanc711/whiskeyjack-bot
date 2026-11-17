@@ -1064,7 +1064,9 @@ open and minutes to close (D58: ids, links built from them, codes and times, nev
   left out of this page, because it already paged with its real reason.
 - `whiskeyjack: QUESTION MISSED` (`x`): a question closed with no forecast of ours. It is
   **lost**; nothing recovers it. Every miss is reported once, and a burst is batched to at most
-  one page an hour. A blocked question is **never** left out of this page.
+  one page an hour. Misses held during a `WORKER DOWN` are the exception: they go out at the first
+  run after recovery. A blocked question is **never** left out of this page. A group member that
+  closed with a forecast of ours standing on it is answered, not missed.
 
 Neither page is sent while `WORKER DOWN` stands, because that page already says every question
 is at risk. Misses are kept and go out as one page on the first run after recovery. Neither is
