@@ -18,6 +18,8 @@ ExecStart=/home/cleblanc/.local/bin/wj-watchdog
 # WORST_CASE_SECONDS in deploy/wj-watchdog is the arithmetic; a test compares the two.
 # 260 since M1-344: its persistence push took the worst case from 238s to 246s. Still under
 # the 300s interval.
-TimeoutStartSec=260
+# 285 since M1-366: the missed-question check's 15s read bound and two 8s pushes take the
+# worst case from 246s to 277s. Still under the 300s interval.
+TimeoutStartSec=285
 UMask=0077
 NoNewPrivileges=true

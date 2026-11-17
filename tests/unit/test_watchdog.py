@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -127,7 +128,12 @@ class Harness:
     # parsed payload, or an exception instance to raise in its place.
     project: list[object] = field(default_factory=lambda: [{"id": ACTIVE_PROJECT}])
     posts: list[object] = field(default_factory=lambda: [{"results": [{"status": "open"}]}])
+    # M1-366: the missed-question check's `with_cp=true` list of the activation's open posts.
+    # Its own route, defaulting to nothing open, because the rollover default above parses as a
+    # blind read under the stricter question parser.
+    open_posts: list[object] = field(default_factory=lambda: [{"results": []}])
     fetched: list[str] = field(default_factory=list)
+    push_timeouts: list[int | None] = field(default_factory=list)
     real_metaculus_get: Any = None
 
     def systemctl(self, *args: str, env: dict[str, str] | None = None) -> str:
@@ -159,11 +165,17 @@ class Harness:
         self, title: str, body: str, *, priority: str, tags: str, timeout: int | None = None
     ) -> bool:
         self.pushes.append({"title": title, "body": body, "priority": priority, "tags": tags})
+        self.push_timeouts.append(timeout)
         return self.delivers[0]
 
-    def metaculus(self, path: str, deadline: float) -> object:
+    def metaculus(self, path: str, deadline: float, **kwargs: Any) -> object:
         self.fetched.append(path)
-        answer = self.project[0] if path.startswith("/projects/") else self.posts[0]
+        if path.startswith("/projects/"):
+            answer = self.project[0]
+        elif "with_cp=true" in path:
+            answer = self.open_posts[0]
+        else:
+            answer = self.posts[0]
         if isinstance(answer, BaseException):
             raise answer
         return answer
@@ -199,7 +211,11 @@ def seed_activation(path: Path, project_id: object) -> None:
     connection = connect(path)
     try:
         tournament_state.append(
-            connection, "activation", "account", {"project_id": project_id, "account_id": 1}
+            connection,
+            "activation",
+            "account",
+            # M1-366 reads `activation_id` as well; a fresh one per row, like `enable`.
+            {"project_id": project_id, "account_id": 1, "activation_id": uuid4().hex},
         )
     finally:
         connection.close()
@@ -335,6 +351,10 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
         + module.ROLLOVER_FETCH_SECONDS
         + module.ROLLOVER_PUSH_TIMEOUT_SECONDS
         + module.PERSISTENCE_PUSH_TIMEOUT_SECONDS
+        # M1-366: the missed-question check's read bound, and its two pushes (UNANSWERED and
+        # MISSED can both be due in one good run; a blind run sends one).
+        + module.UNANSWERED_FETCH_SECONDS
+        + 2 * module.UNANSWERED_PUSH_TIMEOUT_SECONDS
     )
 
 
@@ -403,10 +423,13 @@ def test_every_outward_call_passes_the_timeout_the_budget_counts(
 
     assert module.main() == 1, "everything is inactive, so both subjects are down"
     assert seen["systemctl"] == module.SYSTEMCTL_TIMEOUT_SECONDS
-    # The heartbeat read, then the rollover check's activation read -- which is also bounded by
-    # its thread join, so it may pass less than the ledger timeout and never more.
+    # The heartbeat read, then the rollover check's activation read and the missed-question
+    # check's (M1-366) -- each also bounded by its thread join, so it may pass less than the
+    # ledger timeout and never more. The second check stops at the unreadable activation, so it
+    # never asks for its excluded scopes, and it pushes nothing: blind for under 20 minutes.
     assert ledger_timeouts[0] == module.LEDGER_TIMEOUT_SECONDS
-    assert len(ledger_timeouts) == 2 and 0 < ledger_timeouts[1] <= module.LEDGER_TIMEOUT_SECONDS
+    assert len(ledger_timeouts) == 3
+    assert all(0 < timeout <= module.LEDGER_TIMEOUT_SECONDS for timeout in ledger_timeouts[1:])
     # This ledger has no activation, so the rollover check could not run and says so.
     assert push_timeouts == {
         "whiskeyjack: WORKER DOWN": module.PUSH_TIMEOUT_SECONDS,
@@ -1556,9 +1579,13 @@ def test_the_slug_is_the_pinned_sdks_minibench_id() -> None:
 
 
 def test_a_matching_project_is_quiet_and_asks_metaculus_one_question(watchdog: Harness) -> None:
+    """One question for the rollover check; M1-366's missed-question check asks the second."""
     assert watchdog.run() == 0
     assert watchdog.pushes == []
-    assert watchdog.fetched == ["/projects/tournaments/minibench/"]
+    assert watchdog.fetched == [
+        "/projects/tournaments/minibench/",
+        f"/posts/?tournaments={ACTIVE_PROJECT}&statuses=open&with_cp=true&limit=100",
+    ]
     assert watchdog.state()["rollover"] == {}
     assert watchdog.state()["rollover_check"] == {}
 
@@ -2327,7 +2354,7 @@ module.STATE = __import__("pathlib").Path(os.environ["WJ_TEST_STATE"])
 module.LEDGER = __import__("pathlib").Path({str(ledger)!r})
 answers = json.loads(os.environ["WJ_TEST_UNITS"])
 module._systemctl = lambda *args, env=None: answers[json.dumps(list(args))]
-module._metaculus_get = lambda path, deadline: (
+module._metaculus_get = lambda path, deadline, **kwargs: (
     {{"id": {ACTIVE_PROJECT}}} if path.startswith("/projects/") else {{"results": []}}
 )
 module._push = lambda *a, **k: True
