@@ -176,6 +176,11 @@ were written.
 | ntfy push `whiskeyjack: RESOLUTIONS SCHEDULE STOPPED` | [W1](#w1--resolutions-schedule-stopped) |
 | ntfy push `whiskeyjack: resolutions schedule recovered` | [W1](#w1--resolutions-schedule-stopped) — the condition cleared; nothing to do |
 | ntfy push `whiskeyjack: WORKER DOWN` | [The watchdog itself](#the-watchdog-itself) |
+| ntfy push `whiskeyjack: QUESTION UNANSWERED` | [W3](#w3--question-unanswered-and-question-missed) — an open question has no forecast of ours 20 min after it opened |
+| ntfy push `whiskeyjack: QUESTION MISSED` | [W3](#w3--question-unanswered-and-question-missed) — a question closed with no forecast of ours; it is lost |
+| ntfy push `whiskeyjack: missed-question check failed` | [W3](#when-the-missed-question-check-itself-fails) — the detector is blind, the worker is not down |
+| ntfy push `whiskeyjack: question blocked (<reason>)` | [W3](#the-worker-side-pages) — the worker will not attempt it again under this activation |
+| ntfy push `whiskeyjack: QUESTION UNANSWERABLE (<reason>)` | [W3](#the-worker-side-pages) — an open question this worker will never answer |
 | ntfy push `whiskeyjack: watchdog state unwritable`, or a `STATE:` line in the watchdog's journal | [W2](#w2--watchdog-state-unwritable) — every check still runs |
 | `tournament status` shows `unrecorded_posts` above 0 | [L4](#l4--a-live-post-the-ledger-refused-to-record) |
 
@@ -1040,6 +1045,88 @@ repeat every run too.
 mode or free the space. The next run writes the file, removes the fallback and prints
 `STATE: ... is writable again`. Nothing needs restarting.
 
+### W3 — `QUESTION UNANSWERED` and `QUESTION MISSED`
+
+The watchdog's fourth subject (M1-366). It asks Metaculus for the bound project's open
+questions every five minutes, with `with_cp=true`, and reads, per question, whether a forecast
+of ours is standing (`my_forecasts.latest` present with no `end_time`). It is the one check here
+that looks at the **questions**, not the worker, so it also catches a question the worker never
+discovered: wrong project, retired activation, a discovery bug, the worker not running.
+
+**What you see.** One of two `urgent` pages, the same loudness as `WORKER DOWN`. Each names
+questions by id, with a `https://www.metaculus.com/questions/<post>/` link, minutes since
+open and minutes to close (D58: ids, links built from them, codes and times, never a title).
+
+- `whiskeyjack: QUESTION UNANSWERED` (`rotating_light`): an open question still has no forecast
+  of ours **20 minutes** after it opened. The worker's p90 is about six minutes. It re-pages
+  every **30 minutes** while any stays unanswered, and at once when a new one joins the list
+  (marked `(new)`). A question the worker already paged as blocked or unanswerable (below) is
+  left out of this page, because it already paged with its real reason.
+- `whiskeyjack: QUESTION MISSED` (`x`): a question closed with no forecast of ours. It is
+  **lost**; nothing recovers it. Every miss is reported once, and a burst is batched to at most
+  one page an hour. Misses held during a `WORKER DOWN` are the exception: they go out at the first
+  run after recovery. A blocked question is **never** left out of this page. A group member that
+  closed with a forecast of ours standing on it is answered, not missed.
+
+Neither page is sent while `WORKER DOWN` stands, because that page already says every question
+is at risk. Misses are kept and go out as one page on the first run after recovery. Neither is
+sent while `MINIBENCH ROLLED OVER` stands either: the check is skipped, with no GET, because
+every question of the new project is unanswered by construction. There is no "cleared" push:
+the pages stop.
+
+**What to do.** Inside the 180-minute window an unanswered question is still recoverable:
+
+1. `whiskeyjack-bot tournament status --config config/tournament.yaml` — is the activation live,
+   on the project the question is in, and is the worker polling?
+2. `journalctl --user -u whiskeyjack-tournament.service -n 60` — did the last poll discover the
+   question (`discovered`), skip it (`skipped`, `blocked`, `retry_wait`), stop at the
+   `max_questions` cap, or fail?
+3. If the worker is healthy and cannot answer it, forecast it by hand from the link. That is an
+   owner action outside this program, and the ledger will not record it.
+
+For a `QUESTION MISSED` the same two commands say why, which is what keeps the next one from
+being missed.
+
+A question that leaves the open list **before** its scheduled close (an early close, a withdrawal)
+is logged as a `NOTE:` line, not paged. So is one that closed while the check was not observing
+it, for example while the read was blind: the check cannot tell whether a forecast landed in the
+gap, so it does not claim a miss.
+
+#### When the missed-question check itself fails
+
+An ntfy push titled `whiskeyjack: missed-question check failed`, priority `default`, sent only
+after the check has been blind for 20 minutes without a break, then every six hours. It names
+one of:
+
+| line | what went wrong |
+|---|---|
+| the live activation's project or id could not be read from the ledger | no `activation` event, a ledger the watchdog cannot open read-only, or a `project_id`/`activation_id` it cannot use |
+| the blocked and unanswerable questions could not be read from the ledger | the read of `question_blocked`/`question_unanswerable` rows failed |
+| Metaculus did not answer with a usable list of the project's open questions | the GET failed (network, HTTP error, a 403 for a missing or refused token, a refused redirect) or answered something that is not a list of posts |
+| an open question did not say whether a forecast of ours is standing | a question with no `my_forecasts.latest` **key**, or a shape it cannot read; never read as "unanswered" |
+| Metaculus answered a full page of 100 open posts, so the list may be truncated | at most 12 questions have ever been open at once, so this is an anomaly, not a busy hour |
+| the check did not finish within 15 s | the reads, together, outran their wall-clock bound |
+
+Those six lines are the whole vocabulary. **The worker is not down.** A blind read never clears a
+question being watched, and never re-sends a page already standing. If it does not clear, check
+`METACULUS_TOKEN` in `.env` first: without it, Metaculus answers 403.
+
+#### The worker-side pages
+
+Two `urgent` pages come from the worker itself, for reasons only it knows. Each is sent **once
+per question**, at the moment it appends the ledger row that records the reason:
+
+- `whiskeyjack: question blocked (<reason>)`: the question will not be attempted again under this
+  activation: a deterministic verdict, or transient attempts exhausted. Re-running `tournament
+  enable` clears the verdict and costs one retry.
+- `whiskeyjack: QUESTION UNANSWERABLE (<reason>)`, a `question_unanswerable` row. The reasons:
+  - `unsupported_type`: a type deferred in v1, such as a date or conditional question (D21);
+  - `close_margin`: first reached inside the worker's five-minute close margin, with no
+    confirmed forecast in the ledger;
+  - `no_close_time`: no close time at all.
+
+  None of these will be answered unless someone forecasts it by hand.
+
 ### The watchdog itself
 
 `deploy/wj-watchdog` runs every five minutes from `deploy/systemd/whiskeyjack-watchdog.timer`
@@ -1049,18 +1136,23 @@ runs under the system interpreter rather than the venv, imports nothing from the
 the ledger read-only and touches no `AppConfig` field** — it cannot change `config_sha256` and
 so cannot retire a live activation ([C5](#c5--activation-retired)).
 
-It watches three subjects with **separate state, separate throttles and separate pushes**: the
-poll (`whiskeyjack: WORKER DOWN`, heartbeat staleness, 60-minute re-alert),
-the resolutions schedule (W1 above, no heartbeat rule, 24-hour re-alert) and the MiniBench
-series ([P3](#p3--minibench-rolled-over-to-a-new-project), hourly re-alert; its failed check
-re-alerts every six hours). None can mute another, and "worker recovered" is never sent while
-the schedule is still stopped.
+It watches four subjects with **separate state, separate throttles and separate pushes**:
+- the poll (`whiskeyjack: WORKER DOWN`, heartbeat staleness, 60-minute re-alert);
+- the resolutions schedule (W1 above, no heartbeat rule, 24-hour re-alert);
+- the MiniBench series ([P3](#p3--minibench-rolled-over-to-a-new-project), hourly re-alert;
+  its failed check re-alerts every six hours);
+- the open questions themselves (W3 above, 30-minute re-alert).
 
-The third is the only one that touches the network for its evidence: one read-only GET to
-Metaculus per run, and a second only when the projects differ, all under one 15-second
-wall-clock bound, authenticated with `METACULUS_TOKEN` from the unit's `.env`.
+None can mute another, and "worker recovered" is never sent while the schedule is still stopped.
+The fourth deliberately stands down while the first or third is paging, as W3 explains.
 
-A run makes eleven `systemctl` queries at most and prints three `OK:` lines. The resolutions half
+The last two are the only ones that touch the network for their evidence, both authenticated
+with `METACULUS_TOKEN` from the unit's `.env`. The rollover check makes one read-only GET per
+run, and a second only when the projects differ. The missed-question check makes one more: the
+bound project's open posts with `with_cp=true`, skipped on a rollover mismatch. Each check's
+reads run under their own 15-second wall-clock bound.
+
+A run makes eleven `systemctl` queries at most and prints four `OK:` lines. The resolutions half
 asks its two timestamp queries (`LastTriggerUSec`, `ActiveEnterTimestamp`) only while the timer
 is active and enabled, and asks them under `TZ=UTC LC_ALL=C`, because `systemctl show` renders
 timestamps in the client's local zone and `--timestamp=` does not change that.
@@ -1083,7 +1175,7 @@ journalctl --user -u whiskeyjack-watchdog.service -n 5 -o cat --no-pager
 systemctl --user enable --now whiskeyjack-watchdog.timer
 ```
 
-A healthy run prints three `OK:` lines, one per subject, and exits `0`. Any fault exits `1`; the
+A healthy run prints four `OK:` lines, one per subject, and exits `0`. Any fault exits `1`; the
 unit has no `OnFailure`, so that exit is visible in `systemctl --user status` and nowhere else.
 
 ### Where the lifecycle stops today
@@ -1485,17 +1577,21 @@ happened.
 **Filed as M1-317** — giving this shape a durable ledger identity. Until it ships, the
 terminal and the log are the record.
 
-### R5 — A deferred question leaves no trace
+### R5 — A deferred question
 
 **What you see.** A question in the snapshot does not appear as a forecast and produced no
-failure event.
+failure event. In the live worker, an `urgent` push `whiskeyjack: QUESTION UNANSWERABLE
+(unsupported_type)` arrived once for it ([W3](#the-worker-side-pages)).
 
-**Confirm.** Deferral events (`deferred_v1_type`, `unrecognized_type`) are **in-memory
-only**. There is no table, no migration and no persistence for them — they are reported on
-the run's output and nowhere else.
+**Confirm.** `run` reports deferrals (`deferred_v1_type`, `unrecognized_type`) on its output and
+nowhere else. Since M1-366 the **tournament worker** also appends one `question_unanswerable`
+row per deferred question (scope `<project>:<question id>`, `reason: unsupported_type`,
+`detail_code` the deferral reason), so a live deferral can be audited from the ledger. A deferral
+with no usable question id has no scope, so it gets no row. It still pages, at most once a day per
+project.
 
-**Recovery.** None needed; a question type outside v1 scope is deferred by design. But it
-means you cannot audit deferrals after the fact from the ledger, only from the run output.
+**Recovery.** None in this program: a type outside v1 scope is deferred by design (D21). Inside
+the question's window, the owner can forecast it by hand.
 
 ### R6 — Replay mismatch
 

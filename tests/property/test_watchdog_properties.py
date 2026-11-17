@@ -726,3 +726,208 @@ def test_what_is_saved_is_what_the_next_run_loads_whichever_file_took_it() -> No
 
     check()
     assert all(count > 0 for count in reached.values()), reached
+
+
+# ── M1-366: the missed-question check's pure functions ───────────────────────────────
+#
+# Drawn to reach every arm rather than hoping to. Each question's fields are a `one_of` whose
+# first branch is the well-formed value, so a post whose every field parses -- the only shape
+# that yields a tuple at all -- is common; and `my_forecasts` names each of its pivotal shapes
+# (latest null, latest standing, latest withdrawn, latest key absent) as its own branch, because
+# the property that matters most is that the last one is never read as "unanswered".
+
+STAMPS = st.datetimes(
+    min_value=datetime(2026, 1, 1), max_value=datetime(2027, 1, 1), timezones=st.just(timezone.utc)
+)
+STAMP_TEXT = STAMPS.map(lambda moment: moment.strftime("%Y-%m-%dT%H:%M:%SZ"))
+FORECASTS = st.one_of(
+    st.just({"history": [], "latest": None, "score_data": {}}),
+    st.just({"history": [], "latest": {"end_time": None, "start_time": 1.0}}),
+    STAMPS.map(lambda moment: {"latest": {"end_time": moment.timestamp()}}),
+    STAMP_TEXT.map(lambda text: {"latest": {"end_time": text}}),
+    st.just({"history": None}),
+    st.fixed_dictionaries({"latest": JSON_VALUES}),
+    JSON_VALUES,
+)
+QUESTIONS = st.fixed_dictionaries(
+    {
+        "id": st.one_of(st.integers(min_value=1, max_value=10**7), JSON_LEAVES),
+        "status": st.one_of(st.just("open"), STATUS_WORDS, JSON_LEAVES),
+        "open_time": st.one_of(STAMP_TEXT, JSON_LEAVES),
+        "scheduled_close_time": st.one_of(STAMP_TEXT, JSON_LEAVES),
+        "my_forecasts": FORECASTS,
+    },
+    optional={"title": st.text(max_size=20)},
+)
+CLEAN_QUESTIONS = st.fixed_dictionaries(
+    {
+        "id": st.integers(min_value=1, max_value=10**7),
+        "status": st.sampled_from(["open", "open", "closed", "upcoming"]),
+        "open_time": STAMP_TEXT,
+        "scheduled_close_time": STAMP_TEXT,
+        # The four readable shapes only: one unreadable question blinds the whole answer.
+        "my_forecasts": st.sampled_from(
+            [
+                {"latest": None},
+                {"latest": {"end_time": None}},
+                {"latest": {"end_time": 1.0}},
+                {"latest": {"end_time": "2099-01-01T00:00:00Z"}},
+            ]
+        ),
+    }
+)
+CLEAN_POSTS = st.fixed_dictionaries(
+    {"id": st.integers(min_value=1, max_value=10**7), "question": CLEAN_QUESTIONS}
+)
+QUESTION_POSTS = st.one_of(
+    CLEAN_POSTS,
+    st.fixed_dictionaries(
+        {
+            "id": st.integers(min_value=1, max_value=10**7),
+            "group_of_questions": st.fixed_dictionaries(
+                {"questions": st.lists(CLEAN_QUESTIONS, max_size=3)}
+            ),
+        }
+    ),
+    st.fixed_dictionaries(
+        {"id": st.one_of(st.integers(min_value=1), JSON_LEAVES), "question": QUESTIONS}
+    ),
+    JSON_VALUES,
+)
+OPEN_ANSWERS = st.one_of(
+    # Its own branch, for reachability: without it about 4% of draws (measured over 2,000)
+    # reach a tuple holding an unanswered question and 2% an answered one, so the assertion
+    # this test exists for would rest on a handful of examples per run.
+    st.fixed_dictionaries({"results": st.lists(CLEAN_POSTS, min_size=1, max_size=5)}),
+    st.fixed_dictionaries({"results": st.lists(QUESTION_POSTS, max_size=5)}),
+    st.fixed_dictionaries({"results": JSON_VALUES}),
+    JSON_VALUES,
+)
+
+
+@given(payload=OPEN_ANSWERS, now=STAMPS)
+def test_the_open_question_parser_is_total_and_never_guesses_unanswered(
+    payload: object, now: datetime
+) -> None:
+    """Never raises; a code from the closed vocabulary, or tuples of exactly checked values; and
+    a question is unanswered only where its own `latest` is present and says so, and answered
+    only where it is present with NO end time (AC2; round 1, B3). A settled id is a listed
+    question that is not open and carries exactly that standing forecast (round 1, B2)."""
+    parsed = watchdog._open_questions(payload, now)
+    if isinstance(parsed, str):
+        assert parsed in watchdog.UNANSWERED_CHECK_PROBLEMS
+        return
+    found, settled = parsed
+    assert isinstance(found, tuple) and isinstance(settled, frozenset)
+    assert len({entry[0] for entry in found}) == len(found), "a question id is listed once"
+    by_id = {}
+    for post in payload["results"]:  # type: ignore[index]
+        questions = (
+            [post["question"]]
+            if isinstance(post.get("question"), dict)
+            else post.get("group_of_questions", {}).get("questions", [])
+        )
+        for question in questions:
+            # Keyed by type too: `True == 1`, so a junk `true` id would overwrite question 1.
+            by_id[(type(question["id"]), question["id"])] = question
+    for question_id, post_id, opened, closes, answered in found:
+        assert type(question_id) is int and question_id > 0
+        assert type(post_id) is int and post_id > 0
+        assert opened.tzinfo is not None and closes.tzinfo is not None
+        assert type(answered) is bool
+        source = by_id[(int, question_id)]
+        assert source["status"] == "open"
+        latest = source["my_forecasts"]["latest"]
+        if answered:
+            assert isinstance(latest, dict) and latest["end_time"] is None
+        else:
+            assert latest is None or (
+                isinstance(latest, dict) and latest.get("end_time") is not None
+            )
+    assert not settled & {entry[0] for entry in found}
+    for question_id in settled:
+        source = by_id[(int, question_id)]
+        assert source["status"] != "open"
+        assert source["my_forecasts"]["latest"]["end_time"] is None
+
+
+@given(my_forecasts=FORECASTS, now=STAMPS)
+def test_a_forecast_shape_without_a_latest_key_is_never_an_answer_either_way(
+    my_forecasts: object, now: datetime
+) -> None:
+    verdict = watchdog._forecast_standing(my_forecasts, now)
+    if not isinstance(my_forecasts, dict) or "latest" not in my_forecasts:
+        assert verdict is None
+    elif my_forecasts["latest"] is None:
+        assert verdict is False
+    else:
+        latest = my_forecasts["latest"]
+        standing = isinstance(latest, dict) and "end_time" in latest and latest["end_time"] is None
+        assert (verdict is True) == standing, "answered exactly when end_time is null (AC2)"
+
+
+OBSERVED = st.lists(
+    st.tuples(
+        st.integers(min_value=1, max_value=40),
+        st.integers(min_value=1, max_value=40),
+        st.integers(min_value=0, max_value=300),  # minutes since open
+        st.integers(min_value=-60, max_value=200),  # minutes to close
+        st.booleans(),
+    ),
+    max_size=8,
+    unique_by=lambda row: row[0],
+)
+WATCHED = st.dictionaries(
+    st.integers(min_value=1, max_value=40),
+    st.tuples(
+        st.integers(min_value=1, max_value=40),
+        st.integers(min_value=-60, max_value=200),  # minutes to close
+        st.integers(min_value=0, max_value=120),  # minutes since last seen
+    ),
+    max_size=8,
+)
+
+
+@given(
+    observed_rows=OBSERVED,
+    watched_rows=WATCHED,
+    excluded=st.frozensets(st.integers(min_value=1, max_value=40), max_size=6),
+)
+def test_the_step_is_replay_stable_and_the_exclusion_touches_only_the_at_risk_page(
+    observed_rows: list, watched_rows: dict, excluded: frozenset
+) -> None:
+    """What one run saves, the next run loads unchanged; an excluded question is never at risk
+    and is missed exactly as an unexcluded one is; an answered question is never missed."""
+    now = ANCHOR
+    observed = tuple(
+        (
+            question,
+            post,
+            now - timedelta(minutes=since),
+            now + timedelta(minutes=close),
+            answered,
+        )
+        for question, post, since, close, answered in observed_rows
+    )
+    watched = {
+        question: (post, now + timedelta(minutes=close), now - timedelta(minutes=seen))
+        for question, (post, close, seen) in watched_rows.items()
+    }
+    watching, at_risk, missed, notes = watchdog._unanswered_step(watched, observed, excluded, now)
+    _, _, missed_without, _ = watchdog._unanswered_step(watched, observed, frozenset(), now)
+
+    saved = json.loads(json.dumps(watchdog._watching_form(watching), sort_keys=True))
+    assert watchdog._watched(saved) == watching
+    saved_missed = json.loads(json.dumps(watchdog._missed_form(missed), sort_keys=True))
+    assert watchdog._missed_entries(saved_missed) == missed
+
+    assert missed == missed_without
+    answered_ids = {row[0] for row in observed if row[4]}
+    assert not answered_ids & set(missed)
+    assert not answered_ids & set(watching)
+    risk_ids = {row[0] for row in at_risk}
+    assert not risk_ids & excluded
+    assert risk_ids <= set(watching)
+    for question, _post, opened, closes in at_risk:
+        assert now - opened >= watchdog.UNANSWERED_AFTER and closes > now
+    assert all(isinstance(note, str) and note.startswith("NOTE: ") for note in notes)

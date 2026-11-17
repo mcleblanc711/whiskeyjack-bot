@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -127,7 +128,12 @@ class Harness:
     # parsed payload, or an exception instance to raise in its place.
     project: list[object] = field(default_factory=lambda: [{"id": ACTIVE_PROJECT}])
     posts: list[object] = field(default_factory=lambda: [{"results": [{"status": "open"}]}])
+    # M1-366: the missed-question check's `with_cp=true` list of the activation's open posts.
+    # Its own route, defaulting to nothing open, because the rollover default above parses as a
+    # blind read under the stricter question parser.
+    open_posts: list[object] = field(default_factory=lambda: [{"results": []}])
     fetched: list[str] = field(default_factory=list)
+    push_timeouts: list[int | None] = field(default_factory=list)
     real_metaculus_get: Any = None
 
     def systemctl(self, *args: str, env: dict[str, str] | None = None) -> str:
@@ -159,11 +165,17 @@ class Harness:
         self, title: str, body: str, *, priority: str, tags: str, timeout: int | None = None
     ) -> bool:
         self.pushes.append({"title": title, "body": body, "priority": priority, "tags": tags})
+        self.push_timeouts.append(timeout)
         return self.delivers[0]
 
-    def metaculus(self, path: str, deadline: float) -> object:
+    def metaculus(self, path: str, deadline: float, **kwargs: Any) -> object:
         self.fetched.append(path)
-        answer = self.project[0] if path.startswith("/projects/") else self.posts[0]
+        if path.startswith("/projects/"):
+            answer = self.project[0]
+        elif "with_cp=true" in path:
+            answer = self.open_posts[0]
+        else:
+            answer = self.posts[0]
         if isinstance(answer, BaseException):
             raise answer
         return answer
@@ -199,7 +211,11 @@ def seed_activation(path: Path, project_id: object) -> None:
     connection = connect(path)
     try:
         tournament_state.append(
-            connection, "activation", "account", {"project_id": project_id, "account_id": 1}
+            connection,
+            "activation",
+            "account",
+            # M1-366 reads `activation_id` as well; a fresh one per row, like `enable`.
+            {"project_id": project_id, "account_id": 1, "activation_id": uuid4().hex},
         )
     finally:
         connection.close()
@@ -335,6 +351,10 @@ def test_the_declared_worst_case_run_fits_inside_the_deadline_its_own_unit_decla
         + module.ROLLOVER_FETCH_SECONDS
         + module.ROLLOVER_PUSH_TIMEOUT_SECONDS
         + module.PERSISTENCE_PUSH_TIMEOUT_SECONDS
+        # M1-366: the missed-question check's read bound, and its two pushes (UNANSWERED and
+        # MISSED can both be due in one good run; a blind run sends one).
+        + module.UNANSWERED_FETCH_SECONDS
+        + 2 * module.UNANSWERED_PUSH_TIMEOUT_SECONDS
     )
 
 
@@ -403,10 +423,13 @@ def test_every_outward_call_passes_the_timeout_the_budget_counts(
 
     assert module.main() == 1, "everything is inactive, so both subjects are down"
     assert seen["systemctl"] == module.SYSTEMCTL_TIMEOUT_SECONDS
-    # The heartbeat read, then the rollover check's activation read -- which is also bounded by
-    # its thread join, so it may pass less than the ledger timeout and never more.
+    # The heartbeat read, then the rollover check's activation read and the missed-question
+    # check's (M1-366) -- each also bounded by its thread join, so it may pass less than the
+    # ledger timeout and never more. The second check stops at the unreadable activation, so it
+    # never asks for its excluded scopes, and it pushes nothing: blind for under 20 minutes.
     assert ledger_timeouts[0] == module.LEDGER_TIMEOUT_SECONDS
-    assert len(ledger_timeouts) == 2 and 0 < ledger_timeouts[1] <= module.LEDGER_TIMEOUT_SECONDS
+    assert len(ledger_timeouts) == 3
+    assert all(0 < timeout <= module.LEDGER_TIMEOUT_SECONDS for timeout in ledger_timeouts[1:])
     # This ledger has no activation, so the rollover check could not run and says so.
     assert push_timeouts == {
         "whiskeyjack: WORKER DOWN": module.PUSH_TIMEOUT_SECONDS,
@@ -717,6 +740,21 @@ def test_the_runbooks_p3_check_failed_table_is_the_whole_vocabulary() -> None:
     cells = [row.split("|")[1].strip() for row in rows]
     assert cells[:2] == ["line", "---"], cells[:2]
     assert set(cells[2:]) == set(_load().ROLLOVER_CHECK_PROBLEMS.values())
+
+
+def test_the_runbooks_w3_check_failed_table_is_the_whole_vocabulary() -> None:
+    """The same partition claim, for `missed-question check failed` (M1-366)."""
+    runbook = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    section = runbook.split("#### When the missed-question check itself fails", 1)[1]
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break
+    cells = [row.split("|")[1].strip() for row in rows]
+    assert cells[:2] == ["line", "---"], cells[:2]
+    assert set(cells[2:]) == set(_load().UNANSWERED_CHECK_PROBLEMS.values())
 
 
 def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
@@ -1556,9 +1594,13 @@ def test_the_slug_is_the_pinned_sdks_minibench_id() -> None:
 
 
 def test_a_matching_project_is_quiet_and_asks_metaculus_one_question(watchdog: Harness) -> None:
+    """One question for the rollover check; M1-366's missed-question check asks the second."""
     assert watchdog.run() == 0
     assert watchdog.pushes == []
-    assert watchdog.fetched == ["/projects/tournaments/minibench/"]
+    assert watchdog.fetched == [
+        "/projects/tournaments/minibench/",
+        f"/posts/?tournaments={ACTIVE_PROJECT}&statuses=open&with_cp=true&limit=100",
+    ]
     assert watchdog.state()["rollover"] == {}
     assert watchdog.state()["rollover_check"] == {}
 
@@ -2327,7 +2369,7 @@ module.STATE = __import__("pathlib").Path(os.environ["WJ_TEST_STATE"])
 module.LEDGER = __import__("pathlib").Path({str(ledger)!r})
 answers = json.loads(os.environ["WJ_TEST_UNITS"])
 module._systemctl = lambda *args, env=None: answers[json.dumps(list(args))]
-module._metaculus_get = lambda path, deadline: (
+module._metaculus_get = lambda path, deadline, **kwargs: (
     {{"id": {ACTIVE_PROJECT}}} if path.startswith("/projects/") else {{"results": []}}
 )
 module._push = lambda *a, **k: True
@@ -2424,3 +2466,743 @@ def test_a_diagnostic_guard_never_swallows_an_interrupt(watchdog: Harness) -> No
             watchdog.module._say("anything")
     finally:
         sys.stdout = original
+
+
+# ── the fourth subject: open questions with no forecast of ours (M1-366) ──────────────
+
+UNANSWERED = "QUESTION UNANSWERED"
+MISSED = "QUESTION MISSED"
+UNANSWERED_CHECK_FAILED = "missed-question check failed"
+# A title that must never reach a push (D58): pushes carry ids, URLs built from them, our own
+# codes and computed times only. Every M1-366 fixture post carries it.
+SENTINEL_TITLE = "[SENTINEL-TITLE-M1-366] never in a push"
+# A forecast of ours, standing: what Metaculus answered for q46870/q46871 on 2026-11-17.
+STANDING = {"end_time": None, "start_time": 1763371000.0, "question_id": 1}
+
+
+def _question(
+    question_id: int,
+    *,
+    opened: datetime,
+    closes: datetime,
+    latest: object = None,
+    status: object = "open",
+) -> dict[str, Any]:
+    """One question object in the shape the live list answers (2026-11-17)."""
+    return {
+        "id": question_id,
+        "title": SENTINEL_TITLE,
+        "status": status,
+        "type": "binary",
+        "open_time": opened.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scheduled_close_time": closes.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "my_forecasts": {"history": [], "latest": latest, "score_data": {}},
+    }
+
+
+def _single(post_id: int, question: dict[str, Any]) -> dict[str, Any]:
+    return {"id": post_id, "title": SENTINEL_TITLE, "status": "open", "question": question}
+
+
+def _listing(*posts: dict[str, Any]) -> dict[str, Any]:
+    return {"next": "https://www.metaculus.com/api/posts/?offset=100", "results": list(posts)}
+
+
+def _open_for(
+    watchdog: Harness,
+    minutes: int,
+    *,
+    question_id: int = 46900,
+    post_id: int = 46700,
+    closes_in: int | None = None,
+    latest: object = None,
+) -> None:
+    """One unanswered open question, opened `minutes` ago, closing 180 min after it opened."""
+    now = watchdog.instant[0]
+    opened = now - timedelta(minutes=minutes)
+    closes = (
+        opened + timedelta(minutes=180) if closes_in is None else now + timedelta(minutes=closes_in)
+    )
+    watchdog.open_posts[0] = _listing(
+        _single(post_id, _question(question_id, opened=opened, closes=closes, latest=latest))
+    )
+
+
+def _no_title_leak(watchdog: Harness) -> None:
+    for push in watchdog.pushes:
+        assert "SENTINEL" not in push["title"] + push["body"]
+
+
+def _current_activation_id(watchdog: Harness) -> str:
+    connection = sqlite3.connect(Path(watchdog.module.LEDGER))
+    try:
+        row = connection.execute(
+            "select data from tournament_events where kind='activation' order by seq desc limit 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    value = json.loads(row[0])["activation_id"]
+    assert isinstance(value, str)
+    return value
+
+
+def _seed_event(watchdog: Harness, kind: str, scope: str, data: dict[str, Any]) -> None:
+    connection = connect(Path(watchdog.module.LEDGER))
+    try:
+        tournament_state.append(connection, kind, scope, data)
+    finally:
+        connection.close()
+
+
+def _beat(watchdog: Harness) -> None:
+    """A fresh worker heartbeat at the harness's instant, so moving the clock is not WORKER DOWN."""
+    connection = connect(Path(watchdog.module.LEDGER))
+    try:
+        original = tournament_state.utcnow
+        moment = watchdog.instant[0]
+        tournament_state.utcnow = lambda: moment  # type: ignore[assignment]
+        try:
+            tournament_state.append(connection, "heartbeat", "worker", {"complete": True})
+        finally:
+            tournament_state.utcnow = original  # type: ignore[assignment]
+    finally:
+        connection.close()
+
+
+def _later(watchdog: Harness, minutes: float) -> None:
+    watchdog.instant[0] = watchdog.instant[0] + timedelta(minutes=minutes)
+    _beat(watchdog)
+
+
+def test_an_unanswered_question_under_twenty_minutes_is_silent(watchdog: Harness) -> None:
+    """Killed-mutant: the 20-minute comparison. The worker's p90 is 6.3 minutes."""
+    _open_for(watchdog, 19)
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+    assert list(watchdog.state()["unanswered"]["watching"]) == ["46900"]
+
+
+def test_an_unanswered_question_at_twenty_minutes_pages_urgent_with_its_id_and_link(
+    watchdog: Harness,
+) -> None:
+    _open_for(watchdog, 20)
+    assert watchdog.run() == 1
+    pages = watchdog.titled(UNANSWERED)
+    assert len(pages) == 1 and len(watchdog.pushes) == 1
+    assert pages[0]["title"] == "whiskeyjack: QUESTION UNANSWERED"
+    assert pages[0]["priority"] == "urgent" and pages[0]["tags"] == "rotating_light"
+    assert "q46900 (new): open 20 min, closes in 160 min" in pages[0]["body"]
+    assert "https://www.metaculus.com/questions/46700/" in pages[0]["body"]
+    assert "docs/RUNBOOK.md W3" in pages[0]["body"]
+    assert watchdog.push_timeouts == [watchdog.module.UNANSWERED_PUSH_TIMEOUT_SECONDS]
+    assert watchdog.state()["unanswered"]["paged"] == [46900]
+    _no_title_leak(watchdog)
+
+
+def test_an_answered_question_is_silent_however_old(watchdog: Harness) -> None:
+    _open_for(watchdog, 170, latest=STANDING)
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+    assert watchdog.state()["unanswered"]["watching"] == {}
+
+
+def test_a_withdrawn_forecast_is_not_a_standing_one(watchdog: Harness) -> None:
+    """`latest` with an `end_time` that has passed: we forecast, then the forecast ended."""
+    ended = dict(STANDING, end_time=(watchdog.instant[0] - timedelta(minutes=1)).timestamp())
+    _open_for(watchdog, 30, latest=ended)
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(UNANSWERED)) == 1
+
+
+def test_it_re_pages_every_thirty_minutes_and_not_at_twenty_nine(watchdog: Harness) -> None:
+    """Owner decision 2026-11-10: 30 minutes, measured from the last DELIVERED page."""
+    _open_for(watchdog, 20)
+    watchdog.run()
+    start = watchdog.instant[0]
+    for minutes in (5, 10, 29):
+        watchdog.instant[0] = start + timedelta(minutes=minutes)
+        _beat(watchdog)
+        _open_for(watchdog, 20 + minutes)
+        watchdog.run()
+    assert len(watchdog.titled(UNANSWERED)) == 1
+    watchdog.instant[0] = start + timedelta(minutes=30)
+    _beat(watchdog)
+    _open_for(watchdog, 50)
+    assert watchdog.run() == 1
+    pages = watchdog.titled(UNANSWERED)
+    assert len(pages) == 2
+    assert "(new)" not in pages[1]["body"]
+
+
+def test_a_newly_at_risk_question_pages_at_once_inside_the_window(watchdog: Harness) -> None:
+    """Killed-mutant: the `paged` rule. A new id is new information, not a repeat."""
+    now = watchdog.instant[0]
+    first = _question(46900, opened=now - timedelta(minutes=25), closes=now + timedelta(hours=2))
+    watchdog.open_posts[0] = _listing(_single(46700, first))
+    watchdog.run()
+    _later(watchdog, 5)
+    now = watchdog.instant[0]
+    second = _question(46901, opened=now - timedelta(minutes=20), closes=now + timedelta(hours=2))
+    watchdog.open_posts[0] = _listing(_single(46700, first), _single(46701, second))
+    watchdog.run()
+    pages = watchdog.titled(UNANSWERED)
+    assert len(pages) == 2
+    assert "q46901 (new)" in pages[1]["body"] and "q46900:" in pages[1]["body"]
+
+
+def test_an_answer_clears_the_page_with_no_further_push(watchdog: Harness) -> None:
+    _open_for(watchdog, 20)
+    watchdog.run()
+    _later(watchdog, 5)
+    _open_for(watchdog, 25, latest=STANDING)
+    assert watchdog.run() == 0
+    assert len(watchdog.pushes) == 1
+    assert watchdog.state()["unanswered"]["paged"] == []
+
+
+def test_a_question_blocked_under_this_activation_is_left_out_of_the_at_risk_page(
+    watchdog: Harness,
+) -> None:
+    """Killed-mutant: the exclusion. The worker already paged it urgently, with its reason."""
+    _seed_event(
+        watchdog,
+        "question_blocked",
+        f"{ACTIVE_PROJECT}:46900",
+        {"activation_id": _current_activation_id(watchdog), "reason": "deterministic_verdict"},
+    )
+    _open_for(watchdog, 40)
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+
+def test_a_question_blocked_under_an_older_activation_still_pages(watchdog: Harness) -> None:
+    """`tournament enable` clears a verdict, so an old one is no reason to stay quiet."""
+    _seed_event(
+        watchdog,
+        "question_blocked",
+        f"{ACTIVE_PROJECT}:46900",
+        {"activation_id": "an-older-activation", "reason": "deterministic_verdict"},
+    )
+    _open_for(watchdog, 40)
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(UNANSWERED)) == 1
+
+
+def test_a_question_the_worker_recorded_as_unanswerable_is_left_out_too(watchdog: Harness) -> None:
+    _seed_event(
+        watchdog,
+        "question_unanswerable",
+        f"{ACTIVE_PROJECT}:46900",
+        {"activation_id": "any", "reason": "unsupported_type"},
+    )
+    _open_for(watchdog, 40)
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+
+
+def test_a_blocked_question_that_closes_unanswered_is_still_missed(watchdog: Harness) -> None:
+    """Killed-mutant: exclusion leaking into MISSED. The worker's push is at most once."""
+    _seed_event(
+        watchdog,
+        "question_blocked",
+        f"{ACTIVE_PROJECT}:46900",
+        {"activation_id": _current_activation_id(watchdog), "reason": "deterministic_verdict"},
+    )
+    _open_for(watchdog, 175, closes_in=5)
+    watchdog.run()
+    _later(watchdog, 6)
+    watchdog.open_posts[0] = _listing()
+    assert watchdog.run() == 1
+    pages = watchdog.titled(MISSED)
+    assert len(pages) == 1
+    assert pages[0]["priority"] == "urgent" and pages[0]["tags"] == "x"
+    assert "q46900: closed" in pages[0]["body"]
+    assert "https://www.metaculus.com/questions/46700/" in pages[0]["body"]
+    _no_title_leak(watchdog)
+
+
+def test_a_question_last_seen_long_before_its_close_is_not_claimed_as_missed(
+    watchdog: Harness,
+) -> None:
+    """Killed-mutant: the freshness guard. It may have been answered in the gap."""
+    _open_for(watchdog, 150, closes_in=30)
+    watchdog.run()
+    pushes_before = len(watchdog.pushes)
+    _later(watchdog, 40)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()
+    assert watchdog.titled(MISSED) == []
+    assert len(watchdog.pushes) == pushes_before
+    assert watchdog.state()["unanswered"]["watching"] == {}
+
+
+def test_a_question_still_listed_unanswered_after_its_close_is_missed(watchdog: Harness) -> None:
+    _open_for(watchdog, 181, closes_in=-1)
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(MISSED)) == 1
+    assert watchdog.titled(UNANSWERED) == []
+
+
+def test_a_question_that_leaves_before_its_close_is_logged_and_not_paged(
+    watchdog: Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _open_for(watchdog, 15, closes_in=120)
+    watchdog.run()
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    assert watchdog.run() == 0
+    assert watchdog.pushes == []
+    assert "left the open list before its close" in capsys.readouterr().out
+
+
+def test_misses_are_batched_at_most_hourly_and_each_is_sent_once(watchdog: Harness) -> None:
+    start = watchdog.instant[0]
+    _open_for(watchdog, 175, closes_in=2, question_id=46900, post_id=46700)
+    watchdog.run()
+    _later(watchdog, 5)
+    _open_for(watchdog, 175, closes_in=4, question_id=46901, post_id=46701)
+    watchdog.run()  # 46900 is gone after its close: missed, and paged at once
+    assert len(watchdog.titled(MISSED)) == 1
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()  # 46901 is missed too, but inside the hour
+    assert len(watchdog.titled(MISSED)) == 1
+    watchdog.instant[0] = start + timedelta(minutes=5, hours=1)
+    _beat(watchdog)
+    watchdog.run()
+    pages = watchdog.titled(MISSED)
+    assert len(pages) == 2
+    assert "q46901" in pages[1]["body"] and "q46900" not in pages[1]["body"]
+    _later(watchdog, 65)
+    watchdog.run()
+    assert len(watchdog.titled(MISSED)) == 2
+
+
+def test_worker_down_holds_every_question_page_and_recovery_flushes_misses_as_one(
+    watchdog: Harness,
+) -> None:
+    """AC4. Killed-mutant: the hold. WORKER DOWN already says every question is at risk."""
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    now = watchdog.instant[0]
+    watchdog.open_posts[0] = _listing(
+        _single(
+            46700,
+            _question(
+                46900, opened=now - timedelta(minutes=176), closes=now + timedelta(minutes=4)
+            ),
+        ),
+        _single(
+            46701,
+            _question(
+                46901, opened=now - timedelta(minutes=177), closes=now + timedelta(minutes=3)
+            ),
+        ),
+        _single(
+            46702,
+            _question(
+                46902, opened=now - timedelta(minutes=60), closes=now + timedelta(minutes=120)
+            ),
+        ),
+    )
+    assert watchdog.run() == 1
+    assert [push["title"] for push in watchdog.pushes] == ["whiskeyjack: WORKER DOWN"]
+    _later(watchdog, 5)
+    now = watchdog.instant[0]
+    watchdog.open_posts[0] = _listing(
+        _single(
+            46702,
+            _question(
+                46902, opened=now - timedelta(minutes=65), closes=now + timedelta(minutes=115)
+            ),
+        ),
+    )
+    watchdog.run()
+    assert watchdog.titled(MISSED) == [] and watchdog.titled(UNANSWERED) == []
+    assert [entry["question"] for entry in watchdog.state()["unanswered"]["pending_missed"]] == [
+        46900,
+        46901,
+    ]
+
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "active"
+    _later(watchdog, 5)
+    now = watchdog.instant[0]
+    watchdog.open_posts[0] = _listing(
+        _single(
+            46702,
+            _question(
+                46902, opened=now - timedelta(minutes=70), closes=now + timedelta(minutes=110)
+            ),
+        ),
+    )
+    watchdog.run()
+    missed = watchdog.titled(MISSED)
+    assert len(missed) == 1
+    assert "q46900" in missed[0]["body"] and "q46901" in missed[0]["body"]
+    assert len(watchdog.titled(UNANSWERED)) == 1
+    assert watchdog.state()["unanswered"]["pending_missed"] == []
+
+
+def test_a_refused_push_is_retried_by_the_next_run(watchdog: Harness) -> None:
+    """Killed-mutant: stamping before delivery. A stamp written on refusal is a lost page."""
+    watchdog.delivers[0] = False
+    _open_for(watchdog, 20)
+    watchdog.run()
+    assert watchdog.state()["unanswered"]["paged"] == []
+    assert watchdog.state()["unanswered"]["last_alert"] is None
+    watchdog.delivers[0] = True
+    _later(watchdog, 5)
+    _open_for(watchdog, 25)
+    watchdog.run()
+    pages = watchdog.titled(UNANSWERED)
+    assert len(pages) == 2 and "(new)" in pages[1]["body"]
+
+
+def test_a_refused_miss_stays_pending_until_it_is_delivered(watchdog: Harness) -> None:
+    _open_for(watchdog, 181, closes_in=-1)
+    watchdog.delivers[0] = False
+    watchdog.run()
+    assert len(watchdog.state()["unanswered"]["pending_missed"]) == 1
+    watchdog.delivers[0] = True
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()
+    assert len(watchdog.titled(MISSED)) == 2
+    assert watchdog.state()["unanswered"]["pending_missed"] == []
+
+
+def test_a_rollover_mismatch_skips_the_check_with_no_get_and_no_state_change(
+    watchdog: Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MINIBENCH ROLLED OVER already pages; every new question is unanswered by construction."""
+    _open_for(watchdog, 20)
+    watchdog.run()
+    stored = watchdog.state()["unanswered"]
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    _later(watchdog, 5)
+    watchdog.fetched.clear()
+    watchdog.run()
+    assert not any("with_cp=true" in path for path in watchdog.fetched)
+    assert watchdog.state()["unanswered"] == stored
+    assert len(watchdog.titled(UNANSWERED)) == 1
+    assert "SKIP: missed-question check" in capsys.readouterr().out
+
+
+def test_a_blind_read_waits_twenty_minutes_pages_at_default_and_leaves_the_state_alone(
+    watchdog: Harness,
+) -> None:
+    """AC3: never urgent, never a green, never clears or re-keys the standing entry."""
+    import urllib.error
+
+    _open_for(watchdog, 20)
+    watchdog.run()
+    stored = watchdog.state()["unanswered"]
+    forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, None)  # type: ignore[arg-type]
+    watchdog.open_posts[0] = forbidden
+    # Blind from the first of these runs; 15 minutes blind at the fourth, so still quiet.
+    for _ in range(4):
+        _later(watchdog, 5)
+        assert watchdog.run() == 1
+    assert watchdog.titled(UNANSWERED_CHECK_FAILED) == []
+    assert watchdog.state()["unanswered"] == stored
+    _later(watchdog, 5)
+    watchdog.run()
+    failed = watchdog.titled(UNANSWERED_CHECK_FAILED)
+    assert len(failed) == 1
+    assert failed[0]["priority"] == "default" and failed[0]["tags"] == "grey_question"
+    assert "usable list of the project's open questions" in failed[0]["body"]
+    _later(watchdog, 5)
+    watchdog.run()
+    assert len(watchdog.titled(UNANSWERED_CHECK_FAILED)) == 1
+    assert watchdog.state()["unanswered"] == stored
+    # A good read ends the blind spell, and the standing entry is exactly as it was left.
+    _later(watchdog, 5)
+    _open_for(watchdog, 50)
+    watchdog.run()
+    assert watchdog.state()["unanswered_check"] == {}
+
+
+def test_a_good_read_between_blind_ones_restarts_the_blind_clock(watchdog: Harness) -> None:
+    """Continuous blindness only: a flapping Metaculus is not twenty minutes blind."""
+    import urllib.error
+
+    forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, None)  # type: ignore[arg-type]
+    for _ in range(6):
+        watchdog.open_posts[0] = forbidden
+        watchdog.run()
+        _later(watchdog, 5)
+        watchdog.open_posts[0] = _listing()
+        watchdog.run()
+        _later(watchdog, 5)
+    assert watchdog.titled(UNANSWERED_CHECK_FAILED) == []
+
+
+@pytest.mark.parametrize(
+    ("my_forecasts", "why"),
+    [
+        ({"history": None}, "no latest KEY -- the old group fixture's shape"),
+        (None, "no my_forecasts object at all, as an unauthenticated answer would carry"),
+        ({"latest": "yes"}, "latest that is neither null nor an object"),
+        ({"latest": {"start_time": 1.0}}, "latest with no end_time key"),
+        ({"latest": {"end_time": True}}, "a bool is not a time"),
+        ({"latest": {"end_time": "soon"}}, "a string that is not a time"),
+    ],
+)
+def test_a_forecast_shape_this_cannot_read_is_blind_never_unanswered(
+    watchdog: Harness, my_forecasts: object, why: str
+) -> None:
+    """Killed-mutant: the `latest`-key guard. Blind is its own fault; never an urgent page."""
+    now = watchdog.instant[0]
+    question = _question(46900, opened=now - timedelta(minutes=60), closes=now + timedelta(hours=2))
+    question["my_forecasts"] = my_forecasts
+    watchdog.open_posts[0] = _listing(_single(46700, question))
+    assert watchdog.run() == 1, why
+    assert watchdog.titled(UNANSWERED) == [], why
+    assert watchdog.state()["unanswered_check"]["key"] == "unanswered_check_failed"
+
+
+def test_a_group_pages_only_its_unanswered_sub_question(watchdog: Harness) -> None:
+    now = watchdog.instant[0]
+    group = {
+        "id": 46705,
+        "title": SENTINEL_TITLE,
+        "group_of_questions": {
+            "questions": [
+                _question(
+                    46910, opened=now - timedelta(minutes=30), closes=now + timedelta(hours=2)
+                ),
+                _question(
+                    46911,
+                    opened=now - timedelta(minutes=30),
+                    closes=now + timedelta(hours=2),
+                    latest=STANDING,
+                ),
+                _question(
+                    46912,
+                    opened=now - timedelta(minutes=30),
+                    closes=now + timedelta(hours=2),
+                    status="upcoming",
+                ),
+            ]
+        },
+    }
+    watchdog.open_posts[0] = _listing(group)
+    assert watchdog.run() == 1
+    body = watchdog.titled(UNANSWERED)[0]["body"]
+    assert "q46910" in body and "q46911" not in body and "q46912" not in body
+    assert "https://www.metaculus.com/questions/46705/" in body
+    _no_title_leak(watchdog)
+
+
+def test_a_question_listed_twice_is_blind_whichever_entry_comes_first(watchdog: Harness) -> None:
+    """Found by the property suite: two entries for one id can disagree about our answer."""
+    now = watchdog.instant[0]
+    opened, closes = now - timedelta(minutes=60), now + timedelta(hours=2)
+    unanswered = _single(46700, _question(46900, opened=opened, closes=closes))
+    answered = _single(46701, _question(46900, opened=opened, closes=closes, latest=STANDING))
+    closed = _single(46702, _question(46900, opened=opened, closes=closes, status="closed"))
+    for order in (
+        (unanswered, answered),
+        (answered, unanswered),
+        (unanswered, closed),
+        (closed, unanswered),
+    ):
+        watchdog.open_posts[0] = _listing(*order)
+        assert watchdog.run() == 1
+        assert watchdog.titled(UNANSWERED) == []
+        assert watchdog.state()["unanswered_check"]["key"] == "unanswered_check_failed"
+
+
+def test_a_full_page_is_blind_because_it_may_be_truncated(watchdog: Harness) -> None:
+    now = watchdog.instant[0]
+    watchdog.open_posts[0] = _listing(
+        *(
+            _single(
+                47000 + n,
+                _question(
+                    48000 + n,
+                    opened=now - timedelta(minutes=60),
+                    closes=now + timedelta(hours=2),
+                ),
+            )
+            for n in range(watchdog.module.UNANSWERED_OPEN_PAGE)
+        )
+    )
+    assert watchdog.run() == 1
+    assert watchdog.titled(UNANSWERED) == []
+    assert watchdog.state()["unanswered_check"]["key"] == "unanswered_check_failed"
+
+
+def test_a_hung_read_is_cut_off_at_the_declared_bound(
+    watchdog: Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import threading
+
+    release = threading.Event()
+    rollover_answer = watchdog.metaculus
+
+    def hang(path: str, deadline: float, **kwargs: Any) -> object:
+        if "with_cp=true" in path:
+            release.wait(30)
+        return rollover_answer(path, deadline, **kwargs)
+
+    monkeypatch.setattr(watchdog.module, "UNANSWERED_FETCH_SECONDS", 0.3)
+    monkeypatch.setattr(watchdog.module, "_metaculus_get", hang)
+    started = time.monotonic()
+    try:
+        assert watchdog.run() == 1
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert elapsed < 5, elapsed
+    assert "UNANSWERED CHECK FAILED: timed_out" in capsys.readouterr().out
+
+
+def test_a_rebound_project_restarts_the_watch_and_keeps_undelivered_misses(
+    watchdog: Harness,
+) -> None:
+    _open_for(watchdog, 181, closes_in=-1, question_id=46800, post_id=46600)
+    watchdog.delivers[0] = False
+    watchdog.run()
+    _open_for(watchdog, 20)
+    watchdog.run()
+    assert watchdog.state()["unanswered"]["watching"]
+    # Follow mode rebinds: a new activation on the slug's new project.
+    watchdog.delivers[0] = True
+    watchdog.activate(NEXT_PROJECT)
+    watchdog.project[0] = {"id": NEXT_PROJECT}
+    watchdog.open_posts[0] = _listing()
+    _later(watchdog, 5)
+    watchdog.run()
+    stored = watchdog.state()["unanswered"]
+    assert stored["project"] == NEXT_PROJECT
+    assert stored["watching"] == {} and stored["paged"] == []
+    # The old project's undelivered miss is still owed, and goes out.
+    assert watchdog.titled(MISSED) and "q46800" in watchdog.titled(MISSED)[-1]["body"]
+    assert watchdog.fetched[-1].startswith(f"/posts/?tournaments={NEXT_PROJECT}&")
+
+
+def test_a_hand_edited_unanswered_entry_cannot_stop_the_check(watchdog: Harness) -> None:
+    state = Path(watchdog.module.STATE)
+    state.write_text(
+        json.dumps(
+            {
+                "unanswered": {
+                    "project": ACTIVE_PROJECT,
+                    "activation_id": _current_activation_id(watchdog),
+                    "watching": {"x": 1, "46900": {"post": "a"}, "-3": {}},
+                    "paged": ["46900", True, -1],
+                    "last_alert": 5,
+                    "pending_missed": [1, {"question": True}],
+                    "missed_last_alert": [],
+                },
+                "unanswered_check": {"key": "unanswered_check_failed", "since": "never"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _open_for(watchdog, 20)
+    assert watchdog.run() == 1
+    assert len(watchdog.titled(UNANSWERED)) == 1
+
+
+def test_the_check_never_renders_a_payload_string_in_any_push(watchdog: Harness) -> None:
+    """D58 / AC8, across every push this subject can send."""
+    import urllib.error
+
+    _open_for(watchdog, 179, closes_in=1)
+    watchdog.run()
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()
+    watchdog.open_posts[0] = urllib.error.HTTPError("u", 403, "Forbidden", {}, None)  # type: ignore[arg-type]
+    for _ in range(6):
+        _later(watchdog, 5)
+        watchdog.run()
+    titles = {push["title"] for push in watchdog.pushes}
+    assert titles == {
+        "whiskeyjack: QUESTION UNANSWERED",
+        "whiskeyjack: QUESTION MISSED",
+        "whiskeyjack: missed-question check failed",
+    }
+    _no_title_leak(watchdog)
+
+
+def test_every_missed_question_check_code_has_a_sentence() -> None:
+    module = _load()
+    assert set(module.UNANSWERED_CHECK_PROBLEMS) == {
+        "activation_unreadable",
+        "ledger_unreadable",
+        "posts_unreadable",
+        "forecasts_unreadable",
+        "page_full",
+        "timed_out",
+    }
+    assert all(module.UNANSWERED_CHECK_PROBLEMS.values())
+
+
+# ── M1-366 round 1: the reviewer's reproductions, as regressions ─────────────────────
+
+
+def test_r1_recovery_flushes_a_held_miss_inside_the_hourly_window(watchdog: Harness) -> None:
+    """Round-1 B1 (AC4): the hourly MISSED batch must not delay the recovery flush."""
+    _open_for(watchdog, 181, closes_in=-1, question_id=46800, post_id=46600)
+    watchdog.run()
+    assert len(watchdog.titled(MISSED)) == 1  # 12:00, delivered
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "inactive"
+    _later(watchdog, 5)
+    _open_for(watchdog, 176, closes_in=4)  # unanswered, closes at 12:09
+    watchdog.run()
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()  # 12:10: missed, held
+    assert len(watchdog.titled(MISSED)) == 1
+    watchdog.units[("is-active", "whiskeyjack-tournament.timer")] = "active"
+    _later(watchdog, 5)
+    watchdog.run()  # 12:15: recovery
+    missed = watchdog.titled(MISSED)
+    assert len(missed) == 2 and "q46900" in missed[1]["body"]
+    assert watchdog.state()["unanswered"]["pending_missed"] == []
+
+
+def test_r1_a_group_member_closed_with_a_standing_forecast_is_not_missed(watchdog: Harness) -> None:
+    """Round-1 B2 (AC2): a closed member still listed in an open group carries its own answer."""
+    now = watchdog.instant[0]
+    opened = now - timedelta(minutes=176)
+    member = _question(46910, opened=opened, closes=now + timedelta(minutes=4))
+    sibling = _question(46911, opened=now - timedelta(minutes=30), closes=now + timedelta(hours=2))
+    group = {"id": 46705, "group_of_questions": {"questions": [member, sibling]}}
+    watchdog.open_posts[0] = _listing(group)
+    watchdog.run()
+    _later(watchdog, 5)
+    answered = dict(member, status="closed")
+    answered["my_forecasts"] = {"history": [], "latest": dict(STANDING), "score_data": {}}
+    group = {"id": 46705, "group_of_questions": {"questions": [answered, sibling]}}
+    watchdog.open_posts[0] = _listing(group)
+    watchdog.run()
+    assert watchdog.titled(MISSED) == []
+
+
+@pytest.mark.parametrize("form", ["epoch", "iso"])
+def test_r1_a_future_end_time_is_not_a_standing_forecast(watchdog: Harness, form: str) -> None:
+    """Round-1 B3 (AC2): answered only with NO end_time; a future one is not evidence."""
+    ends = watchdog.instant[0] + timedelta(minutes=10)
+    end_time: object = ends.timestamp() if form == "epoch" else ends.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _open_for(watchdog, 30, latest=dict(STANDING, end_time=end_time))
+    assert watchdog.run() == 1
+    assert watchdog.state()["unanswered_check"]["key"] == "unanswered_check_failed"
+
+
+def test_r1_a_miss_listed_overdue_on_two_polls_is_sent_once(watchdog: Harness) -> None:
+    """Round-1 non-blocking: a delivered miss is not re-enqueued by a later overdue listing."""
+    _open_for(watchdog, 181, closes_in=-1)
+    watchdog.run()
+    _later(watchdog, 5)
+    _open_for(watchdog, 186, closes_in=-6)
+    watchdog.run()
+    _later(watchdog, 5)
+    watchdog.open_posts[0] = _listing()
+    watchdog.run()
+    watchdog.instant[0] = watchdog.instant[0] + timedelta(hours=2)
+    _beat(watchdog)
+    watchdog.run()
+    assert len(watchdog.titled(MISSED)) == 1

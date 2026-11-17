@@ -43,6 +43,16 @@ what the `minibench` slug currently resolves to and compares it with the project
 activation is bound to. It is the only subject that touches the network for its evidence, and a
 failed read is its own fault (`rollover_check_failed`) with its own throttle: never a green, and
 never a "worker down" -- a Metaculus outage is not the worker's.
+
+A fourth subject (M1-366): whether each open MiniBench question has a forecast of ours standing on
+it. Every other signal here is about the worker; this one is about the questions, which is the
+thing actually lost. The worker cannot report a question it never discovered -- wrong project,
+retired activation, a discovery bug, or the worker not running at all -- so this asks Metaculus
+for the bound project's open questions and reads, per question, whether `my_forecasts.latest`
+is standing. An open question still unanswered 20 minutes after it opened pages `QUESTION
+UNANSWERED`, every 30 minutes while it stays so; one that closed unanswered pages `QUESTION
+MISSED`. Both are urgent. A read that cannot establish the answer is its own fault, `missed-question
+check failed`, at default priority and never a green -- the M1-347 shape again.
 """
 
 from __future__ import annotations
@@ -118,6 +128,13 @@ ROLLOVER_PUSH_TIMEOUT_SECONDS = 8
 # test that reads the unit file checks both ends. Eight seconds, like the rollover push, rather
 # than PUSH_TIMEOUT_SECONDS: it is the last call of the run and the least urgent.
 PERSISTENCE_PUSH_TIMEOUT_SECONDS = 8
+# M1-366 adds the missed-question check: one more wall-clock bound over its reads (the
+# activation row, the excluded scopes, one Metaculus GET) and at most two pushes -- UNANSWERED and
+# MISSED can both be due in one good run, while a blind run sends only its one check-failed push.
+# 246 + 15 + 2 x 8 = 277, so the unit's TimeoutStartSec moves 260 -> 285: still under the 300s
+# timer interval, and the test that reads the unit file checks both ends.
+UNANSWERED_FETCH_SECONDS = 15
+UNANSWERED_PUSH_TIMEOUT_SECONDS = 8
 WORST_CASE_SECONDS = (
     11 * SYSTEMCTL_TIMEOUT_SECONDS
     + LEDGER_TIMEOUT_SECONDS
@@ -126,6 +143,8 @@ WORST_CASE_SECONDS = (
     + ROLLOVER_FETCH_SECONDS
     + ROLLOVER_PUSH_TIMEOUT_SECONDS
     + PERSISTENCE_PUSH_TIMEOUT_SECONDS
+    + UNANSWERED_FETCH_SECONDS
+    + 2 * UNANSWERED_PUSH_TIMEOUT_SECONDS
 )
 
 RESOLUTIONS_UNIT = "whiskeyjack-resolutions"
@@ -208,6 +227,51 @@ ROLLOVER_CHECK_PROBLEMS = {
     "project_unreadable": "Metaculus did not answer with a usable MiniBench project",
     "posts_unreadable": "Metaculus did not answer with a usable list of MiniBench's open posts",
     "timed_out": f"the check did not finish within {ROLLOVER_FETCH_SECONDS} s",
+}
+
+# The fourth subject (M1-366). Measured on the live ledger 2026-11-08 (n=235): open ->
+# `forecast_confirmed` is p50 4.3 min and p90 6.3 min, and every one of the 16 answers that took
+# 20 minutes or more came from launch day or the 2026-09-21 rollover. Twenty minutes is the
+# owner's choice (a reviewer proposed 30): three times the p90, and 160 minutes still to act.
+UNANSWERED_AFTER = timedelta(minutes=20)
+# Owner decision 2026-11-10: every 30 minutes while any stays unanswered -- about five pages in a
+# 180-minute window. A separate constant from REALERT_AFTER: two clocks sharing a name become one
+# clock by accident (T-909).
+UNANSWERED_REALERT_AFTER = timedelta(minutes=30)
+# A question that left the open list after its close counts as MISSED only when this check last
+# saw it, still unanswered, this close to the close. Two watchdog intervals: a later answer
+# landing in a gap this check did not observe is then at most ten minutes wide, and the worker
+# does not start a question inside its last five (`tournament.CLOSE_MARGIN`).
+MISSED_FRESH_WITHIN = timedelta(minutes=10)
+# Every miss goes out once and is then cleared; this only batches a burst. The rollover's
+# hourly shape, under its own name.
+MISSED_REALERT_AFTER = timedelta(hours=1)
+# A blind check pages only after this long continuously blind, so one slow Metaculus answer is
+# not a page, and then on the rollover check's six-hour shape.
+UNANSWERED_BLIND_AFTER = timedelta(minutes=20)
+UNANSWERED_CHECK_REALERT_AFTER = timedelta(hours=6)
+# How long an undelivered miss is kept for retry. Past that it is dropped, with a journal line.
+UNANSWERED_RETENTION = timedelta(hours=48)
+# At most 12 questions have been open at once across 3,000 poll snapshots. A full page could be
+# truncated, and a truncated list would read the missing questions as having left -- so a full
+# page is a blind read, not an answer.
+UNANSWERED_OPEN_PAGE = 100
+# An open post with `with_cp=true` measured ~9.5 KB on 2026-11-17; a full page is under 1 MB.
+UNANSWERED_RESPONSE_LIMIT = 4_000_000
+# ntfy turns a body over 4,096 bytes into an attachment; a page names at most this many.
+UNANSWERED_LISTED = 20
+# Built from validated ids only (D58): the URL is ours, the number is a checked positive int.
+QUESTION_URL = "https://www.metaculus.com/questions/{post}/"
+# Closed vocabulary for WHY the missed-question check could not establish an answer. Named in the
+# push, never keyed on, like ROLLOVER_CHECK_PROBLEMS.
+UNANSWERED_CHECK_PROBLEMS = {
+    "activation_unreadable": "the live activation's project or id could not be read from the ledger",
+    "ledger_unreadable": "the blocked and unanswerable questions could not be read from the ledger",
+    "posts_unreadable": "Metaculus did not answer with a usable list of the project's open questions",
+    "forecasts_unreadable": "an open question did not say whether a forecast of ours is standing",
+    "page_full": f"Metaculus answered a full page of {UNANSWERED_OPEN_PAGE} open posts, so the list "
+    "may be truncated",
+    "timed_out": f"the check did not finish within {UNANSWERED_FETCH_SECONDS} s",
 }
 
 
@@ -1053,7 +1117,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _metaculus_get(path: str, deadline: float) -> object:
+def _metaculus_get(path: str, deadline: float, *, limit: int = ROLLOVER_RESPONSE_LIMIT) -> object:
     """One read-only GET against the Metaculus API, parsed. Raises on anything but a JSON answer.
 
     The token is sent as a header and never printed; an HTTPError's text is never rendered, by
@@ -1070,8 +1134,8 @@ def _metaculus_get(path: str, deadline: float) -> object:
     request = urllib.request.Request(f"{METACULUS_API}{path}", headers=headers, method="GET")
     opener = urllib.request.build_opener(_NoRedirect)
     with opener.open(request, timeout=remaining) as response:
-        body = response.read(ROLLOVER_RESPONSE_LIMIT + 1)
-    if len(body) > ROLLOVER_RESPONSE_LIMIT:
+        body = response.read(limit + 1)
+    if len(body) > limit:
         raise ValueError
     return json.loads(body)
 
@@ -1157,7 +1221,7 @@ def _read_rollover() -> tuple[int, int, int | None] | str:
     return outcome[0]
 
 
-def _check_rollover(state: dict) -> bool:
+def _check_rollover(state: dict, observation: tuple[int, int, int | None] | str) -> bool:
     """MiniBench's slug against the live activation (M1-347). True when paging or blind.
 
     Two throttles, deliberately. `rollover` is keyed on the code and the project pair;
@@ -1180,7 +1244,6 @@ def _check_rollover(state: dict) -> bool:
     if not isinstance(stored_check, dict):
         stored_check = {}
 
-    observation = _read_rollover()
     if isinstance(observation, str):
         reason = observation if observation in ROLLOVER_CHECK_PROBLEMS else "project_unreadable"
         key = _throttle_key(("rollover_check_failed",))
@@ -1269,6 +1332,572 @@ def _check_rollover(state: dict) -> bool:
     return True
 
 
+def _activation_id(raw: object) -> str | None:
+    """The `activation_id` of one stored `activation` event's `data`, or None. Pure, total.
+
+    Untrusted for `_activation_project_id`'s reason. Only a non-empty string is an id: it is
+    compared, never rendered.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    value = data.get("activation_id") if isinstance(data, dict) else None
+    return value if type(value) is str and value else None
+
+
+def _scope_question(scope: object, project: int) -> int | None:
+    """The question id in a `"{project}:{qid}"` scope, or None. Pure, total."""
+    if not isinstance(scope, str):
+        return None
+    prefix, _, rest = scope.partition(":")
+    if prefix != str(project) or not rest.isascii() or not rest.isdigit():
+        return None
+    return _positive_int(int(rest))
+
+
+def _excluded_questions(project: int, activation_id: str, deadline: float) -> frozenset[int]:
+    """Questions the worker already paged as lost, so the at-risk page leaves them out.
+
+    Two kinds, both appended by the worker exactly once at a transition that already paged
+    urgently: `question_blocked` under the CURRENT activation (re-running `tournament enable`
+    clears that verdict, so an older one is not a reason to stay quiet), and
+    `question_unanswerable` under any (a type the worker cannot answer does not become answerable).
+    They are excluded from UNANSWERED only. Never from MISSED: the worker's push is at most
+    once, and a question that closed unanswered is reported whatever was said before.
+
+    A row this cannot parse excludes nothing -- the loud direction. Read-only; raises on I/O.
+    """
+    timeout = max(0.0, min(float(LEDGER_TIMEOUT_SECONDS), deadline - time.monotonic()))
+    conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=timeout)
+    try:
+        rows = conn.execute(
+            "select kind, scope, data from tournament_events "
+            "where kind in ('question_blocked', 'question_unanswerable') and scope like ?",
+            (f"{project}:%",),
+        ).fetchall()
+    finally:
+        conn.close()
+    excluded: set[int] = set()
+    for kind, scope, raw in rows:
+        question = _scope_question(scope, project)
+        if question is None:
+            continue
+        if kind == "question_blocked":
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else None
+            except (ValueError, RecursionError):
+                data = None
+            if not isinstance(data, dict) or data.get("activation_id") != activation_id:
+                continue
+        excluded.add(question)
+    return frozenset(excluded)
+
+
+def _forecast_standing(my_forecasts: object, now: datetime) -> bool | None:
+    """Whether a forecast of ours is standing on one question, or None when it cannot say.
+
+    Pure, total. Measured, not assumed (2026-11-17): every question object in the last 400 poll
+    snapshots carries the `latest` key -- null when we have not forecast (54 cases), an object
+    when we have (1,677) -- and an answered question's `latest.end_time` is null. So:
+
+    - `latest` present and null: not answered.
+    - `latest` an object whose `end_time` is null: answered. Only this, per AC2.
+    - `latest` an object whose `end_time` has passed: withdrawn, so not answered.
+    - `latest` an object whose `end_time` is still to come: None. AC2 admits "answered" only with
+      no end time, and a forecast scheduled to end is not one this program ever makes, so it is
+      not evidence either way (round 1, B3: this used to read as answered, a green on no
+      evidence).
+    - anything else -- no `my_forecasts`, no `latest` KEY (an unauthenticated or differently
+      shaped answer), a non-object, an `end_time` that is not a time: None.
+
+    None is never "unanswered". A shape this cannot read is a blind check, which is its own
+    fault; reading it as unanswered would page urgently about every question at once.
+    `end_time` is epoch seconds in the API (the worker's own fake uses `timestamp()`); an ISO
+    string is accepted too. `bool` is refused: JSON `true` is not a time.
+    """
+    if not isinstance(my_forecasts, dict) or "latest" not in my_forecasts:
+        return None
+    latest = my_forecasts["latest"]
+    if latest is None:
+        return False
+    if not isinstance(latest, dict) or "end_time" not in latest:
+        return None
+    end = latest["end_time"]
+    if end is None:
+        return True
+    if type(end) in (int, float):
+        try:
+            ends = datetime.fromtimestamp(end, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+    else:
+        ends = _aware_stamp(end)
+        if ends is None:
+            return None
+    return False if ends <= now else None
+
+
+def _open_questions(
+    payload: object, now: datetime
+) -> tuple[tuple[tuple, ...], frozenset[int]] | str:
+    """`((question, post, opened, closes, answered), ...)` per open question, plus the ids of
+    listed questions that are NOT open and carry a standing forecast of ours; or a code. Pure.
+
+    The second part is round 1's B2. A group post stays open while its members close one by one,
+    so a closed member is still listed, with its own `my_forecasts`. Dropped unread, it looked to
+    the step like a watched question that had vanished after its close, and paged MISSED on a
+    question we had answered. Only positive evidence goes in: a closed member whose forecast this
+    cannot read is left to the step's ordinary freshness rule, and it does not blind the check.
+
+    Total over any parsed JSON. Walks each post's `question`, or each sub-question of its
+    `group_of_questions` (MiniBench publishes both shapes; the worker unpacks groups the same
+    way). Trusts each question's OWN `status`, never the `statuses=open` filter (M1-347's
+    lesson): a question whose status is another string is not open and is skipped; one with no
+    string status is not an answer. A post with neither shape carries no question this check
+    can read, and the API's other post kinds (notebooks, conditionals) are not MiniBench
+    questions; it is skipped rather than blinding the check for every question beside it.
+
+    A question id listed twice is not an answer either: two entries can disagree about whether we
+    answered, and which one wins would then be iteration order. The worker refuses a duplicate id
+    for the same reason (M1-202). Found by the property suite at the gate's profile.
+    """
+    if not isinstance(payload, dict):
+        return "posts_unreadable"
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return "posts_unreadable"
+    if len(results) >= UNANSWERED_OPEN_PAGE:
+        return "page_full"
+    found: list[tuple] = []
+    listed: set[int] = set()
+    settled: set[int] = set()
+    for post in results:
+        if not isinstance(post, dict):
+            return "posts_unreadable"
+        post_id = _positive_int(post.get("id"))
+        if post_id is None:
+            return "posts_unreadable"
+        single = post.get("question")
+        group = post.get("group_of_questions")
+        if isinstance(single, dict):
+            questions: list = [single]
+        elif isinstance(group, dict) and isinstance(group.get("questions"), list):
+            questions = group["questions"]
+        else:
+            continue
+        for question in questions:
+            if not isinstance(question, dict) or type(question.get("status")) is not str:
+                return "posts_unreadable"
+            question_id = _positive_int(question.get("id"))
+            # Before the status skip: an id listed once open and once closed disagrees just as
+            # much as one listed open twice (the property suite found both).
+            if question_id is not None:
+                if question_id in listed:
+                    return "posts_unreadable"
+                listed.add(question_id)
+            if question["status"] != "open":
+                if question_id is not None and (
+                    _forecast_standing(question.get("my_forecasts"), now) is True
+                ):
+                    settled.add(question_id)
+                continue
+            opened = _aware_stamp(question.get("open_time"))
+            closes = _aware_stamp(question.get("scheduled_close_time"))
+            if question_id is None or opened is None or closes is None:
+                return "posts_unreadable"
+            answered = _forecast_standing(question.get("my_forecasts"), now)
+            if answered is None:
+                return "forecasts_unreadable"
+            found.append((question_id, post_id, opened, closes, answered))
+    return tuple(found), frozenset(settled)
+
+
+def _watched(raw: object) -> dict[int, tuple[int, datetime, datetime]]:
+    """The stored `watching` map, `{question: (post, closes, seen)}`. Pure, total.
+
+    Read back out of a file a person can edit. An entry this cannot read is dropped: it can lose
+    a MISSED page it should have sent, never invent one, and the question -- if it is still open
+    -- is observed again on this same run.
+    """
+    watched: dict[int, tuple[int, datetime, datetime]] = {}
+    if not isinstance(raw, dict):
+        return watched
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not key.isascii() or not key.isdigit():
+            continue
+        question = _positive_int(int(key))
+        if question is None or not isinstance(entry, dict):
+            continue
+        post = _positive_int(entry.get("post"))
+        closes = _aware_stamp(entry.get("close"))
+        seen = _aware_stamp(entry.get("seen"))
+        if post is None or closes is None or seen is None:
+            continue
+        watched[question] = (post, closes, seen)
+    return watched
+
+
+def _watching_form(watching: dict[int, tuple[int, datetime, datetime]]) -> dict:
+    """What `_watched` reads back: the state file's form of the watch. Pure."""
+    return {
+        str(question): {"post": post, "close": closes.isoformat(), "seen": seen.isoformat()}
+        for question, (post, closes, seen) in sorted(watching.items())
+    }
+
+
+def _missed_form(missed: dict[int, tuple[int, datetime]]) -> list:
+    """What `_missed_entries` reads back. Pure."""
+    return [
+        {"question": question, "post": post, "close": closes.isoformat()}
+        for question, (post, closes) in sorted(missed.items())
+    ]
+
+
+def _missed_entries(raw: object) -> dict[int, tuple[int, datetime]]:
+    """The stored undelivered misses, `{question: (post, closes)}`. Pure, total."""
+    missed: dict[int, tuple[int, datetime]] = {}
+    if not isinstance(raw, list):
+        return missed
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        question = _positive_int(entry.get("question"))
+        post = _positive_int(entry.get("post"))
+        closes = _aware_stamp(entry.get("close"))
+        if question is None or post is None or closes is None:
+            continue
+        missed[question] = (post, closes)
+    return missed
+
+
+def _unanswered_step(
+    watched: dict[int, tuple[int, datetime, datetime]],
+    observed: tuple[tuple, ...],
+    excluded: frozenset[int],
+    now: datetime,
+    settled: frozenset[int] = frozenset(),
+) -> tuple[
+    dict[int, tuple[int, datetime, datetime]],
+    list[tuple],
+    dict[int, tuple[int, datetime]],
+    list[str],
+]:
+    """One good read against what the last good reads saw. Pure.
+
+    Returns `(watching, at_risk, missed, notes)`:
+
+    - `watching` holds every open question with no forecast of ours, stamped `seen=now`.
+    - `at_risk` is the subset open for UNANSWERED_AFTER or more and not `excluded`.
+    - `missed` holds every question that closed without a forecast of ours: still listed
+      unanswered at or after its close, or gone from the list after its close having last
+      been seen unanswered within MISSED_FRESH_WITHIN of it. `excluded` plays no part here.
+    - `notes` are journal lines for what is not a page: a question that left the list before
+      its close (an early close, or a withdrawal), and one whose last observation is too old to
+      say it closed unanswered.
+
+    A question answered now leaves `watching` silently; that is the ordinary path. So does one
+    in `settled`: listed but no longer open, with a standing forecast of ours (round 1, B2).
+    """
+    watching: dict[int, tuple[int, datetime, datetime]] = {}
+    at_risk: list[tuple] = []
+    missed: dict[int, tuple[int, datetime]] = {}
+    notes: list[str] = []
+    listed: set[int] = set()
+    for question, post, opened, closes, answered in observed:
+        listed.add(question)
+        if answered:
+            continue
+        if closes <= now:
+            missed[question] = (post, closes)
+            continue
+        watching[question] = (post, closes, now)
+        if now - opened >= UNANSWERED_AFTER and question not in excluded:
+            at_risk.append((question, post, opened, closes))
+    for question, (post, closes, seen) in sorted(watched.items()):
+        if question in listed or question in settled:
+            continue
+        if closes > now:
+            notes.append(f"NOTE: q{question} left the open list before its close; not paged")
+        elif seen >= closes - MISSED_FRESH_WITHIN:
+            missed[question] = (post, closes)
+        else:
+            notes.append(
+                f"NOTE: q{question} closed while this check was not observing it; "
+                "whether it was answered is not known, so it is not paged"
+            )
+    return watching, sorted(at_risk), missed, notes
+
+
+def _unanswered_observation(deadline: float, now: datetime) -> tuple | str:
+    """`(project, activation id, excluded, observed)`, or the code for why it cannot say.
+
+    Each stage catches `Exception` broadly, for `_rollover_observation`'s reason: this is the
+    boundary where anything that goes wrong is a check that could not run.
+    """
+    try:
+        raw = _latest_activation_row(deadline)
+    except Exception:
+        raw = None
+    project = _activation_project_id(raw)
+    activation_id = _activation_id(raw)
+    if project is None or activation_id is None:
+        return "activation_unreadable"
+    try:
+        excluded = _excluded_questions(project, activation_id, deadline)
+    except Exception:
+        return "ledger_unreadable"
+    try:
+        payload = _metaculus_get(
+            f"/posts/?tournaments={project}&statuses=open&with_cp=true"
+            f"&limit={UNANSWERED_OPEN_PAGE}",
+            deadline,
+            limit=UNANSWERED_RESPONSE_LIMIT,
+        )
+    except Exception:
+        return "posts_unreadable"
+    parsed = _open_questions(payload, now)
+    if isinstance(parsed, str):
+        return parsed
+    observed, settled = parsed
+    return (project, activation_id, excluded, observed, settled)
+
+
+def _read_unanswered(now: datetime) -> tuple | str:
+    """`_unanswered_observation` under a wall-clock bound of UNANSWERED_FETCH_SECONDS.
+
+    `_read_rollover`'s shape and for its reason: urllib's timeout is per blocking operation,
+    so only the join makes the bound true.
+    """
+    outcome: list[tuple | str] = []
+    deadline = time.monotonic() + UNANSWERED_FETCH_SECONDS
+
+    def work() -> None:
+        try:
+            outcome.append(_unanswered_observation(deadline, now))
+        except BaseException:
+            outcome.append("posts_unreadable")
+
+    worker = threading.Thread(target=work, name="wj-unanswered", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive() or not outcome:
+        return "timed_out"
+    return outcome[0]
+
+
+def _minutes(delta: timedelta) -> int:
+    return int(delta.total_seconds() // 60)
+
+
+def _listed(lines: list[str]) -> str:
+    shown = lines[:UNANSWERED_LISTED]
+    more = len(lines) - len(shown)
+    return "\n".join(shown) + (f"\n- and {more} more" if more else "")
+
+
+def _unanswered_blind(state: dict, stored_check: dict, reason: str, now: datetime) -> bool:
+    """A read that could not establish the answer (M1-366). Always True: blind is not green.
+
+    Touches `unanswered_check` only. The standing `unanswered` entry is left exactly as the last
+    good read left it, so a timeout neither clears a question being watched nor re-keys its
+    throttle (the M1-343/M1-347 lesson). Pages only once the check has been blind for
+    UNANSWERED_BLIND_AFTER without a break, then every six hours.
+    """
+    reason = reason if reason in UNANSWERED_CHECK_PROBLEMS else "posts_unreadable"
+    key = _throttle_key(("unanswered_check_failed",))
+    same = stored_check.get("key") == key
+    since = _aware_stamp(stored_check.get("since")) if same else None
+    if since is None or since > now:
+        since = now
+    entry: dict = {"key": key, "since": since.isoformat()}
+    previous = stored_check.get("last_alert")
+    if same and isinstance(previous, str):
+        entry["last_alert"] = previous
+    if now - since >= UNANSWERED_BLIND_AFTER and _key_is_due(
+        key, stored_check, now, UNANSWERED_CHECK_REALERT_AFTER
+    ):
+        body = (
+            "The missed-question check could not establish whether MiniBench's open questions "
+            "have a forecast of ours standing, and has not been able to for "
+            f"{_minutes(now - since)} min. An unanswered or missed question would go unreported "
+            "until it can.\n\n"
+            f"- {UNANSWERED_CHECK_PROBLEMS[reason]}"
+            "\n\nThis is not the worker: WORKER DOWN pages on its own. Usually a Metaculus outage "
+            "or a slow answer; it clears by itself on the next good read."
+            "\n\nCheck: journalctl --user -u whiskeyjack-watchdog.service -n 40"
+            "\n       docs/RUNBOOK.md W3"
+        )
+        if _push(
+            "whiskeyjack: missed-question check failed",
+            body,
+            priority="default",
+            tags="grey_question",
+            timeout=UNANSWERED_PUSH_TIMEOUT_SECONDS,
+        ):
+            entry["last_alert"] = _now().isoformat()
+    state["unanswered_check"] = entry
+    _say("UNANSWERED CHECK FAILED: " + reason)
+    return True
+
+
+def _check_unanswered(
+    state: dict, rollover: tuple[int, int, int | None] | str, tournament_down: bool
+) -> bool:
+    """Every open question against whether a forecast of ours stands on it (M1-366).
+
+    True when a question is at risk, a miss is pending, or the check is blind.
+
+    Skipped, with no GET and no state change, while the rollover check reports that MiniBench
+    is on a project the activation does not cover: every question of the new project is
+    unanswered by construction, MINIBENCH ROLLED OVER already pages that urgently, and this would
+    otherwise page the same fault a second time per question. A rollover check that could not
+    run is not a mismatch; this check reads its own activation and runs.
+
+    While WORKER DOWN stands nothing is pushed here. That page is already urgent and already
+    says every question is at risk; a second urgent page per run would add noise, not news.
+    Misses are kept, and the first run after recovery sends them as one push. Every throttle
+    stamp is written on delivery only, so a refused push is retried by the next run.
+    """
+    if isinstance(rollover, tuple) and rollover[0] != rollover[1]:
+        _say(
+            "SKIP: missed-question check (MiniBench is on a project the activation does not cover)"
+        )
+        return False
+    now = _now()
+    stored = state.get("unanswered")
+    if not isinstance(stored, dict):
+        stored = {}
+    stored_check = state.get("unanswered_check")
+    if not isinstance(stored_check, dict):
+        stored_check = {}
+
+    reading = _read_unanswered(now)
+    if isinstance(reading, str):
+        return _unanswered_blind(state, stored_check, reading, now)
+    state["unanswered_check"] = {}
+    project, activation_id, excluded, observed, settled = reading
+
+    rebound = stored.get("project") != project or stored.get("activation_id") != activation_id
+    watched = {} if rebound else _watched(stored.get("watching"))
+    paged_raw = [] if rebound else stored.get("paged")
+    paged = {
+        question
+        for question in (paged_raw if isinstance(paged_raw, list) else [])
+        if _positive_int(question) is not None
+    }
+    last_alert = None if rebound else _aware_stamp(stored.get("last_alert"))
+    # Kept across a rebind: a miss is a fact about the project it happened in.
+    pending = _missed_entries(stored.get("pending_missed"))
+    missed_last = _aware_stamp(stored.get("missed_last_alert"))
+    # Round 1, B1: misses held while WORKER DOWN stood are owed at the first run after recovery,
+    # whatever the hourly batch says (AC4). True only, so a hand-edited value cannot owe a push.
+    held = stored.get("missed_held") is True
+    # Round 1, non-blocking: each miss is sent ONCE. A question still listed overdue on the next
+    # poll would otherwise be enqueued again after its delivery. Kept across a rebind, like
+    # `pending`, and pruned on the same 48 h.
+    sent = _missed_entries(stored.get("missed_sent"))
+
+    watching, at_risk, missed, notes = _unanswered_step(watched, observed, excluded, now, settled)
+    for note in notes:
+        _say(note)
+    pending.update({question: entry for question, entry in missed.items() if question not in sent})
+    for record in (pending, sent):
+        for question, (_post, closes) in sorted(record.items()):
+            if now - closes > UNANSWERED_RETENTION:
+                if record is pending:
+                    _say(f"NOTE: q{question} was missed and never delivered; dropped after 48 h")
+                del record[question]
+    at_risk_ids = {question for question, *_ in at_risk}
+    paged &= at_risk_ids
+    # Decided before any push: a miss delivered this run is still a fault this run reported.
+    faulted = bool(at_risk or pending)
+
+    if tournament_down and (at_risk or pending):
+        _say("HELD: question pages wait while WORKER DOWN stands")
+    if tournament_down and pending:
+        held = True
+    if at_risk and not tournament_down:
+        fresh = at_risk_ids - paged
+        if fresh or last_alert is None or now - last_alert >= UNANSWERED_REALERT_AFTER:
+            lines = [
+                f"- q{question}{' (new)' if question in fresh else ''}: open "
+                f"{_minutes(now - opened)} min, closes in {_minutes(closes - now)} min  "
+                + QUESTION_URL.format(post=post)
+                for question, post, opened, closes in at_risk
+            ]
+            body = (
+                f"{len(at_risk)} open MiniBench question(s) still have no forecast of ours "
+                f"standing on Metaculus {_minutes(UNANSWERED_AFTER)} or more minutes after "
+                "opening. The worker usually answers in about five. One that closes unanswered "
+                "is lost.\n\n"
+                + _listed(lines)
+                + "\n\nCheck: whiskeyjack-bot tournament status --config config/tournament.yaml"
+                "\n       journalctl --user -u whiskeyjack-tournament.service -n 60"
+                "\n       docs/RUNBOOK.md W3"
+            )
+            if _push(
+                "whiskeyjack: QUESTION UNANSWERED",
+                body,
+                priority="urgent",
+                tags="rotating_light",
+                timeout=UNANSWERED_PUSH_TIMEOUT_SECONDS,
+            ):
+                paged = set(at_risk_ids)
+                last_alert = _now()
+    if pending and not tournament_down:
+        if held or missed_last is None or now - missed_last >= MISSED_REALERT_AFTER:
+            lines = [
+                f"- q{question}: closed {closes.strftime('%Y-%m-%d %H:%M')}Z  "
+                + QUESTION_URL.format(post=post)
+                for question, (post, closes) in sorted(pending.items())
+            ]
+            body = (
+                f"{len(pending)} MiniBench question(s) closed with no forecast of ours standing. "
+                "They are lost; nothing recovers them. What matters now is why, before the next "
+                "one closes.\n\n"
+                + _listed(lines)
+                + "\n\nCheck: whiskeyjack-bot tournament status --config config/tournament.yaml"
+                "\n       journalctl --user -u whiskeyjack-tournament.service -n 60"
+                "\n       docs/RUNBOOK.md W3"
+            )
+            if _push(
+                "whiskeyjack: QUESTION MISSED",
+                body,
+                priority="urgent",
+                tags="x",
+                timeout=UNANSWERED_PUSH_TIMEOUT_SECONDS,
+            ):
+                sent.update(pending)
+                pending = {}
+                held = False
+                missed_last = _now()
+
+    state["unanswered"] = {
+        "project": project,
+        "activation_id": activation_id,
+        "watching": _watching_form(watching),
+        "paged": sorted(paged),
+        "last_alert": None if last_alert is None else last_alert.isoformat(),
+        "pending_missed": _missed_form(pending),
+        "missed_last_alert": None if missed_last is None else missed_last.isoformat(),
+        "missed_held": held and bool(pending),
+        "missed_sent": _missed_form(sent),
+    }
+    if at_risk:
+        _say("UNANSWERED: " + ", ".join(f"q{question}" for question in sorted(at_risk_ids)))
+    if missed or pending:
+        _say("MISSED: " + ", ".join(f"q{question}" for question in sorted({*missed, *pending})))
+    if not faulted:
+        _say(
+            f"OK: no open question is unanswered past {_minutes(UNANSWERED_AFTER)} min "
+            f"({len(observed)} open)"
+        )
+    return faulted
+
+
 def main() -> int:
     """Every subject, every run, whatever the others say.
 
@@ -1283,14 +1912,18 @@ def main() -> int:
     observed_since = _observe(state, _now())
     tournament_down = _check_tournament(state)
     resolutions_down = _check_resolutions(state, observed_since)
-    # Last, and with nothing downstream of it: the only subject that waits on the network, so
-    # the other two have already paged by the time it could be slow.
-    rollover_down = _check_rollover(state)
+    # Last, after the two that need no network, so they have already paged by the time these
+    # could be slow. The rollover observation is read once and handed to both network subjects:
+    # the missed-question check stands down on a mismatch (M1-366), which is a fact only the
+    # rollover read establishes.
+    rollover = _read_rollover()
+    rollover_down = _check_rollover(state, rollover)
+    unanswered_down = _check_unanswered(state, rollover, tournament_down)
     # M1-344: after the save, because only the save knows whether it failed. Reported, never
-    # returned: a state file that cannot be written is not one of the three subjects, and
+    # returned: a state file that cannot be written is not one of the four subjects, and
     # it must not be the reason this run exits non-zero.
     _report_persistence(state, *_save_state(state))
-    return 1 if tournament_down or resolutions_down or rollover_down else 0
+    return 1 if tournament_down or resolutions_down or rollover_down or unanswered_down else 0
 
 
 if __name__ == "__main__":

@@ -11490,6 +11490,10 @@ forecasts against a deadline. A stopped resolutions timer loses nothing permanen
 commands are idempotent, `Persistent=true` catches a missed run up, and the ledger is unaffected.
 A channel where everything is urgent has no urgent.
 
+*(Amended by M1-366, 2026-11-17. The rule that `urgent` means "lost, not delayed" now has one
+exception, granted by the owner: `QUESTION UNANSWERED` is urgent although the question is still
+recoverable when it fires. See M1-366's Deviation. The resolutions page stays `high`.)*
+
 ### Rejected — letting the watchdog restart the timer
 
 It has no write path by design and this is not the exception. A watchdog that repairs cannot be
@@ -17478,3 +17482,290 @@ Read from the live ledger read-only on 2026-11-16 02:27 UTC.
 - **Cost:** mean $0.238 per forecast (range $0.197 to $0.287), against $0.179 at medium over
   1.3 calls. Six forecasts is a small sample; the wave-27 budget (D64) assumes $0.245.
 - No `length` reply so far, so D59's revisit trigger has not fired.
+
+## M1-366 — page urgently when a MiniBench question is unanswered, missed or unanswerable
+
+A missed MiniBench question is lost, not delayed: each is open for 180 minutes. Before this
+item, a blocked question paged at `high`. A deferred type was logged and dropped. A question
+first reached inside the five-minute close margin was counted and dropped. And nothing compared
+the platform's open questions with whether we had answered them, which is how the 2026-09-21
+rollover lost 13 questions while every poll reported `discovered: 0`.
+
+Owner decisions, 2026-11-10 (the meta review of 2026-11-08, row merged in PR #151):
+- the watchdog is the authority and reads the platform as witness, and the worker adds immediate
+  pages for reasons only it knows;
+- the re-page interval is 30 minutes;
+- push bodies may carry validated ids, links built from them, our own codes and computed times,
+  and never titles (D58).
+
+What shipped:
+
+- **Part A, `notify.py`.** `question_blocked` moves `high` → `urgent`. The tag rule tested
+  `== "high"` alone, so an urgent event would have carried the chart emoji; it now tags
+  `rotating_light` for `{high, urgent}`. An import-time assert holds every priority inside ntfy's
+  vocabulary, because ntfy silently demotes an unknown one to `default`. There is one new event,
+  `question_unanswerable` (`urgent`, a 1-day backstop window).
+- **Part B, `tournament.py`.** `_record_unanswerable` appends one `question_unanswerable` row per
+  question scope and pages only when it appends, for three reasons:
+  - an unsupported-type deferral;
+  - a question first reached inside the close margin, with no confirmed forecast in the ledger
+    and no block under this activation;
+  - a question with no close time.
+- **Part C, `deploy/wj-watchdog`.** A fourth subject, `_check_unanswered`, with three pages:
+  `QUESTION UNANSWERED`, `QUESTION MISSED` and `missed-question check failed`. The budget goes from
+  246 s to 277 s, and `TimeoutStartSec` from 260 to 285.
+- **Docs.** RUNBOOK W3, five symptom-index rows, R5 rewritten, the subjects and network paragraphs,
+  four `OK:` lines.
+
+No migration (`tournament_events.kind` is free text), no dependency, and no `AppConfig`, config or
+prompt byte, so the live activation is untouched.
+
+### Verified before coding — the platform witness (2026-11-17)
+
+The brief's standing risk was that `my_forecasts` on the list endpoint had only been seen in the
+worker's SDK snapshots. Four read-only GETs, spaced at least 15 s from the worker's poll:
+
+- `/posts/?tournaments=33169&statuses=open&with_cp=true&limit=100` with the bot token answered
+  200, 18,980 bytes, two open posts (q46870, q46871). Both answered: `latest` an object with
+  `end_time: null`. That is about 9.5 KB per post.
+- Recently closed posts carry `my_forecasts` keys `{history, latest, score_data}`.
+- **No token: HTTP 403.** So an unauthenticated read raises, and that reads as blind.
+- An empty open list still has a non-null `next`, as M1-347 recorded, so `next` is never read.
+- The live activation is project **33169**, not the 33135 the brief named: follow mode rebound it.
+  The check reads the project from the activation row every run.
+
+The last 400 poll snapshots hold 1,731 question objects with `my_forecasts`. **All** of them carry
+the `latest` key: `null` in 54 (unanswered), an object in 1,677. So "unanswered" is `latest`
+present and null, and a missing key is anomalous. The repo's old group fixture is exactly that
+anomaly (`{"history": null}`, no `latest`).
+
+### Decision — the watchdog is the authority, reading the platform
+
+Owner decision; recorded so the reviewer can see it was weighed. The worker cannot see a question
+it never discovered: wrong project, retired activation, worker down, a discovery bug. All 16
+historical answers that came 20 minutes or more after open were launch day or the rollover. The
+ledger is the record of what *we did*. Only the platform knows whether a forecast is standing
+on a question.
+
+### Decision — worker pages de-duplicate on a ledger row, not on the notifier's window
+
+`Notifier`'s windows are tumbling (`floor(epoch / window)`, chosen there to avoid a
+read-then-write race). A deferral recurs on every poll for 180 minutes, so any window would page
+twice across a boundary, and "once per question" (AC10) would be false.
+
+So the worker appends a `question_unanswerable` row at the transition and pages only when it
+appends. That is `_notify_blocked`'s shape: page where the row is appended, never at the gate
+that re-reads it. The row is keyed on the **scope** alone, not the activation, which is the
+stricter reading of "once per question": re-running `tournament enable` does not make a date
+question answerable.
+
+It also closes R5's gap. A live deferral now leaves a ledger trace, where before it left none.
+
+### Decision — the close-margin page requires the ledger to show no confirmed forecast
+
+Every answered question passes through the close-margin skip at its close. Without the ledger
+check, every question would page at close. The check is a ledger read, not a platform GET: it
+keeps the skip free, and the watchdog is the platform witness. A question already blocked under
+this activation is skipped too, because it paged urgently with its real reason when it was blocked.
+
+### Decision — MISSED is never suppressed for a blocked or unanswerable question
+
+The exclusion applies to the at-risk page only. In-process delivery is at most once (`Notifier`
+claims its stamp before posting, so a failed blocked push is never retried), so the watchdog's
+MISSED is the only page that cannot have been lost. A property asserts the exclusion set never
+changes `missed`.
+
+### Decision — a blind read is blind for everything, including the vanish logic
+
+A missing or malformed `my_forecasts` returns `forecasts_unreadable` and never "unanswered":
+reading it as unanswered would page urgently about every open question at once. A full page of
+100 is also blind (`page_full`), because a truncated list would read the missing questions as
+having left. At most 12 have ever been open at once, so a full page is an anomaly. A blind run
+touches only `unanswered_check`, so it neither clears a watched question nor re-keys a throttle
+(M1-343/M1-347).
+
+### Decision — a question id listed twice is a blind read
+
+Found by the property suite at the gate's `dev` profile, not by the `fast` one. Two entries for
+one question id can disagree about whether we answered, and the step then reads them in list
+order, so whether it pages would be an accident of ordering. The parser now returns
+`posts_unreadable` for any repeated id, checked **before** the status skip. The second gate run
+found an id listed once open and once closed, which slipped past a first fix that compared open
+entries only. That is the worker's own rule: `normalize_questions` refuses a duplicate id
+(M1-202). The unit test runs four orders. The three new properties then held at 20,000 examples
+each, against the 200 of the gate's profile.
+
+### Decision — MISSED needs a fresh last observation
+
+A question gone from the list after its close counts as missed only if this check last saw it
+unanswered within 10 minutes of the close. That is two watchdog intervals. The worker does not
+start a question inside its last five minutes, so a forecast landing in an unobserved gap
+narrower than that is unlikely, and a stale observation logs a `NOTE:` line instead of claiming a
+loss. A question still **listed** unanswered at or after its close is missed directly.
+
+### Decision — at most one push per kind per run, stamped on delivery
+
+UNANSWERED is due when an at-risk id is not in `paged`, or 30 minutes after the last *delivered*
+page. MISSED goes out at once, and a burst is batched to at most one page an hour. Each miss is
+sent once and cleared on delivery. A refused push leaves `paged`, `last_alert` and
+`pending_missed` as they were, so the next run retries it (tests
+`test_a_refused_push_is_retried_by_the_next_run` and
+`test_a_refused_miss_stays_pending_until_it_is_delivered`).
+
+### Decision — stand down while WORKER DOWN or a rollover mismatch stands
+
+While WORKER DOWN stands nothing is pushed: that page is already urgent and already means every
+question is at risk. Misses accumulate and flush as one push on recovery (AC4).
+
+On a rollover mismatch the check is skipped with no GET and no state change, since every question
+of the new project is unanswered by construction and `MINIBENCH ROLLED OVER` already pages. A
+rollover check that could not *run* is not a mismatch, so this check reads its own activation and
+runs. To make that possible, `main` reads the rollover observation once and passes it to both
+checks, and `_check_rollover`'s only change is its signature.
+
+### Decision — the exit status is decided before a push clears what it delivered
+
+Found by the first run of the new tests: `return bool(at_risk or pending)` after a delivered
+MISSED had emptied `pending`, so the run that reported a loss exited 0.
+
+### Decision — every new branch mutation-tested: 31 mutants, 31 killed
+
+Run against the committed tree `a0fa484`, `__pycache__` cleared before each mutant, each mutant
+applied by exact string replacement and reverted with `git checkout`. Every kill was a test
+failure (pytest exit 1), not a collection error (exit 2). The script is not committed, and
+nothing here cites its output as a file.
+
+- **Watchdog (23):** the `latest`-key guard, the `end_time` arm, the 20-minute comparison
+  (`>=` → `>` and two minutes early), the at-risk exclusion, the exclusion leaking into MISSED,
+  the freshness guard, both WORKER DOWN holds, the `paged` new-id rule, the 30-minute re-page,
+  stamping before delivery for each page, the hourly MISSED batch, trusting the question's own
+  status, the blocked-activation match, the unanswerable-kind exclusion, the rollover skip, the
+  blind threshold, the blind clock's continuity, `page_full`, the rebind reset, and a question
+  listed after its close.
+- **Worker (6):** the row de-dup, the answered-in-ledger check, the blocked check, the deferral
+  loop, the `no_close_time` reason and the idless-deferral page.
+- **Notifier (2):** the alarm-tag rule and the blocked priority.
+
+### Deviation — an at-risk page is `urgent` although the question is still recoverable
+
+`docs/M1-NOTES.md`'s M1-341 rule, "urgent means lost, not delayed, and a channel where everything
+is urgent has no urgent", would make `QUESTION UNANSWERED` `high`. The owner granted the
+exception (2026-11-08): with 160 minutes left the question is recoverable, and recoverable is
+exactly when a page is worth waking for. The M1-341 note is amended to cite this. `QUESTION
+MISSED` and the two worker pages are lost-class and need no exception.
+
+### Deviation — a deferral with no usable question id is de-duplicated by the window
+
+It has no scope, so there is no row to key on, and it falls back to the notifier's 1-day window
+keyed on the project. That can page twice across a UTC-day boundary. It is rare by construction:
+`DeferralEvent` carries `None` only when the SDK object exposes no exact `int`.
+
+### Deviation — the push bodies render ids (D58)
+
+M1-347's rollover page renders no value read from Metaculus or the ledger. These pages render
+validated question and post ids, `https://www.metaculus.com/questions/<post>/` built from a
+checked positive int, our own reason codes and computed minutes. D58 records the owner's
+decision. Titles never appear: every fixture post carries a sentinel title, and the tests assert
+that it is absent from every push.
+
+### Rejected — the ledger as the witness for the watchdog
+
+It records what we did, not what the platform holds. It cannot see a question the worker never
+discovered, which is the failure the rollover showed.
+
+### Rejected — one push per question
+
+Up to 12 questions open at once would mean 12 urgent pages a run. One push names every question,
+capped at 20 lines so the body stays under ntfy's 4,096-byte attachment threshold.
+
+### Rejected — a per-question confirming GET
+
+The list with `with_cp=true` already carries each question's own `my_forecasts`. A GET per
+question multiplies the 429 risk on a token the worker shares.
+
+### Rejected — any `AppConfig` field for the thresholds
+
+A new field changes `config_sha256` and retires the live activation. The thresholds are
+constants beside the watchdog's others, each with its own name (T-909).
+
+### Rejected — a "cleared" push
+
+The budget holds two pushes for this check. Silence after a page is the clear, and the journal's
+`OK:` line records it.
+
+### Rejected — reusing `question_blocked` for deferrals
+
+That kind carries a fingerprint and gate semantics: an activation-scoped verdict that
+`tournament enable` clears. A deferral has no canonical question to fingerprint, and the
+verdict is not one an enable should clear.
+
+### Deferred (do not read the absence as an omission)
+
+- **The Cup ledger.** The watchdog watches the MiniBench activation only. The Cup profile is
+  dormant (P1), and it shares the ntfy topic, so its blocked pages are urgent too.
+- **Early closes.** A question that leaves before its scheduled close is logged, not paged. An
+  early close that happened while we were unanswered is indistinguishable from a withdrawal.
+- **Old-project questions across a rebind.** `watching` resets when the project or activation
+  changes. An undelivered miss is kept, but a question of the old project still open at the
+  rebind is not followed.
+- **An invalid (as opposed to missing) token** was not tried live. Any 4xx raises, so it reads as
+  blind.
+- **A post with neither `question` nor `group_of_questions`** (a notebook or a conditional) is
+  skipped rather than blinding the check. The worker defers a conditional and pages it as
+  `unsupported_type`.
+
+### Standing risk — not verifiable offline
+
+- An open, unanswered `latest: null` was confirmed from the worker's SDK snapshots (54 cases),
+  not from a watchdog-path GET: nothing on 33169 was open and unanswered at the moment of the
+  read. The answered shape and the key's presence were confirmed on the watchdog's exact path.
+- In-process delivery stays at most once. A failed `question_blocked` or
+  `question_unanswerable` push is not retried; the watchdog's MISSED is the backstop.
+- The worker's close-margin check is ledger-based. A live post the ledger did not record reads as
+  unanswered there, and pages once as `QUESTION UNANSWERABLE (close_margin)` alongside the
+  existing `unrecorded_post` page.
+- The phone's treatment of an urgent page (sound, bypassing do-not-disturb) is a device setting.
+  AC11's one deliberate test push confirms it at deploy.
+
+### Round 1 — CHANGES REQUESTED on `94e4692`; three blockers and one observation, all fixed
+
+Each finding was reproduced by execution before any fix. The reviewer's scenario was written
+as a regression (`test_r1_*` in `tests/unit/test_watchdog.py`) and failed on `94e4692` for the
+stated reason. Each fix was then mutation-checked, and all five mutants were killed.
+
+- **B1 (AC4) — recovery did not always flush held misses.** The hourly MISSED batch applied on
+  recovery too. With a miss delivered at 12:00 and another held during a WORKER DOWN at 12:10,
+  recovery at 12:15 sent nothing. **Fix:** a held miss sets `missed_held`, which bypasses the
+  batch at the first run after recovery and clears on delivery. The hourly batch now applies only
+  to misses that were not held. **Regression:**
+  `test_r1_recovery_flushes_a_held_miss_inside_the_hourly_window`.
+- **B2 (AC2) — an answered, closed group member paged MISSED.** A group post stays open while its
+  members close, so a closed member is still listed with its own `my_forecasts`. The parser
+  dropped every non-open question unread, and the step then read a watched member as having
+  vanished after its close. **Fix:** `_open_questions` also returns `settled`, the listed,
+  non-open ids carrying a standing forecast, and the step drops those from the watch silently.
+  Only positive evidence counts. A closed member whose forecast cannot be read still falls to
+  the freshness rule and does not blind the check. **Regression:**
+  `test_r1_a_group_member_closed_with_a_standing_forecast_is_not_missed`.
+- **B3 (AC2) — a future `end_time` read as answered.** AC2 says "answered only when ...
+  `latest` is present with no `end_time`". This was my reading drifting from the criterion: I
+  had admitted a future end as standing. **Fix:** `_forecast_standing` is True only for
+  `end_time: null`; a future end time is blind (None), and a past one stays unanswered
+  (withdrawn). **Regression:** `test_r1_a_future_end_time_is_not_a_standing_forecast[epoch|iso]`.
+  The property now asserts "answered" exactly when `end_time` is null.
+- **Non-blocking — a miss listed overdue on two polls was sent twice.** It was classed
+  non-blocking because the ACs limit pushes per run, not per miss. It is fixed anyway, because
+  these notes and RUNBOOK W3 both claim that every miss is sent once. A delivered miss is
+  recorded in `missed_sent`, kept across a rebind and pruned at 48 h, and is not re-enqueued.
+  **Regression:** `test_r1_a_miss_listed_overdue_on_two_polls_is_sent_once`.
+
+Property-test detail: the parser property's source index is now keyed by `(type, id)`, because
+JSON `true == 1` let a junk `true` id overwrite question 1's entry in the test's own lookup
+table.
+
+### Round 2 — APPROVE on `f0dfe5a`
+
+B1, B2, B3 and the round-1 observation are all closed. The reviewer re-ran the five regression
+cases against `94e4692`, where they fail, and against `f0dfe5a`, where they pass. There are no
+new blocking findings and no new backlog candidates. The live endpoint shape and the owner's
+phone test remain deploy checks (AC11).
