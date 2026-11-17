@@ -2018,4 +2018,22 @@ existing intermediate overflows". `a765849` uses it everywhere and removes the c
 changes the arithmetic on every log scale, not only an overflowing one. Deviation 3 gives the
 measurement behind that and what it costs.
 
-Round 2 pending at the time these notes were written.
+**Owner decision, 2026-11-16, before round 2.** The owner had agreed to the reviewer's minimal
+B2 fix, and was asked again once `a765849` had replaced it. The answer was to keep the single
+form.
+
+**Round 2, on `2883806`: APPROVE, no blocking findings.** B1 and B2 were both marked closed,
+each on its round-1 reproduction: the first now refuses with the lower-bound sentence, the
+second returns bucket 150 and `log_mass` -4.896191159705386. None of the request's seven risk
+claims was faulted. The reviewer reports running the 196 scoring unit tests under Python
+3.14.4 and a containment check of its own on the log-scale bucket: 4,415 cases against an
+80-digit oracle, both orientations, counts up to 10,000. It could not run the property suite
+(no Python 3.11 there, and hypothesis's native extension did not load), as in round 1.
+
+One non-blocking candidate: verify platform parity at log-scale bucket edges, with the
+acceptance criterion "when such records become available, commit numerical fixtures covering
+edge resolutions and both zero-point orientations, and document every discrepancy". That is
+the second standing risk above, which names the same trigger. No backlog row was filed for
+it: no live question is log-scaled, so there is no record to build a fixture from.
+
+This entry and the backlog row's flip to Done are the only change after the approved commit.
