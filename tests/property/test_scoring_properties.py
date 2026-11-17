@@ -368,12 +368,13 @@ MESSAGE_PROBES: tuple[Callable[[], object], ...] = (
     lambda: recompute("local_log_binary/1", f"{SENTINEL}-metric", CANARY, "yes"),  # metric mismatch
 )
 
-# M4-809's sites, in source order: 17 more raise statements and 19 more messages. One
+# M4-809's sites, in source order: 19 more raise statements and 21 more messages. One
 # message interpolates a field name across four fields from three statements (a wrong type,
 # a non-finite value, an integer too large for a float), and one across two fields, so those
 # get a probe per field. Every probe input carries a canary the same way: the sentinel for
 # text, and `123456789` in the digits of every number, which the test below looks for as
-# well as the probability canaries' reprs.
+# well as the probability canaries' reprs. Two of the 19 are review round 1's: a closed
+# bound's end of the CDF, one site per bound.
 _CONTINUOUS_CDF = [0.05, 0.25, 0.5, 0.75, 0.95]
 _TOO_LARGE_FOR_A_FLOAT = int("123456789" * 40)
 
@@ -404,6 +405,12 @@ CONTINUOUS_MESSAGE_PROBES: tuple[Callable[[], object], ...] = (
     lambda: _continuous_probe([CANARY, 0.5]),  # one more point than ... inbound outcomes
     lambda: _continuous_probe([*_CONTINUOUS_CDF[:4], 1.123456789]),  # ... probability in [0, 1]
     lambda: _continuous_probe([0.05, 0.25, 0.5, CANARY, 0.95]),  # cdf must not decrease
+    lambda: _continuous_probe(  # cdf must start at 0 when the lower bound is closed
+        [CANARY, 0.25, 0.5, 0.75, 0.95], open_lower_bound=False
+    ),
+    lambda: _continuous_probe(  # cdf must end at 1 when the upper bound is closed
+        [0.05, 0.25, 0.5, 0.75, 0.9123456789], open_upper_bound=False
+    ),
     lambda: _continuous_probe(resolution=[SENTINEL]),  # resolution must be a non-empty string
     lambda: _continuous_probe(resolution=f"{SENTINEL}-thirty"),  # ... decimal or a bound marker
     lambda: _continuous_probe(resolution="1.123456789e999"),  # resolution must be finite
@@ -423,8 +430,8 @@ def test_no_canary_repr_collides_with_any_refusal_message() -> None:
     The counts are the tripwire: a new ``raise ScoreError`` fails this test until its probe
     is added here and the canaries are re-checked against its text, which is the step
     M1-346 existed because nobody had to take. M4-802: 14 raise sites, 15 distinct messages --
-    two sites share the sequence-shape text, and two interpolate a field name. M4-809 adds 17
-    sites and 19 messages (see ``CONTINUOUS_MESSAGE_PROBES``): 31 and 34.
+    two sites share the sequence-shape text, and two interpolate a field name. M4-809 adds 19
+    sites and 21 messages (see ``CONTINUOUS_MESSAGE_PROBES``): 33 and 36.
     """
     messages: set[str] = set()
     for probe in MESSAGE_PROBES:
@@ -436,8 +443,8 @@ def test_no_canary_repr_collides_with_any_refusal_message() -> None:
         with pytest.raises(ScoreError) as excinfo:
             probe()
         messages.add(str(excinfo.value))
-    assert inspect.getsource(scoring).count("raise ScoreError") == 31
-    assert len(messages) == 34
+    assert inspect.getsource(scoring).count("raise ScoreError") == 33
+    assert len(messages) == 36
     for message in messages:
         assert SENTINEL not in message
         assert "123456789" not in message

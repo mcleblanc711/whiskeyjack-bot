@@ -139,6 +139,71 @@ def test_a_closed_bound_with_no_mass_outside_it_cannot_score_an_outcome_there() 
     assert _score("30", [0, 0.25, 0.5, 0.75, 1], open_lower_bound=False).bucket == 2
 
 
+# The two sentences a closed bound's endpoint rule refuses with, restated.
+LOWER_ENDPOINT = "cdf must start at 0 when the lower bound is closed"
+UPPER_ENDPOINT = "cdf must end at 1 when the upper bound is closed"
+
+
+def test_a_closed_bound_with_mass_outside_it_is_refused() -> None:
+    """Review round 1, B1: the flags were read and never checked against the CDF.
+
+    ``CDF`` puts 0.05 outside each bound and is valid in every other way, and each call
+    closes one bound only, so nothing but that bound's rule can refuse.
+    """
+    for resolution in ("30", "-5", "101", BELOW_LOWER_BOUND, ABOVE_UPPER_BOUND):
+        with pytest.raises(ScoreError) as lower:
+            _score(resolution, open_lower_bound=False)
+        assert str(lower.value) == LOWER_ENDPOINT
+        with pytest.raises(ScoreError) as upper:
+            _score(resolution, open_upper_bound=False)
+        assert str(upper.value) == UPPER_ENDPOINT
+    # The reviewer's case closes both; the lower bound is reported first.
+    with pytest.raises(ScoreError) as both:
+        _score(BELOW_LOWER_BOUND, open_lower_bound=False, open_upper_bound=False)
+    assert str(both.value) == LOWER_ENDPOINT
+
+
+def test_the_endpoint_rule_is_exact_and_belongs_to_its_own_bound() -> None:
+    """No tolerance: ``forecast/cdf.py`` builds the endpoints with ``!=``, and so does this.
+
+    Every closed bound among the live fixture cases holds exactly 0 or exactly 1.
+    """
+    smallest = [5e-324, 0.25, 0.5, 0.75, 0.95]
+    with pytest.raises(ScoreError) as lower:
+        _score("30", smallest, open_lower_bound=False)
+    assert str(lower.value) == LOWER_ENDPOINT
+    largest = [0.05, 0.25, 0.5, 0.75, math.nextafter(1.0, 0.0)]
+    with pytest.raises(ScoreError) as upper:
+        _score("30", largest, open_upper_bound=False)
+    assert str(upper.value) == UPPER_ENDPOINT
+    # Each flag guards its own end: a closed lower bound says nothing about the last point,
+    # and a closed upper bound nothing about the first.
+    assert _score("30", [0.0, 0.25, 0.5, 0.75, 0.95], open_lower_bound=False).bucket == 2
+    assert _score("30", [0.05, 0.25, 0.5, 0.75, 1.0], open_upper_bound=False).bucket == 2
+    # What the platform stores at a closed bound, as an integer or a float, and a signed zero.
+    for first, last in ((0, 1), (0.0, 1.0), (-0.0, 1.0)):
+        ends = [first, 0.25, 0.5, 0.75, last]
+        assert _score("30", ends, open_lower_bound=False, open_upper_bound=False).bucket == 2
+    # An open bound may hold no mass outside it: that is still a forecast of the question,
+    # and an outcome outside such a bound has probability 0.
+    assert _score("30", [0.0, 0.25, 0.5, 0.75, 1.0]).bucket == 2
+    with pytest.raises(ScoreError, match="probability 0"):
+        _score(ABOVE_UPPER_BOUND, [0.0, 0.25, 0.5, 0.75, 1.0])
+
+
+def test_every_closed_bound_in_the_fixture_holds_exactly_zero_or_one() -> None:
+    """The evidence for exact equality, kept as a test: the live data has no near-miss."""
+    closed_lower = closed_upper = 0
+    for case in _fixture_cases():
+        if not case["open_lower_bound"]:
+            closed_lower += 1
+            assert case["cdf"][0] == 0
+        if not case["open_upper_bound"]:
+            closed_upper += 1
+            assert case["cdf"][-1] == 1
+    assert closed_lower >= 20 and closed_upper >= 5
+
+
 def test_the_default_inbound_count_is_the_platforms_two_hundred() -> None:
     cdf = [index / 200 for index in range(201)]
     score = score_continuous(
@@ -192,6 +257,77 @@ def test_a_log_scale_with_its_zero_point_above_the_range() -> None:
     # At or beyond a zero point above the range, the outcome is above.
     assert _score("110", **scale).bucket == 5
     assert _score("400", **scale).bucket == 5
+
+
+# `echo "scale=25; l(299/40000)" | bc -l`: the mass (150^2 - 149^2) / 200^2 of bucket 150.
+LN_299_OVER_40000 = -4.8961911597053869280461897
+
+
+def test_a_log_scale_too_wide_for_the_platforms_product_is_placed_by_its_logarithm() -> None:
+    """Review round 1, B2: ``(value - low) * (ratio - 1)`` overflowed and the clamp hid it.
+
+    Range ``[1, 1e200]`` with the zero point at 0: the ratio is 1e200 and the value at
+    location ``u`` is ``1e200 ** u``, so ``1e150`` is at 0.75 exactly. The product is 1e350,
+    which no float holds; the location came out infinite, was clamped to 1, and the outcome
+    was scored in the last bucket.
+    """
+    cdf = [(index / 200) ** 2 for index in range(201)]
+    wide = {"range_min": 1.0, "range_max": 1e200, "zero_point": 0.0}
+    score = score_continuous(cdf, "1e150", open_lower_bound=False, open_upper_bound=False, **wide)
+    # 0.75 * 200 is the edge between buckets 150 and 151: the lower one.
+    assert score.bucket == 150
+    assert score.log_mass == pytest.approx(LN_299_OVER_40000, rel=1e-12)
+    # Four inbound buckets, each fifty decades wide. The product overflows above 1.8e108.
+    for resolution, bucket in (
+        ("1e10", 1),
+        ("1e50", 1),  # an edge
+        ("1e60", 2),
+        ("1e100", 2),  # an edge, and the largest product a float still holds
+        ("1e120", 3),
+        ("1e150", 3),  # an edge
+        ("1e160", 4),
+        ("9.99e199", 4),
+        ("1e200", 4),
+    ):
+        assert _score(resolution, **wide).bucket == bucket
+    # The mirror image, with the zero point above the range.
+    mirrored = {"range_min": -1e200, "range_max": -1.0, "zero_point": 0.0}
+    for resolution, bucket in (
+        ("-1e10", 4),
+        ("-1e60", 3),
+        ("-1e120", 2),
+        ("-1e150", 1),  # an edge
+        ("-1e160", 1),
+        ("-1e200", 1),
+    ):
+        assert _score(resolution, **mirrored).bucket == bucket
+
+
+def test_a_zero_point_just_above_the_range_is_measured_from_the_upper_bound() -> None:
+    """The mirror of B2, found while fixing it: nothing overflows, the sum cancels instead.
+
+    Zero point 1e-200 above ``[-1, 0]``. The location of ``-1e-60`` is
+    ``ln(1e-60) / ln(1e-200) = 0.3``, but ``value - low`` is ``1 - 1e-60``, which is exactly
+    1.0 as a float: every outcome within 1e-16 of the upper bound looked like the upper bound
+    itself and was scored in the last bucket, whatever its location. Measured from the bound
+    nearest the zero point, the offset is ``1e-60`` and nothing is lost.
+    """
+    scale = {"range_min": -1.0, "range_max": 0.0, "zero_point": 1e-200}
+    for resolution, bucket in (
+        ("-1e-10", 1),  # 0.05
+        ("-1e-60", 2),  # 0.3
+        ("-1e-100", 2),  # 0.5, an edge
+        ("-1e-130", 3),  # 0.65
+        ("-1e-180", 4),  # 0.9
+        ("-1e-250", 4),  # nearer the bound than the zero point is: 0.9999...
+        ("0", 4),
+        ("-1", 1),
+    ):
+        assert _score(resolution, **scale).bucket == bucket
+    # Two hundred buckets, as on a live question: 0.5 is bucket 100, not bucket 200.
+    cdf = [(index + 1) / 202 for index in range(201)]
+    score = score_continuous(cdf, "-1e-100", open_lower_bound=True, open_upper_bound=True, **scale)
+    assert score.bucket == 100
 
 
 def test_a_value_one_float_outside_a_bound_is_outside_it_on_every_scale() -> None:
@@ -509,12 +645,13 @@ def test_a_count_of_zero_is_refused_even_with_a_cdf_that_would_match_it() -> Non
 
 
 def test_the_upper_bound_of_a_log_scale_whose_ratio_vanishes_against_one() -> None:
-    """Zero point 1e-20 above the upper bound of ``[-1, 0]``: the ratio is 1e-20, not zero.
+    """Zero point 1e-20 above the upper bound of ``[-1, 0]``: the platform's ratio is 1e-20.
 
     ``ratio - 1.0`` is then exactly ``-1.0``, so at the upper bound the platform's argument
     ``(value - low) * (ratio - 1) + width`` is ``-1 + 1``: zero, whose logarithm does not
     exist (``math.log`` raises ``ValueError``; numpy gives ``-inf``). Mathematically it is
-    ``width * ratio`` and the location is 1: the last inbound bucket.
+    ``width * ratio`` and the location is 1: the last inbound bucket. Measured from the
+    upper bound the offset there is 0 and the location is 1 with nothing to guard.
     """
     scale = {"range_min": -1.0, "range_max": 0.0, "zero_point": 1e-20}
     assert _score("0", **scale).bucket == 4
@@ -526,24 +663,37 @@ def test_the_upper_bound_of_a_log_scale_whose_ratio_vanishes_against_one() -> No
     assert _score("0.5", **scale).bucket == 5
 
 
-def test_a_log_scale_whose_ratio_underflows_to_zero_is_refused() -> None:
-    """A zero point one denormal above the upper bound of a range 1e308 wide.
+def test_a_log_scale_whose_bounds_differ_by_more_than_a_float_holds_is_refused() -> None:
+    """The far bound more than 1.8e308 times as far from the zero point as the near one.
 
     The resolution is inside the range, so the refusal has to come from the scale: an
     outside value would be placed by comparison before the scale was ever used.
     """
+    # A zero point one denormal above the upper bound of a range 1e308 wide.
     with pytest.raises(ScoreError, match="usable log scale"):
         _score("-5", range_min=-1e308, range_max=0.0, zero_point=5e-324)
+    # The platform's own ratio here is 1e-310: not zero, but its reciprocal is not a float.
+    with pytest.raises(ScoreError, match="usable log scale"):
+        _score("-5", range_min=-1e300, range_max=0.0, zero_point=1e-10)
+    # The same scale the other way up.
+    with pytest.raises(ScoreError, match="usable log scale"):
+        _score("5", range_min=0.0, range_max=1e300, zero_point=-1e-10)
+    # One decade inside the limit, either way up, it scores: 1e150 is half way to 1e300.
+    assert _score("-1e150", range_min=-1e300, range_max=-1.0, zero_point=0.0).bucket == 2
+    assert _score("1e150", range_min=1.0, range_max=1e300, zero_point=0.0).bucket == 2
 
 
 @pytest.mark.parametrize(
     ("low", "high", "zero_point", "value"),
     [
-        # Each unscales, by the platform's formula in floats, to the location in the comment.
-        (3.0, 6.0, 6000000000000006.0, "5.979337069251501"),  # 1.2
-        (0.0, 1.3, 6500000000000001.0, "1.048452576641855"),  # 1.5
-        (12.5, 18.0, 2.7500000000000016e16, "17.058704579668582"),  # 2.0
-        (12.5, 112.5, 5.000000000000001e17, "71.05618635076388"),  # 4.0
+        # Each unscales, in floats and before the clamp, to the location in the comment.
+        # Zero point far below: the excursion is past 1. Unclamped, 1.25 is the "above"
+        # bucket for a value inside the range, and 2.0 is a bucket the CDF does not have.
+        (0.0, 1.3, -2943384196243182.5, "1.261131"),  # 1.25
+        (12.5, 52.5, -5.5829517785234214e17, "44.230667"),  # 2.0
+        # Zero point far above: the mirror image, below 0.
+        (3.0, 4.3, 3922086168792967.0, "3.003362"),  # -0.25
+        (0.0, 40.0, 1.1050591450158915e17, "7.147444"),  # -1.0
     ],
 )
 def test_a_value_inside_the_range_is_inbound_however_the_log_scale_rounds(
@@ -551,8 +701,8 @@ def test_a_value_inside_the_range_is_inbound_however_the_log_scale_rounds(
 ) -> None:
     """A zero point about 1e15 range-widths away: the two logarithms cancel to a few ulps.
 
-    Unclamped, these locations index a bucket the CDF does not have (an ``IndexError``, not
-    a ``ScoreError``) or the "above" bucket for a value that is inside the range.
+    Unclamped, the first two index the "above" bucket for a value that is inside the range
+    and a bucket the CDF does not have (an ``IndexError``, not a ``ScoreError``).
     """
     assert low < float(value) < high
     score = _score(value, range_min=low, range_max=high, zero_point=zero_point)
@@ -592,6 +742,9 @@ def test_no_refusal_reprints_a_value() -> None:
         (CDF, "30", {"range_min": CANARY_TEXT}),  # the number rule, by a wrong type
         (CDF, "30", {"zero_point": float("inf")}),  # and by a value that is not finite
         ([0.05, 0.25, 0.5, 0.75, int("123456789" * 40)], "30", {}),  # and by overflow
+        # A closed bound's end of the CDF, each bound's own sentence.
+        ([CANARY, 0.25, 0.5, 0.75, 0.95], "30", {"open_lower_bound": False}),
+        ([0.05, 0.25, 0.5, 0.75, 0.9123456789], "30", {"open_upper_bound": False}),
     ]
     for cdf, resolution, overrides in attempts:
         with pytest.raises(ScoreError) as caught:

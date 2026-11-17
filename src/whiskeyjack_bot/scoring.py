@@ -372,29 +372,61 @@ def _require_cdf(cdf: object, inbound: int) -> tuple[float, ...]:
     return points
 
 
+def _log_scale_ratio(low: float, high: float, zero_point: float) -> float:
+    """How many times farther from the zero point the far bound is than the near one.
+
+    Above 1 on a usable scale. With the zero point below the range this is the platform's
+    ``deriv_ratio``; with it above the range, the reciprocal of that.
+    """
+    if zero_point < low:
+        return (high - zero_point) / (low - zero_point)
+    return (zero_point - low) / (zero_point - high)
+
+
+def _log_location(offset: float, width: float, ratio: float) -> float:
+    """Where a point ``offset`` from the bound nearest the zero point sits: 0 there, 1 across.
+
+    The platform's ``(ln(offset * (ratio - 1) + width) - ln(width)) / ln(ratio)``. Every term
+    is non-negative here, so the sum cannot cancel. It can overflow, when the ratio and the
+    offset are both very large: range ``[1, 1e200]`` with the zero point at 0 and a value of
+    1e150 is a product of 1e350. The same quantity divided through by the width cannot,
+    because ``offset / width`` is at most 1 and the ratio is finite, so that form is used
+    when, and only when, the platform's is not finite.
+    """
+    argument = offset * (ratio - 1.0) + width
+    if math.isfinite(argument):
+        return (math.log(argument) - math.log(width)) / math.log(ratio)
+    return math.log1p(offset / width * (ratio - 1.0)) / math.log(ratio)
+
+
 def _unscaled_location(value: float, low: float, high: float, zero_point: float | None) -> float:
     """Where a value inside ``[low, high]`` sits in the range: 0 at ``low``, 1 at ``high``.
 
-    The platform's ``scaled_location_to_unscaled_location``, clamped to ``[0, 1]``. The
-    caller has already placed a value outside the range, so anything outside ``[0, 1]`` here
-    is rounding. On a linear scale the clamp never acts. On a log scale it does: the two
-    logarithms cancel, and when the zero point is very far from the range their difference is
-    a few units in the last place divided by a divisor of the same size (range ``[3, 6]``
-    with a zero point near 6e15 puts 5.98 at 1.2). Without the clamp such a value would index
-    a bucket the CDF does not have.
+    The platform's ``scaled_location_to_unscaled_location``, unchanged on a linear scale.
+
+    A log scale is measured from the bound nearest its zero point. The platform always
+    measures from ``low``. With the zero point above the range that is the far bound, and
+    its sum ``(value - low) * (ratio - 1) + width`` then cancels: with the zero point 1e-200
+    above ``[-1, 0]``, every value within 1e-16 of the upper bound computes to the upper
+    bound, whatever its location. Measured from ``high`` the same quantity is one minus
+    :func:`_log_location`, and nothing cancels.
+
+    The result is clamped to ``[0, 1]``. The caller has already placed a value outside the
+    range, so anything outside ``[0, 1]`` here is rounding. On a linear scale the clamp never
+    acts. On a log scale it does: the two logarithms cancel, and when the zero point is very
+    far from the range their difference is a few units in the last place divided by a divisor
+    of the same size. Without the clamp such a value would index a bucket the CDF does not
+    have.
     """
     width = high - low
     if zero_point is None:
         location = (value - low) / width
     else:
-        ratio = (high - zero_point) / (low - zero_point)
-        argument = (value - low) * (ratio - 1.0) + width
-        if not argument > 0.0:
-            # Reached only by rounding, at the upper end of a scale whose ratio is too small
-            # to register against 1 (`ratio - 1.0` is exactly -1.0): mathematically the
-            # argument there is `width * ratio`, which is positive.
-            return 1.0
-        location = (math.log(argument) - math.log(width)) / math.log(ratio)
+        ratio = _log_scale_ratio(low, high, zero_point)
+        if zero_point < low:
+            location = _log_location(value - low, width, ratio)
+        else:
+            location = 1.0 - _log_location(high - value, width, ratio)
     return min(max(location, 0.0), 1.0)
 
 
@@ -466,14 +498,25 @@ def score_continuous(
         zero = _require_number(zero_point, "zero_point")
         if low <= zero <= high:
             raise ScoreError("zero_point must lie outside the question's range")
-        ratio = (high - zero) / (low - zero)
-        if not math.isfinite(ratio) or not ratio > 0.0 or ratio == 1.0:
+        # The ratio the scale is evaluated with. Infinite when the bounds' distances from the
+        # zero point differ by more than a float holds; 1 when the zero point is so far away
+        # that they do not differ at all, and the logarithm that divides is zero.
+        ratio = _log_scale_ratio(low, high, zero)
+        if not math.isfinite(ratio) or not ratio > 1.0:
             raise ScoreError("zero_point does not define a usable log scale")
-    open_bounds = int(_require_flag(open_lower_bound, "open_lower_bound")) + int(
-        _require_flag(open_upper_bound, "open_upper_bound")
-    )
+    lower_open = _require_flag(open_lower_bound, "open_lower_bound")
+    upper_open = _require_flag(open_upper_bound, "open_upper_bound")
     inbound = _inbound_outcome_count(inbound_outcome_count)
     points = _require_cdf(cdf, inbound)
+    # A closed bound pins its end of the CDF: no outcome exists outside it, so mass there is
+    # not a forecast of this question. Exact, as `forecast/cdf.py` builds it and as every
+    # closed bound the platform has returned holds it. An open bound is not checked the other
+    # way: no mass outside one is still a forecast of this question, and an outcome there is
+    # refused below as probability 0.
+    if not lower_open and points[0] != 0.0:
+        raise ScoreError("cdf must start at 0 when the lower bound is closed")
+    if not upper_open and points[-1] != 1.0:
+        raise ScoreError("cdf must end at 1 when the upper bound is closed")
     bucket = _resolved_bucket(resolution, low, high, zero, inbound)
     if bucket == 0:
         mass = points[0]
@@ -487,7 +530,7 @@ def score_continuous(
         log_mass=math.log(mass),
         bucket=bucket,
         bucket_count=inbound + 2,
-        open_bounds=open_bounds,
+        open_bounds=int(lower_open) + int(upper_open),
         implementation_version=CONTINUOUS_LOG_VERSION,
     )
 
