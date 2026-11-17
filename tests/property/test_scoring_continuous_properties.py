@@ -533,7 +533,19 @@ def test_a_log_scale_bucket_holds_the_exact_location_of_its_value(
         st.one_of(
             # Spread evenly over the locations, so every bucket of a wide scale is reached.
             LOCATIONS.map(lambda location: min(max(_value_at(location, scaling), low), high)),
-            LOCATIONS.map(lambda location: min(max(_value_at(location, scaling), low), high)),
+            # A hair either side of a bucket edge, from a third of a bucket down to 1e-8 of
+            # one. A bucket is all the scorer returns, so an error in the location only
+            # shows when it carries a value across an edge; this is what makes a small one
+            # visible (the platform's expression is 1e-5 of the range out at a zero point
+            # 1e9 range-widths away, and nothing else here would notice).
+            st.builds(
+                lambda edge, decade, side: min(
+                    max(_value_at((edge + side * 10.0**-decade) / inbound, scaling), low), high
+                ),
+                st.integers(min_value=0, max_value=inbound),
+                st.floats(min_value=0.5, max_value=8.0),
+                st.sampled_from([1.0, -1.0]),
+            ),
             st.floats(min_value=low, max_value=high),
             st.sampled_from([low, high]),
         )
