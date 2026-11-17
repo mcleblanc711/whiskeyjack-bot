@@ -1459,6 +1459,7 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
     if len(results) >= UNANSWERED_OPEN_PAGE:
         return "page_full"
     found: list[tuple] = []
+    listed: set[int] = set()
     for post in results:
         if not isinstance(post, dict):
             return "posts_unreadable"
@@ -1476,14 +1477,18 @@ def _open_questions(payload: object, now: datetime) -> tuple[tuple, ...] | str:
         for question in questions:
             if not isinstance(question, dict) or type(question.get("status")) is not str:
                 return "posts_unreadable"
+            question_id = _positive_int(question.get("id"))
+            # Before the status skip: an id listed once open and once closed disagrees just as
+            # much as one listed open twice (the property suite found both).
+            if question_id is not None:
+                if question_id in listed:
+                    return "posts_unreadable"
+                listed.add(question_id)
             if question["status"] != "open":
                 continue
-            question_id = _positive_int(question.get("id"))
             opened = _aware_stamp(question.get("open_time"))
             closes = _aware_stamp(question.get("scheduled_close_time"))
             if question_id is None or opened is None or closes is None:
-                return "posts_unreadable"
-            if any(entry[0] == question_id for entry in found):
                 return "posts_unreadable"
             answered = _forecast_standing(question.get("my_forecasts"), now)
             if answered is None:

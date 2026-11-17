@@ -2999,7 +2999,13 @@ def test_a_question_listed_twice_is_blind_whichever_entry_comes_first(watchdog: 
     opened, closes = now - timedelta(minutes=60), now + timedelta(hours=2)
     unanswered = _single(46700, _question(46900, opened=opened, closes=closes))
     answered = _single(46701, _question(46900, opened=opened, closes=closes, latest=STANDING))
-    for order in ((unanswered, answered), (answered, unanswered)):
+    closed = _single(46702, _question(46900, opened=opened, closes=closes, status="closed"))
+    for order in (
+        (unanswered, answered),
+        (answered, unanswered),
+        (unanswered, closed),
+        (closed, unanswered),
+    ):
         watchdog.open_posts[0] = _listing(*order)
         assert watchdog.run() == 1
         assert watchdog.titled(UNANSWERED) == []

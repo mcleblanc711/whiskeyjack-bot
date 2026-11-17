@@ -17589,8 +17589,11 @@ touches only `unanswered_check`, so it neither clears a watched question nor re-
 Found by the property suite at the gate's `dev` profile, not by the `fast` one. Two entries for
 one question id can disagree about whether we answered, and the step then reads them in list
 order, so whether it pages would be an accident of ordering. The parser now returns
-`posts_unreadable` for any repeated id. That is the worker's own rule: `normalize_questions`
-refuses a duplicate id (M1-202). The unit test runs both orders.
+`posts_unreadable` for any repeated id, checked **before** the status skip. The second gate run
+found an id listed once open and once closed, which slipped past a first fix that compared open
+entries only. That is the worker's own rule: `normalize_questions` refuses a duplicate id
+(M1-202). The unit test runs four orders. The three new properties then held at 20,000 examples
+each, against the 200 of the gate's profile.
 
 ### Decision — MISSED needs a fresh last observation
 
