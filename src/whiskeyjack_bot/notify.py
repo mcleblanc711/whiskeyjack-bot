@@ -81,6 +81,7 @@ NotifyEvent = Literal[
     "unrecorded_post",
     "resolution_withheld",
     "series_followed",
+    "question_unanswerable",
 ]
 
 # What happened to one push. Closed for the same reason the outcome vocabularies in
@@ -123,6 +124,12 @@ NotifyOutcome = Literal["sent", "throttled", "disabled", "failed"]
 # - ``series_followed`` (M1-354) is an event, not a condition: the worker bound a new
 #   project of a followed series. Keyed on the new activation, so each rebind pages exactly
 #   once; the window is a backstop.
+# - ``question_unanswerable`` (M1-366) is an event: the worker saw an open question it will
+#   never answer -- a type deferred in v1, or one first reached inside the five-minute close
+#   margin. De-duplicated by the durable ``question_unanswerable`` ledger row the worker
+#   writes at the transition, not by this window: a tumbling window over a condition that
+#   recurs every poll for three hours pages twice across a boundary. The day is a backstop
+#   for the one case with no row to write, a deferral with no usable question id.
 _WINDOW_SECONDS: Final[dict[str, int]] = {
     "question_blocked": 1800,
     "provider_failed": 1800,
@@ -133,6 +140,7 @@ _WINDOW_SECONDS: Final[dict[str, int]] = {
     "unrecorded_post": 86400,
     "resolution_withheld": 86400,
     "series_followed": 86400,
+    "question_unanswerable": 86400,
 }
 assert set(_WINDOW_SECONDS) == set(get_args(NotifyEvent))
 assert all(seconds > 0 for seconds in _WINDOW_SECONDS.values())
@@ -166,9 +174,20 @@ _STAMP_SUBDIR: Final = "notifications"
 # residue: once a window has passed, its stamp can never suppress anything again.
 _STAMP_RETENTION = timedelta(days=7)
 
+# ntfy's own priority vocabulary (https://docs.ntfy.sh/publish/#message-priority). A value
+# outside it is not an error at ntfy -- it is silently treated as ``default`` -- so a typo
+# here would quietly demote a page; the assertion below makes it an import failure instead.
+_NTFY_PRIORITIES: Final = ("min", "low", "default", "high", "urgent")
+
+# Priorities that carry the alarm tag rather than the chart one. An urgent page must look at
+# least as alarming as a high one; before M1-366 the tag rule tested ``== "high"`` alone.
+_ALARM_PRIORITIES: Final = frozenset({"high", "urgent"})
+
 # ntfy priorities, as the header value the service expects.
 _PRIORITY: Final[dict[str, str]] = {
-    "question_blocked": "high",
+    # M1-366: a blocked question is lost, not delayed -- it will not be attempted again under
+    # this activation and closes inside its three-hour window -- so it pages like WORKER DOWN.
+    "question_blocked": "urgent",
     "provider_failed": "high",
     "budget_threshold": "high",
     "prediction_posted": "default",
@@ -185,8 +204,11 @@ _PRIORITY: Final[dict[str, str]] = {
     # seeing promptly, not an incident -- the incident is a rollover it did NOT follow, and
     # the watchdog pages that one urgently.
     "series_followed": "default",
+    # M1-366: an open question this worker will never answer. Lost, like a blocked one.
+    "question_unanswerable": "urgent",
 }
 assert set(_PRIORITY) == set(get_args(NotifyEvent))
+assert set(_PRIORITY.values()) <= set(_NTFY_PRIORITIES)
 
 
 class _PushExpired(BaseException):
@@ -521,7 +543,11 @@ class Notifier:
         headers = {
             "Title": _header_safe(redact_secrets(title, self.secret_names)),
             "Priority": _PRIORITY[event],
-            "Tags": "rotating_light" if _PRIORITY[event] == "high" else "chart_with_upwards_trend",
+            "Tags": (
+                "rotating_light"
+                if _PRIORITY[event] in _ALARM_PRIORITIES
+                else "chart_with_upwards_trend"
+            ),
         }
         content = redact_secrets(body, self.secret_names).encode("utf-8", "replace")
         try:

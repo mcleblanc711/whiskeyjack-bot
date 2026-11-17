@@ -1245,6 +1245,7 @@ class _Pushes:
             {
                 "title": headers.get("title", ""),
                 "priority": headers.get("priority", ""),
+                "tags": headers.get("tags", ""),
                 "body": request.content.decode("utf-8"),
             }
         )
@@ -1392,7 +1393,9 @@ def test_a_deterministic_block_pushes_once_and_the_next_poll_is_silent(
     blocked = pushes.matching("question blocked")
     assert len(blocked) == 1
     assert "deterministic_verdict" in blocked[0]["body"]
-    assert blocked[0]["priority"] == "high"
+    # M1-366: a blocked question is lost, not delayed -- it pages like WORKER DOWN.
+    assert blocked[0]["priority"] == "urgent"
+    assert blocked[0]["tags"] == "rotating_light"
     assert (
         conn.execute(
             "SELECT count(*) FROM tournament_events WHERE kind='question_blocked'"
@@ -2671,3 +2674,180 @@ def test_the_poll_passes_the_derived_conversion_record_to_the_post(
     result = poll(case)
     assert result["forecast_confirmed"] == 1
     assert seen == [sentinel]
+
+
+# -- M1-366: questions this worker will never answer page at once, once per question ------
+
+
+class _DeferringPlatform(Platform):
+    """The case's binary question plus extra open questions of a type v1 defers (D21)."""
+
+    def __init__(self, raw: dict[str, Any], extra: list[Any]):
+        super().__init__(raw)
+        self.extra = extra
+
+    def get_all_open_questions_from_tournament(self, project: int, **kwargs: Any) -> list[Any]:
+        return [*super().get_all_open_questions_from_tournament(project, **kwargs), *self.extra]
+
+
+# A title that must never reach a push (D58): pushes carry ids, URLs built from them and our
+# own codes only.
+_SENTINEL_TITLE = "[SENTINEL-TITLE-M1-366] never in a push"
+
+
+def _date_question(question_id: int | None, post_id: int | None) -> Any:
+    from forecasting_tools.data_models.questions import DateQuestion
+
+    question = DateQuestion(
+        question_text=_SENTINEL_TITLE,
+        lower_bound=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        upper_bound=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        open_lower_bound=False,
+        open_upper_bound=False,
+    )
+    question.id_of_question = question_id
+    question.id_of_post = post_id
+    return question
+
+
+def _deferring_poll(case: Any, extra: list[Any]) -> dict[str, Any]:
+    conn, config, platform, news, model = case
+    deferring = _DeferringPlatform(platform.raw, extra)
+    return run_once(
+        conn,
+        config,
+        client=deferring,
+        poster=platform,
+        news_client=news,
+        web_client=object(),
+        forecaster=model,
+    )
+
+
+def _unanswerable_rows(conn: Any) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (scope, json.loads(data))
+        for scope, data in conn.execute(
+            "SELECT scope, data FROM tournament_events WHERE kind='question_unanswerable' "
+            "ORDER BY seq"
+        )
+    ]
+
+
+def test_a_deferred_type_pages_urgent_once_and_records_one_row(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC10. Before M1-366 a deferral was logged and dropped, leaving no trace (RUNBOOK R5).
+
+    The second poll runs on a FRESH throttle directory, so its silence is the ledger row's
+    doing and not the notifier window's -- the T-907 lesson `_recording` documents.
+    """
+    conn, config, _platform, _news, _model = case
+    first = _recording(monkeypatch, config, tmp_path / "first")
+    _deferring_poll(case, [_date_question(77001, 76001)])
+
+    pages = first.matching("QUESTION UNANSWERABLE")
+    assert len(pages) == 1
+    assert pages[0]["title"] == "whiskeyjack: QUESTION UNANSWERABLE (unsupported_type)"
+    assert pages[0]["priority"] == "urgent"
+    assert pages[0]["tags"] == "rotating_light"
+    assert "32977:77001" in pages[0]["body"]
+    assert "https://www.metaculus.com/questions/76001/" in pages[0]["body"]
+    assert "detail=deferred_v1_type" in pages[0]["body"]
+    rows = _unanswerable_rows(conn)
+    assert [scope for scope, _ in rows] == ["32977:77001"]
+    assert rows[0][1]["reason"] == "unsupported_type"
+    assert rows[0][1]["post_id"] == 76001
+
+    again = _recording(monkeypatch, config, tmp_path / "second")
+    _deferring_poll(case, [_date_question(77001, 76001)])
+    assert again.matching("QUESTION UNANSWERABLE") == []
+    assert len(_unanswerable_rows(conn)) == 1
+    for push in [*first.sent, *again.sent]:
+        assert "SENTINEL" not in push["title"] + push["body"]
+
+
+def test_a_deferral_with_no_usable_id_pages_without_a_row(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No scope means no row to de-dup on; the notifier's day window is the backstop."""
+    conn, config, _platform, _news, _model = case
+    pushes = _recording(monkeypatch, config, tmp_path / "first")
+    _deferring_poll(case, [_date_question(None, None)])
+
+    pages = pushes.matching("QUESTION UNANSWERABLE")
+    assert len(pages) == 1 and pages[0]["priority"] == "urgent"
+    assert "no usable question id" in pages[0]["body"]
+    assert _unanswerable_rows(conn) == []
+    # Same throttle directory: the backstop window holds it to one page.
+    _deferring_poll(case, [_date_question(None, None)])
+    assert len(pushes.matching("QUESTION UNANSWERABLE")) == 1
+
+
+def test_an_unanswered_question_inside_the_close_margin_pages_once(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC10: first reached inside the five-minute margin, so it is skipped -- and lost."""
+    conn, config, platform, _news, _model = case
+    platform.raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(minutes=3)).isoformat()
+    first = _recording(monkeypatch, config, tmp_path / "first")
+    assert poll(case)["heartbeat"]["skipped"] == 1
+
+    pages = first.matching("QUESTION UNANSWERABLE")
+    assert len(pages) == 1
+    assert pages[0]["title"] == "whiskeyjack: QUESTION UNANSWERABLE (close_margin)"
+    assert pages[0]["priority"] == "urgent"
+    question_id = platform.raw["question"]["id"]
+    post_id = platform.raw["id"]
+    assert f"32977:{question_id}" in pages[0]["body"]
+    assert f"https://www.metaculus.com/questions/{post_id}/" in pages[0]["body"]
+    assert platform.posts == 0
+
+    again = _recording(monkeypatch, config, tmp_path / "second")
+    poll(case)
+    assert again.matching("QUESTION UNANSWERABLE") == []
+    assert len(_unanswerable_rows(conn)) == 1
+
+
+def test_an_answered_question_reaching_its_close_margin_is_silent(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every answered question passes through the close-margin skip once: never a page."""
+    conn, config, platform, _news, _model = case
+    assert poll(case)["forecast_confirmed"] == 1
+    platform.raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(minutes=3)).isoformat()
+    pushes = _recording(monkeypatch, config, tmp_path / "close")
+    poll(case)
+    assert pushes.matching("QUESTION UNANSWERABLE") == []
+    assert _unanswerable_rows(conn) == []
+
+
+def test_a_blocked_question_reaching_its_close_margin_is_silent(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It already paged urgently with its real reason when it was blocked."""
+    conn, config, platform, news, _model = case
+    news.stale = True
+    blocked = _recording(monkeypatch, config, tmp_path / "block")
+    poll(case)
+    assert len(blocked.matching("question blocked")) == 1
+    platform.raw["question"]["scheduled_close_time"] = (utcnow() + timedelta(minutes=3)).isoformat()
+    pushes = _recording(monkeypatch, config, tmp_path / "close")
+    poll(case)
+    assert pushes.matching("QUESTION UNANSWERABLE") == []
+    assert _unanswerable_rows(conn) == []
+
+
+def test_a_question_with_no_close_time_pages_as_its_own_reason(
+    case: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same skip's other arm, equally silent before M1-366."""
+    conn, config, platform, _news, _model = case
+    platform.raw["question"]["scheduled_close_time"] = None
+    pushes = _recording(monkeypatch, config, tmp_path / "first")
+    poll(case)
+    pages = pushes.matching("QUESTION UNANSWERABLE")
+    assert [page["title"] for page in pages] == [
+        "whiskeyjack: QUESTION UNANSWERABLE (no_close_time)"
+    ]
+    assert _unanswerable_rows(conn)[0][1]["reason"] == "no_close_time"

@@ -133,7 +133,10 @@ def test_the_message_carries_the_ntfy_headers(tmp_path: Path) -> None:
     )
     headers = handler.requests[0]["headers"]
     assert headers["title"] == "blocked"
-    assert headers["priority"] == "high"
+    # M1-366: a blocked question is lost, not delayed, so it pages like WORKER DOWN, and an
+    # urgent page carries the alarm tag (it used to get the chart one: the rule was `== "high"`).
+    assert headers["priority"] == "urgent"
+    assert headers["tags"] == "rotating_light"
     assert handler.requests[0]["body"] == "why"
 
 
@@ -619,6 +622,26 @@ def test_every_event_has_a_positive_window() -> None:
     assert set(notify._WINDOW_SECONDS) == set(get_args(notify.NotifyEvent))
     assert all(seconds > 0 for seconds in notify._WINDOW_SECONDS.values())
     assert set(notify._PRIORITY) == set(get_args(notify.NotifyEvent))
+
+
+def test_every_priority_is_one_ntfy_knows_and_every_alarm_tags_like_one(tmp_path: Path) -> None:
+    """M1-366. ntfy silently demotes an unknown priority to `default`, so a typo would quietly
+    turn a page into a notification; the module asserts the vocabulary at import, and this
+    proves the assertion is over the real table. The tag follows the priority: every `high` or
+    `urgent` event carries `rotating_light`, every other the chart -- one push per event, so a
+    rule that tested `== "high"` alone (the pre-M1-366 code) fails here for both urgent events.
+    """
+    assert set(notify._PRIORITY.values()) <= set(notify._NTFY_PRIORITIES)
+    assert notify._PRIORITY["question_unanswerable"] == "urgent"
+    for event, priority in notify._PRIORITY.items():
+        handler = _Exchange()
+        _notifier(tmp_path / event, handler).send(event, subject="s", title="t", body="b")
+        headers = handler.requests[0]["headers"]
+        assert headers["priority"] == priority, event
+        expected = (
+            "rotating_light" if priority in {"high", "urgent"} else "chart_with_upwards_trend"
+        )
+        assert headers["tags"] == expected, event
 
 
 def test_a_subject_never_becomes_a_path_component(tmp_path: Path) -> None:

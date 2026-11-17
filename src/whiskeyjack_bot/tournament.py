@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, get_args
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 from uuid import uuid4
 
 from whiskeyjack_bot.approval import approve
@@ -258,6 +258,105 @@ def _notify_blocked(scope: str, *, reason: str, detail: str | None) -> None:
             f"{scope} will not be attempted again under this activation. "
             f"reason={reason} detail={detail or 'none'}. "
             f"Re-running `tournament enable` clears the verdict and costs one retry."
+        ),
+    )
+
+
+# M1-366. Why a question this worker saw will never be answered, as recorded on a
+# ``question_unanswerable`` row and named in its push. Our own vocabulary, so the push may
+# carry it (D58): a type deferred in v1 (D21), a question first reached inside the close
+# margin below, and one with no close time at all (the same skip, equally silent before).
+UnanswerableReason = Literal["unsupported_type", "close_margin", "no_close_time"]
+
+# The close-margin skip: a question this close to its close is not started, because a poll
+# cannot finish a forecast in the time left. Named because M1-366 pages on it.
+CLOSE_MARGIN: Final = timedelta(minutes=5)
+
+_METACULUS_QUESTION_URL: Final = "https://www.metaculus.com/questions/{post_id}/"
+
+
+def _positive_id(value: object) -> int | None:
+    """``value`` when it is exactly a positive ``int``, else None. ``bool`` is refused."""
+    return value if type(value) is int and value > 0 else None
+
+
+def _answered_in_ledger(conn: sqlite3.Connection, project: str, question_id: int) -> bool:
+    """Whether any record for this question in this project reached ``forecast_confirmed``.
+
+    The ledger's view, not the platform's: the watchdog reads the platform (M1-366's
+    authority). A live post this ledger never recorded reads as unanswered here, and that
+    case already pages on its own as ``unrecorded_post`` (M1-342).
+    """
+    rows = conn.execute(
+        "SELECT record_id FROM forecast_records WHERE question_id=? AND tournament_id=?",
+        (question_id, project),
+    ).fetchall()
+    return any(_confirmed(conn, str(row[0])) for row in rows)
+
+
+def _record_unanswerable(
+    conn: sqlite3.Connection,
+    scope: str,
+    *,
+    activation: dict[str, Any],
+    reason: UnanswerableReason,
+    detail_code: str | None,
+    post_id: int | None,
+) -> None:
+    """Record, once per question, that this worker will never answer it, and page (M1-366).
+
+    De-duplicated on the durable row, not on the notifier's window: the condition recurs on
+    every poll for as long as the question is open, and ``Notifier``'s tumbling window would
+    page twice across a boundary. This is :func:`_notify_blocked`'s shape -- page at the
+    transition that appends, never at a gate that re-reads it -- and keyed on the scope alone
+    rather than the activation, which is the stricter "once per question": re-running
+    ``tournament enable`` does not make a deferred type answerable.
+
+    The push carries only what D58 admits: the scope (validated ids), a URL built from the
+    validated post id, our own reason and detail codes. Never a title or a question type.
+    """
+    if events(conn, "question_unanswerable", scope):
+        return
+    append(
+        conn,
+        "question_unanswerable",
+        scope,
+        {
+            "at": utcnow().isoformat(),
+            "activation_id": activation["activation_id"],
+            "reason": reason,
+            "detail_code": detail_code,
+            "post_id": post_id,
+        },
+    )
+    link = "" if post_id is None else f" {_METACULUS_QUESTION_URL.format(post_id=post_id)}"
+    emit(
+        "question_unanswerable",
+        subject=scope,
+        title=f"whiskeyjack: QUESTION UNANSWERABLE ({reason})",
+        body=(
+            f"{scope} is open and this worker will not answer it: reason={reason} "
+            f"detail={detail_code or 'none'}.{link} It will close unanswered unless someone "
+            "forecasts it by hand. See docs/RUNBOOK.md W3."
+        ),
+    )
+
+
+def _notify_unidentified_deferral(project: str, detail_code: str) -> None:
+    """A deferral with no usable question id (M1-366): no scope, so no row to de-dup on.
+
+    Left to the notifier's day-long window instead, keyed on the project -- the one case
+    the backstop window exists for. Rare by construction: ``DeferralEvent`` carries ``None``
+    only when the SDK object exposes no exact ``int`` there.
+    """
+    emit(
+        "question_unanswerable",
+        subject=f"{project}:unidentified-deferral",
+        title="whiskeyjack: QUESTION UNANSWERABLE (unsupported_type)",
+        body=(
+            f"An open question in project {project} has a type this worker cannot answer "
+            f"(detail={detail_code}) and no usable question id. The worker log names it, as a "
+            "`deferring unsupported question type` line. See docs/RUNBOOK.md W3."
         ),
     )
 
@@ -1032,6 +1131,23 @@ def run_once(
         )
         normalized = normalize_questions(questions)
         heartbeat["discovered"] = len(questions)
+        # M1-366: a deferred type is an open question this worker will never answer. Before
+        # this it was logged and dropped here, and left no trace in the ledger (RUNBOOK R5).
+        for deferral in normalized.deferrals:
+            deferred_id = _positive_id(deferral.question_id)
+            if question_id is not None and deferred_id != question_id:
+                continue
+            if deferred_id is None:
+                _notify_unidentified_deferral(project, deferral.reason)
+                continue
+            _record_unanswerable(
+                conn,
+                f"{project}:{deferred_id}",
+                activation=activation,
+                reason="unsupported_type",
+                detail_code=deferral.reason,
+                post_id=_positive_id(deferral.post_id),
+            )
         ordered = sorted(normalized.questions, key=lambda q: q.close_time or utcnow())
         series = series_of(conn, activation)
         budget = Budget(
@@ -1064,7 +1180,23 @@ def run_once(
             if question_id is not None and question.question_id != question_id:
                 continue
             now = utcnow()
-            if question.close_time is None or question.close_time <= now + timedelta(minutes=5):
+            if question.close_time is None or question.close_time <= now + CLOSE_MARGIN:
+                # M1-366: an answered question passes through here at every close, so only
+                # one the ledger has no confirmed forecast for pages, and not one already
+                # blocked under this activation -- that one paged with its real reason.
+                close_scope = f"{project}:{question.question_id}"
+                if not _answered_in_ledger(conn, project, question.question_id) and not any(
+                    event.get("activation_id") == activation["activation_id"]
+                    for event in events(conn, "question_blocked", close_scope)
+                ):
+                    _record_unanswerable(
+                        conn,
+                        close_scope,
+                        activation=activation,
+                        reason="no_close_time" if question.close_time is None else "close_margin",
+                        detail_code=None,
+                        post_id=_positive_id(question.post_id),
+                    )
                 heartbeat["skipped"] += 1
                 continue
             if events(conn, "restored_question_hold", f"{project}:{question.question_id}"):
