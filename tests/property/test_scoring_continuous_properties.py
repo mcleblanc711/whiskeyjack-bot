@@ -505,7 +505,8 @@ def test_the_resolved_value_lies_inside_the_bucket_it_was_assigned(
 
 # How far, in buckets, an exact location may sit outside the bucket the scorer chose. The
 # platform's own rule moves an edge up by 1e-10 of a bucket; float rounding of the location
-# measured at most 3.6e-16 over 200,000 scales of every size, times at most 24 buckets here.
+# is under 4e-16 in every regime `scripts/measure_log_scale_location.py` measures, times at
+# most 24 buckets here.
 _EDGE_TOLERANCE = Decimal("1e-9")
 
 

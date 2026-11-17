@@ -395,8 +395,11 @@ def _log_location(offset: float, width: float, ratio: float) -> float:
       ``[1, 1e200]`` with the zero point at 0 and a value of 1e150 is a product of 1e350);
       here ``offset / width`` is at most 1 and the ratio is finite;
     - its two logarithms cancel when the zero point is far from the range, leaving an error
-      that grows with the distance (1.5e-5 of the range at 1e9 range-widths, 1.5% at 1e12,
-      nothing meaningful by 1e14); here ``log1p`` takes the small quantity itself.
+      that grows with the distance (1.6e-5 of the range at 1e9 range-widths, 1.7% at 1e12,
+      more than the whole range by 1e14); here ``log1p`` takes the small quantity itself.
+
+    ``scripts/measure_log_scale_location.py`` prints those numbers, and this form's distance
+    from exact arithmetic in each regime (under 4e-16 of the range in all of them).
 
     Both terms are ``log1p`` of a non-negative number and the first is no larger than the
     second, so the result is in ``[0, 1]`` but for an ulp of rounding.

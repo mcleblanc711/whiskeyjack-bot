@@ -300,7 +300,7 @@ def test_a_log_scale_too_wide_for_the_platforms_product_is_placed_by_its_logarit
         ("1e10", 1),
         ("1e50", 1),  # an edge
         ("1e60", 2),
-        ("1e100", 2),  # an edge, and the largest product a float still holds
+        ("1e100", 2),  # an edge; the product here is 1e300, which a float still holds
         ("1e120", 3),
         ("1e150", 3),  # an edge
         ("1e160", 4),
@@ -722,7 +722,8 @@ def test_a_log_scale_whose_bounds_differ_by_more_than_a_float_holds_is_refused()
         (8e15, "2.2", 4, 3),  # 0.55
         (2e15, "1.2", 4, 2),  # 0.3
         (-1e15, "3.5", 200, 175),  # 0.875, an edge
-        # A thousand times nearer, where the platform's expression is a bucket out, not twenty.
+        # A thousand times nearer. (The platform's expression, in this machine's floats, is
+        # one bucket out on these two and twenty on the first; nothing here asserts that.)
         (-4e12, "1.8", 200, 90),  # 0.45, an edge
         (4e12, "2.2", 200, 110),  # 0.55, an edge
     ],
@@ -733,11 +734,13 @@ def test_a_zero_point_far_from_the_range_is_the_linear_scale(
     """The third way the platform's expression fails in floats: its two logarithms cancel.
 
     With the zero point ``d`` range-widths away, a log scale differs from the linear one by
-    less than ``1 / (8 d)`` of the range, so at 1e12 widths and beyond the bucket is the
-    linear bucket and the expected values are plain fractions of ``[0, 4]``. The platform's
-    ``ln(argument) - ln(width)`` is then a difference of two nearly equal numbers. Round 1's
-    code used that expression and clamped the result, which kept the bucket inside the CDF
-    and said nothing about whether it was the right one.
+    about ``1 / (8 d)`` of the range at most. At 1e12 widths that is 1.25e-13 of the range,
+    or 2.5e-11 of a bucket of two hundred: inside the platform's edge epsilon of 1e-10. So in
+    every case below the bucket is the linear bucket, edges included, and the expected
+    values are plain fractions of ``[0, 4]``. The platform's ``ln(argument) - ln(width)`` is
+    there a difference of two nearly equal numbers. Round 1's code used that expression and
+    clamped the result, which kept the bucket inside the CDF and said nothing about whether
+    it was the right one.
     """
     cdf = [(index + 1) / (inbound + 2) for index in range(inbound + 1)]
     scaling: dict[str, Any] = {
