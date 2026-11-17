@@ -9,8 +9,8 @@ The CLAUDE.md pre-review fuzz pass over ``scoring.score_continuous``:
    PMF puts on the returned bucket, or a refusal exactly when that mass is zero.
 3. The resolved value lies inside the bucket it was assigned, checked by mapping the bucket's
    edges back through the platform's *inverse* scaling, which this module does not contain.
-   On a log scale whose zero point is within one range-width of the nearest bound, the
-   bucket also holds the value's exact location, computed in 60-digit decimal arithmetic.
+   On every log scale the bucket also holds the value's exact location, computed in
+   60-digit decimal arithmetic.
 4. Buckets are ordered as resolutions are: a larger value never lands in an earlier bucket.
 5. One representative resolution per bucket recovers the whole distribution: the masses sum
    to one.
@@ -26,8 +26,12 @@ whether the platform's own product overflowed, and refusals.
 Review round 1 found two defects this file could not reach. The bound flags were drawn
 independently of the CDF's endpoints, so no property could say what a closed bound means;
 and every scale was within 1e6 of zero, so no product could overflow. ``valid_inputs`` now
-builds the CDF from the flags, property 9 draws them apart on purpose, and half of all
-scales are drawn across the whole float range, a third of them where that product overflows.
+builds the CDF from the flags and property 9 draws them apart on purpose. Scales come in
+five sizes: the original one, a zero point up to 1e15 range-widths away, the size of a real
+question, anywhere a float reaches, and the corner where the platform's own product
+overflows. And the check that found nothing was in value space with a slack of a millionth
+of the range, which on a wide log scale is wider than most buckets; the exact-location
+property is in location space, to a billionth of a bucket.
 """
 
 from __future__ import annotations
@@ -141,6 +145,20 @@ def _moderate_scale(draw: st.DrawFn, kind: str) -> tuple[float, float, float | N
     return low, high, low - gap if kind == "zero_below" else high + gap
 
 
+def _far_scale(draw: st.DrawFn, kind: str) -> tuple[float, float, float | None]:
+    """Within 1e6 of zero, with the zero point up to 1e15 range-widths away.
+
+    A log scale this far from its zero point is the linear scale to one part in the distance.
+    The platform's expression loses a digit of location for every decade of that distance.
+    """
+    low = draw(st.floats(min_value=-1e6, max_value=1e6))
+    width = draw(st.floats(min_value=1e-3, max_value=1e6))
+    if kind == "linear":
+        return low, low + width, None
+    gap = width * 10.0 ** draw(st.floats(min_value=0.0, max_value=15.0))
+    return low, low + width, low - gap if kind == "zero_below" else low + width + gap
+
+
 # Decades of range width, and decades of log ratio, for a scale built around its zero point.
 # "ordinary" is the size of a real question. "extreme" is anywhere a float reaches.
 # "overflowing" is where the platform's product `offset * (ratio - 1)` exceeds a float for
@@ -150,14 +168,13 @@ _SIZES: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
     "extreme": ((-280.0, 280.0), (0.0, 300.0)),
     "overflowing": ((160.0, 280.0), (150.0, 300.0)),
 }
+SIZES = ("moderate", "far", *_SIZES)
 
 
 def _sized_scale(draw: st.DrawFn, kind: str, size: str) -> tuple[float, float, float | None]:
     """A scale of a given size whose zero point is within one range-width of the nearest bound.
 
-    That is a log ratio of 2 or more, where a log scale's location is well determined at any
-    size. Farther away is the moderate strategy's job, and past about 1e15 widths the
-    documented standing risk.
+    That is a log ratio of 2 or more, up to 1e300.
     """
     (low_decade, high_decade), (low_ratio, high_ratio) = _SIZES[size]
     decade = draw(st.floats(min_value=low_decade, max_value=high_decade))
@@ -181,15 +198,14 @@ KINDS = ("linear", "zero_below", "zero_above")
 
 @st.composite
 def scalings(
-    draw: st.DrawFn,
-    *,
-    kinds: tuple[str, ...] = KINDS,
-    sizes: tuple[str, ...] = ("moderate", "extreme", "overflowing"),
+    draw: st.DrawFn, *, kinds: tuple[str, ...] = KINDS, sizes: tuple[str, ...] = SIZES
 ) -> dict[str, object]:
     kind = draw(st.sampled_from(kinds))
     size = draw(st.sampled_from(sizes))
     if size == "moderate":
         low, high, zero = _moderate_scale(draw, kind)
+    elif size == "far":
+        low, high, zero = _far_scale(draw, kind)
     else:
         low, high, zero = _sized_scale(draw, kind, size)
     assume(math.isfinite(low) and math.isfinite(high) and high > low)
@@ -489,26 +505,27 @@ def test_the_resolved_value_lies_inside_the_bucket_it_was_assigned(
 
 # How far, in buckets, an exact location may sit outside the bucket the scorer chose. The
 # platform's own rule moves an edge up by 1e-10 of a bucket; float rounding of the location
-# measured at most 1.2e-13 over 40,000 scales, times at most 24 buckets here.
+# measured at most 3.6e-16 over 200,000 scales of every size, times at most 24 buckets here.
 _EDGE_TOLERANCE = Decimal("1e-9")
 
 
 @given(
     data=st.data(),
-    scaling=scalings(kinds=("zero_below", "zero_above"), sizes=tuple(_SIZES)),
+    scaling=scalings(kinds=("zero_below", "zero_above")),
     inbound=INBOUND,
 )
 def test_a_log_scale_bucket_holds_the_exact_location_of_its_value(
     data: st.DataObject, scaling: dict[str, object], inbound: int
 ) -> None:
-    """Review round 1, B2, and its mirror image: the property that reaches both.
+    """Review round 1, B2, and the two failures of the same kind found while fixing it.
 
     The value-space check above allows a millionth of the range, and on a log scale spanning
     two hundred decades a millionth of the range is wider than most buckets. This one is in
     location space: the bucket must hold the location the platform's formula gives in exact
-    arithmetic, to a billionth of a bucket. It covers log scales whose zero point is within
-    one range-width of the nearest bound, at every size; farther away the location is decided
-    by fewer and fewer of a float's digits (see the standing risk in the notes).
+    arithmetic, to a billionth of a bucket, on every log scale the scorer accepts. That
+    covers a ratio of 1e300 (the platform's product overflows), a zero point 1e-200 above
+    the range (its sum cancels) and a zero point 1e15 range-widths away (its two logarithms
+    cancel).
     """
     low, high, zero = scaling["range_min"], scaling["range_max"], scaling["zero_point"]
     assert isinstance(low, float) and isinstance(high, float) and isinstance(zero, float)
@@ -532,6 +549,9 @@ def test_a_log_scale_bucket_holds_the_exact_location_of_its_value(
     overflowed = not math.isfinite(offset * (far / near - 1.0) + (high - low))
     side = "below" if zero < low else "above"
     event(f"zero {side}: product {'overflowed' if overflowed else 'finite'}")
+    event(
+        f"ratio: {'under 1 + 1e-9' if far / near - 1.0 < 1e-9 else 'above 1e16' if far / near > 1e16 else 'between'}"
+    )
     where = "only" if inbound == 1 else "first" if score.bucket == 1 else "last"
     event(f"bucket: {where if score.bucket in (1, inbound) else 'between'}")
 

@@ -263,14 +263,32 @@ def test_a_log_scale_with_its_zero_point_above_the_range() -> None:
 LN_299_OVER_40000 = -4.8961911597053869280461897
 
 
+def _platform_argument(value: float, low: float, high: float, zero_point: float) -> float:
+    """The argument of the platform's logarithm, in floats, written out from ``formulas.py``.
+
+    ``(x - range_min) * (deriv_ratio - 1) + (range_max - range_min)``. Restated here so that
+    the three ways it fails are executed witnesses and not sentences in a docstring.
+    """
+    ratio = (high - zero_point) / (low - zero_point)
+    return (value - low) * (ratio - 1.0) + (high - low)
+
+
+def _platform_location(value: float, low: float, high: float, zero_point: float) -> float:
+    """The platform's ``scaled_location_to_unscaled_location`` on a log scale, in floats."""
+    ratio = (high - zero_point) / (low - zero_point)
+    argument = _platform_argument(value, low, high, zero_point)
+    return (math.log(argument) - math.log(high - low)) / math.log(ratio)
+
+
 def test_a_log_scale_too_wide_for_the_platforms_product_is_placed_by_its_logarithm() -> None:
     """Review round 1, B2: ``(value - low) * (ratio - 1)`` overflowed and the clamp hid it.
 
     Range ``[1, 1e200]`` with the zero point at 0: the ratio is 1e200 and the value at
     location ``u`` is ``1e200 ** u``, so ``1e150`` is at 0.75 exactly. The product is 1e350,
     which no float holds; the location came out infinite, was clamped to 1, and the outcome
-    was scored in the last bucket.
+    was scored in the last bucket. The width is now divided out before the logarithm.
     """
+    assert _platform_location(1e150, 1.0, 1e200, 0.0) == math.inf
     cdf = [(index / 200) ** 2 for index in range(201)]
     wide = {"range_min": 1.0, "range_max": 1e200, "zero_point": 0.0}
     score = score_continuous(cdf, "1e150", open_lower_bound=False, open_upper_bound=False, **wide)
@@ -290,10 +308,11 @@ def test_a_log_scale_too_wide_for_the_platforms_product_is_placed_by_its_logarit
         ("1e200", 4),
     ):
         assert _score(resolution, **wide).bucket == bucket
-    # A modest ratio on a range near the largest float, where it is the sum that overflows
-    # and the fallback's argument is small. Zero point 5e307 below [0, 1e308]: the ratio is
-    # 3, the product at 5e307 is 1e308 and the width is another 1e308. The location is
-    # ln(2) / ln(3), `echo "scale=25; l(2)/l(3)" | bc -l` = 0.6309..., the third of four.
+    # A modest ratio on a range near the largest float, where it is the platform's sum that
+    # overflows. Zero point 5e307 below [0, 1e308]: the ratio is 3, the product at 5e307 is
+    # 1e308 and the width is another 1e308. The location is ln(2) / ln(3),
+    # `echo "scale=25; l(2)/l(3)" | bc -l` = 0.6309..., the third of four.
+    assert _platform_argument(5e307, 0.0, 1e308, -5e307) == math.inf
     assert _score("5e307", range_min=0.0, range_max=1e308, zero_point=-5e307).bucket == 3
     # And its mirror image, at 1 - 0.6309 = 0.369: the second.
     assert _score("-5e307", range_min=-1e308, range_max=0.0, zero_point=5e307).bucket == 2
@@ -320,6 +339,8 @@ def test_a_zero_point_just_above_the_range_is_measured_from_the_upper_bound() ->
     nearest the zero point, the offset is ``1e-60`` and nothing is lost.
     """
     scale = {"range_min": -1.0, "range_max": 0.0, "zero_point": 1e-200}
+    # The platform's sum is exactly zero for an outcome sixty decades from the upper bound.
+    assert _platform_argument(-1e-60, -1.0, 0.0, 1e-200) == 0.0
     for resolution, bucket in (
         ("-1e-10", 1),  # 0.05
         ("-1e-60", 2),  # 0.3
@@ -691,29 +712,59 @@ def test_a_log_scale_whose_bounds_differ_by_more_than_a_float_holds_is_refused()
 
 
 @pytest.mark.parametrize(
-    ("low", "high", "zero_point", "value"),
+    ("zero_point", "value", "inbound", "bucket"),
     [
-        # Each unscales, in floats and before the clamp, to the location in the comment.
-        # Zero point far below: the excursion is past 1. Unclamped, 1.25 is the "above"
-        # bucket for a value inside the range, and 2.0 is a bucket the CDF does not have.
-        (0.0, 1.3, -2943384196243182.5, "1.261131"),  # 1.25
-        (12.5, 52.5, -5.5829517785234214e17, "44.230667"),  # 2.0
-        # Zero point far above: the mirror image, below 0.
-        (3.0, 4.3, 3922086168792967.0, "3.003362"),  # -0.25
-        (0.0, 40.0, 1.1050591450158915e17, "7.147444"),  # -1.0
+        # Range [0, 4] throughout. 2.8 is 0.7 of it: the third of four buckets, and the edge
+        # between the 140th and 141st of two hundred.
+        (-4e15, "2.8", 4, 3),
+        (-4e15, "2.8", 200, 140),
+        (8e15, "0.5", 200, 25),  # 0.125, an edge
+        (8e15, "2.2", 4, 3),  # 0.55
+        (2e15, "1.2", 4, 2),  # 0.3
+        (-1e15, "3.5", 200, 175),  # 0.875, an edge
+        # A thousand times nearer, where the platform's expression is a bucket out, not twenty.
+        (-4e12, "1.8", 200, 90),  # 0.45, an edge
+        (4e12, "2.2", 200, 110),  # 0.55, an edge
     ],
 )
-def test_a_value_inside_the_range_is_inbound_however_the_log_scale_rounds(
-    low: float, high: float, zero_point: float, value: str
+def test_a_zero_point_far_from_the_range_is_the_linear_scale(
+    zero_point: float, value: str, inbound: int, bucket: int
 ) -> None:
-    """A zero point about 1e15 range-widths away: the two logarithms cancel to a few ulps.
+    """The third way the platform's expression fails in floats: its two logarithms cancel.
 
-    Unclamped, the first two index the "above" bucket for a value that is inside the range
-    and a bucket the CDF does not have (an ``IndexError``, not a ``ScoreError``).
+    With the zero point ``d`` range-widths away, a log scale differs from the linear one by
+    less than ``1 / (8 d)`` of the range, so at 1e12 widths and beyond the bucket is the
+    linear bucket and the expected values are plain fractions of ``[0, 4]``. The platform's
+    ``ln(argument) - ln(width)`` is then a difference of two nearly equal numbers. Round 1's
+    code used that expression and clamped the result, which kept the bucket inside the CDF
+    and said nothing about whether it was the right one.
     """
-    assert low < float(value) < high
-    score = _score(value, range_min=low, range_max=high, zero_point=zero_point)
-    assert 1 <= score.bucket <= 4
+    cdf = [(index + 1) / (inbound + 2) for index in range(inbound + 1)]
+    scaling: dict[str, Any] = {
+        "range_min": 0.0,
+        "range_max": 4.0,
+        "open_lower_bound": True,
+        "open_upper_bound": True,
+        "inbound_outcome_count": inbound,
+    }
+    far = score_continuous(cdf, value, zero_point=zero_point, **scaling)
+    linear = score_continuous(cdf, value, zero_point=None, **scaling)
+    assert far.bucket == bucket == linear.bucket
+
+
+def test_the_platforms_expression_is_a_tenth_of_the_range_out_at_1e15_widths() -> None:
+    """What the clamp hid, as a witness that does not depend on the last bit of a logarithm.
+
+    The ratio of ``[0, 4]`` with the zero point at -4e15 is ``1 + 1e-15``, which a float
+    holds as ``1 + 5 ulps``; the difference of two logarithms near ``ln(4)`` is a whole
+    number of the same ulps. Their quotient can only be a multiple of a fifth. 2.8 is at 0.7,
+    half way between two of them, so the platform's location is wrong by a tenth of the
+    range: twenty buckets of two hundred, whichever way a libm rounds.
+    """
+    assert (4.0 + 4e15) / 4e15 == 1.0 + 5 * 2.0**-52
+    location = _platform_location(2.8, 0.0, 4.0, -4e15)
+    assert abs(location * 5 - round(location * 5)) < 1e-9
+    assert abs(location - 0.7) > 0.09
 
 
 def test_exactly_the_upper_bound_is_the_last_inbound_bucket_at_the_largest_count() -> None:

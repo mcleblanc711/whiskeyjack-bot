@@ -386,48 +386,48 @@ def _log_scale_ratio(low: float, high: float, zero_point: float) -> float:
 def _log_location(offset: float, width: float, ratio: float) -> float:
     """Where a point ``offset`` from the bound nearest the zero point sits: 0 there, 1 across.
 
-    The platform's ``(ln(offset * (ratio - 1) + width) - ln(width)) / ln(ratio)``. Every term
-    is non-negative here, so the sum cannot cancel. It can overflow, when the ratio and the
-    offset are both very large: range ``[1, 1e200]`` with the zero point at 0 and a value of
-    1e150 is a product of 1e350. The same quantity divided through by the width cannot,
-    because ``offset / width`` is at most 1 and the ratio is finite, so that form is used
-    when, and only when, the platform's is not finite.
+    ``ln(1 + (offset / width) * (ratio - 1)) / ln(ratio)``: the platform's
+    ``(ln(offset * (ratio - 1) + width) - ln(width)) / ln(ratio)`` with the width divided out
+    before the logarithm is taken instead of subtracted after. It is the same number, and
+    the platform's form does not survive floats in two places where this one does:
+
+    - its product overflows when the ratio and the offset are both very large (range
+      ``[1, 1e200]`` with the zero point at 0 and a value of 1e150 is a product of 1e350);
+      here ``offset / width`` is at most 1 and the ratio is finite;
+    - its two logarithms cancel when the zero point is far from the range, leaving an error
+      that grows with the distance (1.5e-5 of the range at 1e9 range-widths, 1.5% at 1e12,
+      nothing meaningful by 1e14); here ``log1p`` takes the small quantity itself.
+
+    Both terms are ``log1p`` of a non-negative number and the first is no larger than the
+    second, so the result is in ``[0, 1]`` but for an ulp of rounding.
     """
-    argument = offset * (ratio - 1.0) + width
-    if math.isfinite(argument):
-        return (math.log(argument) - math.log(width)) / math.log(ratio)
-    return math.log1p(offset / width * (ratio - 1.0)) / math.log(ratio)
+    span = ratio - 1.0
+    return math.log1p(offset / width * span) / math.log1p(span)
 
 
 def _unscaled_location(value: float, low: float, high: float, zero_point: float | None) -> float:
     """Where a value inside ``[low, high]`` sits in the range: 0 at ``low``, 1 at ``high``.
 
-    The platform's ``scaled_location_to_unscaled_location``, unchanged on a linear scale.
+    The platform's ``scaled_location_to_unscaled_location``, as written on a linear scale.
 
-    A log scale is measured from the bound nearest its zero point. The platform always
-    measures from ``low``. With the zero point above the range that is the far bound, and
-    its sum ``(value - low) * (ratio - 1) + width`` then cancels: with the zero point 1e-200
-    above ``[-1, 0]``, every value within 1e-16 of the upper bound computes to the upper
-    bound, whatever its location. Measured from ``high`` the same quantity is one minus
+    A log scale is measured from the bound nearest its zero point, in the form
+    :func:`_log_location` gives. The platform always measures from ``low``. With the zero
+    point above the range that is the far bound, and its sum
+    ``(value - low) * (ratio - 1) + width`` then cancels: with the zero point 1e-200 above
+    ``[-1, 0]``, every value within 1e-16 of the upper bound computes to the upper bound,
+    whatever its location. Measured from ``high`` the same quantity is one minus
     :func:`_log_location`, and nothing cancels.
 
-    The result is clamped to ``[0, 1]``. The caller has already placed a value outside the
-    range, so anything outside ``[0, 1]`` here is rounding. On a linear scale the clamp never
-    acts. On a log scale it does: the two logarithms cancel, and when the zero point is very
-    far from the range their difference is a few units in the last place divided by a divisor
-    of the same size. Without the clamp such a value would index a bucket the CDF does not
-    have.
+    Not clamped. The caller has already placed a value outside the range, so the result is
+    in ``[0, 1]`` but for an ulp, which :func:`_bucket_index` absorbs at both ends.
     """
     width = high - low
     if zero_point is None:
-        location = (value - low) / width
-    else:
-        ratio = _log_scale_ratio(low, high, zero_point)
-        if zero_point < low:
-            location = _log_location(value - low, width, ratio)
-        else:
-            location = 1.0 - _log_location(high - value, width, ratio)
-    return min(max(location, 0.0), 1.0)
+        return (value - low) / width
+    ratio = _log_scale_ratio(low, high, zero_point)
+    if zero_point < low:
+        return _log_location(value - low, width, ratio)
+    return 1.0 - _log_location(high - value, width, ratio)
 
 
 def _bucket_index(location: float, inbound: int) -> int:
@@ -436,7 +436,9 @@ def _bucket_index(location: float, inbound: int) -> int:
     ``max(int(u * N + 1 - 1e-10), 1)``. The epsilon is the platform's: a resolution exactly on
     a bucket edge belongs to the lower bucket, which also puts exactly the upper bound
     (``u == 1``) in the last inbound bucket for every count this module accepts. The clamp
-    to 1 keeps exactly the lower bound inbound, never "below".
+    to 1 keeps exactly the lower bound inbound, never "below". The same two rules place a
+    location an ulp outside ``[0, 1]``: an ulp past 1 times the largest count is 2e-12,
+    inside the epsilon, and anything below 0 is bucket 1.
     """
     return max(int(location * inbound + 1.0 - _BUCKET_EPSILON), 1)
 
@@ -500,7 +502,8 @@ def score_continuous(
             raise ScoreError("zero_point must lie outside the question's range")
         # The ratio the scale is evaluated with. Infinite when the bounds' distances from the
         # zero point differ by more than a float holds; 1 when the zero point is so far away
-        # that they do not differ at all, and the logarithm that divides is zero.
+        # (about 1e16 range-widths) that they do not differ at all, and the logarithm that
+        # divides is zero.
         ratio = _log_scale_ratio(low, high, zero)
         if not math.isfinite(ratio) or not ratio > 1.0:
             raise ScoreError("zero_point does not define a usable log scale")
