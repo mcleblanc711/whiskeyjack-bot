@@ -742,6 +742,21 @@ def test_the_runbooks_p3_check_failed_table_is_the_whole_vocabulary() -> None:
     assert set(cells[2:]) == set(_load().ROLLOVER_CHECK_PROBLEMS.values())
 
 
+def test_the_runbooks_w3_check_failed_table_is_the_whole_vocabulary() -> None:
+    """The same partition claim, for `missed-question check failed` (M1-366)."""
+    runbook = (REPO_ROOT / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    section = runbook.split("#### When the missed-question check itself fails", 1)[1]
+    rows: list[str] = []
+    for line in section.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break
+    cells = [row.split("|")[1].strip() for row in rows]
+    assert cells[:2] == ["line", "---"], cells[:2]
+    assert set(cells[2:]) == set(_load().UNANSWERED_CHECK_PROBLEMS.values())
+
+
 def test_a_timer_that_has_never_fired_says_nothing(watchdog: Harness) -> None:
     """The criterion's first silence, and it is guard A's -- not the arithmetic's.
 
