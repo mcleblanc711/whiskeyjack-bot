@@ -290,7 +290,14 @@ def test_a_log_scale_too_wide_for_the_platforms_product_is_placed_by_its_logarit
         ("1e200", 4),
     ):
         assert _score(resolution, **wide).bucket == bucket
-    # The mirror image, with the zero point above the range.
+    # A modest ratio on a range near the largest float, where it is the sum that overflows
+    # and the fallback's argument is small. Zero point 5e307 below [0, 1e308]: the ratio is
+    # 3, the product at 5e307 is 1e308 and the width is another 1e308. The location is
+    # ln(2) / ln(3), `echo "scale=25; l(2)/l(3)" | bc -l` = 0.6309..., the third of four.
+    assert _score("5e307", range_min=0.0, range_max=1e308, zero_point=-5e307).bucket == 3
+    # And its mirror image, at 1 - 0.6309 = 0.369: the second.
+    assert _score("-5e307", range_min=-1e308, range_max=0.0, zero_point=5e307).bucket == 2
+    # The mirror image of the wide scale, with the zero point above the range.
     mirrored = {"range_min": -1e200, "range_max": -1.0, "zero_point": 0.0}
     for resolution, bucket in (
         ("-1e10", 4),
