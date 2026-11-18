@@ -312,5 +312,41 @@ no migration and no config change, so the activation is not retired.
 
 ### Mutation testing
 
-Copy-based (`git archive HEAD` per worker, never the worktree), with the M4-809 harness adapted:
-`~/wj-prompts/wave27/m5-806-drafts/mutate_m5806.py`. Results are recorded below once run.
+Copy-based, with the M4-809 harness adapted (`~/wj-prompts/wave27/m5-806-drafts/mutate_m5806.py`):
+
+- each worker takes a `git archive HEAD` and never touches the worktree;
+- it checks that its copy is the one imported, and that the unmutated copy passes;
+- each mutant then runs the four M5-806 test files with `-x` at the `dev` profile.
+
+**First run, on `9c7af91`: 46 mutants, 40 killed, 6 survived.** Every survivor was a test gap,
+not an equivalent mutant, and each now has a test:
+
+| # | Mutant | Why it survived | Test added |
+| --- | --- | --- | --- |
+| 06 | checkpoint first-run filter dropped | the hash check rejects a wrong run set anyway | `test_only_checkpoints_led_by_the_records_own_run_are_candidates` calls the filter directly |
+| 22 | frozen selection replaced by the current population | no test changed the population between runs | `test_a_resumed_arm_uses_its_frozen_selection_not_the_population_now` |
+| 28 | `drop_provider` keeps the dropped providers | the properties checked "nothing added", never "exactly these kept" | `test_each_kind_keeps_exactly_what_its_spec_says`, a per-kind oracle restated from the spec |
+| 29 | `collapse_syndication` keeps the last member | same gap | same oracle |
+| 35 | the guard's exact-type check replaced by `isinstance` | re-validation also refuses a lens packet, so the type rule never fired alone | each refused case now names the rule that must refuse it (`_REFUSED_BY`) |
+| 40 | the read-only ledger probe removed | the later check still refused, after a read-write open that leaves WAL-mode bytes unchanged | the test spies on every open of the path and requires `?mode=ro` |
+
+The 40 killed include every fidelity check, both leakage guards, the per-sample scope, the
+post-cutoff guard, the location guard, the per-arm series, the ceiling maximum, the
+resume skip, billed calls and held cost read from the journal, the client-model check, the
+settings binding, id renumbering, the sample-index draw, mask's None rule and host identity,
+input order, every spending-site guard clause, the transform seam, the effort keyword, the
+store's reader and writer hash checks, the journal-kind trigger, and the spec's set, model,
+prompt-hash and label rules.
+
+**Re-run of the six on `31e82f8`:** five killed. Mutant 29 survived again. The new oracle
+property does kill it when run alone, so the miss is a reach problem: in 200 random draws the
+property may never meet `collapse_syndication` over a cluster of two or more. Deterministic
+tests now pin the cluster kinds on a fixed packet of three host clusters:
+
+- `test_collapse_keeps_the_lowest_source_id_of_each_cluster`;
+- `test_drop_cluster_drops_the_kth_cluster_ordered_by_its_lowest_member`;
+- `test_drop_provider_drops_exactly_the_named_providers`.
+
+The first fails against mutant 29 (checked on a mutated `git archive` copy). The lesson is
+the vacuous-property class in another form: a property that kills a mutant *sometimes* is a lottery,
+not a test. A rule that holds only on a rare input needs a fixed example as well.

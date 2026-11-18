@@ -395,3 +395,72 @@ def test_each_kind_keeps_exactly_what_its_spec_says(
     else:
         assert result.applicable
         assert {d.source_id for d in result.documents} == expected
+
+
+def _fixed_packet() -> tuple[ArmDocument, ...]:
+    """Five documents in three host clusters: {1, 3, 5} on a.example, {2} on b, {4} on c."""
+    hosts = {1: "a.example", 2: "b.example", 3: "www.a.example", 4: "c.example", 5: "a.example"}
+    documents = []
+    for index, host in hosts.items():
+        url = f"https://{host}/story/{index}"
+        documents.append(
+            ArmDocument(
+                source_id=f"src-{index:03d}",
+                provider="asknews" if index % 2 else "exa",
+                retrieval_run_id="run-1",
+                canonical_url=url,
+                content_sha256=f"{index:064x}",
+                rendered=ForecastDocumentInput(
+                    source_id=f"src-{index:03d}",
+                    url=url,
+                    retrieved_at=AS_OF,
+                    source_type="news",
+                    provenance="direct_api",
+                ),
+            )
+        )
+    return tuple(documents)
+
+
+def test_collapse_keeps_the_lowest_source_id_of_each_cluster() -> None:
+    """Deterministic: the random property reaches a multi-member cluster only by chance."""
+    result = apply_transform(
+        CollapseSyndicationTransform(kind="collapse_syndication", labeller="by-host"),
+        _fixed_packet(),
+        question_id=1,
+        sample_index=0,
+        labellers=LABELLERS,
+    )
+    assert [d.source_id for d in result.documents] == ["src-001", "src-002", "src-004"]
+
+
+def test_drop_cluster_drops_the_kth_cluster_ordered_by_its_lowest_member() -> None:
+    transform = DropClusterTransform(kind="drop_cluster", labeller="by-host")
+    kept = [
+        [
+            d.source_id
+            for d in apply_transform(
+                transform, _fixed_packet(), question_id=1, sample_index=k, labellers=LABELLERS
+            ).documents
+        ]
+        for k in range(3)
+    ]
+    assert kept == [
+        ["src-002", "src-004"],
+        ["src-001", "src-003", "src-004", "src-005"],
+        ["src-001", "src-002", "src-003", "src-005"],
+    ]
+    beyond = apply_transform(
+        transform, _fixed_packet(), question_id=1, sample_index=3, labellers=LABELLERS
+    )
+    assert not beyond.applicable
+
+
+def test_drop_provider_drops_exactly_the_named_providers() -> None:
+    result = apply_transform(
+        DropProviderTransform(kind="drop_provider", providers=("exa",)),
+        _fixed_packet(),
+        question_id=1,
+        sample_index=0,
+    )
+    assert [d.source_id for d in result.documents] == ["src-001", "src-003", "src-005"]
