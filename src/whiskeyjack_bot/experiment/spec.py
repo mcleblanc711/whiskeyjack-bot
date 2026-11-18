@@ -218,6 +218,19 @@ class PromptRef(_SpecModel):
             )
         return value
 
+    @field_validator("path")
+    @classmethod
+    def _path(cls, value: str) -> str:
+        # Review round 1, B1. A NUL is valid JSON and valid text, and no filesystem path can
+        # hold one: ``Path.resolve`` raises a bare ``ValueError`` on it. Refused here, as the
+        # spec's own error, rather than discovered later as a traceback.
+        if "\x00" in value:
+            raise authored_error(
+                "arm_spec_prompt_path_nul",
+                "the arm prompt path must not contain a NUL character",
+            )
+        return value
+
     @field_validator("sha256")
     @classmethod
     def _sha(cls, value: str) -> str:
@@ -322,17 +335,19 @@ def arm_sha256(spec: ArmSpec) -> str:
 
 @dataclass(frozen=True)
 class LoadedArmSpec:
-    """A validated arm, the file it came from, and its identity."""
+    """A validated arm, the file it came from, its identity, and its prompt's resolved path.
+
+    ``prompt_path`` is the spec's prompt path resolved against the spec file's directory, not
+    the working one. It is resolved once, by :func:`load_arm_spec`, inside that function's
+    refusal handling: resolving it lazily put ``Path.resolve`` -- which raises ``RuntimeError``
+    on a symlink loop -- on every caller's path, outside any handler (review round 1, B1).
+    """
 
     path: Path
     spec: ArmSpec
     spec_json: str
     sha256: str
-
-    @property
-    def prompt_path(self) -> Path:
-        """The prompt path, resolved against the spec file's directory, not the working one."""
-        return (self.path.parent / self.spec.prompt.path).resolve()
+    prompt_path: Path
 
 
 def _refuse_constant(token: str) -> object:
@@ -378,8 +393,22 @@ def load_arm_spec(path: Path) -> LoadedArmSpec:
             f"arm spec {path} is not valid UTF-8 JSON (parser detail withheld)"
         ) from None
     spec = parse_arm_spec(data)
+    try:
+        resolved = path.resolve()
+        prompt_path = (resolved.parent / spec.prompt.path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # RuntimeError is a symlink loop (Python 3.11's non-strict resolve); ValueError a path
+        # the platform cannot represent. Neither message is rendered beyond the path.
+        raise ExperimentError(
+            f"cannot resolve the prompt path of arm spec {path} (a symlink loop, or a path "
+            "the filesystem cannot represent)"
+        ) from None
     return LoadedArmSpec(
-        path=path.resolve(), spec=spec, spec_json=canonical_spec_json(spec), sha256=arm_sha256(spec)
+        path=resolved,
+        spec=spec,
+        spec_json=canonical_spec_json(spec),
+        sha256=arm_sha256(spec),
+        prompt_path=prompt_path,
     )
 
 

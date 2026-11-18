@@ -2329,6 +2329,7 @@ def _run_experiment(args: argparse.Namespace) -> int:
         return EXIT_CONFIG_INVALID
     # The prompts the fidelity gate may resolve a record's prompt_sha256 against: the arm's own
     # prompt directory and the configured one, each with its archive/ of earlier versions.
+    # Pure path arithmetic on already-resolved paths: nothing here touches the filesystem.
     prompt_dirs: list[Path] = []
     for directory in (loaded.prompt_path.parent, config.forecast.prompt_path.parent):
         for candidate in (directory, directory / "archive"):

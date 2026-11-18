@@ -279,3 +279,45 @@ def test_every_field_of_the_spec_is_inside_the_hash(data: dict[str, Any], field:
     else:
         edited["selection"] = {**data["selection"], "limit": data["selection"].get("limit", 0) + 1}
     assert arm_sha256(parse_arm_spec(edited)) != arm_sha256(parse_arm_spec(data))
+
+
+# Weighted toward the shapes the property is about. Plain `st.text()` reaches a NUL so rarely
+# that the property passed against the code it was written to catch (measured on ae05693).
+_PATH_PIECES = st.sampled_from(["a", "b.md", "/", "..", ".", " ", "\x00", "\ud800", "é", "\\"])
+awkward_paths = st.lists(_PATH_PIECES | st.text(max_size=4), min_size=1, max_size=12).map("".join)
+
+
+def test_the_path_strategy_reaches_nul_and_surrogates() -> None:
+    seen: Counter[str] = Counter()
+
+    @settings(max_examples=200, deadline=None, database=None)
+    @given(awkward_paths)
+    def record(value: str) -> None:
+        seen["nul"] += "\x00" in value
+        seen["surrogate"] += "\ud800" in value
+
+    record()
+    assert seen["nul"] >= 5 and seen["surrogate"] >= 5, seen
+
+
+@settings(deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(specs(), awkward_paths.filter(bool))
+def test_any_prompt_path_is_resolved_or_refused_as_an_experiment_error(
+    tmp_path: Path, data: dict[str, Any], prompt_path: str
+) -> None:
+    """Review round 1, B1: the path is text the filesystem may not be able to take.
+
+    The valid-spec strategy draws ordinary file names; this one draws any text -- NUL, lone
+    surrogates, separators, ``..`` -- and requires a loaded spec's prompt path to be a
+    resolved ``Path`` or the load to refuse as the module's own error.
+    """
+    edited = json.loads(json.dumps(data))
+    edited["prompt"]["path"] = prompt_path
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(edited), encoding="utf-8")
+    try:
+        loaded = load_arm_spec(path)
+    except ExperimentError as exc:
+        assert exc.__cause__ is None
+    else:
+        assert loaded.prompt_path.is_absolute()

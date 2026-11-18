@@ -259,6 +259,9 @@ brief settled this ("build the transforms against an interface … say which wai
   (SOURCE-ALPHA "Analysis points"). Today a resumed arm uses its frozen list, so extension needs
   an explicit operation.
 - **Scoring arm forecasts.** M5-805 (the paired report) reads `read_arm_samples`.
+- **Refusing purchases when a store is reopened after a restore** (**M5-808**, filed from review
+  round 1). The live worker runs `check_storage` before purchasing; the store does not yet. The
+  row records one design constraint: two stores in one directory share a `.posting-guard`.
 - **Locale-rendering (lens) arms.** `generate_forecast` refuses a transform combined with
   `render_locales`. The lens returns as a live labelled arm (M1-614).
 
@@ -350,3 +353,37 @@ tests now pin the cluster kinds on a fixed packet of three host clusters:
 The first fails against mutant 29 (checked on a mutated `git archive` copy). The lesson is
 the vacuous-property class in another form: a property that kills a mutant *sometimes* is a lottery,
 not a test. A rule that holds only on a rare input needs a fixed example as well.
+
+### Review
+
+**Round 1 (`ae05693`): CHANGES REQUESTED, one blocking finding.**
+
+- **B1: a prompt path the filesystem cannot take escaped as a raw exception.** Reproduced on
+  `ae05693` before any fix:
+  - `prompt.path` set to `"bad\u0000prompt.md"`, which is valid JSON, loaded. Reading
+    `loaded.prompt_path` then raised `ValueError: embedded null byte`. The CLI reads it outside
+    its handlers.
+  - Siblings, enumerated per LESSONS 6. A prompt path that is a symlink loop raised
+    `RuntimeError` from Python 3.11's non-strict `Path.resolve`. Lone surrogates and over-long
+    paths were already refused as `ExperimentError`.
+
+  Fixed as a class:
+  - `PromptRef` refuses a NUL with an authored error.
+  - `load_arm_spec` resolves the prompt path once, inside its own refusal handling, so
+    `prompt_path` is a plain field rather than a lazy property on every caller's path.
+  - The other three `resolve` sites in the package now also catch `RuntimeError` and
+    `ValueError`.
+
+  Regressions, each confirmed to fail on a `git archive` of `ae05693`:
+  - the NUL load;
+  - the symlink-loop load;
+  - the CLI exiting 2, dry and paid;
+  - a property drawing any text as the prompt path.
+
+  That property first passed against the pre-fix code, because plain `st.text()` almost never
+  draws a NUL. Its alphabet is now weighted toward NUL, surrogates, separators and `..`, with a
+  reach check of its own.
+- **Non-blocking: verify spend witnesses when a store is reopened after a restore.** Accepted as
+  a backlog candidate and filed as **M5-808**. It is not done here because `check_storage` reads
+  the database directory's `.posting-guard`, which two stores in one directory would share, so a
+  naive call would refuse a healthy store. That needs its own design.

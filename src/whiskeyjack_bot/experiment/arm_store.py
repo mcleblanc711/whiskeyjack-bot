@@ -153,7 +153,7 @@ def _refuse_a_ledger(path: Path) -> None:
         return
     try:
         probe = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    except (sqlite3.Error, OSError, ValueError):
+    except (sqlite3.Error, OSError, RuntimeError, ValueError):
         raise ExperimentError(f"cannot open experiment store {path}") from None
     try:
         present = _tables(probe)

@@ -1044,3 +1044,56 @@ def test_a_resumed_arm_uses_its_frozen_selection_not_the_population_now(
     finally:
         conn.close()
     assert json.loads(selection) == [case.record_id]
+
+
+# --- review round 1, B1: a prompt path the filesystem cannot take is the spec's own refusal -------
+
+
+def _spec_with_prompt_path(case: LiveCase, tmp_path: Path, value: str) -> Path:
+    path = arm_spec(case, tmp_path / "specs")
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    spec["prompt"]["path"] = value
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    return path
+
+
+def test_a_nul_in_the_prompt_path_is_refused_as_an_experiment_error(
+    case: LiveCase, tmp_path: Path
+) -> None:
+    """The round-1 reproduction: valid JSON, a path no filesystem can hold."""
+    with pytest.raises(ExperimentError, match="NUL") as excinfo:
+        load_arm_spec(_spec_with_prompt_path(case, tmp_path, "bad\u0000prompt.md"))
+    assert excinfo.value.__cause__ is None
+
+
+def test_a_prompt_path_that_is_a_symlink_loop_is_refused_as_an_experiment_error(
+    case: LiveCase, tmp_path: Path
+) -> None:
+    """The sibling shape: Python 3.11's non-strict resolve raises RuntimeError on a loop."""
+    loop = tmp_path / "loop.md"
+    loop.symlink_to(loop)
+    with pytest.raises(ExperimentError, match="cannot resolve the prompt path"):
+        load_arm_spec(_spec_with_prompt_path(case, tmp_path, str(loop)))
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_a_spec_whose_prompt_path_is_unusable_exits_2_with_no_traceback(
+    case: LiveCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any, dry_run: bool
+) -> None:
+    monkeypatch.setattr(cli, "_load_verified_config", lambda _path: case.config)
+    arguments = [
+        "experiment",
+        "run",
+        "--spec",
+        str(_spec_with_prompt_path(case, tmp_path, "bad\u0000prompt.md")),
+        "--ledger",
+        str(case.ledger),
+        "--store",
+        str(_store(tmp_path)),
+        "--config",
+        str(tmp_path / "unused.yaml"),
+    ]
+    arguments += ["--dry-run"] if dry_run else ["--ceiling-usd", "5"]
+    assert cli.main(arguments) == 2
+    assert "refused" in capsys.readouterr().out
+    assert not _store(tmp_path).exists()

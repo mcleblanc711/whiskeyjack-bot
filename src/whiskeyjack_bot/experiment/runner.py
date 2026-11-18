@@ -194,7 +194,7 @@ def require_store_location(store_path: Path, live_path: Path, config: AppConfig)
         live = live_path.resolve()
         live_artifacts = config.storage.artifact_root.resolve()
         files = store_files_dir(store).resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         raise ExperimentError(f"cannot resolve experiment store path {store_path}") from None
     if store == live or store.parent == live.parent:
         raise ExperimentError(

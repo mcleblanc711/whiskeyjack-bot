@@ -126,7 +126,7 @@ def prompt_archive(directories: Sequence[Path]) -> dict[str, str]:
     for directory in directories:
         try:
             paths = sorted(path for path in directory.glob("*.md") if path.is_file())
-        except OSError:
+        except (OSError, RuntimeError, ValueError):
             raise ExperimentError(f"cannot list prompt directory {directory}") from None
         for path in paths:
             try:
