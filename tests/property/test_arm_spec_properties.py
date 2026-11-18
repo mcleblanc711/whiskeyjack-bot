@@ -256,3 +256,26 @@ def test_the_strategy_reaches_every_transform_kind() -> None:
 
     record()
     assert set(seen) == set(KINDS), seen
+
+
+@settings(deadline=None)
+@given(specs(), st.sampled_from(["name", "effort", "samples", "path", "version", "selection"]))
+def test_every_field_of_the_spec_is_inside_the_hash(data: dict[str, Any], field: str) -> None:
+    """The whole spec is hashed: the label and the prompt path included (a stated decision)."""
+    edited = json.loads(json.dumps(data))
+    if field == "name":
+        edited["name"] = data["name"] + "x" if len(data["name"]) < 64 else "y"
+    elif field == "effort":
+        edited["reasoning_effort"] = {"low": "medium", "medium": "high", "high": "low"}[
+            data["reasoning_effort"]
+        ]
+    elif field == "samples":
+        edited["samples"] = data["samples"] % 10 + 1
+    elif field == "path":
+        edited["prompt"]["path"] = data["prompt"]["path"] + "x"
+    elif field == "version":
+        major = int(data["prompt"]["version"].split(".")[0])
+        edited["prompt"]["version"] = f"{major + 1}.0.0"
+    else:
+        edited["selection"] = {**data["selection"], "limit": data["selection"].get("limit", 0) + 1}
+    assert arm_sha256(parse_arm_spec(edited)) != arm_sha256(parse_arm_spec(data))

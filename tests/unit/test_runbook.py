@@ -149,6 +149,7 @@ def documented_invocations(text: str) -> list[list[str]]:
 DOCUMENTED_COMMANDS: Final = frozenset(
     {
         "approve",
+        "experiment",
         "ingest-resolutions",
         "init-ledger",
         "reconcile-submission",
@@ -166,7 +167,7 @@ DOCUMENTED_COMMANDS: Final = frozenset(
         "verify-submission",
     }
 )
-DOCUMENTED_INVOCATION_COUNT: Final = 22
+DOCUMENTED_INVOCATION_COUNT: Final = 24
 
 
 def subparsers_of(parser: ArgumentParser) -> dict[str, ArgumentParser]:

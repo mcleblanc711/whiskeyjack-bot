@@ -916,3 +916,78 @@ def test_an_unknown_outcome_is_recorded_once_and_never_bought_again(
     again = OpenRouter(reply_for(case.question))
     second, _, _ = _run(case, live, tmp_path, monkeypatch, endpoint=again)
     assert again.posts == 0 and second.skipped_existing == 1
+
+
+# --- the store's writer and verified reader -----------------------------------------------------
+
+
+def test_the_writer_refuses_a_control_hash_the_ledger_does_not_hold(
+    case: LiveCase, live: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = runner.append_arm_sample
+
+    def tampered(store: Any, live_conn: Any, sample: Any) -> None:
+        real(store, live_conn, replace(sample, control_forecast_sha256="0" * 64))
+
+    monkeypatch.setattr(runner, "append_arm_sample", tampered)
+    with pytest.raises(ExperimentError, match="control forecast_sha256"):
+        _run(case, live, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "message"),
+    [
+        ("forecast_sha256", "0" * 64, "does not match its hash"),
+        ("reported_models_json", '[ "x"]', "canonical form"),
+        ("created_at_utc", "2026-11-17T00:00:00", "no offset"),
+        ("billed_calls", -1, None),
+    ],
+)
+def test_the_reader_refuses_a_row_that_does_not_attest_to_itself(
+    case: LiveCase,
+    live: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    column: str,
+    value: object,
+    message: str | None,
+) -> None:
+    """A row copied with one field changed (raw SQL, bypassing the writer) is refused on read."""
+    report, store, _ = _run(case, live, tmp_path, monkeypatch)
+    conn = open_store(store)
+    try:
+        row = dict(conn.execute("SELECT * FROM arm_samples").fetchone())
+        row.update(sample_id="copy", attempt_id="copy-attempt", sample_index=1)
+        row[column] = value
+        columns = ", ".join(row)
+        insert = f"INSERT INTO arm_samples ({columns}) VALUES ({', '.join('?' for _ in row)})"
+        if message is None:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(insert, tuple(row.values()))
+            return
+        conn.execute(insert, tuple(row.values()))
+        with pytest.raises(ExperimentError, match=message):
+            read_arm_samples(conn, report.arm_sha256)
+    finally:
+        conn.close()
+
+
+# --- the spec's own refusals before anything runs ------------------------------------------------
+
+
+def test_an_arm_on_a_model_with_no_in_service_instant_is_refused(
+    case: LiveCase, tmp_path: Path
+) -> None:
+    with pytest.raises(ExperimentError, match="in-service"):
+        _loaded(case, tmp_path, model="openrouter/openai/gpt-5.6-sol")
+
+
+def test_an_arm_whose_prompt_bytes_do_not_match_its_hash_is_refused(
+    case: LiveCase, tmp_path: Path
+) -> None:
+    loaded = _loaded(case, tmp_path)
+    spec = loaded.spec.model_copy(
+        update={"prompt": loaded.spec.prompt.model_copy(update={"sha256": "0" * 64})}
+    )
+    with pytest.raises(ExperimentError, match="does not match the sha256"):
+        prepare_arm(replace(loaded, spec=spec), case.config, files_root=None)
