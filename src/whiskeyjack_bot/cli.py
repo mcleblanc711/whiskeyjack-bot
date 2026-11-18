@@ -422,6 +422,46 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     lens_report.add_argument("--config", default="config.yaml", type=Path)
+    experiment = subparsers.add_parser(
+        "experiment",
+        help="replay arms: never-submittable forecasts from stored research packets (M5-806)",
+    )
+    experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
+    experiment_run = experiment_commands.add_parser(
+        "run",
+        help=(
+            "run one arm spec over resolved questions into a separate experiment store; reads "
+            "the live ledger read-only, reserves every model call against --ceiling-usd, and "
+            "never approves or posts anything"
+        ),
+    )
+    experiment_run.add_argument("--spec", required=True, type=Path, help="the arm spec (JSON)")
+    experiment_run.add_argument(
+        "--ledger", required=True, type=Path, help="the live ledger, opened read-only"
+    )
+    experiment_run.add_argument(
+        "--store",
+        required=True,
+        type=Path,
+        help=(
+            "the experiment store (created if new); must not be in the live ledger's directory, "
+            "e.g. data/experiments/arms.sqlite3"
+        ),
+    )
+    experiment_run.add_argument("--config", required=True, type=Path)
+    experiment_run.add_argument(
+        "--ceiling-usd",
+        type=int,
+        help=(
+            "the arm's spending ceiling in whole USD, cumulative over every run of the arm "
+            "(required unless --dry-run)"
+        ),
+    )
+    experiment_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="select records and run the fidelity gate only: no store, no client, no spend",
+    )
     return parser
 
 
@@ -2244,6 +2284,90 @@ def _run_tournament(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_experiment(args: argparse.Namespace) -> int:
+    """Run one replay arm (M5-806), or with ``--dry-run`` only select and gate its records.
+
+    The live ledger is opened through :func:`_open_readonly_ledger` and is never written. The
+    credential is checked before the store is touched, so a missing key costs nothing and leaves
+    no unknown-outcome call behind.
+    """
+    from whiskeyjack_bot.config import ConfigError
+    from whiskeyjack_bot.credentials import MissingCredentialError
+    from whiskeyjack_bot.env_verify import EXIT_CONFIG_INVALID, EXIT_ENV_MISSING, EXIT_OK
+    from whiskeyjack_bot.experiment.errors import ExperimentError
+    from whiskeyjack_bot.experiment.runner import (
+        build_arm_client,
+        check_arm,
+        prepare_arm,
+        render_report,
+        run_arm,
+        store_files_dir,
+    )
+    from whiskeyjack_bot.experiment.spec import MAX_EXPERIMENT_CEILING_USD, load_arm_spec
+    from whiskeyjack_bot.research.allowlist import AllowlistError
+
+    if not args.dry_run and (
+        args.ceiling_usd is None or not 0 < args.ceiling_usd <= MAX_EXPERIMENT_CEILING_USD
+    ):
+        print(
+            f"refused: --ceiling-usd is required and must be from 1 to "
+            f"{MAX_EXPERIMENT_CEILING_USD} USD"
+        )
+        return EXIT_REFUSED
+    try:
+        config = _load_verified_config(args.config)
+    except ConfigError as exc:
+        print(exc)
+        return EXIT_CONFIG_INVALID
+    except AllowlistError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING if exc.is_filesystem_error else EXIT_CONFIG_INVALID
+    try:
+        loaded = load_arm_spec(args.spec)
+    except ExperimentError as exc:
+        print(f"refused: {exc}")
+        return EXIT_CONFIG_INVALID
+    # The prompts the fidelity gate may resolve a record's prompt_sha256 against: the arm's own
+    # prompt directory and the configured one, each with its archive/ of earlier versions.
+    # Pure path arithmetic on already-resolved paths: nothing here touches the filesystem.
+    prompt_dirs: list[Path] = []
+    for directory in (loaded.prompt_path.parent, config.forecast.prompt_path.parent):
+        for candidate in (directory, directory / "archive"):
+            if candidate not in prompt_dirs:
+                prompt_dirs.append(candidate)
+    live = _open_readonly_ledger(args.ledger)
+    if live is None:
+        return EXIT_REFUSED
+    try:
+        if args.dry_run:
+            prepared = prepare_arm(loaded, config, files_root=None)
+            report = check_arm(prepared=prepared, live=live, prompt_dirs=prompt_dirs)
+        else:
+            prepared = prepare_arm(loaded, config, files_root=store_files_dir(args.store))
+            client = build_arm_client(prepared)
+            report = run_arm(
+                prepared=prepared,
+                client=client,
+                live=live,
+                live_path=args.ledger,
+                store_path=args.store,
+                ceiling_usd=args.ceiling_usd,
+                prompt_dirs=prompt_dirs,
+            )
+    except MissingCredentialError as exc:
+        print(exc)
+        return EXIT_ENV_MISSING
+    except ExperimentError as exc:
+        print(f"refused: {exc}")
+        return EXIT_REFUSED
+    finally:
+        live.close()
+    print(render_report(report))
+    if report.stop_reason in ("ceiling", "journal_refused"):
+        return EXIT_REFUSED
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2293,6 +2417,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_report(args)
     if args.command == "research":
         return _run_research(args)
+    if args.command == "experiment":
+        return _run_experiment(args)
     raise AssertionError(f"unhandled command: {args.command}")
 
 

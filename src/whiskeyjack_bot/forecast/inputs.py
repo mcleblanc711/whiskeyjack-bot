@@ -422,3 +422,72 @@ def render_model_input(model_input: ModelInput) -> str:
             "the reasoning packet could not be rendered as canonical JSON "
             "(detail withheld: it can echo question or document content)"
         ) from None
+
+
+# The two document fields a transformed reasoning packet may change (M5-806): the only fields
+# that name a publisher. Everything else a document renders is either its identity in the ledger
+# or its content, and a replay arm that edited either would be measuring an edit nobody made.
+TRANSFORMABLE_DOCUMENT_FIELDS: frozenset[str] = frozenset({"publisher", "url"})
+
+
+def require_transformed_input(base: ModelInput, transformed: object) -> ModelInput:
+    """Return ``transformed`` re-validated, or refuse it as a :class:`ForecastInputError`.
+
+    The structural rule behind a replay arm's packet transform (M5-806, AC4), enforced where the
+    money is spent rather than trusted from the transform: a value carries no memory of which
+    function built it. ``transformed`` must be ``base`` with documents removed, reordered, or
+    with :data:`TRANSFORMABLE_DOCUMENT_FIELDS` rewritten, and nothing else:
+
+    - the same :class:`ForecastModelInput` type (a :class:`LensModelInput` renders other bytes),
+      re-validated, because ``model_copy`` skips every field constraint;
+    - every field but ``research_documents`` unchanged, ``as_of_utc`` included -- the reply is
+      checked against the request's cutoff;
+    - ``sources`` a subsequence of ``base.sources``, in base order, each entry equal to its base;
+    - the rendered documents exactly the documents ``sources`` names, each one a base document
+      with at most the transformable fields changed. So no document is added, none is renumbered,
+      and a citation of a dropped document cannot resolve -- ``sources`` is what the attribution
+      check reads.
+
+    The messages are constants: they describe which rule failed, never a value.
+    """
+    if not isinstance(base, ModelInput) or type(base.packet) is not ForecastModelInput:
+        raise ForecastInputError("a transform applies only to a plain reasoning packet")
+    if type(transformed) is not ModelInput or type(transformed.packet) is not ForecastModelInput:
+        raise ForecastInputError("a transformed reasoning packet must be a plain ModelInput")
+    try:
+        packet = ForecastModelInput.model_validate(
+            transformed.packet.model_dump(mode="python", warnings=False)
+        )
+    except Exception:
+        raise ForecastInputError(
+            "a transformed reasoning packet does not validate (detail withheld: it can echo "
+            "question or document content)"
+        ) from None
+    unchanged = {"research_documents"}
+    if packet.model_dump(exclude=unchanged, warnings=False) != base.packet.model_dump(
+        exclude=unchanged, warnings=False
+    ):
+        raise ForecastInputError("a transform may change only the research documents")
+    sources = transformed.sources
+    if type(sources) is not tuple or any(type(item) is not SourceReference for item in sources):
+        raise ForecastInputError("a transformed packet's sources must be a tuple of references")
+    position = {reference.source_id: index for index, reference in enumerate(base.sources)}
+    indices = [position.get(reference.source_id) for reference in sources]
+    if any(index is None for index in indices):
+        raise ForecastInputError("a transformed packet names a source the base packet lacks")
+    ordered = [index for index in indices if index is not None]
+    if ordered != sorted(set(ordered)):
+        raise ForecastInputError("a transformed packet's sources must keep base order, once each")
+    if any(base.sources[index] != reference for index, reference in zip(ordered, sources)):
+        raise ForecastInputError("a transformed packet's source reference differs from its base")
+    base_documents = {document.source_id: document for document in base.packet.research_documents}
+    rendered = [document.source_id for document in packet.research_documents]
+    if len(set(rendered)) != len(rendered) or set(rendered) != {r.source_id for r in sources}:
+        raise ForecastInputError("a transformed packet must render exactly the sources it names")
+    for document in packet.research_documents:
+        original = base_documents.get(document.source_id)
+        if original is None or document.model_dump(
+            exclude=set(TRANSFORMABLE_DOCUMENT_FIELDS), warnings=False
+        ) != original.model_dump(exclude=set(TRANSFORMABLE_DOCUMENT_FIELDS), warnings=False):
+            raise ForecastInputError("a transform may not change a document's identity or content")
+    return ModelInput(packet=packet, sources=sources)

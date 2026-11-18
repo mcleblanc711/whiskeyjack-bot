@@ -24,7 +24,8 @@ import asyncio
 import json
 import math
 from dataclasses import dataclass
-from typing import Any, Final
+from datetime import datetime, timezone
+from typing import Any, Final, Literal, get_args
 
 import httpx
 
@@ -42,12 +43,19 @@ from whiskeyjack_bot.tournament_state import (
 )
 from whiskeyjack_bot.redaction import redact_secrets
 
+# The reasoning efforts a priced call may send (M5-806). Closed, so a replay arm cannot name a
+# value OpenRouter would forward unvalidated, and so the fidelity gate can try every member when
+# it rebuilds a stored call whose effort no record field carries.
+ReasoningEffort = Literal["low", "medium", "high"]
+
 # Reasoning effort sent on every priced call (M1-367, D59; was "medium" from Launch to M1-367).
 # Code, not an AppConfig field: a new config field retires the live activation, and what
 # attribution needs is the value actually sent, which each `model_response` now records.
 # Reasoning tokens bill as output and count against `max_tokens`; at medium, 298 live Astra
 # responses used at most 1,781 of MAX_OUTPUT_TOKENS (reasoning max 480), all `stop`.
-REASONING_EFFORT: Final = "high"
+# M5-806 lets a replay arm pass another member of `ReasoningEffort` to `PricedClient`; every
+# live caller passes nothing, so this stays the value the worker sends.
+REASONING_EFFORT: Final[ReasoningEffort] = "high"
 
 # Output ceiling per call. `tournament.run_once` also requires model.max_output_tokens to
 # equal this, so the reservation below and the request cannot disagree about it.
@@ -79,13 +87,40 @@ PRICED_MODELS: Final[dict[str, PricedModel]] = {
 }
 
 
-def build_request(messages: Any, model: PricedModel) -> dict[str, Any]:
+# The earliest instant this project can attest each model was in service (M5-806, D62). A replay
+# arm is refused for a question that opened before its model's instant, because a model released
+# after a question opened may have been trained on its outcome; this is the leak the stored
+# packets cannot close. Astra: M1-408 read OpenRouter's public listing on 2026-09-10, so the end
+# of that day is the conservative bound (an earlier provider release only makes it stricter).
+# Sol is deliberately absent: no date has been recorded for it, so a Sol arm is refused for every
+# question rather than admitted on a guess. A model missing here is refused, never defaulted.
+MODEL_IN_SERVICE: Final[dict[str, datetime]] = {
+    "openrouter/openai/gpt-6-astra": datetime(2026, 9, 11, tzinfo=timezone.utc),
+}
+
+
+def _require_effort(value: object) -> ReasoningEffort:
+    if type(value) is not str or value not in get_args(ReasoningEffort):
+        raise TournamentError("reasoning effort is not a supported value")
+    effort: ReasoningEffort = value  # type: ignore[assignment]
+    return effort
+
+
+def build_request(
+    messages: Any, model: PricedModel, *, reasoning_effort: ReasoningEffort = REASONING_EFFORT
+) -> dict[str, Any]:
     """The exact OpenRouter body for one call: the registered ID, and `max_price` from the
-    registered prices, so OpenRouter refuses to route above what the reservation assumed."""
+    registered prices, so OpenRouter refuses to route above what the reservation assumed.
+
+    ``reasoning_effort`` (M5-806) defaults to the live constant, so every existing caller's body
+    -- and with it every journal cache scope already written -- is byte-identical. The replay
+    harness passes another member of :data:`ReasoningEffort` to run an arm at that effort, and
+    the fidelity gate passes each member to rebuild a stored call made before M1-367.
+    """
     return {
         "model": model.openrouter_id,
         "messages": messages,
-        "reasoning": {"effort": REASONING_EFFORT, "exclude": True},
+        "reasoning": {"effort": _require_effort(reasoning_effort), "exclude": True},
         "max_tokens": MAX_OUTPUT_TOKENS,
         "provider": {
             "max_price": {
@@ -165,17 +200,22 @@ def _finite_float(token: str) -> float:
 
 
 class PricedClient:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self, config: AppConfig, *, reasoning_effort: ReasoningEffort = REASONING_EFFORT
+    ) -> None:
         priced = PRICED_MODELS.get(config.model.name)
         if priced is None:
             raise TournamentError("model is not a registered priced model")
         self.model = config.model.name
         self.priced = priced
         self.config = config
+        # M5-806: the effort this client sends. The worker never passes it, so it is
+        # REASONING_EFFORT there; checked here so a bad value refuses before any reservation.
+        self.reasoning_effort = _require_effort(reasoning_effort)
         self.last_cost: float | None = None
 
     async def invoke(self, prompt: Any, system_prompt: str | None = None) -> str:
-        request = build_request(prompt, self.priced)
+        request = build_request(prompt, self.priced, reasoning_effort=self.reasoning_effort)
         budget = CURRENT_BUDGET.get()
         estimate = reservation_estimate_usd(request, self.priced)
         cache_scope = f"{budget.scope}:{digest(request)}" if budget else ""

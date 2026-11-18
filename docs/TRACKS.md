@@ -57,6 +57,7 @@ near zero this time, with no other lane open when it started and one when it mer
 
 | Item | Branch | Worktree | Adds deps? | Migration | Started |
 | --- | --- | --- | --- | --- | --- |
+| M5-806 | feat/m5-806-replay-experiment-harness | whiskeyjack-m5-806 | no | none | 2026-11-17 |
 | M1-366 | feat/m1-366-missed-question-alarm | whiskeyjack-m1-366 | no | none | 2026-11-17 |
 | M4-809 | feat/m4-809-numeric-local-score | whiskeyjack-m4-809 | no | none | 2026-11-16 |
 | M1-363 | feat/m1-363-prompt-tie-at-bound | whiskeyjack-m1-363 | no | none | 2026-11-05 |

@@ -495,6 +495,8 @@ version: 11
 | `research language-census` | **read-only**; reads AskNews artifacts | no | no |
 | `research lens-report` | **read-only** | no | no |
 | `run` | writes records | **yes** | **YES — retrieval and model calls** |
+| `experiment run --dry-run` | **read-only**; opens no experiment store | no | no |
+| `experiment run` | **read-only**; writes the separate experiment store | **yes** | **YES — model calls, reserved against `--ceiling-usd`** |
 | `submit` | appends an attempt | **POST** | posts a forecast |
 | `tournament correct-costs` | **read-only** | no | no |
 | `tournament correct-costs --apply` | appends `cost_corrected` and back-filled AskNews `cost_settled` events | no | no |
@@ -828,6 +830,44 @@ sqlite3 -readonly data/whiskeyjack_bot.sqlite3 \
 **Persian lens documents do not reach the shadow's model yet.** The control's relevance filter
 reads English terms only, so the Exa Persian pages the lens stores are filtered out (M1-361).
 Scoring the two arms against each other is M5-805.
+
+### 10. Replay experiment arms (M5-806)
+
+A replay arm re-forecasts resolved questions from their **stored** research packets under one
+controlled change, and appends the forecasts to a separate experiment store that nothing can
+approve or post (D62). The live ledger is opened read-only and never written. The arm is a JSON
+spec (`experiments/arms/`), hashed; every row carries the hash. Always gate first, which spends
+nothing:
+
+```bash
+uv run whiskeyjack-bot experiment run --spec experiments/arms/smoke.json \
+  --ledger data/whiskeyjack_bot.sqlite3 --store data/experiments/arms.sqlite3 \
+  --config config/tournament.yaml --dry-run
+```
+
+It prints how many records were selected, how many passed the fidelity gate, and every
+exclusion by reason. On 2026-11-17: 229 selected, 19 `model_not_in_service` (the Sol era), and
+210 passed. Then run it under a ceiling the owner has agreed:
+
+```bash
+uv run whiskeyjack-bot experiment run --spec experiments/arms/smoke.json \
+  --ledger data/whiskeyjack_bot.sqlite3 --store data/experiments/arms.sqlite3 \
+  --config config/tournament.yaml --ceiling-usd 5
+```
+
+- **The ceiling is the arm's total, over every run of it**, in whole USD, at most 400. A run that
+  reaches it stops cleanly, reports `ceiling` and exits 4; rerun with a higher ceiling to
+  continue. A rerun skips every completed (record, sample) and buys nothing twice.
+- **Never put the store in the live ledger's directory.** Its spend witnesses would land in
+  `data/.posting-guard`, and the worker's restore check would stop the worker. The command
+  refuses that placement and the artifact root, so use `data/experiments/`.
+- A missing credential exits 3 before the store is touched. A refused spec, prompt or store
+  exits 2 or 4 with the reason.
+- The gate's reason codes: `model_not_in_service`, `open_time_unknown`, `no_checkpoint`,
+  `checkpoint_ambiguous`, `packet_hash_mismatch`, `artifact_unreadable`, `artifact_mismatch`,
+  `request_unbuildable`, `request_mismatch`, `model_unpriced`, `prompt_unavailable`,
+  `call_not_reproduced`, `effort_disagrees`, `record_unreadable`. A rising
+  `prompt_unavailable` count means a live prompt version has no copy in `prompts/archive/`.
 
 ### Scheduled ingestion and scoring
 

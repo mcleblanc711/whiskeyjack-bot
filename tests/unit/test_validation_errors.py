@@ -393,6 +393,37 @@ def _cases() -> list[tuple[str, Callable[[], object], Callable[[], object], type
             ResolutionError,
         )
     )
+    # M5-806: the arm spec, with the marker as an unknown key, as a bad transform kind (a union
+    # tag pydantic quotes), and as a field value -- each one a shape pydantic's own text echoes.
+    from whiskeyjack_bot.experiment.errors import ExperimentError
+    from whiskeyjack_bot.experiment.spec import ArmSpec, parse_arm_spec
+
+    arm = {
+        "spec_schema_version": "1.0.0",
+        "name": "arm",
+        "model": "openrouter/openai/gpt-6-astra",
+        "reasoning_effort": "high",
+        "prompt": {"path": "p.md", "version": "1.5.0", "sha256": "0" * 64},
+        "transform": {"kind": "identity"},
+        "samples": 1,
+        "selection": {},
+    }
+    for index, variant in enumerate(
+        (
+            {**arm, MARKER: 1},
+            {**arm, "transform": {"kind": MARKER}},
+            {**arm, "name": MARKER + " !"},
+            {**arm, "samples": INT_MARKER},
+        )
+    ):
+        cases.append(
+            (
+                f"arm-spec-{index}",
+                lambda variant=variant: ArmSpec.model_validate(variant),
+                lambda variant=variant: parse_arm_spec(variant),
+                ExperimentError,
+            )
+        )
     return cases
 
 
