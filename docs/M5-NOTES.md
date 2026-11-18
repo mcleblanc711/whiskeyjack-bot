@@ -387,3 +387,10 @@ not a test. A rule that holds only on a rare input needs a fixed example as well
   a backlog candidate and filed as **M5-808**. It is not done here because `check_storage` reads
   the database directory's `.posting-guard`, which two stores in one directory would share, so a
   naive call would refuse a healthy store. That needs its own design.
+
+**Round 2 (`2389f18`): APPROVE, no blocking findings.** B1 closed, and the restore observation
+stays tracked as M5-808. The reviewer could not run pytest in its sandbox, because the
+virtualenv's interpreter was unavailable to it. Its approval rests on source and diff
+inspection. The gates are this branch's own: `review-request.py` ran all four before each
+request and refuses to emit on a red gate, and CI's `quality-gate` passed on the PR. Approved
+is therefore not the same as independently reproduced.
