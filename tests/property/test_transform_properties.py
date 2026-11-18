@@ -338,3 +338,60 @@ def test_the_strategy_reaches_every_kind_and_both_outcomes() -> None:
         "proper_subset",
     ):
         assert seen[name] > 0, (name, seen)
+
+
+def _oracle(transform: Any, documents: tuple[ArmDocument, ...], question: int, sample: int) -> Any:
+    """What each kind keeps, restated from its spec independently of the implementation.
+
+    Returns the kept source ids as a set (order is asserted by the order property), or None
+    for a result that must be "not applicable".
+    """
+    ids = {d.source_id for d in documents}
+    clusters = _by_host(documents)
+    groups: dict[str, list[str]] = {}
+    for source_id, cluster in clusters.items():
+        groups.setdefault(cluster, []).append(source_id)
+    ordered_groups = sorted(
+        (sorted(group, key=id_order) for group in groups.values()), key=lambda g: id_order(g[0])
+    )
+    if isinstance(transform, (IdentityTransform, MaskPublisherTransform, ShuffleOrderTransform)):
+        return ids
+    if isinstance(transform, NoResearchTransform):
+        return set()
+    if isinstance(transform, DropProviderTransform):
+        return {d.source_id for d in documents if d.provider not in transform.providers}
+    if isinstance(transform, RandomSubsetTransform):
+        p = transform.inclusion_probability
+        if transform.unit == "document":
+            return {s for s in ids if unit_draw(transform.seed, question, sample, s) < p}
+        kept = {c for c in groups if unit_draw(transform.seed, question, sample, c) < p}
+        return {s for s, c in clusters.items() if c in kept}
+    if isinstance(transform, DropClusterTransform):
+        if sample >= len(ordered_groups):
+            return None
+        return ids - set(ordered_groups[sample])
+    if isinstance(transform, DropPublisherClassTransform):
+        return {
+            d.source_id
+            for d in documents
+            if (d.rendered.publisher or "none") not in transform.classes
+        }
+    if all(len(group) < 2 for group in ordered_groups):
+        return None
+    return {group[0] for group in ordered_groups}
+
+
+@settings(deadline=None)
+@given(packets(), transforms(), st.integers(min_value=0, max_value=5), st.integers(1, 10**6))
+def test_each_kind_keeps_exactly_what_its_spec_says(
+    documents: tuple[ArmDocument, ...], transform: Any, sample: int, question: int
+) -> None:
+    result = apply_transform(
+        transform, documents, question_id=question, sample_index=sample, labellers=LABELLERS
+    )
+    expected = _oracle(transform, documents, question, sample)
+    if expected is None:
+        assert not result.applicable and result.documents == ()
+    else:
+        assert result.applicable
+        assert {d.source_id for d in result.documents} == expected

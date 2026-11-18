@@ -384,11 +384,26 @@ def test_the_store_has_its_own_schema_version(tmp_path: Path) -> None:
 
 
 def test_a_ledger_is_refused_as_a_store_without_being_opened_for_writing(
-    case: LiveCase,
+    case: LiveCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Refused by a read-only look, before ``ledger.connect`` could set a pragma on it.
+
+    The bytes alone cannot show this: a read-write open of a ledger already in WAL mode leaves
+    the file unchanged. So every open of the path is recorded too, and each must be read-only.
+    """
     before = _fingerprint(case.ledger)
+    opened: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spy(target: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        opened.append(str(target))
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
     with pytest.raises(ExperimentError, match="is a ledger"):
         open_store(case.ledger)
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
+    assert opened and all(target.endswith("?mode=ro") for target in opened), opened
     assert _fingerprint(case.ledger) == before
 
 
@@ -991,3 +1006,41 @@ def test_an_arm_whose_prompt_bytes_do_not_match_its_hash_is_refused(
     )
     with pytest.raises(ExperimentError, match="does not match the sha256"):
         prepare_arm(replace(loaded, spec=spec), case.config, files_root=None)
+
+
+def test_only_checkpoints_led_by_the_records_own_run_are_candidates(
+    case: LiveCase, live: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The record stores its first run id; a checkpoint led by another run is not its own.
+
+    Without this filter the hash check would still reject a checkpoint whose runs differ, so
+    the filter is tested directly: it is the record's own claim about its first run, and it
+    keeps the gate from loading runs the record never named.
+    """
+    record = read_forecast_record(live, case.record_id)
+    saved = [
+        {"run_ids": ["run-of-another-attempt", record.retrieval_run_id]},
+        {"run_ids": [record.retrieval_run_id]},
+        {"run_ids": [record.retrieval_run_id]},
+        {"run_ids": []},
+        {"run_ids": [7]},
+        "not a checkpoint",
+    ]
+    monkeypatch.setattr(fidelity, "events", lambda conn, kind, scope: saved)
+    assert fidelity._checkpoints(live, record) == [(record.retrieval_run_id,)]
+
+
+def test_a_resumed_arm_uses_its_frozen_selection_not_the_population_now(
+    case: LiveCase, live: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A question resolved after the arm started never enters it (SOURCE-ALPHA stopping rule)."""
+    first, store, _ = _run(case, live, tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "select", lambda live_conn, loaded: ("a-newly-resolved-record",))
+    second, _, endpoint = _run(case, live, tmp_path, monkeypatch)
+    assert second.selected == 1 and second.skipped_existing == 1 and endpoint.posts == 0
+    conn = open_store(store)
+    try:
+        (selection,) = conn.execute("SELECT selection_json FROM arms").fetchone()
+    finally:
+        conn.close()
+    assert json.loads(selection) == [case.record_id]

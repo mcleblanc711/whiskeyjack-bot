@@ -285,10 +285,36 @@ def _refused() -> list[tuple[str, Any]]:
     ]
 
 
+# The rule each forbidden case must be refused by: several cases would also fail a later
+# check (a lens packet does not re-validate as a plain one), so naming the rule is what keeps
+# each check load-bearing on its own.
+_REFUSED_BY = {
+    "not a ModelInput": "plain ModelInput",
+    "a lens packet": "plain ModelInput",
+    "a moved cutoff": "only the research documents",
+    "an edited question": "only the research documents",
+    "an added document": "names a source the base packet lacks",
+    "sources out of order": "keep base order",
+    "a duplicated source": "keep base order",
+    "a dropped document still cited": "render exactly the sources",
+    "a document shown without its source": "render exactly the sources",
+    "an edited title": "identity or content",
+    "an edited summary": "identity or content",
+    "a renumbered document": "identity or content",
+    "a changed reference": "differs from its base",
+    "a list of sources": "tuple of references",
+    "an invalid document": "does not validate",
+}
+
+
 @pytest.mark.parametrize(("name", "transformed"), _refused(), ids=[n for n, _ in _refused()])
 def test_a_forbidden_transform_is_refused(name: str, transformed: Any) -> None:
-    with pytest.raises(ForecastInputError):
+    with pytest.raises(ForecastInputError, match=_REFUSED_BY[name]):
         require_transformed_input(_base(), transformed)
+
+
+def test_every_refused_case_names_its_rule() -> None:
+    assert {name for name, _ in _refused()} == set(_REFUSED_BY)
 
 
 def test_a_lens_base_cannot_be_transformed() -> None:
