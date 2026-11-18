@@ -100,7 +100,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
@@ -133,6 +133,7 @@ from whiskeyjack_bot.forecast.inputs import (
     ModelInput,
     SourceReference,
     build_model_input,
+    require_transformed_input,
     render_model_input,
 )
 
@@ -354,11 +355,19 @@ def generate_forecast(
     now: datetime,
     client: Forecaster | None = None,
     render_locales: bool = False,
+    model_input_transform: Callable[[ModelInput], ModelInput] | None = None,
 ) -> ForecastGeneration:
     """Call the configured model once, with at most one bounded repair.
 
     ``render_locales`` is the shadow arm's (M1-359): each document is sent with its locale
     row (``inputs.build_model_input``). Every control forecast leaves it off.
+
+    ``model_input_transform`` is the replay harness's (M5-806): it receives the reasoning
+    packet built from ``question`` and ``packet`` -- source ids already assigned over the whole
+    packet -- and returns the one the model is sent, with documents removed, reordered or their
+    publisher masked. Its result is held to ``inputs.require_transformed_input`` here, before
+    any spend, so a transform cannot add a document, renumber one or edit anything else. The
+    worker never passes it; left ``None`` the request is byte-identical to before it existed.
 
     Never raises on provider or model failure: those are reported on the returned
     :class:`ForecastGeneration`, because a repair means two billed calls and raising
@@ -508,6 +517,12 @@ def generate_forecast(
         now=now,
         include_locales=render_locales,
     )
+    if model_input_transform is not None:
+        if render_locales:
+            raise ForecastGenerationError(
+                "a model input transform cannot be combined with rendered locales"
+            )
+        model_input = _transformed_or_refuse(model_input, model_input_transform)
 
     if client is None:
         client = build_forecaster_client(config)
@@ -594,6 +609,23 @@ def _model_input_or_refuse(
             "the reasoning packet could not be built from these arguments "
             "(offending input withheld)"
         ) from None
+
+
+def _transformed_or_refuse(
+    base: ModelInput, transform: Callable[[ModelInput], ModelInput]
+) -> ModelInput:
+    """Apply a replay arm's transform and hold its result to the structural rule (M5-806).
+
+    The transform's own exceptions propagate unchanged: it is the caller's code, raising the
+    caller's error type. Only the rule's refusal is translated, into this module's caller-
+    mistake vocabulary, and it is raised before any billable call like every refusal here.
+    """
+    transformed = transform(base)
+    try:
+        return require_transformed_input(base, transformed)
+    except ForecastInputError as exc:
+        # The message is one of require_transformed_input's constants and carries no value.
+        raise ForecastGenerationError(str(exc)) from None
 
 
 def _grid_is_convertible(question: BoundedQuestion, calibration: NumericCalibrationConfig) -> bool:

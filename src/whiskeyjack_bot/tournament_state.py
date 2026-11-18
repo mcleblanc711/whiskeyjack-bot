@@ -45,6 +45,17 @@ class AskNewsSubcapReached(TournamentError):
     """
 
 
+class BudgetExhausted(TournamentError):
+    """A reservation was refused because it would take spend over a round or series ceiling.
+
+    Its own type (M5-806) so a caller can tell "the ceiling stopped this purchase" from every
+    other ``TournamentError`` a reservation can raise -- a non-finite estimate, a restored
+    spending hold -- without parsing wording the error-hygiene rule may legitimately change. The
+    replay harness stops a run cleanly on exactly this one. It subclasses ``TournamentError``, so
+    every existing catcher in the worker is unchanged. The message is a constant.
+    """
+
+
 class StorageFailure(TournamentError):
     """Stop the worker; continuing could lose evidence or spend."""
 
@@ -950,7 +961,7 @@ class Budget:
                     # that was crossed, it is the refusal itself, and it is the one budget
                     # condition that has already stopped a paid call from happening.
                     crossed = 100
-                    raise TournamentError("round budget exhausted; no provider call made")
+                    raise BudgetExhausted("round budget exhausted; no provider call made")
                 reservation: dict[str, Any] = {
                     "reservation_id": identifier,
                     "provider": provider,
@@ -961,7 +972,7 @@ class Budget:
                     series_used = series_actual + series_held + amount
                     if series_used > self.series_ceiling:
                         series_crossed = 100
-                        raise TournamentError("series budget exhausted; no provider call made")
+                        raise BudgetExhausted("series budget exhausted; no provider call made")
                     series_crossed = budget_level_crossed(series_used, self.series_ceiling)
                     reservation["series_id"] = self.series_id
                     if provider == "asknews" and self.asknews_ceiling is not None:

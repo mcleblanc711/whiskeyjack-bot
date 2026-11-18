@@ -1,0 +1,14 @@
+{
+  "spec_schema_version": "1.0.0",
+  "name": "smoke-a0",
+  "model": "openrouter/openai/gpt-6-astra",
+  "reasoning_effort": "high",
+  "prompt": {
+    "path": "../../prompts/forecaster-tournament.md",
+    "version": "1.5.0",
+    "sha256": "cbcd738dd81047804c42095f12e498fc462689723d7e9b39374d870691a3bb21"
+  },
+  "transform": {"kind": "identity"},
+  "samples": 1,
+  "selection": {"limit": 8}
+}
