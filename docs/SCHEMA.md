@@ -56,6 +56,8 @@ and bumping one never bumps another.
 | `EXPORT_SCHEMA_VERSION` | `1` | `export.py:EXPORT_SCHEMA_VERSION` | The export contract below. |
 | `REPORT_SCHEMA_VERSION` | `1` | `report.py:REPORT_SCHEMA_VERSION` | The report contract below. |
 | `REGISTRY_SCHEMA_VERSION` | `1` | `research/locales.py:REGISTRY_SCHEMA_VERSION` | The `schema_version` the locale registry (`config/locales.yaml`, M1-356) must declare. Not hashed into anything: a lens run records the registry file's own sha256. |
+| `ARM_SPEC_SCHEMA_VERSION` | `1.0.0` | `experiment/spec.py:ARM_SPEC_SCHEMA_VERSION` | The `spec_schema_version` a replay arm spec (M5-806) must declare. Part of the hashed spec, so it is inside every `arm_sha256`. |
+| `EXPERIMENT_STORE_SCHEMA_VERSION` | `1` | `experiment/arm_store.py:EXPERIMENT_STORE_SCHEMA_VERSION` | The experiment store's own schema (M5-806), recorded in its `experiment_schema` table with the checksum of `experiment/store_schema_001.sql`. A separate file from the ledger, never migrated by `init-ledger`; see [Experiment store](#experiment-store-experiment_store_schema_version-1). |
 
 The prompt's own version (the H1 of the prompt file) and each score's
 `implementation_version` are data, stored per row, not constants: see
@@ -733,3 +735,28 @@ members, written `<exclusion>`.
 | `files[].name` | File name. |
 | `files[].rows` | Lines in `records.jsonl`; 1 for `report.json`. |
 | `files[].sha256` | Digest of the file's bytes. |
+
+## Experiment store (`EXPERIMENT_STORE_SCHEMA_VERSION` 1)
+
+The replay harness (M5-806, D62) writes to its own SQLite file, never to the ledger. It is
+created by the first `experiment run` against a path and verified on every open: a file holding
+`schema_migrations` or `forecast_records` is refused as a ledger (looked at read-only first), and
+a store whose `experiment_schema` row does not match this build's version and DDL checksum is
+refused. Every table is append-only by trigger. The DDL is
+`src/whiskeyjack_bot/experiment/store_schema_001.sql`, outside `migrations/`.
+
+| Table | One row per | Binds to |
+| --- | --- | --- |
+| `experiment_schema` | applied store schema | -- |
+| `arms` | arm, at its first run: the canonical spec, the generation-settings digest and the frozen, ordered list of control record ids | -- |
+| `runs` | invocation of `experiment run`: the live ledger path and schema version read, the ceiling | `arms` |
+| `run_reports` | finished run: stop reason and counts | `runs` |
+| `fidelity_outcomes` | (run, control record) the gate judged; `reason_code` NULL means it passed | `runs` |
+| `arm_samples` | (arm, control record, sample index) that reached the model: outcome, the arm's record in canonical form and its `forecast_sha256`, kept-packet and request digests, raw-output path, billed calls and cost from the journal, provider-reported models, effort sent | `arms`, `runs`; the control by `control_record_id` and `control_forecast_sha256` **as text** -- there is no cross-file key, so the writer re-reads the control through `read_forecast_record` |
+| `tournament_events` | spend-journal event of the priced client (migration 012's table, index and append-only triggers verbatim, without 012's submission trigger); a trigger admits only `cost_reserved`, `cost_settled`, `cost_settled_id`, `cost_corrected`, `witness`, `model_started`, `model_completed` and `model_response` | -- |
+
+No table here is one the approval, submission or posting code reads; `tournament_events` is the
+priced client's journal under the owner's reading of AC7 (2026-11-17), and no activation, intent
+or confirmation kind can be written to it. Raw artifacts and spend witnesses go under
+`<store>-files/`; the store must not be in the live ledger's directory, where its witnesses would
+reach the live `.posting-guard` that `check_storage` reads.
